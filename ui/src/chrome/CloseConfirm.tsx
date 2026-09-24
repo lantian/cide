@@ -15,13 +15,18 @@
  * 2. **It does not appear when nothing is at risk.** `atRisk` decides, and the caller is
  *    expected to consult it (or simply to mount this only on a refusal). A dialog that
  *    shows up on every close is one users learn to dismiss unread.
- * 3. **Cancel is the default.** Escape cancels, the initial focus is on Cancel, and the
- *    destructive button is the plain one. The accent-filled button is the safe one.
+ * 3. **Cancel is the default.** Escape cancels, the initial focus is on Cancel, and Cancel is
+ *    the kit's primary. The destructive button is the kit's black `danger`: the accent-filled
+ *    button is the safe one, and the loss never wears the accent.
  *
  * NOT mounted here — see the note at the bottom of this file for where it goes.
  */
 import { useEffect, useRef } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Dialog } from '@/kit/components/Overlay'
+import { Dot } from '@/kit/components/Status'
+import { PathGroup, PathList, PathRow } from '@/kit/components/Surface'
 import type { SessionSummary, UnsavedTab } from '@/ipc/client'
 import {
   atRisk,
@@ -32,7 +37,6 @@ import {
   unsavedRow,
   type CloseScope,
 } from './closeConfirmModel'
-import styles from './CloseConfirm.module.css'
 
 export interface CloseConfirmProps {
   /** What the user asked to close. Only the wording depends on it. */
@@ -86,83 +90,72 @@ export function CloseConfirm({
   const risk = { unsaved, sessions }
   const title = confirmTitle(scope, risk)
 
+  // The prominent button is Cancel and holds the focus; the loss is the kit's black `danger`.
+  // `Save all` is the recovery and sits in the footer's left slot, away from the two close
+  // actions, so a user reaching for it cannot hit Discard by being 4px off.
   return (
-    <OverlayCard label={title} onDismiss={onCancel}>
-      {/* The handler sits on a wrapper inside the card rather than on `document`: focus is
-          already in here (the effect above put it on Cancel), and a document listener would
-          also answer for the terminal underneath and for any other overlay that is open. */}
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="closeConfirm">
-        <div className={styles.head}>
-          <h2 className={styles.title} data-audit="closeConfirmTitle">
-            {title}
-          </h2>
-          <p className={styles.body}>{confirmBody(scope, risk)}</p>
-        </div>
-
-        <ul className={styles.list} data-audit="closeConfirmList">
-          {unsaved.length > 0 && sessions.length > 0 && (
-            <li className={styles.groupLabel}>Unsaved files</li>
-          )}
+    <Modal onDismiss={onCancel}>
+      {/* The handler sits on the dialog rather than on `document`: focus is already in here
+          (the effect above put it on Cancel), and a document listener would also answer for
+          the terminal underneath and for any other overlay that is open. */}
+      <Dialog
+        title={title}
+        lead={confirmBody(scope, risk)}
+        width="narrow"
+        flush
+        onKeyDown={onKeyDown}
+        data-audit="closeConfirm"
+        footNote={
+          onSaveAll !== undefined &&
+          unsaved.length > 0 && (
+            <Button onClick={onSaveAll} data-audit="closeConfirmSave">
+              Save all and close
+            </Button>
+          )
+        }
+        actions={
+          <>
+            <Button variant="danger" onClick={onDiscard} data-audit="closeConfirmDiscard">
+              {confirmLabel(risk)}
+            </Button>
+            <Button ref={cancel} variant="primary" onClick={onCancel} data-audit="closeConfirmCancel">
+              Cancel
+            </Button>
+          </>
+        }
+      >
+        <PathList data-audit="closeConfirmList">
+          {unsaved.length > 0 && sessions.length > 0 && <PathGroup>Unsaved files</PathGroup>}
           {unsaved.map((tab) => {
             const row = unsavedRow(tab)
+            // The accent dot is the tab strip's dirty mark, so the row and the tab match.
             return (
-              <li key={tab.tab} className={styles.row}>
-                {/* The tab strip's own dirty dot, so the row and the tab match. */}
-                <span className={`${styles.mark} ${styles.markUnsaved}`} aria-hidden="true" />
-                <span className={styles.name}>{row.name}</span>
-                <span className={styles.where} title={tab.path}>
-                  {row.where}
-                </span>
-              </li>
+              <PathRow
+                key={tab.tab}
+                mark={<Dot tone="accent" label="Unsaved" />}
+                name={row.name}
+                where={row.where}
+                full={tab.path}
+              />
             )
           })}
 
-          {unsaved.length > 0 && sessions.length > 0 && (
-            <li className={styles.groupLabel}>Sessions mid-turn</li>
-          )}
+          {unsaved.length > 0 && sessions.length > 0 && <PathGroup>Sessions mid-turn</PathGroup>}
           {sessions.map((session) => {
             const row = sessionRow(session)
+            // Amber: a session mid-turn is *waiting* on something, not lost yet.
             return (
-              <li key={session.session} className={styles.row}>
-                <span className={`${styles.mark} ${styles.markSession}`} aria-hidden="true" />
-                <span className={styles.name}>{row.name}</span>
-                <span className={styles.where}>{row.where}</span>
-              </li>
+              <PathRow
+                key={session.session}
+                mark={<Dot tone="yellow" label="Mid-turn" />}
+                name={row.name}
+                where={row.where}
+              />
             )
           })}
-        </ul>
-
-        <div className={styles.footer}>
-          {onSaveAll !== undefined && unsaved.length > 0 && (
-            <button
-              type="button"
-              className={`${styles.button} ${styles.save}`}
-              onClick={onSaveAll}
-              data-audit="closeConfirmSave"
-            >
-              Save all and close
-            </button>
-          )}
-          <button
-            type="button"
-            className={`${styles.button} ${styles.buttonDanger}`}
-            onClick={onDiscard}
-            data-audit="closeConfirmDiscard"
-          >
-            {confirmLabel(risk)}
-          </button>
-          <button
-            ref={cancel}
-            type="button"
-            className={`${styles.button} ${styles.buttonPrimary}`}
-            onClick={onCancel}
-            data-audit="closeConfirmCancel"
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+        </PathList>
+      </Dialog>
+    </Modal>
   )
 }
 

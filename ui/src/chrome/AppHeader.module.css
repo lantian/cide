@@ -17,7 +17,7 @@
 .lights {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 0 14px 0 12px;
 }
 
@@ -28,6 +28,8 @@
   padding: 0 12px 0 14px;
 }
 
+/* The traffic lights are the kit's `Dot`s: its status gradients, not three literal hexes. Their
+   size is the layout audit's (`trafficLight`), so it stays. */
 .light {
   width: 11px;
   height: calc(11px * var(--ui-scale));
@@ -50,15 +52,15 @@
  * next sweep for hardcoded colour.
  */
 .close {
-  background: #e0655b;
+  background: var(--grad-red);
 }
 
 .minimize {
-  background: #dfae68;
+  background: var(--grad-yellow);
 }
 
 .zoom {
-  background: #7fb069;
+  background: var(--grad-green);
 }
 
 /*
@@ -160,7 +162,7 @@
 }
 
 .tab:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 
@@ -317,9 +319,12 @@
  * The inversion is what makes one rule serve both themes; `TabStrip.module.css` states the
  * contrast measurements, and this uses the identical pair rather than restating them.
  */
+/* The kit's `Counter` in yellow ("waiting on someone"): the amber gradient under its dark ink
+   (`--on-yellow`, 6.8–8.8:1), with the fill's lit edge. */
 .awaitingOn {
-  background: var(--yellow);
-  color: var(--panel);
+  background: var(--grad-yellow);
+  box-shadow: var(--fill-sheen);
+  color: var(--on-yellow);
   font-weight: 600;
 }
 
@@ -481,7 +486,7 @@
 }
 
 .add:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text-hi);
 }
 
@@ -505,7 +510,7 @@
 
 .recent:hover,
 .recent[aria-expanded='true'] {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text-hi);
 }
 
@@ -519,9 +524,9 @@
 .rows {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--sp-1);
   flex: none;
-  padding: 0 4px;
+  padding: 0 var(--sp-2);
 }
 
 .rowButton {
@@ -529,7 +534,7 @@
   align-items: center;
   gap: var(--sp-2);
   height: calc(22px * var(--ui-scale));
-  padding: 0 8px;
+  padding: 0 var(--sp-4);
   border-radius: var(--r-2);
   background: transparent;
   border: 0;
@@ -545,7 +550,7 @@
 }
 
 .rowButton:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 
@@ -570,8 +575,8 @@
 .actions {
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 0 8px 0 12px;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-4) 0 var(--sp-5);
   color: var(--dim);
 }
 
@@ -600,7 +605,7 @@
 }
 
 .action:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 

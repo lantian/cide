@@ -1,0 +1,691 @@
+/*
+ * The containers content sits in: a panel's header, a section with its caption, a card, a
+ * key/value summary, the toolbar, the tabs, and the three kinds of row a list is made of.
+ *
+ * Surfaces step by one token each, never skipping: `--bg` (the window, and the inside of a
+ * field) → `--panel` (a sidebar, a card) → `--panel-2` (a recessed strip inside a card, a hover)
+ * → `--chrome-hi` (a pressed or selected control). A card on `--panel` is told apart by its
+ * border, not by a second fill.
+ *
+ * Radii by size, from the wizard: controls `--r-2`, cards `--r-3`, dialogs `--r-4`, a badge or a
+ * dot `--r-full`. `--r-1` is for things smaller than a control — a tag, inline code, a key.
+ */
+
+/* --- panel header ---------------------------------------------------------------------------- */
+
+/* The strip at the top of a sidebar panel: title, a count, tools at the right. `--h-panelheader`
+   tall, so every panel's first line sits at the same height. */
+.panelHeader {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: var(--h-panelheader);
+  padding: 0 var(--sp-3) 0 var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.panelTitle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.tools {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* --- section --------------------------------------------------------------------------------- */
+
+/* The wizard's `.planTitle`: small caps-ish caption over a group. Uppercase at 11px with tracking
+   — the one place uppercase is used, so it always means "a group starts here". */
+.caption {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.captionAside {
+  margin-left: auto;
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 400;
+}
+
+.section + .section {
+  margin-top: var(--sp-7);
+}
+
+/* The dialog's and page's heading pair: a title and one lead sentence under it. */
+.heading {
+  margin-bottom: var(--sp-6);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--fs-ui-16);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.lead {
+  max-width: calc(600px * var(--ui-scale));
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+/* --- card ------------------------------------------------------------------------------------ */
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.cardHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.cardBody {
+  padding: var(--sp-5);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--text);
+}
+
+/* A card that is a state as well as a box — the GitLab approval box. The tone runs through the
+   border and a 7% wash; the text keeps its own colour so it stays readable. */
+.card[data-tone='ok'] {
+  border-color: color-mix(in srgb, var(--green) 32%, transparent);
+  background: color-mix(in srgb, var(--green) 7%, var(--panel));
+}
+
+.card[data-tone='warn'] {
+  border-color: color-mix(in srgb, var(--yellow) 32%, transparent);
+  background: color-mix(in srgb, var(--yellow) 7%, var(--panel));
+}
+
+.card[data-tone='bad'] {
+  border-color: color-mix(in srgb, var(--red) 32%, transparent);
+  background: color-mix(in srgb, var(--red) 7%, var(--panel));
+}
+
+/* The dashed box: something proposed, not yet real — the wizard's plan, a draft comment. */
+.card[data-draft='true'] {
+  border-style: dashed;
+  background: transparent;
+}
+
+/* --- summary (key / value) ------------------------------------------------------------------- */
+
+.summary {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  overflow: hidden;
+}
+
+.summaryRow {
+  display: grid;
+  grid-template-columns: calc(110px * var(--ui-scale)) minmax(0, 1fr);
+  gap: var(--sp-5);
+  padding: var(--sp-4) var(--sp-6);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+}
+
+.summaryRow:last-child {
+  border-bottom: 0;
+}
+
+.summaryRow:nth-child(odd) {
+  background: var(--panel);
+}
+
+.summaryRow dt {
+  color: var(--dim);
+}
+
+.summaryRow dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-hi);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* --- toolbar --------------------------------------------------------------------------------- */
+
+/* Wraps rather than clipping: nine tools in a 200px sidebar go to a second line, where a
+   single-line row cut the last three off with no way to reach them. */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+}
+
+.toolbarSep {
+  flex: none;
+  width: 1px;
+  height: calc(16px * var(--ui-scale));
+  margin: 0 var(--sp-2);
+  background: var(--border);
+}
+
+.toolbarSpacer {
+  flex: 1;
+}
+
+/* --- tabs ------------------------------------------------------------------------------------ */
+
+/*
+ * Tabs inside a panel or a pane: text with an accent underline under the current one. Not the
+ * segmented control — tabs switch *what* is shown (Overview / Changes / Pipelines), a segmented
+ * control filters or scopes one thing. The editor's tab strip is its own component in `chrome/`
+ * and not this.
+ */
+.tabs {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-5);
+  padding: 0 var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: calc(32px * var(--ui-scale));
+  padding: 0 var(--sp-1);
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease-out);
+}
+
+.tab::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  border-radius: var(--r-1) var(--r-1) 0 0;
+  background: transparent;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+/* 500, not 600: the gradient underline carries the state, and a 600 label at 12px read heavier
+   than the tab strip needed (the same note as the segmented control's). */
+.tab[aria-selected='true'] {
+  color: var(--text-hi);
+  font-weight: 500;
+}
+
+.tab[aria-selected='true']::after {
+  background: var(--grad-accent-h);
+}
+
+.tab:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/*
+ * A label that turns 500 when chosen, without the control changing width. The first pass let
+ * the text reflow: "Changes" grew by a few pixels as it went bold and every tab to its right
+ * shifted — the user caught it jumping. The label is a column with an invisible, zero-height
+ * copy of itself in 500 under it, so its width is always the chosen width and nothing moves.
+ * `/ ''` gives the copy an empty alternative text, so a screen reader does not read it twice.
+ */
+.steadyLabel {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.steadyLabel::after {
+  /* The plain form first: an engine without the alt-text syntax drops the second line and
+     keeps this one, so the width is still reserved. */
+  content: attr(data-label);
+  content: attr(data-label) / '';
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  font-weight: 500;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* --- rows ------------------------------------------------------------------------------------ */
+
+.list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/*
+ * The rich row: the GitLab inbox's MR item. Two to four lines — a top line of small facts, a
+ * title, a meta line, a footer of signals. Hover is a `--panel-2` wash; the open one gets a 2px
+ * accent bar at the left and a 5% accent wash, so it is findable in a long list without
+ * shouting.
+ */
+.item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease-out);
+}
+
+.item:hover {
+  background: var(--panel-2);
+}
+
+.item[aria-current='true'] {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
+}
+
+.item:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.itemTop {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.itemTopAside {
+  margin-left: auto;
+}
+
+.itemTitle {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-hi);
+}
+
+.itemMeta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.itemFoot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin-top: var(--sp-2);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.itemFoot > span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/*
+ * The compact row: one line, 26px — a file, a branch, a setting in a list. Icon, label, a dim
+ * detail, a right-aligned trailing slot. Selected is `--sel`, the app's selection colour, so a
+ * row selected here matches a row selected in the file tree.
+ */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: calc(26px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease-out);
+}
+
+.row > svg {
+  flex: none;
+  color: var(--dim);
+}
+
+.row:hover {
+  background: var(--panel-2);
+}
+
+.row[aria-selected='true'] {
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+.row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.rowLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowDetail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.rowTrail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-left: auto;
+}
+
+/* The tree row's chevron box. The row's indent is set inline by `Surface.tsx`'s `Row` — 12px a
+   level, the width of this box, so a child's icon sits under its parent's label. */
+.twisty {
+  flex: none;
+  display: flex;
+  width: var(--icon-0);
+  color: var(--dim);
+}
+
+/* --- breadcrumbs ----------------------------------------------------------------------------- */
+
+/* Where you are inside a thing: a revision's path, a container's directory. Mono, because the
+   segments are path segments. The last one is the current one and is not a link. */
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+}
+
+.crumbs li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+  color: var(--faint);
+}
+
+.crumb {
+  padding: var(--sp-1) var(--sp-2);
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.crumb:hover {
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+.crumb:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.crumbCurrent {
+  padding: var(--sp-1) var(--sp-2);
+  color: var(--text-hi);
+}
+
+/* --- disclosure ------------------------------------------------------------------------------ */
+
+/* A section that folds: a group in a panel, "Show details" under an error. Native `<details>`,
+   so it is keyboard- and find-in-page-complete; the marker is the kit's chevron. */
+.disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 0;
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--text);
+  list-style: none;
+  cursor: pointer;
+}
+
+.disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.disclosure > summary > svg {
+  flex: none;
+  color: var(--dim);
+  transition: transform var(--dur-1) var(--ease-out);
+}
+
+.disclosure[open] > summary > svg {
+  transform: rotate(90deg);
+}
+
+.disclosure > summary:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-1);
+}
+
+.disclosureAside {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.disclosureBody {
+  padding: var(--sp-2) 0 var(--sp-4) calc(18px * var(--ui-scale));
+}
+
+/* --- code block ------------------------------------------------------------------------------ */
+
+/* Output, a log tail, a command, a stack: `--panel-2` recess, mono at the code size, selectable,
+   scrolls sideways rather than wrapping a line a user will copy. */
+.codeBlock {
+  margin: 0;
+  max-height: calc(260px * var(--ui-scale));
+  padding: var(--sp-4) var(--sp-5);
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.6;
+  white-space: pre;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* --- table ----------------------------------------------------------------------------------- */
+
+.table {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
+  font-size: var(--fs-ui-12);
+}
+
+.table th,
+.table td {
+  padding: var(--sp-3) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+}
+
+.table th {
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--dim);
+  background: var(--panel-2);
+}
+
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.table tbody tr:hover td {
+  background: var(--panel-2);
+}
+
+.table td[data-numeric='true'],
+.table th[data-numeric='true'] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- path list ------------------------------------------------------------------------------- */
+
+/* Flush in a dialog body: the rows line up with the dialog's own 28px text edge. */
+.pathList {
+  margin: 0;
+  padding: var(--sp-3) 0;
+  list-style: none;
+}
+
+.pathList[data-max] {
+  max-height: calc(260px * var(--ui-scale));
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.pathRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-4);
+  padding: var(--sp-1) calc(28px * var(--ui-scale));
+  white-space: nowrap;
+}
+
+.pathMark {
+  flex: none;
+  display: inline-flex;
+  align-self: center;
+  color: var(--dim);
+}
+
+.pathName {
+  flex: none;
+  max-width: 70%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--fs-ui-13);
+  color: var(--text-hi);
+}
+
+.pathWhere {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.pathTrail {
+  flex: none;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.pathGroup {
+  padding: var(--sp-4) calc(28px * var(--ui-scale)) var(--sp-2);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.pathGroup:first-child {
+  padding-top: var(--sp-2);
+}

@@ -93,7 +93,7 @@
 
 .body :global(.cm-content) {
   caret-color: var(--tk-caret);
-  padding: 4px 0;
+  padding: var(--sp-2) 0;
 }
 
 .body :global(.cm-line) {
@@ -266,7 +266,7 @@
 
 .body :global(.cm-lineNumbers .cm-gutterElement) {
   min-width: 0;
-  padding: 0 12px 0 0;
+  padding: 0 var(--sp-5) 0 0;
   text-align: right;
 }
 
@@ -359,7 +359,7 @@
   border-radius: var(--r-1);
   color: var(--dim);
   margin: 0 3px;
-  padding: 0 4px;
+  padding: 0 var(--sp-2);
   cursor: pointer;
 }
 
@@ -410,7 +410,7 @@
 .body :global(.cm-blame .cm-gutterElement) {
   min-width: 0;
   overflow: hidden;
-  padding: 0 8px;
+  padding: 0 var(--sp-4);
   text-align: left;
   /*
    * Never wrap. A gutter element's height is set from the *text line* it sits beside, so a label
@@ -846,7 +846,7 @@
 .findBar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   /*
    * The vertical padding scales and the horizontal does not, which looks arbitrary and is not.
    * `--h-findbar` is *derived* from this number — `check:rows` re-adds `padding × 2 + the
@@ -917,15 +917,16 @@
 }
 
 .findButton:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text-hi);
 }
 
 /* The two toggles carry state; the arrows and the close button do not and never light up. */
+/* The kit's icon toggle "on": the accent on a 12% accent wash. */
 .findButton[data-on='true'] {
-  border-color: var(--accent-dim);
-  background: var(--accent-dim);
-  color: var(--text-hi);
+  border-color: transparent;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
 }
 
 /* --- Diagnostics (M12) ------------------------------------------------------------------ */
@@ -1054,7 +1055,7 @@
   font-family: var(--font-ui);
   font-size: var(--fs-ui-12);
   max-width: 420px;
-  padding: 2px;
+  padding: var(--sp-1);
 }
 
 /* The nested section must not double the card up. */
@@ -1065,7 +1066,7 @@
 
 .body :global(.cm-diagnostic) {
   border-left: 2px solid transparent;
-  padding: 4px 8px;
+  padding: var(--sp-2) var(--sp-4);
   /*
    * The reason people mouse into this popup at all: to select the message and paste it into
    * a search or a commit. CodeMirror keeps hover tooltips open while the pointer is inside
@@ -1098,7 +1099,7 @@
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  padding-left: 6px;
+  padding-left: var(--sp-3);
 }
 
 /* ==========================================================================================

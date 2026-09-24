@@ -1,0 +1,166 @@
+/*
+ * The kit's dropdown: a trigger drawn as a field, and a popup drawn as a menu.
+ *
+ * It replaced a native `<select>` on the user's request (2026-09-24): the platform popup is a
+ * grey OS list with no icons, no secondary text, no check mark and none of the kit's type, and
+ * it looked like a different application inside every form. The keyboard and screen-reader
+ * behaviour the native one gave for free is rebuilt in `Select.tsx`.
+ *
+ * The trigger reuses `Field.module.css`'s box (same heights, same focus halo), so a dropdown in a
+ * form row is indistinguishable in shape from the text field beside it. The popup is a
+ * `Menu`'s surface — `--panel`, `--r-3`, `--shadow-2` — with the selected option checked and the
+ * keyboard-active one on `--sel`.
+ */
+
+/* At least 120 where there is room, never wider than its box: a hard 120px floor pushed the
+   select over the field beside it in a narrow sidebar. */
+.trigger {
+  width: 100%;
+  min-width: min(calc(120px * var(--ui-scale)), 100%);
+  padding: 0 calc(26px * var(--ui-scale)) 0 var(--sp-4);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  text-align: left;
+  cursor: pointer;
+}
+
+.trigger:disabled {
+  cursor: default;
+}
+
+.trigger:focus-visible {
+  outline: none;
+}
+
+.md .value,
+.md .placeholder {
+  font-size: var(--fs-ui-13);
+}
+
+.value {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-hi);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.value > svg {
+  flex: none;
+  color: var(--dim);
+}
+
+.placeholder {
+  overflow: hidden;
+  color: var(--faint);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.trigger:disabled .value {
+  color: var(--faint);
+}
+
+.chevron {
+  position: absolute;
+  right: var(--sp-4);
+  display: flex;
+  color: var(--dim);
+  pointer-events: none;
+  transition: transform var(--dur-1) var(--ease-out);
+}
+
+.trigger[aria-expanded='true'] .chevron {
+  transform: rotate(180deg);
+}
+
+/* --- the popup ------------------------------------------------------------------------------ */
+
+/*
+ * Portalled to `<body>` and placed with `position: fixed` from the trigger's rectangle, so a
+ * dialog's `overflow: hidden` (every `Dialog` has one, for its rounded corners) cannot clip it.
+ * Opens upward when there is less room below than above.
+ */
+.popup {
+  position: fixed;
+  z-index: 90;
+  max-height: calc(264px * var(--ui-scale));
+  margin: 0;
+  padding: var(--sp-2);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  box-shadow: var(--shadow-2);
+  list-style: none;
+  animation: kit-select-in var(--dur-1) var(--ease-out);
+}
+
+@keyframes kit-select-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  min-height: calc(28px * var(--ui-scale));
+  padding: 0 var(--sp-4) 0 var(--sp-3);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.option[data-active='true'] {
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+.option[aria-selected='true'] {
+  color: var(--text-hi);
+  font-weight: 500;
+}
+
+.option[aria-disabled='true'] {
+  color: var(--faint);
+  cursor: default;
+}
+
+.option > svg {
+  flex: none;
+  color: var(--dim);
+}
+
+/* The check column: always present, so labels line up whether or not their row is chosen. */
+.check {
+  flex: none;
+  display: flex;
+  width: var(--icon-1);
+  color: var(--accent);
+}
+
+.optionLabel {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.optionDetail {
+  flex: none;
+  font-size: var(--fs-ui-11);
+  font-weight: 400;
+  color: var(--faint);
+}

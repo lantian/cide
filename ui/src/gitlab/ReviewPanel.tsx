@@ -1,4 +1,5 @@
 import { Icon, type IconName } from '@/icons/Icon'
+import { IconButton } from '@/kit/components/Button'
 import { ApprovalStatus, MRState } from './ReviewStatus'
 import chrome from './ReviewChrome.module.css'
 import { Users } from './UserLink'
@@ -181,10 +182,9 @@ export function ReviewPanel({
           <span className={chrome.mrNumber}>!{d.mr.iid}</span>
           <MRState state={d.mr.state} draft={d.mr.draft} />
           <div className={chrome.headerTools}>
-            <button
-              className={chrome.iconButton}
-              aria-label="Refresh merge request"
-              title="Refresh merge request"
+            <IconButton
+              icon="refresh-cw"
+              label="Refresh merge request"
               disabled={busy}
               onClick={() =>
                 void run(async () => {
@@ -194,35 +194,24 @@ export function ReviewPanel({
                   setFiles([])
                 })
               }
-            >
-              <Icon name="refresh-cw" />
-            </button>
-            <button
-              className={chrome.iconButton}
-              aria-label="Review with an agent"
-              title="Review with an agent — its findings become draft comments you publish"
+            />
+            <IconButton
+              icon="eye"
+              label="Review with an agent"
               disabled={busy}
               onClick={() => showLaunchReview(review)}
-            >
-              <Icon name="eye" />
-            </button>
-            <button
-              className={chrome.iconButton}
-              aria-label="Open in GitLab"
-              title="Open in GitLab"
+            />
+            <IconButton
+              icon="arrow-up-right"
+              label="Open in GitLab"
               onClick={() => void gitlab.openUrl(d.mr.web_url)}
-            >
-              <Icon name="arrow-up-right" />
-            </button>
-            <button
-              className={chrome.iconButton}
-              aria-label="Close MR review"
-              title="Close review and remove its temporary worktrees"
+            />
+            <IconButton
+              icon="x"
+              label="Close MR review"
               disabled={busy}
               onClick={() => void run(() => closeReview(review))}
-            >
-              <Icon name="x" />
-            </button>
+            />
           </div>
         </header>
         <h2 className={chrome.reviewTitle}>{d.mr.title}</h2>

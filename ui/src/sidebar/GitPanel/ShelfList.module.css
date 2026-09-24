@@ -4,7 +4,7 @@
   overflow-y: auto;
   overflow-x: hidden;
   margin: 0;
-  padding: 4px 0;
+  padding: var(--sp-2);
   list-style: none;
   background: var(--panel);
 }
@@ -18,12 +18,12 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
+  gap: var(--sp-1);
   /* `flex: 1; min-width: 0` rather than `width: 100%`: the row is a flex line now, and a
      100%-wide child would push the three action buttons out of the panel. */
   flex: 1;
   min-width: 0;
-  padding: 5px 10px;
+  padding: var(--sp-3) var(--sp-5);
   border: 0;
   background: transparent;
   color: var(--text);
@@ -34,7 +34,7 @@
 }
 
 .entry:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .entry:focus-visible {
@@ -52,12 +52,17 @@
 .row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding-right: 8px;
+  gap: var(--sp-2);
+  padding-right: var(--sp-4);
+}
+
+/* The kit's row hover. The row's actions appear on it, so they are part of the row. */
+.row {
+  border-radius: var(--r-2);
 }
 
 .row:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .row:hover .entry,
@@ -74,7 +79,7 @@
 .actions {
   flex: none;
   display: flex;
-  gap: 2px;
+  gap: var(--sp-1);
   visibility: hidden;
 }
 
@@ -84,34 +89,14 @@
 }
 
 .action {
-  padding: 3px 7px;
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-11);
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.action:hover {
-  border-color: var(--border);
-  color: var(--text-hi);
-}
-
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 0;
+  composes: button sm quiet from '../../kit/components/Button.module.css';
 }
 
 /* `--red` on the one that cannot be undone, the same as every other destructive control. */
-.danger:hover {
-  border-color: var(--red);
-  color: var(--red);
+/* Drop is a quiet row action like the other two: it opens `ConfirmDestructive`, and that dialog
+   is where the kit's black danger button lives. Nothing here dresses the row as the act. */
+.danger {
+  font-weight: 400;
 }
 
 .name {
@@ -123,13 +108,13 @@
 
 .meta {
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
 .empty {
   margin: 0;
-  padding: 12px;
+  padding: var(--sp-5);
   color: var(--faint);
   font-size: var(--fs-ui-12);
 }

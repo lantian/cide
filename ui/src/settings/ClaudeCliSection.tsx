@@ -33,6 +33,7 @@
  * rule no check script can run, and this project has six shipped bugs that lived in exactly
  * that place.
  */
+import { Button, IconButton } from '@/kit/components/Button'
 import { useState, type ReactNode } from 'react'
 import type { ClaudeCli, ClaudeCliSupport, ClaudeEnvVar } from '@/ipc/client'
 import { Group, Note, PathReadout, Row, Toggle } from './controls'
@@ -46,7 +47,6 @@ import {
   type Fate,
   type InjectionKey,
 } from './claudeCli'
-import { Icon } from '@/icons/Icon'
 
 import styles from './ClaudeCliSection.module.css'
 
@@ -557,17 +557,17 @@ export function Why({ text }: { text: string | null }) {
 
 export function Add({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <button type="button" className={styles.add} onClick={onClick}>
-      + {label}
-    </button>
+    <span className={styles.add}>
+      <Button size="sm" variant="quiet" icon="plus" onClick={onClick}>
+        {label}
+      </Button>
+    </span>
   )
 }
 
 export function Remove({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <button type="button" className={styles.remove} aria-label={label} onClick={onClick}>
-      <Icon name="x" size={1} />
-    </button>
+    <IconButton icon="x" label={label} onClick={onClick} />
   )
 }
 

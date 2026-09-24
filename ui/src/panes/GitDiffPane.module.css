@@ -36,13 +36,13 @@
 }
 
 .notice {
-  padding: 12px;
+  padding: var(--sp-5);
   color: var(--dim);
   font-size: var(--fs-ui-12);
 }
 
 .noticeWhy {
-  margin-top: 4px;
+  margin-top: var(--sp-2);
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
@@ -54,7 +54,7 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   min-height: var(--h-panetitle);
   /*
    * Reserved for the pane frame's floating controls — same reason as `DiffPane.module.css`'s
@@ -100,13 +100,13 @@
   align-items: center;
   gap: 10px;
   margin-left: auto;
-  padding-left: 8px;
+  padding-left: var(--sp-4);
 }
 
 .sides {
   flex: none;
   display: flex;
-  gap: 2px;
+  gap: var(--sp-1);
 }
 
 .side {
@@ -126,7 +126,7 @@
 }
 
 .side:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 
@@ -147,10 +147,13 @@
   text-decoration-color: var(--faint);
 }
 
+/* The kit's "on (segmented)": raised onto `--panel`, `--shadow-1`, `--text-hi` 500. */
 .sideOn {
   border-color: var(--border);
-  background: var(--panel-2);
+  background: var(--panel);
+  box-shadow: var(--shadow-1);
   color: var(--text-hi);
+  font-weight: 500;
 }
 
 .note {
@@ -210,8 +213,8 @@
   z-index: 1;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-4);
   border-bottom: 1px solid var(--border-soft);
   background: var(--chrome);
   color: var(--dim);
@@ -221,9 +224,9 @@
   flex: 1;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   min-width: 0;
-  padding: 2px 0;
+  padding: var(--sp-1) 0;
   border: 0;
   background: none;
   color: var(--blue);
@@ -242,31 +245,15 @@
 }
 
 .hunkAction {
+  composes: button sm secondary from '../kit/components/Button.module.css';
   flex: none;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-11);
-  line-height: 1;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.hunkAction:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
-}
 
-.hunkAction:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
+
+
+
+
 
 /* The tri-state box. `–` for a partially selected hunk, matching the panel's TriCheckbox. */
 .box {
@@ -286,10 +273,13 @@
   cursor: pointer;
 }
 
+/* Ticked like the kit's `Checkbox` (a native one with `accent-color`): the accent fill under an
+   `--on-accent` mark. `--accent-dim` was the fill, and the red palette turned it pink. */
 .box[data-state='all'],
 .box[data-state='some'] {
   border-color: var(--accent);
-  background: var(--accent-dim);
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .lines {
@@ -302,7 +292,7 @@
   grid-template-columns: 16px 5ch 5ch 2ch 1fr;
   align-items: start;
   gap: 0;
-  padding-right: 8px;
+  padding-right: var(--sp-4);
 }
 
 /*
@@ -413,7 +403,7 @@
 .half {
   display: grid;
   align-items: start;
-  padding-right: 8px;
+  padding-right: var(--sp-4);
   min-width: 0;
 }
 
@@ -464,7 +454,7 @@
  * middle.
  */
 .column[data-side='old'] .lineno {
-  padding-right: 6px;
+  padding-right: var(--sp-3);
 }
 
 /*
@@ -571,9 +561,9 @@
 .hunkBar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   min-height: 22px;
-  padding: 2px 8px;
+  padding: var(--sp-1) var(--sp-4);
   border-top: 1px solid var(--border-soft);
   border-bottom: 1px solid var(--border-soft);
   background: var(--chrome);
@@ -602,7 +592,7 @@
 
 .fold:hover:not(:disabled) {
   color: var(--text);
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .fold:disabled {
@@ -709,7 +699,7 @@
 .lineBox {
   width: 12px;
   height: calc(12px * var(--ui-scale));
-  margin: 2px;
+  margin: var(--sp-1);
   padding: 0;
   display: flex;
   align-items: center;
@@ -726,7 +716,8 @@
 .row[data-selected='true'] .lineBox,
 .half[data-selected='true'] .lineBox {
   border-color: var(--accent);
-  background: var(--accent-dim);
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .lineBox:disabled {
@@ -850,8 +841,8 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
   border-top: 1px solid var(--border);
   background: var(--chrome);
 }
@@ -868,30 +859,14 @@
 }
 
 .button {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  line-height: 1;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
-.button:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
-}
 
-.button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
+
+
+
+
 
 .primary {
   composes: primary from '../styles/buttons.module.css';

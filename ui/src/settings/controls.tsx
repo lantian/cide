@@ -2,10 +2,21 @@
  * The Settings screen's form vocabulary.
  *
  * Presentational only: nothing here reads the store or the IPC surface, so the whole screen
- * can be rendered from a fixture. The mock draws exactly three kinds of control — a toggle
- * row, a segmented choice and a small numeric field — and this file is all of them.
+ * can be rendered from a fixture.
+ *
+ * Since the redesign (2026-09-24) every control here is the UI kit's — `Switch`, `Segmented`,
+ * `Select`, `TextInput`, `Textarea`, `Button`, `FormRow`, `Section`, `Note` — and this file is
+ * only the settings screen's names for them plus the commit rules the kit does not decide
+ * (blur-commit, clamp-on-commit, Escape to revert). The names stay because six sections call
+ * them; the look is the kit's so that a settings row and a dialog field are the same thing.
  */
 import { useState, type ReactNode } from 'react'
+import { Button } from '@/kit/components/Button'
+import { FormRow, TextInput, Textarea } from '@/kit/components/Field'
+import { Segmented as KitSegmented, Switch } from '@/kit/components/Choice'
+import { Note as KitNote } from '@/kit/components/Feedback'
+import { Select as KitSelect } from '@/kit/components/Select'
+import { Section } from '@/kit/components/Surface'
 import styles from './controls.module.css'
 
 export interface ToggleProps {
@@ -17,26 +28,11 @@ export interface ToggleProps {
 }
 
 /**
- * The 34x19 pill with a 15px knob, `--accent` when on.
- *
- * A `button` with `role="switch"` rather than a styled checkbox: a checkbox brings its own
- * indeterminate state and a label association this layout does not use, and hiding one behind
- * a pill is how a control ends up unreachable from the keyboard.
+ * The kit's `Switch`: a yes/no that takes effect the moment it flips, which is what every
+ * setting here is. A `button` with `role="switch"`, reachable from the keyboard.
  */
 export function Toggle({ checked, onChange, label, disabled }: ToggleProps) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled === true}
-      className={checked ? `${styles.pill} ${styles.pillOn}` : styles.pill}
-      onClick={() => onChange(!checked)}
-    >
-      <span className={styles.knob} aria-hidden="true" />
-    </button>
-  )
+  return <Switch label={label} checked={checked} onChange={onChange} disabled={disabled === true} />
 }
 
 export interface RowProps {
@@ -49,13 +45,9 @@ export interface RowProps {
 /** One line of the settings form: text on the left, one control hard right. */
 export function Row({ label, hint, control }: RowProps) {
   return (
-    <div className={styles.row}>
-      <div className={styles.rowText}>
-        <div className={styles.label}>{label}</div>
-        {hint !== undefined && <div className={styles.hint}>{hint}</div>}
-      </div>
-      <div className={styles.control}>{control}</div>
-    </div>
+    <FormRow label={label} hint={hint}>
+      {control}
+    </FormRow>
   )
 }
 
@@ -92,25 +84,7 @@ export function Segmented<T extends string>({
   onChange,
   label,
 }: SegmentedProps<T>) {
-  return (
-    <div className={styles.segmented} role="radiogroup" aria-label={label}>
-      {options.map((option) => {
-        const active = option.value === value
-        return (
-          <button
-            key={option.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            className={active ? `${styles.segment} ${styles.segmentActive}` : styles.segment}
-            onClick={() => onChange(option.value)}
-          >
-            {option.label}
-          </button>
-        )
-      })}
-    </div>
-  )
+  return <KitSegmented label={label} value={value} options={options} onChange={onChange} size="sm" />
 }
 
 export interface SelectProps<T extends string> {
@@ -127,27 +101,23 @@ export interface SelectProps<T extends string> {
  * two fixed values and stays segmented; a colour scheme is `cide` plus however many the user has
  * imported, which is unbounded and could be one or twenty.
  *
- * A native `<select>` rather than a listbox built out of divs. It gets keyboard behaviour,
- * typeahead, screen-reader semantics and the platform's own popup for free — and the popup is
- * the part worth having: a custom one inside a webview cannot escape the window, so a long list
- * near the bottom of the Settings tab would scroll inside a panel instead of opening over it.
- * The arrow is drawn with `appearance: none` and a background image so the control matches the
- * rest of the form; everything else is the browser's.
+ * The kit's `Select`. It was a native `<select>`, whose popup was the platform's and whose arrow
+ * was a data-URI hard-coded to `#888`; the kit's portals its list to `<body>` — so a long list
+ * near the bottom of the Settings tab opens over the tab rather than scrolling inside it, the
+ * reason the native one was chosen — flips upward when there is no room below, and keeps the
+ * select-only combobox keys (arrows, Home/End, type-ahead).
  */
 export function Select<T extends string>({ value, options, onChange, label }: SelectProps<T>) {
   return (
-    <select
-      className={styles.select}
-      aria-label={label}
-      value={value}
-      onChange={(e) => onChange(e.target.value as T)}
-    >
-      {options.map((option) => (
-        <option key={option.value} value={option.value}>
-          {option.label}
-        </option>
-      ))}
-    </select>
+    <div className={styles.selectBox}>
+      <KitSelect
+        size="sm"
+        aria-label={label}
+        value={value}
+        options={options}
+        onChange={(next) => onChange(next as T)}
+      />
+    </div>
   )
 }
 
@@ -193,8 +163,10 @@ export function NumberField({ value, min, max, step, onChange, label }: NumberFi
   }
 
   return (
-    <input
-      className={styles.number}
+    <span className={styles.number}>
+    <TextInput
+      size="sm"
+      mono
       type="number"
       // `decimal`, not `numeric`: a phone keypad without a decimal point cannot type 12.5.
       inputMode="decimal"
@@ -213,6 +185,7 @@ export function NumberField({ value, min, max, step, onChange, label }: NumberFi
         else if (e.key === 'Escape') setDraft(null)
       }}
     />
+    </span>
   )
 }
 
@@ -223,20 +196,20 @@ export function Part({ title }: { title: string }) {
 }
 
 export function Group({ title, children }: { title?: string | undefined; children: ReactNode }) {
+  if (title === undefined) return <section className={styles.group}>{children}</section>
   return (
-    <section className={styles.group}>
-      {title !== undefined && <h3 className={styles.groupTitle}>{title}</h3>}
-      {children}
-    </section>
+    <div className={styles.group}>
+      <Section caption={title}>{children}</Section>
+    </div>
   )
 }
 
 /**
  * A block of prose that explains something the controls cannot.
  *
- * `tone="warn"` recolours the left rule only. A whole yellow panel would out-shout the
- * section it sits in, and the one warning this screen carries — an unverified `claude` — is a
- * thing to notice on the way past rather than an error to stop at.
+ * The kit's `Note`: the tone is its left bar and its mark, the words stay `--text`, so the one
+ * warning this screen carries — an unverified `claude` — is a thing to notice on the way past
+ * rather than an error to stop at.
  */
 export function Note({
   title,
@@ -248,10 +221,9 @@ export function Note({
   children: ReactNode
 }) {
   return (
-    <div className={tone === 'warn' ? `${styles.note} ${styles.noteWarn}` : styles.note}>
-      {title !== undefined && <div className={styles.noteTitle}>{title}</div>}
+    <KitNote tone={tone} title={title}>
       {children}
-    </div>
+    </KitNote>
   )
 }
 
@@ -287,21 +259,14 @@ export interface ActionButtonProps {
 /**
  * A small secondary button, for a row whose control is an action rather than a value.
  *
- * The mock has no button in Settings because the mock has no action rows; "open the log
- * directory" is the first. Drawn as a quieter sibling of `Segmented` — same height, same
- * border, same radius — so it reads as part of the same form rather than as something
- * borrowed from elsewhere in the app.
+ * The kit's secondary `Button` at the row size, so an action row and a value row share one
+ * control height.
  */
 export function ActionButton({ label, onClick, disabled }: ActionButtonProps) {
   return (
-    <button
-      type="button"
-      className={styles.action}
-      disabled={disabled === true}
-      onClick={onClick}
-    >
+    <Button size="sm" disabled={disabled === true} onClick={onClick}>
       {label}
-    </button>
+    </Button>
   )
 }
 
@@ -358,8 +323,7 @@ export function TextArea({
   return (
     <label className={styles.field}>
       <span className={styles.fieldLabel}>{label}</span>
-      <textarea
-        className={styles.fieldArea}
+      <Textarea
         spellCheck={false}
         autoCapitalize="off"
         autoCorrect="off"
@@ -419,8 +383,10 @@ export function TextField({
   return (
     <label className={styles.field}>
       <span className={styles.fieldLabel}>{label}</span>
-      <input
-        className={styles.fieldInput}
+      {/* An id, a URL, a package name and a credential are all machine strings: mono, like
+          every path and counter in this app. */}
+      <TextInput
+        mono
         type="text"
         spellCheck={false}
         autoCapitalize="off"

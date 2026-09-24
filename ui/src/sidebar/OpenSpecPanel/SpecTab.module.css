@@ -153,24 +153,15 @@
 }
 
 .button {
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  padding: var(--sp-1) var(--sp-4);
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--panel-2);
-  color: var(--text);
-  cursor: pointer;
-  transition: background-color var(--dur-1) ease;
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
-.button:hover {
-  background: var(--panel);
-}
+
 
 .primary {
-  composes: primary from '../../styles/buttons.module.css';
+  composes: button sm primary from '../../kit/components/Button.module.css';
 }
+
 
 .hint,
 .empty,
@@ -286,7 +277,7 @@
   display: flex;
   align-items: flex-start;
   gap: var(--sp-2);
-  padding: 2px 0;
+  padding: var(--sp-1) 0;
   font-size: var(--fs-ui-12);
 }
 
@@ -354,7 +345,7 @@
 }
 
 .scenarioTitle {
-  margin: 0 0 2px;
+  margin: 0 0 var(--sp-1);
   font-size: var(--fs-ui-11);
   font-weight: 600;
   color: var(--dim);
@@ -436,14 +427,10 @@
 }
 
 .findClose {
+  composes: icon sm from '../../kit/components/Button.module.css';
   flex: 0 0 auto;
-  font: inherit;
-  background: none;
-  border: 0;
-  padding: 0;
-  color: var(--dim);
-  cursor: pointer;
 }
+
 
 /*
  * A hit, and the current hit.

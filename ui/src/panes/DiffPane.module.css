@@ -32,7 +32,7 @@
   flex: none;
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   height: var(--h-panetitle);
   /*
    * The right pad is the pane frame's floating control cluster, not decoration.
@@ -78,7 +78,7 @@
 .headerNote {
   flex: none;
   margin-left: auto;
-  padding-left: 8px;
+  padding-left: var(--sp-4);
   color: var(--faint);
 }
 
@@ -86,9 +86,9 @@
 .layout {
   flex: none;
   display: flex;
-  gap: 2px;
+  gap: var(--sp-1);
   margin-left: auto;
-  padding-left: 8px;
+  padding-left: var(--sp-4);
   align-self: center;
 }
 
@@ -109,7 +109,7 @@
 }
 
 .mode:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 
@@ -118,10 +118,13 @@
   cursor: default;
 }
 
+/* The kit's "on (segmented)": raised onto `--panel`, `--shadow-1`, `--text-hi` 500. */
 .modeOn {
   border-color: var(--border);
-  background: var(--panel-2);
+  background: var(--panel);
+  box-shadow: var(--shadow-1);
   color: var(--text-hi);
+  font-weight: 500;
 }
 
 .body {
@@ -139,53 +142,30 @@
   display: flex;
   justify-content: flex-end;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
   border-top: 1px solid var(--border);
   background: var(--chrome);
 }
 
 .button {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  line-height: 1;
-  padding: 6px 10px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
-  color: var(--text);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
-.button:hover {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
 
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
+
+
+
+
 
 .accept {
   composes: primary from '../styles/buttons.module.css';
 }
 
+/* Reject is an ordinary answer — it declines Claude's proposal and destroys nothing — so it is
+   the kit's secondary beside the primary Accept, not red. */
 .reject {
-  color: var(--red);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.reject:hover {
-  border-color: var(--red);
-  color: var(--red);
+  font-weight: 400;
 }
 
 /*
@@ -198,8 +178,8 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 16px;
+  gap: var(--sp-3);
+  padding: var(--sp-6);
   text-align: center;
 }
 
@@ -384,30 +364,16 @@
  */
 .body :global(.cm-editor .cm-chunkButtons) {
   display: flex;
-  gap: 4px;
+  gap: var(--sp-2);
 }
 
 .chunkButton {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  line-height: 1;
-  padding: 3px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome);
-  color: var(--dim);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
-.chunkButton:hover {
-  border-color: var(--accent-dim);
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
+
+
+
 
 /* The per-chunk revert column between the two editors. */
 .body :global(.cm-mergeView .cm-merge-revert) {

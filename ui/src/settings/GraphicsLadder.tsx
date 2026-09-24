@@ -21,6 +21,7 @@
  *   do not apply the default either". Overriding one rung therefore makes the stored settings
  *   the whole ladder, and the banner says so.
  */
+import { Badge } from '@/kit/components/Status'
 import { useCallback, useEffect, useState } from 'react'
 import {
   settings as settingsApi,
@@ -106,7 +107,13 @@ export function GraphicsLadder({ graphics, onChange }: GraphicsLadderProps) {
                 {rung.active ? ' — set in this process' : ' — not set in this process'}
               </div>
               <div className={styles.rungCost}>{rung.cost}</div>
-              {restart && <span className={styles.restart}>takes effect on the next launch</span>}
+              {restart && (
+                <span className={styles.restart}>
+                  <Badge tone="yellow" soft>
+                    takes effect on the next launch
+                  </Badge>
+                </span>
+              )}
             </div>
             <Segmented
               label={rung.label}

@@ -12,7 +12,7 @@
 .modeRow {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 4px 0 11px;
   border-bottom: 1px solid var(--border-soft);
 }
@@ -41,40 +41,21 @@
 
 .fieldLabel {
   display: block;
-  font-size: var(--fs-ui-13);
-  color: var(--text);
-  margin-bottom: 6px;
-}
-
-.input {
-  display: block;
-  width: 100%;
-  height: calc(26px * var(--ui-scale));
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  /* A URL is a machine string: mono, like every path and counter in this app. */
-  font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: var(--sp-3);
 }
 
-.input::placeholder {
-  color: var(--faint);
-}
 
-.input:focus {
-  outline: 0;
-  border-color: var(--accent);
-}
+
 
 .fieldHint {
   display: block;
-  font-size: var(--fs-ui-12);
+  font-size: var(--fs-ui-11);
   line-height: 1.45;
   color: var(--dim);
-  margin-top: 5px;
+  margin-top: var(--sp-3);
 }
 
 /* --- the environment readout --- */
@@ -83,8 +64,8 @@
   margin: 0;
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel);
-  padding: 8px 10px;
+  background: var(--panel-2);
+  padding: var(--sp-4) var(--sp-5);
   /* A long proxy URL must scroll inside the box rather than widening the settings pane. */
   overflow-x: auto;
 }
@@ -124,7 +105,7 @@
 
 .readoutEmpty,
 .readoutFoot {
-  margin: 8px 0 0;
+  margin: var(--sp-4) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
@@ -153,7 +134,7 @@
 }
 
 .targetName {
-  margin: 0 0 6px;
+  margin: 0 0 var(--sp-3);
   font-size: var(--fs-ui-12);
   font-weight: 600;
   color: var(--text);

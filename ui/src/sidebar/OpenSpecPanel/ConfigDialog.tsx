@@ -46,12 +46,12 @@
  * positive statement that the directory is not there, switches to the wizard; `unusable` and
  * `unknown` fall through to the form.
  */
+import { IconButton } from '@/kit/components/Button'
 import { useCallback, useEffect, useState } from 'react'
 import type { ProjectId, SpecBoard, SpecConfig, SpecSchema } from '@/ipc/client'
 import { file, spec, specConfig } from '@/ipc/client'
 import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
-import { Icon, asIcon } from '@/icons/Icon'
 import { ConfigForm, ConfigWizard, type SaveStatus } from './ConfigForm'
 import { reloadConsoleAfterSetUp } from './consoleReload'
 import { draftFrom, editsFor, isDirty, type ConfigDraft } from './configModel'
@@ -98,16 +98,13 @@ export function ConfigDialog({
       <div className={styles.dialog} data-audit="specConfigDialog" onKeyDown={onKeyDown}>
         <div className={styles.dialogHead}>
           <span className={styles.dialogTitle}>OpenSpec — this project</span>
-          <button
-            type="button"
-            className={styles.dialogClose}
+          <IconButton
+            icon="x"
+            label="Close (Escape)"
             data-audit="specConfigClose"
-            title="Close (Escape)"
             autoFocus
             onClick={onClose}
-          >
-            <Icon name={asIcon('x')} size={1} label="Close" />
-          </button>
+          />
         </div>
         {/*
           * Keyed on the project, so switching projects rebuilds the whole screen rather than

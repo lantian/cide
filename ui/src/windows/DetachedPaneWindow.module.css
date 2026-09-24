@@ -24,7 +24,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 8px 0 12px;
+  padding: 0 var(--sp-4) 0 var(--sp-5);
   background: var(--chrome);
   border-bottom: 1px solid var(--border);
 }
@@ -48,34 +48,16 @@
 }
 
 .redock {
+  composes: button sm secondary from '../kit/components/Button.module.css';
   flex: none;
-  height: calc(22px * var(--ui-scale));
-  padding: 0 10px;
-  border-radius: var(--r-1);
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.redock:hover {
-  background: var(--chrome-hi);
-  border-color: var(--accent);
-  color: var(--text);
-}
+
+
+
 
 /* There is no other chrome in this window, so the sole control has to show its focus. Drawn
    inside the box because the header clips nothing but has no room for an outset ring. */
-.redock:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
 
 /*
  * One stretched grid cell, the same shape `SplitTree`'s leaf wrapper uses, so the pane fills

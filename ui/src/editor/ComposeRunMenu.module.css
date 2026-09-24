@@ -39,5 +39,5 @@
 
 .row:hover,
 .row:focus-visible {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }

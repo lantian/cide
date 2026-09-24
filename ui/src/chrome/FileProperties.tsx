@@ -28,8 +28,13 @@
  * tab it opens is itself a description, and because the card has already resolved the repository
  * and the repo-relative path that command would otherwise have to look up again.
  */
-import { useEffect, useRef, useState } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Note, Spinner } from '@/kit/components/Feedback'
+import { Dialog } from '@/kit/components/Overlay'
+import { Badge } from '@/kit/components/Status'
+import { Section, Summary } from '@/kit/components/Surface'
 import { file as fileApi, history as historyApi } from '@/ipc/client'
 import type { DirSummary, FileProperties as FilePropertiesDto, FilePropertiesGit } from '@/ipc/generated'
 import { errorText } from '@/ipc/errorText'
@@ -198,71 +203,84 @@ export function FileProperties({
   const footnote = moreLine(gitLike, shown.length)
   const now = Date.now()
 
-  return (
-    <OverlayCard label={label} onDismiss={close}>
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="fileProperties">
-        <Head
-          props={props}
-          path={path}
-          roots={roots}
-          failure={failure}
-        />
+  const name = props?.name ?? path.slice(path.lastIndexOf('/') + 1)
+  const kind = props === null ? null : kindLabel(props as PropertiesLike)
+  const language = props?.kind === 'file' ? typeLabel(path) : null
+  const kindText = language ?? kind
 
+  return (
+    <Modal onDismiss={close}>
+      <Dialog
+        title={props === null ? name : label}
+        titleAside={
+          kindText !== null && (
+            <Badge tone="neutral" soft squared>
+              {kindText}
+            </Badge>
+          )
+        }
+        head={<PathLine path={path} roots={roots} failure={failure} />}
+        onKeyDown={onKeyDown}
+        data-audit="fileProperties"
+        actions={
+          <Button
+            ref={closeButton}
+            variant="primary"
+            onClick={close}
+            data-audit="filePropertiesClose"
+          >
+            Close
+          </Button>
+        }
+      >
         <div className={styles.body}>
           {failure !== null && (
-            <p className={styles.failure} data-audit="filePropertiesFailure">
-              {failure}
-            </p>
+            <span data-audit="filePropertiesFailure">
+              <Note tone="bad">{failure}</Note>
+            </span>
           )}
 
           {props !== null && (
             <>
-              <Section>
-                <Row
-                  label="Size"
-                  value={
-                    props.kind === 'dir'
-                      ? dirSizeLine(dir)
-                      : formatSize(props.len)
-                  }
-                  pending={props.kind === 'dir' && dir === null ? 'Measuring…' : null}
-                  note={sizeNote(hasDirtyBuffer(path))}
-                />
-
-                {props.kind === 'dir' && (
-                  <Row
-                    label="Entries"
-                    value={entriesLine(dir)}
-                    pending={dir === null ? 'Counting…' : null}
-                  />
-                )}
-
-                {props.kind !== 'dir' && (
-                  <Row label="Lines" value={textLine(props as PropertiesLike)} />
-                )}
-
-                {props.symlinkTarget !== undefined && (
-                  <Row label="Target" value={props.symlinkTarget} mono />
-                )}
-              </Section>
-
-              <Section>
-                <Row label="Modified" value={formatTime(props.modifiedUnixMs)} />
-                <Row label="Changed" value={formatTime(props.changedUnixMs)} />
-                {props.createdUnixMs !== undefined && (
-                  <Row label="Created" value={formatTime(props.createdUnixMs)} />
-                )}
-              </Section>
-
-              <Section>
-                {props.modeString !== undefined && (
-                  <Row label="Permissions" value={props.modeString} mono />
-                )}
-                <Row label="Owner" value={formatOwner(props.owner)} />
-                {props.readonly && (
-                  <Row label="Writable" value="No — the mode bits carry no write permission" />
-                )}
-              </Section>
+              <Summary
+                rows={compact([
+                  row(
+                    'Size',
+                    props.kind === 'dir' && dir === null
+                      ? 'Measuring…'
+                      : props.kind === 'dir'
+                        ? dirSizeLine(dir)
+                        : formatSize(props.len),
+                    sizeNote(hasDirtyBuffer(path)),
+                  ),
+                  props.kind === 'dir'
+                    ? row('Entries', dir === null ? 'Counting…' : entriesLine(dir))
+                    : row('Lines', textLine(props as PropertiesLike)),
+                  props.symlinkTarget !== undefined
+                    ? row('Target', props.symlinkTarget, null, true)
+                    : null,
+                ])}
+              />
+              <Summary
+                rows={compact([
+                  row('Modified', formatTime(props.modifiedUnixMs)),
+                  row('Changed', formatTime(props.changedUnixMs)),
+                  props.createdUnixMs !== undefined
+                    ? row('Created', formatTime(props.createdUnixMs))
+                    : null,
+                ])}
+              />
+              <Summary
+                rows={compact([
+                  props.modeString !== undefined
+                    ? row('Permissions', props.modeString, null, true)
+                    : null,
+                  row('Owner', formatOwner(props.owner)),
+                  props.readonly
+                    ? row('Writable', 'No — the mode bits carry no write permission')
+                    : null,
+                ])}
+              />
             </>
           )}
 
@@ -271,175 +289,126 @@ export function FileProperties({
             * would be a heading making claims about a file git has never heard of.
             */}
           {gitAsked && gitLike !== null && (
-            <section className={styles.git} data-audit="filePropertiesGit">
-              <h3 className={styles.sectionTitle}>Git</h3>
-              <Row
-                label="Status"
-                value={statusLabel(statusAt(status.statuses, path), status.truncated)}
-              />
-              <Row label="Tracked" value={trackedSince(gitLike)} />
-
-              {shown.length > 0 && (
-                <>
-                  <div className={styles.recentHead}>
-                    <span className={styles.recentLabel}>Recent</span>
-                    {onOpenHistory !== undefined && (
-                      <button
-                        type="button"
-                        className={styles.link}
-                        data-audit="filePropertiesHistory"
-                        onClick={() => {
-                          onOpenHistory(gitLike.repo, gitLike.relPath)
-                          close()
-                        }}
-                      >
-                        Open full history
-                      </button>
-                    )}
-                  </div>
-                  <ul className={styles.commits}>
-                    {shown.map((row) => (
-                      <li key={row.oid} className={styles.commit} title={row.summary}>
-                        <span className={styles.oid}>{row.shortOid}</span>
-                        <span className={styles.commitWhen}>{when(row.authored, now)}</span>
-                        <span className={styles.commitAuthor}>{row.author}</span>
-                        <span className={styles.commitSummary}>{row.summary}</span>
+            <div data-audit="filePropertiesGit">
+              <Section
+                caption="Git"
+                aside={
+                  shown.length > 0 &&
+                  onOpenHistory !== undefined && (
+                    <Button
+                      variant="link"
+                      size="sm"
+                      data-audit="filePropertiesHistory"
+                      onClick={() => {
+                        onOpenHistory(gitLike.repo, gitLike.relPath)
+                        close()
+                      }}
+                    >
+                      Open full history
+                    </Button>
+                  )
+                }
+              >
+                <Summary
+                  rows={compact([
+                    row(
+                      'Status',
+                      statusLabel(statusAt(status.statuses, path), status.truncated),
+                    ),
+                    row('Tracked', trackedSince(gitLike)),
+                  ])}
+                />
+                {shown.length > 0 && (
+                  <ul className={styles.commits} aria-label="Recent commits">
+                    {shown.map((c) => (
+                      <li key={c.oid} className={styles.commit} title={c.summary}>
+                        <span className={styles.oid}>{c.shortOid}</span>
+                        <span className={styles.commitWhen}>{when(c.authored, now)}</span>
+                        <span className={styles.commitAuthor}>{c.author}</span>
+                        <span className={styles.commitSummary}>{c.summary}</span>
                       </li>
                     ))}
                   </ul>
-                  {footnote !== null && <p className={styles.more}>{footnote}</p>}
-                </>
-              )}
-            </section>
+                )}
+                {footnote !== null && <p className={styles.more}>{footnote}</p>}
+              </Section>
+            </div>
           )}
 
           {!gitAsked && props !== null && (
-            <p className={styles.waiting} data-audit="filePropertiesGitPending">
-              Reading history…
-            </p>
+            <span className={styles.waiting} data-audit="filePropertiesGitPending">
+              <Spinner label="Reading history…" />
+            </span>
           )}
         </div>
-
-        <div className={styles.footer}>
-          <button
-            ref={closeButton}
-            type="button"
-            className={styles.close}
-            onClick={close}
-            data-audit="filePropertiesClose"
-          >
-            Close
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }
 
-/** The name, the kind and the path, with a copy button for the path. */
-function Head({
-  props,
+/** One key → value line; `null` when there is nothing to say, which `compact` drops. */
+function row(
+  label: string,
+  value: string | null,
+  note: string | null = null,
+  mono = false,
+): { label: string; value: ReactNode } | null {
+  if (value === null) return null
+  return {
+    label,
+    value: (
+      <span className={mono ? styles.mono : undefined}>
+        {value}
+        {note !== null && <span className={styles.note}>{note}</span>}
+      </span>
+    ),
+  }
+}
+
+function compact<T>(rows: ReadonlyArray<T | null>): T[] {
+  return rows.filter((r): r is T => r !== null)
+}
+
+/**
+ * The path under the title, and the one act on it. Shown relative to a project root when it
+ * is under one — the full path is on hover and is what Copy copies, whatever is shown.
+ */
+function PathLine({
   path,
   roots,
   failure,
 }: {
-  props: FilePropertiesDto | null
   path: string
   roots: readonly string[]
   failure: string | null
 }) {
   const [copied, setCopied] = useState(false)
   const shown = displayPath(path, roots)
-
-  // The heading is available before the stat answers, because the path is what the gesture
-  // carried. A card that showed nothing at all for its first frame reads as a card that failed.
-  const name = props?.name ?? path.slice(path.lastIndexOf('/') + 1)
-  const kind = props === null ? null : kindLabel(props as PropertiesLike)
-  const language = props?.kind === 'file' ? typeLabel(path) : null
-
   return (
-    <div className={styles.head}>
-      <div className={styles.titleRow}>
-        <h2 className={styles.title} data-audit="filePropertiesTitle">
-          {name}
-        </h2>
-        {(language ?? kind) !== null && (
-          <span className={styles.kind}>{language ?? kind}</span>
-        )}
-      </div>
-      <div className={styles.pathRow}>
-        <span className={styles.path} title={path}>
-          {failure === null ? shown : path}
-        </span>
-        <button
-          type="button"
-          className={styles.copy}
-          data-audit="filePropertiesCopy"
-          onClick={() => {
-            // The absolute path, never the displayed relative one: a path copied out of this
-            // dialog is pasted into a terminal or another tool, where a project-relative one
-            // resolves against the wrong directory or not at all.
-            void navigator.clipboard.writeText(path).then(
-              () => setCopied(true),
-              () => setCopied(false),
-            )
-          }}
-        >
-          {copied ? 'Copied' : 'Copy path'}
-        </button>
-      </div>
+    <div className={styles.pathRow}>
+      <span className={styles.path} title={path}>
+        {failure === null ? shown : path}
+      </span>
+      <Button
+        variant="link"
+        size="sm"
+        data-audit="filePropertiesCopy"
+        onClick={() => {
+          void navigator.clipboard.writeText(path).then(
+            () => setCopied(true),
+            () => setCopied(false),
+          )
+        }}
+      >
+        {copied ? 'Copied' : 'Copy path'}
+      </Button>
     </div>
   )
 }
 
-/**
- * What the chip beside the name says for a file: the image format, else the language.
- *
- * `imageKindFor` decides by **name**, which is the same rule `PaneBody` uses to pick a viewer, so
- * the chip and the pane agree about what a `.png` is. The *bytes* may disagree — `cide_core`
- * sniffs them for the image pane — and that disagreement is the image pane's to report, not a
- * properties card's.
- */
 function typeLabel(path: string): string {
   const image = imageKindFor(path)
   return image === null ? languageName(path) : imageLabel(image)
 }
 
 /** A group of rows with a rule under it. */
-function Section({ children }: { children: React.ReactNode }) {
-  return <section className={styles.section}>{children}</section>
-}
-
-/**
- * One `label: value` line.
- *
- * Renders **nothing** when the value is `null` and there is no pending sentence — that is how an
- * inapplicable fact (a `Created` row on a filesystem with no birth time) disappears rather than
- * showing a label with a blank beside it. A fact that is merely *unknown* never reaches here as
- * `null`: `filePropertiesModel.ts` turns those into `Not recorded`, which is a sentence.
- */
-function Row({
-  label,
-  value,
-  pending = null,
-  note = null,
-  mono = false,
-}: {
-  label: string
-  value: string | null
-  pending?: string | null
-  note?: string | null
-  mono?: boolean
-}) {
-  const shown = pending ?? value
-  if (shown === null) return null
-  return (
-    <div className={styles.row} data-audit="filePropertiesRow">
-      <span className={styles.rowLabel}>{label}</span>
-      <span className={`${styles.rowValue} ${mono ? styles.mono : ''}`}>
-        {shown}
-        {note !== null && <span className={styles.note}>{note}</span>}
-      </span>
-    </div>
-  )
-}

@@ -15,7 +15,10 @@
  * the card rather than on `document`, which would also answer for that terminal.
  */
 import { useLayoutEffect, useRef } from 'react'
-import { OverlayCard } from './ModalShell'
+import { Modal } from './ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Dialog } from '@/kit/components/Overlay'
+import { Summary } from '@/kit/components/Surface'
 import { useWorkspace } from '@/store/workspace'
 import styles from './AboutCard.module.css'
 
@@ -36,31 +39,41 @@ export function AboutCard({ onDismiss }: { onDismiss: () => void }) {
   }
 
   return (
-    <OverlayCard label="About cide" onDismiss={onDismiss}>
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="about">
-        <div className={styles.head}>
-          <h2 className={styles.name}>cide</h2>
-          <p className={styles.version} data-audit="aboutVersion">
-            {/* `null` only before bootstrap resolves, and the host is mounted with `boot`, so
-                in practice the version is always there; the bare name is the honest fallback. */}
-            {version === null ? 'cide' : `cide ${version}`}
-          </p>
-          <p className={styles.claude} data-audit="aboutClaude">
-            {claude === null ? 'claude is not on PATH' : `claude ${claude}`}
-          </p>
-        </div>
-        <div className={styles.footer}>
-          <button
-            ref={close}
-            type="button"
-            className={styles.button}
-            onClick={onDismiss}
-            data-audit="aboutClose"
-          >
+    <Modal onDismiss={onDismiss}>
+      <Dialog
+        title="cide"
+        width="narrow"
+        onKeyDown={onKeyDown}
+        data-audit="about"
+        actions={
+          <Button ref={close} variant="primary" onClick={onDismiss} data-audit="aboutClose">
             Close
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+          </Button>
+        }
+      >
+        <Summary
+          rows={[
+            {
+              label: 'Version',
+              // `null` only before bootstrap resolves, and the host is mounted with `boot`, so
+              // in practice the version is always there; the bare name is the honest fallback.
+              value: (
+                <span className={styles.mono} data-audit="aboutVersion">
+                  {version === null ? 'cide' : `cide ${version}`}
+                </span>
+              ),
+            },
+            {
+              label: 'Claude Code',
+              value: (
+                <span className={styles.mono} data-audit="aboutClaude">
+                  {claude === null ? 'claude is not on PATH' : `claude ${claude}`}
+                </span>
+              ),
+            },
+          ]}
+        />
+      </Dialog>
+    </Modal>
   )
 }

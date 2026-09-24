@@ -1,54 +1,12 @@
 /*
- * The pool-state card's body. (M90) The scrim and the card come from `OverlayCard`
- * (`overlays/Overlay.module.css`); this file styles only what sits inside, for `AboutCard`'s
- * reason. Every colour is a token and every size a `--fs-ui-*` rung, for `check:ui-scale`'s.
+ * The model pools card. The frame, the section captions, the status badges and the buttons are
+ * the UI kit's; this stylesheet lays out an entry row (index, model, load, status, answers) and
+ * the plain lines under the sections, which the kit has no part for.
  */
-
-/* The Escape wrapper re-declares the column, for `AboutCard.module.css`'s reason. */
-.dialog {
-  flex: 1;
-  min-height: 0;
+.body {
   display: flex;
   flex-direction: column;
-}
-
-.head {
-  flex: none;
-  padding: 16px 18px 10px;
-  border-bottom: 1px solid var(--border);
-}
-
-.title {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-16);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-.lede {
-  margin: 0;
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-  line-height: 1.45;
-}
-
-/* The one part that scrolls: a machine with several pools and a long history outgrows the card. */
-.body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 6px 18px 12px;
-}
-
-.pool {
-  margin-top: 12px;
-}
-
-.poolName {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-13);
-  font-weight: 600;
-  color: var(--text-hi);
+  gap: var(--sp-6);
 }
 
 .entries,
@@ -59,20 +17,20 @@
 }
 
 .entry {
-  padding: 6px 0;
-  border-top: 1px solid var(--border);
+  padding: var(--sp-3) 0;
+  border-top: 1px solid var(--border-soft);
 }
 
 .entryHead {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   font-size: var(--fs-ui-12);
 }
 
 .index {
   flex: none;
-  width: 20px;
+  width: calc(20px * var(--ui-scale));
   color: var(--dim);
   font-family: var(--font-mono);
 }
@@ -90,39 +48,29 @@
 .load {
   flex: none;
   font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
   color: var(--dim);
 }
 
+/* A benched entry's badge carries a sentence; it gives way before the model name does. */
 .status {
-  flex: none;
+  flex: 0 1 auto;
   max-width: 45%;
+  min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ok {
-  color: var(--green);
-}
-
-.warn {
-  color: var(--yellow);
-}
-
-.bad {
-  color: var(--red);
+  display: inline-flex;
 }
 
 .actions {
   flex: none;
-  display: flex;
-  gap: 6px;
+  display: inline-flex;
+  gap: var(--sp-2);
 }
 
 .runs,
 .testOk,
 .testBad {
-  margin: 3px 0 0 28px;
+  margin: var(--sp-1) 0 0 calc(28px * var(--ui-scale));
   font-size: var(--fs-ui-11);
   color: var(--dim);
 }
@@ -136,14 +84,14 @@
 }
 
 .line {
-  padding: 3px 0;
+  padding: var(--sp-1) 0;
   font-size: var(--fs-ui-12);
   color: var(--text);
   line-height: 1.4;
 }
 
 .time {
-  margin-right: 8px;
+  margin-right: var(--sp-4);
   font-family: var(--font-mono);
   color: var(--dim);
 }
@@ -153,60 +101,10 @@
 }
 
 .dim {
+  margin: 0;
   color: var(--dim);
-}
-
-.footer {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 18px;
-  border-top: 1px solid var(--border);
 }
 
 .problem {
-  flex: 1;
-  font-size: var(--fs-ui-12);
   color: var(--red);
-}
-
-/* `AboutCard`'s primary button, for its reason: dialogs on one ground share a button. */
-.button {
-  composes: primary from '../styles/buttons.module.css';
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid transparent;
-  cursor: default;
-}
-
-.secondary {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  line-height: 1;
-  padding: 5px 10px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text);
-  cursor: default;
-  transition: border-color var(--dur-1) var(--ease-out);
-}
-
-.secondary:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.secondary:disabled {
-  color: var(--dim);
-}
-
-.button:focus-visible,
-.secondary:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
 }

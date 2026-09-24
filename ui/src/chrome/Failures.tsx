@@ -54,7 +54,8 @@ import {
 } from './notices'
 import { useWorkspace } from '@/store/workspace'
 import { activeProjectIdOf } from '@/keys/target'
-import { Icon } from '@/icons/Icon'
+import { Icon, type IconName } from '@/icons/Icon'
+import { Button, IconButton } from '@/kit/components/Button'
 
 import styles from './Failures.module.css'
 
@@ -104,6 +105,13 @@ export function Failures(): React.ReactNode {
   )
 }
 
+/** The kit's outcome marks, by notice kind. An unknown kind falls back to `info`. */
+const KIND_ICON: Partial<Record<string, IconName>> = {
+  ok: 'circle-check',
+  warn: 'triangle-alert',
+  error: 'circle-alert',
+}
+
 function Toast({ notice }: { notice: Notice }) {
   /*
    * Everything but `ok` interrupts. The full argument is at `NoticeKind` in `notices.ts`; the
@@ -136,6 +144,11 @@ function Toast({ notice }: { notice: Notice }) {
       aria-live={loud ? 'assertive' : 'polite'}
       data-audit="noticeToast"
     >
+      {/* The kit `Toast`'s tone mark: the edge says the kind at a glance, the mark says it to
+          anyone who does not read colour. */}
+      <span className={styles.mark} aria-hidden="true">
+        <Icon name={KIND_ICON[notice.kind] ?? 'info'} size={2} />
+      </span>
       <div className={styles.body}>
         <p className={styles.text}>{notice.text}</p>
         {notice.hint !== undefined && <p className={styles.hint}>{notice.hint}</p>}
@@ -151,10 +164,9 @@ function Toast({ notice }: { notice: Notice }) {
            */
           <div className={styles.actions}>
             {notice.actions.map((action) => (
-              <button
+              <Button
                 key={action.label}
-                type="button"
-                className={styles.action}
+                size="sm"
                 data-audit="noticeAction"
                 onClick={() => {
                   action.run()
@@ -162,7 +174,7 @@ function Toast({ notice }: { notice: Notice }) {
                 }}
               >
                 {action.label}
-              </button>
+              </Button>
             ))}
           </div>
         )}
@@ -186,15 +198,7 @@ function Toast({ notice }: { notice: Notice }) {
           </details>
         )}
       </div>
-      <button
-        type="button"
-        className={styles.dismiss}
-        title="Dismiss"
-        aria-label="Dismiss"
-        onClick={() => dismiss(notice.id)}
-      >
-        <Icon name="x" size={1} />
-      </button>
+      <IconButton icon="x" label="Dismiss" onClick={() => dismiss(notice.id)} />
     </div>
   )
 }

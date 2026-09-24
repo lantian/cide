@@ -211,7 +211,8 @@ try {
   const storeTs = read('../src/sidebar/agentsStore.ts')
   const storeCode = stripComments(storeTs)
   const modalShellTsx = read('../src/overlays/ModalShell.tsx')
-  const overlayCss = read('../src/overlays/Overlay.module.css')
+  // The scrim is the kit's `Scrim` since the redesign; `OverlayCard` and `Modal` both draw it.
+  const overlayCss = read('../src/kit/components/Overlay.module.css')
 
   /* ------------------------------------------------------- every field a refusal can name */
 

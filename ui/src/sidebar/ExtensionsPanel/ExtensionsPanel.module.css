@@ -66,27 +66,15 @@
    * window, and a 4px step down the sidebar seam is what happens when they drift.
    */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-3);
-  padding: 0 var(--sp-3) 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerTitle {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  composes: panelTitle from '../../kit/components/Surface.module.css';
 }
 
 /*
@@ -97,47 +85,13 @@
  * the face.
  */
 .headerAction {
-  appearance: none;
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: calc(20px * var(--ui-scale));
-  height: calc(20px * var(--ui-scale));
-  border: none;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  text-transform: none;
-  letter-spacing: 0;
-  cursor: pointer;
-  /* `padding: 0`: `appearance: none` does not reset WebKit's default button padding, and with
-     `box-sizing: border-box` an unreset `1px 6px` shrinks the content box until the mark
-     overflows to one side of its own hover background. `check:ui-icons` asserts every
-     mark-in-a-fixed-box states this; `DockerPanel.module.css`'s `.headerAction` has the full note. */
-  padding: 0;
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
-.headerAction:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
-
-.headerAction:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.headerAction:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
+/* The kit's icon toggle "on": the accent on a 12% wash. */
 .headerActionOn {
-  background: var(--chrome-hi);
   color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 /* --- the connect field, revealed by the header's `+` --------------------------------------- */
@@ -179,13 +133,18 @@
 .input {
   flex: 1 1 auto;
   min-width: 0;
-  background: var(--panel-2);
-  color: var(--text);
+  height: calc(24px * var(--ui-scale));
+  /* The kit field: `--bg` inside, `--text-hi` typed, the accent border and halo on focus. */
+  background: var(--bg);
+  color: var(--text-hi);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  padding: 3px 7px;
+  padding: 0 var(--sp-4);
   font: inherit;
   font-size: var(--fs-ui-12);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .searchInput {
@@ -196,10 +155,10 @@
   color: var(--faint);
 }
 
-.input:focus-visible {
+.input:focus {
   outline: none;
-  box-shadow: var(--focus-inset);
-  background: var(--panel);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /*
@@ -229,14 +188,14 @@
   flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   border: 1px solid transparent;
-  background: var(--chrome);
+  background: transparent;
   color: var(--dim);
   font: inherit;
   font-size: var(--fs-ui-11);
-  padding: 2px 7px;
-  border-radius: var(--r-4);
+  padding: var(--sp-1) var(--sp-4);
+  border-radius: var(--r-2);
   cursor: pointer;
   white-space: nowrap;
   transition:
@@ -246,7 +205,7 @@
 }
 
 .chip:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 
@@ -255,10 +214,14 @@
   outline-offset: 2px;
 }
 
+/* The kit's "on (segmented)": raised onto `--panel`, a border, `--shadow-1`, `--text-hi` 500 —
+   a filter that is on is a choice, not the primary act, so it never takes the accent fill. */
 .chipOn {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
+  background: var(--panel);
+  border-color: var(--border);
+  box-shadow: var(--shadow-1);
+  color: var(--text-hi);
+  font-weight: 500;
   transition:
     background-color var(--dur-1) var(--ease-out),
     border-color var(--dur-1) var(--ease-out),
@@ -266,8 +229,8 @@
 }
 
 .chipOn:hover {
-  background: var(--accent-hi);
-  color: var(--on-accent);
+  background: var(--panel);
+  color: var(--text-hi);
 }
 
 /* Tabular, so seven counts do not jitter the chips as they change. */
@@ -278,8 +241,7 @@
 }
 
 .chipOn .chipCount {
-  color: var(--on-accent);
-  opacity: 0.75;
+  color: var(--dim);
 }
 
 /* --- the body --------------------------------------------------------------------------------- */
@@ -292,7 +254,7 @@
 }
 
 .group {
-  padding-top: 2px;
+  padding-top: var(--sp-1);
 }
 
 /*
@@ -349,7 +311,7 @@
 .groupActions {
   margin-left: auto;
   display: flex;
-  gap: 2px;
+  gap: var(--sp-1);
   opacity: 0;
   transition: opacity var(--dur-1) var(--ease-out);
 }
@@ -364,7 +326,7 @@
 .row {
   display: grid;
   grid-template-columns: calc(9px * var(--ui-scale)) 1fr;
-  gap: 0 6px;
+  gap: 0 var(--sp-3);
   padding: 7px 10px 8px;
   border-bottom: 1px solid var(--border-soft);
 }
@@ -464,7 +426,7 @@
  */
 .description {
   grid-column: 2;
-  margin: 2px 0 0;
+  margin: var(--sp-1) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
@@ -490,7 +452,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 3px;
-  margin-top: 4px;
+  margin-top: var(--sp-2);
 }
 
 .perm {
@@ -512,58 +474,29 @@
   grid-column: 2;
   display: flex;
   align-items: center;
-  gap: 4px;
-  margin-top: 6px;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
 }
 
 /* --- buttons ---------------------------------------------------------------------------------- */
 
 /*
+.primary {
+  composes: button sm primary from '../../kit/components/Button.module.css';
+}
+
  * Two weights, and the difference is deliberate: the primary is the one act that changes what is
  * on the user's disk, and it is filled so that a column of rows shows at a glance which of them
  * are offering it.
  */
-.primary {
-  composes: primary from '../../styles/buttons.module.css';
-  appearance: none;
-  border: 1px solid transparent;
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  padding: 2px 9px;
-  border-radius: var(--r-2);
-  cursor: pointer;
-}
 
 .action {
-  appearance: none;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  padding: 2px 6px;
-  border-radius: var(--r-2);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
-.action:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
 
-.action:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
 
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
+
 
 /* A resting state, not a control. Never a disabled button — see `ExtensionsPanel.tsx`. */
 .installed {
@@ -602,15 +535,15 @@
  * where it stops.
  */
 .report {
-  margin-top: 8px;
+  margin-top: var(--sp-4);
   border-top: 1px solid var(--border);
-  padding-top: 2px;
+  padding-top: var(--sp-1);
 }
 
 .langRow {
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: 0 6px;
+  gap: 0 var(--sp-3);
   padding: 4px 10px;
 }
 

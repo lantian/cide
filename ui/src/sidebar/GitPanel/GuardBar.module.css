@@ -4,24 +4,30 @@
  * scrolled past. Yellow rather than red — the working tree is fine, two views of the index
  * merely disagree.
  */
+/* The kit `Banner`'s drawing — flush, the tone at 8% over the panel, its mark in the tone —
+   with the tone set here: amber for a guard (waiting on you), red for a merge in conflict. */
 .bar {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   min-height: calc(26px * var(--ui-scale));
-  padding: 4px 10px;
-  background: var(--chrome-hi);
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
+  padding: var(--sp-3) var(--sp-5);
+  --tone: var(--yellow);
+  background: color-mix(in srgb, var(--tone) 8%, var(--panel));
+  border-bottom: 1px solid var(--border-soft);
   color: var(--text);
   font-size: var(--fs-ui-12);
 }
 
+.bar:has(.glyphConflict) {
+  --tone: var(--red);
+}
+
 .glyph {
   flex: none;
-  color: var(--yellow);
-  font-size: var(--fs-ui-12);
+  display: inline-flex;
+  color: var(--tone);
 }
 
 /*
@@ -33,7 +39,7 @@
  * somebody decides something.
  */
 .glyphConflict {
-  color: var(--red);
+  color: var(--tone);
 }
 
 .text {
@@ -57,21 +63,8 @@
  * primary would be a recommendation this code is not in a position to make.
  */
 .action {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
   flex: none;
-  height: calc(20px * var(--ui-scale));
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.action:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
 }
 
 /*
@@ -86,13 +79,3 @@
  * `not(:disabled)` on the hover rule above is the other half — a control that lights up under
  * the pointer and then refuses is worse than one that never lit up.
  */
-.action:disabled {
-  color: var(--faint);
-  border-color: var(--border-soft);
-  cursor: default;
-}
-
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}

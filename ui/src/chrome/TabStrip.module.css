@@ -60,8 +60,9 @@
   white-space: nowrap;
 }
 
+/* The kit's `ChromeTab` hover: the tab lifts onto the panel ground it would take if chosen. */
 .tab:hover {
-  background: var(--chrome-hi);
+  background: var(--panel);
 }
 
 /*
@@ -301,9 +302,12 @@
  * rather than a bare digit because a lone numeral 9px from a tab's title reads as part of the
  * title.
  */
+/* The kit's `Counter` in yellow ("waiting on someone"): the amber gradient under its dark ink
+   (`--on-yellow`, 6.8–8.8:1), with the fill's lit edge. */
 .awaitingOn {
-  background: var(--yellow);
-  color: var(--panel);
+  background: var(--grad-yellow);
+  box-shadow: var(--fill-sheen);
+  color: var(--on-yellow);
   font-weight: 600;
 }
 
@@ -321,26 +325,9 @@
  * padding: the button now has a width of its own to account for.
  */
 .close {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
+  composes: tabClose from '../kit/components/Chrome.module.css';
   margin-right: calc(var(--sp-2) - var(--tab-pad));
-  padding: 0;
-  border-radius: var(--r-1);
-  background: transparent;
-  border: 0;
-  color: var(--faint);
   font: inherit;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.close:hover {
-  color: var(--text);
 }
 
 /* The dirty marker is the close control wearing the mock's dot, not a separate indicator:
@@ -371,7 +358,7 @@
   color: var(--faint);
   border: 1px solid var(--border);
   border-radius: var(--r-1);
-  padding: 0 4px;
+  padding: 0 var(--sp-2);
   line-height: calc(13px * var(--ui-scale));
   letter-spacing: 0;
   flex: none;
@@ -475,7 +462,7 @@
 
 .overflow:hover,
 .overflow[aria-expanded='true'] {
-  background: var(--chrome-hi);
+  background: var(--panel);
   color: var(--text-hi);
 }
 

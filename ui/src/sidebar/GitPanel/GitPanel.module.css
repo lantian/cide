@@ -14,72 +14,13 @@
   overflow: hidden;
 }
 
-/* 30px, matching the explorer's header so the two sidebars swap without the content
-   below them moving by a pixel. */
-.header {
-  /* `--h-panelheader`, the same token the six explorer-side panels read: this header and
-     theirs are the same edge, and the token exists so they cannot drift. */
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-4);
-  background: var(--chrome);
-  border-bottom: 1px solid var(--border);
-}
-
-/* Commit / Shelf, as one segmented control rather than two loose buttons: they are
-   mutually exclusive, and the shared track is what says so before either is read. */
-.segmented {
-  display: flex;
-  padding: 2px;
-  gap: 2px;
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-}
-
-.segment {
-  /* 22 from 18. An 18px-tall control was the smallest thing in the app and the hardest to
-     hit; `(34 - 22 - 2*2) / 2 = 4`, so it still centres on a whole pixel in the header. */
-  height: calc(22px * var(--ui-scale));
-  padding: 0 10px;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.segment:hover {
-  color: var(--text);
-}
-
-.segmentOn,
-.segmentOn:hover {
-  background: var(--chrome-hi);
-  color: var(--accent);
-}
-
-.segment:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
-/* The branch, mono and purple — the same treatment the status bar gives it. */
 /* A flex row for the same reason as `BranchSelector`'s widget: the ellipsis belongs on the box
    holding the text, not on the one holding the mark and the text. */
 .branch {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  margin-left: auto;
+  max-width: calc(200px * var(--ui-scale));
   min-width: 0;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
@@ -101,41 +42,4 @@
   /* The speed-search readout is `position: absolute` against this box. It cannot be a child of
      the changes tree — that element is `role="tree"` and its children have to be tree items. */
   position: relative;
-}
-
-/*
- * One line, never a dialog: a git command that is missing or failed is information, and
- * the panel keeps working around it.
- */
-.note {
-  flex: none;
-  margin: 0;
-  padding: 5px 10px;
-  background: var(--panel-2);
-  border-bottom: 1px solid var(--border-soft);
-  color: var(--faint);
-  font-size: var(--fs-ui-11);
-  /* A backend error can be long; it must not widen the panel or wrap into three lines. */
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.noteWarn {
-  color: var(--yellow);
-}
-
-/*
- * The way out of a note that changes what a button does — today, the partial-selection line.
- * A link rather than a button shape because the note is one line and must stay one line; see
- * `.note`'s `white-space: nowrap`.
- */
-.noteAction {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--accent);
-  font: inherit;
-  text-decoration: underline;
-  cursor: pointer;
 }

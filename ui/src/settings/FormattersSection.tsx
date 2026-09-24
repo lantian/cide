@@ -31,6 +31,7 @@
  * lets React reuse a node for a shifted-up value, and the next blur commits the stale text back
  * — which resurrects a row the user just deleted.
  */
+import { Button, IconButton } from '@/kit/components/Button'
 import type { EditorSettings } from '@/ipc/client'
 import { BUILTIN_LANGUAGES } from '@/editor/builtinLanguages'
 import styles from './FormattersSection.module.css'
@@ -99,15 +100,11 @@ export function FormattersSection({
                 replace(at, [event.currentTarget.value, argv])
               }}
             />
-            <button
-              type="button"
-              className={styles.remove}
-              aria-label={`Remove the formatter for ${language}`}
-              title={`Remove the formatter for ${language}`}
+            <IconButton
+              icon="x"
+              label={`Remove the formatter for ${language}`}
               onClick={() => commit(entries.filter((_, index) => index !== at))}
-            >
-              ×
-            </button>
+            />
           </div>
 
           <div className={styles.tokens}>
@@ -128,23 +125,20 @@ export function FormattersSection({
                 }}
               />
             ))}
-            <button
-              type="button"
-              className={styles.add}
+            <Button
+              size="sm"
+              variant="quiet"
+              icon="plus"
               onClick={() => replace(at, [language, [...argv, '']])}
             >
               Add argument
-            </button>
+            </Button>
             {argv.length > 1 && (
-              <button
-                type="button"
-                className={styles.remove}
-                aria-label="Remove the last argument"
-                title="Remove the last argument"
+              <IconButton
+                icon="minus"
+                label="Remove the last argument"
                 onClick={() => replace(at, [language, argv.slice(0, -1)])}
-              >
-                −
-              </button>
+              />
             )}
           </div>
 
@@ -176,14 +170,17 @@ export function FormattersSection({
         ))}
       </datalist>
 
-      <button
-        type="button"
-        className={styles.add}
-        onClick={() => commit([...entries, ['', ['']]])}
-        title={PLACEHOLDER_HINT}
-      >
-        Add a formatter
-      </button>
+      <span className={styles.addRow}>
+        <Button
+          size="sm"
+          variant="quiet"
+          icon="plus"
+          onClick={() => commit([...entries, ['', ['']]])}
+          title={PLACEHOLDER_HINT}
+        >
+          Add a formatter
+        </Button>
+      </span>
     </div>
   )
 }

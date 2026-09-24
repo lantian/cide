@@ -126,7 +126,7 @@
 }
 
 .addRowButton:hover {
-  background: var(--accent-dim);
+  background: var(--panel-2);
   color: var(--text-hi);
 }
 

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cide UI kit</title>
+    <!--
+      The UI kit: the reference page for how every control in cide should look. See
+      `docs/ui-kit.md`. It is a second page of the same Vite project, served by the dev server at
+      http://localhost:1420/kit.html, and never part of the app's bundle — `vite build` only
+      builds `index.html`.
+
+      `theme-boot.js` is the app's own, so `?theme=dark` and `?ui=15` mean here exactly what they
+      mean in a cide window.
+    -->
+    <script src="/theme-boot.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/kit/main.tsx"></script>
+  </body>
+</html>

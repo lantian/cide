@@ -14520,3 +14520,99 @@ review. Nothing is written into a repository.
   - `check:gitlab-dom` asserts the dialog opens with the repository's prompt over the global one.
 - **Not confirmed on a display**: the settings block and the pre-filled dialog have not been seen
   in a running cide.
+
+## A milestone with a row in its inbox is not finished (M99)
+
+Reported from `~/work/selfcraft`: the first milestone, `slice`, showed **Accept** and the project
+never woke to plan again, while one task still sat in its inbox. Both symptoms came from one rule.
+`t-233` held the milestone, eighty subtasks under it were done, the gate passed — and `t-245`,
+*Hollowroot density decision*, was `subtaskOf` `t-233` in the **inbox**: something a run noticed
+while working on the milestone and nobody had ruled on. Two surfaces asked "is this milestone
+finished", both answered from `open_under` (todo, doing, review), and the inbox row was invisible
+to both: `MilestonesPanel::readyToAccept` drew Accept, and `spinner::gate_blocks_planning` stood
+the timer down as *waiting for you in review*. Accepting would have marked `t-233` done with the
+undecided row hanging under a closed goal, where nobody looks again.
+
+The old UI comment defended excluding the inbox — *holding a milestone open on something nobody
+decided to do would let any passing observation block it* — and it is half right, which is why the
+count is new rather than the filter widened. `cide_agents::milestones::inbox_under` counts inbox
+rows **under this goal only**; selfcraft's other 130 inbox tasks are somebody else's milestone and
+hold nothing up.
+
+- **`inbox_under` is separate from `open_under` on purpose.** The inbox is not work in flight, so
+  it must never count against `maxOpen` — that cap is about how much is started at once, and
+  counting observations in it would close the board to new work. A test pins both numbers on one
+  board.
+- **`gate_blocks_planning(passed, open, undecided)`** now needs all three clear to stand the timer
+  down, so a green gate over an undecided row *plans* instead of parking on the user. That is the
+  right turn to run: deciding is what a planning turn does.
+- **`readyToAccept` requires `undecided(tasks) === 0`**, the same rule on the other side, so the
+  button and the spinner cannot disagree about one board.
+- **`facts_line` names the rows and the way out.** Inbox rows under the goal are listed with the
+  rest (`[inbox]`), and the line says what clears each one: move it to todo if the milestone needs
+  it, or unlink it from the goal if it does not. A turn told only that it is blocked would go
+  looking for work to do instead of making the decision that unblocks it.
+- **Two notes that were promises the feature did not keep.** `announce_met`'s comment said flatly
+  that cide would not plan until the user accepted, and the panel's note said the same; both are
+  now conditional on the milestone actually being finished, and the panel's names what is in the
+  way. `render_milestones` counts the inbox under the goal apart from the open work, so a model
+  reading the milestone sees a decision owed rather than a third open task.
+- Checks: `cargo test -p cide-agents -- milestones tools`, `cargo test -p cide-app -- spinner
+  milestones`, `check:agents`, `check:agents-render`.
+- **Not confirmed on a display**: the panel's note and the hidden Accept button have not been seen
+  in a running cide; the user tests with `./run.sh` on the real selfcraft board.
+
+## The app on the UI kit (M100)
+
+The user picked the UI kit (`ui/src/kit/`, `docs/ui-kit.md`, `kit.html`) as the look for the
+whole app and asked for every panel, window, setting and modal to be brought to it. Done in
+phases, each reviewed with `./run.sh` before the next, and at the user's word the last ones
+without a stop: the palette, then dialogs and pickers, settings, the sidebar panels, the panes
+and windows, and the app chrome. Two of the user's calls changed the kit itself: its red accent
+went into `tokens.css`, and the chrome — which the kit's first draft left out (its rule 6, now
+rule 7) — went onto it too.
+
+- **The kit grew to be wireable before anything used it.** `Dialog` (widths, `titleAside`,
+  `head`, `flush`, `below`, scrolling body, attributes passed through), `Scrim`, an inline
+  `RadioGroup`, `PathList`/`PathRow`/`PathGroup` for "what this act touches", a composable
+  `Picker` (frame, input row, list, virtual rows, status, foot, hints), refs on `Button` and the
+  fields, a `Toolbar` label, and a Chrome chapter (`Rail`/`RailButton`, `ChromeTabs`/`ChromeTab`,
+  `StatusBar`/`StatusItem`, `PaneBar`, `ChromeButton`, `WindowControls`). Every part has its
+  specimen and its entry; `check:kit` holds it.
+- **One scrim.** `overlays/ModalShell.tsx` gained `Modal` (the kit `Scrim`, portalled), and
+  `OverlayCard` draws the same `Scrim`, so every modal and picker sits on one layer.
+- **Two bridges, written down as rule 3.** Where a check pins an element line by line (the
+  Agents settings form, the task card, panel rows, all of the chrome) the element stays and its
+  CSS `composes` the kit's class; where a field carries a state the kit field does not draw (a
+  struck-through refused CLI argument, a grid cell) it stays a bare `<input>` drawn with the kit
+  field's numbers. The pinned checks that read class names were translated to the kit's terms
+  (`check-log-actions`, `check-push`, `check-picker`, `check-settings-agents`, `check-gitlab-dom`,
+  `check-openspec-render`, `check-ui-icons`), never loosened.
+- **A specificity trap that made the kit look wrong only in GitLab.** `.inbox button` (0,1,1) and
+  the older `.panel button`, `.review button`, `.openDialog button` rules out-ranked every kit
+  class (0,1,0), so a kit `Button` there took the panel's font, colour and disabled state. They
+  are one zero-specificity `:where()` block now, drawn as the kit's secondary button and field.
+- **One drawing per state.** Hover is `--panel-2` in every list (a sweep caught about fifty rules
+  still on `--chrome-hi`, and the trees' `--sel`-derived hover); selected is `--sel` (the log's
+  rows had been `--accent-dim`, which the red palette turned pink); the open task row is the
+  accent bar and a 5% wash; a segment that is on is raised onto `--panel`, never red text; an
+  icon toggle that is on is the accent on a 12% wash; counts are the kit `Counter`.
+- **Narrow panels** (the user's report after the panels phase): the kit `Segmented` used bare
+  `1fr` tracks, whose floor is their content, so three labels pushed out of a 200px sidebar; the
+  `Select` had a hard 120px floor; the `Toolbar` never wrapped. All three are fixed in the kit, so
+  every user of them shrinks.
+- **Danger is black.** A confirming destructive button is the kit's `danger` fill; the unarmed
+  first press of a two-step delete is a bold ink label; row-level destroys that open a confirm are
+  quiet. Red stays a status colour.
+- **Not converted, on purpose or not yet**: `TriCheckbox`; the attachment lightbox; the native
+  `title` tooltips (~200; the kit `Tooltip` is drawn but not wired); avatars; the picker's
+  file-type labels; the renderers (diff, merge, commit graph, terminal, editor). The kit page's
+  last chapter lists them with the reason each has.
+- Checks: `tsc`, every `check:*`, `pnpm build`. The layout audits (`./run.sh --audit-chrome`,
+  `--audit-panes`, `--audit-windows`) need a display and were **not** run; the chrome kept its
+  geometry (tab widths, rail and status heights, traffic lights) so they should hold, but that is
+  a claim, not a measurement.
+- **Not confirmed on a display**: nothing in this milestone was seen by me in a running cide.
+  The user reviewed phases 1–3 with `./run.sh`; the panes phase, the chrome phase and the
+  close-out were done without a stop at the user's request and are unreviewed.
+

@@ -42,10 +42,11 @@
   display: grid;
   grid-template-columns: 1fr auto;
   align-items: center;
-  gap: var(--sp-1) var(--sp-2);
-  padding: var(--sp-2);
+  gap: var(--sp-1) var(--sp-4);
+  padding: var(--sp-4) var(--sp-5);
   border: 1px solid var(--border);
-  border-radius: var(--r-2);
+  border-radius: var(--r-3);
+  background: var(--panel);
 }
 
 .name {
@@ -100,17 +101,17 @@
 .compare {
   display: grid;
   gap: var(--sp-2);
-  padding: var(--sp-3);
+  padding: var(--sp-5);
   border: 1px solid var(--accent);
-  border-radius: var(--r-2);
+  border-radius: var(--r-3);
   background: var(--panel);
 }
 
 .invite {
   display: grid;
   gap: var(--sp-2);
-  padding: var(--sp-3);
+  padding: var(--sp-5);
   border: 1px solid var(--border);
-  border-radius: var(--r-2);
+  border-radius: var(--r-3);
   background: var(--panel-2);
 }

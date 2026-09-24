@@ -19,9 +19,9 @@
  * mode (§1). It is a toggle, so it gets `aria-pressed` rather than a click handler that
  * silently flips something invisible.
  */
-import { Icon, type IconName } from '@/icons/Icon'
-
-import styles from './Toolbar.module.css'
+import type { IconName } from '@/icons/Icon'
+import { IconButton } from '@/kit/components/Button'
+import { Toolbar as KitToolbar } from '@/kit/components/Surface'
 
 export interface ToolbarProps {
   stagingArea: boolean
@@ -124,25 +124,22 @@ export function Toolbar(props: ToolbarProps) {
     { icon: 'chevrons-up-down', label: 'Expand all', onClick: props.onExpandAll },
   ]
 
+  // The kit's `Toolbar` of `IconButton`s: hover `--panel-2`, the staging-area toggle "on" as the
+  // accent on a 12% wash — the one drawing every icon toggle in the app has.
   return (
-    <div className={styles.bar} role="toolbar" aria-label="Changes" data-audit="gitToolbar">
-      {items.map((item, i) => (
-        <button
-          // Index is kept in the key even though the marks are now distinct: it costs nothing,
-          // and a future toolbar that does repeat one would otherwise warn about duplicate keys.
-          key={`${item.icon}-${i}`}
-          type="button"
-          className={styles.button}
-          title={item.label}
-          aria-label={item.label}
-          {...(item.pressed === undefined ? {} : { 'aria-pressed': item.pressed })}
-          data-pressed={item.pressed === true ? '' : undefined}
-          disabled={item.disabled === true}
-          onClick={item.onClick}
-        >
-          <Icon name={item.icon} />
-        </button>
-      ))}
+    <div data-audit="gitToolbar">
+      <KitToolbar label="Changes">
+        {items.map((item, i) => (
+          <IconButton
+            key={`${item.icon}-${i}`}
+            icon={item.icon}
+            label={item.label}
+            pressed={item.pressed}
+            disabled={item.disabled === true}
+            onClick={item.onClick}
+          />
+        ))}
+      </KitToolbar>
     </div>
   )
 }

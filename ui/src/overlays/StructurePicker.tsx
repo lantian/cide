@@ -19,6 +19,7 @@
  * The cost, stated: no collapse, so a 400-method file is a 400-row scroll. The filter is the
  * mitigation, and it is what the popup is for.
  */
+import { PickerRow, PickerStatus } from '@/kit/components/Overlay'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
@@ -171,15 +172,12 @@ export function StructurePicker({ project, onDismiss, onGoTo }: StructurePickerP
             if (row === undefined) return null
             const badge = symbolBadge(row.node.kind)
             return (
-              <div
+              <PickerRow
                 key={`${row.index}`}
                 data-audit="structureRow"
-                className={`${styles.row} ${item.index === selected ? styles.rowSelected : ''}`}
+                virtual
+                selected={item.index === selected}
                 style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  width: '100%',
                   height: ROW_HEIGHT,
                   transform: `translateY(${item.start}px)`,
                   // Indentation is inline rather than a class per depth: depth is unbounded and
@@ -199,7 +197,7 @@ export function StructurePicker({ project, onDismiss, onGoTo }: StructurePickerP
                 {query.trim() !== '' && row.node.container !== null && (
                   <span className={styles.path}>{row.node.container}</span>
                 )}
-              </div>
+              </PickerRow>
             )
           })}
         </div>
@@ -225,11 +223,11 @@ function Body({
   rows: readonly Row[]
   query: string
 }) {
-  if (outline === null) return <div className={styles.status}>Reading the file…</div>
+  if (outline === null) return <PickerStatus>Reading the file…</PickerStatus>
   if (outline.kind === 'unsupported' || outline.kind === 'failed') {
-    return <div className={styles.status}>{outline.reason}</div>
+    return <PickerStatus>{outline.reason}</PickerStatus>
   }
   if (rows.length > 0) return null
-  if (query.trim() !== '') return <div className={styles.status}>No matching members</div>
-  return <div className={styles.status}>No members in this file</div>
+  if (query.trim() !== '') return <PickerStatus>No matching members</PickerStatus>
+  return <PickerStatus>No members in this file</PickerStatus>
 }

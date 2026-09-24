@@ -75,6 +75,7 @@
  * cannot show: that the global `qa` the user is looking at is inert because this project has one
  * too.
  */
+import { Select as KitSelect } from '@/kit/components/Select'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   agentDefs,
@@ -2136,10 +2137,9 @@ function Field({
 /**
  * A closed choice.
  *
- * A native `<select>` rather than the `Segmented` control the rest of Settings uses, because two
+ * The kit's `Select` rather than the `Segmented` control the rest of Settings uses, because two
  * of the three vocabularies here do not fit on a row: six permission modes plus an unset is
- * seven segments, and a segmented control that wraps reads as a broken toolbar. The tokens are
- * the same, so it sits in the same form as the segments above it.
+ * seven segments, and a segmented control that wraps reads as a broken toolbar.
  */
 function Choice({
   label,
@@ -2156,19 +2156,16 @@ function Choice({
   disabled?: boolean
 }) {
   return (
-    <select
-      className={styles.select}
-      aria-label={label}
-      value={value}
-      disabled={disabled}
-      onChange={(e) => onChange(e.target.value)}
-    >
-      {options.map((option) => (
-        <option key={option.value} value={option.value}>
-          {option.label}
-        </option>
-      ))}
-    </select>
+    <div className={styles.select}>
+      <KitSelect
+        size="sm"
+        aria-label={label}
+        value={value}
+        disabled={disabled === true}
+        options={options}
+        onChange={onChange}
+      />
+    </div>
   )
 }
 
@@ -2221,21 +2218,21 @@ function ModelField({
   const options = value !== '' && !listed.includes(value) ? [value, ...listed] : listed
   return (
     <div className={styles.suggest}>
-      <select
-        className={styles.select}
-        aria-label="Model suggestions"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      >
-        <option value="">
-          {loading ? 'Reading the model list…' : `The ${harnessLabel(harness)} default`}
-        </option>
-        {options.map((model) => (
-          <option key={model} value={model}>
-            {model}
-          </option>
-        ))}
-      </select>
+      <div className={styles.select}>
+        <KitSelect
+          size="sm"
+          aria-label="Model suggestions"
+          value={value}
+          onChange={onChange}
+          options={[
+            {
+              value: '',
+              label: loading ? 'Reading the model list…' : `The ${harnessLabel(harness)} default`,
+            },
+            ...options.map((model) => ({ value: model, label: model })),
+          ]}
+        />
+      </div>
       <input
         className={styles.input}
         type="text"

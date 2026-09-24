@@ -1,47 +1,18 @@
 /*
- * The one 620px modal shell, shared by the file picker and the command palette.
+ * What the app's overlays draw on top of the UI kit.
  *
- * Every number here is transcribed from the mock's overlay spec: 620px wide, `--chrome`
- * ground, a 1px `--border` outline, 9px radius, `--shadow`, 96px from the top of the window.
- * The two overlays differ in their rows and their prompt glyph and in nothing else, which is
- * why there is one shell and not two.
- *
- * The scrim is the one place this file departs from the mock — see `.scrim`.
+ * The frames are the kit's: pickers are `PickerFrame`/`PickerInput`/`PickerList`/`PickerRow`,
+ * dialogs `Dialog`, both on the kit `Scrim` through `Modal`. What is left here is `.card` —
+ * `OverlayCard`'s box, the same ground, border, radius and shadow as the kit `Dialog`, for the
+ * callers that draw their own head and foot inside it — the block caret of the picker field,
+ * and the contents of picker rows (file-type badge, name, path, group, usage lines).
  */
 
-.scrim {
-  position: fixed;
-  inset: 0;
-  /*
-   * 60 is only meaningful because `ModalShell.tsx`'s `OverlayCard` portals this element to
-   * `document.body`. `z-index` is compared within one stacking context, and `layout/
-   * TabContent.module.css` gives every tab panel its own — so a card rendered in place inside a
-   * tab resolved this 60 against that panel's children and painted *under* the sidebar
-   * splitter's `z-index: 1`, which is the bug the portal fixes. If a future change unportals
-   * it, raising this number will look like a fix and will not be one.
-   */
-  z-index: 60;
-  /*
-   * The mock spells this `rgba(0,0,0,.42)` and an earlier comment here defended it as
-   * necessarily theme-independent. That was half right. A scrim must be built from a *dark*
-   * colour in both themes — a light-theme scrim made of a light token recedes nothing — but
-   * one alpha cannot serve both. Over `--bg` at #111113 the wash is barely visible; over the
-   * white light ground the user asked for, 42% black lands on #949494 — a heavy grey over
-   * the whole window for as long as an overlay is open. (Only for that long: the beige
-   * `--bg`/`--chrome` were why the light theme read as grey at rest, and those are
-   * `tokens.css`'s to fix, not this rule's.)
-   *
-   * So the value lives in `--scrim`, which `tokens.css` now defines per theme: the mock's
-   * `rgba(0,0,0,.42)` for dark, and a lighter warm wash for light. The literal here is only a
-   * fallback and is deliberately the dark value — if the token ever goes missing again, the
-   * theme that still looks right is the one the mock specifies.
-   */
-  background: var(--scrim, rgba(0, 0, 0, 0.42));
-  display: flex;
-  justify-content: center;
-  align-items: flex-start;
-  padding-top: 96px;
-}
+/*
+ * The scrim is the kit's `Scrim` (`kit/components/Overlay.module.css`), drawn by `Modal` and
+ * `OverlayCard` alike — z-index 60 above the panes and under the menus, the per-theme `--scrim`
+ * wash, 96px of it above the card.
+ */
 
 .card {
   width: 620px;
@@ -73,31 +44,8 @@
   user-select: text;
 }
 
-.inputRow {
-  flex: none;
-  height: calc(44px * var(--ui-scale));
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 0 14px;
-  border-bottom: 1px solid var(--border);
-  /* Chrome, and outside `.list`: the prompt and the counter are not text anyone copies. The
-     `<input>` itself stays selectable — a form control is, whatever this says. */
-  -webkit-user-select: none;
-  user-select: none;
-}
-
-.prompt {
-  flex: none;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-14);
-  line-height: 1;
-  color: var(--dim);
-  -webkit-user-select: none;
-  user-select: none;
-}
-
-/* The palette's `>` is accent; the picker's `›` is not. */
+/* The palette's `>` is accent; the picker's `›` is not. The frame, the lead slot and the
+   counter are the kit's `PickerInput`; this is the one colour it does not decide. */
 .promptAccent {
   color: var(--accent);
 }
@@ -165,40 +113,16 @@
   }
 }
 
-.counter {
-  flex: none;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
-  color: var(--faint);
-  font-variant-numeric: tabular-nums;
-  /* "6 of 2,418" — a readout, not content, and it changes on every keystroke. */
-  -webkit-user-select: none;
-  user-select: none;
-}
-
-.list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  /*
-   * The one place inside the card that keeps the app-wide `none`, and it covers `.row`,
-   * `.viewport`, `.status` and `.usageSummary` in one rule — every virtualized row of all five
-   * pickers. A row is a navigation target reached with the arrow keys, not prose: a drag across
-   * it would smear a selection over rows that are about to be recycled under it, and a mousedown
-   * that starts a selection is a mousedown that moves focus off the search input, which is the
-   * caret-repaint failure `FilePicker.tsx` and `check-picker.mjs` already guard against.
-   */
-  -webkit-user-select: none;
-  user-select: none;
-}
-
 /* The virtualizer's spacer: one tall relatively-positioned box the absolute rows sit in. */
 .viewport {
   position: relative;
   width: 100%;
 }
 
+/*
+ * A usage popup's file heading: laid out like the kit's `PickerRow` and placed by the
+ * virtualiser the same way, but not an option — it cannot be selected, so it is not one.
+ */
 .row {
   position: absolute;
   left: 0;
@@ -206,14 +130,11 @@
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 0 14px;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-2);
   white-space: nowrap;
   cursor: default;
-}
-
-.rowSelected {
-  background: var(--sel);
 }
 
 .badge {
@@ -258,7 +179,7 @@
   font-size: var(--fs-ui-13);
 }
 
-.rowSelected .name {
+[aria-selected='true'] .name {
   color: var(--text-hi);
 }
 
@@ -318,46 +239,12 @@
   font-size: var(--fs-ui-11);
 }
 
-.chip {
-  flex: none;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  line-height: calc(15px * var(--ui-scale));
-  padding: 0 5px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  color: var(--dim);
-}
-
-.footer {
-  flex: none;
-  height: calc(30px * var(--ui-scale));
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 0 14px;
-  border-top: 1px solid var(--border);
-  color: var(--faint);
-  font-size: var(--fs-ui-11);
-  -webkit-user-select: none;
-  user-select: none;
-}
-
+/* The footer scope chip's chord. The other hints are the kit's `PickerHint`, which draws its
+   keys the same way. */
 .footerKey {
   font-family: var(--font-mono);
   color: var(--dim);
   margin-right: 4px;
-}
-
-.status {
-  padding: 16px 14px;
-  color: var(--dim);
-  font-size: var(--fs-ui-13);
-}
-
-/* Reserved for the frame after `picker_open` resolves but before the first frame lands. */
-.statusFaint {
-  color: var(--faint);
 }
 
 /*
@@ -373,7 +260,7 @@
  * Both themes come free: every colour here is a token, and `tokens.css` defines `--faint`
  * for each.
  */
-.rowDisabled .name {
+[aria-disabled='true'] .name {
   color: var(--faint);
 }
 
@@ -474,7 +361,7 @@
   color: var(--faint);
 }
 
-.rowSelected .usageAt {
+[aria-selected='true'] .usageAt {
   color: var(--dim);
 }
 
@@ -492,7 +379,7 @@
   color: var(--dim);
 }
 
-.rowSelected .usageText {
+[aria-selected='true'] .usageText {
   color: var(--text);
 }
 
@@ -507,7 +394,9 @@
 /* `41 usages in 12 files`, under the list. The count the counter cannot show: the counter says how
    many the filter left, and this says what the search actually found. */
 .usageSummary {
-  padding: 8px 14px;
+  flex: none;
+  padding: var(--sp-3) var(--sp-5);
+  border-top: 1px solid var(--border-soft);
   color: var(--faint);
   font-size: var(--fs-ui-12);
 }
@@ -578,6 +467,6 @@
   white-space: nowrap;
 }
 
-.rowSelected .source {
+[aria-selected='true'] .source {
   color: var(--dim);
 }

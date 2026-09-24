@@ -1,21 +1,6 @@
 {
   "schemaVersion": 2,
-  "rev": 44,
-  "nextId": 45,
-  "tasks": [
-    {
-      "id": "t-42",
-      "title": "Task ids are contiguous: a counter only a create advances",
-      "status": "done",
-      "agent": null,
-      "links": [],
-      "createdBy": {
-        "kind": "orchestrator"
-      },
-      "createdUnixMs": 1789735711986,
-      "updatedUnixMs": 1789736083090,
-      "commentCount": 1,
-      "attachmentCount": 0
-    }
-  ]
+  "rev": 110,
+  "nextId": 46,
+  "tasks": []
 }

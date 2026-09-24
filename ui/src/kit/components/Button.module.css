@@ -1,0 +1,208 @@
+/*
+ * Buttons. The reference look, taken from the New Project wizard's footer (M97).
+ *
+ * Two sizes and no third: `md` (30px) is a dialog footer's and a form's, `sm` (24px) is a panel
+ * row's and a toolbar's. Every button in the app is one of these two heights, and a text input
+ * beside it is the same height (`Field.module.css`), so a row of controls lines up without a
+ * per-site nudge. The wizard's path field was 32px beside a 30px Browse — a two-pixel step the
+ * eye catches — and the kit settles it at 30.
+ *
+ * Variants, and when each is right:
+ *   - `primary`   — the one act the surface exists for. At most one per footer or row.
+ *                   The look is `styles/buttons.module.css`'s, composed, not copied.
+ *   - `secondary` — every other act beside it (Back, Cancel, Browse). The wizard's `.ghost`.
+ *   - `quiet`     — a borderless act inside dense content (a row's Retry, "Load more").
+ *   - `danger`    — the confirming half of something that destroys. Filled black, drawn like
+ *                   the primary in ink (`--grad-danger`). It was outlined red until the accent
+ *                   turned red; then a red danger beside a red primary made "the act this
+ *                   dialog is for" and "the act that destroys" one colour, and the user asked
+ *                   for black.
+ *   - `link`      — an act that reads as a link inside prose or a footer line.
+ */
+
+.button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--r-2);
+  font-family: var(--font-ui);
+  /* 400, not 500: only the primary is heavy (600, from the shared class). At 500 the red of a
+     danger button read as bold beside it and competed with the primary for the eye — the
+     user's note on the first pass. */
+  font-weight: 400;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+}
+
+.button:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.button:disabled {
+  cursor: default;
+}
+
+.md {
+  height: calc(30px * var(--ui-scale));
+  padding: 0 var(--sp-6);
+  font-size: var(--fs-ui-12);
+}
+
+.sm {
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  font-size: var(--fs-ui-11);
+}
+
+.block {
+  width: 100%;
+}
+
+/* --- variants ---------------------------------------------------------------------------- */
+
+.primary {
+  composes: primary from '../../styles/buttons.module.css';
+}
+
+.secondary {
+  border-color: var(--border);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.secondary:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+.secondary:disabled {
+  color: var(--faint);
+  border-color: var(--border-soft);
+}
+
+.quiet {
+  background: transparent;
+  color: var(--dim);
+}
+
+.quiet:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.quiet:disabled {
+  color: var(--faint);
+}
+
+.danger {
+  border-color: var(--danger-edge);
+  background: var(--grad-danger);
+  color: var(--on-danger);
+  font-weight: 600;
+  box-shadow: var(--fill-sheen), var(--shadow-1);
+}
+
+.danger:hover:not(:disabled) {
+  box-shadow: var(--fill-sheen), var(--shadow-2);
+}
+
+.danger:disabled {
+  opacity: 0.45;
+  box-shadow: none;
+}
+
+.link {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+}
+
+.link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.link:disabled {
+  color: var(--faint);
+}
+
+/* --- the icon-only button ---------------------------------------------------------------- */
+
+/*
+ * The GitLab inbox's `.iconButton`: no border at rest, a `--panel-2` wash on hover. Square, the
+ * same two heights as a text button, so an icon button in a row of text buttons does not stand
+ * proud of them. `aria-label` and `title` are required by the component, not optional: an icon
+ * is the only content, so without them the control has no name.
+ */
+.icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.icon.md {
+  width: calc(30px * var(--ui-scale));
+  padding: 0;
+}
+
+.icon.sm {
+  width: calc(24px * var(--ui-scale));
+  padding: 0;
+}
+
+.icon:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+/* Pressed: a toggle that is on (a filter, a view mode). The accent carries the state. */
+.icon[aria-pressed='true'] {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.icon:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.icon:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The spinner that replaces a busy button's icon. `Feedback.module.css`'s `.spin`, same rule. */
+.busy {
+  animation: kit-button-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes kit-button-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

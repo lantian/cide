@@ -1,193 +1,27 @@
 /*
  * The house destructive confirmation — the Git panel's reverts and the file tree's *Move to
- * Trash*. Scrim and card come from `OverlayCard`; this styles only what sits inside, exactly
- * as `CloseConfirm.module.css` beside it does — the three dialogs are the same gesture in
- * three places and must not drift apart.
+ * Trash*. The frame, the buttons, the radios and the checkbox are the UI kit's (`Modal` +
+ * `Dialog`, `Button`, `RadioGroup`, `Checkbox`); this styles only the content the kit has no
+ * part for — the list of every path at stake — and the head's two pieces of spacing.
  *
- * `--red` appears once, on the button that removes something. That is the only thing that
- * colour means in this app.
+ * The mark is `--red` because it says "this goes"; the destroy button itself is the kit's
+ * black `danger`, so red and the primary never share a meaning.
  */
 
-.dialog {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.head {
-  flex: none;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.title {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-/*
- * The mode picker — `--soft` / `--mixed` / `--hard`, and whatever needs three answers next.
- *
- * A row of radios and not a `<select>`: the whole point of the control is that all three modes
- * and their consequences are visible at once, and a dropdown hides two of the three behind a
- * click. It sits between the title and the body because the body is *about* the selection.
- */
+/* The mode picker sits between the title and the body, because the body is *about* it. */
 .choices {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin: 10px 0;
-}
-
-.choice {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--fs-ui-13);
-  color: var(--text);
-  cursor: default;
-}
-
-.choice input {
-  /* `PasteConfirm.module.css` sets the same pair on its checkbox. The engine draws the native
-     control; this is the one property that makes it look like it belongs to this app. */
-  accent-color: var(--accent);
-  margin: 0;
+  margin-top: var(--sp-5);
 }
 
 .body {
-  margin: 0;
+  margin: var(--sp-4) 0 0;
   font-size: var(--fs-ui-13);
-  line-height: calc(18px * var(--ui-scale));
+  line-height: 1.5;
   color: var(--dim);
 }
 
-/* Every path at stake. Scrolls rather than growing: a changelist can hold a hundred files,
-   and a dialog taller than the window puts its own buttons off screen. */
-.list {
-  flex: 1;
-  min-height: 0;
-  max-height: calc(260px * var(--ui-scale));
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin: 0;
-  padding: 6px 0;
-  list-style: none;
-}
-
-.row {
-  display: flex;
-  align-items: baseline;
-  gap: 9px;
-  padding: 3px 18px;
-  white-space: nowrap;
-}
-
+/* The kit's `PathList` draws the rows; the mark alone is red, because it says "this goes". */
 .mark {
-  flex: none;
-  width: 10px;
-  font-size: var(--fs-ui-11);
-  line-height: calc(18px * var(--ui-scale));
-  color: var(--red);
-}
-
-.name {
-  flex: none;
-  font-size: var(--fs-ui-13);
-  color: var(--text-hi);
-}
-
-/* The directory. Shrinks and ellipsises first: the file name is what identifies the row, and
-   a truncated name is a row the user cannot place. The full path is on the row's `title`. */
-.where {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  color: var(--faint);
-}
-
-.footer {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 18px;
-  border-top: 1px solid var(--border);
-}
-
-/* Pushed hard left, away from the answers — the same `margin-right: auto` and the same reason
-   as `PasteConfirm.module.css`'s `.applyAll`: an option beside the destructive button is one a
-   click that missed by 4px can untick, and this one is what makes the act recoverable. */
-.option {
-  margin-right: auto;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-  cursor: default;
-}
-
-.option input {
-  accent-color: var(--accent);
-  margin: 0;
-}
-
-.button {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
-  color: var(--text);
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.button:hover {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
-
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
-
-/*
- * The default is the prominent one, and for every destructive caller the default is Cancel;
- * the destructive button is the plain one.
- *
- * That dialog exists because something is about to be destroyed, and making the destruction
- * the eye-catching default is how it gets clicked by reflex. The one caller that flips this
- * — the file tree's trash move, reversible by construction (`ConfirmState.defaultButton`) —
- * moves the class *with* the focus, so the accent never lies about what Enter does.
- */
-.buttonPrimary {
-  composes: primary from '../styles/buttons.module.css';
-}
-
-.buttonDanger {
-  color: var(--red);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.buttonDanger:hover {
-  border-color: var(--red);
+  display: inline-flex;
   color: var(--red);
 }

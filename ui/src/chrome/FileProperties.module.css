@@ -1,73 +1,22 @@
 /*
- * The properties card's body. The scrim and the 620px card come from `OverlayCard`
- * (`overlays/Overlay.module.css`), so this file styles only what sits inside them.
- *
- * Deliberately the same measurements as `PasteConfirm.module.css` and `CloseConfirm.module.css`
- * — 16/18px head padding, the same button shape, the same rule colour. Those two are argued at
- * length in the first of them and the reasoning carries: a user meets these dialogs minutes
- * apart, and three cards that are 4px and half a font-size different is how an app stops looking
- * like one app.
- *
- * Every colour is a token, so both themes come out of `tokens.css`. Every font size is a
- * `--fs-ui-*` rung: a bare `font-size: 12px` here is a label that silently stops following the
- * UI font size, and it looks right at the default, which is where this was written.
- * `check:ui-scale` is what refuses one.
- *
- * There are no transitions in this file at all, deliberately. Nothing on this card animates —
- * it is a reading, every row arrives once, and a fade on a value that fills in a beat later
- * draws the eye to the slowest fact on the card rather than to the one that was asked about.
+ * The properties card. The frame, the title with its kind badge, the key → value blocks
+ * (`Summary`), the Git section caption, the buttons and the failure note are the UI kit's; this
+ * stylesheet is the path line under the title and the recent-commits list, which the kit has no
+ * part for.
  */
 
-/* Re-declares the column for the reason `PasteConfirm`'s wrapper does: `OverlayCard` makes the
-   card a flex column, and a plain block in between would stop the body being the only thing
-   that scrolls. */
-.dialog {
-  flex: 1;
-  min-height: 0;
+/* The key → value blocks stack with a section's gap between them. */
+.body {
   display: flex;
   flex-direction: column;
-}
-
-.head {
-  flex: none;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.titleRow {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.title {
-  flex: 1;
-  min-width: 0;
-  margin: 0;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-  /* The name, not the path, so it may be long but is rarely absurd. Truncated rather than
-     wrapped: a two-line heading pushes every fact below the fold on a short window. */
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* `TypeScript`, `PNG`, `Folder`. A classification, so it is dim and does not compete with the
-   name it is classifying. */
-.kind {
-  flex: none;
-  font-size: var(--fs-ui-11);
-  color: var(--dim);
-  text-transform: none;
+  gap: var(--sp-5);
 }
 
 .pathRow {
   display: flex;
   align-items: baseline;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--sp-4);
+  margin-top: var(--sp-3);
 }
 
 .path {
@@ -84,66 +33,6 @@
   text-align: left;
 }
 
-.copy {
-  flex: none;
-  appearance: none;
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  color: var(--accent);
-  cursor: pointer;
-}
-
-.copy:hover {
-  text-decoration: underline;
-}
-
-.body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 4px 18px 8px;
-}
-
-.section {
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.section:last-of-type {
-  border-bottom: none;
-}
-
-.row {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 3px 0;
-}
-
-/* A fixed column so the values line up into a readable second column. Not a table: the rows are
-   independently conditional, and a `<table>` with half its `<tr>`s absent is markup that has to
-   be reasoned about every time a row is added. */
-.rowLabel {
-  flex: none;
-  width: 104px;
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-}
-
-.rowValue {
-  flex: 1;
-  min-width: 0;
-  font-size: var(--fs-ui-12);
-  color: var(--text-hi);
-  /* Wraps. A permissions string or an owner pair is short, but a `text_skipped` sentence and a
-     symlink target are not, and truncating a sentence that exists to explain something is
-     exactly the wrong half to lose. */
-  overflow-wrap: anywhere;
-}
-
 .mono {
   font-family: var(--font-mono);
 }
@@ -151,7 +40,7 @@
 /* `on disk`. A qualifier on the value beside it, so it is dim, small and in brackets — it is
    not a second fact and must not read as a column of its own. */
 .note {
-  margin-left: 8px;
+  margin-left: var(--sp-4);
   font-size: var(--fs-ui-11);
   color: var(--dim);
 }
@@ -164,50 +53,8 @@
   content: ')';
 }
 
-.git {
-  padding: 10px 0 2px;
-  border-top: 1px solid var(--border);
-}
-
-.sectionTitle {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-11);
-  font-weight: 600;
-  color: var(--dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.recentHead {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 10px 0 4px;
-}
-
-.recentLabel {
-  font-size: var(--fs-ui-11);
-  color: var(--dim);
-}
-
-.link {
-  appearance: none;
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  color: var(--accent);
-  cursor: pointer;
-}
-
-.link:hover {
-  text-decoration: underline;
-}
-
 .commits {
-  margin: 0;
+  margin: var(--sp-4) 0 0;
   padding: 0;
   list-style: none;
 }
@@ -219,8 +66,8 @@
   display: grid;
   grid-template-columns: auto auto minmax(0, 8rem) minmax(0, 1fr);
   align-items: baseline;
-  gap: 10px;
-  padding: 2px 0;
+  gap: var(--sp-5);
+  padding: var(--sp-1) 0;
   font-size: var(--fs-ui-11);
 }
 
@@ -249,47 +96,12 @@
   color: var(--text-hi);
 }
 
-.more,
-.waiting {
-  margin: 8px 0 0;
+.more {
+  margin: var(--sp-4) 0 0;
   font-size: var(--fs-ui-11);
   color: var(--dim);
 }
 
-/* A refused `invoke`, in the card rather than as a toast: the failure is about the one path this
-   dialog is for, and a notice in the corner would outlive the card that gave it context. */
-.failure {
-  margin: 10px 0;
-  font-size: var(--fs-ui-12);
-  color: var(--red);
-}
-
-.footer {
-  flex: none;
-  display: flex;
-  justify-content: flex-end;
-  padding: 12px 18px;
-  border-top: 1px solid var(--border);
-}
-
-.close {
-  appearance: none;
-  /* Stated, because `appearance: none` does *not* reset a `<button>`'s UA padding in WebKit —
-     it keeps `1px 6px` — and under the global `box-sizing: border-box` that is how a label
-     lands off-centre in its own background. */
-  padding: 5px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--accent);
-  /* `--bg`, not a literal white: the accent is light in the dark theme and dark in the light
-     one, so a fixed label colour fails contrast in one of them. The same pair `CloseConfirm`
-     and `PasteConfirm` use, and their comments carry the argument. */
-  color: var(--bg);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.close:hover {
-  filter: brightness(1.08);
+.waiting {
+  display: block;
 }

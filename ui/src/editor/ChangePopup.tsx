@@ -14,6 +14,7 @@
  * which is `BlamePopupProps.onAnnotateParent`'s documented argument: a disabled row with a
  * guessed reason is worse than no row.
  */
+import { Button } from '@/kit/components/Button'
 import type { ReactNode } from 'react'
 import styles from './ChangePopup.module.css'
 
@@ -61,23 +62,21 @@ export function ChangePopup({
       )}
       {(onRevert !== undefined || onCopy !== undefined) && (
         <div className={styles.actions}>
-          {/* `type="button"`, both. A bare <button> inside anything that is ever a form is a
+          {/* `type="button"`, both — the kit `Button` defaults to it. A bare <button> inside anything that is ever a form is a
               submit button, and these live in a floating card whose ancestor is not this file's
               to know. */}
           {onRevert !== undefined && (
-            <button
-              type="button"
-              className={styles.action}
+            <Button size="sm"
               onClick={onRevert}
               title="Put HEAD's version of these lines back. Ctrl+Z undoes it."
             >
               Revert
-            </button>
+            </Button>
           )}
           {onCopy !== undefined && (
-            <button type="button" className={styles.action} onClick={onCopy}>
+            <Button size="sm" onClick={onCopy}>
               Copy
-            </button>
+            </Button>
           )}
         </div>
       )}

@@ -8,131 +8,54 @@
   overflow: hidden;
   color: var(--text);
   background: var(--panel);
-  font: 12px/1.45 var(--font-ui);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
   box-sizing: border-box;
 }
-.inbox button,
-.inbox input,
-.inbox select {
+/*
+ * The panel's own raw controls inherit its face. Inside `:where()`, so the rule has no
+ * specificity at all: at `.inbox button` (0,1,1) it outranked every kit component's single
+ * class and repainted a kit primary button's label, a kit field's font, a kit icon button's
+ * disabled state — the kit parts in this panel only looked like the kit where these rules did
+ * not reach.
+ */
+:where(.inbox, .reviewPanel) :where(button, input, select) {
   font: inherit;
   color: inherit;
 }
-.inbox button {
+
+:where(.inbox, .reviewPanel) :where(button) {
   cursor: pointer;
 }
-.inbox button:disabled {
+
+:where(.inbox, .reviewPanel) :where(button:disabled) {
   opacity: 0.55;
   cursor: default;
 }
-.inbox :is(button, input, select):focus-visible,
-.reviewPanel :is(button, input):focus-visible {
-  outline: 2px solid var(--accent);
+
+:where(.inbox, .reviewPanel) :where(button, input, select):focus-visible {
+  outline: var(--focus-ring);
   outline-offset: -2px;
 }
-.panelHeader {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border);
-  flex: none;
-}
-.panelHeader h2 {
-  font-size: var(--fs-ui-12);
-  font-weight: 600;
-  margin: 0;
-  flex: 1;
-}
-.inbox .iconButton,
-.reviewPanel .iconButton {
-  width: 26px;
-  height: 26px;
-  padding: 4px;
-  border: 0;
-  border-radius: 4px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-  background: transparent;
-  color: var(--dim);
-}
-.inbox .iconButton:hover,
-.reviewPanel .iconButton:hover {
-  background: var(--panel-2);
-  color: var(--text);
-}
+
 .inboxFilters {
-  padding: 10px;
+  padding: var(--sp-5);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-4);
   border-bottom: 1px solid var(--border-soft);
   flex: none;
 }
-.scopeTabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  background: var(--panel-2);
-  border: 1px solid var(--border-soft);
-  border-radius: 6px;
-  padding: 2px;
-  gap: 2px;
-}
-.scopeTabs button {
-  border: 1px solid transparent;
-  padding: 5px 2px;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--dim);
-  font-size: var(--fs-ui-11);
-}
-.scopeTabs button:hover {
-  color: var(--text);
-}
-.scopeTabs button[aria-pressed='true'] {
-  color: var(--accent-hi);
-  background: var(--panel);
-  border-color: var(--border);
-  box-shadow: 0 1px 2px #0000000a;
-  font-weight: 600;
-}
-.inboxFilters input,
-.inboxFilters select {
-  min-width: 0;
-  box-sizing: border-box;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 5px 7px;
-  height: 29px;
-}
-.inboxFilters input::placeholder {
-  color: var(--faint);
-}
-.searchField {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding-left: 8px;
-  color: var(--dim);
-}
-.searchField:focus-within {
-  border-color: var(--accent);
-}
-.searchField input {
-  width: 100%;
-  border: 0;
-  background: transparent;
-  padding-left: 0;
-  outline: none;
-}
 .filterRow {
   display: grid;
-  grid-template-columns: minmax(65px, 0.7fr) minmax(0, 1.3fr);
-  gap: 6px;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: var(--sp-3);
+}
+
+.filterState,
+.filterProject {
+  min-width: 0;
 }
 .listCaption {
   display: flex;
@@ -141,7 +64,7 @@
   padding: 9px 12px;
   color: var(--dim);
   font-size: var(--fs-ui-11);
-  gap: 8px;
+  gap: var(--sp-4);
   flex: none;
 }
 .listCaption span:last-child {
@@ -198,9 +121,9 @@
 .state {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   flex: none;
-  border-radius: 4px;
+  border-radius: var(--r-1);
   padding: 2px 5px;
   font-size: var(--fs-ui-11);
   font-weight: 600;
@@ -238,7 +161,7 @@
 .branchPreview {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   color: var(--faint);
   font: 10px/1.6 var(--font-mono);
   max-width: 100%;
@@ -253,7 +176,7 @@
 .itemFooter {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   margin-top: 9px;
   font-size: var(--fs-ui-11);
   min-width: 0;
@@ -270,7 +193,7 @@
 .itemSignals {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   margin-left: auto;
   color: var(--faint);
   white-space: nowrap;
@@ -292,7 +215,7 @@
   font-size: var(--fs-ui-11);
 }
 .inboxError {
-  padding: 8px 12px;
+  padding: var(--sp-4) var(--sp-5);
   flex: none;
 }
 .empty {
@@ -316,10 +239,10 @@
 .inbox .loadMore {
   display: block;
   width: calc(100% - 24px);
-  margin: 12px;
+  margin: var(--sp-5);
   padding: 7px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--r-1);
   background: var(--panel-2);
 }
 .inboxFooter {
@@ -327,7 +250,7 @@
   justify-content: space-between;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   border-top: 1px solid var(--border);
   padding: 7px 10px;
   color: var(--faint);
@@ -391,25 +314,25 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   background: var(--panel-2);
-  border-radius: 3px;
-  padding: 2px 4px;
+  border-radius: var(--r-1);
+  padding: var(--sp-1) var(--sp-2);
   font: 10px/1.5 var(--font-mono);
 }
 .assignees {
   color: var(--dim);
   display: flex;
   align-items: baseline;
-  gap: 4px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
   font-size: var(--fs-ui-11);
 }
 .approval {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 9px;
   border: 1px solid color-mix(in srgb, var(--dim) 25%, transparent);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   color: var(--dim);
   background: var(--panel-2);
 }
@@ -420,7 +343,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
 }
 .approval strong {
   font-size: var(--fs-ui-12);
@@ -475,8 +398,8 @@
 .reviewPanel .reviewActions button {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
   font: 11px/1.4 var(--font-ui);
   text-align: left;
   border-color: var(--border-soft);

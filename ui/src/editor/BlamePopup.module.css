@@ -11,12 +11,12 @@
 .card {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
   /* Wide enough for a full subject line without wrapping in the common case, and capped so a
      500-character commit message from a squash does not become a card the width of the window. */
   max-width: 440px;
   min-width: 220px;
-  padding: 8px 10px;
+  padding: var(--sp-4) var(--sp-5);
 }
 
 /*
@@ -48,31 +48,9 @@
 
 .actions {
   display: flex;
-  gap: 6px;
-  margin-top: 6px;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
 }
 
-.action {
-  background: var(--chrome);
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  color: var(--text);
-  cursor: pointer;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-11);
-  padding: 3px 8px;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
 
-.action:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
 
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}

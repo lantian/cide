@@ -3165,7 +3165,26 @@ fn render_milestones(view: &cide_ipc::MilestonesView) -> String {
                 .iter()
                 .filter(|t| t.status != TaskStatus::Done)
                 .collect();
-            out.push_str(&format!("  tasks: {} open, {done} done\n", open.len()));
+            // Inbox rows under the goal are counted apart (M99): they are not work in flight,
+            // but they do hold the milestone — the Accept button and the spinner's stand-down
+            // both wait on them (`cide_agents::milestones::inbox_under`) — and a model told only
+            // "3 open" cannot see that one of the three is a decision it owes rather than work.
+            let undecided = open
+                .iter()
+                .filter(|t| t.status == TaskStatus::Inbox)
+                .count();
+            out.push_str(&format!(
+                "  tasks: {} open, {done} done{}\n",
+                open.len() - undecided,
+                if undecided == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", {undecided} in the inbox under it — undecided, and this milestone \
+                         cannot be accepted until each is moved to todo or unlinked from the goal"
+                    )
+                }
+            ));
             // Every open one for the active milestone — that is the work — and a count for the
             // rest, whose lists are read when they become active, not before.
             if active.as_deref() == Some(m.id.as_str()) && !view.accepted.contains(&m.id) {
@@ -8446,6 +8465,10 @@ mod tests {
             "{text}"
         );
         assert!(
+            !text.contains("undecided"),
+            "nothing sits in this milestone's inbox: {text}"
+        );
+        assert!(
             !text.contains("t-4"),
             "done work is counted, not listed: {text}"
         );
@@ -8453,6 +8476,50 @@ mod tests {
             text.contains("  tasks: 1 open, 0 done\n") && !text.contains("t-10"),
             "{text}"
         );
+    }
+
+    /// An inbox row under the active milestone is listed, counted apart from the open work, and
+    /// says what clears it. (M99) The bug it comes from: selfcraft's `slice`, gate green and one
+    /// inbox row under the goal, read everywhere as finished.
+    #[test]
+    fn the_milestones_answer_counts_the_inbox_under_the_goal_apart() {
+        let task_of = |id: &str, status, depth| cide_ipc::MilestoneTask {
+            id: TaskId(id.into()),
+            title: format!("work {id}"),
+            status,
+            agent: None,
+            depth,
+        };
+        let view = cide_ipc::MilestonesView {
+            project: cide_ipc::ProjectId::new(),
+            plan: cide_ipc::MilestonePlan {
+                items: vec![cide_ipc::Milestone {
+                    id: "slice".into(),
+                    title: "slice".into(),
+                    task: Some(TaskId("t-1".into())),
+                    gate: "true".into(),
+                    timeout_secs: None,
+                }],
+                ..Default::default()
+            },
+            gates: Vec::new(),
+            verifies: Vec::new(),
+            accepted: Vec::new(),
+            tasks: vec![cide_ipc::MilestoneTasks {
+                milestone: "slice".into(),
+                tasks: vec![
+                    task_of("t-2", TaskStatus::Done, 0),
+                    task_of("t-3", TaskStatus::Inbox, 0),
+                ],
+            }],
+            proposals: Vec::new(),
+        };
+        let text = render_milestones(&view);
+        assert!(
+            text.contains("  tasks: 0 open, 1 done, 1 in the inbox under it — undecided"),
+            "{text}"
+        );
+        assert!(text.contains("- t-3 [inbox] work t-3"), "{text}");
     }
 
     /// With milestones, the orchestrator's task is todo only under the active one. (M83)

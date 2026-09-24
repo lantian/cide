@@ -1,4 +1,9 @@
 import { UserLink } from './UserLink'
+import { IconButton } from '@/kit/components/Button'
+import { Segmented } from '@/kit/components/Choice'
+import { SearchField, TextInput } from '@/kit/components/Field'
+import { Select } from '@/kit/components/Select'
+import { PanelHeader } from '@/kit/components/Surface'
 import { useEffect, useState } from 'react'
 import { gitlab } from '@/ipc/client'
 import { openReview, startGitLab, useGitLab } from './store'
@@ -103,94 +108,84 @@ export function GitLabInbox() {
   )
   return (
     <section className={chrome.inbox} aria-label="GitLab merge requests">
-      <header className={chrome.panelHeader}>
-        <h2>Merge requests</h2>
-        <button
-          className={chrome.iconButton}
-          title="Refresh merge requests"
-          aria-label="Refresh merge requests"
-          disabled={busy}
-          onClick={() => {
-            setPage(1)
-            setRefresh((n) => n + 1)
-          }}
-        >
-          <Icon name="refresh-cw" />
-        </button>
-        <button
-          className={chrome.iconButton}
-          title="Open merge request by URL"
-          aria-label="Open merge request by URL"
-          onClick={() => showOverlay('gitlabOpen')}
-        >
-          <Icon name="link" />
-        </button>
-      </header>
+      <PanelHeader
+        title="Merge requests"
+        tools={
+          <>
+            <IconButton
+              icon="refresh-cw"
+              label="Refresh merge requests"
+              disabled={busy}
+              onClick={() => {
+                setPage(1)
+                setRefresh((n) => n + 1)
+              }}
+            />
+            <IconButton
+              icon="link"
+              label="Open merge request by URL"
+              onClick={() => showOverlay('gitlabOpen')}
+            />
+          </>
+        }
+      />
       <div className={chrome.inboxFilters}>
-        <div
-          className={chrome.scopeTabs}
-          role="group"
-          aria-label="MR relationship"
-        >
-          {(
-            [
-              ['review', 'To review', 'Review requested from me'],
-              ['created', 'Created', 'Created by me'],
-              ['assigned', 'Assigned', 'Assigned to me'],
-            ] as const
-          ).map(([value, label, title]) => (
-            <button
-              key={value}
-              aria-pressed={scope === value}
-              aria-label={title}
-              title={title}
-              onClick={() => setScope(value)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-        <label className={chrome.searchField}>
-          <Icon name="search" size={1} />
-          <input
-            aria-label="Search merge requests"
-            placeholder="Search merge requests…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-        </label>
+        <Segmented
+          label="MR relationship"
+          block
+          size="sm"
+          value={scope}
+          onChange={setScope}
+          options={[
+            { value: 'review', label: 'To review' },
+            { value: 'created', label: 'Created' },
+            { value: 'assigned', label: 'Assigned' },
+          ]}
+        />
+        <SearchField
+          size="sm"
+          aria-label="Search merge requests"
+          placeholder="Search merge requests…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
         <div className={chrome.filterRow}>
-          <select
-            aria-label="MR state"
-            value={state}
-            onChange={(e) => setState(e.target.value)}
-          >
-            <option value="opened">Open</option>
-            <option value="merged">Merged</option>
-            <option value="closed">Closed</option>
-            <option value="all">All states</option>
-          </select>
-          <input
-            aria-label="Filter project"
-            title="Filter by group/project"
-            placeholder="All projects"
-            value={project}
-            onChange={(e) => setProject(e.target.value)}
-          />
+          <div className={chrome.filterState}>
+            <Select
+              size="sm"
+              aria-label="MR state"
+              value={state}
+              onChange={setState}
+              options={[
+                { value: 'opened', label: 'Open' },
+                { value: 'merged', label: 'Merged' },
+                { value: 'closed', label: 'Closed' },
+                { value: 'all', label: 'All states' },
+              ]}
+            />
+          </div>
+          <div className={chrome.filterProject}>
+            <TextInput
+              size="sm"
+              aria-label="Filter project"
+              title="Filter by group/project"
+              placeholder="All projects"
+              value={project}
+              onChange={(e) => setProject(e.target.value)}
+            />
+          </div>
         </div>
         {board.accounts.length > 1 && (
-          <select
+          <Select
+            size="sm"
             aria-label="GitLab account"
             value={account}
-            onChange={(e) => setAccount(e.target.value)}
-          >
-            <option value="">All accounts</option>
-            {board.accounts.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.username} · {a.host}
-              </option>
-            ))}
-          </select>
+            onChange={setAccount}
+            options={[
+              { value: '', label: 'All accounts' },
+              ...board.accounts.map((a) => ({ value: a.id, label: `${a.username} · ${a.host}` })),
+            ]}
+          />
         )}
       </div>
       {(error || connectionError) && (

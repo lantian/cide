@@ -33,6 +33,10 @@
  * which imports nothing so `check:picker` can drive every case — including the ones that are only
  * visible as a wrong caret position.
  */
+import { Modal } from './ModalShell'
+import { PickerFrame } from '@/kit/components/Overlay'
+import { Button } from '@/kit/components/Button'
+import { TextInput } from '@/kit/components/Field'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { focusedCaret } from '@/editor/caretTrack'
@@ -84,16 +88,11 @@ export function GoToLine({ onDismiss, onGoTo }: GoToLineProps) {
   }
 
   return (
-    // Click-through to dismiss on the scrim only; `stopPropagation` on the box keeps a click
-    // inside from closing it. The same arrangement `ModalShell`'s `OverlayCard` uses.
-    <div className={styles.scrim} data-audit="gotoScrim" onMouseDown={onDismiss}>
-      <div
-        className={styles.popup}
+    <Modal onDismiss={onDismiss}>
+      <PickerFrame
+        label="Go to line"
+        narrow
         data-audit="gotoPopup"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Go to line"
-        onMouseDown={(ev) => ev.stopPropagation()}
         /*
          * Escape on the box rather than on `document`: a window listener would also answer for
          * the terminal underneath and for any other overlay that happens to be open. `stopPropagation`
@@ -107,31 +106,29 @@ export function GoToLine({ onDismiss, onGoTo }: GoToLineProps) {
       >
         <div className={styles.head}>Go to line</div>
         <div className={styles.row}>
-          <input
-            ref={field}
-            className={styles.input}
-            data-audit="gotoInput"
-            value={text}
-            placeholder="line or line:column"
-            aria-label="Line number"
-            spellCheck={false}
-            autoComplete="off"
-            onChange={(ev) => setText(ev.target.value)}
-            onKeyDown={(ev) => {
-              if (ev.key !== 'Enter') return
-              ev.preventDefault()
-              go()
-            }}
-          />
-          <button
-            type="button"
-            className={styles.button}
-            data-audit="gotoSubmit"
-            disabled={!canGo(parsed)}
-            onClick={go}
-          >
+          <div className={styles.field}>
+            {/* Mono, because the content is a number the user compares with the line count in
+                the note underneath. */}
+            <TextInput
+              ref={field}
+              mono
+              data-audit="gotoInput"
+              value={text}
+              placeholder="line or line:column"
+              aria-label="Line number"
+              spellCheck={false}
+              autoComplete="off"
+              onChange={(ev) => setText(ev.target.value)}
+              onKeyDown={(ev) => {
+                if (ev.key !== 'Enter') return
+                ev.preventDefault()
+                go()
+              }}
+            />
+          </div>
+          <Button variant="primary" data-audit="gotoSubmit" disabled={!canGo(parsed)} onClick={go}>
             Go
-          </button>
+          </Button>
         </div>
         {/*
           * One slot, always rendered, and its height reserved in CSS (`min-height`), so the box
@@ -142,7 +139,7 @@ export function GoToLine({ onDismiss, onGoTo }: GoToLineProps) {
         <div className={styles.note} data-audit="gotoNote" aria-live="polite">
           {note}
         </div>
-      </div>
-    </div>
+      </PickerFrame>
+    </Modal>
   )
 }

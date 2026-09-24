@@ -31,7 +31,7 @@
 .bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   flex: 0 0 auto;
   padding: 0 calc(8px + var(--pane-corner-clear, 0px)) 0 8px;
   min-height: calc(26px * var(--ui-scale));
@@ -50,29 +50,14 @@
 }
 
 .action {
-  appearance: none;
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  padding: 2px 8px;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
-.action:hover:not(:disabled) {
-  background: var(--chrome-hi);
-}
 
-.action:disabled {
-  color: var(--faint);
-  cursor: default;
-}
+
+
+
+
 
 .primary {
   composes: primary from '../styles/buttons.module.css';
@@ -149,21 +134,21 @@
 }
 
 .empty {
-  padding: 12px;
+  padding: var(--sp-5);
   color: var(--dim);
   font-size: var(--fs-ui-12);
   line-height: 1.5;
 }
 
 .note {
-  margin: 0 0 8px;
+  margin: 0 0 var(--sp-4);
 }
 
 /* The per-conflict widget the centre pane draws above each unresolved region. */
 .decisions {
   display: flex;
-  gap: 4px;
-  padding: 2px 6px;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
   background: var(--chrome-hi);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
@@ -172,7 +157,7 @@
 .decisionLabel {
   color: var(--dim);
   font-size: var(--fs-ui-11);
-  margin-right: 4px;
+  margin-right: var(--sp-2);
   align-self: center;
 }
 
@@ -196,6 +181,11 @@
 }
 
 /*
+.accept {
+  composes: button sm secondary from '../kit/components/Button.module.css';
+  flex: none;
+}
+
  * IDEA's chevron, as a button in the side pane's heading.
  *
  * In the *heading* rather than in the editor's gutter, and that is a limit worth stating: IDEA
@@ -206,32 +196,10 @@
  * header). The regions are still painted in all three panes, so the button always has a visible
  * subject.
  */
-.accept {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-2);
-  height: calc(18px * var(--ui-scale));
-  padding: 0 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--panel);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-11);
-  cursor: pointer;
-}
 
-.accept:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
-}
 
-.accept:disabled {
-  color: var(--faint);
-  border-color: var(--border-soft);
-  cursor: default;
-}
+
+
 
 /* Already taken. Green, and it stays clickable — clicking again removes it, which is how a
    user backs out of "both" without resetting the whole region. */
@@ -243,7 +211,7 @@
 .paneHead {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 
 /*

@@ -365,7 +365,7 @@ try {
       'act irreversible on a machine that is not the user’s',
   )
   ok(
-    /styles\.primary\}`\}[\s\S]*?data-audit="pushCancel"/.test(dialog),
+    /variant="primary"\s+data-audit="pushCancel"/.test(dialog),
     'the accent is on Cancel — rule 3, and this dialog is opened by a keystroke',
   )
   ok(
@@ -374,8 +374,8 @@ try {
       'run on every render and yank focus back off the force checkbox',
   )
   ok(
-    /forcing \? styles\.danger/.test(dialog),
-    'the red is on the confirm button only while forcing — --red means one thing in this app',
+    /variant=\{forcing \? 'danger' : 'secondary'\}/.test(dialog),
+    'the danger fill is on the confirm button only while forcing — it means one thing in this app',
   )
   ok(
     /disabled=\{total === 0\}/.test(dialog),

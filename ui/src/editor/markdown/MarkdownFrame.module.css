@@ -187,12 +187,13 @@
 
 .switchButton:hover {
   color: var(--text-hi);
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .switchButton[aria-pressed='true'] {
+  /* The kit's icon toggle "on": the accent on a 12% accent wash. */
   color: var(--accent);
-  background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 /*

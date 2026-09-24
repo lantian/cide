@@ -229,74 +229,32 @@
 
 /* --- buttons ------------------------------------------------------------------------------- */
 
-.primary,
-.secondary,
-.add,
-.remove {
-  border-radius: var(--r-1);
-  font-family: var(--font-ui);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.primary:disabled,
-.secondary:disabled,
-.add:disabled,
-.remove:disabled {
-  cursor: default;
-  opacity: 0.45;
-}
-
 .primary {
-  composes: primary from '../../styles/buttons.module.css';
-  padding: var(--sp-2) var(--sp-5);
-  border: 1px solid transparent;
-  font-size: var(--fs-ui-12);
+  composes: button sm primary from '../../kit/components/Button.module.css';
 }
 
 .secondary {
-  padding: var(--sp-2) var(--sp-4);
-  border: 1px solid var(--border);
-  background: var(--chrome);
-  color: var(--text);
-  font-size: var(--fs-ui-12);
-  white-space: nowrap;
-}
-
-.secondary:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
 .add {
+  composes: button sm quiet from '../../kit/components/Button.module.css';
   align-self: flex-start;
-  padding: var(--sp-1) var(--sp-3);
-  border: 1px dashed var(--border);
-  background: transparent;
-  color: var(--dim);
-  font-size: var(--fs-ui-11);
 }
 
-.add:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text);
-}
-
+/* A word, not a mark, so the kit's small quiet button rather than its square icon button. */
 .remove {
-  padding: var(--sp-1) var(--sp-3);
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--faint);
-  font-size: var(--fs-ui-11);
+  composes: button sm quiet from '../../kit/components/Button.module.css';
 }
 
-.remove:hover:not(:disabled) {
-  border-color: var(--red);
-  color: var(--red);
-}
+
+
+
+
+
+
+
+
 
 /* --- notes and the footer ------------------------------------------------------------------ */
 

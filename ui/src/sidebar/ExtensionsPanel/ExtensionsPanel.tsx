@@ -101,7 +101,7 @@ export function ExtensionsPanelView(props: ExtensionsPanelViewProps): React.JSX.
             title="Connect a marketplace"
             onClick={() => setConnecting((open) => !open)}
           >
-            +
+            <Icon name="plus" size={1} />
           </button>
         )}
       </div>

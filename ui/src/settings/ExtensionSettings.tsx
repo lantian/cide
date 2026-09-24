@@ -25,7 +25,8 @@
  * `ext.setSetting`. So this component takes no `SectionProps` — the same shape `AgentsSection` has
  * for the same reason, and `sections.tsx` says so where it renders both.
  */
-import { NumberField, Note, Row, Segmented, ToggleRow } from './controls'
+import { TextInput } from '@/kit/components/Field'
+import { Group, NumberField, Note, Row, Segmented, ToggleRow } from './controls'
 import styles from './controls.module.css'
 import { notifyFailure } from '@/chrome/notices'
 import { ext as extApi } from '@/ipc/client'
@@ -157,8 +158,7 @@ export function ExtensionSettingsView({
   return (
     <>
       {rows.map((extension) => (
-        <section key={`${extension.marketplace}.${extension.extension}`} className={styles.group}>
-          <h3 className={styles.groupTitle}>{extension.name}</h3>
+        <Group key={`${extension.marketplace}.${extension.extension}`} title={extension.name}>
           {/*
            * First, above the extension's own settings: it is cide's row rather than the
            * extension's, and it decides whether the reader can *find* the thing the rows below
@@ -184,7 +184,7 @@ export function ExtensionSettingsView({
               onChange={(next) => onChange?.(extension, setting.id, next)}
             />
           ))}
-        </section>
+        </Group>
       ))}
     </>
   )
@@ -267,8 +267,9 @@ function SettingRow({
           label={setting.label}
           hint={hint}
           control={
-            <input
-              className={styles.text}
+            <div className={styles.selectBox}>
+            <TextInput
+              size="sm"
               type="text"
               spellCheck={false}
               aria-label={setting.label}
@@ -281,6 +282,7 @@ function SettingRow({
               // own header sets that out at length.
               onChange={(event) => onChange(event.target.value)}
             />
+            </div>
           }
         />
       )

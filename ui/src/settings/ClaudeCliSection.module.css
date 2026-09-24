@@ -19,7 +19,7 @@
   display: block;
   font-size: var(--fs-ui-13);
   color: var(--text);
-  margin-bottom: 6px;
+  margin-bottom: var(--sp-3);
 }
 
 .fieldHint {
@@ -30,19 +30,27 @@
   margin-top: 5px;
 }
 
+/*
+ * The kit `TextInput`'s look — the `--bg` box, one control height, the accent border and 3px
+ * halo on focus — on a bare `<input>`, because these rows carry a state the kit field does not
+ * draw: a refused entry is struck through (below), a warned one gets an amber rule.
+ */
 .input {
   display: block;
   width: 100%;
-  height: calc(26px * var(--ui-scale));
-  padding: 0 9px;
+  height: calc(30px * var(--ui-scale));
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   /* A program name, a flag and a variable are all machine strings: mono, like every path and
      counter in this app. */
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .input::placeholder {
@@ -52,6 +60,7 @@
 .input:focus {
   outline: 0;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /*
@@ -88,7 +97,7 @@
 .list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 9px 0;
 }
 
@@ -97,7 +106,7 @@
   /* `wrap`, so the sentence below can take a whole line of its own rather than competing with
      the inputs for the row's width. Without it a long refusal squeezes the field it explains. */
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--sp-3);
   align-items: center;
 }
 
@@ -114,7 +123,7 @@
 .why {
   flex-basis: 100%;
   margin: 0;
-  padding-left: 2px;
+  padding-left: var(--sp-1);
   font-size: var(--fs-ui-12);
   line-height: 1.4;
   color: var(--dim);
@@ -131,48 +140,9 @@
   min-width: 0;
 }
 
+/* The kit's quiet `Button` with a plus, placed at the start of the list. */
 .add {
   align-self: flex-start;
-  height: calc(24px * var(--ui-scale));
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.add:hover {
-  color: var(--text);
-  border-color: var(--accent);
-}
-
-.remove {
-  flex: none;
-  width: 24px;
-  height: calc(26px * var(--ui-scale));
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--faint);
-  font-size: var(--fs-ui-14);
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.remove:hover {
-  color: var(--text);
-  border-color: var(--border);
 }
 
 /* --- the resolved argv --- */
@@ -181,8 +151,8 @@
   margin: 0;
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel);
-  padding: 8px 10px;
+  background: var(--panel-2);
+  padding: var(--sp-4) var(--sp-5);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   line-height: 1.7;
@@ -205,7 +175,7 @@
 }
 
 .foot {
-  margin: 8px 0 0;
+  margin: var(--sp-4) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
@@ -222,8 +192,8 @@
 .injections {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 4px 0;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
 }
 
 /*
@@ -262,7 +232,7 @@
  * it is meant to be read, so it gets the line height of prose rather than of a hint.
  */
 .injectionCost {
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);

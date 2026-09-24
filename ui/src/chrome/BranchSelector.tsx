@@ -35,6 +35,7 @@
  * Every decision about *which* rows appear and *what a refusal says* is in `branchModel.ts`,
  * which has no React in it and is driven directly by `ui/scripts/check-branches.mjs`.
  */
+import { Button, IconButton } from '@/kit/components/Button'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { notify } from '@/chrome/notices'
@@ -691,17 +692,13 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 }}
               />
               <div className={styles.actions}>
-                <button
-                  type="button"
-                  className={styles.action}
+                <Button size="sm"
                   disabled={busy}
                   onClick={() => setMode({ kind: 'new', from: null })}
                 >
                   New branch…
-                </button>
-                <button
-                  type="button"
-                  className={styles.action}
+                </Button>
+                <Button size="sm"
                   disabled={busy || project === null || repo === null}
                   // Tracked, so the bar says `Fetching…` for the whole network round trip.
                   // `act` routes this through `store.run` as a `'checkout'` — `GitOp` has no
@@ -713,20 +710,16 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   }
                 >
                   Fetch
-                </button>
-                <button
-                  type="button"
-                  className={styles.action}
+                </Button>
+                <Button size="sm"
                   // Without an upstream this only ever fails, so it is not offered.
                   disabled={busy || !canPull(list?.head ?? null)}
                   onClick={() => void tryPull()}
                   title="Fetch, then integrate — fast-forward, merge or rebase."
                 >
                   Pull
-                </button>
-                <button
-                  type="button"
-                  className={styles.action}
+                </Button>
+                <Button size="sm"
                   disabled={busy || !canPush(list?.head ?? null)}
                   /*
                    * Opens the dialog rather than pushing, since M31 — the same road the palette
@@ -751,7 +744,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   }}
                 >
                   Push
-                </button>
+                </Button>
               </div>
             </div>
 
@@ -840,12 +833,10 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 : 'Deleting a branch removes the name. The commits stay until git collects them.'}
             </p>
             <div className={styles.panelButtons}>
-              <button type="button" className={styles.action} onClick={back}>
+              <Button size="sm" onClick={back}>
                 Cancel
-              </button>
-              <button
-                type="button"
-                className={mode.force ? styles.danger : styles.primary}
+              </Button>
+              <Button size="sm" variant={mode.force ? 'danger' : 'primary'}
                 disabled={busy}
                 onClick={() => {
                   if (project === null || repo === null) return
@@ -872,7 +863,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 }}
               >
                 {mode.force ? 'Delete anyway' : 'Delete'}
-              </button>
+              </Button>
             </div>
           </div>
         )}
@@ -919,27 +910,23 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
               <code>git stash list</code> has it either way.
             </p>
             <div className={styles.panelButtons}>
-              <button type="button" className={styles.action} onClick={back}>
+              <Button size="sm" onClick={back}>
                 Cancel
-              </button>
-              <button
-                type="button"
-                className={styles.action}
+              </Button>
+              <Button size="sm"
                 disabled={busy}
                 onClick={() => tryCheckout(mode.refusal.branch, 'stash')}
                 title="git stash -u, then switch. The whole working tree — including untracked files — stays in the stash."
               >
                 Stash and switch
-              </button>
-              <button
-                type="button"
-                className={styles.primary}
+              </Button>
+              <Button size="sm" variant="primary"
                 disabled={busy}
                 onClick={() => tryCheckout(mode.refusal.branch, 'stashAndRestore')}
                 title="Stash the whole working tree, switch, then put it all back on the new branch."
               >
                 Bring changes along
-              </button>
+              </Button>
             </div>
           </div>
         )}
@@ -1036,42 +1023,39 @@ function Row({ entry, head, heading, id, active, open, busy, ...on }: RowProps) 
           </span>
           <span className={styles.subject}>{entry.subject}</span>
         </button>
-        <button
-          type="button"
-          className={styles.more}
-          aria-label={`Actions for ${entry.name}`}
+        <IconButton
+          icon="ellipsis"
+          label={`Actions for ${entry.name}`}
           aria-expanded={open}
           onClick={on.onToggleMenu}
-        >
-          <Icon name="ellipsis" size={1} />
-        </button>
+        />
       </div>
       {open && (
         <div className={styles.rowMenu}>
           {actions.includes('checkout') && (
-            <button type="button" className={styles.menuItem} onClick={on.onCheckout}>
+            <Button size="sm" onClick={on.onCheckout}>
               Checkout
-            </button>
+            </Button>
           )}
           {actions.includes('newFrom') && (
-            <button type="button" className={styles.menuItem} onClick={on.onNewFrom}>
+            <Button size="sm" onClick={on.onNewFrom}>
               New branch from here
-            </button>
+            </Button>
           )}
           {actions.includes('merge') && (
-            <button type="button" className={styles.menuItem} onClick={on.onMerge}>
+            <Button size="sm" onClick={on.onMerge}>
               Merge into current branch
-            </button>
+            </Button>
           )}
           {actions.includes('rename') && (
-            <button type="button" className={styles.menuItem} onClick={on.onRename}>
+            <Button size="sm" onClick={on.onRename}>
               Rename
-            </button>
+            </Button>
           )}
           {actions.includes('delete') && (
-            <button type="button" className={styles.menuItem} onClick={on.onDelete}>
+            <Button size="sm" onClick={on.onDelete}>
               Delete
-            </button>
+            </Button>
           )}
         </div>
       )}
@@ -1099,12 +1083,12 @@ function MergePanel({ ask, busy, onCancel, onMerge }: MergePanelProps) {
       <p className={styles.panelTitle}>{ask.title}</p>
       <p className={styles.panelBody}>{ask.body}</p>
       <div className={styles.panelButtons}>
-        <button type="button" className={styles.action} onClick={onCancel}>
+        <Button size="sm" onClick={onCancel}>
           Cancel
-        </button>
-        <button type="button" className={styles.primary} disabled={busy} onClick={onMerge}>
+        </Button>
+        <Button size="sm" variant="primary" disabled={busy} onClick={onMerge}>
           Merge
-        </button>
+        </Button>
       </div>
     </div>
   )
@@ -1153,27 +1137,23 @@ function NameForm({ title, submit, secondary, initial, busy, onCancel, onSubmit 
         }}
       />
       <div className={styles.panelButtons}>
-        <button type="button" className={styles.action} onClick={onCancel}>
+        <Button size="sm" onClick={onCancel}>
           Cancel
-        </button>
+        </Button>
         {secondary !== undefined && (
-          <button
-            type="button"
-            className={styles.action}
+          <Button size="sm"
             disabled={!ready}
             onClick={() => onSubmit(name.trim(), false)}
           >
             {secondary}
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
-          className={styles.primary}
+        <Button size="sm" variant="primary"
           disabled={!ready}
           onClick={() => onSubmit(name.trim(), secondary !== undefined)}
         >
           {submit}
-        </button>
+        </Button>
       </div>
     </div>
   )

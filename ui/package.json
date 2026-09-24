@@ -44,6 +44,7 @@
     "check:image": "node scripts/check-image.mjs",
     "check:input": "node scripts/check-input-emitters.mjs",
     "check:json-log": "node scripts/check-json-log.mjs",
+    "check:kit": "node scripts/check-kit.mjs",
     "check:keymap": "node scripts/check-keymap.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:latin": "node scripts/check-latin.mjs",

@@ -45,6 +45,9 @@
  * spelling, because "it is focused, usually" is exactly the kind of thing that reads fine in a
  * review.
  */
+import { Icon } from '@/icons/Icon'
+import { Modal } from './ModalShell'
+import { PickerFrame, PickerInput, PickerList, PickerRow, PickerStatus } from '@/kit/components/Overlay'
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { SCRATCH_TYPES, defaultScratchType, filterScratchTypes } from '@/editor/languages'
@@ -88,7 +91,7 @@ export function ScratchType({ onDismiss, onCreate }: ScratchTypeProps) {
    */
   const [at, setAt] = useState(() => defaultScratchType(focusedTabPath(boot)))
   const field = useRef<HTMLInputElement>(null)
-  const rows = useRef<Array<HTMLButtonElement | null>>([])
+  const rows = useRef<Array<HTMLDivElement | null>>([])
 
   /*
    * Layout, not passive — see the module header. A frame with the field unfocused is a frame in
@@ -128,46 +131,20 @@ export function ScratchType({ onDismiss, onCreate }: ScratchTypeProps) {
   }
 
   return (
-    <div className={styles.scrim} data-audit="scratchScrim" onMouseDown={onDismiss}>
-      <div
-        className={styles.popup}
-        data-audit="scratchPopup"
-        role="dialog"
-        aria-modal="true"
-        aria-label="New scratch file"
-        onMouseDown={(ev) => ev.stopPropagation()}
-      >
-        <div className={styles.head}>
-          New scratch file
-          {/*
-            * Live, not the constant `13 types` it used to be. A filter with a fixed total beside
-            * it is a counter that contradicts the list under it the moment anything is typed.
-            */}
-          <span className={styles.count}>{matchCounter(shown.length, SCRATCH_TYPES.length)}</span>
-        </div>
-        <div className={styles.filterRow}>
+    <Modal onDismiss={onDismiss}>
+      <PickerFrame label="New scratch file" narrow data-audit="scratchPopup">
+        <div className={styles.head}>New scratch file</div>
+        <PickerInput
+          lead={<Icon name="search" size={1} />}
+          trailing={matchCounter(shown.length, SCRATCH_TYPES.length)}
+        >
           <input
             ref={field}
-            className={styles.input}
             data-audit="scratchFilter"
             aria-label="Filter scratch file types"
             placeholder="Filter…"
             value={query}
             onChange={(ev) => retype(ev.target.value)}
-            /*
-             * Handled on the field rather than on `document`, exactly as `GoToLine` argues: a
-             * window listener would also answer for the terminal underneath and for any other
-             * overlay that happens to be open. `listAction` is the shared list vocabulary — the
-             * same wrap-around, the same Page Up jump, the same Escape as the pickers — so this
-             * cannot drift into a list that feels different from the others.
-             *
-             * With **no matches** `listAction` answers `{kind:'none'}` for Enter, so the key is
-             * not claimed, nothing is created, and the popup stays open with the sentence below
-             * explaining why. That falls out of the shared vocabulary rather than being a rule
-             * here, which is the point of using it. What it deliberately does *not* do is create
-             * a scratch of the typed extension: that is a free-text path into
-             * `cide_core::scratch::check_ext` and a separate decision.
-             */
             onKeyDown={(ev) => {
               const action = listAction(ev, shown.length, at)
               if (!isListKey(action)) return
@@ -178,33 +155,18 @@ export function ScratchType({ onDismiss, onCreate }: ScratchTypeProps) {
               else if (action.kind === 'accept') accept(at)
             }}
           />
-        </div>
+        </PickerInput>
         {shown.length === 0 ? (
-          // Said out loud. An empty box under a query is otherwise indistinguishable from a
-          // popup that failed to load, which is the class of silence this project keeps paying
-          // for — and here it is one line of markup.
-          <p className={styles.none} data-audit="scratchNoMatch" role="status">
-            No type matches ‘{query.trim()}’.
-          </p>
+          <PickerStatus data-audit="scratchNoMatch">No type matches ‘{query.trim()}’.</PickerStatus>
         ) : (
-          <div className={styles.list} role="listbox" aria-label="Scratch file type">
+          <PickerList aria-label="Scratch file type">
             {shown.map((type, index) => (
-              <button
+              <PickerRow
                 key={type.ext}
                 ref={(el) => {
                   rows.current[index] = el
                 }}
-                type="button"
-                role="option"
-                aria-selected={index === at}
-                className={index === at ? `${styles.row} ${styles.rowOn}` : styles.row}
-                /*
-                 * `onMouseDown` and not `onClick`, and now for a sharper reason than before: the
-                 * *field* holds focus, and a `mousedown` on a button moves it before the click
-                 * resolves — which would blur the input, and a blur that reached anything would
-                 * unmount this overlay from under a half-finished gesture. `preventDefault`
-                 * keeps the caret in the field. The pickers all bind the same event.
-                 */
+                selected={index === at}
                 onMouseDown={(ev) => {
                   ev.preventDefault()
                   ev.stopPropagation()
@@ -216,11 +178,11 @@ export function ScratchType({ onDismiss, onCreate }: ScratchTypeProps) {
                 {/* The extension, because it is what the file will actually be called and what
                     decides the highlighting — `scratch.rs`, not "a Rust file". */}
                 <span className={styles.ext}>.{type.ext}</span>
-              </button>
+              </PickerRow>
             ))}
-          </div>
+          </PickerList>
         )}
-      </div>
-    </div>
+      </PickerFrame>
+    </Modal>
   )
 }

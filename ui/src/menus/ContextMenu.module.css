@@ -1,16 +1,17 @@
 /*
- * The context menu box.
+ * The context menu box — the UI kit's `Menu` (`kit/components/Overlay.module.css`), drawn by the
+ * component that positions it. The kit's `Menu` is the look and the spec; this is the real menu
+ * with placement, submenus and keyboard, so it keeps its own stylesheet and copies the kit's
+ * numbers rather than composing its classes (a kit class carrying `position: fixed` placement
+ * would stop being a specimen the page can show inline).
  *
- * Tokens only — every colour here is defined in both `:root` (light, white) and
- * `[data-theme='dark']`, so the menu is checked against the *default* theme first. The two
- * places a menu can go wrong on white specifically are the ground and the hover: `--panel`
- * on `--bg` is only a hair of contrast, so the box needs its border and its shadow to read
- * as floating, and a hover built from `--accent` would be a saturated red bar on white.
- * `--chrome-hi` is the hover in both themes and is a step *away* from the panel in each.
- *
- * Dimensions follow the mock's overlay family: 1px `--border`, `--shadow`, a 9px card radius
- * on the box and square rows inside it (same reason as `Overlay.module.css` — square rows
- * paint over a rounded corner unless the box clips them).
+ * The kit's rules, restated where they bite:
+ *   - a `--panel` box with its border, `--r-3`, `--shadow-2`, inset `--sp-2`; rows `--r-1`;
+ *   - hover and the keyboard's current row are `--sel`, the one "selected" drawing — never
+ *     the accent, which would be a saturated red bar on white;
+ *   - a destructive item is ink, bold at rest, with the black `--grad-danger` fill under the
+ *     pointer: with a red accent a red Delete read as the primary act, and red text on a
+ *     hover ground had been a contrast problem anyway.
  */
 
 .menu {
@@ -20,20 +21,20 @@
    * recent thing the user did, and it is dismissed by the next click anywhere.
    */
   z-index: 80;
-  min-width: 180px;
-  max-width: 380px;
+  min-width: calc(200px * var(--ui-scale));
+  max-width: calc(380px * var(--ui-scale));
   display: flex;
   flex-direction: column;
-  padding: 4px 0;
+  padding: var(--sp-2);
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: var(--r-4);
+  border-radius: var(--r-3);
   box-shadow: var(--shadow-2);
   /* `placeMenu` computes the budget; the box scrolls inside it rather than off the window. */
   overflow-y: auto;
   overflow-x: hidden;
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
+  font-size: var(--fs-ui-12);
   -webkit-user-select: none;
   user-select: none;
   outline: none;
@@ -60,10 +61,11 @@
   text-align: left;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 10px 0 8px;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-4);
   height: calc(26px * var(--ui-scale));
   flex: 0 0 auto;
+  border-radius: var(--r-1);
   color: var(--text);
   font: inherit;
   cursor: default;
@@ -76,29 +78,32 @@
 .item:hover:not(.disabled),
 .item:focus-visible,
 .item.active {
-  background: var(--chrome-hi);
+  background: var(--sel);
   color: var(--text-hi);
   outline: none;
 }
 
 .danger {
-  color: var(--red);
+  color: var(--text-hi);
+  font-weight: 600;
 }
 
 /*
  * Repeated for the focused states because `.item:hover:not(.disabled)` is three selectors
- * wide and `.item.active` two, so both outrank a bare `.danger` and would repaint Delete in
- * `--text-hi` at exactly the moment the pointer is on it — the one line whose colour is
- * carrying information loses it in the instant before the click. Ordering the rules
+ * wide and `.item.active` two, so both outrank a bare `.danger` and would paint Delete with
+ * the ordinary `--sel` ground at exactly the moment the pointer is on it. Ordering the rules
  * differently does not help; only matching the specificity does.
- *
- * `--red` on `--chrome-hi` is 4.5:1 on white and better than that on the dark panel, so the
- * hover ground does not cost the contrast the colour was chosen for.
  */
 .item.danger:hover:not(.disabled),
 .item.danger:focus-visible,
 .item.danger.active {
-  color: var(--red);
+  background: var(--grad-danger);
+  color: var(--on-danger);
+}
+
+.item.danger:hover:not(.disabled) .hint,
+.item.danger.active .hint {
+  color: inherit;
 }
 
 .disabled {
@@ -144,7 +149,7 @@
   flex: 0 0 auto;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  color: var(--dim);
+  color: var(--faint);
   letter-spacing: 0;
 }
 
@@ -164,7 +169,7 @@
      glyph in them to outgrow the box. */
   height: 1px;
   flex: 0 0 auto;
-  margin: 4px 0;
+  margin: var(--sp-2) var(--sp-3);
   background: var(--border-soft);
 }
 

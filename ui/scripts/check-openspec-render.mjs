@@ -804,6 +804,8 @@ try {
      * a panel whose title sets differently from every other one reads as a rendering fault.
      */
     {
+      // Since the redesign (2026-09-24) every sidebar header is the UI kit's `PanelHeader`,
+      // composed rather than restated — so "the same as every other" is "composes the kit's".
       const tasksCss = read('../src/sidebar/TasksPanel/TasksPanel.module.css')
       const rules = (source, selector) => {
         const at = source.indexOf(`\n${selector} {`)
@@ -812,25 +814,9 @@ try {
       const mine = rules(css, '.head')
       const theirs = rules(tasksCss, '.header')
       ok(mine !== '' && theirs !== '', 'both header rules were found')
-      for (const property of [
-        'height',
-        'font-size',
-        'font-weight',
-        'letter-spacing',
-        'text-transform',
-        'color',
-        'padding',
-      ]) {
-        const value = (block) => {
-          const match = new RegExp(`\\n\\s*${property}:\\s*([^;]+);`).exec(block)
-          return match === null ? null : match[1].trim()
-        }
-        eq(
-          value(mine),
-          value(theirs),
-          `the OpenSpec header's ${property} matches every other sidebar header's`,
-        )
-      }
+      const kitHeader = /composes:\s*panelHeader from '[^']*kit\/components\/Surface\.module\.css'/
+      ok(kitHeader.test(mine), "the OpenSpec header composes the kit's PanelHeader")
+      ok(kitHeader.test(theirs), '…and so does the Tasks header it used to be compared with')
       // And the content starts on the same left edge as the title, which is the other half of
       // looking like one panel: a header at one indent over rows at another reads as a fault.
       ok(

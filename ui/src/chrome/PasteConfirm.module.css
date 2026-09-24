@@ -1,232 +1,25 @@
 /*
- * The paste confirmation's body. The scrim and the 620px card come from `OverlayCard`
- * (`overlays/Overlay.module.css`), so this file styles only what sits inside them.
- *
- * Deliberately the same measurements as `CloseConfirm.module.css`: 16/18px head padding,
- * 12.5px body, the same button shape. The two are the only confirmations in the app and a
- * user meets them a minute apart; two dialogs that are 4px and half a font-size different is
- * how an app stops looking like one app. They are not merged into a shared stylesheet because
- * the shared part is already `OverlayCard` — what is left is each dialog's own content, and a
- * common file for that would be a place for one dialog's tweak to move the other.
- *
- * Every colour is a token, so both themes come out of `tokens.css`. `--red` appears once, on
- * the answer that cannot be undone.
+ * The paste collision dialog. The frame, buttons, checkbox and file list are the UI kit's
+ * (`Modal` + `Dialog`, `Button`, `Checkbox`, `PathList`); this styles the two pieces of text
+ * the kit has no part for.
  */
 
-/* Re-declares the column for the reason `CloseConfirm`'s wrapper does: `OverlayCard` makes the
-   card a flex column, and a plain block in between would make the list stop being the only
-   thing that scrolls. */
-.dialog {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.head {
-  flex: none;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.titleRow {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.title {
-  flex: 1;
-  min-width: 0;
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-/* `3 of 7`. Mono and dim: it is a position, not a message, and it must not compete with the
-   name of the file being asked about. */
-.progress {
-  flex: none;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  color: var(--faint);
-}
-
-.body {
-  margin: 0;
-  font-size: var(--fs-ui-13);
-  line-height: calc(18px * var(--ui-scale));
-  color: var(--dim);
-}
-
-/* The full destination path. Mono, dim, and ellipsised from the end — the same treatment as
-   `CloseConfirm`'s `.where`, and for the same reason: two folders called `src` are the normal
-   case, so the dialog has to say which one. */
+/* The destination, whole: mono and `--faint`, the full path on hover. */
 .where {
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   overflow: hidden;
-  white-space: nowrap;
   text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
-/*
- * The sample of what would be overwritten.
- *
- * Capped in Rust at six entries, so this never needs to grow without bound — but it still
- * scrolls, because a dialog taller than the window puts its own buttons off screen.
- */
-.list {
-  flex: 1;
-  min-height: 0;
-  max-height: calc(200px * var(--ui-scale));
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin: 0;
-  padding: 6px 0;
-  list-style: none;
-}
-
-.groupLabel {
-  padding: 8px 18px 4px;
-  font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--faint);
-}
-
-.row {
-  display: flex;
-  align-items: baseline;
-  gap: 9px;
-  padding: 3px 18px;
-  white-space: nowrap;
-}
-
-/* Red rather than the accent `CloseConfirm` uses for its dirty dot: these rows are not "at
-   risk if you continue", they are the exact files the button below destroys. */
-/*
- * A filled dot, drawn in CSS rather than as an icon.
- *
- * Lucide has no filled primitive — every mark in the set is a stroke — so `circle` here would
- * draw a *ring*, which reads as "empty" exactly where the meaning is "full". A filled dot is a
- * shape, not an icon, and this app already draws its shapes this way: `AppHeader`'s project dot
- * and `TabStrip`'s dirty marker are both boxes with a radius.
- */
-.mark {
-  flex: none;
-  /* The row's first column: an 8px dot, centred vertically by the row's `align-items`. */
-  width: 8px;
-  height: 8px;
-  margin: 0 1px;
-  border-radius: 50%;
-  background: currentColor;
-  color: var(--red);
-}
-
-.name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
-  color: var(--text-hi);
-}
-
-.more {
-  padding-left: 37px;
-  font-size: var(--fs-ui-12);
-  color: var(--faint);
-}
-
-.footer {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 18px;
-  border-top: 1px solid var(--border);
-}
-
-/* Pushed hard left, away from the three answers. A checkbox beside `Replace` is one that gets
-   ticked by a click that was 4px off — and this one multiplies whichever answer follows it. */
-.applyAll {
-  margin-right: auto;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-  cursor: default;
-}
-
-.applyAll input {
-  accent-color: var(--accent);
-  margin: 0;
-}
-
-.button {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
-  color: var(--text);
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.button:hover {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
-
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
-
-/*
- * *Keep both* is the default and the prominent one.
- *
- * It takes the accent fill, the initial focus and therefore the Enter key. Replace is the
- * plain button: this dialog exists because something is about to be destroyed, and making the
- * destruction the eye-catching default is how it gets clicked by reflex.
- */
-.buttonPrimary {
-  composes: primary from '../styles/buttons.module.css';
-}
-
-.buttonDanger {
-  color: var(--red);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.buttonDanger:hover {
-  border-color: var(--red);
-  color: var(--red);
-}
-
-/* The claim the whole ordering exists to make, under the buttons rather than in the body: it
-   is reassurance about the Cancel beside it, not part of the question. */
+/* "Nothing has been written yet" — under the list, before the answers, because it is what
+   makes Cancel free. */
 .note {
-  flex: none;
   margin: 0;
-  padding: 0 18px 14px;
-  font-size: var(--fs-ui-12);
-  line-height: calc(16px * var(--ui-scale));
+  padding: var(--sp-4) calc(28px * var(--ui-scale));
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }

@@ -1,179 +1,15 @@
 /*
- * The *New scratch file…* popup.
- *
- * A near-copy of `GoToLine.module.css`, which is itself `chrome/ProjectSwitcher.module.css`'s
- * geometry with a scrim. That duplication is deliberate and this comment is the accounting for
- * it: two copies is where extraction is a guess, and doing it in the same change that ships the
- * feature would make a regression in Go to line indistinguishable from a bug here.
- *
- * **A third copy is the trigger.** Whoever writes it should hoist `.scrim`, `.popup` and `.head`
- * into a shared `Popup.module.css` and leave the per-overlay rules behind, rather than adding a
- * third near-identical file to this directory.
- *
- * The one geometric difference from Go to line is the width — 380px rather than 340px, because
- * `TypeScript` beside `.ts` is a wider row than a line number — and the scrolling list, which
- * that one does not have.
- *
- * Every colour is a token, so both themes come for free.
+ * New scratch file. The frame, the filter row, the rows, the no-match line and the scrim are
+ * the UI kit's (`Modal`, `PickerFrame narrow`, `PickerInput`, `PickerRow`, `PickerStatus`);
+ * this styles the title strip and the two halves of a row.
  */
-
-.scrim {
-  position: fixed;
-  inset: 0;
-  /* The same layer as `Overlay.module.css`'s scrim: above the panes and the status bar, below
-     the context menus, which portal out at 80. */
-  z-index: 60;
-  background: var(--scrim, rgba(0, 0, 0, 0.42));
-}
-
-.popup {
-  position: fixed;
-  /* Centred with a transform rather than by flexing the scrim, so the box does not move as the
-     list scrolls. */
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-
-  width: 380px;
-  max-width: calc(100vw - 48px);
-  display: flex;
-  flex-direction: column;
-
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--r-4);
-  box-shadow: var(--shadow-2);
-  overflow: hidden;
-}
-
-/* The box no longer takes the keyboard — the filter field does — but the rule stays, because
-   the box is still `tabIndex={-1}`-less and a stray programmatic focus on a `role="dialog"` the
-   user is looking straight at must not draw a platform ring around the whole popup. */
-.popup:focus {
-  outline: none;
-}
-
-/* The same uppercase label the switcher and Go to line use, so the small popups read as
-   siblings. */
 .head {
   flex: none;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 9px 14px 7px;
+  padding: var(--sp-4) var(--sp-5) var(--sp-3);
   border-bottom: 1px solid var(--border-soft);
-  font-family: var(--font-ui);
   font-size: var(--fs-ui-12);
   font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
   color: var(--faint);
-}
-
-.count {
-  margin-left: auto;
-  letter-spacing: 0;
-  text-transform: none;
-  font-variant-numeric: tabular-nums;
-}
-
-/*
- * The filter field. (M15)
- *
- * Geometry copied from `GoToLine.module.css`'s `.row`/`.input` pair, which is the third copy in
- * this directory and therefore the trigger the header above names for hoisting a shared
- * `Popup.module.css`. It is not hoisted *in this change*, deliberately: doing it here would make
- * a regression in Go to line indistinguishable from a bug in the scratch picker, which is the
- * same argument that kept the two apart in the first place.
- *
- * `--font-ui` and no `tabular-nums`, unlike Go to line's: the content here is `TypeScript`, not
- * a line number.
- */
-/* `.filterRow`, not `.row` — this stylesheet already has a `.row`, which is a list row 24px
-   tall. Copying Go to line's selector name verbatim would have silently merged the two. */
-.filterRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 14px 2px;
-}
-
-.input {
-  flex: 1;
-  min-width: 0;
-  height: calc(26px * var(--ui-scale));
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-}
-
-.input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-
-.input::placeholder {
-  color: var(--faint);
-}
-
-/* What a query that matched nothing says, where the list would be. Without it, the fifth
-   indistinguishable empty state: an empty box that could equally be a popup that failed to
-   load. */
-.none {
-  padding: 12px 14px;
-  color: var(--dim);
-  font-size: var(--fs-ui-12);
-}
-
-/*
- * `max-height` in viewport units, so a short window scrolls rather than pushing the last rows
- * off the bottom edge of the screen — the box is centred by transform, so an overflowing child
- * would grow it symmetrically past both edges and the first rows would go too.
- */
-.list {
-  flex: 1;
-  min-height: 0;
-  max-height: min(52vh, 420px);
-  overflow-y: auto;
-  padding: 5px 0 6px;
-}
-
-.row {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  width: 100%;
-  /* The same 24px the file tree draws its rows at, so the two lists feel like one application. */
-  height: calc(24px * var(--ui-scale));
-  padding: 0 14px;
-  border: none;
-  background: transparent;
-  color: var(--text);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  text-align: left;
-  cursor: pointer;
-}
-
-.row:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
-/*
- * The selection, painted from a class rather than from `:hover` or `:focus`.
- *
- * Keyboard and pointer move the *same* index — `onMouseEnter` sets it — so there is exactly one
- * highlighted row however the user is driving. Two independent highlights is how a list ends up
- * with the arrow keys pointing at one row and Enter opening another.
- */
-.rowOn {
-  background: var(--accent);
-  color: var(--on-accent);
 }
 
 .label {
@@ -184,18 +20,11 @@
   white-space: nowrap;
 }
 
-/* Mono, and dim, because it is the literal suffix the file will carry. It shrinks before the
-   label does — a 380px box has room for both, but a future translation of `label` may not. */
+/* Mono, and faint, because it is the literal suffix the file will carry. It shrinks before the
+   label does — the box has room for both, but a future translation of `label` may not. */
 .ext {
   flex: none;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   color: var(--faint);
-}
-
-/* On the selected row the dim token would vanish into the accent ground, so it borrows the
-   foreground and loses its weight to opacity instead. */
-.rowOn .ext {
-  color: inherit;
-  opacity: 0.75;
 }

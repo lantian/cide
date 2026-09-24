@@ -136,6 +136,26 @@ pub fn open_under(rows: &[TaskRow], goal: &TaskId) -> usize {
         .count()
 }
 
+/// Inbox tasks under `goal`, the goal itself not counted. (M99)
+///
+/// Kept apart from [`open_under`] because the two answer different questions and one number
+/// could not answer both. The inbox is not work in flight, so it must never count against
+/// [`MilestonePlan::max_open`] — that cap is about how much is started at once, and counting
+/// observations in it would close the board to new work. But an inbox task *linked under a
+/// milestone's goal* is not nothing either: it is something a run noticed while working on that
+/// milestone and nobody has decided about, and accepting the milestone over it marks the goal
+/// done with an undecided item hanging under it, where nobody looks again. So it is a decision
+/// owed, and the surfaces that ask "is this milestone finished" ([`facts_line`], the spinner's
+/// stand-down, the Accept button) count it; the rest of the inbox — anything not under this
+/// goal — is untouched, or every passing observation anywhere would hold every milestone open.
+pub fn inbox_under(rows: &[TaskRow], goal: &TaskId) -> usize {
+    rows.iter()
+        .filter(|r| &r.id != goal)
+        .filter(|r| r.status == TaskStatus::Inbox)
+        .filter(|r| descends_from(rows, &r.id, goal))
+        .count()
+}
+
 /// Whether `task` may be started while milestones are in force: it serves the active milestone,
 /// or belongs to none. A task under a *later* milestone waits for it. `None` means it may.
 pub fn outside_active(plan: &MilestonePlan, rows: &[TaskRow], task: &TaskId) -> Option<String> {
@@ -314,6 +334,11 @@ pub fn facts_line(
         .as_ref()
         .map(|goal| open_under(rows, goal))
         .unwrap_or(0);
+    let undecided = current
+        .task
+        .as_ref()
+        .map(|goal| inbox_under(rows, goal))
+        .unwrap_or(0);
     let gate = match gate {
         None => "its gate has not run yet".to_string(),
         Some(result) if result.passed => "its gate PASSES".to_string(),
@@ -339,20 +364,17 @@ pub fn facts_line(
             )
         }
     };
-    // The open tasks themselves, not just their number (M83): a planning turn told "5 open" has
+    // The tasks themselves, not just their number (M83): a planning turn told "5 open" has
     // to go and find them, and one told which five does not. Capped, and the cap says so.
+    // Inbox rows under the goal are listed too (M99) — they are what the turn is being woken to
+    // decide, and a number with no ids sends it hunting through a board of hundreds.
     let listed: Vec<String> = current
         .task
         .as_ref()
         .map(|goal| {
             tree_under(rows, goal)
                 .into_iter()
-                .filter(|(_, r)| {
-                    matches!(
-                        r.status,
-                        TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Review
-                    )
-                })
+                .filter(|(_, r)| r.status != TaskStatus::Done)
                 .map(|(_, r)| {
                     let title: String = r.title.chars().take(60).collect();
                     format!("{} [{}] {title}", r.id, status_word(r.status))
@@ -370,13 +392,36 @@ pub fn facts_line(
     let tasks = if listed.is_empty() {
         String::new()
     } else if more > 0 {
-        format!(" Its open tasks: {shown}; and {more} more.")
+        format!(" Its unfinished tasks: {shown}; and {more} more.")
     } else {
-        format!(" Its open tasks: {shown}.")
+        format!(" Its unfinished tasks: {shown}.")
+    };
+    // What to do about the undecided ones, spelled out (M99): the milestone cannot be accepted
+    // while one is there, and a turn told only that it is blocked would look for work to do
+    // instead of making the decision that unblocks it.
+    let owed = if undecided == 0 {
+        String::new()
+    } else {
+        format!(
+            " {undecided} of its own {} in the inbox, undecided, and it cannot be accepted while \
+             {} does: either move it to todo (it is work this milestone needs) or unlink it from \
+             {} (it is not, and it stays in the inbox for a later milestone).",
+            if undecided == 1 {
+                "tasks sits"
+            } else {
+                "tasks sit"
+            },
+            if undecided == 1 { "it" } else { "they" },
+            current
+                .task
+                .as_ref()
+                .map(TaskId::to_string)
+                .unwrap_or_else(|| "its goal".into())
+        )
     };
     Some(format!(
         "Facts from cide: the active milestone is `{}` ({}){}; {gate}. It has {open} open tasks \
-         (limit {}); {inbox} tasks wait in the inbox.{tasks}",
+         (limit {}); {inbox} tasks wait in the inbox.{owed}{tasks}",
         current.id,
         current.title,
         current
@@ -1024,11 +1069,57 @@ mod tests {
         assert!(line.contains("2 open tasks"), "{line}");
         assert!(
             line.contains(
-                "Its open tasks: t-3 [doing] Bot finishes the run; t-4 [todo] Tune grub xp."
+                "Its unfinished tasks: t-3 [doing] Bot finishes the run; t-4 [todo] Tune grub xp."
             ),
-            "the open tasks are named, done ones are not: {line}"
+            "the unfinished tasks are named, done ones are not: {line}"
+        );
+        assert!(
+            !line.contains("undecided"),
+            "nothing is owed on this board: {line}"
         );
         assert!(facts_line(&MilestonePlan::default(), &rows, None).is_none());
+    }
+
+    /// An inbox row under the goal is counted apart from the open ones, named with the rest, and
+    /// spelled out as the decision it is. The `max_open` cap must not see it: the cap is about
+    /// work in flight, and an observation nobody ruled on is not in flight.
+    #[test]
+    fn an_inbox_task_under_the_goal_is_a_decision_owed() {
+        let t1 = TaskId("t-1".into());
+        let mut rows = board();
+        rows.push(row(
+            "t-7",
+            "Hollowroot density decision",
+            TaskStatus::Inbox,
+            Some("t-1"),
+        ));
+        rows.push(row("t-8", "Noticed elsewhere", TaskStatus::Inbox, None));
+
+        assert_eq!(inbox_under(&rows, &t1), 1, "only the one under the goal");
+        assert_eq!(open_under(&rows, &t1), 2, "the inbox is not open work");
+        assert_eq!(
+            placement(false, &plan(2), &rows, Some(&t1)).status,
+            TaskStatus::Inbox,
+            "the cap still counts the two open ones, and the inbox row does not push it over"
+        );
+
+        let line = facts_line(&plan(12), &rows, None).expect("a plan");
+        assert!(
+            line.contains("1 of its own tasks sits in the inbox, undecided"),
+            "{line}"
+        );
+        assert!(
+            line.contains("unlink it from t-1"),
+            "it says how to clear it: {line}"
+        );
+        assert!(
+            line.contains("t-7 [inbox] Hollowroot density decision"),
+            "the undecided row is named with the rest: {line}"
+        );
+        assert!(
+            !line.contains("t-8"),
+            "an inbox row outside the milestone is not its business: {line}"
+        );
     }
 
     fn failed_verify() -> cide_ipc::CheckResult {

@@ -73,7 +73,7 @@
 }
 
 .arrow {
-  padding: 0 6px;
+  padding: 0 var(--sp-3);
   color: var(--faint);
 }
 
@@ -98,7 +98,7 @@
 
 .crumb:hover {
   border-color: var(--border);
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text-hi);
 }
 
@@ -120,31 +120,15 @@
 }
 
 .back {
+  composes: button sm secondary from '../kit/components/Button.module.css';
   flex: none;
-  padding: 3px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--chrome-hi);
-  color: var(--text);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  line-height: 1.3;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.back:hover {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
 
-.back:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
+
+
+
+
 
 /*
  * The second strip, and the reason it is a strip rather than a sentence inside the buffer: the
@@ -172,12 +156,12 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: var(--sp-3);
   min-height: 0;
-  padding: 16px;
+  padding: var(--sp-6);
   background: var(--panel);
   text-align: center;
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   font-size: var(--fs-ui-12);
   color: var(--dim);
 }
@@ -185,6 +169,7 @@
 .noticeTitle {
   font-size: var(--fs-ui-13);
   color: var(--text-hi);
+  font-weight: 600;
 }
 
 .noticeWhy {

@@ -8,7 +8,7 @@
    * visible at all times.
    */
   overflow-x: hidden;
-  padding: 4px 0;
+  padding: var(--sp-2) 0;
   background: var(--panel);
   /*
    * No text selection in this tree, ever — not only while a drag is in flight.
@@ -53,31 +53,24 @@
   height: calc(24px * var(--ui-scale));
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   padding-right: 10px;
   white-space: nowrap;
   cursor: default;
 }
 
 /*
- * Hover, mixed down from the selection band. `--chrome-hi` is a heavier wash than `--sel` on
- * the white panel (L 0.794 against L 0.835 on a panel at L 1.000) and a lighter one in dark,
- * so hover and the current row read in opposite orders in the two themes; deriving one from
- * the other makes the ordering hold in both. See `sidebar/FileTree.module.css`.
+ * Hover is the kit's row hover, `--panel-2` (`docs/ui-kit.md`, "State, the same way
+ * everywhere"). It used to be mixed down from `--sel`, so hover and selection were one colour
+ * family; the kit gives every list one hover and one selection, and a tree that differs from
+ * the explorer beside it is the drift the kit exists to end.
  *
- * A `background-image` layer rather than a `background-color`, which is what the other two
- * sidebars use, because this is the one tree whose rows already have a colour of their own: a
- * group row is `--panel-2`, and an opaque hover *replaced* it, so hovering a changelist header
- * made it stop looking like a header. An image composites over the colour instead of
- * displacing it. The `--chrome-hi` line is the fallback an engine without `color-mix()` keeps —
- * one flat stop, so it is the band this replaces rather than nothing.
+ * Still a `background-image` layer rather than a `background-color`, because a row can carry a
+ * ground of its own (a drop band below) and an image composites over it instead of displacing
+ * it.
  */
 .row:hover {
-  background-image: linear-gradient(var(--chrome-hi), var(--chrome-hi));
-  background-image: linear-gradient(
-    color-mix(in srgb, var(--sel) 55%, transparent),
-    color-mix(in srgb, var(--sel) 55%, transparent)
-  );
+  background-image: linear-gradient(var(--panel-2), var(--panel-2));
 }
 
 /* Keyboard focus has to be visible in a tree whose selection is drawn as checkboxes: the
@@ -87,8 +80,10 @@
   box-shadow: var(--focus-inset);
 }
 
+/* A changelist or repository header: the name at the section caption's weight, on the panel
+   itself — `--panel-2` is the kit's hover, so a header drawn in it looked hovered at rest. */
 .groupRow {
-  background: var(--panel-2);
+  background: transparent;
 }
 
 /* There is no `.groupRow:hover` any more, and its absence is the fix: it repainted the row
@@ -207,7 +202,8 @@
 
 .groupName {
   font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
   color: var(--dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -239,10 +235,11 @@
  */
 .count {
   margin-left: auto;
-  padding-left: 8px;
+  padding-left: var(--sp-4);
   flex: none;
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
   color: var(--faint);
 }
 
@@ -349,7 +346,7 @@
  */
 .empty {
   margin: 0;
-  padding: 12px;
+  padding: var(--sp-5);
   color: var(--faint);
   font-size: var(--fs-ui-12);
 }
@@ -436,7 +433,6 @@
 .row[data-drop-band='move'],
 .row[data-drop-band='track'],
 .row[data-drop-band='noop'] {
-  background-image: linear-gradient(var(--chrome-hi), var(--chrome-hi));
   background-image: linear-gradient(
     color-mix(in srgb, var(--sel) 40%, transparent),
     color-mix(in srgb, var(--sel) 40%, transparent)
@@ -464,7 +460,7 @@
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding: 4px 8px;
+  padding: var(--sp-2) var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
   background: var(--chrome);

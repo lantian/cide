@@ -29,6 +29,9 @@
  * With `?git-story=<name>` on the URL it renders a fixture instead of talking to Rust —
  * `mock`, `guard`, `multi`, `empty`. See `fixture.ts` for why that exists.
  */
+import { Button } from '@/kit/components/Button'
+import { Banner } from '@/kit/components/Feedback'
+import { PanelHeader, Tabs } from '@/kit/components/Surface'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { ProjectId, RepoId } from '@/ipc/client'
 import type { IconTheme } from '@/icons/iconFor'
@@ -137,30 +140,30 @@ export function GitPanelView({
 
   return (
     <aside className={styles.panel} data-audit="gitPanel" aria-label="Commit">
-      <div className={styles.header}>
-        <div className={styles.segmented} role="tablist" aria-label="Git">
-          {(['commit', 'shelf'] as const).map((id) => (
-            <button
-              key={id}
-              type="button"
-              role="tab"
-              aria-selected={tab === id}
-              className={tab === id ? `${styles.segment} ${styles.segmentOn}` : styles.segment}
-              onClick={() => setTab(id)}
-            >
-              {id === 'commit' ? 'Commit' : 'Shelf'}
-            </button>
-          ))}
-        </div>
-        {/* The branch belongs in the header of a commit window; with several repos it is
-            per-repo and the tree's own rows carry it instead. */}
-        {repos.length === 1 && repos[0] !== undefined && repos[0].branch.head !== '' && (
-          <span className={styles.branch}>
-            <Icon name="git-branch" size={0} />
-            <span className={styles.branchName}>{repos[0].branch.head}</span>
-          </span>
-        )}
-      </div>
+      {/* The kit's panel frame: the header every sidebar panel tops with, then `Tabs` — Commit
+          and Shelf switch *what* is shown, which is tabs and not a segmented filter. The branch
+          belongs in the header of a commit window; with several repos it is per-repo and the
+          tree's own rows carry it instead. */}
+      <PanelHeader
+        title="Git"
+        tools={
+          repos.length === 1 && repos[0] !== undefined && repos[0].branch.head !== '' ? (
+            <span className={styles.branch}>
+              <Icon name="git-branch" size={0} />
+              <span className={styles.branchName}>{repos[0].branch.head}</span>
+            </span>
+          ) : undefined
+        }
+      />
+      <Tabs
+        label="Git"
+        value={tab}
+        onChange={setTab}
+        tabs={[
+          { value: 'commit', label: 'Commit' },
+          { value: 'shelf', label: 'Shelf' },
+        ]}
+      />
 
       <Toolbar
         stagingArea={git.stagingArea}
@@ -187,9 +190,9 @@ export function GitPanelView({
       />
 
       {git.story && (
-        <p className={styles.note} data-audit="gitStoryNote">
-          Fixture — no git commands are running.
-        </p>
+        <div data-audit="gitStoryNote">
+          <Banner>Fixture — no git commands are running.</Banner>
+        </div>
       )}
       {git.unavailable !== null && (
         /*
@@ -199,13 +202,9 @@ export function GitPanelView({
          * only way to read the rest — the note cannot wrap without pushing the tree down on
          * every transient failure.
          */
-        <p
-          className={`${styles.note} ${styles.noteWarn}`}
-          data-audit="gitUnavailable"
-          title={git.unavailable}
-        >
-          {git.unavailable}
-        </p>
+        <div data-audit="gitUnavailable" title={git.unavailable}>
+          <Banner tone="warn">{git.unavailable}</Banner>
+        </div>
       )}
       {/*
         * A held partial selection changes what Commit writes, and nothing else in this panel
@@ -215,13 +214,19 @@ export function GitPanelView({
         * the lines are.
         */}
       {git.partials.length > 0 && (
-        <p className={`${styles.note} ${styles.noteWarn}`} data-audit="gitPartials">
-          {git.partials.length} file{git.partials.length === 1 ? '' : 's'} will be committed in
-          part.{' '}
-          <button type="button" className={styles.noteAction} onClick={git.clearPartials}>
-            Use whole files
-          </button>
-        </p>
+        <div data-audit="gitPartials">
+          <Banner
+            tone="warn"
+            action={
+              <Button size="sm" variant="link" onClick={git.clearPartials}>
+                Use whole files
+              </Button>
+            }
+          >
+            {git.partials.length} file{git.partials.length === 1 ? '' : 's'} will be committed in
+            part.
+          </Banner>
+        </div>
       )}
 
       <div className={styles.body} role="tabpanel" aria-label={tab === 'commit' ? 'Commit' : 'Shelf'}>

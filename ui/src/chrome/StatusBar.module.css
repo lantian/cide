@@ -1,21 +1,9 @@
+/* The kit's `StatusBar` (`kit/components/Chrome.module.css`): `--h-status` on `--chrome`, mono
+   at 12, clipping rather than wrapping — a wrapped bar would eat a second row, and one that
+   overflowed visibly would widen the window past the pane grid. */
 .bar {
-  height: var(--h-status);
+  composes: status from '../kit/components/Chrome.module.css';
   flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-5);
-  padding: 0 var(--sp-5);
-  background: var(--chrome);
-  border-top: 1px solid var(--border);
-  color: var(--dim);
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
-  /*
-   * A status bar that wraps would eat a second 24px row, and one that overflows visibly
-   * would widen the window past the pane grid. It clips instead.
-   */
-  white-space: nowrap;
-  overflow: hidden;
 }
 
 .left,
@@ -181,7 +169,7 @@
 }
 
 .separator {
-  padding: 0 6px;
+  padding: 0 var(--sp-3);
   color: var(--border);
 }
 

@@ -18,7 +18,7 @@
   flex: none;
   display: flex;
   align-items: center;
-  padding: 0 4px 0 13px;
+  padding: 0 var(--sp-2) 0 var(--sp-5);
   background: var(--panel-2);
   border-bottom: 1px solid var(--border);
 }
@@ -26,39 +26,14 @@
 .title {
   color: var(--text-hi);
   font-size: var(--fs-ui-12);
+  font-weight: 500;
 }
 
 .spacer {
   flex: 1;
 }
 
-/*
- * The way out. Sized and padded like the tool window's hide control, because it is the same
- * gesture in the same kind of strip — and `padding` is stated rather than inherited for the
- * reason `check:ui-icons` records: `appearance: none` does not reset a `<button>`'s UA padding
- * in WebKit, so a mark centred in an unstated box lands off its own hover background.
- */
-.close {
-  width: calc(22px * var(--ui-scale));
-  height: calc(22px * var(--ui-scale));
-  flex: none;
-  display: grid;
-  place-items: center;
-  padding: 0;
-  border: 0;
-  border-radius: var(--r-1);
-  background: transparent;
-  color: var(--dim);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
 
-.close:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
 
 .body {
   flex: 1;

@@ -84,7 +84,8 @@
 }
 
 .railIconActive {
-  background: var(--chrome-hi);
+  /* The kit's `RailButton` when current: the accent on a 12% accent wash. */
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
 }
 
@@ -232,7 +233,7 @@
 }
 
 .benchButton:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 

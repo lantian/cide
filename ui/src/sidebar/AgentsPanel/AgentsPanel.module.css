@@ -53,29 +53,15 @@
    * window, and a 4px step down the sidebar seam is what happens when they drift.
    */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
-  /* Written twice: WebKitGTK 2.52 drops the unprefixed property outright. See
-     `ui/scripts/check-css-prefix.mjs`, which is the gate that keeps the pair together. */
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerTitle {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  composes: panelTitle from '../../kit/components/Surface.module.css';
 }
 
 /* Mono and tabular, matching the explorer's row counter. Empty when `metaFigure` says `null`:
@@ -85,9 +71,8 @@
   flex: none;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  letter-spacing: 0;
-  color: var(--faint);
   font-variant-numeric: tabular-nums;
+  color: var(--faint);
 }
 
 /*
@@ -108,32 +93,10 @@
  * 10.5px with 0.09em of tracking, `RESUME` reads as one more section label in a row of them.
  * A control has to look unlike the labels around it to be seen as pressable.
  */
+/* Pause all / Resume all: a glyph *and* a word, so the kit's small quiet button — not its square
+   icon button, which clipped the word to its 24px box. */
 .headerAction {
-  flex: none;
-  height: calc(20px * var(--ui-scale));
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 6px;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: inherit;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
-  cursor: pointer;
-}
-
-.headerAction:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
-
-.headerAction:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
+  composes: button sm quiet from '../../kit/components/Button.module.css';
 }
 
 /*
@@ -161,7 +124,7 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 12px 12px 16px;
+  padding: var(--sp-5) var(--sp-5) var(--sp-6);
   /* The disabled state is prose the user has to be able to quote — a path, above all — and
      the chrome around it sets `user-select: none` globally. Both spellings, as above. */
   -webkit-user-select: text;
@@ -185,7 +148,7 @@
 }
 
 .detail {
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--faint);
@@ -194,7 +157,7 @@
 /* The sentence that has to be read *before* the button: enabling writes a file the user's
    repository will contain. Bordered off so it cannot be skimmed past as body copy. */
 .warn {
-  margin: 12px 0 0;
+  margin: var(--sp-5) 0 0;
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-left: 2px solid var(--accent);
@@ -208,7 +171,7 @@
    to somebody's repository is the one word in it that cannot be guessed. */
 .path {
   display: block;
-  margin-top: 4px;
+  margin-top: var(--sp-2);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   color: var(--text-hi);
@@ -218,8 +181,8 @@
 .actions {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--sp-4);
+  margin-top: var(--sp-5);
   flex-wrap: wrap;
 }
 
@@ -228,25 +191,8 @@
  * colour change alone is not enough — `ProblemsPanel.module.css`'s `.action`, same rule.
  */
 .action {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
   flex: none;
-  padding: 3px 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.action:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
-}
-
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
 }
 
 /* The one affirmative control on the disabled screen. This was accent-bordered rather than
@@ -280,7 +226,7 @@
   justify-content: center;
   gap: 10px;
   min-height: 220px;
-  padding: 24px 4px;
+  padding: var(--sp-7) var(--sp-2);
   text-align: center;
 }
 
@@ -293,24 +239,7 @@
  * distinguish it — the same reason the terminal's file links are underlined.
  */
 .link {
-  padding: 2px 4px;
-  border: none;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--faint);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-.link:hover {
-  color: var(--text);
-}
-
-.link:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
+  composes: button sm link from '../../kit/components/Button.module.css';
 }
 
 /* --- Sections. ---------------------------------------------------------------------- */
@@ -335,12 +264,12 @@
  */
 .tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 2px;
-  padding: 2px;
-  margin-bottom: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  margin-bottom: var(--sp-5);
   border: 1px solid var(--border-soft);
-  border-radius: 6px;
+  border-radius: var(--r-2);
   background: var(--panel-2);
 }
 
@@ -348,10 +277,10 @@
   display: flex;
   align-items: baseline;
   justify-content: center;
-  gap: 6px;
-  padding: 5px 2px;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-1);
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: var(--r-1);
   background: transparent;
   color: var(--dim);
   font-family: inherit;
@@ -368,12 +297,14 @@
   outline-offset: 1px;
 }
 
+/* The kit's "on (segmented)": raised onto `--panel`, `--text-hi` at 500 — not the accent at
+   600, which the kit keeps for the one primary act. */
 .tab[aria-pressed='true'] {
-  color: var(--accent-hi);
+  color: var(--text-hi);
   background: var(--panel);
   border-color: var(--border);
-  box-shadow: 0 1px 2px #0000000a;
-  font-weight: 600;
+  box-shadow: var(--shadow-1);
+  font-weight: 500;
 }
 
 /* The count on each tab — where the old section heading's figure went. */
@@ -393,7 +324,7 @@
 .rows {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
 }
 
 /* --- One run. ------------------------------------------------------------------------ */
@@ -407,14 +338,14 @@
 }
 
 .row:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   background: color-mix(in srgb, var(--sel) 40%, transparent);
 }
 
 .rowTop {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   min-width: 0;
 }
 
@@ -486,7 +417,7 @@
 .rowBottom {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   min-width: 0;
   /* The glyph column above is 12px plus the 6px gap; the second line hangs under the label
      rather than under the dot, so the two lines read as one row. */
@@ -557,7 +488,7 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
 }
 
 /*
@@ -568,26 +499,8 @@
  * run gets no Open element at all, not a disabled one.
  */
 .control {
+  composes: button sm quiet from '../../kit/components/Button.module.css';
   flex: none;
-  padding: 1px 5px;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  line-height: 1.4;
-  cursor: pointer;
-}
-
-.control:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
-
-.control:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
 }
 
 .controlGlyph {
@@ -607,14 +520,14 @@
   color: var(--yellow);
 }
 
-.controlArmed:hover {
+.controlArmed:hover:not(:disabled) {
   background: var(--yellow);
   background: color-mix(in srgb, var(--yellow) 34%, transparent);
   color: var(--yellow);
 }
 
 /* Stop is the one irreversible control on the row, so it is the one that takes a colour. */
-.controlStop:hover {
+.controlStop:hover:not(:disabled) {
   color: var(--red);
 }
 
@@ -663,10 +576,10 @@
 .staleBar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   flex-wrap: wrap;
   margin-top: 3px;
-  padding: 4px 6px;
+  padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--border);
   border-left: 2px solid var(--yellow);
   border-radius: var(--r-1);
@@ -686,28 +599,8 @@
 }
 
 .staleAction {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
   flex: none;
-  padding: 2px 7px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.staleAction:hover {
-  background: var(--chrome-hi);
-}
-
-.staleAction:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
 }
 
 /* --- One run of a role, under that role's own line. ---------------------------------- */
@@ -728,7 +621,7 @@
 .activityLine {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   min-width: 0;
 }
 
@@ -737,20 +630,20 @@
 .roleRow {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 4px;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
   border-radius: var(--r-2);
 }
 
 .roleRow:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   background: color-mix(in srgb, var(--sel) 40%, transparent);
 }
 
 .roleTop {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   min-width: 0;
 }
 
@@ -831,7 +724,7 @@
 .roleFigure {
   flex: none;
   margin-left: auto;
-  padding-left: 6px;
+  padding-left: var(--sp-3);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--faint);

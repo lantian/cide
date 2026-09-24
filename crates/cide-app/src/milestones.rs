@@ -367,9 +367,26 @@ fn announce_met(
     if matches!(current.status, TaskStatus::Review | TaskStatus::Done) {
         return;
     }
+    // What the comment promises depends on what is still under the goal (M99). A gate can go
+    // green over work that is not finished — subtasks still in todo or doing, or a row a run
+    // dropped in the inbox under this goal and nobody ruled on — and the old text said flatly
+    // that cide would stop planning until the user accepted. It does not (`spinner::
+    // gate_blocks_planning`), and Accept is not offered either, so the note was a promise the
+    // rest of the feature did not keep; the reader believed it and went looking for a button
+    // that was not there.
+    let rows = store.list();
+    let left = cide_agents::milestones::open_under(&rows, task)
+        + cide_agents::milestones::inbox_under(&rows, task);
+    let stands = if left == 0 {
+        "It stays in review until you accept it in the Milestones tab of the Tasks panel; until \
+         then cide does not wake this project to plan more."
+    } else {
+        "Tasks under it are not finished, though — some are still open, or waiting in its inbox \
+         for somebody to decide — so this is not done: cide keeps planning, and Accept is not \
+         offered until the board under this goal is clear."
+    };
     let text = format!(
-        "**cide: the gate for milestone `{}` passes.** It stays in review until you accept it in \
-         the Milestones tab of the Tasks panel; until then cide does not wake this project to plan more.\n\n\
+        "**cide: the gate for milestone `{}` passes.** {stands}\n\n\
          `{}` — exit 0 in {}s{}\n\n```\n{}\n```",
         milestone.id,
         result.command,

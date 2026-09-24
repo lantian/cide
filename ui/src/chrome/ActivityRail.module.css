@@ -29,47 +29,17 @@
   display: contents;
 }
 
+/* The kit's `RailButton` (`kit/components/Chrome.module.css`): 32px in the 46px gutter, `--r-3`,
+   hover `--panel-2`. The note on why it is 32 with a 20px mark lives there now. */
 .item {
-  /*
-   * Fixed, like the rail that holds it: a 32px button in a 46px `--h-rail` gutter, none of
-   * which is text. The badge below is the one thing here that carries a glyph, and it scales.
-   *
-   * 32 from 28, and the mark inside it stays 20px (`ICON_PX`, and `--icon-3`). The button grew
-   * and the drawing did not, on purpose: 28px was small for a primary navigation target, and
-   * this is the one set of icons in the app nobody has complained about — growing the artwork
-   * as well would have been a second change with no report behind it. The extra four pixels
-   * become clear space, six a side instead of four.
-   */
-  width: 32px;
-  height: 32px;
-  /* A column flex item shrinks by default; the spacer's zero basis means a short window
-     would take the whole deficit out of these boxes. */
-  flex: none;
-  display: grid;
-  place-items: center;
-  border-radius: var(--r-3);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-  cursor: pointer;
-  /* Anchors the git badge, which the mock positions against the button box. */
-  position: relative;
-  background: transparent;
-  border: 0;
-  padding: 0;
-  color: inherit;
-  font-family: inherit;
-}
-
-.item:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
+  composes: railButton from '../kit/components/Chrome.module.css';
 }
 
 /* Selected wins over hover, so the accent does not drop back to --text on pointer-over. */
+/* The current panel: the kit's icon toggle "on", the accent on a 12% accent wash. */
 .itemActive,
 .itemActive:hover {
-  background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
 }
 
@@ -96,11 +66,6 @@
 
 /* The icons are the only affordance in this rail, so focus has to be visible. Drawn
    inside the 28px box, matching the header and tab strip, so it cannot widen the rail. */
-.item:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
 /* Pushes the trailing items (settings) to the bottom of the rail. */
 .spacer {
   flex: 1;
@@ -144,8 +109,12 @@
   padding: 0 var(--sp-2);
   box-sizing: border-box;
   border-radius: var(--r-full);
-  background: var(--accent);
-  color: var(--on-accent);
+  /* The kit's `Counter`: the neutral fill under a white label, with the fill's lit edge. A
+     count of changed files is a fact, not a call to act, so it is not the accent. */
+  background: var(--grad-neutral);
+  box-shadow: var(--fill-sheen);
+  color: var(--on-fill);
+  font-weight: 600;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   /* The line box is the pill: matching `height` centres the digits with no flex container. */
@@ -169,7 +138,7 @@
  * thing for `check:theme` to hold true for no visible gain.
  */
 .badgeError {
-  background: var(--red);
+  background: var(--grad-red);
 }
 
 /*

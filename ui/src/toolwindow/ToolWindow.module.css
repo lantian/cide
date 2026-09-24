@@ -24,7 +24,7 @@
   display: flex;
   align-items: stretch;
   gap: 1px;
-  padding: 0 4px;
+  padding: 0 var(--sp-2);
   background: var(--chrome);
   border-bottom: 1px solid var(--border);
 }
@@ -34,22 +34,24 @@
   display: flex;
   align-items: center;
   /* The close button tucks against its tab's right edge rather than floating in the gap. */
-  gap: 2px;
-  padding: 0 2px 0 8px;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-1) 0 var(--sp-4);
   color: var(--dim);
   font-size: var(--fs-ui-12);
   border-bottom: 2px solid transparent;
 }
 
+/* The kit's current tab: `--text-hi` 500 over the accent underline. */
 .tabActive {
   color: var(--text-hi);
+  font-weight: 500;
   border-bottom-color: var(--accent);
 }
 
 .tabButton {
   background: transparent;
   border: 0;
-  padding: 0 2px;
+  padding: 0 var(--sp-1);
   color: inherit;
   font: inherit;
   cursor: pointer;
@@ -60,46 +62,33 @@
   white-space: nowrap;
 }
 
-.tabButton:focus-visible,
-.close:focus-visible,
-.hide:focus-visible {
+.close {
+  composes: icon sm from '../kit/components/Button.module.css';
+}
+
+
+.hide {
+  composes: icon sm from '../kit/components/Button.module.css';
+  align-self: center;
+}
+
+
+.tabButton:focus-visible {
   outline: none;
   box-shadow: var(--focus-inset);
 }
 
-.close,
-.hide {
-  background: transparent;
-  border: 0;
-  padding: 0 4px;
-  color: var(--faint);
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  cursor: pointer;
-  line-height: 1;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
 
-.close:hover,
-.hide:hover {
-  color: var(--text);
-}
+
+
+
+
 
 .spacer {
   flex: 1;
 }
 
-.hide {
-  font-size: var(--fs-ui-12);
-  align-self: center;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
+
 
 /*
  * The tab's own scroll container. `min-height: 0` because it is a `flex: 1` child of a column
@@ -115,7 +104,7 @@
 
 /* The honest empty state, until a tab's own view is mounted into the body. */
 .placeholder {
-  padding: 16px;
+  padding: var(--sp-6);
   color: var(--dim);
   font-size: var(--fs-ui-13);
 }
@@ -129,7 +118,7 @@
  * sentence in the same kind of surface — see `check:ui-scale` for why neither is a bare px.
  */
 .noProject {
-  padding: 14px 16px;
+  padding: var(--sp-5) var(--sp-6);
   overflow: auto;
 }
 
@@ -141,7 +130,7 @@
 }
 
 .detail {
-  margin: 4px 0 0;
+  margin: var(--sp-2) 0 0;
   max-width: 62ch;
   font-size: var(--fs-ui-12);
   line-height: 1.5;

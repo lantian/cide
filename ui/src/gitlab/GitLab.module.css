@@ -2,7 +2,7 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px;
+  padding: var(--sp-5);
   width: var(--w-sidebar-files, 280px);
   min-width: 180px;
   height: 100%;
@@ -16,54 +16,102 @@
   font-size: var(--fs-ui-13);
   margin: 0;
 }
+/*
+ * Every raw control in the GitLab surfaces, drawn as the UI kit's: a button is the kit's small
+ * secondary (`kit/components/Button.module.css`), a field the kit's field (`--bg`, the accent
+ * border and 3px halo on focus). Stated once here instead of the six per-surface copies this
+ * file had (`.panel button`, `.review button`, `.openDialog button`, `.draft button`, …), each
+ * with its own padding and a 4px radius the tokens never had.
+ *
+ * All inside `:where()`, so these rules have **no specificity**: a kit component rendered in
+ * one of these surfaces (a `Button`, a `Select`, a `TextInput`) keeps its own drawing, and a
+ * surface class that styles one control on purpose (`.logSection > button`) still wins.
+ */
+:where(.panel, .settings, .review, .editor > .bar, .prompt, .inline, .reviewSidebar, .openDialog, .thread, .inlineComposer, .draft)
+  :where(button) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  min-height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+:where(.panel, .settings, .review, .editor > .bar, .prompt, .inline, .reviewSidebar, .openDialog, .thread, .inlineComposer, .draft)
+  :where(button:hover:not(:disabled)) {
+  border-color: var(--accent-dim);
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+:where(.panel, .settings, .review, .editor > .bar, .prompt, .inline, .reviewSidebar, .openDialog, .thread, .inlineComposer, .draft)
+  :where(button:disabled) {
+  color: var(--faint);
+  border-color: var(--border-soft);
+  cursor: default;
+}
+
+:where(.panel, .settings, .review, .editor > .bar, .prompt, .inline, .reviewSidebar, .openDialog, .thread, .inlineComposer, .draft)
+  :where(button:focus-visible) {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+:where(.panel, .settings, .review, .editor, .reviewSidebar, .openDialog, .draft, .launch)
+  :where(input:not([type='checkbox'], [type='radio']), select, textarea) {
+  min-width: 0;
+  min-height: calc(24px * var(--ui-scale));
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--bg);
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+}
+
+:where(.panel, .settings, .review, .editor, .reviewSidebar, .openDialog, .draft, .launch)
+  :where(input:not([type='checkbox'], [type='radio']), select, textarea):focus {
+  outline: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+:where(.panel, .settings, .review, .editor, .reviewSidebar, .openDialog, .draft, .launch)
+  :where(input, textarea)::placeholder {
+  color: var(--faint);
+}
+
+:where(.panel, .settings, .review, .editor, .reviewSidebar, .openDialog, .draft, .launch)
+  :where(input[type='checkbox'], input[type='radio']) {
+  accent-color: var(--accent);
+}
+
 .bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   flex-wrap: wrap;
   padding: 7px 10px;
-  border-bottom: 1px solid var(--border, #8884);
-}
-.panel input,
-.panel select,
-.settings input,
-.settings textarea,
-.review input,
-.editor input,
-.review select {
-  background: var(--panel);
-  color: inherit;
-  border: 1px solid var(--border, #8886);
-  padding: 5px 7px;
-  border-radius: 4px;
-  min-width: 0;
-}
-.panel button,
-.settings button,
-.review button,
-.editor > .bar button,
-.prompt button {
-  color: inherit;
-  background: var(--panel);
-  border: 1px solid var(--border, #8886);
-  border-radius: 4px;
-  padding: 4px 8px;
-  cursor: pointer;
-}
-.panel button:hover,
-.review button:hover,
-.editor > .bar button:hover {
-  background: var(--chrome-hi);
-}
-.panel button:disabled,
-.review button:disabled,
-.editor > .bar button:disabled {
-  opacity: 0.5;
-  cursor: default;
+  border-bottom: 1px solid var(--border-soft);
 }
 .row {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-4);
   align-items: center;
   flex-wrap: wrap;
 }
@@ -78,7 +126,7 @@
   text-align: left;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--sp-2);
   padding: 9px !important;
 }
 .muted {
@@ -87,7 +135,7 @@
 }
 .error {
   color: var(--red);
-  padding: 6px;
+  padding: var(--sp-3);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -95,12 +143,12 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px 0;
+  padding: var(--sp-5) 0;
 }
 .settings label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
 }
 .settings textarea {
   min-height: 65px;
@@ -110,9 +158,9 @@
 .reviewPromptRow {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
   padding-left: 10px;
-  border-left: 2px solid var(--border, #8884);
+  border-left: 2px solid var(--border-soft);
 }
 .reviewPromptRow input {
   flex: 1;
@@ -135,13 +183,13 @@
   flex: 0 0 40%;
   min-width: 180px;
   overflow: auto;
-  padding: 6px;
-  border-right: 1px solid var(--border, #8884);
+  padding: var(--sp-3);
+  border-right: 1px solid var(--border-soft);
 }
 .file {
   display: flex;
   width: 100%;
-  gap: 8px;
+  gap: var(--sp-4);
   align-items: center;
   border: 0 !important;
   border-radius: 0 !important;
@@ -164,15 +212,15 @@
 }
 .discussions {
   overflow: auto;
-  padding: 8px;
+  padding: var(--sp-4);
   flex: 1;
   min-height: 0;
 }
 .thread {
-  border: 1px solid var(--border, #8884);
-  border-radius: 5px;
-  margin-bottom: 8px;
-  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-4);
 }
 .thread p {
   white-space: pre-wrap;
@@ -184,8 +232,8 @@
   min-height: 60px;
   color: inherit;
   background: var(--panel);
-  border: 1px solid var(--border, #8886);
-  border-radius: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
   padding: 7px;
   box-sizing: border-box;
   resize: vertical;
@@ -226,8 +274,8 @@
 .inline {
   flex: 0 0 290px;
   overflow: auto;
-  padding: 8px;
-  border-left: 1px solid var(--border, #8884);
+  padding: var(--sp-4);
+  border-left: 1px solid var(--border-soft);
 }
 .log {
   margin: 0;
@@ -247,8 +295,8 @@
   padding: 14px;
   color: var(--text);
   background: var(--panel);
-  border: 1px solid var(--border, #8886);
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
   box-shadow: 0 4px 24px #0004;
 }
 .prompt p {
@@ -303,7 +351,7 @@
 .users {
   display: inline-flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 .metadata {
   display: grid;
@@ -336,7 +384,7 @@
   padding: 10px;
   overflow-x: auto;
   background: var(--panel-2);
-  border-radius: 4px;
+  border-radius: var(--r-1);
 }
 .markdown code {
   font-family: var(--font-mono, monospace);
@@ -345,11 +393,11 @@
 .markdown :not(pre) > code {
   padding: 1px 4px;
   background: var(--panel-2);
-  border-radius: 3px;
+  border-radius: var(--r-1);
 }
 .markdown blockquote {
-  margin: 8px 0;
-  padding-left: 12px;
+  margin: var(--sp-4) 0;
+  padding-left: var(--sp-5);
   border-left: 3px solid var(--border);
   color: var(--dim);
 }
@@ -368,22 +416,22 @@
 .markdown h2,
 .markdown h3 {
   font-size: var(--fs-ui-14);
-  margin: 12px 0 6px;
+  margin: var(--sp-5) 0 var(--sp-3);
 }
 .markdown input {
   pointer-events: none;
 }
 .activity {
   list-style: none;
-  padding: 0 0 0 12px;
+  padding: 0 0 0 var(--sp-5);
   margin: 0;
   border-left: 1px solid var(--border);
 }
 .activity li {
-  padding: 8px 12px;
-  margin: 0 0 8px;
+  padding: var(--sp-4) var(--sp-5);
+  margin: 0 0 var(--sp-4);
   background: var(--panel-2);
-  border-radius: 5px;
+  border-radius: var(--r-2);
 }
 .activity li[data-system='true'] {
   background: transparent;
@@ -412,7 +460,7 @@
   align-items: center;
   gap: 5px;
   padding: 2px 7px;
-  border-radius: 10px;
+  border-radius: var(--r-full);
   font-size: var(--fs-ui-11);
   white-space: nowrap;
   background: var(--panel-2);
@@ -446,13 +494,13 @@
   background: color-mix(in srgb, var(--yellow) 12%, transparent);
 }
 .stage {
-  margin-bottom: 12px;
+  margin-bottom: var(--sp-5);
 }
 .stage h3 {
   font-size: var(--fs-ui-11);
   font-weight: 600;
   color: var(--dim);
-  padding: 6px 8px;
+  padding: var(--sp-3) var(--sp-4);
   margin: 0;
   border-bottom: 1px solid var(--border);
 }
@@ -464,7 +512,7 @@
   padding: 9px;
   margin-top: 3px;
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: var(--r-2);
   text-align: left;
 }
 .jobName {
@@ -475,24 +523,20 @@
   background: var(--sel);
   border-color: var(--accent);
 }
+/* The kit's current tab: ground unchanged, `--text-hi` 500 and the accent underline, not a
+   filled, accent-lettered box. */
 .review .bar [role='tab'][aria-selected='true'] {
-  color: var(--accent);
-  background: var(--chrome-hi);
-  border-color: var(--accent);
-}
-.inline button {
-  color: inherit;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 4px 8px;
-  cursor: pointer;
+  color: var(--text-hi);
+  font-weight: 500;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .review .activityLocation {
   border: 0;
   background: transparent;
-  padding: 4px 0;
+  padding: var(--sp-2) 0;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--accent);
@@ -513,7 +557,7 @@
 .sidebarHeader {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 10px;
   border-bottom: 1px solid var(--border);
 }
@@ -527,7 +571,7 @@
 .sidebarSummary {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 10px;
   border-bottom: 1px solid var(--border);
 }
@@ -549,39 +593,9 @@
 .reviewActions {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 10px;
   border-bottom: 1px solid var(--border);
-}
-.reviewSidebar button,
-.openDialog button,
-.thread button,
-.inlineComposer button {
-  background: var(--panel);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 5px 8px;
-  cursor: pointer;
-}
-.reviewSidebar button:hover,
-.openDialog button:hover {
-  background: var(--chrome-hi);
-}
-.reviewSidebar button:disabled,
-.openDialog button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.reviewSidebar input,
-.openDialog input,
-.openDialog select {
-  background: var(--panel);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 6px 8px;
-  min-width: 0;
 }
 .additions {
   color: var(--green);
@@ -590,7 +604,7 @@
   color: var(--red);
 }
 .notice {
-  padding: 8px;
+  padding: var(--sp-4);
   margin: 0;
   font-size: var(--fs-ui-12);
 }
@@ -598,7 +612,7 @@
   padding: 20px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--sp-5);
   color: var(--text);
 }
 .openDialog h2 {
@@ -612,8 +626,8 @@
 .dialogFooter {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  margin-top: 8px;
+  gap: var(--sp-4);
+  margin-top: var(--sp-4);
 }
 /* The dialogs' acting button, in the app's one primary look. It beats `.openDialog button`
    (0,1,1) on specificity; see `styles/buttons.module.css`. */
@@ -651,7 +665,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 8px 10px;
   background: var(--panel-2);
   border-bottom: 1px solid var(--border);
@@ -669,22 +683,22 @@
   margin: 10px 12px;
 }
 .thread > form {
-  padding-top: 6px;
+  padding-top: var(--sp-3);
   border-top: 1px solid var(--border);
 }
 .thread .note {
-  padding: 12px 16px;
+  padding: var(--sp-5) var(--sp-6);
 }
 .thread .note + .note {
   background: var(--panel-2);
   border-top: 1px solid var(--border);
 }
 .thread .noteHeader {
-  margin-bottom: 8px;
+  margin-bottom: var(--sp-4);
 }
 .threadCounts {
   display: inline-flex;
-  gap: 6px;
+  gap: var(--sp-3);
   margin-left: auto;
   font-family: var(--font-ui, sans-serif);
   font-size: var(--fs-ui-11);
@@ -708,15 +722,15 @@
 }
 .inlineComposer {
   border: 1px solid var(--accent);
-  border-radius: 5px;
-  margin: 6px 0;
+  border-radius: var(--r-2);
+  margin: var(--sp-3) 0;
 }
 .inlineComposer form {
-  padding: 12px;
+  padding: var(--sp-5);
 }
 .logLine {
   display: flex;
-  gap: 12px;
+  gap: var(--sp-5);
   white-space: pre;
   min-height: 1.5em;
   line-height: 1.5;
@@ -742,7 +756,7 @@
   border: 0;
   border-radius: 0;
   text-align: left;
-  padding: 6px 8px;
+  padding: var(--sp-3) var(--sp-4);
   background: var(--panel-2);
   font-family: var(--font-mono);
   color: var(--accent);
@@ -756,7 +770,7 @@
   display: inline-flex;
   align-items: center;
   padding: 1px 7px;
-  border-radius: 10px;
+  border-radius: var(--r-full);
   font-size: var(--fs-ui-11);
   font-weight: 600;
   white-space: nowrap;
@@ -783,7 +797,7 @@
   margin: 12px 0 20px;
   border: 1px dashed var(--border);
   border-left: 3px solid var(--dim);
-  border-radius: 5px;
+  border-radius: var(--r-2);
   background: var(--panel);
   overflow: hidden;
 }
@@ -810,19 +824,10 @@
 .draft .note {
   padding: 10px 16px;
 }
-.draft button,
-.draft select {
-  background: var(--panel);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 5px 8px;
-  cursor: pointer;
-}
 .draftTitle {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   flex-wrap: wrap;
   font-size: var(--fs-ui-12);
 }
@@ -833,10 +838,10 @@
 .draftEdit {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 .draftGroup {
-  margin: 16px 0 4px;
+  margin: var(--sp-6) 0 var(--sp-2);
   font-family: var(--font-mono, monospace);
   font-size: var(--fs-ui-12);
   font-weight: 600;
@@ -848,7 +853,7 @@
 .launch {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-4);
 }
 .launch textarea {
   min-height: 90px;
@@ -866,9 +871,9 @@
   z-index: 1;
   display: flex;
   justify-content: flex-end;
-  gap: 2px;
+  gap: var(--sp-1);
   margin-top: -5px;
-  padding: 2px 6px;
+  padding: var(--sp-1) var(--sp-3);
   background: var(--panel);
 }
 .treeAction {
@@ -876,7 +881,7 @@
   height: 22px;
   padding: 3px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--r-1);
   display: inline-flex;
   align-items: center;
   justify-content: center;

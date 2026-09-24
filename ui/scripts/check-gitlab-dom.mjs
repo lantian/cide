@@ -988,7 +988,12 @@ try {
   )
   assert.ok(container.querySelector('[data-state="draft"]'))
   assert.match(container.textContent, /group\/service/)
-  await click(container.querySelector('[aria-label="Created by me"]'))
+  // The scope is the kit's `Segmented` since the redesign: a radio group whose segments are
+  // named by their visible label, and "on" is `aria-checked`, not `aria-pressed`.
+  const scopeSegment = (label) =>
+    [...container.querySelectorAll('[role="radiogroup"][aria-label="MR relationship"] [role="radio"]')]
+      .find((b) => b.textContent === label)
+  await click(scopeSegment('Created'))
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 300))
   })
@@ -998,9 +1003,7 @@ try {
     'created',
   )
   assert.equal(
-    container
-      .querySelector('[aria-label="Created by me"]')
-      .getAttribute('aria-pressed'),
+    scopeSegment('Created').getAttribute('aria-checked'),
     'true',
   )
   await click(

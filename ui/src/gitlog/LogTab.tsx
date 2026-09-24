@@ -135,7 +135,11 @@ import {
   tagRequestFor,
 } from './logMenu'
 import { openTagDialog, registerTagDialog } from '@/keys/dispatch'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { TextInput } from '@/kit/components/Field'
+import { Dialog, PickerList, PickerRow } from '@/kit/components/Overlay'
+import { Select } from '@/kit/components/Select'
 import { gestureOf, logFileClick } from '@/sidebar/clickSemantics'
 import { copyText } from '@/sidebar/copyText'
 import { useWorkspace } from '@/store/workspace'
@@ -2477,82 +2481,75 @@ function NamePromptCard({
   }
 
   return (
-    <OverlayCard label={title} onDismiss={onCancel}>
-      <div className={styles.prompt} onKeyDown={onKeyDown} data-audit="logPrompt">
-        <h2 className={styles.promptTitle} data-audit="logPromptTitle">
-          {title}
-        </h2>
-        {askRepo && (
-          <select
-            className={styles.promptSelect}
-            data-audit="logPromptRepo"
-            aria-label="Repository"
-            // `target` and not `pickedRepo`: the two differ for one render if the prompt is
-            // raised before `git_repos` has answered, and a `<select>` whose value matches no
-            // option renders **blank** — so the control would be showing nothing while the
-            // button beside it was about to act on the first root.
-            value={target ?? ''}
-            onChange={(ev) => setPickedRepo(ev.target.value as RepoId)}
-          >
-            {repos.map((info) => (
-              <option key={info.id} value={info.id}>
-                {info.name}
-              </option>
-            ))}
-          </select>
-        )}
-        <input
-          ref={field}
-          className={styles.promptInput}
-          data-audit="logPromptName"
-          value={name}
-          placeholder={kind === 'branch' ? 'Branch name' : 'Tag name'}
-          aria-label={kind === 'branch' ? 'Branch name' : 'Tag name'}
-          spellCheck={false}
-          autoComplete="off"
-          onChange={(ev) => setName(ev.target.value)}
-          onKeyDown={(ev) => {
-            if (ev.key !== 'Enter') return
-            ev.preventDefault()
-            submit()
-          }}
-        />
-        {kind === 'tag' && (
-          <input
-            className={styles.promptInput}
-            data-audit="logPromptMessage"
-            value={message}
-            placeholder="Message (leave empty for a lightweight tag)"
-            aria-label="Tag message"
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={title}
+        width="narrow"
+        onKeyDown={onKeyDown}
+        data-audit="logPrompt"
+        actions={
+          <>
+            <Button onClick={onCancel}>Cancel</Button>
+            {/* Nothing here destroys anything — a new ref is added and the old ones stay — so the
+                primary is the one that acts, which is `ChangelistDialog`'s rule and the opposite
+                of `ConfirmDestructive`'s. */}
+            <Button
+              variant="primary"
+              data-audit="logPromptSubmit"
+              disabled={!ready}
+              onClick={submit}
+            >
+              {submitLabel}
+            </Button>
+          </>
+        }
+      >
+        <div className={styles.promptFields}>
+          {askRepo && (
+            <span data-audit="logPromptRepo">
+              <Select
+                aria-label="Repository"
+                value={target ?? null}
+                onChange={(value) => setPickedRepo(value as RepoId)}
+                options={repos.map((info) => ({ value: info.id, label: info.name }))}
+              />
+            </span>
+          )}
+          <TextInput
+            ref={field}
+            mono
+            data-audit="logPromptName"
+            value={name}
+            placeholder={kind === 'branch' ? 'Branch name' : 'Tag name'}
+            aria-label={kind === 'branch' ? 'Branch name' : 'Tag name'}
             spellCheck={false}
             autoComplete="off"
-            onChange={(ev) => setMessage(ev.target.value)}
+            onChange={(ev) => setName(ev.target.value)}
             onKeyDown={(ev) => {
               if (ev.key !== 'Enter') return
               ev.preventDefault()
               submit()
             }}
           />
-        )}
-        <div className={styles.promptFooter}>
-          <button type="button" className={styles.promptButton} onClick={onCancel}>
-            Cancel
-          </button>
-          {/* Nothing here destroys anything — a new ref is added and the old ones stay — so the
-              accent-filled button is the one that acts, which is `ChangelistDialog`'s rule and
-              the opposite of `ConfirmDestructive`'s. */}
-          <button
-            type="button"
-            className={`${styles.promptButton} ${styles.promptPrimary}`}
-            data-audit="logPromptSubmit"
-            disabled={!ready}
-            onClick={submit}
-          >
-            {submitLabel}
-          </button>
+          {kind === 'tag' && (
+            <TextInput
+              data-audit="logPromptMessage"
+              value={message}
+              placeholder="Message (leave empty for a lightweight tag)"
+              aria-label="Tag message"
+              spellCheck={false}
+              autoComplete="off"
+              onChange={(ev) => setMessage(ev.target.value)}
+              onKeyDown={(ev) => {
+                if (ev.key !== 'Enter') return
+                ev.preventDefault()
+                submit()
+              }}
+            />
+          )}
         </div>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }
 
@@ -2661,63 +2658,72 @@ function CompareWithCard({
 
   const title = `Compare ${shortOid} with…`
   return (
-    <OverlayCard label={title} onDismiss={onCancel}>
-      <div className={styles.prompt} onKeyDown={onKeyDown} data-audit="logCompareWith">
-        <h2 className={styles.promptTitle}>{title}</h2>
-        <input
-          ref={field}
-          className={styles.promptInput}
-          data-audit="logCompareSpec"
-          value={spec}
-          placeholder="Branch, tag or revision — main, v1.2, HEAD~3, v1.0..v1.1"
-          aria-label="Revision"
-          spellCheck={false}
-          autoComplete="off"
-          onChange={(ev) => {
-            setSpec(ev.target.value)
-            setError(null)
-          }}
-          onKeyDown={(ev) => {
-            if (ev.key !== 'Enter') return
-            ev.preventDefault()
-            submit()
-          }}
-        />
-        {error !== null && (
-          <div className={styles.compareError} data-audit="logCompareError">
-            {error}
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={title}
+        flush
+        onKeyDown={onKeyDown}
+        data-audit="logCompareWith"
+        head={
+          <div className={styles.compareHead}>
+            <TextInput
+              ref={field}
+              mono
+              invalid={error !== null}
+              data-audit="logCompareSpec"
+              value={spec}
+              placeholder="Branch, tag or revision — main, v1.2, HEAD~3, v1.0..v1.1"
+              aria-label="Revision"
+              spellCheck={false}
+              autoComplete="off"
+              onChange={(ev) => {
+                setSpec(ev.target.value)
+                setError(null)
+              }}
+              onKeyDown={(ev) => {
+                if (ev.key !== 'Enter') return
+                ev.preventDefault()
+                submit()
+              }}
+            />
+            {error !== null && (
+              <div className={styles.compareError} data-audit="logCompareError">
+                {error}
+              </div>
+            )}
           </div>
-        )}
-        <div className={styles.compareList} data-audit="logCompareList">
-          {listed.map((r) => (
-            <button
-              key={`${r.repo}:${r.oid}`}
-              type="button"
-              className={styles.compareRow}
-              data-audit="logCompareRow"
-              title={r.oid}
-              onClick={() => pickRow(r.oid)}
+        }
+        actions={
+          <>
+            <Button onClick={onCancel}>Cancel</Button>
+            <Button
+              variant="primary"
+              data-audit="logCompareSubmit"
+              disabled={spec.trim() === '' || busy}
+              busy={busy}
+              onClick={submit}
             >
-              <span className={styles.compareOid}>{r.shortOid}</span>
-              <span className={styles.compareSubject}>{r.summary}</span>
-            </button>
-          ))}
+              Compare
+            </Button>
+          </>
+        }
+      >
+        <div className={styles.compareList} data-audit="logCompareList">
+          <PickerList aria-label="Recent commits">
+            {listed.map((r) => (
+              <PickerRow
+                key={`${r.repo}:${r.oid}`}
+                data-audit="logCompareRow"
+                title={r.oid}
+                onClick={() => pickRow(r.oid)}
+              >
+                <span className={styles.compareOid}>{r.shortOid}</span>
+                <span className={styles.compareSubject}>{r.summary}</span>
+              </PickerRow>
+            ))}
+          </PickerList>
         </div>
-        <div className={styles.promptFooter}>
-          <button type="button" className={styles.promptButton} onClick={onCancel}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className={`${styles.promptButton} ${styles.promptPrimary}`}
-            data-audit="logCompareSubmit"
-            disabled={spec.trim() === '' || busy}
-            onClick={submit}
-          >
-            Compare
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }

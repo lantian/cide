@@ -45,7 +45,7 @@
 .titleRow {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
 }
 
 .title {
@@ -67,7 +67,7 @@
 }
 
 .description {
-  margin: 4px 0 0;
+  margin: var(--sp-2) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
@@ -75,8 +75,8 @@
 }
 
 .capabilities {
-  margin: 8px 0 0;
-  padding: 0 0 0 16px;
+  margin: var(--sp-4) 0 0;
+  padding: 0 0 0 var(--sp-6);
   list-style: disc;
   max-width: 72ch;
 }
@@ -90,53 +90,28 @@
 .actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   margin-top: 10px;
   /* The buttons are controls, not prose: a drag across the row must not highlight "Install". */
   -webkit-user-select: none;
   user-select: none;
 }
 
-.primary,
-.action {
-  appearance: none;
-  border: 1px solid var(--border);
-  background: var(--chrome);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  padding: 3px 12px;
-  border-radius: var(--r-2);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
 .primary {
-  composes: primary from '../styles/buttons.module.css';
+  composes: button sm primary from '../kit/components/Button.module.css';
 }
 
-.primary:hover:not(:disabled),
-.action:hover:not(:disabled) {
-  background: var(--chrome-hi);
+.action {
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
-.primary:disabled,
-.action:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
 
-.primary:focus-visible,
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
+
+
+
 
 .problem {
-  margin: 8px 0 0;
+  margin: var(--sp-4) 0 0;
   font-size: var(--fs-ui-11);
   line-height: 1.5;
   color: var(--red);

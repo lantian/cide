@@ -967,24 +967,24 @@ try {
   const cancelButton = before('data-audit="confirmDestructiveCancel"', 260)
   ok(runButton !== '', 'the destructive button is still identifiable')
   ok(
-    runButton.includes('confirmDefault ? styles.buttonPrimary : danger ? styles.buttonDanger'),
-    'the accent reaches the confirm button ONLY behind `confirmDefault`. This one className is ' +
+    runButton.includes("variant={confirmDefault ? 'primary' : danger ? 'danger' : 'secondary'}"),
+    'the accent reaches the confirm button ONLY behind `confirmDefault`. This one variant is ' +
       'rule 3 in the DOM: for every destructive caller the prominent button has to be Cancel, ' +
       'or a reflexive Enter performs the destruction — and where a caller did declare the act ' +
       'reversible, the accent displaces the red, because an act safe enough to confirm by ' +
       'reflex has no claim on the colour that means "this destroys work"',
   )
   ok(
-    cancelButton.includes("confirmDefault ? '' : styles.buttonPrimary"),
+    cancelButton.includes("variant={confirmDefault ? 'secondary' : 'primary'}"),
     'Cancel is the accent-filled one exactly when it is the default — the accent and the focus ' +
       'travel together, or the dialog looks like Enter will do one thing and it does the other',
   )
   ok(
-    runButton.includes('buttonDanger'),
-    'the destructive button can still be red…',
+    runButton.includes("'danger'"),
+    'the destructive button can still wear the danger fill…',
   )
   ok(
-    /danger \? styles\.buttonDanger/.test(dialog),
+    /danger \? 'danger'/.test(dialog),
     '…and the red is now conditional, so a --soft reset does not borrow the colour that means ' +
       '"this destroys work"',
   )
@@ -995,7 +995,8 @@ try {
   )
 
   // The radio group, and the guard in front of it.
-  const groupAt = dialog.indexOf('role="radiogroup"')
+  // The kit's `RadioGroup` since the redesign (2026-09-24); it is `role="radiogroup"` itself.
+  const groupAt = dialog.indexOf('<RadioGroup')
   const guardAt = dialog.indexOf('{choices !== undefined && (')
   ok(groupAt > 0, 'the radio group is rendered')
   ok(guardAt > 0, 'behind an explicit `choices !== undefined` guard')
@@ -1005,11 +1006,16 @@ try {
       'control that cannot be operated, so every caller that predates the log must draw none',
   )
   ok(
-    /\{option !== undefined && \(/.test(dialog),
+    /option !== undefined && \(/.test(dialog),
     'the option row is guarded the same way',
   )
   ok(
-    /type="radio"/.test(dialog) && /type="checkbox"/.test(dialog),
+    // The kit draws them now, so the kit's source is where the native inputs are.
+    (() => {
+      const kit = stripComments(readFileSync(join(UI, 'src', 'kit', 'components', 'Choice.tsx'), 'utf8'))
+      return /<RadioGroup/.test(dialog) && /<Checkbox/.test(dialog) &&
+        /type="radio"/.test(kit) && /type="checkbox"/.test(kit) && /role="radiogroup"/.test(kit)
+    })(),
     'both are real native inputs — the browser brings arrow-key navigation, roving tab order ' +
       'and the right screen-reader semantics, and a hand-rolled group that got any of the three ' +
       'wrong would be wrong in a dialog whose whole job is being read carefully',

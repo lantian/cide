@@ -27,7 +27,7 @@
  * see its `project` prop for the three things that follow from it.
  */
 import type { SettingsSection } from '@/ipc/client'
-import { Icon } from '@/icons/Icon'
+import { IconButton } from '@/kit/components/Button'
 import { SettingsTab } from './SettingsTab'
 import styles from './SettingsFrame.module.css'
 
@@ -53,16 +53,12 @@ export function SettingsFrame({ section, onClose }: SettingsFrameProps) {
       <div className={styles.strip}>
         <span className={styles.title}>Settings</span>
         <div className={styles.spacer} aria-hidden="true" />
-        <button
-          type="button"
-          className={styles.close}
-          aria-label="Close settings"
-          title="Close settings"
+        <IconButton
+          icon="x"
+          label="Close settings"
           data-audit="settingsFrameClose"
           onClick={onClose}
-        >
-          <Icon name="x" size={1} />
-        </button>
+        />
       </div>
       <div className={styles.body}>
         {/*

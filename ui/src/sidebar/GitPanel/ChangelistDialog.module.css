@@ -1,233 +1,45 @@
 /*
- * The changelist chooser's body. The scrim and the 620px card come from `OverlayCard`
- * (`overlays/Overlay.module.css`), so only what sits inside them is styled here — the same
- * split `CloseConfirm.module.css` follows, and the reason the two dialogs cannot drift apart.
- *
- * Every colour is a token, and both themes come out of the tokens; nothing here hardcodes a
- * light or a dark value.
+ * The changelist chooser: create, rename, or move files into one. The frame, the path list,
+ * the field, the buttons and the pickable rows are the UI kit's (`Modal` + `Dialog`,
+ * `PathList`, `TextInput`, `Button`, `PickerList`/`PickerRow`); this lays out the name row and
+ * the two halves of a changelist row.
  */
-
-/*
- * Re-declares the column rather than sitting in the card as a plain block: `OverlayCard` makes
- * the card a flex column, and an ordinary wrapper would make the head, the lists and the footer
- * children of *it* — the lists would stop being the only things that scroll and the footer
- * would slide off the bottom of a tall dialog.
- */
-.dialog {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.head {
-  flex: none;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.title {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-/* The repository, for a workspace with more than one. A changelist belongs to exactly one
-   repo, and a dialog that did not say which would be a guess in a monorepo. */
-.repo {
-  font-weight: 400;
-  color: var(--faint);
-}
-
-.body {
-  margin: 0;
-  font-size: var(--fs-ui-13);
-  line-height: calc(18px * var(--ui-scale));
-  color: var(--dim);
-}
-
-/*
- * The paths being moved, named rather than counted.
- *
- * Capped and scrollable: a changelist can hold a hundred files, and a dialog taller than the
- * window puts its own buttons off screen.
- */
-.paths {
-  flex: none;
-  max-height: calc(132px * var(--ui-scale));
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin: 0;
-  padding: 8px 0;
-  list-style: none;
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.path {
-  padding: 2px 18px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  color: var(--faint);
-}
-
 .nameRow {
-  flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 18px;
+  gap: var(--sp-4);
+  padding: var(--sp-5) calc(28px * var(--ui-scale)) 0;
 }
 
-.input {
+.nameField {
   flex: 1;
   min-width: 0;
-  height: calc(28px * var(--ui-scale));
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text-hi);
-  font-family: inherit;
-  font-size: var(--fs-ui-13);
-}
-
-.input::placeholder {
-  color: var(--faint);
-}
-
-.input:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: -1px;
-  border-color: var(--accent);
 }
 
 .warn {
-  flex: none;
-  margin: 0;
-  padding: 0 18px 10px;
-  font-size: var(--fs-ui-12);
-  color: var(--yellow);
+  margin: var(--sp-2) 0 0;
+  padding: 0 calc(28px * var(--ui-scale));
+  font-size: var(--fs-ui-11);
+  color: var(--red);
 }
 
-/* The existing changelists. Scrolls for the same reason `.paths` does. */
-.list {
-  flex: 1;
-  min-height: 0;
-  max-height: calc(220px * var(--ui-scale));
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin: 0;
-  padding: 4px 0;
-  list-style: none;
-  border-top: 1px solid var(--border-soft);
-}
-
-.entry {
+/* The kit list, inset to the dialog's text edge and capped so forty changelists scroll. */
+.lists {
   display: flex;
-  align-items: baseline;
-  gap: 10px;
-  width: 100%;
-  padding: 5px 18px;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-13);
-  text-align: left;
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.entry:hover:not(:disabled) {
-  background: var(--chrome-hi);
-}
-
-.entry:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
-.entry:disabled {
-  color: var(--faint);
+  max-height: calc(260px * var(--ui-scale));
+  /* 28 less the list's own 4px inset, so the rows' text lines up with the dialog's. */
+  margin: var(--sp-4) calc(24px * var(--ui-scale)) var(--sp-4);
 }
 
 .entryName {
-  flex: none;
-  color: inherit;
-}
-
-.entryMeta {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: right;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
-  color: var(--faint);
 }
 
-/* In create/rename the lists are context, not targets: nothing to click, so nothing that
-   looks clickable. */
-.existing {
-  padding: 3px 18px;
-  font-size: var(--fs-ui-12);
-  color: var(--faint);
-}
-
-.footer {
+.entryMeta {
   flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 18px;
-  border-top: 1px solid var(--border);
-}
-
-.button {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
-  color: var(--text);
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.button:hover:not(:disabled) {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
-
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.button:disabled {
+  font-size: var(--fs-ui-11);
   color: var(--faint);
-  border-color: var(--border-soft);
-}
-
-/* Nothing in this dialog destroys anything, so the primary button is the one that acts —
-   unlike `CloseConfirm`, where the prominent button is the one that backs out. It used to be
-   filled only while enabled; the shared class fades a disabled one instead, which still says
-   which button would act. */
-.buttonPrimary {
-  composes: primary from '../../styles/buttons.module.css';
 }

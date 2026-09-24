@@ -9,6 +9,14 @@
  */
 import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import {
+  PickerFoot,
+  PickerFrame,
+  PickerHint,
+  PickerInput,
+  PickerList,
+  Scrim,
+} from '@/kit/components/Overlay'
 import styles from './Overlay.module.css'
 
 export interface ModalShellProps {
@@ -88,52 +96,50 @@ export function ModalShell({
   const showBlockCaret = caretAtEnd
 
   return (
-    <OverlayCard label={label} onDismiss={onDismiss}>
-      <div className={styles.inputRow}>
-        <span
-          className={promptAccent === true ? `${styles.prompt} ${styles.promptAccent}` : styles.prompt}
-          aria-hidden="true"
+    <Modal onDismiss={onDismiss}>
+      <PickerFrame label={label} data-audit="overlayCard">
+        <PickerInput
+          lead={
+            <span className={promptAccent === true ? styles.promptAccent : undefined}>{prompt}</span>
+          }
+          trailing={
+            counter !== undefined ? <span data-audit="overlayCounter">{counter}</span> : undefined
+          }
         >
-          {prompt}
-        </span>
-        <div className={styles.field}>
-          <input
-            ref={input}
-            className={showBlockCaret ? `${styles.input} ${styles.inputHiddenCaret}` : styles.input}
-            data-audit="overlayInput"
-            value={value}
-            placeholder={placeholder}
-            spellCheck={false}
-            autoComplete="off"
-            autoCorrect="off"
-            aria-label={label}
-            onChange={(ev) => onChange(ev.target.value)}
-            onKeyDown={onKeyDown}
-          />
-          {showBlockCaret && (
-            // `ch` is exact here because the field is monospaced; see Overlay.module.css.
-            <span
-              className={styles.caret}
-              style={{ left: `${value.length}ch` }}
-              aria-hidden="true"
+          <div className={styles.field}>
+            <input
+              ref={input}
+              className={showBlockCaret ? `${styles.input} ${styles.inputHiddenCaret}` : styles.input}
+              data-audit="overlayInput"
+              value={value}
+              placeholder={placeholder}
+              spellCheck={false}
+              autoComplete="off"
+              autoCorrect="off"
+              aria-label={label}
+              onChange={(ev) => onChange(ev.target.value)}
+              onKeyDown={onKeyDown}
             />
-          )}
+            {showBlockCaret && (
+              // `ch` is exact here because the field is monospaced; see Overlay.module.css.
+              <span
+                className={styles.caret}
+                style={{ left: `${value.length}ch` }}
+                aria-hidden="true"
+              />
+            )}
+          </div>
+        </PickerInput>
+
+        <PickerList ref={scrollRef} data-audit="overlayList">
+          {children}
+        </PickerList>
+
+        <div data-audit="overlayFooter">
+          <PickerFoot>{footer}</PickerFoot>
         </div>
-        {counter !== undefined && (
-          <span className={styles.counter} data-audit="overlayCounter">
-            {counter}
-          </span>
-        )}
-      </div>
-
-      <div className={styles.list} ref={scrollRef} data-audit="overlayList">
-        {children}
-      </div>
-
-      <div className={styles.footer} data-audit="overlayFooter">
-        {footer}
-      </div>
-    </OverlayCard>
+      </PickerFrame>
+    </Modal>
   )
 }
 
@@ -201,12 +207,13 @@ export function OverlayCard({
   className?: string | undefined
 }) {
   return createPortal(
-    // Click-through to dismiss is on the scrim only; `stopPropagation` on the card keeps a
-    // click inside from closing it. A `<div>` rather than `<dialog>`: `showModal()` moves the
+    // The kit's `Scrim` (the same layer `Modal` below draws), so a card and a kit `Dialog` sit
+    // on one scrim. Click-through to dismiss is on the scrim only; `stopPropagation` on the card
+    // keeps a click inside from closing it. A `<div>` rather than `<dialog>`: `showModal()` moves the
     // element into the top layer and takes focus itself, which fights the focus rule in
     // `ModalShell` — this component's callers all decide for themselves where focus lands, and
     // one of them (`settings/AgentsSection.tsx`) has a reason it must not be the first control.
-    <div className={styles.scrim} data-audit="overlayScrim" onMouseDown={onDismiss}>
+    <Scrim data-audit="overlayScrim" onDismiss={onDismiss}>
       <div
         className={className === undefined ? styles.card : `${styles.card} ${className}`}
         data-audit="overlayCard"
@@ -217,7 +224,7 @@ export function OverlayCard({
       >
         {children}
       </div>
-    </div>,
+    </Scrim>,
     // No SSR guard, deliberately, and the same call `menus/ContextMenu.tsx` and
     // `settings/KeymapSection.tsx` make. Nothing in `ui/scripts/check-*-render.mjs` renders a
     // card — every smoke entry was checked — and a future one that did would fail loudly on
@@ -227,12 +234,28 @@ export function OverlayCard({
   )
 }
 
-/** One `⏎ open`-style footer hint. The glyph is mono and dim; the words are not. */
-export function Hint({ keys, children }: { keys: string; children: ReactNode }) {
-  return (
-    <span>
-      <span className={styles.footerKey}>{keys}</span>
+/**
+ * The kit's `Scrim`, portalled — the layer every kit `Dialog` in the app sits on.
+ *
+ * `OverlayCard` above draws a card of its own; this draws none, because the kit's `Dialog`
+ * (and `Picker`) is the card. Everything the long comment on `OverlayCard` says about the
+ * portal holds here word for word — the stacking context each tab panel makes, `position:
+ * fixed` under a transform, `overflow: hidden` on a pane, a hidden tab still eating keys —
+ * which is why this is a second export from the same file and not a component in `kit/`,
+ * where the page it would portal into is the kit page's own.
+ *
+ * Dismissal is on a press that *starts* on the scrim, as `OverlayCard`'s is; the kit `Scrim`
+ * compares the target instead of stopping propagation in the card, which also keeps a drag
+ * that began in a dialog's text field and ended outside it from closing the dialog.
+ */
+export function Modal({ onDismiss, children }: { onDismiss: () => void; children: ReactNode }) {
+  return createPortal(
+    <Scrim data-audit="overlayScrim" onDismiss={onDismiss}>
       {children}
-    </span>
+    </Scrim>,
+    document.body,
   )
 }
+
+/** One `⏎ open`-style footer hint — the kit's `PickerHint`, under the name every picker imports. */
+export const Hint = PickerHint

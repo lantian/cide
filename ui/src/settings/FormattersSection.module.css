@@ -21,15 +21,16 @@
 .entry {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 9px;
+  gap: var(--sp-3);
+  padding: var(--sp-5);
   border: 1px solid var(--border);
-  border-radius: var(--r-2);
+  border-radius: var(--r-3);
+  background: var(--panel);
 }
 
 .entryHead {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-3);
   align-items: center;
 }
 
@@ -49,7 +50,7 @@
 .tokens {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--sp-3);
   align-items: center;
 }
 
@@ -59,19 +60,20 @@
   min-width: 0;
 }
 
+/* The kit `TextInput`'s look at the row size, on a bare `<input>`: these fields are sized by
+   their column (a language id, a program, an argument), which the kit field leaves to its box. */
 .input {
-  height: calc(26px * var(--ui-scale));
-  padding: 0 8px;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  /* `--panel-2`, the same ground every other settings input sits on. A `var()` with a fallback
-     would be worse than a wrong colour: `check-theme.mjs` resolves every token a stylesheet
-     names against both palette blocks precisely because an undefined one takes its fallback in
-     silence, and the screen then looks subtly unlike every other. */
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .input::placeholder {
@@ -81,51 +83,16 @@
 .input:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-.add {
+.addRow {
   align-self: flex-start;
-  height: calc(24px * var(--ui-scale));
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.add:hover {
-  color: var(--text);
-  border-color: var(--accent);
-}
 
-.remove {
-  flex: none;
-  width: 24px;
-  height: calc(26px * var(--ui-scale));
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--faint);
-  font-size: var(--fs-ui-14);
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
 
-.remove:hover {
-  color: var(--text);
-  border-color: var(--border);
-}
+
 
 /*
  * The resolved command line, read-only, under each entry.
@@ -137,9 +104,9 @@
 .argv {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--sp-2);
   margin: 0;
-  padding-left: 2px;
+  padding-left: var(--sp-1);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   line-height: 1.4;

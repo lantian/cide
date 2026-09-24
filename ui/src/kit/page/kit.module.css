@@ -1,0 +1,511 @@
+/*
+ * The kit *page's* own layout — the nav, the top bar, the specimen frames. Not part of the kit:
+ * nothing in the app should ever look like this file. The components the page shows are in
+ * `../components/`.
+ */
+
+.page {
+  display: grid;
+  grid-template-columns: calc(220px * var(--ui-scale)) minmax(0, 1fr);
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* --- nav ------------------------------------------------------------------------------------- */
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--grad-accent-soft), var(--panel-2);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-7) var(--sp-6) var(--sp-6);
+}
+
+.brandMark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(26px * var(--ui-scale));
+  height: calc(26px * var(--ui-scale));
+  border-radius: var(--r-2);
+  background: var(--grad-accent-ink);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-1);
+}
+
+.brandText {
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.brandSub {
+  font-size: var(--fs-ui-11);
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.navList {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0 var(--sp-4) var(--sp-6);
+  list-style: none;
+}
+
+.navGroup {
+  padding: var(--sp-5) var(--sp-4) var(--sp-2);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.navLink {
+  display: block;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+  text-decoration: none;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.navLink:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text-hi);
+}
+
+/* --- main column ----------------------------------------------------------------------------- */
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  height: calc(48px * var(--ui-scale));
+  padding: 0 var(--sp-7);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.topbarTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.sizePicker {
+  width: calc(96px * var(--ui-scale));
+}
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.content {
+  max-width: calc(1080px * var(--ui-scale));
+  padding: var(--sp-7) calc(40px * var(--ui-scale)) calc(96px * var(--ui-scale));
+}
+
+.intro {
+  max-width: calc(720px * var(--ui-scale));
+  margin: 0 0 calc(40px * var(--ui-scale));
+  font-size: var(--fs-ui-13);
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+.intro h1 {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-ui-20);
+  color: var(--text-hi);
+}
+
+.intro p {
+  margin: 0 0 var(--sp-4);
+}
+
+/* --- chapter and specimen -------------------------------------------------------------------- */
+
+.chapter {
+  margin-bottom: calc(56px * var(--ui-scale));
+  scroll-margin-top: var(--sp-6);
+}
+
+.chapterTitle {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-ui-20);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.chapterLead {
+  max-width: calc(720px * var(--ui-scale));
+  margin: 0 0 var(--sp-7);
+  font-size: var(--fs-ui-13);
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+.specimen {
+  margin-bottom: var(--sp-7);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.specimenHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-5);
+  padding: var(--sp-5) var(--sp-6);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.specimenName {
+  margin: 0;
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.specimenSource {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.specimenUse {
+  padding: var(--sp-4) var(--sp-6) 0;
+  font-size: var(--fs-ui-12);
+  line-height: 1.55;
+  color: var(--dim);
+}
+
+.specimenUse strong {
+  color: var(--text);
+}
+
+/* The stage: `--bg` with the specimen centred and padded, like a window's content area. */
+.stage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--sp-6);
+  margin: var(--sp-5) var(--sp-6);
+  padding: var(--sp-7);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-2);
+  background: var(--bg);
+}
+
+.stage[data-ground='panel'] {
+  background: var(--panel);
+}
+
+.stage[data-ground='chrome'] {
+  background: var(--chrome);
+}
+
+.stage[data-flush='true'] {
+  padding: 0;
+  overflow: hidden;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-4);
+}
+
+.cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.cellLabel {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.grow {
+  flex: 1 1 calc(260px * var(--ui-scale));
+}
+
+/* A mock sidebar or pane, for composed examples. */
+.frame {
+  display: flex;
+  flex-direction: column;
+  width: calc(300px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.frameWide {
+  width: 100%;
+}
+
+/* --- spec table ------------------------------------------------------------------------------ */
+
+.spec {
+  width: calc(100% - 2 * var(--sp-6));
+  margin: 0 var(--sp-6) var(--sp-5);
+  border-collapse: collapse;
+  font-size: var(--fs-ui-11);
+}
+
+.spec th,
+.spec td {
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  vertical-align: top;
+}
+
+.spec th {
+  font-weight: 600;
+  color: var(--faint);
+}
+
+.spec td:first-child {
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.spec code {
+  font-family: var(--font-mono);
+  color: var(--dim);
+}
+
+/* --- foundations ----------------------------------------------------------------------------- */
+
+.swatches {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(calc(150px * var(--ui-scale)), 1fr));
+  gap: var(--sp-5);
+  width: 100%;
+}
+
+.swatch {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.swatchChip {
+  height: calc(44px * var(--ui-scale));
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.swatchText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.swatchName {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--text-hi);
+}
+
+.swatchValue {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.swatchUse {
+  font-size: var(--fs-ui-11);
+  line-height: 1.4;
+  color: var(--dim);
+}
+
+.typeRow {
+  display: grid;
+  grid-template-columns: calc(120px * var(--ui-scale)) minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--sp-6);
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--border-soft);
+  width: 100%;
+}
+
+.typeRow:last-child {
+  border-bottom: 0;
+}
+
+.scaleBar {
+  height: calc(12px * var(--ui-scale));
+  border-radius: var(--r-1);
+  background: var(--grad-accent-h);
+}
+
+.radiusBox {
+  width: calc(64px * var(--ui-scale));
+  height: calc(44px * var(--ui-scale));
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+}
+
+.shadowBox {
+  width: calc(120px * var(--ui-scale));
+  height: calc(64px * var(--ui-scale));
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-3);
+  background: var(--panel);
+}
+
+.iconGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(calc(104px * var(--ui-scale)), 1fr));
+  gap: var(--sp-2);
+  width: 100%;
+}
+
+.iconCell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-2);
+  border-radius: var(--r-2);
+  color: var(--text);
+}
+
+.iconCell:hover {
+  background: var(--panel-2);
+}
+
+.iconName {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+/* --- rules ----------------------------------------------------------------------------------- */
+
+.dosDonts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(calc(260px * var(--ui-scale)), 1fr));
+  gap: var(--sp-5);
+  width: 100%;
+}
+
+.rule {
+  padding: var(--sp-5);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--panel);
+}
+
+.rule[data-kind='do'] {
+  border-top: 3px solid var(--green);
+}
+
+.rule[data-kind='dont'] {
+  border-top: 3px solid var(--red);
+}
+
+.ruleTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  font-weight: 600;
+}
+
+.rule[data-kind='do'] .ruleTitle {
+  color: var(--green);
+}
+
+.rule[data-kind='dont'] .ruleTitle {
+  color: var(--red);
+}
+
+/* --- inventory ------------------------------------------------------------------------------- */
+
+.inventory {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-ui-12);
+}
+
+.inventory th,
+.inventory td {
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  vertical-align: top;
+}
+
+.inventory th {
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--faint);
+  background: var(--panel-2);
+}
+
+.inventory td:nth-child(2) {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.inventory code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+

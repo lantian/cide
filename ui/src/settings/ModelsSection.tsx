@@ -28,6 +28,9 @@
  * overwrite the real key. What survives is `ClaudeCliSection`'s rule — a value you cannot see is a
  * value you cannot correct — and a `Note` saying plainly where the bytes end up.
  */
+import { Select } from '@/kit/components/Select'
+import { IconButton } from '@/kit/components/Button'
+import { Badge } from '@/kit/components/Status'
 import { useCallback, useMemo, useRef, useState } from 'react'
 
 import { Icon } from '@/icons'
@@ -333,23 +336,18 @@ function ProviderCard({
         {/* Drawn collapsed as well as open: whether a provider works is the one thing worth
             seeing without unfolding anything. */}
         {probed && provider.id !== '' && (
-          <span className={offered === null ? styles.verdictBad : styles.verdictOk}>
-            {offered === null ? (
-              <Icon name="circle-alert" size={1} label="not answering" />
-            ) : (
-              `${offered.length}`
-            )}
-          </span>
+          <Badge tone={offered === null ? 'red' : 'green'} soft>
+            {offered === null ? 'not answering' : `${offered.length}`}
+          </Badge>
         )}
-        <span className={styles.kind}>{provider.kind}</span>
-        <button
-          type="button"
-          className={styles.iconButton}
-          aria-label="Remove provider"
+        <Badge tone="neutral" soft squared>
+          {provider.kind}
+        </Badge>
+        <IconButton
+              icon="trash-2"
+              label="Remove provider"
           onClick={onRemove}
-        >
-          <Icon name="trash-2" size={1} />
-        </button>
+            />
       </div>
 
       {!open ? null : (
@@ -696,24 +694,17 @@ function ModelRows({
               value={model.output === 0 ? '' : String(model.output)}
               onChange={(e) => set(index, { ...model, output: numberOf(e.target.value) })}
             />
-            <button
-              type="button"
-              className={styles.iconButton}
-              aria-label="Read limits from the server"
-              title="Read this model's context and output limits from the server"
+            <IconButton
+              icon="refresh-cw"
+              label="Read this model's context and output limits from the server"
               disabled={model.id.trim() === '' || probes[model.id.trim()] === 'running'}
               onClick={() => detect(model, true)}
-            >
-              <Icon name="refresh-cw" size={1} />
-            </button>
-            <button
-              type="button"
-              className={styles.iconButton}
-              aria-label="Remove model"
+            />
+            <IconButton
+              icon="x"
+              label="Remove model"
               onClick={() => onChange(removeAt(models, index))}
-            >
-              <Icon name="x" size={1} />
-            </button>
+            />
           </div>
           <LimitsNote probe={probes[model.id.trim()]} />
         </div>
@@ -767,9 +758,10 @@ function PoolCard({
     <div className={styles.card}>
       <div className={styles.cardHead}>
         <span className={styles.cardTitle}>{pool.name === '' ? 'New pool' : pool.name}</span>
-        <button type="button" className={styles.iconButton} aria-label="Remove pool" onClick={onRemove}>
-          <Icon name="trash-2" size={1} />
-        </button>
+        <IconButton
+              icon="trash-2"
+              label="Remove pool" onClick={onRemove}
+            />
       </div>
       <TextField
         label="Name"
@@ -794,25 +786,27 @@ function PoolCard({
             className={isStruck(verdict) ? `${styles.entry} ${styles.entryDead}` : styles.entry}
           >
             <span className={styles.entryOrdinal}>{index + 1}</span>
-            <select
-              className={styles.entryField}
-              aria-label="Entry provider"
-              value={entry.provider}
-              onChange={(e) => set(index, { ...entry, provider: e.target.value })}
-            >
-              <option value="">(pick a provider)</option>
-              {/* A provider the entry names but that no longer exists still has to be
-                  displayable, or the row reads as empty over a value that is really there. */}
-              {providers.every((p) => p.id !== entry.provider) && entry.provider !== '' && (
-                <option value={entry.provider}>{entry.provider}</option>
-              )}
-              {providers.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.id}
-                  {isEnabled(p) ? '' : ' (off)'}
-                </option>
-              ))}
-            </select>
+            <span className={styles.entrySelect}>
+              <Select
+                size="sm"
+                aria-label="Entry provider"
+                value={entry.provider === '' ? null : entry.provider}
+                placeholder="(pick a provider)"
+                onChange={(provider) => set(index, { ...entry, provider })}
+                options={[
+                  // A provider the entry names but that no longer exists still has to be
+                  // displayable, or the row reads as empty over a value that is really there.
+                  ...(providers.every((p) => p.id !== entry.provider) && entry.provider !== ''
+                    ? [{ value: entry.provider, label: entry.provider }]
+                    : []),
+                  ...providers.map((p) => ({
+                    value: p.id,
+                    label: p.id,
+                    detail: isEnabled(p) ? undefined : 'off',
+                  })),
+                ]}
+              />
+            </span>
             {/*
              * A picker *and* a box, the shape `AgentsSection`'s ModelField already uses: the menu
              * is what this machine actually reports, and the box stays typable because a model
@@ -827,21 +821,19 @@ function PoolCard({
                 value={entry.model}
                 onChange={(e) => set(index, { ...entry, model: e.target.value })}
               />
-              <select
-                className={styles.comboPick}
-                aria-label="Pick a model"
-                value=""
-                onChange={(e) => {
-                  if (e.target.value !== '') set(index, { ...entry, model: e.target.value })
-                }}
-              >
-                <option value="">Pick…</option>
-                {modelsFor(entry.provider, offered).map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
+              <span className={styles.comboPick}>
+                <Select
+                  size="sm"
+                  aria-label="Pick a model"
+                  value={null}
+                  placeholder="Pick…"
+                  onChange={(model) => set(index, { ...entry, model })}
+                  options={modelsFor(entry.provider, offered).map((model) => ({
+                    value: model,
+                    label: model,
+                  }))}
+                />
+              </span>
             </div>
             <input
               className={styles.entryField}
@@ -869,32 +861,23 @@ function PoolCard({
             />
             {/* Buttons rather than drag: keyboard-reachable, and the move logic is a pure
                 function `check:pools` drives. `check:ui-icons` forbids a Unicode arrow. */}
-            <button
-              type="button"
-              className={styles.iconButton}
-              aria-label="Move entry up"
+            <IconButton
+              icon="arrow-up"
+              label="Move entry up"
               disabled={index === 0}
               onClick={() => onChange({ ...pool, entries: moveUp(entries, index) })}
-            >
-              <Icon name="arrow-up" size={1} />
-            </button>
-            <button
-              type="button"
-              className={styles.iconButton}
-              aria-label="Move entry down"
+            />
+            <IconButton
+              icon="arrow-down"
+              label="Move entry down"
               disabled={index === entries.length - 1}
               onClick={() => onChange({ ...pool, entries: moveDown(entries, index) })}
-            >
-              <Icon name="arrow-down" size={1} />
-            </button>
-            <button
-              type="button"
-              className={styles.iconButton}
-              aria-label="Remove entry"
+            />
+            <IconButton
+              icon="x"
+              label="Remove entry"
               onClick={() => onChange({ ...pool, entries: removeAt(entries, index) })}
-            >
-              <Icon name="x" size={1} />
-            </button>
+            />
           </div>
         )
       })}

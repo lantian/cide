@@ -18,7 +18,12 @@
  * Escape is answered on a wrapper *inside* the card rather than on `document`.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { OverlayCard } from './ModalShell'
+import { Modal } from './ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Spinner } from '@/kit/components/Feedback'
+import { Dialog } from '@/kit/components/Overlay'
+import { Badge } from '@/kit/components/Status'
+import { Section } from '@/kit/components/Surface'
 import { agentEvents, agentDefs, pools as poolsApi } from '@/ipc/client'
 import { errorText } from '@/ipc/errorText'
 import type {
@@ -173,18 +178,27 @@ export function PoolStateCard({ onDismiss }: { onDismiss: () => void }) {
     typeof report === 'object' && report !== null && report.pools.some((p) => p.entries.some((e) => e.bench !== null))
 
   return (
-    <OverlayCard label="Model pools" onDismiss={onDismiss}>
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="poolState">
-        <div className={styles.head}>
-          <h2 className={styles.title}>Model pools</h2>
-          <p className={styles.lede}>
-            A run starts on the first entry that has room and is not benched. A provider that refuses a run is
-            benched for everyone until it expires or you reset it. Reset moves waiting runs back up; a run already
-            on a model keeps it until its next dispatch.
-          </p>
-        </div>
+    <Modal onDismiss={onDismiss}>
+      <Dialog
+        title="Model pools"
+        lead="A run starts on the first entry that has room and is not benched. A provider that refuses a run is benched for everyone until it expires or you reset it. Reset moves waiting runs back up; a run already on a model keeps it until its next dispatch."
+        width="picker"
+        onKeyDown={onKeyDown}
+        data-audit="poolState"
+        footNote={problem !== null && <span className={styles.problem}>{problem}</span>}
+        actions={
+          <>
+            <Button disabled={!anyBench} onClick={() => reset(null)} data-audit="poolStateResetAll">
+              Reset all
+            </Button>
+            <Button ref={close} variant="primary" onClick={onDismiss}>
+              Close
+            </Button>
+          </>
+        }
+      >
         <div className={styles.body}>
-          {report === null && <p className={styles.dim}>Reading…</p>}
+          {report === null && <Spinner label="Reading…" />}
           {report === 'unsupported' && <p className={styles.dim}>This build cannot report pool state.</p>}
           {typeof report === 'object' && report !== null && (
             <>
@@ -192,48 +206,46 @@ export function PoolStateCard({ onDismiss }: { onDismiss: () => void }) {
                 <p className={styles.dim}>No pools are configured. Add one on the Models screen in Settings.</p>
               )}
               {report.pools.map((pool) => (
-                <section key={pool.name} className={styles.pool} data-audit="poolStatePool">
-                  <h3 className={styles.poolName}>
-                    {pool.name}
-                    {pool.description !== '' && <span className={styles.dim}> — {pool.description}</span>}
-                  </h3>
-                  <ol className={styles.entries}>
-                    {pool.entries.map((entry, i) => (
-                      <EntryRow
-                        key={`${i}:${targetKey(entry.entry)}`}
-                        pool={pool.name}
-                        index={i}
-                        state={entry}
-                        now={now}
-                        test={tests[targetKey(entry.entry)]}
-                        onReset={() => reset(entry.entry)}
-                        onTest={() => test(entry.entry)}
-                      />
-                    ))}
-                  </ol>
-                </section>
+                <div key={pool.name} data-audit="poolStatePool">
+                  <Section caption={pool.name} aside={pool.description !== '' ? pool.description : undefined}>
+                    <ol className={styles.entries}>
+                      {pool.entries.map((entry, i) => (
+                        <EntryRow
+                          key={`${i}:${targetKey(entry.entry)}`}
+                          pool={pool.name}
+                          index={i}
+                          state={entry}
+                          now={now}
+                          test={tests[targetKey(entry.entry)]}
+                          onReset={() => reset(entry.entry)}
+                          onTest={() => test(entry.entry)}
+                        />
+                      ))}
+                    </ol>
+                  </Section>
+                </div>
               ))}
               {report.offPool.length > 0 && (
-                <section className={styles.pool} data-audit="poolStateOffPool">
-                  <h3 className={styles.poolName}>Off any pool ({report.offPool.length})</h3>
-                  <p className={styles.dim}>
-                    These runs' roles are not pointed at a pool, so no pool above applies to them: each runs on its
-                    role's own model or, with none, opencode's default model. Point a role or a whole project at a
-                    pool under Settings → Agents.
-                  </p>
-                  <ul className={styles.list}>
-                    {report.offPool.map((run) => (
-                      <li key={run.run} className={styles.line}>
-                        <span className={styles.who}>{run.agentLabel}</span>
-                        <span className={styles.dim}> — {run.model ?? 'the CLI default model'}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
+                <div data-audit="poolStateOffPool">
+                  <Section caption={`Off any pool (${report.offPool.length})`}>
+                    <p className={styles.dim}>
+                      These runs' roles are not pointed at a pool, so no pool above applies to them: each runs on
+                      its role's own model or, with none, opencode's default model. Point a role or a whole project
+                      at a pool under Settings → Agents.
+                    </p>
+                    <ul className={styles.list}>
+                      {report.offPool.map((run) => (
+                        <li key={run.run} className={styles.line}>
+                          <span className={styles.who}>{run.agentLabel}</span>
+                          <span className={styles.dim}> — {run.model ?? 'the CLI default model'}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </Section>
+                </div>
               )}
               {report.waiting.length > 0 && (
-                <section className={styles.pool}>
-                  <h3 className={styles.poolName}>Waiting</h3>
+                <Section caption="Waiting">
                   <ul className={styles.list}>
                     {report.waiting.map((run) => (
                       <li key={run.run} className={styles.line}>
@@ -242,10 +254,9 @@ export function PoolStateCard({ onDismiss }: { onDismiss: () => void }) {
                       </li>
                     ))}
                   </ul>
-                </section>
+                </Section>
               )}
-              <section className={styles.pool}>
-                <h3 className={styles.poolName}>Recent decisions</h3>
+              <Section caption="Recent decisions">
                 {report.events.length === 0 ? (
                   <p className={styles.dim}>Nothing yet since cide started.</p>
                 ) : (
@@ -259,29 +270,17 @@ export function PoolStateCard({ onDismiss }: { onDismiss: () => void }) {
                     ))}
                   </ul>
                 )}
-              </section>
+              </Section>
             </>
           )}
         </div>
-        <div className={styles.footer}>
-          {problem !== null && <span className={styles.problem}>{problem}</span>}
-          <button
-            type="button"
-            className={styles.secondary}
-            disabled={!anyBench}
-            onClick={() => reset(null)}
-            data-audit="poolStateResetAll"
-          >
-            Reset all
-          </button>
-          <button ref={close} type="button" className={styles.button} onClick={onDismiss}>
-            Close
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }
+
+/** A status tone, as the kit's badge tone: ready is done-green, full is waiting-amber. */
+const BADGE_TONE = { ok: 'green', warn: 'yellow', bad: 'red' } as const
 
 function EntryRow({
   pool,
@@ -329,22 +328,25 @@ function EntryRow({
         <span className={styles.load} title="Runs on this model now, in every project, against its maxRunning">
           {load}
         </span>
-        <span className={`${styles.status} ${styles[status.tone]}`}>{status.text}</span>
+        <span className={styles.status} title={status.text}>
+          <Badge tone={BADGE_TONE[status.tone]} soft>
+            {status.text}
+          </Badge>
+        </span>
         <span className={styles.actions}>
           {benched && (
-            <button type="button" className={styles.secondary} onClick={onReset} data-audit="poolStateReset">
+            <Button size="sm" onClick={onReset} data-audit="poolStateReset">
               Reset
-            </button>
+            </Button>
           )}
-          <button
-            type="button"
-            className={styles.secondary}
+          <Button
+            size="sm"
             onClick={onTest}
-            disabled={test === 'running'}
+            busy={test === 'running'}
             title="One real turn against this model. It spends quota."
           >
             {test === 'running' ? 'Testing…' : 'Test'}
-          </button>
+          </Button>
         </span>
       </div>
       {state.runs.length > 0 && (

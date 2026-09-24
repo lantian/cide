@@ -132,16 +132,18 @@ export function ResumeSplash({
   const controlStyle: CSSProperties = {
     alignSelf: 'stretch',
     textAlign: 'left',
-    padding: '9px 12px',
-    borderRadius: 8,
+    // The kit's card-sized button: its padding, `--r-3`, and the secondary button's hover —
+    // the `--accent-dim` edge over a `--panel-2` wash, never a full accent outline.
+    padding: 'var(--sp-4) var(--sp-5)',
+    borderRadius: 'var(--r-3)',
     // Longhand rather than the `border` shorthand: the colour is the only part that moves,
     // and mixing the two in one style object leaves the result depending on key order.
     borderWidth: 1,
     borderStyle: 'solid',
     // The lift is the whole affordance — nothing else on this surface is clickable, so the
     // box has to say so on hover and on keyboard focus alike.
-    borderColor: lifted ? 'var(--accent)' : 'var(--border)',
-    background: 'transparent',
+    borderColor: lifted ? 'var(--accent-dim)' : 'var(--border)',
+    background: lifted ? 'var(--panel-2)' : 'var(--panel)',
     color: lifted ? 'var(--text-hi)' : 'var(--text)',
     font: 'inherit',
     cursor: 'pointer',

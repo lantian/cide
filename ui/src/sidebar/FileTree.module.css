@@ -42,27 +42,15 @@
    * window, and a 4px step down the sidebar seam is what happens when they drift.
    */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerTitle {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  composes: panelTitle from '../kit/components/Surface.module.css';
 }
 
 /* The meta figure. Mono and tabular so a growing count does not shift the label beside it. */
@@ -70,9 +58,8 @@
   flex: none;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  letter-spacing: 0;
-  color: var(--faint);
   font-variant-numeric: tabular-nums;
+  color: var(--faint);
 }
 
 /* The status-cap marker beside the meta figure. Mono, so it sits on the counter's baseline
@@ -101,28 +88,7 @@
  * lands at the right edge with no change to the layout the chrome audit measures.
  */
 .headerAction {
-  width: 20px;
-  height: calc(20px * var(--ui-scale));
-  flex: none;
-  display: grid;
-  place-items: center;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: inherit;
-  /* Not the header's own: that is 10.5px uppercase with 0.09em tracking, which would draw the
-     glyph as a tiny smudge and letter-space it away from the centre of its box. */
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  letter-spacing: 0;
-  text-transform: none;
-  cursor: pointer;
-  padding: 0;
-}
-
-.headerAction:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
+  composes: icon sm from '../kit/components/Button.module.css';
 }
 
 /*
@@ -131,16 +97,6 @@
  * responding rather than disappearing — a control that renders nothing does not read as "not
  * applicable", it reads as broken, which is a user report this project has already had.
  */
-.headerAction:disabled {
-  color: var(--faint);
-  cursor: default;
-}
-
-.headerAction:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
 .scroll {
   flex: 1;
   min-height: 0;
@@ -164,7 +120,7 @@
   /* The right padding is where the status tag sits; the left is the tree's own gutter, and
      per-depth indentation is applied to the twisty as a margin rather than to the row, so
      the selection band still spans the full width. */
-  padding: 0 8px 0 6px;
+  padding: 0 var(--sp-4) 0 var(--sp-3);
   /*
    * The UI face, not the mono one, and this overrides the mock deliberately.
    *
@@ -201,28 +157,18 @@
 }
 
 /*
- * Hover, derived from the selection band rather than from the chrome.
+ * Hover is the UI kit's row hover, `--panel-2` (`docs/ui-kit.md`, "State, the same way
+ * everywhere"), shared with every list in the app since the redesign (2026-09-24).
  *
- * `--chrome-hi` was the wrong side of `--sel` in the light theme, and only there. On the white
- * panel (#ffffff, L 1.000) the hover band `--chrome-hi` (#e6e6eb) sits at L 0.794 while the
- * selected band `--sel` (#ffe7d9) sits at L 0.835 — so hovering an *unselected* row painted a
- * heavier wash than the selected row next to it, and the list read as though the mouse were
- * the selection. Dark has the two the right way round (panel L 0.008, hover L 0.017, sel
- * L 0.042), which is why this survived: the ordering flipped with the theme.
- *
- * Mixing `--sel` down is what makes the ordering true by construction instead of by two
- * palettes happening to agree — hover is always a fraction of the same colour selection is,
- * in whatever theme. The alternative that lost was picking a third token per theme: there
- * isn't one that works in both (`--panel-2` is *below* `--panel` in dark, so a hover made of
- * it reads as a hole), and it would have to be re-checked every time the palette moves.
- *
- * The `--chrome-hi` line above it is the fallback, not a leftover: an engine without
- * `color-mix()` drops the second declaration and keeps the first, so the worst case is the
- * hover this replaces rather than no hover at all.
+ * It used to be `--sel` mixed down to 55%, argued from the old palette: `--chrome-hi` hover sat
+ * heavier than the peach selection on white. The kit settles the same question another way —
+ * hover is the recessed `--panel-2`, selection the tinted `--sel`, so the two differ in hue as
+ * well as weight in both themes. In dark `--panel-2` sits *below* `--panel`, which reads as a
+ * pressed-in row rather than a lit one; that is the kit's drawing and it is the same in every
+ * list, which is the point.
  */
 .row:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
+  background: var(--panel-2);
 }
 
 /*
@@ -788,7 +734,7 @@
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding: 4px 8px;
+  padding: var(--sp-2) var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
   background: var(--chrome);

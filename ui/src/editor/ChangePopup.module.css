@@ -10,12 +10,12 @@
 .card {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
   /* Wide enough for a normal line of code without wrapping, and capped so a minified line does
      not become a card the width of the window. */
   max-width: 560px;
   min-width: 220px;
-  padding: 8px 10px;
+  padding: var(--sp-4) var(--sp-5);
 }
 
 .head {
@@ -36,7 +36,7 @@
 .body {
   display: flex;
   flex-direction: column;
-  margin-top: 4px;
+  margin-top: var(--sp-2);
   max-height: 40vh;
   overflow-y: auto;
 }
@@ -66,36 +66,14 @@
   color: var(--faint);
   font-family: var(--font-ui);
   font-size: var(--fs-ui-11);
-  margin-top: 2px;
+  margin-top: var(--sp-1);
 }
 
 .actions {
   display: flex;
-  gap: 6px;
-  margin-top: 6px;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
 }
 
-.action {
-  background: var(--chrome);
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  color: var(--text);
-  cursor: pointer;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-11);
-  padding: 3px 8px;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
 
-.action:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
 
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}

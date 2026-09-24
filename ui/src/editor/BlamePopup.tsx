@@ -19,6 +19,7 @@
  * parser` — and gets the mono face and the full-strength text colour. Everything after it is a
  * detail row.
  */
+import { Button } from '@/kit/components/Button'
 import type { ReactNode } from 'react'
 import styles from './BlamePopup.module.css'
 
@@ -68,17 +69,17 @@ export function BlamePopup({
       {oid !== '' && (
         <div className={styles.actions}>
           {/*
-            * `type="button"`, both of them. A bare <button> inside anything that is ever a form is
+            * `type="button"`, both of them — the kit `Button` defaults to it. A bare <button> inside anything that is ever a form is
             * a submit button, and these live in a floating card whose ancestor is not this file's
             * to know.
             */}
-          <button type="button" className={styles.action} onClick={onShowCommit}>
+          <Button size="sm" onClick={onShowCommit}>
             Show in log
-          </button>
+          </Button>
           {onAnnotateParent !== undefined && (
-            <button type="button" className={styles.action} onClick={onAnnotateParent}>
+            <Button size="sm" onClick={onAnnotateParent}>
               Annotate previous revision
-            </button>
+            </Button>
           )}
         </div>
       )}

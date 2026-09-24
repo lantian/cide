@@ -27,7 +27,11 @@
  * file picker and the close confirmation.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { TextInput } from '@/kit/components/Field'
+import { Dialog, PickerList, PickerRow } from '@/kit/components/Overlay'
+import { PathGroup, PathList, PathRow } from '@/kit/components/Surface'
 import { DEFAULT_CHANGELIST } from './model'
 import type { ChangelistDialogState } from './types'
 import styles from './ChangelistDialog.module.css'
@@ -110,22 +114,13 @@ export function ChangelistDialog({
   }
 
   return (
-    <OverlayCard label={title} onDismiss={onCancel}>
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="changelistDialog">
-        <div className={styles.head}>
-          <h2 className={styles.title} data-audit="changelistDialogTitle">
-            {title}
-            {state.repoName !== '' && <span className={styles.repo}> · {state.repoName}</span>}
-          </h2>
-          {state.mode === 'move' && (
-            /*
-             * What picking a list will do, in a sentence. The `track` wording names the write
-             * to the repository — a changelist cannot hold a path git does not track, so
-             * these files are added to it, which is a change to the repository and not a
-             * re-filing. The drag says the same thing on its ghost (`dragDrop.ts::trackHint`);
-             * the two routes must not describe one operation two ways.
-             */
-            <p className={styles.body} data-audit="changelistDialogBody">
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={title}
+        titleAside={state.repoName !== '' ? state.repoName : undefined}
+        lead={
+          state.mode === 'move' ? (
+            <span data-audit="changelistDialogBody">
               {state.track
                 ? state.paths.length === 1
                   ? 'Git is not tracking this file. It is added to git, then moved to the '
@@ -135,47 +130,56 @@ export function ChangelistDialog({
                 : state.paths.length === 1
                   ? 'This file moves to the changelist you pick.'
                   : `These ${state.paths.length} files move to the changelist you pick.`}
-            </p>
-          )}
-        </div>
-
+            </span>
+          ) : undefined
+        }
+        width="narrow"
+        flush
+        onKeyDown={onKeyDown}
+        data-audit="changelistDialog"
+        actions={
+          <Button data-audit="changelistDialogCancel" onClick={onCancel}>
+            Cancel
+          </Button>
+        }
+      >
         {state.mode === 'move' && (
-          <ul className={styles.paths} data-audit="changelistDialogPaths">
+          <PathList data-audit="changelistDialogPaths">
             {state.paths.map((path) => (
-              <li key={path} className={styles.path} title={path}>
-                {path}
-              </li>
+              <PathRow key={path} full={path} name={path} />
             ))}
-          </ul>
+          </PathList>
         )}
 
         <div className={styles.nameRow}>
-          <input
-            ref={field}
-            className={styles.input}
-            data-audit="changelistDialogName"
-            value={name}
-            placeholder={state.mode === 'move' ? 'New changelist…' : 'Changelist name'}
-            aria-label="Changelist name"
-            spellCheck={false}
-            autoComplete="off"
-            onChange={(ev) => setName(ev.target.value)}
-            onKeyDown={(ev) => {
-              if (ev.key !== 'Enter') return
-              ev.preventDefault()
-              submit()
-            }}
-          />
-          <button
-            type="button"
-            className={`${styles.button} ${styles.buttonPrimary}`}
+          <div className={styles.nameField}>
+            <TextInput
+              ref={field}
+              data-audit="changelistDialogName"
+              value={name}
+              placeholder={state.mode === 'move' ? 'New changelist…' : 'Changelist name'}
+              aria-label="Changelist name"
+              spellCheck={false}
+              autoComplete="off"
+              invalid={clash}
+              onChange={(ev) => setName(ev.target.value)}
+              onKeyDown={(ev) => {
+                if (ev.key !== 'Enter') return
+                ev.preventDefault()
+                submit()
+              }}
+            />
+          </div>
+          <Button
+            variant="primary"
             data-audit="changelistDialogSubmit"
             disabled={!nameOk}
             onClick={submit}
           >
             {submitLabel}
-          </button>
+          </Button>
         </div>
+        {/* The kit's invalid field: a red border *and* the reason in words underneath. */}
         {clash && (
           <p className={styles.warn} data-audit="changelistDialogClash">
             A changelist called “{trimmed}” already exists here.
@@ -183,19 +187,15 @@ export function ChangelistDialog({
         )}
 
         {state.mode === 'move' && (
-          <ul className={styles.list} data-audit="changelistDialogList">
-            {state.lists.map((list) => {
-              // The list the paths are already in is not a move. Disabled rather than hidden:
-              // a chooser that silently omits the current list makes the user wonder whether
-              // it was deleted.
-              const here = list.id === state.id
-              return (
-                <li key={list.id}>
-                  <button
-                    type="button"
-                    className={styles.entry}
+          <div className={styles.lists} data-audit="changelistDialogList">
+            <PickerList aria-label="Changelists">
+              {state.lists.map((list) => {
+                const here = list.id === state.id
+                return (
+                  <PickerRow
+                    key={list.id}
                     disabled={here}
-                    onClick={() => onPick(list.id)}
+                    onClick={here ? undefined : () => onPick(list.id)}
                   >
                     <span className={styles.entryName}>{list.name}</span>
                     <span className={styles.entryMeta}>
@@ -204,34 +204,22 @@ export function ChangelistDialog({
                       {list.id === DEFAULT_CHANGELIST && 'default · '}
                       {list.count} {list.count === 1 ? 'file' : 'files'}
                     </span>
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
+                  </PickerRow>
+                )
+              })}
+            </PickerList>
+          </div>
         )}
 
         {state.mode !== 'move' && state.lists.length > 0 && (
-          <ul className={styles.list} data-audit="changelistDialogExisting">
+          <PathList data-audit="changelistDialogExisting">
+            <PathGroup>Already here</PathGroup>
             {state.lists.map((list) => (
-              <li key={list.id} className={styles.existing}>
-                {list.name}
-              </li>
+              <PathRow key={list.id} name={list.name} />
             ))}
-          </ul>
+          </PathList>
         )}
-
-        <div className={styles.footer}>
-          <button
-            type="button"
-            className={styles.button}
-            data-audit="changelistDialogCancel"
-            onClick={onCancel}
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }

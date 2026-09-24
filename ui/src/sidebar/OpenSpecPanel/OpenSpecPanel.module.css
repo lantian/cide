@@ -47,28 +47,15 @@
  * puts a few-pixel step in the sidebar seam.
  */
 .head {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
+  /* The kit's `PanelHeader`, like every other sidebar panel's header. */
+  composes: panelHeader from '../../kit/components/Surface.module.css';
   /* Written twice: WebKitGTK 2.52 drops the unprefixed property. See `check-css-prefix.mjs`. */
   -webkit-user-select: none;
   user-select: none;
 }
 
 .title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  composes: panelTitle from '../../kit/components/Surface.module.css';
 }
 
 .meta {
@@ -88,22 +75,9 @@
  * six board arms, so a rule that depended on it would move the gear when the board changed.
  */
 .headAction {
-  flex: none;
-  display: flex;
-  align-items: center;
-  padding: var(--sp-1);
-  border: 0;
-  border-radius: var(--r-1);
-  background: none;
-  color: var(--dim);
-  cursor: pointer;
-  transition: background-color var(--dur-1) ease;
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
-.headAction:hover {
-  background: var(--panel-2);
-  color: var(--text);
-}
 
 .body {
   flex: 1 1 auto;
@@ -154,24 +128,11 @@
 }
 
 .button {
-  font: inherit;
-  padding: var(--sp-1) var(--sp-3);
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--panel-2);
-  color: var(--text);
-  cursor: pointer;
-  transition: background-color var(--dur-1) ease;
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
-.button:hover:not(:disabled) {
-  background: var(--panel-2);
-}
 
-.button:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
+
 
 /*
  * The in-flight mark inside Set up. Inline-block with a small negative dip rather than making the
@@ -207,8 +168,9 @@
 }
 
 .primary {
-  composes: primary from '../../styles/buttons.module.css';
+  composes: button sm primary from '../../kit/components/Button.module.css';
 }
+
 
 /*
  * The composer that opens under the toolbar. (M28)
@@ -341,22 +303,12 @@
 }
 
 .rowAction {
+  composes: button sm quiet from '../../kit/components/Button.module.css';
   flex: 0 0 auto;
-  font: inherit;
-  font-size: var(--fs-ui-11);
   margin-right: var(--sp-5);
-  padding: 0 var(--sp-2);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-1);
-  background: none;
-  color: var(--accent);
-  cursor: pointer;
-  transition: background-color var(--dur-1) ease;
 }
 
-.rowAction:hover {
-  background: var(--panel-2);
-}
+
 
 .row {
   display: flex;

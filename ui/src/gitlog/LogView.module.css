@@ -55,7 +55,7 @@
   display: flex;
   flex: none;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 5px 10px;
   border-bottom: 1px solid var(--border);
 }
@@ -89,7 +89,7 @@
   top: 100%;
   left: 0;
   z-index: 5;
-  margin: 2px 0 0;
+  margin: var(--sp-1) 0 0;
   padding: 3px;
   list-style: none;
   min-width: 180px;
@@ -125,7 +125,7 @@
 }
 
 .branchRow:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 /* The keyboard highlight, which is a different thing from `:hover` and must win over it: the
@@ -133,8 +133,9 @@
    selection back. */
 .branchRowOn,
 .branchRowOn:hover {
-  background: var(--accent);
-  color: var(--panel-2);
+  /* The kit's "selected": `--sel`, not an accent bar with inverted text. */
+  background: var(--sel);
+  color: var(--text-hi);
 }
 
 .branchNote {
@@ -150,9 +151,9 @@
   height: calc(24px * var(--ui-scale));
   box-sizing: border-box;
   border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--panel-2);
-  color: var(--text);
+  border-radius: var(--r-2);
+  background: var(--bg);
+  color: var(--text-hi);
   font: inherit;
   font-size: var(--fs-ui-12);
 }
@@ -163,11 +164,12 @@
   max-width: 220px;
   height: calc(24px * var(--ui-scale));
   box-sizing: border-box;
-  padding: 0 7px;
+  padding: 0 var(--sp-4);
+  /* The kit field. */
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font: inherit;
   font-size: var(--fs-ui-12);
 }
@@ -180,54 +182,31 @@
 .input:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-.clear,
-.refresh {
+.clear {
+  composes: button sm secondary from '../kit/components/Button.module.css';
   flex: none;
-  height: calc(24px * var(--ui-scale));
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome);
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.clear:hover,
-.refresh:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
+
+.refresh {
+  composes: button sm secondary from '../kit/components/Button.module.css';
+  flex: none;
 }
 
-.refresh:disabled {
-  cursor: default;
-  opacity: 0.6;
-}
+
+
+
+
+
+
 
 /* The way out of an empty filtered list, beside the sentence that explains it. */
 .inlineClear {
-  display: block;
-  margin-top: 8px;
-  padding: 3px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome);
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.inlineClear:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
+  composes: button sm secondary from '../kit/components/Button.module.css';
+  margin-top: var(--sp-4);
 }
 
 /*
@@ -251,7 +230,7 @@
 }
 
 .reveal .inlineClear {
-  margin: 8px 12px 0;
+  margin: var(--sp-4) var(--sp-5) 0;
 }
 
 /*
@@ -277,7 +256,7 @@
 .row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   height: calc(24px * var(--ui-scale));
   padding: 0 10px;
   cursor: pointer;
@@ -291,12 +270,14 @@
 }
 
 .row:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
+/* The kit's "selected": `--sel`. It was `--accent-dim`, which the red palette turned into a
+   pink bar across the whole commit row. */
 .rowActive,
 .rowActive:hover {
-  background: var(--accent-dim);
+  background: var(--sel);
   color: var(--text-hi);
 }
 
@@ -483,7 +464,7 @@ button.chip:focus-visible {
 
 .status,
 .note {
-  padding: 12px;
+  padding: var(--sp-5);
   color: var(--dim);
   font-size: var(--fs-ui-13);
   white-space: normal;
@@ -495,38 +476,17 @@ button.chip:focus-visible {
 }
 
 .more {
-  display: block;
+  composes: button sm secondary from '../kit/components/Button.module.css';
+  display: flex;
   width: calc(100% - 20px);
-  margin: 6px 10px 12px;
-  padding: 5px;
-  background: var(--chrome);
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.more:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
-
-.more:disabled {
-  cursor: default;
-  opacity: 0.6;
+  margin: var(--sp-3) 10px var(--sp-5);
 }
 
 .details {
   border-left: 1px solid var(--border);
   overflow: auto;
   min-width: 0;
-  padding: 12px;
+  padding: var(--sp-5);
   font-size: var(--fs-ui-13);
   color: var(--text);
   /* The message is prose the user will want to copy — a hash out of a revert line, a ticket
@@ -556,7 +516,7 @@ button.chip:focus-visible {
 .fileRow {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   width: 100%;
   padding: var(--sp-2) var(--sp-3);
   box-sizing: border-box;
@@ -590,123 +550,16 @@ button.chip:focus-visible {
 }
 
 /* ------------------------------------------------------------------------------------------
- * The name prompt — *New branch from here…* and *Tag…*
+ * The name prompt — *New branch from here…* and *Tag…* — and *Compare with…*
  *
- * The scrim and the 620px card come from `OverlayCard` (`overlays/Overlay.module.css`), so only
- * what sits inside them is styled here. That is the same split `ChangelistDialog.module.css`
- * follows and the reason the two dialogs cannot drift apart: every overlay in this app draws the
- * same ground, radius, shadow and width, and the only thing a caller owns is the body.
- *
- * Every colour is a token, so both themes come out of `tokens.css` and nothing here hardcodes a
- * light or a dark value.
+ * Both are the kit's `Dialog` in `Modal`, with its `TextInput`, `Select` and `Button`s; only
+ * the stack of fields and the compare list's two columns are styled here.
  * --------------------------------------------------------------------------------------- */
 
-/* Re-declares the column rather than sitting in the card as a plain block: `OverlayCard` makes
-   the card a flex column, and an ordinary wrapper would make the title, the fields and the
-   footer children of *it*. */
-.prompt {
-  flex: 1;
-  min-height: 0;
+.promptFields {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 16px 18px;
-}
-
-.promptTitle {
-  margin: 0;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-/* The two fields are 28px, matching `ChangelistDialog`'s — an overlay's field, not the 22px
-   filter-bar control at the top of this same stylesheet. */
-.promptInput {
-  flex: none;
-  min-width: 0;
-  height: calc(28px * var(--ui-scale));
-  box-sizing: border-box;
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text-hi);
-  font-family: inherit;
-  font-size: var(--fs-ui-13);
-}
-
-.promptInput::placeholder {
-  color: var(--faint);
-}
-
-.promptInput:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: -1px;
-  border-color: var(--accent);
-}
-
-/* Only drawn for a tag asked for from the command palette in a project with several roots —
-   see `NamePromptCard`. `appearance` is left alone for the reason `.branch` above gives. */
-.promptSelect {
-  flex: none;
-  align-self: flex-start;
-  max-width: 100%;
-  height: calc(28px * var(--ui-scale));
-  box-sizing: border-box;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text-hi);
-  font-family: inherit;
-  font-size: var(--fs-ui-13);
-}
-
-.promptFooter {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding-top: 2px;
-}
-
-.promptButton {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
-  color: var(--text);
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.promptButton:hover:not(:disabled) {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
-
-.promptButton:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.promptButton:disabled {
-  color: var(--faint);
-  border-color: var(--border-soft);
-}
-
-/* Nothing in this dialog destroys anything, so the primary button is the one that acts —
-   unlike `ConfirmDestructive`, where the prominent button is the one that backs out. It used to
-   be filled only while enabled; the shared class fades a disabled one instead. */
-.promptPrimary {
-  composes: primary from '../styles/buttons.module.css';
+  gap: var(--sp-4);
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -723,11 +576,16 @@ button.chip:focus-visible {
 .rangeHead {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   justify-content: space-between;
 }
 
 /*
+.swap {
+  composes: button sm secondary from '../kit/components/Button.module.css';
+  flex: none;
+}
+
  * ⇄ Swap.
  *
  * Deliberately the same shape as `.inlineClear` — the other "way out of the state you are in"
@@ -737,31 +595,10 @@ button.chip:focus-visible {
  * the class and then overriding both would be the same duplication with an inheritance chain in
  * front of it.
  */
-.swap {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: 2px 7px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome);
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  white-space: nowrap;
-  cursor: pointer;
-}
 
-.swap:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
 
-.swap:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
+
+
 
 /*
  * `+12 −3` at the end of a changed-file row.
@@ -787,44 +624,20 @@ button.chip:focus-visible {
  * `<select>` because it carries two columns and a `<select>` option carries one string.
  * --------------------------------------------------------------------------------------- */
 
-/* Bounded and scrolled, so a log that has had *Load more* pressed six times does not make the
-   card taller than the window. `OverlayCard` is a flex column, so this is the child that gives. */
-.compareList {
-  flex: 1;
-  min-height: 0;
-  max-height: calc(260px * var(--ui-scale));
-  overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-}
-
-.compareRow {
+/* The field and its refusal, in the dialog's head: they are what the list below answers to. */
+.compareHead {
   display: flex;
-  gap: 8px;
-  width: 100%;
-  padding: 4px 8px;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-5);
 }
 
-.compareRow:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
-
-.compareRow:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
+/* Bounded and scrolled, so a log that has had *Load more* pressed six times does not make the
+   dialog taller than the window. The rows are the kit's `PickerRow`. */
+.compareList {
+  display: flex;
+  max-height: calc(260px * var(--ui-scale));
+  padding: 0 calc(24px * var(--ui-scale));
 }
 
 /* The hash column: fixed width and tabular, so the subjects beside it line up into a column the
@@ -837,6 +650,7 @@ button.chip:focus-visible {
 }
 
 .compareSubject {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -850,9 +664,8 @@ button.chip:focus-visible {
  * blank is a refusal they have to remember rather than read.
  */
 .compareError {
-  flex: none;
   color: var(--red);
-  font-size: var(--fs-ui-12);
+  font-size: var(--fs-ui-11);
 }
 
 /*
@@ -880,7 +693,7 @@ button.chip:focus-visible {
  */
 .commitMessage {
   margin-top: 10px;
-  padding-top: 8px;
+  padding-top: var(--sp-4);
   border-top: 1px solid var(--border);
 }
 
@@ -889,7 +702,7 @@ button.chip:focus-visible {
   /* Long enough to break a narrow pane: a URL in a commit message has no space in it, and
      without this the whole details pane grows a horizontal scrollbar. */
   overflow-wrap: anywhere;
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   font: inherit;
 }
 
@@ -915,7 +728,7 @@ button.chip:focus-visible {
  */
 .fileRowOn,
 .fileRowOn:hover {
-  background: var(--chrome-hi);
+  background: var(--sel);
 }
 
 /*
@@ -929,9 +742,9 @@ button.chip:focus-visible {
 .fileDir {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   width: 100%;
-  padding: 2px 6px;
+  padding: var(--sp-1) var(--sp-3);
   box-sizing: border-box;
   border: 0;
   border-radius: var(--r-1);

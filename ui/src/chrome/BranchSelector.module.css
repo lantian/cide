@@ -54,7 +54,7 @@
 }
 
 .widget:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--accent);
 }
 
@@ -80,21 +80,21 @@
   align-items: flex-end;
   justify-content: flex-start;
   /* Clear of the status bar itself, so the widget stays visible under the popup. */
-  padding: 24px 12px calc(var(--h-status) + 6px);
+  padding: var(--sp-7) var(--sp-5) calc(var(--h-status) + 6px);
 }
 
 .popup {
   display: flex;
   flex-direction: column;
-  width: 460px;
+  width: calc(460px * var(--ui-scale));
   max-width: 100%;
   max-height: 100%;
-  background: var(--panel);
+  /* The kit `PickerFrame`'s box, anchored to the status bar instead of centred. */
+  background: var(--chrome);
   border: 1px solid var(--border);
   border-radius: var(--r-4);
-  box-shadow: var(--shadow-2);
+  box-shadow: var(--shadow-3);
   color: var(--text);
-  font-family: var(--font-ui);
   font-size: var(--fs-ui-13);
   overflow: hidden;
 }
@@ -114,8 +114,8 @@
 .repos {
   flex: none;
   display: flex;
-  gap: 2px;
-  padding: 6px 8px;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-4);
   border-bottom: 1px solid var(--border-soft);
   overflow-x: auto;
 }
@@ -124,10 +124,11 @@
 .repoOn {
   appearance: none;
   border: 0;
-  border-radius: var(--r-1);
-  padding: 4px 8px;
+  border-radius: var(--r-2);
+  padding: var(--sp-2) var(--sp-4);
   background: transparent;
   font: inherit;
+  font-size: var(--fs-ui-12);
   color: var(--dim);
   cursor: pointer;
   white-space: nowrap;
@@ -138,16 +139,19 @@
 }
 
 .repo:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
+/* The kit's "on (segmented)": raised onto `--panel`, a border and `--shadow-1`, 500. */
 .repoOn {
-  background: var(--chrome-hi);
+  background: var(--panel);
+  box-shadow: 0 0 0 1px var(--border), var(--shadow-1);
   color: var(--text-hi);
+  font-weight: 500;
 }
 
 .repoHead {
-  margin-left: 6px;
+  margin-left: var(--sp-3);
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
@@ -155,25 +159,35 @@
 
 .head {
   flex: none;
-  padding: 10px;
+  padding: var(--sp-5);
   border-bottom: 1px solid var(--border-soft);
 }
 
+/*
+ * The kit `TextInput`'s look (`--bg` box, one control height, the accent border and 3px halo on
+ * focus) on a bare `<input>`, because this field is a combobox that owns
+ * `aria-activedescendant` and the arrow keys — wrapping it would move the focus target.
+ */
 .search {
   width: 100%;
+  height: calc(30px * var(--ui-scale));
   appearance: none;
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  padding: 5px 8px;
-  background: var(--panel-2);
-  color: var(--text);
+  padding: 0 var(--sp-4);
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: var(--font-ui);
   font-size: var(--fs-ui-13);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .search:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .search::placeholder {
@@ -182,55 +196,9 @@
 
 .actions {
   display: flex;
-  gap: 6px;
-  margin-top: 8px;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
   flex-wrap: wrap;
-}
-
-.action,
-.primary,
-.danger {
-  appearance: none;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  padding: 4px 10px;
-  background: var(--panel-2);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  color: var(--text);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.action:hover:not(:disabled),
-.primary:hover:not(:disabled),
-.danger:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.action:disabled,
-.primary:disabled,
-.danger:disabled {
-  color: var(--faint);
-  cursor: default;
-  border-color: var(--border-soft);
-}
-
-/* The default action of whichever panel is open, in the app's one primary look. This rule was
-   where `--grad-accent-ink` was first chosen over the decorative `--grad-accent`, for the 2.4:1
-   label the latter puts on its orange end; `styles/buttons.module.css` carries that forward. */
-.primary {
-  composes: primary from '../styles/buttons.module.css';
-}
-
-/* Deleting an unmerged branch — the one action here that can lose commits. */
-.danger {
-  background: transparent;
-  border-color: var(--red);
-  color: var(--red);
 }
 
 /* --- rows ------------------------------------------------------------------------------ */
@@ -239,21 +207,24 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 4px 0 6px;
+  padding: var(--sp-2);
 }
 
+/* The kit's section caption. */
 .section {
-  padding: 8px 12px 4px;
+  padding: var(--sp-4) var(--sp-4) var(--sp-2);
   color: var(--faint);
-  font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 .row,
 .rowCurrent {
   display: flex;
   align-items: stretch;
+  border-radius: var(--r-2);
   transition:
     background-color var(--dur-1) var(--ease-out),
     border-color var(--dur-1) var(--ease-out),
@@ -262,7 +233,7 @@
 
 .row:hover,
 .rowCurrent:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 /*
@@ -278,9 +249,9 @@
  * rather than a `border-left`, because a border is laid out and every row would shift two pixels
  * sideways as the highlight arrived.
  */
+/* The keyboard's row: the kit's "selected", `--sel`. */
 .rowOn {
-  background: var(--chrome-hi);
-  box-shadow: inset 2px 0 0 var(--accent);
+  background: var(--sel);
 }
 
 .rowMain {
@@ -288,11 +259,11 @@
   min-width: 0;
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   appearance: none;
   border: 0;
   background: transparent;
-  padding: 5px 4px 5px 12px;
+  padding: var(--sp-3) var(--sp-2) var(--sp-3) var(--sp-4);
   font: inherit;
   color: inherit;
   text-align: left;
@@ -312,7 +283,7 @@
    its own column on every other row. */
 .rowCurrent .name {
   color: var(--accent);
-  font-weight: var(--w-bold);
+  font-weight: 500;
 }
 
 .name {
@@ -353,57 +324,15 @@
   font-size: var(--fs-ui-12);
 }
 
-.more {
-  flex: none;
-  appearance: none;
-  border: 0;
-  background: transparent;
-  padding: 0 10px;
-  color: var(--dim);
-  font-size: var(--fs-ui-14);
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.more:hover {
-  color: var(--accent);
-}
-
 .rowMenu {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  padding: 4px 12px 8px 24px;
-  background: var(--panel-2);
-}
-
-.menuItem {
-  appearance: none;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  padding: 3px 8px;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  color: var(--text);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.menuItem:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4) var(--sp-4) calc(24px * var(--ui-scale));
 }
 
 .empty {
-  padding: 18px 12px;
+  padding: var(--sp-6) var(--sp-5);
   color: var(--faint);
   text-align: center;
 }
@@ -414,18 +343,18 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 12px;
+  padding: var(--sp-5);
 }
 
 .panelTitle {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-13);
-  font-weight: var(--w-bold);
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
   color: var(--text-hi);
 }
 
 .panelBody {
-  margin: 8px 0 0;
+  margin: var(--sp-4) 0 0;
   color: var(--dim);
   line-height: calc(17px * var(--ui-scale));
 }
@@ -436,8 +365,8 @@
  * screen. Same rule as `ChangelistDialog`'s path list.
  */
 .paths {
-  margin: 8px 0 0;
-  padding: 8px;
+  margin: var(--sp-4) 0 0;
+  padding: var(--sp-4);
   max-height: calc(160px * var(--ui-scale));
   overflow-y: auto;
   list-style: none;
@@ -459,8 +388,8 @@
 .panelButtons {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--sp-4);
+  margin-top: var(--sp-5);
 }
 
 /* --- the one-line outcome -------------------------------------------------------------- */
@@ -472,7 +401,7 @@
  */
 .note {
   flex: none;
-  padding: 8px 12px;
+  padding: var(--sp-4) var(--sp-5);
   border-top: 1px solid var(--border-soft);
   background: var(--panel-2);
   color: var(--dim);

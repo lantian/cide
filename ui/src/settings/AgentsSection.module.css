@@ -13,8 +13,8 @@
 .split {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 6px 0;
+  gap: var(--sp-4);
+  padding: var(--sp-3) 0;
 }
 
 .list {
@@ -27,14 +27,14 @@
 }
 
 .listEmpty {
-  padding: 12px 2px;
+  padding: var(--sp-5) var(--sp-1);
   font-size: var(--fs-ui-12);
   color: var(--dim);
 }
 
 .listActions {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-4);
 }
 
 /*
@@ -45,15 +45,20 @@
  * that is not itself a control is free to say more than a click target should: two badges, a
  * status word, and Rust's sentence when there is one.
  */
+/* A row of the roster: the kit's list row — hover `--panel-2`, the one being edited is the kit's
+   "open / current" (a 2px accent bar and a 5% accent wash). */
 .row {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 7px 9px;
-  border: 1px solid transparent;
+  gap: var(--sp-5);
+  padding: var(--sp-4) var(--sp-5);
   border-radius: var(--r-2);
   background: transparent;
   color: var(--text);
+}
+
+.row:hover {
+  background: var(--panel-2);
 }
 
 .row:hover {
@@ -71,12 +76,13 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 
-.rowActive {
-  background: var(--chrome-hi);
-  border-color: var(--border);
+.rowActive,
+.rowActive:hover {
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 /*
@@ -95,7 +101,7 @@
 .rowHead {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
 }
 
 .rowName {
@@ -105,7 +111,7 @@
 
 .rowFile {
   display: block;
-  margin-top: 2px;
+  margin-top: var(--sp-1);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   line-height: 1.45;
@@ -129,20 +135,13 @@
 }
 
 /* Which directory the file is in — the whole of what scope means, so it is on every row. */
+/* The kit's quiet `Badge soft squared`, neutral: a kind (scope, harness), not a state. */
 .badge {
+  composes: badge soft squared from '../kit/components/Status.module.css';
   flex: none;
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-full);
-  font-size: var(--fs-ui-11);
-  line-height: 1.5;
-  color: var(--dim);
-  text-transform: none;
-  letter-spacing: 0;
 }
 
 .badgeGlobal {
-  border-color: var(--border-soft);
   color: var(--faint);
 }
 
@@ -166,27 +165,13 @@
 }
 
 /* The row's own two buttons. Smaller than the form's, because they sit inside a list row. */
+/*
+ * The buttons below compose the UI kit's own classes (`kit/components/Button.module.css`) rather
+ * than drawing a look of their own: this form's JSX is pinned line by line by
+ * `check-settings-agents.mjs`, so its elements stay and the kit's drawing is attached to them.
+ */
 .act {
-  height: calc(22px * var(--ui-scale));
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.act:hover {
-  color: var(--text);
-  border-color: var(--accent);
-}
-
-.act:disabled {
-  color: var(--faint);
-  border-color: var(--border-soft);
-  cursor: default;
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
 /*
@@ -197,14 +182,7 @@
  * button carried before Delete moved out here.
  */
 .actDanger {
-  border-color: var(--red);
-  color: var(--red);
-}
-
-.actDanger:hover {
-  border-color: var(--red);
-  color: var(--red);
-  background: var(--chrome-hi);
+  composes: danger from '../kit/components/Button.module.css';
 }
 
 /* --- the form --- */
@@ -218,7 +196,7 @@
   display: block;
   font-size: var(--fs-ui-13);
   color: var(--text);
-  margin-bottom: 6px;
+  margin-bottom: var(--sp-3);
 }
 
 .fieldHint {
@@ -232,12 +210,12 @@
 .input {
   display: block;
   width: 100%;
-  height: calc(26px * var(--ui-scale));
-  padding: 0 9px;
+  height: calc(30px * var(--ui-scale));
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   /* A role name is a file stem and a branch segment; a tool name and a model alias are machine
      strings. Mono, like every path and counter in this app. */
   font-family: var(--font-mono);
@@ -251,28 +229,16 @@
 .input:focus {
   outline: 0;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .inputNarrow {
-  width: 92px;
+  width: calc(92px * var(--ui-scale));
 }
 
+/* The width a kit `Select` takes in this form. */
 .select {
-  display: block;
-  height: calc(26px * var(--ui-scale));
-  min-width: 220px;
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-}
-
-.select:focus {
-  outline: 0;
-  border-color: var(--accent);
+  min-width: calc(220px * var(--ui-scale));
 }
 
 /*
@@ -286,11 +252,11 @@
   display: block;
   width: 100%;
   min-height: calc(56px * var(--ui-scale));
-  padding: 5px 9px;
+  padding: var(--sp-3) var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   line-height: 1.5;
@@ -306,6 +272,7 @@
 .descArea:focus {
   outline: 0;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /*
@@ -324,11 +291,11 @@
   display: block;
   width: 100%;
   min-height: calc(320px * var(--ui-scale));
-  padding: 9px 10px;
+  padding: var(--sp-4) var(--sp-5);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   line-height: 1.55;
@@ -344,6 +311,7 @@
 .prompt:focus {
   outline: 0;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /*
@@ -355,7 +323,7 @@
  * it never moves out of one.
  */
 .error {
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--red);
@@ -366,39 +334,25 @@
 .suggest {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 
 .suggestRow {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 
+/* One suggestion; the chosen one is the kit's "on (segmented)": raised onto `--panel`. */
 .chip {
-  height: calc(24px * var(--ui-scale));
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.chip:hover {
-  color: var(--text);
-  border-color: var(--accent);
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
 .chipOn {
-  background: var(--chrome-hi);
-  border-color: var(--accent);
-  color: var(--text);
+  background: var(--panel);
+  border-color: var(--border);
+  box-shadow: var(--shadow-1);
+  color: var(--text-hi);
+  font-weight: 500;
 }
 
 /* --- the tool list --- */
@@ -406,12 +360,12 @@
 .tools {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
 }
 
 .toolRow {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-3);
   align-items: center;
 }
 
@@ -429,7 +383,7 @@
  */
 .extraRow {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-3);
   align-items: start;
 }
 
@@ -456,47 +410,12 @@
 }
 
 .add {
+  composes: button sm quiet from '../kit/components/Button.module.css';
   align-self: flex-start;
-  height: calc(24px * var(--ui-scale));
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.add:hover {
-  color: var(--text);
-  border-color: var(--accent);
 }
 
 .remove {
-  flex: none;
-  width: 24px;
-  height: calc(26px * var(--ui-scale));
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--faint);
-  font-size: var(--fs-ui-14);
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.remove:hover {
-  color: var(--text);
-  border-color: var(--border);
+  composes: icon sm from '../kit/components/Button.module.css';
 }
 
 /* --- the dialog --- */
@@ -535,20 +454,21 @@
 
 .dialogHead {
   flex: none;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--border);
+  /* The kit `Dialog`'s head: 16 over 28 at the sides, no rule — the body starts below it. */
+  padding: var(--sp-6) calc(28px * var(--ui-scale)) var(--sp-4);
 }
 
 .dialogTitle {
   margin: 0;
   font-size: var(--fs-ui-16);
+  font-weight: 600;
   color: var(--text-hi);
 }
 
 .dialogSub {
-  margin: 5px 0 0;
-  font-size: var(--fs-ui-12);
-  line-height: 1.45;
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
   color: var(--dim);
 }
 
@@ -557,12 +477,12 @@
   min-height: 0;
   overflow-y: auto;
   /* No bottom padding: the last `Group` brings its own 28px margin, and two of them stack. */
-  padding: 14px 18px 0;
+  padding: var(--sp-5) calc(28px * var(--ui-scale)) 0;
 }
 
 .dialogFoot {
   flex: none;
-  padding: 12px 18px 14px;
+  padding: var(--sp-5) calc(28px * var(--ui-scale));
   border-top: 1px solid var(--border);
 }
 
@@ -577,7 +497,7 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--sp-4);
 }
 
 /*
@@ -597,47 +517,17 @@
    button next to it is *Keep editing*, so a reflexive Enter keeps the work — `ConfirmDestructive`
    rule 3, with the safe answer being "stay" rather than "cancel". */
 .dangerText {
-  color: var(--red);
-}
-
-.dangerText:hover {
-  color: var(--red);
-  border-color: var(--red);
+  composes: danger from '../kit/components/Button.module.css';
 }
 
 /* --- save, and the state of the form --- */
 
 .save {
-  composes: primary from '../styles/buttons.module.css';
-  height: calc(26px * var(--ui-scale));
-  padding: 0 14px;
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  font-weight: 600;
-  cursor: pointer;
+  composes: button md primary from '../kit/components/Button.module.css';
 }
 
 .quiet {
-  height: calc(26px * var(--ui-scale));
-  padding: 0 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.quiet:hover {
-  color: var(--text);
-  border-color: var(--accent);
+  composes: button md secondary from '../kit/components/Button.module.css';
 }
 
 /*
@@ -671,15 +561,15 @@
   border: 1px solid var(--border);
   border-radius: var(--r-2);
   background: var(--panel-2);
-  padding: 4px 12px 8px;
+  padding: var(--sp-2) var(--sp-5) var(--sp-4);
   margin-bottom: 10px;
 }
 
 .overrideHead {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 0 2px;
+  gap: var(--sp-4);
+  padding: var(--sp-4) 0 var(--sp-1);
 }
 
 .overrideTitle {
@@ -695,33 +585,20 @@
   font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
-  margin: 0 0 4px;
+  margin: 0 0 var(--sp-2);
 }
 
 .overrideRemove {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: calc(22px * var(--ui-scale));
-  height: calc(22px * var(--ui-scale));
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--dim);
-  cursor: pointer;
-}
-
-.overrideRemove:hover {
-  color: var(--text);
+  composes: icon sm from '../kit/components/Button.module.css';
 }
 
 /* The Add controls under the override list. */
 .overrideActions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   flex-wrap: wrap;
-  padding: 6px 0 2px;
+  padding: var(--sp-3) 0 var(--sp-1);
 }
 
 /*

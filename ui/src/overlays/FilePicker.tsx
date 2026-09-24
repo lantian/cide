@@ -30,6 +30,7 @@ import {
 import styles from './Overlay.module.css'
 import { scaledRow, useUiScale } from '@/settings/useUiScale'
 import { Icon } from '@/icons/Icon'
+import { PickerRow as KitPickerRow, PickerStatus } from '@/kit/components/Overlay'
 
 /**
  * The last path component, which is what the row draws large.
@@ -266,14 +267,14 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
       }
     >
       {failed ? (
-        <div className={styles.status}>
+        <PickerStatus>
           File index unavailable — <code>picker_query</code> is not registered in this build.
-        </div>
+        </PickerStatus>
       ) : hits.length === 0 ? (
         /* Four states, two of which look identical and mean opposite things. The rule is
            `format.ts`'s and is driven by `check:picker`; this is the `switch` over its answer
            and holds no decision of its own. */
-        <div className={styles.status}>
+        <PickerStatus>
           {pickerEmptyText(
             pickerEmptyState({
               running: frame?.running === true,
@@ -283,7 +284,7 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
               total: frame?.total ?? null,
             }),
           )}
-        </div>
+        </PickerStatus>
       ) : (
         <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
           {virtualizer.getVirtualItems().map((item) => {
@@ -292,9 +293,10 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
             const badge = kindBadge(basename(hit.value))
             const tone = TONE_CLASS[badge.tone] ?? styles.toneFaint
             return (
-              <div
+              <KitPickerRow
                 key={hit.value}
-                className={item.index === selected ? `${styles.row} ${styles.rowSelected}` : styles.row}
+                virtual
+                selected={item.index === selected}
                 data-audit="pickerRow"
                 style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
                 onMouseMove={() => setSelected(item.index)}
@@ -312,7 +314,7 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
                     project row has nothing to say and an empty chip would be a column of
                     blank boxes down the left of the user's own files. */}
                 {hit.source != null && <span className={styles.source}>{hit.source}</span>}
-              </div>
+              </KitPickerRow>
             )
           })}
         </div>

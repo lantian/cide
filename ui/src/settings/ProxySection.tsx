@@ -50,6 +50,7 @@
  * exactly the kind that ships inverted. A rule inside a component is a rule no check script
  * can run.
  */
+import { TextInput } from '@/kit/components/Field'
 import { useState } from 'react'
 import type { ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SettingsPatch } from '@/ipc/client'
 import { Group, Note, Row, Segmented } from './controls'
@@ -388,8 +389,9 @@ function Field({ label, hint, value, placeholder, onCommit }: FieldProps) {
   return (
     <label className={styles.field}>
       <span className={styles.fieldLabel}>{label}</span>
-      <input
-        className={styles.input}
+      {/* A URL is a machine string: mono, like every path and counter in this app. */}
+      <TextInput
+        mono
         type="text"
         spellCheck={false}
         autoCapitalize="off"

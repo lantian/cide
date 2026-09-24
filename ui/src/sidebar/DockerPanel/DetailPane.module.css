@@ -50,26 +50,8 @@
 }
 
 .headerAction {
-  appearance: none;
+  composes: icon sm from '../../kit/components/Button.module.css';
   flex: none;
-  display: grid;
-  place-items: center;
-  width: calc(20px * var(--ui-scale));
-  height: calc(20px * var(--ui-scale));
-  border: none;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  cursor: pointer;
-  /* `padding: 0`: `appearance: none` does not reset WebKit's default button padding, and with
-     `box-sizing: border-box` it shrinks the content box until the mark overflows to one side of
-     its own hover background. `DockerPanel.module.css`'s `.headerAction` carries the full note. */
-  padding: 0;
-}
-
-.headerAction:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
 }
 
 .body {
@@ -173,25 +155,8 @@
 }
 
 .apply {
-  appearance: none;
+  composes: button sm secondary from '../../kit/components/Button.module.css';
   flex: none;
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  cursor: pointer;
-}
-
-.apply:hover:not(:disabled) {
-  background: var(--chrome-hi);
-}
-
-.apply:disabled {
-  opacity: 0.4;
-  cursor: default;
 }
 
 /*

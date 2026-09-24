@@ -1,149 +1,16 @@
 /*
  * IDEA's *Files Merged with Conflicts*. (M20)
  *
- * Inside `OverlayCard`, which owns the scrim and the 620px card, so this stylesheet is only the
- * contents: a heading, a scrolling list of rows, and a footer.
+ * The frame, the rows and every button are the UI kit's (`Modal` + `Dialog`, `PathList`,
+ * `Button`); this colours the one mark: a conflict still open is `--red`, an answered one
+ * `--green`, and the words beside them stay neutral.
  */
-.head {
-  padding: 14px 16px 10px;
-  border-bottom: 1px solid var(--border);
-}
-
-.title {
-  margin: 0;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-.body {
-  margin: 6px 0 0;
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-  line-height: 1.45;
-}
-
-/* Capped so a merge with forty conflicted files scrolls rather than growing a card taller than
-   the window. `OverlayCard` has no scroll of its own. */
-.list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: calc(320px * var(--ui-scale));
-  overflow-y: auto;
-}
-
-.row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 16px;
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-}
-
-.row:last-child {
-  border-bottom: none;
-}
-
 .mark {
-  flex: none;
-  width: calc(14px * var(--ui-scale));
-  text-align: center;
-  font-family: var(--font-mono);
+  display: inline-flex;
   color: var(--red);
 }
 
 .markDone {
+  display: inline-flex;
   color: var(--green);
-}
-
-.name {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  color: var(--text);
-}
-
-/* The directory, dimmed and shrinking first — the basename is what identifies the row. */
-.where {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  color: var(--faint);
-}
-
-.done {
-  flex: none;
-  color: var(--green);
-  font-size: var(--fs-ui-11);
-}
-
-.rowActions {
-  flex: none;
-  display: flex;
-  gap: 4px;
-}
-
-.foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 16px 14px;
-  border-top: 1px solid var(--border);
-}
-
-.spacer {
-  flex: 1 1 auto;
-}
-
-.count {
-  font-size: var(--fs-ui-11);
-  color: var(--dim);
-}
-
-.action {
-  flex: none;
-  height: calc(22px * var(--ui-scale));
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.action:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
-}
-
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
-
-/* The rule `GuardBar.module.css` was missing until M20: a disabled control that keeps its
-   border, its colour and its pointer cursor reads as live and does nothing when pressed. */
-.action:disabled {
-  color: var(--faint);
-  border-color: var(--border-soft);
-  cursor: default;
-}
-
-.primary {
-  composes: primary from '../styles/buttons.module.css';
 }

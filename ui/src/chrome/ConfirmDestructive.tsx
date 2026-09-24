@@ -91,7 +91,11 @@
  * touched, still leaves the work retrievable from the Shelf.
  */
 import { useEffect, useId, useRef } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Checkbox, RadioGroup } from '@/kit/components/Choice'
+import { Dialog } from '@/kit/components/Overlay'
+import { PathList, PathRow } from '@/kit/components/Surface'
 import { basename, dirname } from '@/overlays/format'
 import { Icon, asIcon } from '@/icons/Icon'
 
@@ -308,132 +312,131 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
   // red stays theirs by default and only a mode that explicitly risks nothing gives it up.
   const danger = active === undefined || active.danger === true
 
+  /*
+   * Rule 3 lives in these two `variant`s. For every destructive caller the prominent button is
+   * Cancel — the kit's primary, focused — so the Enter already in flight when the dialog
+   * appeared backs out, and the act itself is the kit's `danger` (a black fill, not the
+   * accent: with a red accent, a red destroy button read as the primary). Where a caller
+   * declared the act reversible, the primary moves *with* the focus, never without it, and
+   * displaces the danger fill: an act safe enough to confirm by reflex has no claim on the
+   * look that means "this destroys work". A choice that risks nothing (a `--soft` reset) is
+   * a plain secondary.
+   */
+  const runButton = (
+    <Button
+      ref={confirmBtn}
+      variant={confirmDefault ? 'primary' : danger ? 'danger' : 'secondary'}
+      data-audit="confirmDestructiveRun"
+      onClick={onConfirm}
+    >
+      {confirmLabel}
+    </Button>
+  )
+  const cancelButton = (
+    <Button
+      ref={cancel}
+      variant={confirmDefault ? 'secondary' : 'primary'}
+      data-audit="confirmDestructiveCancel"
+      onClick={onCancel}
+    >
+      Cancel
+    </Button>
+  )
+
   return (
-    <OverlayCard label={state.title} onDismiss={onCancel}>
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="confirmDestructive">
-        <div className={styles.head}>
-          <h2 className={styles.title} data-audit="confirmDestructiveTitle">
-            {state.title}
-          </h2>
-
-          {/*
-            * Above the body, not below it, because the body is *about* the selection. Reading
-            * order has to be "reset what, to where / which kind / and here is what that kind
-            * costs"; putting the radios under the sentence makes the first read of the dialog
-            * describe a mode the user has not chosen yet.
-            *
-            * Real `<input type="radio">`s rather than buttons with `role="radio"`: the native
-            * control brings arrow-key navigation, roving tab order and the right screen-reader
-            * semantics for free, and a hand-rolled group that got any of the three wrong would
-            * be wrong in a dialog whose entire job is being read carefully.
-            */}
-          {choices !== undefined && (
-            <div
-              className={styles.choices}
-              role="radiogroup"
-              aria-label={state.title}
-              data-audit="confirmDestructiveChoices"
-            >
-              {choices.map((choice) => (
-                <label
-                  key={choice.id}
-                  className={styles.choice}
-                  data-audit="confirmDestructiveChoice"
-                  data-choice={choice.id}
-                >
-                  <input
-                    type="radio"
-                    name={group}
-                    value={choice.id}
-                    checked={choice.id === active?.id}
-                    onChange={() => onChoose?.(choice.id)}
-                  />
-                  <span className={styles.choiceLabel}>{choice.label}</span>
-                </label>
-              ))}
-            </div>
-          )}
-
-          <p className={styles.body}>{body}</p>
-        </div>
-
-        <ul className={styles.list} data-audit="confirmDestructiveList">
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={state.title}
+        width="narrow"
+        flush
+        onKeyDown={onKeyDown}
+        data-audit="confirmDestructive"
+        head={
+          <>
+            {/*
+              * Above the body, not below it, because the body is *about* the selection. Reading
+              * order has to be "reset what, to where / which kind / and here is what that kind
+              * costs"; putting the radios under the sentence makes the first read of the dialog
+              * describe a mode the user has not chosen yet. The kit's `RadioGroup` is real
+              * `<input type="radio">`s, which bring arrow keys, roving tab order and the right
+              * screen-reader semantics — a hand-rolled group that got any of the three wrong
+              * would be wrong in a dialog whose entire job is being read carefully.
+              */}
+            {choices !== undefined && (
+              <div className={styles.choices} data-audit="confirmDestructiveChoices">
+                <RadioGroup
+                  legend={state.title}
+                  name={group}
+                  inline
+                  value={active?.id ?? ''}
+                  onChange={(id) => onChoose?.(id)}
+                  options={choices.map((choice) => ({ value: choice.id, label: choice.label }))}
+                />
+              </div>
+            )}
+            <p className={styles.body}>{body}</p>
+          </>
+        }
+        footNote={
+          /*
+           * Pushed hard left, away from the two answers — `PasteConfirm`'s rule, for the same
+           * reason: a checkbox next to the destructive button is one that gets toggled by a
+           * click that was 4px off, and this one decides whether the act is recoverable.
+           *
+           * It is *ticked* by default where it appears at all, which is the opposite of the
+           * usual "opt in to the extra step". The safe answer should be the one a user reaches
+           * by doing nothing; that is why Cancel has the focus, and this is the same rule one
+           * step further in — the person who deliberately clicks *Discard 3 files* still gets
+           * their work back out of the Shelf.
+           */
+          option !== undefined && (
+            <span data-audit="confirmDestructiveOption">
+              <Checkbox label={option.label} checked={option.checked} onChange={option.onToggle} />
+            </span>
+          )
+        }
+        // Primary last, where the eye ends and the hand goes — whichever button that is.
+        actions={
+          confirmDefault ? (
+            <>
+              {cancelButton}
+              {runButton}
+            </>
+          ) : (
+            <>
+              {runButton}
+              {cancelButton}
+            </>
+          )
+        }
+      >
+        <PathList data-audit="confirmDestructiveList">
           {files.map((path) => {
             // `basename`/`dirname` rather than the Git panel's `splitPath`, which does the
             // same arithmetic: this file no longer lives in that panel, and a chrome component
             // reaching back into a feature folder for a two-line helper is the import that
             // makes a shared component un-shareable again.
             const split = state.split !== false
-            const name = split ? basename(path) : path
-            const dir = split ? dirname(path) : ''
             return (
-              <li key={path} className={styles.row} title={path}>
-                {/* `minus` rather than the tab strip's dirty dot: what is about to happen to
-                    these rows is removal, and reusing the dot would say "unsaved" instead. The
-                    out-of-project open overrides it with an outward arrow, because nothing is
-                    being removed there — see `ConfirmState.mark`. */}
-                <span className={styles.mark} aria-hidden="true">
-                  <Icon name={asIcon(state.mark ?? 'minus')} size={1} />
-                </span>
-                <span className={styles.name}>{name}</span>
-                {dir !== '' && <span className={styles.where}>{dir}</span>}
-              </li>
+              <PathRow
+                key={path}
+                full={path}
+                name={split ? basename(path) : path}
+                where={split ? dirname(path) : ''}
+                /* `minus` rather than the tab strip's dirty dot: what is about to happen to
+                   these rows is removal, and reusing the dot would say "unsaved" instead. The
+                   out-of-project open overrides it with an outward arrow, because nothing is
+                   being removed there — see `ConfirmState.mark`. Red: "this goes". */
+                mark={
+                  <span className={styles.mark}>
+                    <Icon name={asIcon(state.mark ?? 'minus')} size={1} />
+                  </span>
+                }
+              />
             )
           })}
-        </ul>
-
-        <div className={styles.footer}>
-          {/*
-            * Pushed hard left, away from the two answers — `PasteConfirm`'s rule, for the same
-            * reason: a checkbox next to the destructive button is one that gets toggled by a
-            * click that was 4px off, and this one decides whether the act is recoverable.
-            *
-            * It is *ticked* by default where it appears at all, which is the opposite of the
-            * usual "opt in to the extra step". The safe answer should be the one a user reaches
-            * by doing nothing; that is why Cancel has the focus, and this is the same rule one
-            * step further in — the person who deliberately clicks *Discard 3 files* still gets
-            * their work back out of the Shelf.
-            */}
-          {option !== undefined && (
-            <label className={styles.option} data-audit="confirmDestructiveOption">
-              <input
-                type="checkbox"
-                checked={option.checked}
-                onChange={(ev) => option.onToggle(ev.target.checked)}
-              />
-              {option.label}
-            </label>
-          )}
-          {/*
-            * `buttonPrimary` only behind `confirmDefault`. Rule 3 lives in this one className:
-            * for every destructive caller the accent-filled button is Cancel, so the Enter
-            * already in flight when the dialog appeared backs out — and where a caller has
-            * declared the act reversible, the accent moves *with* the focus, never without it.
-            * The accent also displaces the red there: `buttonDanger` is only the red *text*,
-            * conditional since the log's reset because a `--soft` reset destroys nothing and
-            * must not wear the colour that says it does, and a trash move gives it up for the
-            * same reason.
-            */}
-          <button
-            ref={confirmBtn}
-            type="button"
-            className={`${styles.button} ${confirmDefault ? styles.buttonPrimary : danger ? styles.buttonDanger : ''}`}
-            data-audit="confirmDestructiveRun"
-            onClick={onConfirm}
-          >
-            {confirmLabel}
-          </button>
-          <button
-            ref={cancel}
-            type="button"
-            className={`${styles.button} ${confirmDefault ? '' : styles.buttonPrimary}`}
-            data-audit="confirmDestructiveCancel"
-            onClick={onCancel}
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+        </PathList>
+      </Dialog>
+    </Modal>
   )
 }

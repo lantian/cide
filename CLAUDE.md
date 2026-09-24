@@ -20,6 +20,7 @@ backend, React 19 + Vite 8 frontend, Linux-first (developed on KDE/Wayland; macO
 | [`docs/forks.md`](docs/forks.md) | the rust-analyzer, salsa and gopls forks (`../forks/*`); each fork has its own `CLAUDE.md` — read it before touching that repo |
 | [`docs/worktree-isolation.md`](docs/worktree-isolation.md) | for project authors: what concurrent runs share, `agents.isolateEnv`, `verifyExclusive`, reading a refused verify |
 | [`docs/packaging.md`](docs/packaging.md) | `cargo xtask package`, `./build.sh`, releases |
+| [`docs/ui-kit.md`](docs/ui-kit.md) | **before drawing any UI**: the kit's components, tokens and state rules, and how to add a component; the live page is <http://localhost:1420/kit.html> |
 | `CONTRIBUTING.md` / `README.md` | prerequisites and build / the landing page |
 
 ## Running it
@@ -164,6 +165,7 @@ before you change it.
 | [An agent reviewing a GitLab MR, and its draft comments](docs/checks.md#an-agent-reviewing-a-gitlab-mr-and-its-draft-comments) | `cargo test -p cide-gitlab`, `cargo test -p cide-agents review`, `cargo test -p cide-app -- agent_rpc mr_review`, `check:gitlab`, `check:gitlab-render`, `check:gitlab-dom`, `cargo --locked xtask codegen --check` |
 | [The console harness, or anything that spawns codex](docs/checks.md#the-console-harness-or-anything-that-spawns-codex) | `cargo test -p cide-core -- codex_cli workspace`, `cargo test -p cide-claude`, `cargo test -p cide-agents`, `cargo test -p cide-app -- cmd::session agents spec`, `check:awaiting`, `check:claude-cli`, `check:menu-model`, `check:ext`, `cargo --locked xtask codegen --check`, `cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn` |
 | [Added, renamed or moved any file](docs/checks.md#added-renamed-or-moved-any-file) | `check:casing` |
+| [The UI kit, or any new UI](docs/checks.md#the-ui-kit-or-any-new-ui) | `check:kit`, `check:ui-scale`, `check:motion`, `check:theme`, `check:ui-icons`, `check:menus` |
 
 ## Architecture invariants
 
@@ -198,6 +200,15 @@ Full account in [`docs/architecture.md`](docs/architecture.md). The rules that b
 
 ## Conventions
 
+- **New UI is built from the UI kit** ([`docs/ui-kit.md`](docs/ui-kit.md), `ui/src/kit/`) — the
+  New Project wizard's and the GitLab panel's look, rebuilt on the tokens. Import the kit's
+  `Button`, `TextInput`, `Badge`, `Dialog`, … rather than writing another `.primary`/`.action`/
+  `.row` class; the app had ~45 secondary buttons before M100 because every feature drew its own. A part the
+  kit lacks is **added to the kit first** — component, specimen on the kit page, entry in
+  `docs/ui-kit.md` — then used; changing a kit part means updating its specimen and entry in the
+  same change. `check:kit` fails on a component without either. The app is on the kit since the redesign (M100): a surface whose
+  markup a check pins composes the kit's classes instead of rendering the component —
+  `docs/ui-kit.md` rule 3.
 - **Comments here carry the why, at length, including the option that lost and the bug the
   code prevents.** Match that density; do not "tidy away" a comment that names a failure — most
   of them exist because the failure happened.

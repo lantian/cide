@@ -68,7 +68,7 @@
 .bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 6px 10px;
   background: var(--panel-2);
   border-top: 1px solid var(--border);
@@ -81,17 +81,20 @@
 .field {
   flex: 1;
   min-width: 0;
-  padding: 2px 6px;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  /* The kit field. */
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font: inherit;
 }
 
 .field:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /*
@@ -126,27 +129,12 @@
 }
 
 .button {
+  composes: button sm secondary from '../kit/components/Button.module.css';
   flex: none;
-  padding: 1px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.button:hover:not(:disabled) {
-  color: var(--text-hi);
-  border-color: var(--accent);
-}
 
-.button:disabled {
-  color: var(--dim);
-  cursor: default;
-  opacity: 0.5;
-}
+
+
+
+

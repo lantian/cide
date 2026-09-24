@@ -53,37 +53,23 @@
    * window, and a 4px step down the sidebar seam is what happens when they drift.
    */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
-  /* Written twice: WebKitGTK 2.52 drops the unprefixed property. See `check-css-prefix.mjs`. */
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerTitle {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  composes: panelTitle from '../../kit/components/Surface.module.css';
 }
 
 .headerMeta {
   flex: none;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  letter-spacing: 0;
-  color: var(--faint);
   font-variant-numeric: tabular-nums;
+  color: var(--faint);
 }
 
 .body {
@@ -91,7 +77,7 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 12px 12px 16px;
+  padding: var(--sp-5) var(--sp-5) var(--sp-6);
   /* Task bodies and comments are the content of this panel and have to be quotable; the chrome
      around them sets `user-select: none` globally. Both spellings, as above. */
   -webkit-user-select: text;
@@ -116,14 +102,14 @@
 }
 
 .detail {
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--faint);
 }
 
 .warn {
-  margin: 12px 0 0;
+  margin: var(--sp-5) 0 0;
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-left: 2px solid var(--accent);
@@ -135,7 +121,7 @@
 
 .path {
   display: block;
-  margin-top: 4px;
+  margin-top: var(--sp-2);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   color: var(--text-hi);
@@ -144,7 +130,7 @@
 
 /* The parse error, verbatim, in a block that cannot be mistaken for prose the panel wrote. */
 .error {
-  margin: 8px 0 0;
+  margin: var(--sp-4) 0 0;
   padding: 8px 10px;
   border: 1px solid var(--border-soft);
   border-radius: var(--r-1);
@@ -160,8 +146,8 @@
 .actions {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--sp-4);
+  margin-top: var(--sp-5);
   flex-wrap: wrap;
 }
 
@@ -183,29 +169,8 @@
 }
 
 .action {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
   flex: none;
-  padding: 3px 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.action:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
-}
-
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
 }
 
 /* Every primary action in the panel, in the app's one primary look (`styles/buttons.module.css`):
@@ -224,9 +189,24 @@
  * `--warn` and `check:theme` fails on an invented one.
  */
 .actionDanger,
-.actionDanger:hover {
-  border-color: var(--red);
-  color: var(--red);
+/*
+ * Delete, in two presses. Unarmed it is the kit's destructive *item*: the ordinary button with a
+ * bold ink label, which is what tells somebody scanning the foot of the card which of the two
+ * destroys something. Armed — the confirming half — it is the kit's black danger fill, the one
+ * drawing destruction has in the app. The armed button is told apart by its `data-audit`, which
+ * the component already writes, so no second class had to be threaded through.
+ */
+.actionDanger {
+  color: var(--text-hi);
+  font-weight: 600;
+}
+
+.actionDanger[data-audit='tasksDeleteConfirm'],
+.actionDanger[data-audit='tasksDeleteConfirm']:hover:not(:disabled) {
+  border-color: var(--danger-edge);
+  background: var(--grad-danger);
+  color: var(--on-danger);
+  box-shadow: var(--fill-sheen), var(--shadow-1);
 }
 
 /* The same control inside a 320px list row, where `.action`'s padding would push the title out. */
@@ -249,16 +229,19 @@
 .filters {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
-  margin-top: 8px;
+  margin-top: var(--sp-4);
 }
 
+/* The status filters: the kit's segment look — at rest a quiet label, on raised onto
+   `--panel` with a border and `--shadow-1`, 500, never the accent. */
 .filter {
   flex: none;
-  padding: 1px 7px;
+  height: calc(22px * var(--ui-scale));
+  padding: 0 var(--sp-4);
   border: 1px solid transparent;
-  border-radius: var(--r-3);
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font-family: inherit;
@@ -284,9 +267,11 @@
    is showing, and a single discriminator is one a themed background can swallow. */
 .filterOn,
 .filterOn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: transparent;
+  border-color: var(--border);
+  background: var(--panel);
+  box-shadow: var(--shadow-1);
+  color: var(--text-hi);
+  font-weight: 500;
 }
 
 /* --- The search box. ------------------------------------------------------------------ */
@@ -300,19 +285,26 @@
  * carry a ring, and a ring on the inner element inside a bordered parent draws the double
  * outline every native search field manages to avoid.
  */
+/* The kit's `SearchField`: the `--bg` box, one control height, the accent border and halo. */
 .search {
   display: flex;
   align-items: center;
-  gap: 5px;
-  margin-top: 8px;
-  padding: 0 4px 0 6px;
+  gap: var(--sp-3);
+  height: calc(24px * var(--ui-scale));
+  margin-top: var(--sp-4);
+  padding: 0 var(--sp-2) 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
+  background: var(--bg);
+  color: var(--dim);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .search:focus-within {
-  box-shadow: var(--focus-inset);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .searchGlyph {
@@ -325,10 +317,10 @@
 .searchInput {
   flex: 1;
   min-width: 0;
-  padding: 3px 0;
+  padding: 0;
   border: 0;
   background: transparent;
-  color: var(--text);
+  color: var(--text-hi);
   font-family: inherit;
   font-size: var(--fs-ui-12);
 }
@@ -348,25 +340,8 @@
  * is present exactly when it has work to do.
  */
 .searchClear {
+  composes: icon sm from '../../kit/components/Button.module.css';
   flex: none;
-  display: flex;
-  align-items: center;
-  padding: 1px;
-  border: 0;
-  border-radius: var(--r-1);
-  background: transparent;
-  color: var(--faint);
-  cursor: pointer;
-}
-
-.searchClear:hover {
-  color: var(--text);
-  background: var(--chrome-hi);
-}
-
-.searchClear:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
 }
 
 /* --- The list. ----------------------------------------------------------------------- */
@@ -377,7 +352,7 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
-  margin-top: 12px;
+  margin-top: var(--sp-5);
 }
 
 /* The filtered-to-nothing block: the claim, the count, and the way back. Spaced off the filter
@@ -406,7 +381,7 @@
 .groupHead {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   font-size: var(--fs-ui-12);
   letter-spacing: 0;
   text-transform: none;
@@ -481,7 +456,7 @@
 .row {
   display: flex;
   align-items: baseline;
-  gap: 2px;
+  gap: var(--sp-1);
   width: 100%;
   border-radius: var(--r-2);
 }
@@ -493,15 +468,16 @@
  * the ground alone is `:hover`'s, and "the pointer is here" and "this one is open" must not look
  * the same.
  */
+/* The kit's "open / current": the accent bar and a 5% accent wash. Hover is the kit's row
+   hover, `--panel-2`. */
 .rowOpen,
 .rowOpen:hover {
-  background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .row:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
+  background: var(--panel-2);
 }
 
 .rowMain {
@@ -509,7 +485,7 @@
   min-width: 0;
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 3px 4px;
   border: 0;
   border-radius: var(--r-2);
@@ -536,30 +512,12 @@
  * hover and focus merely bring it forward.
  */
 .rowDelete {
+  composes: icon sm from '../../kit/components/Button.module.css';
   flex: none;
   align-self: center;
-  padding: 0 5px;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
-  line-height: 1.2;
-  cursor: pointer;
 }
 
 .row:hover .rowDelete,
-.rowDelete:hover {
-  color: var(--red);
-}
-
-.rowDelete:focus-visible {
-  color: var(--red);
-  outline: none;
-  box-shadow: var(--focus-inset);
-}
-
 .glyph {
   flex: none;
   width: 12px;
@@ -599,9 +557,9 @@
   flex: none;
   display: inline-flex;
   align-items: baseline;
-  gap: 4px;
+  gap: var(--sp-2);
   max-width: 45%;
-  padding: 1px 5px;
+  padding: var(--sp-1) var(--sp-3);
   border-radius: var(--r-full);
   font-size: var(--fs-ui-11);
   overflow: hidden;
@@ -639,15 +597,16 @@
   color: var(--faint);
 }
 
+/* The kit's `Badge soft`: the tone's hue on a 12% wash of it. Live is green — a run is going. */
 .chipLive {
-  background: var(--sel);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
   color: var(--green);
 }
 
 /* A live run waiting for a permission answer — the one run state that is a call to action, and
    the reason `agentChip` promotes it over an earlier sibling. */
 .chipAttention {
-  background: var(--sel);
+  background: color-mix(in srgb, var(--yellow) 14%, transparent);
   color: var(--yellow);
 }
 
@@ -688,7 +647,7 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 10px 14px;
   border-bottom: 1px solid var(--border-soft);
 }
@@ -758,30 +717,8 @@
 /* The explicit way out. A glyph, because the head has an id and a status marker in it already,
    and because × in a dialog's top corner is the one control nobody has to be taught. */
 .close {
+  composes: icon sm from '../../kit/components/Button.module.css';
   flex: none;
-  width: 22px;
-  height: calc(22px * var(--ui-scale));
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: var(--r-1);
-  background: transparent;
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-16);
-  line-height: 1;
-  cursor: pointer;
-}
-
-.close:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
-
-.close:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
 }
 
 .detailId {
@@ -851,7 +788,7 @@
 .fieldHead {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   /* The label's own 3px is zeroed inside this row (see below), so the head must carry the
      space to whatever follows. It is visible on the one head with no pencil in it — status —
      where the row is only the label's height and the segment sat flush against it. */
@@ -873,28 +810,8 @@
  * change three of the four fields.
  */
 .fieldEdit {
+  composes: button sm quiet from '../../kit/components/Button.module.css';
   flex: none;
-  min-width: 20px;
-  height: calc(20px * var(--ui-scale));
-  padding: 0 6px;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  line-height: 1;
-  cursor: pointer;
-}
-
-.fieldEdit:hover {
-  background: var(--chrome-hi);
-  color: var(--accent);
-}
-
-.fieldEdit:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
 }
 
 /*
@@ -906,7 +823,7 @@
  */
 .fieldValue {
   margin: 0;
-  padding: 2px 0;
+  padding: var(--sp-1) 0;
   font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--text);
@@ -933,7 +850,7 @@
 .fieldActions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 6px;
+  margin-top: var(--sp-3);
 }
 
 /*
@@ -952,18 +869,24 @@
   color: var(--text-hi);
 }
 
+/* The kit field's drawing on the card's native controls (the card's checks count them, so they
+   stay native): `--bg`, `--r-2`, `--text-hi`, the accent border and 3px halo on focus. */
 .input,
 .textarea,
 .select {
   width: 100%;
-  padding: 4px 6px;
+  min-height: calc(24px * var(--ui-scale));
+  padding: var(--sp-2) var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: inherit;
   font-size: var(--fs-ui-12);
   line-height: 1.45;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .textarea {
@@ -1003,7 +926,7 @@
 }
 
 .mentionOption[aria-selected='true'] {
-  background: var(--chrome-hi);
+  background: var(--sel);
 }
 
 .mentionId {
@@ -1024,19 +947,22 @@
   white-space: nowrap;
 }
 
-.input:focus-visible,
-.textarea:focus-visible,
-.select:focus-visible {
+.input:focus,
+.textarea:focus,
+.select:focus {
   outline: none;
-  box-shadow: var(--focus-inset);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /* The four-way status segment: one track, four buttons, so the mutual exclusivity is visible
    before any of the labels are read. `GitPanel.module.css`'s `.segmented`, at this scale. */
+/* The kit's `Segmented`: a `--panel-2` track, the chosen segment raised onto `--panel`. */
 .segment {
   display: flex;
-  padding: 2px;
-  gap: 2px;
+  padding: var(--sp-1);
+  gap: var(--sp-1);
+  border: 1px solid var(--border-soft);
   border-radius: var(--r-2);
   background: var(--panel-2);
 }
@@ -1059,13 +985,15 @@
 }
 
 .segmentButton:hover {
-  color: var(--text);
+  color: var(--text-hi);
 }
 
 .segmentOn,
 .segmentOn:hover {
-  background: var(--chrome-hi);
-  color: var(--accent);
+  background: var(--panel);
+  box-shadow: 0 0 0 1px var(--border), var(--shadow-1);
+  color: var(--text-hi);
+  font-weight: 500;
 }
 
 .segmentButton:focus-visible {
@@ -1081,7 +1009,7 @@
  * hand-drawn one would be a second answer to what "collapsed" looks like.
  */
 .history {
-  margin-top: 4px;
+  margin-top: var(--sp-2);
 }
 
 .historySummary {
@@ -1100,16 +1028,16 @@
 .historyRows {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
   margin-top: 3px;
-  padding-left: 8px;
+  padding-left: var(--sp-4);
   border-left: 2px solid var(--border-soft);
 }
 
 .historyRow {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   font-size: var(--fs-ui-11);
 }
 
@@ -1141,7 +1069,7 @@
 .runStrip {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   flex-wrap: wrap;
   padding: var(--sp-3) var(--sp-4);
   border: 1px solid var(--border-soft);
@@ -1165,19 +1093,19 @@
   /* Wider than it was, because an entry is three rows now — head, text, actions — and at 8px
      one comment's controls sat closer to the next comment's author than to its own text. */
   gap: 14px;
-  margin-top: 6px;
+  margin-top: var(--sp-3);
 }
 
 .logEntry {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
 }
 
 .logHead {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   font-size: var(--fs-ui-11);
   color: var(--faint);
 }
@@ -1279,32 +1207,12 @@
  */
 .mdToolbar {
   display: flex;
-  gap: 2px;
+  gap: var(--sp-1);
   margin-bottom: 3px;
 }
 
 .mdTool {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: calc(22px * var(--ui-scale));
-  height: calc(20px * var(--ui-scale));
-  padding: 0;
-  border: 0;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  cursor: pointer;
-}
-
-.mdTool:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
-
-.mdTool:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
 /*
@@ -1315,11 +1223,11 @@
  * 20px title inside a 620px card would out-shout the card's own head.
  */
 .mdP {
-  margin: 0 0 6px;
+  margin: 0 0 var(--sp-3);
 }
 
 .mdHeading {
-  margin: 8px 0 4px;
+  margin: var(--sp-4) 0 var(--sp-2);
   /* One rung above the largest container base (`.fieldValueBody`'s 13), so a heading still
      reads as one in both containers. */
   font-size: var(--fs-ui-14);
@@ -1329,7 +1237,7 @@
 }
 
 .mdPre {
-  margin: 4px 0 6px;
+  margin: var(--sp-2) 0 var(--sp-3);
   padding: 5px 8px;
   border: 1px solid var(--border-soft);
   border-radius: var(--r-2);
@@ -1349,14 +1257,14 @@
 }
 
 .mdQuote {
-  margin: 4px 0 6px;
+  margin: var(--sp-2) 0 var(--sp-3);
   padding: 1px 0 1px 8px;
   border-left: 2px solid var(--border);
   color: var(--dim);
 }
 
 .mdList {
-  margin: 2px 0 6px;
+  margin: var(--sp-1) 0 var(--sp-3);
   padding-left: 18px;
 }
 
@@ -1369,27 +1277,27 @@
 
 .mdCheck {
   display: inline-block;
-  margin-right: 4px;
+  margin-right: var(--sp-2);
   vertical-align: -2px;
   color: var(--dim);
 }
 
 .mdRule {
-  margin: 8px 0;
+  margin: var(--sp-4) 0;
   border: 0;
   border-top: 1px solid var(--border-soft);
 }
 
 .mdTable {
   display: block;
-  margin: 4px 0 6px;
+  margin: var(--sp-2) 0 var(--sp-3);
   border-collapse: collapse;
   overflow-x: auto;
 }
 
 .mdTable th,
 .mdTable td {
-  padding: 2px 6px;
+  padding: var(--sp-1) var(--sp-3);
   border: 1px solid var(--border-soft);
 }
 
@@ -1408,7 +1316,7 @@
 .composerActions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 6px;
+  margin-top: var(--sp-3);
 }
 
 /* ------------------------------------------------------------------ the compose dialog (M21) */
@@ -1437,7 +1345,7 @@
 .composeActions {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-4);
   /* No margin — `.cardBody`'s gap spaces it off the last block; the rule and its own padding
      are what say "the form ends here". */
   padding-top: var(--sp-3);
@@ -1451,12 +1359,6 @@
  * not `default`: the cursor is the only feedback a pointer user gets before they read the
  * button's title, and `default` reads as decoration rather than as a control that is waiting.
  */
-.action:disabled {
-  border-color: var(--border-soft);
-  color: var(--faint);
-  cursor: not-allowed;
-}
-
 /*
  * The primary action while its call is in flight — `Integrate & Archive`, which merges a branch,
  * archives the change, re-validates and closes the task.
@@ -1506,10 +1408,6 @@
   }
 }
 
-.action:disabled:hover {
-  background: transparent;
-}
-
 /*
  * The card's foot, where the delete lives.
  *
@@ -1527,7 +1425,7 @@
 }
 
 .empty {
-  margin: 6px 0 0;
+  margin: var(--sp-3) 0 0;
   font-size: var(--fs-ui-11);
   font-style: italic;
   color: var(--faint);
@@ -1578,30 +1476,12 @@
 .logActions {
   display: flex;
   justify-content: flex-end;
-  gap: 4px;
-  margin-top: 2px;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
 }
 
 .logAction {
-  padding: 2px 6px;
-  border: 0;
-  border-radius: var(--r-2);
-  background: none;
-  /* One step stronger than the timestamp beside it (`--faint`): a control the eye can find has
-     to read as at least as present as the label it sits under. */
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.logAction:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
+  composes: button sm quiet from '../../kit/components/Button.module.css';
 }
 
 /*
@@ -1623,13 +1503,13 @@
 .logEdit {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-top: 4px;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
 }
 
 .logEditActions {
   display: flex;
-  gap: 4px;
+  gap: var(--sp-2);
 }
 
 /* The editor's Save and Cancel are the same button one deliberate state further on. They stay
@@ -1746,35 +1626,22 @@
   white-space: nowrap;
 }
 
-.specSessionResume,
-.specSessionOpen,
-.specSessionElsewhere {
+.specSessionOpen {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
   flex: none;
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  padding: 0 var(--sp-2);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-1);
-  background: none;
-  color: var(--accent);
-  cursor: pointer;
-  transition: background-color var(--dur-1) ease;
+}
+
+.specSessionElsewhere {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
+  flex: none;
+}
+
+.specSessionResume {
+  composes: button sm primary from '../../kit/components/Button.module.css';
+  flex: none;
 }
 
 /* Resume leads and carries the accent; Reopen and Hand-elsewhere are the quieter pair. */
-.specSessionResume {
-  border-color: var(--accent);
-}
-
-.specSessionElsewhere {
-  color: var(--dim);
-}
-
-.specSessionResume:hover,
-.specSessionOpen:hover,
-.specSessionElsewhere:hover {
-  background: var(--panel-2);
-}
 
 .specProgressLabel {
   font-size: var(--fs-ui-11);
@@ -1869,7 +1736,7 @@
   display: flex;
   align-items: flex-start;
   gap: var(--sp-2);
-  padding: 2px 0;
+  padding: var(--sp-1) 0;
   font-size: var(--fs-ui-12);
 }
 
@@ -1878,14 +1745,7 @@
 }
 
 .specOpen {
-  font: inherit;
-  font-size: var(--fs-ui-11);
-  background: none;
-  border: 0;
-  padding: 0;
-  color: var(--accent);
-  cursor: pointer;
-  text-align: left;
+  composes: button sm link from '../../kit/components/Button.module.css';
 }
 
 .specDelta {
@@ -1924,7 +1784,7 @@
 }
 
 .specScenarioTitle {
-  margin: 0 0 2px;
+  margin: 0 0 var(--sp-1);
   font-size: var(--fs-ui-11);
   font-weight: 600;
   color: var(--dim);
@@ -1973,13 +1833,13 @@
 .linkGroupHead {
   font-size: var(--fs-ui-11);
   color: var(--faint);
-  padding: 0 4px;
+  padding: 0 var(--sp-2);
 }
 
 .linkRow {
   display: flex;
   align-items: baseline;
-  gap: 2px;
+  gap: var(--sp-1);
   min-width: 0;
   border-radius: var(--r-2);
 }
@@ -1994,8 +1854,8 @@
   min-width: 0;
   display: flex;
   align-items: baseline;
-  gap: 6px;
-  padding: 2px 4px;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-2);
   border: 0;
   border-radius: var(--r-2);
   background: transparent;
@@ -2025,23 +1885,7 @@ button.linkRowMain {
 }
 
 .linkRemove {
-  appearance: none;
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: var(--faint);
-  padding: 0 2px;
-  border-radius: var(--r-1);
-  line-height: 1;
-}
-
-.linkRemove:hover {
-  color: var(--red);
-}
-
-.linkRemove:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
 .linkAdd {
@@ -2288,22 +2132,7 @@ button.linkRowMain {
 }
 
 .stagedRemove {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px;
-  border: 0;
-  border-radius: var(--r-full);
-  background: none;
-  color: var(--dim);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.stagedRemove:hover {
-  background: var(--chrome);
-  color: var(--text);
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
 /*
@@ -2338,7 +2167,7 @@ button.linkRowMain {
 }
 
 .milestoneLine:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .milestoneLine:focus-visible {
@@ -2457,12 +2286,7 @@ button.linkRowMain {
 }
 
 .verifyLog {
+  composes: button sm link from '../../kit/components/Button.module.css';
   margin-left: auto;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  font-family: inherit;
-  font-size: var(--fs-ui-11);
-  cursor: pointer;
 }
+

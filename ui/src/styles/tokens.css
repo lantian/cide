@@ -54,14 +54,16 @@
   --dim: #56565f;
   --faint: #6c6c77;
   /*
-   * `#d97757` is Claude's orange and the family everything here is built from; on white it
-   * is only 3.1:1, so the light accent is the same hue pushed toward red until white text
-   * on it clears AA (4.96:1). `--accent-hi` is *darker* here and lighter in dark — "hi"
-   * means more prominent, not brighter.
+   * A bright red, the UI kit's palette (the user's call, 2026-09-24, moved here from
+   * `kit/kit-tokens.css` when the redesign wired the kit in). It replaced an orange-brown
+   * built from Claude's `#d97757`: with the kit's filled status marks, orange read as a
+   * status. Measured, not eyeballed: `--accent` is 4.91:1 on white, AA for body text and
+   * links. `--accent-hi` is *darker* here and lighter in dark — "hi" means more prominent,
+   * not brighter.
    */
-  --accent: #c4452a;
-  --accent-hi: #9e3319;
-  --accent-dim: #f6d0bf;
+  --accent: #dc1f2b;
+  --accent-hi: #b3121d;
+  --accent-dim: #f7c9cc;
   /* What to put ON `--accent` or any `--grad-accent-ink` fill. */
   --on-accent: #ffffff;
   /*
@@ -155,11 +157,11 @@
   --ignored: #7d6a45;
   /*
    * Selection is in the accent family rather than the mock's blue: it is the one large
-   * tinted surface in a white theme and a blue one would fight the red/orange. Kept pale so
-   * that syntax-coloured text stays readable *on* it — the worst case is `--green` at
-   * 4.45:1, better than a saturated selection would allow.
+   * tinted surface in a white theme and a blue one would fight the red. Kept pale so
+   * that syntax-coloured text stays readable *on* it, which a saturated selection would not
+   * allow.
    */
-  --sel: #ffe7d9;
+  --sel: #ffe4e6;
   /*
    * Two layers, both far softer than the beige theme's single 0.18 drop. On white a heavy
    * shadow reads as the surface peeling; the hairline does the "this is above you" work and
@@ -189,25 +191,58 @@
     0 1px 2px rgba(24, 16, 12, 0.06), 0 18px 44px rgba(24, 16, 12, 0.12);
 
   /*
-   * The red→orange gradient the user asked for. Stops are exposed separately so a module
+   * The red→crimson gradient of the kit's palette. Stops are exposed separately so a module
    * can build its own angle without hardcoding hexes.
    *
-   * `--grad-accent` is vivid and therefore DECORATIVE: white on its orange end is 2.4:1,
-   * which fails even AA-large. Fills, rails, indicator bars, icon washes, oversized
-   * display type — not body text. Anything carrying text uses `--grad-accent-ink`, whose
-   * stops are both ≥4.5:1 against `--on-accent` (5.42:1 and 4.80:1), so a button label is
-   * AA anywhere along the sweep.
+   * `--grad-accent` is vivid and therefore DECORATIVE: fills, rails, indicator bars, icon
+   * washes, oversized display type — never text. Anything carrying text uses
+   * `--grad-accent-ink`, whose stops are both ≥4.5:1 against `--on-accent` (4.76:1 and
+   * 6.07:1), so a button label is AA anywhere along the sweep.
    */
-  --grad-from: #dc3f28;
-  --grad-to: #f2903a;
+  --grad-from: #ff3b3b;
+  --grad-to: #e11d48;
   --grad-accent: linear-gradient(135deg, var(--grad-from) 0%, var(--grad-to) 100%);
   --grad-accent-h: linear-gradient(90deg, var(--grad-from) 0%, var(--grad-to) 100%);
-  --grad-accent-ink: linear-gradient(135deg, #c4342b 0%, #b8560d 100%);
+  --grad-accent-ink: linear-gradient(135deg, #e0202a 0%, #c2153a 100%);
   --grad-accent-soft: linear-gradient(
     135deg,
-    rgba(220, 63, 40, 0.1) 0%,
-    rgba(242, 144, 58, 0.08) 100%
+    rgba(224, 32, 42, 0.1) 0%,
+    rgba(225, 29, 72, 0.05) 100%
   );
+
+  /*
+   * Filled status marks: the UI kit's badges, counters, dots and progress bars (`kit/`,
+   * `docs/ui-kit.md`), drawn like the primary button. White (`--on-fill`) on both stops of
+   * every one but amber is ≥ 4.5:1, so a label is AA anywhere along the sweep; amber carries
+   * `--on-yellow`. Deliberately not the accent: with the kit's red accent, a status drawn in
+   * the accent ("running") read as a failure. Additive — nothing in the
+   * app read these before the kit — and identical in the dark theme, where a saturated fill
+   * under a white label reads as well as it does on white.
+   */
+  --on-fill: #ffffff;
+  --grad-red: linear-gradient(135deg, #e0202a 0%, #c2153a 100%);
+  --grad-green: linear-gradient(135deg, #16803c 0%, #0f6e3a 100%);
+  /* Amber is the one light fill, so it takes dark ink (`--on-yellow`, 6.8–8.8:1) instead of
+     white: a white label needs an amber so dark it reads as brown, which is what the first
+     pass shipped and what made "pending" look muddy. */
+  --grad-yellow: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+  --on-yellow: #3a2400;
+  --grad-purple: linear-gradient(135deg, #8a4be6 0%, #6d28d9 100%);
+  --grad-blue: linear-gradient(135deg, #256ae6 0%, #1d4ed8 100%);
+  --grad-cyan: linear-gradient(135deg, #0a7f8c 0%, #0e7490 100%);
+  --grad-neutral: linear-gradient(135deg, #71717a 0%, #52525b 100%);
+  /* The 1px lit edge along the top of a filled mark; it is what keeps a gradient pill from
+     reading flat. */
+  --fill-sheen: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  /*
+   * The UI kit's danger fill: black, drawn like the primary button but in ink. The user's call
+   * (2026-09-24) once the accent became red — a red danger button next to a red primary made
+   * "the act this dialog is for" and "the act that destroys" the same colour. `--danger-edge` is
+   * a border that only the dark theme needs, where black on `--bg` would have no edge at all.
+   */
+  --grad-danger: linear-gradient(135deg, #34343b 0%, #0a0a0c 100%);
+  --on-danger: #ffffff;
+  --danger-edge: transparent;
 
   /* Diff row backgrounds. Denser than the dark theme's: a 10% tint washes out on white. */
   --diff-add-bg: rgba(47, 122, 61, 0.12);
@@ -365,11 +400,15 @@
   --text-hi: #f2f2f5;
   --dim: #84848f;
   --faint: #5c5c66;
-  --accent: #d97757;
-  --accent-hi: #e89476;
-  --accent-dim: #7a4432;
-  /* Dark ink, not white: white on this accent is 3.12:1, under AA for anything but 24px+. */
-  --on-accent: #1a0f08;
+  /*
+   * A lighter red for links, focus and the current tab's text (6.18:1 on `--bg`). The label
+   * on an accent fill is white, not the old dark ink: a red bright enough for dark ink looked
+   * pink, so dark keeps the light theme's deep ink gradient and a white label on it.
+   */
+  --accent: #ff5a5f;
+  --accent-hi: #ff8a8d;
+  --accent-dim: #6b1f24;
+  --on-accent: #ffffff;
   --blue: #7aa2f7;
   --green: #8fbf7a;
   --purple: #b48ead;
@@ -401,7 +440,7 @@
    * light theme's ignored token is AA for the same reason.
    */
   --ignored: #8f8256;
-  --sel: #2b3a55;
+  --sel: #3b1c21;
   /*
    * The same three rungs; see the light block for what each height means. Dark keeps the
    * single wide drop it always had at every rung, because on #111113 a 1px hairline layer is
@@ -414,19 +453,37 @@
 
   /*
    * The same six gradient tokens, so a CSS module that uses one is not writing a
-   * light-only rule. Stops run brighter here because they sit on #111113, and
-   * `--grad-accent-ink` is measured against the dark `--on-accent` (4.83:1 and 7.10:1).
+   * light-only rule. `--grad-accent-ink` is the light theme's, under the same white label.
    */
-  --grad-from: #d9573f;
-  --grad-to: #f0a06a;
+  --grad-from: #ff4d55;
+  --grad-to: #e11d48;
   --grad-accent: linear-gradient(135deg, var(--grad-from) 0%, var(--grad-to) 100%);
   --grad-accent-h: linear-gradient(90deg, var(--grad-from) 0%, var(--grad-to) 100%);
-  --grad-accent-ink: linear-gradient(135deg, #d9573f 0%, #e08a52 100%);
+  --grad-accent-ink: linear-gradient(135deg, #e0202a 0%, #c2153a 100%);
   --grad-accent-soft: linear-gradient(
     135deg,
-    rgba(217, 87, 63, 0.18) 0%,
-    rgba(240, 160, 106, 0.1) 100%
+    rgba(255, 77, 85, 0.16) 0%,
+    rgba(225, 29, 72, 0.08) 100%
   );
+
+  /* The filled status marks — see the light block. Same fills, a quieter sheen. */
+  --on-fill: #ffffff;
+  --grad-red: linear-gradient(135deg, #e0202a 0%, #c2153a 100%);
+  --grad-green: linear-gradient(135deg, #16803c 0%, #0f6e3a 100%);
+  /* Amber is the one light fill, so it takes dark ink (`--on-yellow`, 6.8–8.8:1) instead of
+     white: a white label needs an amber so dark it reads as brown, which is what the first
+     pass shipped and what made "pending" look muddy. */
+  --grad-yellow: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+  --on-yellow: #3a2400;
+  --grad-purple: linear-gradient(135deg, #8a4be6 0%, #6d28d9 100%);
+  --grad-blue: linear-gradient(135deg, #256ae6 0%, #1d4ed8 100%);
+  --grad-cyan: linear-gradient(135deg, #0a7f8c 0%, #0e7490 100%);
+  --grad-neutral: linear-gradient(135deg, #71717a 0%, #52525b 100%);
+  --fill-sheen: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  /* The danger fill — see the light block. */
+  --grad-danger: linear-gradient(135deg, #2c2c33 0%, #050506 100%);
+  --on-danger: #ffffff;
+  --danger-edge: rgba(255, 255, 255, 0.18);
 
   /* Diff row backgrounds, from the mock's inline rgba() values. */
   --diff-add-bg: rgba(143, 191, 122, 0.1);
@@ -469,7 +526,7 @@
    *
    * A selection is a *ground*. Every dark ink in this block was chosen against `--tk-bg`, which
    * is nearly black, so a selection lighter than the background raises the floor under all of
-   * them at once — and the arithmetic is unforgiving. The chrome's `--sel` (#2b3a55) sits 1.60:1
+   * them at once — and the arithmetic is unforgiving. The chrome's `--sel` of the time (#2b3a55) sat 1.60:1
    * above the background, which took comments from 2.76:1 to **1.73:1**, gone, and punctuation
    * to 3.09:1. The report was "when I select the code in dark theme I don't see the text", and it
    * was true of the whole quiet half of the palette.

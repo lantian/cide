@@ -246,8 +246,8 @@ enum Caller {
 /// in one line after the prompt. For the timer, a gate that has not run against what is checked
 /// out now is run first, so the plan is made from today's answer rather than yesterday's; a gate
 /// that passes there moves the milestone to review (`milestones::announce_met`), and **if nothing
-/// is left open under the milestone's goal** nothing is planned: that was the question the
-/// planning turn would have been asking.
+/// is left open or undecided under the milestone's goal** nothing is planned: that was the
+/// question the planning turn would have been asking.
 ///
 /// A pass with open tasks under the goal is *not* "nothing to plan". Until this was split, any
 /// pass refused, and a milestone whose gate went green before its last tasks were closed — in
@@ -297,12 +297,14 @@ fn wake(
             && gate_blocks_planning(
                 gate.as_ref().is_some_and(|g| g.passed),
                 open_under_goal(&rows, current),
+                undecided_under_goal(&rows, current),
             )
         {
             tracing::info!(%project, milestone = %current.id, "the gate passes; not planning past it");
             return Err(format!(
-                "Milestone {} already passes its gate and is waiting for you in review, so \
-                 there is nothing to plan until it is accepted.",
+                "Milestone {} already passes its gate, with nothing open and nothing undecided \
+                 under it, and is waiting for you in review, so there is nothing to plan until \
+                 it is accepted.",
                 current.id
             ));
         }
@@ -459,9 +461,11 @@ fn facts(
 /// Letting it through is safe: [`wake`] re-runs a stale gate before planning and stops there
 /// if it passes. The `git rev-parse` is only paid when the last verdict passed, which is rare.
 ///
-/// **And nothing left open under the milestone's goal** ([`gate_blocks_planning`]). A green gate
-/// with tasks still in todo, doing or review is a milestone with work to plan around, and
-/// parking it on the user would leave those tasks idle until someone accepted by hand.
+/// **And nothing left open or undecided under the milestone's goal** ([`gate_blocks_planning`]).
+/// A green gate with tasks still in todo, doing or review is a milestone with work to plan
+/// around, and parking it on the user would leave those tasks idle until someone accepted by
+/// hand; a green gate with an inbox row under the goal is a milestone with a decision to make,
+/// and the planning turn is what makes it.
 fn milestone_ready(app: &AppHandle, root: &std::path::Path, rows: &[TaskRow]) -> bool {
     let plan = cide_agents::config::load_milestones(root);
     let Some(current) = plan.current() else {
@@ -476,7 +480,11 @@ fn milestone_ready(app: &AppHandle, root: &std::path::Path, rows: &[TaskRow]) ->
     {
         return false;
     }
-    if !gate_blocks_planning(true, open_under_goal(rows, current)) {
+    if !gate_blocks_planning(
+        true,
+        open_under_goal(rows, current),
+        undecided_under_goal(rows, current),
+    ) {
         return false;
     }
     let head = cide_core::check::head_of(root);
@@ -493,11 +501,34 @@ fn open_under_goal(rows: &[TaskRow], milestone: &cide_ipc::Milestone) -> usize {
         .unwrap_or(0)
 }
 
+/// Inbox tasks under the milestone's goal task — decisions owed, not work in flight. See
+/// `cide_agents::milestones::inbox_under` for why they are counted apart from the open ones.
+fn undecided_under_goal(rows: &[TaskRow], milestone: &cide_ipc::Milestone) -> usize {
+    milestone
+        .task
+        .as_ref()
+        .map(|goal| cide_agents::milestones::inbox_under(rows, goal))
+        .unwrap_or(0)
+}
+
 /// Whether a milestone's gate stops the timer from planning: it passed, **and** nothing is left
-/// open under the milestone. One rule for [`wake`] and [`milestone_ready`], so the timer that
-/// decides to wake and the wake that decides to plan cannot disagree about the same board.
-fn gate_blocks_planning(gate_passed: bool, open_under_goal: usize) -> bool {
-    gate_passed && open_under_goal == 0
+/// open under the milestone, **and** nothing under it waits in the inbox. One rule for [`wake`]
+/// and [`milestone_ready`], so the timer that decides to wake and the wake that decides to plan
+/// cannot disagree about the same board.
+///
+/// The inbox arm is M99, from selfcraft's `slice`: its gate went green with every subtask done
+/// but one row left in the inbox under the goal — a thing a run noticed and nobody ruled on. The
+/// project parked itself on the user, Accept offered, with an undecided item hanging under the
+/// goal Accept would mark done. Deciding it is exactly a planning turn's job — keep it and do it
+/// under this milestone, or unlink it and let it wait in the inbox — so the timer plans instead
+/// of standing down, and [`crate::milestones`]' Accept is not offered until the board is clear.
+/// Only the inbox *under this goal* counts; the rest of the inbox is somebody else's milestone.
+fn gate_blocks_planning(
+    gate_passed: bool,
+    open_under_goal: usize,
+    undecided_under_goal: usize,
+) -> bool {
+    gate_passed && open_under_goal == 0 && undecided_under_goal == 0
 }
 
 /// How long this project has looked quiet, updating the record.
@@ -560,18 +591,24 @@ mod tests {
         }
     }
 
-    /// A green gate stands the timer down only when the milestone has nothing left open; a red
-    /// or unknown one never does. The case that was wrong: `slice` passing with tasks in todo,
-    /// doing and review, and the planner refusing as if it were finished.
+    /// A green gate stands the timer down only when the milestone has nothing left open and
+    /// nothing left undecided; a red or unknown one never does. Two cases were wrong here: a
+    /// gate passing with tasks in todo, doing and review, and the planner refusing as if the
+    /// milestone were finished; and (M99) a gate passing with one inbox row under the goal,
+    /// which is a decision owed and the reason to plan, not a reason not to.
     #[test]
     fn a_passing_gate_blocks_only_an_empty_milestone() {
-        assert!(gate_blocks_planning(true, 0));
+        assert!(gate_blocks_planning(true, 0, 0));
         assert!(
-            !gate_blocks_planning(true, 3),
+            !gate_blocks_planning(true, 3, 0),
             "open tasks under the goal are work to plan"
         );
-        assert!(!gate_blocks_planning(false, 0));
-        assert!(!gate_blocks_planning(false, 3));
+        assert!(
+            !gate_blocks_planning(true, 0, 1),
+            "an inbox task under the goal is a decision to make, and only a turn can make it"
+        );
+        assert!(!gate_blocks_planning(false, 0, 0));
+        assert!(!gate_blocks_planning(false, 3, 2));
     }
 
     #[test]

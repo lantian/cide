@@ -763,7 +763,11 @@ try {
    * their order. Nothing else in the suite can see it — no check mounts a dialog and a toast
    * together, and neither `tsc` nor `vite build` has an opinion about paint order.
    */
-  const scrimZ = Number(/\.scrim \{[^}]*z-index:\s*(\d+)/.exec(overlayCss)?.[1])
+  // The scrim is the kit's since the redesign (2026-09-24): `Modal` and `OverlayCard` both draw
+  // `kit/components/Overlay.tsx`'s `Scrim`, so that stylesheet is where its layer is declared.
+  const scrimZ = Number(
+    /\.scrim \{[^}]*z-index:\s*(\d+)/.exec(uiFile('src/kit/components/Overlay.module.css'))?.[1],
+  )
   const toastZ = Number(
     /\.stack \{[^}]*z-index:\s*(\d+)/.exec(uiFile('src/chrome/Failures.module.css'))?.[1],
   )

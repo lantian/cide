@@ -11,11 +11,12 @@
 }
 
 .nav {
-  width: 190px;
+  width: calc(200px * var(--ui-scale));
   flex: none;
   display: flex;
   flex-direction: column;
-  padding: 10px 0;
+  gap: var(--sp-1);
+  padding: var(--sp-5) var(--sp-3);
   background: var(--panel);
   border-right: 1px solid var(--border);
 }
@@ -25,8 +26,9 @@
   flex: none;
   display: flex;
   align-items: center;
-  padding: 0 14px;
+  padding: 0 var(--sp-5);
   border: 0;
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font-family: inherit;
@@ -39,15 +41,18 @@
     color var(--dur-1) var(--ease-out);
 }
 
+/* The kit's row states: hover `--panel-2`, selected `--sel`. */
 .navItem:hover {
+  background: var(--panel-2);
   color: var(--text);
 }
 
 /* Selected wins over hover so the row does not lose its background on pointer-over. */
 .navItemActive,
 .navItemActive:hover {
-  background: var(--chrome-hi);
+  background: var(--sel);
   color: var(--text-hi);
+  font-weight: 500;
 }
 
 .navItem:focus-visible {
@@ -61,7 +66,7 @@
   /* The nav must not scroll with the section: a long keymap listing would otherwise carry the
      seven headings off the top of the window. */
   overflow-y: auto;
-  padding: 34px 44px;
+  padding: calc(32px * var(--ui-scale)) calc(44px * var(--ui-scale));
   /*
    * Everything in a section is copy-out-able, because this screen is where the app states
    * facts about itself that belong somewhere else — an address to type into a phone, a
@@ -101,22 +106,22 @@
 }
 
 .title {
-  margin: 0 0 6px;
+  margin: 0 0 var(--sp-3);
   font-size: var(--fs-ui-20);
   font-weight: 600;
   color: var(--text-hi);
 }
 
 .description {
-  margin: 0 0 22px;
-  max-width: 620px;
+  margin: 0 0 var(--sp-7);
+  max-width: calc(620px * var(--ui-scale));
   font-size: var(--fs-ui-13);
   line-height: 1.5;
   color: var(--dim);
 }
 
 .body {
-  max-width: 620px;
+  max-width: calc(620px * var(--ui-scale));
 }
 
 .loading {

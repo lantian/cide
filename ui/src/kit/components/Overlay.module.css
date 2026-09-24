@@ -1,0 +1,558 @@
+/*
+ * What floats above the workspace: the dialog, the wizard shell with its step rail, the picker
+ * (the command palette's shape), the menu and the tooltip.
+ *
+ * Elevation is by shadow token and nothing else: a tooltip or menu `--shadow-2`, a dialog or a
+ * picker `--shadow-3`. The scrim is the app's `--scrim` — the dialog is the thing to look at, and
+ * the workspace behind it stays legible enough to remember what you were doing.
+ */
+
+/* --- dialog ---------------------------------------------------------------------------------- */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: calc(96px * var(--ui-scale));
+  background: var(--scrim, rgba(0, 0, 0, 0.42));
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  width: calc(520px * var(--ui-scale));
+  max-width: calc(100vw - 32px);
+  /* 96px of scrim above, the side gutter below: a long body scrolls, the footer stays. */
+  max-height: calc(100vh - 128px);
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  background: var(--chrome);
+  box-shadow: var(--shadow-3);
+  overflow: hidden;
+  /*
+   * A dialog is portalled to `document.body`, a sibling of whatever opened it, so a panel's own
+   * `user-select: text` never reaches it — and under the app-wide `none` on `html, body` a
+   * task's comments, a conflict's paths and a changelist's file names were uncopyable: text a
+   * person opened the dialog to read. Prefixed first: WebKitGTK drops the unprefixed spelling.
+   */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.dialog[data-width='narrow'] {
+  width: calc(420px * var(--ui-scale));
+}
+
+.dialog[data-width='picker'] {
+  width: calc(620px * var(--ui-scale));
+}
+
+.dialog[data-width='wide'] {
+  width: calc(880px * var(--ui-scale));
+}
+
+.dialogHead {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-5);
+  padding: var(--sp-6) var(--sp-6) 0 calc(28px * var(--ui-scale));
+}
+
+.dialogHeadText {
+  flex: 1;
+  min-width: 0;
+  padding-top: var(--sp-3);
+}
+
+.dialogTitleRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-4);
+}
+
+.titleAside {
+  margin-left: auto;
+  flex: none;
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+.dialogTitle {
+  margin: 0;
+  font-size: var(--fs-ui-16);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.dialogLead {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.dialogBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-6) calc(28px * var(--ui-scale));
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.dialogBodyFlush {
+  padding: 0;
+  margin-top: var(--sp-5);
+  border-top: 1px solid var(--border-soft);
+}
+
+/* Pinned under the scrolling body, over the footer: the same for every page of the body. */
+.dialogBelow {
+  flex: none;
+  padding: var(--sp-4) calc(28px * var(--ui-scale));
+  border-top: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+/* The footer: an optional note at the left (what will happen), the buttons at the right with
+   the primary last — the eye ends where the hand goes. */
+.dialogFoot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-5) calc(28px * var(--ui-scale));
+  border-top: 1px solid var(--border);
+  background: var(--chrome);
+}
+
+.footNote {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+/* --- wizard shell ---------------------------------------------------------------------------- */
+
+.wizard {
+  display: grid;
+  grid-template-columns: calc(196px * var(--ui-scale)) minmax(0, 1fr);
+  min-height: calc(420px * var(--ui-scale));
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--grad-accent-soft), var(--panel-2);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-7) var(--sp-6) var(--sp-6);
+}
+
+.brandMark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(26px * var(--ui-scale));
+  height: calc(26px * var(--ui-scale));
+  border-radius: var(--r-2);
+  background: var(--grad-accent-ink);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-1);
+}
+
+.brandText {
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.railNote {
+  margin: auto 0 0;
+  padding: var(--sp-4) var(--sp-6) var(--sp-6);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--faint);
+}
+
+.wizardMain {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wizardBody {
+  flex: 1;
+  padding: var(--sp-7) calc(28px * var(--ui-scale)) var(--sp-6);
+}
+
+/* --- stepper --------------------------------------------------------------------------------- */
+
+.stepper {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-6);
+  list-style: none;
+}
+
+.step {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  padding: var(--sp-3) 0;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+/* The thread between two dots; accent-dim once the step above it is done. */
+.step:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  left: calc(11px * var(--ui-scale));
+  top: calc(30px * var(--ui-scale));
+  bottom: calc(-1 * var(--sp-3));
+  width: 1px;
+  background: var(--border);
+}
+
+.step[data-state='done']:not(:last-child)::after {
+  background: var(--accent-dim);
+}
+
+.stepDot {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(22px * var(--ui-scale));
+  height: calc(22px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: var(--panel);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--dim);
+}
+
+.step[data-state='current'] .stepDot {
+  border-color: transparent;
+  background: var(--grad-accent-ink);
+  color: var(--on-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.step[data-state='current'] .stepName {
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.step[data-state='done'] .stepDot {
+  border-color: var(--accent-dim);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  color: var(--accent);
+}
+
+.step[data-state='done'] .stepName {
+  color: var(--text);
+}
+
+/* --- picker ---------------------------------------------------------------------------------- */
+
+/* The command palette's frame: a 44px input row over a list of rows, a footer of key hints. */
+.picker {
+  display: flex;
+  flex-direction: column;
+  width: calc(620px * var(--ui-scale));
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 128px);
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  background: var(--chrome);
+  box-shadow: var(--shadow-3);
+  overflow: hidden;
+  /* Rows are chrome, not text: a drag across them is a pointer path, not a selection. The
+     field itself stays selectable — a form control is, whatever this says. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.picker[data-width='narrow'] {
+  width: calc(340px * var(--ui-scale));
+}
+
+.pickerInput {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  height: calc(44px * var(--ui-scale));
+  padding: 0 var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  color: var(--dim);
+}
+
+.pickerInput > input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-14);
+}
+
+.pickerInput > input::placeholder {
+  color: var(--faint);
+}
+
+.pickerLead {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-14);
+  line-height: 1;
+  color: var(--dim);
+}
+
+.pickerCount {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+.pickerList {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--sp-2);
+}
+
+.pickerRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  height: calc(30px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-13);
+  white-space: nowrap;
+  color: var(--text);
+  cursor: default;
+}
+
+/* The virtualiser places the row; the list's own padding still insets it, because the
+   virtualiser's spacer is inside that padding. */
+.pickerRowVirtual {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+.pickerRow > svg {
+  flex: none;
+  color: var(--dim);
+}
+
+.pickerRow[aria-selected='true'] {
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+.pickerRow[aria-selected='true'] > svg {
+  color: var(--accent);
+}
+
+.pickerRow[aria-disabled='true'] {
+  color: var(--faint);
+}
+
+/* The typed characters inside a matched label. */
+.match {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pickerDetail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.pickerStatus {
+  padding: var(--sp-6) var(--sp-5);
+  font-size: var(--fs-ui-13);
+  color: var(--dim);
+}
+
+.pickerFoot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  min-height: calc(30px * var(--ui-scale));
+  padding: var(--sp-2) var(--sp-5);
+  border-top: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.pickerHint {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.pickerHintKey {
+  font-family: var(--font-mono);
+  color: var(--dim);
+}
+
+/* --- menu ------------------------------------------------------------------------------------ */
+
+.menu {
+  min-width: calc(200px * var(--ui-scale));
+  margin: 0;
+  padding: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  box-shadow: var(--shadow-2);
+  list-style: none;
+}
+
+.menuItem {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  width: 100%;
+  height: calc(26px * var(--ui-scale));
+  padding: 0 var(--sp-4);
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  text-align: left;
+  cursor: pointer;
+}
+
+.menuItem > svg {
+  flex: none;
+  color: var(--dim);
+}
+
+.menuItem:hover:not(:disabled),
+.menuItem:focus-visible {
+  outline: none;
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+.menuItem:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* Danger is ink, like the danger button: bold at rest, the black fill under the pointer. */
+.menuItem[data-danger='true'] {
+  color: var(--text-hi);
+  font-weight: 600;
+}
+
+.menuItem[data-danger='true'] > svg {
+  color: inherit;
+}
+
+.menuItem[data-danger='true']:hover:not(:disabled),
+.menuItem[data-danger='true']:focus-visible {
+  background: var(--grad-danger);
+  color: var(--on-danger);
+}
+
+/* Keeps labels aligned in a menu where only some items have an icon. */
+.menuIconSlot {
+  flex: none;
+  width: var(--icon-1);
+}
+
+.menuLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menuShortcut {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.menuSep {
+  height: 1px;
+  margin: var(--sp-2) var(--sp-3);
+  background: var(--border-soft);
+}
+
+.menuGroup {
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* --- tooltip --------------------------------------------------------------------------------- */
+
+/* Inverted — `--text-hi` ground, `--bg` ink — so it reads as not-part-of-the-page in both themes. */
+.tooltip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  max-width: calc(260px * var(--ui-scale));
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-11);
+  line-height: 1.4;
+  color: var(--bg);
+  background: var(--text-hi);
+  box-shadow: var(--shadow-2);
+}
+
+.tooltipKey {
+  font-family: var(--font-mono);
+  opacity: 0.7;
+}

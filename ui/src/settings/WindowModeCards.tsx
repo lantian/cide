@@ -10,6 +10,7 @@
  * the process rather than by any window (ADR 0002): both modes are different mappings from
  * `ProjectId` to window label over identical state, and no child notices the change.
  */
+import { ChoiceCards } from '@/kit/components/Choice'
 import type { WindowMode } from '@/ipc/client'
 import styles from './WindowModeCards.module.css'
 
@@ -76,30 +77,19 @@ export interface WindowModeCardsProps {
 }
 
 export function WindowModeCards({ value, onChange }: WindowModeCardsProps) {
+  // The kit's `ChoiceCards`: one of two options that each need a picture — the wizard's project
+  // type, drawn the same way, so a choice with art looks like one choice everywhere.
   return (
-    <div className={styles.cards} role="radiogroup" aria-label="Window layout">
-      {CARDS.map((card) => {
-        const active = card.value === value
-        return (
-          <button
-            key={card.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            className={active ? `${styles.card} ${styles.cardActive}` : styles.card}
-            onClick={() => onChange(card.value)}
-          >
-            <Diagram kind={card.diagram} />
-            <div className={styles.cardLabel}>
-              <span className={styles.radio}>
-                {active && <span className={styles.radioDot} />}
-              </span>
-              {card.label}
-            </div>
-            <div className={styles.cardHint}>{card.hint}</div>
-          </button>
-        )
-      })}
-    </div>
+    <ChoiceCards
+      label="Window layout"
+      value={value}
+      onChange={onChange}
+      options={CARDS.map((card) => ({
+        value: card.value,
+        title: card.label,
+        text: card.hint,
+        art: <Diagram kind={card.diagram} />,
+      }))}
+    />
   )
 }

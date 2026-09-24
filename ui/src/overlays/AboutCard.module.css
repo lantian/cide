@@ -1,69 +1,7 @@
 /*
- * The About box's body. The scrim and the 620px card come from `OverlayCard`
- * (`overlays/Overlay.module.css`) — this file styles only what sits inside them, so the box
- * cannot drift away from the palette that opened it. Every colour is a token, and every size
- * a `--fs-ui-*` rung, for `check:ui-scale`'s reason.
+ * About cide. The frame, the key → value block and the button are the UI kit's; the versions
+ * are mono, because they are what a user pastes into a bug report.
  */
-
-/* The wrapper that catches Escape. Re-declares the column for the reason
-   `CloseConfirm.module.css` gives: `OverlayCard` makes the card a flex column, and an ordinary
-   block in between would make the head and footer children of *it*. */
-.dialog {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.head {
-  flex: none;
-  padding: 16px 18px 14px;
-}
-
-.name {
-  margin: 0 0 6px;
-  font-size: var(--fs-ui-16);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-/* Mono and selectable: this line exists to be copied. */
-.version {
-  margin: 0 0 4px;
+.mono {
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-13);
-  color: var(--text);
-  -webkit-user-select: text;
-  user-select: text;
-}
-
-.claude {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-  -webkit-user-select: text;
-  user-select: text;
-}
-
-.footer {
-  flex: none;
-  display: flex;
-  justify-content: flex-end;
-  padding: 12px 18px;
-  border-top: 1px solid var(--border);
-}
-
-/* `CloseConfirm`'s primary button, byte for byte where it can be: the two dialogs share a
-   ground and should share a button. The look is the shared primary class; the geometry is
-   `CloseConfirm`'s `.button`. */
-.button {
-  composes: primary from '../styles/buttons.module.css';
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid transparent;
-  cursor: default;
 }

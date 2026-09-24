@@ -8,6 +8,7 @@
  * The index is built lazily: `symbols.index` is called once when this opens, is idempotent, and a
  * user who never presses this chord never pays for a symbol walk of their repository.
  */
+import { PickerRow, PickerStatus } from '@/kit/components/Overlay'
 import { useEffect, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
@@ -157,15 +158,12 @@ export function SymbolPicker({ project, onDismiss, onGoTo }: SymbolPickerProps) 
             if (row === undefined) return null
             const badge = symbolBadge(row.kind)
             return (
-              <div
+              <PickerRow
                 key={`${row.path}:${row.line}:${row.name}`}
                 data-audit="symbolRow"
-                className={`${styles.row} ${item.index === selected ? styles.rowSelected : ''}`}
+                virtual
+                selected={item.index === selected}
                 style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  width: '100%',
                   height: ROW_HEIGHT,
                   transform: `translateY(${item.start}px)`,
                 }}
@@ -192,7 +190,7 @@ export function SymbolPicker({ project, onDismiss, onGoTo }: SymbolPickerProps) 
                 <span className={styles.where}>
                   {row.rel}:{row.line}
                 </span>
-              </div>
+              </PickerRow>
             )
           })}
         </div>
@@ -215,24 +213,24 @@ function Body({
   rows: number
 }) {
   if (failed) {
-    return <div className={styles.status}>Symbol search is not available in this build.</div>
+    return <PickerStatus>Symbol search is not available in this build.</PickerStatus>
   }
   // "The walk has not started" is not "the walk found nothing". Rendering the first as the
   // second would tell the user their repository declares no functions.
-  if (awaiting || frame === null) return <div className={styles.status}>Indexing symbols…</div>
+  if (awaiting || frame === null) return <PickerStatus>Indexing symbols…</PickerStatus>
   if (rows > 0) {
     return frame.truncated ? (
-      <div className={styles.status}>
+      <PickerStatus>
         Showing the first {groupDigits(frame.total)} symbols — the index stopped at its cap.
-      </div>
+      </PickerStatus>
     ) : null
   }
   if (query.trim() === '') {
     return (
-      <div className={styles.status}>
+      <PickerStatus>
         {frame.running ? 'Indexing symbols…' : 'Type to search this project’s symbols'}
-      </div>
+      </PickerStatus>
     )
   }
-  return <div className={styles.status}>{frame.running ? 'Indexing symbols…' : 'No matches'}</div>
+  return <PickerStatus>{frame.running ? 'Indexing symbols…' : 'No matches'}</PickerStatus>
 }

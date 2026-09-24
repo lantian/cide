@@ -1,77 +1,18 @@
 /*
- * The log-line viewer. Scrim and card come from `OverlayCard`; this styles only what sits
- * inside, on `ConfirmDestructive.module.css`'s measurements — the cards in this app are one
- * gesture in several places and must not drift apart.
- *
- * Type comes from the `--fs-ui-*` ladder and nowhere else. A bare `font-size: 13px` is a label
- * that silently stops following the UI font size, and it looks right at the default, which is
- * where it would be written.
+ * One log line, opened. The frame, the title and lead, the buttons, the status badge and the
+ * pinned provenance strip are the UI kit's (`Modal` + `Dialog` with `below`, `Button`,
+ * `Badge`); this styles what a log line is made of — JSON, prose, a command and its output —
+ * and the two rows of the provenance.
  */
 
-.dialog {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.head {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 16px 18px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.title {
-  margin: 0;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-.actions {
-  display: flex;
-  gap: 8px;
-}
-
-.button {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  padding: 7px 13px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
-  color: var(--text);
-  cursor: default;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out);
-}
-
-.button:hover:not(:disabled) {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
-
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.button:disabled {
-  color: var(--faint);
-}
-
-.body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: 12px 18px 16px;
+/* The tool call's own title under the heading: one line, the whole of it on hover. */
+.subtitle {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
 }
 
 .note {
@@ -120,14 +61,13 @@
 .sections {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: var(--sp-5);
 }
 
 .meta {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-family: var(--font-ui);
+  gap: var(--sp-4);
   font-size: var(--fs-ui-12);
   color: var(--dim);
 }
@@ -136,24 +76,10 @@
   font-variant-numeric: tabular-nums;
 }
 
-.badgeOk,
-.badgeBad {
-  font-size: var(--fs-ui-11);
-  line-height: 1;
-  padding: 4px 7px;
-  border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  color: var(--green);
-}
-
-.badgeBad {
-  color: var(--red);
-}
-
 .section {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
   min-width: 0;
 }
 
@@ -170,10 +96,10 @@
 .code,
 .prose {
   margin: 0;
-  padding: 10px 12px;
+  padding: var(--sp-4) var(--sp-5);
   border-radius: var(--r-2);
-  border: 1px solid var(--border);
-  background: var(--chrome-hi);
+  border: 1px solid var(--border-soft);
+  background: var(--panel-2);
   font-family: var(--font-mono);
   font-size: var(--fs-code);
   line-height: 1.5;
@@ -200,25 +126,18 @@
  * and must not push the output — the thing somebody opened the card for — further down the card
  * as it grows.
  *
- * Outside `.body`, so it stays put while a long output scrolls under it. `flex: none` for the
- * same reason `.head` has it.
+ * The kit `Dialog`'s `below` strip, so it stays put while a long output scrolls under it.
  */
 .foot {
-  flex: none;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 10px 18px 12px;
-  border-top: 1px solid var(--border);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
+  gap: var(--sp-2);
 }
 
 .footRow {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   min-width: 0;
 }
 

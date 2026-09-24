@@ -23,7 +23,7 @@
   flex: none;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 12px 20px 10px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel);
@@ -32,35 +32,22 @@
 .titleRow {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   min-width: 0;
 }
 
 /* `appearance: none` keeps WebKit's `1px 6px`, so the padding is stated — the icon note in CLAUDE.md. */
 .back {
-  appearance: none;
-  padding: 0;
+  composes: icon sm from '../kit/components/Button.module.css';
   margin: 0;
   width: 22px;
-  height: 22px;
-  display: grid;
-  place-items: center;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--dim);
-  cursor: pointer;
 }
 
-.back:hover:enabled {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
 
-.back:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
+
+
+
+
 
 .mark {
   color: var(--dim);
@@ -81,7 +68,7 @@
 .kind {
   flex: none;
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--r-1);
   font-size: var(--fs-ui-11);
   color: var(--dim);
   background: var(--chrome);
@@ -98,7 +85,7 @@
 .links {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: var(--sp-5);
   font-size: var(--fs-ui-12);
 }
 
@@ -117,9 +104,9 @@
 }
 
 .signature {
-  margin: 4px 0 0;
-  padding: 8px 12px;
-  border-radius: 4px;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-4) var(--sp-5);
+  border-radius: var(--r-1);
   background: var(--chrome);
   color: var(--text);
   font-family: var(--font-mono);
@@ -142,13 +129,13 @@
 
 .members {
   max-width: 84ch;
-  margin-top: 24px;
-  padding-top: 16px;
+  margin-top: var(--sp-7);
+  padding-top: var(--sp-6);
   border-top: 1px solid var(--border-soft);
 }
 
 .membersTitle {
-  margin: 0 0 12px;
+  margin: 0 0 var(--sp-5);
   font-size: var(--fs-ui-12);
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -164,7 +151,7 @@
 .memberHead {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   min-width: 0;
 }
 
@@ -191,7 +178,7 @@
 }
 
 .memberSignature {
-  margin: 4px 0 6px;
+  margin: var(--sp-2) 0 var(--sp-3);
   font-family: var(--font-mono);
   font-size: var(--fs-code);
   color: var(--dim);

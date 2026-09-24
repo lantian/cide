@@ -48,7 +48,7 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 0 10px;
   border-bottom: 1px solid var(--border-soft);
   font-size: var(--fs-ui-12);
@@ -69,36 +69,15 @@
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--sp-1);
 }
 
 .action {
-  appearance: none;
-  border: none;
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  text-transform: none;
-  letter-spacing: 0;
-  padding: 2px 6px;
-  border-radius: var(--r-2);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  composes: button sm secondary from '../kit/components/Button.module.css';
 }
 
-.action:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
 
-.action:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
+
 
 .body {
   flex: 1 1 auto;
@@ -109,13 +88,13 @@
 .rows {
   display: flex;
   flex-direction: column;
-  padding: 4px 0;
+  padding: var(--sp-2) 0;
 }
 
 .row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   min-height: calc(22px * var(--ui-scale));
   padding: 0 10px 0 0;
   font-size: var(--fs-ui-12);
@@ -136,7 +115,7 @@
 }
 
 .row:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .twisty {
@@ -163,7 +142,7 @@
 
 .detail {
   margin-left: auto;
-  padding-left: 8px;
+  padding-left: var(--sp-4);
   color: var(--dim);
   font-size: var(--fs-ui-12);
   white-space: nowrap;

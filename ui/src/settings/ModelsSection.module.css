@@ -5,57 +5,38 @@
  * a bare `font-size: <n>px` is a label that silently stops following the UI font size.
  */
 
+/* The kit `Card`: a box on `--panel` told apart by its border, `--r-3`, 12px inside. */
 .card {
   border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  padding: 10px 12px;
-  margin-bottom: 10px;
+  border-radius: var(--r-3);
+  background: var(--panel);
+  padding: var(--sp-5);
+  margin-bottom: var(--sp-5);
 }
 
 .cardHead {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 2px;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-1);
 }
 
 .cardTitle {
   flex: 1;
-  font-size: var(--fs-ui-13);
-  color: var(--text);
+  font-size: var(--fs-ui-14);
+  font-weight: 600;
+  color: var(--text-hi);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.kind {
-  font-size: var(--fs-ui-11);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--dim);
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  padding: 1px 5px;
-}
-
-/* Both themes define the palette colours, so these need no media query: the token carries the
-   light/dark difference, which is `.noteWarn`'s rule one file over. */
-.verdictOk {
-  font-size: var(--fs-ui-12);
-  color: var(--green);
-}
-
-.verdictBad {
-  font-size: var(--fs-ui-12);
-  color: var(--yellow);
-}
 
 .problem {
   font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--yellow);
-  margin-top: 4px;
+  margin-top: var(--sp-2);
 }
 
 /* --- pool entries --- */
@@ -63,8 +44,13 @@
 .entry {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 0;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+}
+
+.entrySelect {
+  flex: 1;
+  min-width: 0;
 }
 
 .entryOrdinal {
@@ -75,17 +61,25 @@
   color: var(--faint);
 }
 
+/*
+ * The kit `TextInput`'s look at the row size — `--bg` box, the accent border and halo on focus —
+ * on a bare `<input>`: these fields sit in a column grid and a struck entry strikes their text,
+ * neither of which the kit field's own box takes.
+ */
 .entryField {
   flex: 1;
   min-width: 0;
   height: calc(24px * var(--ui-scale));
-  padding: 0 7px;
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .entryLimit {
@@ -95,35 +89,9 @@
 .entryField:focus {
   outline: 0;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-.iconButton {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: calc(22px * var(--ui-scale));
-  height: calc(22px * var(--ui-scale));
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--dim);
-  cursor: pointer;
-}
-
-.iconButton:hover:not(:disabled) {
-  color: var(--text);
-}
-
-.iconButton:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-
-/*
- * A row whose provider is unknown or switched off. Struck through, dimmed, and *still legible* —
- * the entry is kept rather than deleted because the provider may be the next thing the user
- * creates, so they have to be able to read what they typed.
- */
 .entryDead .entryField {
   text-decoration: line-through;
   color: var(--dim);
@@ -132,11 +100,11 @@
 /* --- the resolved-argv readout --- */
 
 .readout {
-  margin-top: 6px;
-  padding: 7px 9px;
-  border: 1px solid var(--border);
+  margin-top: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border: 1px solid var(--border-soft);
   border-radius: var(--r-2);
-  background: var(--panel);
+  background: var(--panel-2);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   line-height: 1.7;
@@ -156,16 +124,16 @@
 
 .actions {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-4);
   flex-wrap: wrap;
-  padding: 8px 0 2px;
+  padding: var(--sp-4) 0 var(--sp-1);
 }
 
 .modelRow {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 0;
+  gap: var(--sp-3);
+  padding: var(--sp-1) 0;
 }
 
 /* What the server said about a row's limits, under it. (M88) */
@@ -177,7 +145,7 @@
 }
 
 .modelNumber {
-  width: 74px;
+  width: calc(74px * var(--ui-scale));
   flex: none;
 }
 
@@ -186,7 +154,9 @@
 .disclosure {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-3);
+  flex: 1;
+  min-width: 0;
   width: 100%;
   padding: 0;
   border: 0;
@@ -206,21 +176,15 @@
 
 .combo {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-3);
   flex: 1;
   min-width: 0;
 }
 
+/* The kit `Select` beside the model box: wide enough for "Pick…" and its chevron. */
 .comboPick {
   flex: none;
-  width: calc(30px * var(--ui-scale));
-  height: calc(24px * var(--ui-scale));
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-ui-11);
+  width: calc(96px * var(--ui-scale));
 }
 
 .testResultOk {
@@ -239,10 +203,10 @@
 
 .modelHead {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-3);
   font-size: var(--fs-ui-11);
   color: var(--faint);
-  padding: 4px 0 0;
+  padding: var(--sp-2) 0 0;
 }
 
 .modelHeadId {
@@ -250,6 +214,6 @@
 }
 
 .modelHeadNumber {
-  width: 74px;
+  width: calc(74px * var(--ui-scale));
   flex: none;
 }

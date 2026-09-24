@@ -468,11 +468,12 @@ export function DeleteControl({
       <button
         type="button"
         /*
-         * Red **unarmed** as well as armed. It was `--red` only once it had been pressed, on the
-         * theory that arming is what makes it dangerous — but the colour is what tells somebody
+         * Marked **unarmed** as well as armed. It was marked only once it had been pressed, on
+         * the theory that arming is what makes it dangerous — but the mark is what tells somebody
          * scanning the foot of the card which of these two buttons is the one that destroys
-         * something, and by the time it is armed they have already pressed it. `--red` means
-         * "this destroys work" in exactly one place in this app; a delete is that place.
+         * something, and by the time it is armed they have already pressed it. Since the redesign
+         * the mark is the kit's (a bold ink label unarmed, the black danger fill armed), not
+         * `--red`: with a red accent, red read as the primary. See `.actionDanger`.
          */
         className={
           compact ? cx(styles.rowDelete) : cx(styles.action, styles.actionDanger)

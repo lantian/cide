@@ -1,0 +1,359 @@
+/*
+ * Telling the user what happened: the note (an inline callout), the banner (a strip across a
+ * panel), the toast, the empty state, and the marks of work in progress — spinner, progress bar,
+ * skeleton, and the wizard's checklist of steps.
+ *
+ * The note was first the wizard's verdict box as it was — the whole text in the tone's hue on a
+ * flat 10–12% wash — and on the page the warn and bad notes read as brown and pink blocks with
+ * hard-to-read text. It is now drawn like the filled marks in `Status.module.css`: the tone's
+ * gradient in a 3px bar down the left edge and behind a round icon mark, a wash that fades left
+ * to right, a hairline border in the tone, and the text in `--text` / `--text-hi` so it reads
+ * the same in every tone. The colour says how it went; the words stay black.
+ */
+
+.note {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5) var(--sp-4) calc(15px * var(--ui-scale));
+  border: 1px solid color-mix(in srgb, var(--tone) 24%, transparent);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--text);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--tone) 11%, var(--panel)) 0%,
+    color-mix(in srgb, var(--tone) 3%, var(--panel)) 100%
+  );
+  overflow: hidden;
+}
+
+.note::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--tone-fill);
+}
+
+.noteMark {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(18px * var(--ui-scale));
+  height: calc(18px * var(--ui-scale));
+  border-radius: var(--r-full);
+  color: var(--tone-ink, var(--on-fill));
+  background: var(--tone-fill);
+  box-shadow: var(--fill-sheen);
+}
+
+.noteBody {
+  flex: 1;
+  min-width: 0;
+  padding-top: calc(1px * var(--ui-scale));
+}
+
+.noteTitle {
+  display: block;
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.noteAction {
+  flex: none;
+  align-self: center;
+}
+
+/* Info is blue, not the accent: with the red accent an informational note read as a warning. */
+.note[data-tone='info'] {
+  --tone: var(--blue);
+  --tone-fill: var(--grad-blue);
+}
+
+.note[data-tone='ok'] {
+  --tone: var(--green);
+  --tone-fill: var(--grad-green);
+}
+
+.note[data-tone='warn'] {
+  --tone: var(--yellow);
+  --tone-fill: var(--grad-yellow);
+  --tone-ink: var(--on-yellow);
+}
+
+.note[data-tone='bad'] {
+  --tone: var(--red);
+  --tone-fill: var(--grad-red);
+}
+
+/* --- banner --------------------------------------------------------------------------------- */
+
+/* Across the top of a panel or pane, flush, square: "New commits available. Refresh". */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+  background: color-mix(in srgb, var(--tone, var(--blue)) 8%, var(--panel));
+}
+
+.banner > svg {
+  flex: none;
+  color: var(--tone, var(--blue));
+}
+
+.banner[data-tone='warn'] {
+  --tone: var(--yellow);
+}
+
+.banner[data-tone='bad'] {
+  --tone: var(--red);
+}
+
+.banner[data-tone='ok'] {
+  --tone: var(--green);
+}
+
+.bannerText {
+  flex: 1;
+  min-width: 0;
+}
+
+/* --- toast ---------------------------------------------------------------------------------- */
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+  width: calc(340px * var(--ui-scale));
+  max-width: 100%;
+  padding: var(--sp-5);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--tone, var(--blue));
+  border-radius: var(--r-3);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: var(--shadow-3);
+}
+
+.toast > svg {
+  flex: none;
+  color: var(--tone, var(--blue));
+}
+
+.toast[data-tone='ok'] {
+  --tone: var(--green);
+}
+
+.toast[data-tone='bad'] {
+  --tone: var(--red);
+}
+
+.toast[data-tone='warn'] {
+  --tone: var(--yellow);
+}
+
+.toastBody {
+  flex: 1;
+  min-width: 0;
+}
+
+.toastTitle {
+  display: block;
+  margin-bottom: var(--sp-1);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+/* --- empty state ---------------------------------------------------------------------------- */
+
+/*
+ * A claim, a sentence, one button, centred both ways — `AgentsPanel`'s argument: a lone button at
+ * the top of an empty column reads as a list that failed to load; in the middle it reads as the
+ * thing the screen is for. The mark sits on the soft gradient, the wizard's art ground.
+ */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-4);
+  padding: var(--sp-7) var(--sp-6);
+  text-align: center;
+}
+
+.emptyMark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(44px * var(--ui-scale));
+  height: calc(44px * var(--ui-scale));
+  margin-bottom: var(--sp-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-4);
+  background: var(--grad-accent-soft), var(--panel-2);
+  color: var(--accent);
+}
+
+.emptyTitle {
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.emptyText {
+  max-width: calc(260px * var(--ui-scale));
+  margin: 0;
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+/* --- work in progress ----------------------------------------------------------------------- */
+
+/* A loop, so reduced motion is answered through `--motion-loop` — see `tokens.css`. Blue: work
+   in progress is a status, and statuses never take the red accent. */
+.spin {
+  color: var(--blue);
+  animation: kit-feedback-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes kit-feedback-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.progressHead {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.track {
+  height: calc(4px * var(--ui-scale));
+  border-radius: var(--r-full);
+  background: var(--chrome-hi);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--grad-blue);
+}
+
+/* Every tone is a gradient: the first pass left "done" a flat green beside a gradient "in
+   progress", and the pair read as two different components. In progress is blue, a status. */
+.fill[data-tone='ok'] {
+  background: var(--grad-green);
+}
+
+.fill[data-tone='bad'] {
+  background: var(--grad-red);
+}
+
+/* A shape where content will be. Static: a shimmer is one more loop to justify. */
+.skeleton {
+  display: block;
+  height: calc(10px * var(--ui-scale));
+  border-radius: var(--r-1);
+  background: var(--chrome-hi);
+}
+
+/* --- checklist ------------------------------------------------------------------------------ */
+
+/* The wizard's Create step: a list of steps that each go waiting → running → done | failed. */
+.checklist {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-5);
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-13);
+  color: var(--faint);
+}
+
+.check:last-child {
+  border-bottom: 0;
+}
+
+.checkMark {
+  flex: none;
+  display: flex;
+}
+
+.checkBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.checkDetail {
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.check[data-state='running'] {
+  color: var(--text-hi);
+}
+
+.check[data-state='running'] .checkMark {
+  color: var(--blue);
+}
+
+.check[data-state='done'] {
+  color: var(--text);
+}
+
+.check[data-state='done'] .checkMark {
+  color: var(--green);
+}
+
+.check[data-state='failed'] {
+  color: var(--text-hi);
+}
+
+.check[data-state='failed'] .checkMark,
+.check[data-state='failed'] .checkDetail {
+  color: var(--red);
+}

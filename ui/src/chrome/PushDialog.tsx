@@ -23,8 +23,10 @@
  * work or do nothing at all is one people learn to tick.
  */
 import { useEffect, useRef, useState } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
-import { Icon } from '@/icons/Icon'
+import { Modal } from '@/overlays/ModalShell'
+import { Button, IconButton } from '@/kit/components/Button'
+import { Checkbox } from '@/kit/components/Choice'
+import { Dialog } from '@/kit/components/Overlay'
 import {
   blockedNote,
   confirmLabel,
@@ -84,8 +86,11 @@ export function PushDialog() {
   }
 
   return (
-    <OverlayCard label="Push commits" onDismiss={() => usePush.getState().dismiss()}>
-      <div
+    <Modal onDismiss={() => usePush.getState().dismiss()}>
+      <Dialog
+        title="Push commits"
+        lead={<span data-audit="pushSummary">{pushSummary(previews, checked)}</span>}
+        flush
         onKeyDown={(ev) => {
           if (ev.key === 'Escape') {
             ev.stopPropagation()
@@ -93,14 +98,48 @@ export function PushDialog() {
           }
         }}
         data-audit="pushDialog"
+        footNote={
+          <span
+            data-audit="pushForce"
+            title={
+              canForce
+                ? 'Overwrite the remote branch, refusing if it moved since your last fetch'
+                : 'Nothing selected would be rejected, so there is nothing to force'
+            }
+          >
+            <Checkbox
+              label="Force push (with lease)"
+              checked={forcing}
+              disabled={!canForce}
+              onChange={setForce}
+            />
+          </span>
+        }
+        actions={
+          <>
+            {/* The kit's black `danger` only while forcing: an ordinary push loses nothing, and a
+                forced one overwrites history on a machine that is not the user's. */}
+            <Button
+              variant={forcing ? 'danger' : 'secondary'}
+              disabled={total === 0}
+              data-audit="pushConfirm"
+              onClick={() => usePush.getState().confirm(checked, forcing)}
+            >
+              {confirmLabel(total, forcing)}
+            </Button>
+            {/* Rule 3: this dialog is opened by a keystroke, so the prominent, focused answer is
+                the one that does nothing. */}
+            <Button
+              variant="primary"
+              data-audit="pushCancel"
+              ref={cancel}
+              onClick={() => usePush.getState().dismiss()}
+            >
+              Cancel
+            </Button>
+          </>
+        }
       >
-        <div className={styles.head}>
-          <h2 className={styles.title}>Push commits</h2>
-          <p className={styles.body} data-audit="pushSummary">
-            {pushSummary(previews, checked)}
-          </p>
-        </div>
-
         <ul className={styles.list} data-audit="pushList">
           {previews.map((preview) => {
             const id = preview.repo.id
@@ -111,16 +150,13 @@ export function PushDialog() {
             return (
               <li key={id} className={styles.repo} data-audit="pushRepo" data-repo={id}>
                 <div className={styles.repoRow}>
-                  <button
-                    type="button"
-                    className={styles.twisty}
+                  <IconButton
+                    icon={open ? 'chevron-down' : 'chevron-right'}
+                    label={open ? 'Collapse' : 'Expand'}
                     disabled={preview.commits.length === 0}
-                    aria-label={open ? 'Collapse' : 'Expand'}
                     aria-expanded={open}
                     onClick={() => fold(id)}
-                  >
-                    <Icon name={open ? 'chevron-down' : 'chevron-right'} size={1} />
-                  </button>
+                  />
                   <input
                     type="checkbox"
                     className={styles.tick}
@@ -173,45 +209,7 @@ export function PushDialog() {
             )
           })}
         </ul>
-
-        <div className={styles.foot}>
-          <label
-            className={`${styles.force} ${canForce ? '' : styles.forceOff}`}
-            data-audit="pushForce"
-            title={
-              canForce
-                ? 'Overwrite the remote branch, refusing if it moved since your last fetch'
-                : 'Nothing selected would be rejected, so there is nothing to force'
-            }
-          >
-            <input
-              type="checkbox"
-              checked={forcing}
-              disabled={!canForce}
-              onChange={(ev) => setForce(ev.target.checked)}
-            />
-            Force push (with lease)
-          </label>
-          <button
-            type="button"
-            className={`${styles.action} ${forcing ? styles.danger : ''}`}
-            disabled={total === 0}
-            data-audit="pushConfirm"
-            onClick={() => usePush.getState().confirm(checked, forcing)}
-          >
-            {confirmLabel(total, forcing)}
-          </button>
-          <button
-            type="button"
-            className={`${styles.action} ${styles.primary}`}
-            data-audit="pushCancel"
-            ref={cancel}
-            onClick={() => usePush.getState().dismiss()}
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }

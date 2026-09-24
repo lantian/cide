@@ -44,46 +44,31 @@
    * window, and a 4px step down the sidebar seam is what happens when they drift.
    */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerTitle {
-  flex: none;
+  composes: panelTitle from '../kit/components/Surface.module.css';
 }
 
 /* The readout. Mono and tabular so a climbing count does not shift the label beside it. */
 .headerMeta {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: right;
+  flex: none;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--faint);
   font-variant-numeric: tabular-nums;
+  color: var(--faint);
 }
 
 .controls {
   flex: none;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 8px 10px;
   border-bottom: 1px solid var(--border-soft);
 }
@@ -92,11 +77,15 @@
   width: 100%;
   height: calc(24px * var(--ui-scale));
   box-sizing: border-box;
-  padding: 0 7px;
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  /* The kit field: `--bg` inside, `--text-hi` typed, the accent border and halo on focus. */
+  background: var(--bg);
+  color: var(--text-hi);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
 }
@@ -117,7 +106,7 @@
 .field {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
 }
 
 .field .input {
@@ -146,41 +135,31 @@
  * second button metric here would be visible as a half-pixel of drift against the row above.
  */
 .clear {
-  flex: none;
-  width: 24px;
-  height: calc(20px * var(--ui-scale));
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  line-height: 1;
-  cursor: default;
+  composes: icon sm from '../kit/components/Button.module.css';
 }
 
-.clear:hover {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
 
 .input:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .toggles {
   display: flex;
-  gap: 4px;
+  gap: var(--sp-2);
 }
 
 /*
  * The three switches. Mono, because two of the three labels (`Aa`, `.*`) are read as code and
  * a proportional font makes `.*` almost invisible at this size.
  */
+/* The kit's icon toggle: square, no border at rest, `--panel-2` on hover, and "on" is the accent
+   on a 12% accent wash — the one drawing every icon toggle in the app has. */
 .toggle {
   flex: none;
-  width: 24px;
-  height: calc(20px * var(--ui-scale));
+  width: calc(24px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
   padding: 0;
   border: 1px solid transparent;
   border-radius: var(--r-2);
@@ -193,7 +172,7 @@
 }
 
 .toggle:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text);
 }
 
@@ -215,14 +194,13 @@
 }
 
 .toggleOn:disabled:hover {
-  background: var(--sel);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .toggleOn,
 .toggleOn:hover {
-  border-color: var(--accent-dim);
-  background: var(--sel);
-  color: var(--text-hi);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
 }
 
 .scroll {
@@ -247,7 +225,7 @@
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 0 8px 0 6px;
+  padding: 0 var(--sp-4) 0 var(--sp-3);
   border: 0;
   background: transparent;
   /*
@@ -271,14 +249,10 @@
     color var(--dur-1) var(--ease-out);
 }
 
-/* Hover derived from `--sel`, for the reason spelled out in `FileTree.module.css`: on the
-   white panel `--chrome-hi` is a *heavier* wash than the selected row's `--sel`, so hover and
-   selection read in the wrong order, and only in the light theme. The `--chrome-hi` line is
-   the fallback for an engine with no `color-mix()`. */
+/* The kit's row hover, `--panel-2` — see `FileTree.module.css`. */
 .fileRow:hover,
 .hitRow:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
+  background: var(--panel-2);
 }
 
 /*
@@ -445,7 +419,7 @@
 .notice {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--sp-2);
   padding: 12px 10px;
   color: var(--dim);
   font-size: var(--fs-ui-12);

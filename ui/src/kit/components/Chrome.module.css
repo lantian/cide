@@ -1,0 +1,314 @@
+/*
+ * The chrome's drawing — see `Chrome.tsx`. The app's chrome components compose these classes,
+ * so every number here is the app's own: the heights are `tokens.css`'s `--h-*`, and a change
+ * here moves the real tab strip, rail, status bar and pane bars with the specimens.
+ *
+ * The state rules are the kit's everywhere else, restated for the chrome:
+ *   - hover is `--panel-2`;
+ *   - the current tab is the panel ground with the accent underline and `--text-hi` — not
+ *     bolder, because the strip's tabs are measured by the layout audit and must not reflow;
+ *   - an icon that is on (the current rail panel, a pane bar toggle) is the accent on a 12%
+ *     accent wash — the one drawing every icon toggle has;
+ *   - a count is the kit's `Counter`: neutral, accent only when it asks for you.
+ */
+
+/* --- rail ------------------------------------------------------------------------------------ */
+
+.rail {
+  width: var(--h-rail);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4) 0;
+  border-right: 1px solid var(--border);
+  background: var(--chrome);
+  color: var(--dim);
+}
+
+/* 32px of button around a 20px mark, in the 46px `--h-rail` gutter. Fixed, like the rail: none
+   of it is text. */
+.railButton {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-3);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.railButton:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.railButton[aria-pressed='true'],
+.railButton[aria-pressed='true']:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.railButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.railCount {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  display: flex;
+  pointer-events: none;
+}
+
+/* --- tab strip ------------------------------------------------------------------------------- */
+
+.strip {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  height: var(--h-tabstrip);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.tab {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-2) 0 var(--sp-5);
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.tab:hover {
+  background: var(--panel);
+  color: var(--text);
+}
+
+.tab[aria-selected='true'],
+.tab[aria-selected='true']:hover {
+  border-bottom-color: var(--accent);
+  background: var(--panel);
+  color: var(--text-hi);
+}
+
+.tab:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.tabTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The close control, which wears the unsaved dot until it is pointed at: an unsaved buffer must
+   still be closable by keyboard and pointer. */
+.tabClose {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.tabClose:hover {
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+.tabClose[data-dirty] > svg {
+  display: none;
+}
+
+.tabClose[data-dirty]:hover > svg {
+  display: block;
+}
+
+.tabClose[data-dirty]:hover .dirtyDot {
+  display: none;
+}
+
+.dirtyDot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+}
+
+/* --- status bar ------------------------------------------------------------------------------ */
+
+/* Mono at 12: the bar is readouts a user compares and pastes (a branch, `Ln 12, Col 4`), and it
+   clips rather than wrapping — a wrapped status bar eats a second row. */
+.status {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  height: var(--h-status);
+  padding: 0 var(--sp-5);
+  border-top: 1px solid var(--border);
+  background: var(--chrome);
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.statusItem {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: calc(20px * var(--ui-scale));
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+}
+
+button.statusItem {
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+button.statusItem:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.statusIcon {
+  display: inline-flex;
+}
+
+.statusIcon[data-tone='green'] {
+  color: var(--green);
+}
+
+.statusIcon[data-tone='yellow'] {
+  color: var(--yellow);
+}
+
+.statusIcon[data-tone='red'] {
+  color: var(--red);
+}
+
+.statusIcon[data-tone='blue'] {
+  color: var(--blue);
+}
+
+.statusIcon[data-tone='purple'] {
+  color: var(--purple);
+}
+
+/* --- pane bar -------------------------------------------------------------------------------- */
+
+.paneBar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: calc(28px * var(--ui-scale));
+  padding: 0 var(--sp-2) 0 var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: var(--fs-ui-12);
+}
+
+.paneBar[data-focused] {
+  background: var(--panel);
+  color: var(--text-hi);
+}
+
+.paneTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.paneTools {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* --- chrome buttons -------------------------------------------------------------------------- */
+
+.chromeButton {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.chromeButton:hover {
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+.chromeButton[aria-pressed='true'] {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.chromeButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+/* Red on hover only: closing a window is not dangerous at rest, and a permanently red corner
+   would advertise a danger that is not there. */
+.chromeClose:hover {
+  background: var(--red);
+  color: var(--on-fill);
+}
+
+.windowControls {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}

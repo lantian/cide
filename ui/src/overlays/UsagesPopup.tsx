@@ -23,6 +23,7 @@
  * confident nonsense, because almost any subsequence of characters occurs somewhere in forty lines
  * of code. See `usagesModel.ts`, which holds the predicate and says so.
  */
+import { PickerRow, PickerStatus } from '@/kit/components/Overlay'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
@@ -193,7 +194,7 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
         </>
       }
     >
-      {status !== null && <div className={styles.status}>{status}</div>}
+      {status !== null && <PickerStatus>{status}</PickerStatus>}
       {grouped.length > 0 && (
         <div style={{ height: virtual.getTotalSize(), position: 'relative' }}>
           {virtual.getVirtualItems().map((item) => {
@@ -235,10 +236,11 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
             if (usage === undefined) return null
             const parts = splitHighlight(usage.text, usage.start, usage.end)
             return (
-              <div
+              <PickerRow
                 key={`h:${row.index}`}
                 data-audit="usageRow"
-                className={`${styles.row} ${row.index === selected ? styles.rowSelected : ''}`}
+                virtual
+                selected={row.index === selected}
                 style={style}
                 onMouseMove={() => setSelected(row.index)}
                 onMouseDown={(event) => {
@@ -252,7 +254,7 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
                   <mark className={styles.usageMatch}>{parts.match}</mark>
                   {parts.after}
                 </span>
-              </div>
+              </PickerRow>
             )
           })}
         </div>

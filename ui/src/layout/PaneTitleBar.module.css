@@ -766,11 +766,11 @@
  *
  * "Just buttons without background" is the rest state and it is honoured. A 22px square with
  * no fill and no border gives no edge to aim at once it is on screen, and the app's other
- * icon buttons — the window controls below, the row strip in `SplitTree` — all answer the
- * pointer with `--chrome-hi`. Silent controls would have been the odd ones out.
+ * icon buttons answer the pointer with the kit's `--panel-2` (`kit/components/Chrome.module.css`,
+ * `.chromeButton`). Silent controls would have been the odd ones out.
  */
 .action:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
   color: var(--text-hi);
 }
 
@@ -810,7 +810,9 @@
   color: inherit;
 }
 
+/* A toggle that is on: the kit's icon toggle, the accent on a 12% accent wash. */
 .actionOn {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
 }
 
@@ -845,30 +847,12 @@
   gap: 2px;
 }
 
+/* The kit's `ChromeButton` (`kit/components/Chrome.module.css`): 22px, `--r-2`, `--panel-2`
+   under the pointer. */
 .control {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: var(--r-2);
-  background: transparent;
-  border: 0;
-  color: var(--dim);
-  cursor: pointer;
-  padding: 0;
+  composes: chromeButton from '../kit/components/Chrome.module.css';
   font: inherit;
   line-height: 1;
-}
-
-.control:hover {
-  background: var(--chrome-hi);
-  color: var(--text-hi);
-}
-
-.control:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-inset);
 }
 
 /*

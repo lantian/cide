@@ -1,0 +1,230 @@
+/*
+ * Text entry: the input, the textarea, the search field and the select, plus the label and the
+ * hint around them. The reference is the New Project wizard's path field and the GitLab inbox's
+ * search field.
+ *
+ * One box for all four. `--bg` inside a `--panel` or `--chrome` surface, so the field reads as
+ * a hole in the card rather than a raised thing on it; `--text-hi` for what the user typed and
+ * `--faint` for the placeholder, so the two can never be mistaken for each other. Focus is the
+ * accent border plus a 3px accent halo at 20%: an outline alone was lost against a card edge in
+ * the light theme, and a halo without the border change looked like a shadow.
+ *
+ * Same two heights as `Button.module.css` (30 and 24) — see that file for why they must match.
+ */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  font-size: var(--fs-ui-12);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.optional {
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.hint {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--faint);
+}
+
+/* A field that failed validation says so under itself, in red, with the reason — never a red
+   border alone, which says "wrong" without saying what. */
+.error {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--red);
+}
+
+/* --- the box ------------------------------------------------------------------------------ */
+
+.box {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--bg);
+  color: var(--dim);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+}
+
+.box:hover {
+  border-color: color-mix(in srgb, var(--dim) 45%, var(--border));
+}
+
+.box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.box[data-invalid='true'] {
+  border-color: var(--red);
+}
+
+.box[data-invalid='true']:focus-within {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 18%, transparent);
+}
+
+.box[data-disabled='true'] {
+  background: var(--panel-2);
+  border-color: var(--border-soft);
+}
+
+.md {
+  height: calc(30px * var(--ui-scale));
+}
+
+.sm {
+  height: calc(24px * var(--ui-scale));
+}
+
+.lead {
+  flex: none;
+  display: flex;
+  padding-left: var(--sp-4);
+  color: var(--dim);
+  pointer-events: none;
+}
+
+.trail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding-right: var(--sp-2);
+}
+
+.input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--sp-4);
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.md .input {
+  font-size: var(--fs-ui-13);
+}
+
+.lead + .input {
+  padding-left: var(--sp-3);
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+/*
+ * The engine's own clear button and search decoration, off. `SearchField` is `type="search"`
+ * (so Escape clears it and a screen reader announces a search box), and WebKit draws a blue ✕
+ * of its own inside such an input — beside the kit's clear button that made two, which the
+ * user caught on the first review.
+ */
+.input::-webkit-search-cancel-button,
+.input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
+.input:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* Paths, branch names, ids, commands: anything the user may copy into a terminal. */
+.mono {
+  font-family: var(--font-mono);
+}
+
+.textarea {
+  display: block;
+  width: 100%;
+  min-height: calc(84px * var(--ui-scale));
+  padding: var(--sp-4) var(--sp-5);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--bg);
+  color: var(--text-hi);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-13);
+  line-height: 1.5;
+  resize: vertical;
+  -webkit-user-select: text;
+  user-select: text;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
+}
+
+.textarea::placeholder {
+  color: var(--faint);
+}
+
+.textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+/* --- a form's rows ------------------------------------------------------------------------- */
+
+/* Label left, control right: the settings pages' row, the wizard's summary. */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: var(--sp-5) 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.row:last-child {
+  border-bottom: 0;
+}
+
+.rowText {
+  flex: 1;
+  min-width: 0;
+}
+
+.rowLabel {
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+.rowHint {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.rowControl {
+  flex: none;
+}

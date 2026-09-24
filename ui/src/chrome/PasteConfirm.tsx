@@ -26,7 +26,12 @@
  * gesture — rather than by the shell, so the feature is reachable without touching `App.tsx`.
  */
 import { useEffect, useRef, useState } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Checkbox } from '@/kit/components/Choice'
+import { Dialog } from '@/kit/components/Overlay'
+import { Dot } from '@/kit/components/Status'
+import { PathGroup, PathList, PathRow } from '@/kit/components/Surface'
 import {
   applyToRestLabel,
   askBody,
@@ -95,29 +100,65 @@ export function PasteConfirm({ ask, onAnswer, onCancel }: PasteConfirmProps) {
   const replaceable = canReplace(collision)
 
   return (
-    <OverlayCard label={title} onDismiss={onCancel}>
-      <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="pasteConfirm">
-        <div className={styles.head}>
-          <div className={styles.titleRow}>
-            <h2 className={styles.title} data-audit="pasteConfirmTitle">
-              {title}
-            </h2>
-            {/* Which question this is, when there is more than one. A user four deep in seven
-                needs to know how many are left before deciding whether to use the checkbox. */}
-            {progress !== null && (
-              <span className={styles.progress} data-audit="pasteConfirmProgress">
-                {progress}
-              </span>
-            )}
-          </div>
-          <p className={styles.body} data-audit="pasteConfirmBody">
-            {askBody(collision)}
-          </p>
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={title}
+        /* Which question this is, when there is more than one. A user four deep in seven needs
+           to know how many are left before deciding whether to use the checkbox. */
+        titleAside={
+          progress !== null && <span data-audit="pasteConfirmProgress">{progress}</span>
+        }
+        lead={<span data-audit="pasteConfirmBody">{askBody(collision)}</span>}
+        head={
           <p className={styles.where} title={collision.dest}>
             {collision.dest}
           </p>
-        </div>
-
+        }
+        width="narrow"
+        flush
+        onKeyDown={onKeyDown}
+        data-audit="pasteConfirm"
+        /* Pushed left, away from the answers: a checkbox that sits beside `Replace` is one the
+           user ticks by being 4px off, and it multiplies the destructive answer. */
+        footNote={
+          restLabel !== null && (
+            <span data-audit="pasteConfirmApplyAll">
+              <Checkbox label={restLabel} checked={applyToRest} onChange={setApplyToRest} />
+            </span>
+          )
+        }
+        actions={
+          <>
+            {/*
+              * Absent, not disabled, when Replace is refused.
+              *
+              * The house treatment is a disabled control with the reason on it — but the reason
+              * is already the entire body of this dialog when `blocked` is set, so a greyed
+              * button repeating it would be the same sentence twice with a dead control under it.
+              */}
+            {replaceable && (
+              <Button
+                variant="danger"
+                onClick={() => onAnswer('replace', applyToRest)}
+                data-audit="pasteConfirmReplace"
+              >
+                {replaceLabel(collision)}
+              </Button>
+            )}
+            <Button onClick={onCancel} data-audit="pasteConfirmCancel">
+              Cancel
+            </Button>
+            <Button
+              ref={keep}
+              variant="primary"
+              onClick={() => onAnswer('keepBoth', applyToRest)}
+              data-audit="pasteConfirmKeepBoth"
+            >
+              {keepBothLabel(collision)}
+            </Button>
+          </>
+        }
+      >
         {/*
           * The files a merge would overwrite, by name.
           *
@@ -126,76 +167,20 @@ export function PasteConfirm({ ask, onAnswer, onCancel }: PasteConfirmProps) {
           * can tell whether the twelve files are the twelve they meant.
           */}
         {collision.sample.length > 0 && (
-          <ul className={styles.list} data-audit="pasteConfirmList">
-            <li className={styles.groupLabel}>Would be overwritten</li>
+          <PathList data-audit="pasteConfirmList">
+            <PathGroup>Would be overwritten</PathGroup>
             {collision.sample.map((rel) => (
-              <li key={rel} className={styles.row}>
-<span className={styles.mark} aria-hidden="true" />
-                <span className={styles.name}>{rel}</span>
-              </li>
+              <PathRow key={rel} mark={<Dot tone="red" label="Overwritten" />} name={rel} />
             ))}
             {collision.replaces > collision.sample.length && (
-              <li className={`${styles.row} ${styles.more}`}>
-                and {collision.replaces - collision.sample.length} more
-              </li>
+              <PathRow name={`and ${collision.replaces - collision.sample.length} more`} />
             )}
-          </ul>
+          </PathList>
         )}
-
-        <div className={styles.footer}>
-          {/* Pushed left, away from the answers: a checkbox that sits beside `Replace` is one
-              the user ticks by being 4px off, and it multiplies the destructive answer. */}
-          {restLabel !== null && (
-            <label className={styles.applyAll}>
-              <input
-                type="checkbox"
-                checked={applyToRest}
-                onChange={(ev) => setApplyToRest(ev.target.checked)}
-                data-audit="pasteConfirmApplyAll"
-              />
-              {restLabel}
-            </label>
-          )}
-          {/*
-            * Absent, not disabled, when Replace is refused.
-            *
-            * The house treatment is a disabled control with the reason on it — but the reason
-            * is already the entire body of this dialog when `blocked` is set, so a greyed
-            * button repeating it would be the same sentence twice with a dead control under it.
-            */}
-          {replaceable && (
-            <button
-              type="button"
-              className={`${styles.button} ${styles.buttonDanger}`}
-              onClick={() => onAnswer('replace', applyToRest)}
-              data-audit="pasteConfirmReplace"
-            >
-              {replaceLabel(collision)}
-            </button>
-          )}
-          <button
-            type="button"
-            className={styles.button}
-            onClick={onCancel}
-            data-audit="pasteConfirmCancel"
-          >
-            Cancel
-          </button>
-          <button
-            ref={keep}
-            type="button"
-            className={`${styles.button} ${styles.buttonPrimary}`}
-            onClick={() => onAnswer('keepBoth', applyToRest)}
-            data-audit="pasteConfirmKeepBoth"
-          >
-            {keepBothLabel(collision)}
-          </button>
-        </div>
-
         <p className={styles.note} data-audit="pasteConfirmNote">
           {nothingWrittenYet()}
         </p>
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }

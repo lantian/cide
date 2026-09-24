@@ -2,8 +2,8 @@
   flex: none;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 8px 10px 10px;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5) var(--sp-5);
   background: var(--panel);
   border-top: 1px solid var(--border);
 }
@@ -11,14 +11,15 @@
 .top {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--sp-5);
+  min-width: 0;
   min-height: calc(18px * var(--ui-scale));
 }
 
 .amend {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-3);
   color: var(--text);
   font-size: var(--fs-ui-13);
   cursor: pointer;
@@ -43,7 +44,7 @@
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  color: var(--accent);
+  color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -58,7 +59,7 @@
   height: calc(104px * var(--ui-scale));
   flex: none;
   resize: none;
-  padding: 7px 8px;
+  padding: var(--sp-3) var(--sp-4);
   /*
    * Neutral at rest, accent on focus.
    *
@@ -71,8 +72,9 @@
     border-color var(--dur-1) var(--ease-out),
     box-shadow var(--dur-1) var(--ease-out);
   border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
+  /* The kit field's ground: `--bg`, the inside of a text field. */
+  background: var(--bg);
+  color: var(--text-hi);
   font-family: var(--font-mono);
   font-size: var(--fs-ui-12);
   line-height: calc(17px * var(--ui-scale));
@@ -88,65 +90,28 @@
 .message:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
+/* Wraps: in a narrow sidebar "Commit and Push…" goes under Commit instead of past the edge. */
 .actions {
   display: flex;
-  gap: 8px;
-}
-
-.commit,
-.push {
-  height: calc(26px * var(--ui-scale));
-  padding: 0 12px;
-  border-radius: var(--r-2);
-  font-family: inherit;
-  font-size: var(--fs-ui-13);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+  flex-wrap: wrap;
+  gap: var(--sp-4);
 }
 
 /*
- * The app's primary look (`styles/buttons.module.css`). It used to be a flat accent fill
- * labelled `--bg`, which was right for that fill and is not for the gradient: the shared class
- * labels it `--on-accent`, measured against both of the gradient's stops.
+ * The kit's buttons (`kit/components/Button.module.css`), composed onto the elements the git
+ * checks read: Commit is the one primary of the panel, Commit and Push… its secondary. The kit
+ * dims a disabled primary to 0.45 rather than hiding it — the button is the answer to "how do I
+ * commit", and it has to still be there when the reason it is unavailable is an empty message.
  */
 .commit {
-  composes: primary from '../../styles/buttons.module.css';
-  border: 1px solid transparent;
+  composes: button md primary from '../../kit/components/Button.module.css';
 }
 
 .push {
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text);
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.push:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
-}
-
-.commit:disabled,
-.push:disabled {
-  /* Dimmed rather than hidden: the button is the answer to "how do I commit", and it has
-     to still be there when the reason it is unavailable is an empty message. */
-  opacity: 0.45;
-  cursor: default;
-}
-
-.commit:focus-visible,
-.push:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
+  composes: button md secondary from '../../kit/components/Button.module.css';
 }
 
 /* Visible to assistive technology only — the textarea's placeholder is not a label. */

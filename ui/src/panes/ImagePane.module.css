@@ -32,7 +32,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 12px;
+  padding: var(--sp-5);
   overflow: auto;
   background-color: var(--panel);
   background-image:
@@ -87,7 +87,7 @@
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   padding: 5px 10px;
   border-top: 1px solid var(--border);
   background: var(--chrome);
@@ -116,31 +116,15 @@
 }
 
 .button {
+  composes: button sm secondary from '../kit/components/Button.module.css';
   flex: none;
-  padding: 3px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome-hi);
-  color: var(--text);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-11);
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
 }
 
-.button:hover {
-  border-color: var(--dim);
-  color: var(--text-hi);
-}
 
-.button:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
+
+
+
+
 
 /* The two states that are not a picture. Deliberately the same shape as `EditorPane`'s. */
 .notice {
@@ -148,12 +132,12 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: var(--sp-4);
   height: 100%;
-  padding: 16px;
+  padding: var(--sp-6);
   background: var(--panel);
   text-align: center;
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   font-size: var(--fs-ui-12);
   color: var(--dim);
 }
@@ -161,6 +145,7 @@
 .noticeTitle {
   font-size: var(--fs-ui-13);
   color: var(--text-hi);
+  font-weight: 600;
 }
 
 .noticeWhy {

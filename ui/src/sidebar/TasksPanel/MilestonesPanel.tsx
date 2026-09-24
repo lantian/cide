@@ -379,12 +379,7 @@ export function MilestonesPanel({
               currentGate?.last?.passed === true &&
               view?.accepted.includes(current.id) !== true && (
                 <p className={styles.note}>
-                  The gate passes. cide will not wake this project to plan until you accept{' '}
-                  {current.id} — or tighten its gate if this is not what you meant.
-                  {openWork(tasksOf(current.id)) > 0 &&
-                    ` Accept waits for its ${openWork(tasksOf(current.id))} open task${
-                      openWork(tasksOf(current.id)) === 1 ? '' : 's'
-                    } to be done.`}
+                  {gateNote(current, currentGate?.running === true, currentGate?.last, tasksOf(current.id))}
                 </p>
               )}
 
@@ -920,20 +915,37 @@ function countLine(tasks: readonly MilestoneTask[]): string {
 }
 
 /**
- * Work still in flight under a milestone: todo, doing, review. The inbox is not counted — it is
- * by definition not work yet (`TaskStatus`'s account of it), and holding a milestone open on
- * something nobody decided to do would let any passing observation block it.
+ * Work still in flight under a milestone: todo, doing, review. The inbox is counted separately,
+ * by `undecided` — it is by definition not work yet (`TaskStatus`'s account of it).
  */
 function openWork(tasks: readonly MilestoneTask[]): number {
   return tasks.filter((t) => t.status !== 'done' && t.status !== 'inbox').length
 }
 
 /**
+ * Decisions owed under a milestone: rows sitting in the inbox *under its goal*. (M99)
+ *
+ * These were not counted at all, on the reasoning that the inbox is not work and any passing
+ * observation could otherwise block a milestone. Half right: the inbox at large is somebody
+ * else's problem, and nothing here looks at it — `tasks` is only what is linked under this
+ * goal. But a row a run put in the inbox *under this goal* is something noticed while working on
+ * this milestone that nobody has ruled on, and Accept marks that goal done, burying it. So it
+ * holds Accept, exactly as an open task does, and the way to clear it is one decision: move it
+ * to todo, or unlink it from the goal. In selfcraft's `slice` this was the whole bug — gate
+ * green, eighty subtasks done, one inbox row under the goal, and cide offering Accept while the
+ * spinner stood down (`spinner::gate_blocks_planning` is the same rule on the Rust side).
+ */
+function undecided(tasks: readonly MilestoneTask[]): number {
+  return tasks.filter((t) => t.status === 'inbox').length
+}
+
+/**
  * Whether Accept is offered — the card's and the modal's one rule. The active milestone only
  * (`accept` takes no id; Rust accepts the current one), its gate's last run passed and none is
- * running, and nothing under it is still open. The gate alone was the first version, and it
- * offered Accept on a milestone with tasks in doing: a gate that passed an hour ago says nothing
- * about work started since, and accepting marks the milestone's task done over its open subtasks.
+ * running, and nothing under it is still open or still undecided. The gate alone was the first
+ * version, and it offered Accept on a milestone with tasks in doing: a gate that passed an hour
+ * ago says nothing about work started since, and accepting marks the milestone's task done over
+ * its open subtasks — or, with `undecided`, over an inbox row nobody ruled on.
  */
 function readyToAccept(
   active: boolean,
@@ -941,7 +953,48 @@ function readyToAccept(
   gate: CheckResult | undefined,
   tasks: readonly MilestoneTask[],
 ): boolean {
-  return active && !gateRunning && gate?.passed === true && openWork(tasks) === 0
+  return (
+    active &&
+    !gateRunning &&
+    gate?.passed === true &&
+    openWork(tasks) === 0 &&
+    undecided(tasks) === 0
+  )
+}
+
+/**
+ * The line drawn under a green gate. (M99)
+ *
+ * It used to say one thing — *cide will not wake this project to plan until you accept it* — and
+ * that is only true of a milestone that is actually finished. A green gate over work still in
+ * flight, or over a row a run left in this milestone's inbox, is a milestone cide goes on
+ * planning for (`spinner::gate_blocks_planning`) and does not offer Accept on, so the old
+ * sentence told the reader to look for a button that was not drawn and to expect a silence that
+ * was not coming. Now it says which of the two it is, and when it is the second it names what is
+ * in the way and the one move that clears it.
+ */
+function gateNote(
+  current: Milestone,
+  gateRunning: boolean,
+  gate: CheckResult | undefined,
+  tasks: readonly MilestoneTask[],
+): string {
+  if (readyToAccept(true, gateRunning, gate, tasks)) {
+    return `The gate passes. cide will not wake this project to plan until you accept ${current.id} — or tighten its gate if this is not what you meant.`
+  }
+  const open = openWork(tasks)
+  const owed = undecided(tasks)
+  const waits: string[] = []
+  if (open > 0) waits.push(`its ${open} open task${open === 1 ? '' : 's'} to be done`)
+  if (owed > 0) {
+    waits.push(
+      `${owed} task${owed === 1 ? '' : 's'} in its inbox to be decided — move ${
+        owed === 1 ? 'it' : 'each'
+      } to todo if this milestone needs it, or unlink it from ${current.task ?? 'the goal'} if it does not`,
+    )
+  }
+  const head = `The gate passes, but ${current.id} is not finished, so cide keeps planning rather than waiting on you.`
+  return waits.length === 0 ? `${head} Accept is offered once the gate has finished running.` : `${head} Accept waits for ${waits.join(', and for ')}.`
 }
 
 /** Open a task's card — the same selection the board's rows make — and close this modal. */

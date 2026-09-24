@@ -79,61 +79,15 @@
 /* The panel header, identical in all seven sidebar panels — see `ExtensionsPanel.module.css`
  * for the four declarations that made it this and why each of them changed. */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-3);
-  padding: 0 var(--sp-3) 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  color: var(--text);
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerAction {
-  appearance: none;
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: calc(20px * var(--ui-scale));
-  height: calc(20px * var(--ui-scale));
-  border: none;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: var(--fs-ui-13);
-  line-height: 1;
-  cursor: pointer;
-  /*
-   * **`padding: 0`, and it is not tidying.**
-   *
-   * `appearance: none` does not reset padding in WebKit — the UA default for a `<button>` is
-   * `1px 6px`, and it survives. With the global `box-sizing: border-box` a 20px button therefore
-   * has an **8px** content box, the mark's auto-sized grid track is 14px wide, and a track wider
-   * than its content box overflows towards the inline **end**. So the glyph sat 6px from the left
-   * edge of its own hover background and flush against the right, which is what "the icon's hover
-   * background isn't centred" looks like. `place-items: center` cannot fix it: it centres the item
-   * in its track, and the track is what is displaced.
-   *
-   * Every other icon button in the app already sets this — `ActivityRail`, `TabStrip`, the tool
-   * window — which is why it had never been reported. `check:ui-icons` asserts it now, because a
-   * convention four files keep and one forgets is not a rule.
-   */
-  padding: 0;
-}
-
-.headerAction:hover:not(:disabled) {
-  background: var(--chrome-hi);
-  color: var(--text);
-}
-
-.headerAction:disabled {
-  opacity: 0.4;
-  cursor: default;
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
 /* --- the connection, in the header row ---------------------------------------------------- */
@@ -192,8 +146,7 @@
 
 /* The panel's own name, in the sidebar only. */
 .headerLabel {
-  flex: none;
-  font-weight: 500;
+  composes: panelTitle from '../../kit/components/Surface.module.css';
 }
 
 /* --- body --------------------------------------------------------------------------------- */
@@ -247,7 +200,8 @@
 .row.rowSelected,
 .row.rowSelected:hover,
 .row.rowSelected:focus-within {
-  background: var(--accent-dim);
+  /* The kit's "selected". */
+  background: var(--sel);
 }
 
 /*
@@ -276,19 +230,7 @@
 }
 
 .retry {
-  appearance: none;
-  padding: var(--sp-2) var(--sp-4);
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--chrome);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-}
-
-.retry:hover:not(:disabled) {
-  background: var(--chrome-hi);
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
 /*
@@ -403,7 +345,7 @@
 
 .row:hover,
 .row:focus-within {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 /*
@@ -485,35 +427,12 @@
 }
 
 .action {
-  appearance: none;
-  display: grid;
-  place-items: center;
-  width: calc(20px * var(--ui-scale));
-  height: calc(20px * var(--ui-scale));
-  border: none;
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  line-height: 1;
-  cursor: pointer;
-  /* `padding: 0` for the reason spelled out above — WebKit's button padding is not reset
-     by `appearance: none`, and it pushes the mark off its own hover background. */
-  padding: 0;
+  composes: icon sm from '../../kit/components/Button.module.css';
 }
 
-.action:hover:not(:disabled) {
-  background: var(--chrome);
-  color: var(--text);
-}
-
-.action:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
+/* A row's Remove is an icon like its neighbours; the confirm it opens carries the danger. */
 .actionDanger:hover:not(:disabled) {
-  color: var(--red);
+  color: var(--text-hi);
 }
 
 .imageSize {

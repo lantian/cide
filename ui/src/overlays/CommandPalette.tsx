@@ -25,6 +25,8 @@
  * in the pane host" is the truth and takes one line. It is also the only honest alternative
  * to what shipped, which was ~35 rows that ran into silence.
  */
+import { Kbd } from '@/kit/components/Status'
+import { PickerRow, PickerStatus } from '@/kit/components/Overlay'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ModalShell, Hint } from './ModalShell'
@@ -154,24 +156,23 @@ export function CommandPalette({
       }
     >
       {rows.length === 0 ? (
-        <div className={styles.status}>No matching commands</div>
+        <PickerStatus>No matching commands</PickerStatus>
       ) : (
         <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
           {virtualizer.getVirtualItems().map((item) => {
             const row = rows[item.index]
             if (!row) return null
             const chip = keymap.chipFor(row.id)
-            const classes = [styles.row]
-            if (item.index === selected) classes.push(styles.rowSelected)
-            if (row.unavailable !== null) classes.push(styles.rowDisabled)
             return (
-              <div
+              <PickerRow
                 key={row.id}
-                className={classes.join(' ')}
+                virtual
+                selected={item.index === selected}
+                disabled={row.unavailable !== null}
                 data-audit={row.unavailable === null ? 'paletteRow' : 'paletteRowDisabled'}
-                // Read out as one sentence — "Restart Claude session, unavailable: …" — so a
-                // screen reader gets the reason the greying carries visually.
-                aria-disabled={row.unavailable !== null}
+                // `disabled` is `aria-disabled`, read out as one sentence — "Restart Claude
+                // session, unavailable: …" — so a screen reader gets the reason the greying
+                // carries visually.
                 title={row.unavailable ?? undefined}
                 style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
                 onMouseMove={() => setSelected(item.index)}
@@ -188,12 +189,12 @@ export function CommandPalette({
                         an empty bordered rectangle reads as a shortcut that failed to
                         render. Nothing may be bound to an unavailable command at all, so
                         that branch has no chip by construction. */}
-                    {chip !== null && <span className={styles.chip}>{chip}</span>}
+                    {chip !== null && <Kbd keys={[chip]} />}
                   </>
                 ) : (
                   <span className={styles.reason}>{row.unavailable}</span>
                 )}
-              </div>
+              </PickerRow>
             )
           })}
         </div>

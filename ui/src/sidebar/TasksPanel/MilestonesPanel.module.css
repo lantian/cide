@@ -5,10 +5,11 @@
   gap: var(--sp-1);
 }
 
+/* The kit's segment look: quiet at rest, on raised onto `--panel` with `--shadow-1`. */
 .tab {
-  padding: 1px 7px;
+  padding: var(--sp-1) var(--sp-4);
   border: 1px solid transparent;
-  border-radius: var(--r-3);
+  border-radius: var(--r-2);
   background: transparent;
   color: var(--dim);
   font-family: inherit;
@@ -23,6 +24,8 @@
 
 .tabOn {
   border-color: var(--border);
+  background: var(--panel);
+  box-shadow: var(--shadow-1);
   color: var(--text-hi);
 }
 
@@ -68,7 +71,7 @@
 .row {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sp-1);
   width: 100%;
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--border);
@@ -81,7 +84,7 @@
 }
 
 .row:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .row:focus-visible {
@@ -239,9 +242,17 @@
   flex: 1;
 }
 
+/* The armed second click of a remove or a reject: the confirming half of something destructive,
+   so the kit's black danger fill (`Button.module.css`). The hover rule restates the fill because
+   this sits on the panel's secondary `.action`, whose own hover would otherwise repaint it. */
 .danger {
-  border-color: var(--red);
-  color: var(--red);
+  composes: danger from '../../kit/components/Button.module.css';
+}
+
+.danger:hover:not(:disabled) {
+  border-color: var(--danger-edge);
+  background: var(--grad-danger);
+  color: var(--on-danger);
 }
 
 .mono {
@@ -265,7 +276,7 @@
 }
 
 .result:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .result[data-verdict='running'] {
@@ -341,7 +352,7 @@
 }
 
 .taskRow:hover {
-  background: var(--chrome-hi);
+  background: var(--panel-2);
 }
 
 .taskRow:focus-visible {
@@ -394,7 +405,7 @@
 .busy {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   margin-left: var(--sp-2);
   padding: 0 var(--sp-1);
   border: none;
@@ -415,7 +426,7 @@
 .rowGate[data-verdict='running'] {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-2);
   color: var(--yellow);
 }
 
@@ -477,39 +488,26 @@
 .modalTabs {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-4);
   flex-wrap: wrap;
   padding-bottom: var(--sp-2);
   border-bottom: 1px solid var(--border);
 }
 
 .modalTab {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: inherit;
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
-.modalTab:hover {
-  background: var(--chrome-hi);
-}
+
+
+
 
 .modalTab[aria-pressed='true'] {
   color: var(--accent);
   border-color: var(--accent);
 }
 
-.modalTab:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
+
 
 .taskTab {
   display: flex;
@@ -564,12 +562,15 @@
   color: var(--accent);
 }
 
+/* The kit's `Counter`: neutral by default, filled with the neutral gradient under a white
+   label — accent only when it asks for attention, which a tab's count does not. */
 .tabCount {
-  margin-left: 4px;
-  padding: 0 5px;
-  border-radius: var(--r-3);
-  background: var(--accent);
-  color: var(--panel);
+  margin-left: var(--sp-2);
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-full);
+  background: var(--grad-neutral);
+  color: var(--on-fill);
+  font-weight: 600;
   font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
 }

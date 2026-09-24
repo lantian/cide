@@ -31,8 +31,13 @@
  *
  * The post-hoc conflict banner stays too, because it is what catches a hand-edited file.
  */
+import { Button } from '@/kit/components/Button'
+import { SearchField } from '@/kit/components/Field'
+import { Note as KitNote } from '@/kit/components/Feedback'
+import { Dialog } from '@/kit/components/Overlay'
+import { Kbd } from '@/kit/components/Status'
+import { Modal } from '@/overlays/ModalShell'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { createPortal } from 'react-dom'
 import {
   settings as settingsApi,
   type KeymapEdit,
@@ -66,20 +71,6 @@ import {
 import { Note } from './controls'
 import styles from './panels.module.css'
 
-/**
- * Both boxes render into `document.body` rather than where they are written.
- *
- * This section lives inside a pane, and a pane is an `overflow: hidden` box in a grid — the
- * failure `menus/ContextMenu.tsx` documents for the same reason. A `position: fixed` child is
- * not clipped by that today, but it *is* positioned against the nearest ancestor with a
- * `transform`, `filter` or `contain`, and one of those arriving in the pane chrome would move
- * a modal off centre with nothing to explain it. The other half is `visibility: hidden`, which
- * is how `TabContent` hides an inactive tab: rendered in place, switching tabs with the
- * recorder armed would hide the popup while it went on consuming every keystroke in the window.
- */
-function popup(node: React.ReactNode): React.ReactNode {
-  return createPortal(node, document.body)
-}
 
 /** A change the user has asked for that needs answering before it is written. */
 type Pending =
@@ -209,48 +200,48 @@ export function KeymapSection() {
       )}
 
       {report.conflicts.map((conflict) => (
-        <div key={`${conflict.key}${conflict.when ?? ''}`} className={styles.conflict}>
-          <span className={styles.keyChip}>{conflict.key}</span> is bound to{' '}
+        <KitNote key={`${conflict.key}${conflict.when ?? ''}`} tone="warn">
+          <Kbd keys={[conflict.key]} /> is bound to{' '}
           {conflict.commands.length} commands
           {conflict.when !== null && <> when <code>{conflict.when}</code></>}:{' '}
           {conflict.commands.join(', ')}.{' '}
           {/* Resolution order is the contract: later layers win, and within a layer the last
               entry does. Naming the winner is what makes this actionable rather than alarming. */}
           <strong>{conflict.commands[conflict.commands.length - 1]}</strong> wins.
-        </div>
+        </KitNote>
       ))}
 
       {report.problems.map((problem, i) => (
-        <div key={`${problem.key}-${problem.command}-${i}`} className={`${styles.conflict} ${styles.problem}`}>
-          {problem.key !== '' && <span className={styles.keyChip}>{problem.key}</span>}{' '}
+        <KitNote key={`${problem.key}-${problem.command}-${i}`} tone="bad">
+          {problem.key !== '' && <Kbd keys={[problem.key]} />}{' '}
           {problem.command !== '' && <code className={styles.command}>{problem.command}</code>}{' '}
           {problem.message}
-        </div>
+        </KitNote>
       ))}
 
       {/* The failure `KeymapEditResult` carries counts for: an edit that matched nothing looks
           exactly like one that worked, so the screen says which it was. */}
       {note !== null && <div className={styles.clean}>{note}</div>}
-      {error !== null && <div className={`${styles.conflict} ${styles.problem}`}>{error}</div>}
+      {error !== null && <KitNote tone="bad">{error}</KitNote>}
 
       <div className={styles.toolbar}>
-        <input
-          className={styles.filter}
-          type="search"
-          placeholder="Filter by command, group or key"
-          aria-label="Filter keybindings"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-        />
-        <button
-          type="button"
-          className={styles.action}
+        <div className={styles.filter}>
+          <SearchField
+            size="sm"
+            placeholder="Filter by command, group or key"
+            aria-label="Filter keybindings"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+        </div>
+        <Button
+          size="sm"
           data-audit="keymapResetAll"
           disabled={!canResetAll}
           onClick={() => setPending({ kind: 'resetAll', count: overrides })}
         >
           Reset all
-        </button>
+        </Button>
       </div>
 
       <table className={styles.table}>
@@ -339,7 +330,7 @@ function Line({
       </td>
       <td>
         {binding !== null ? (
-          <span className={styles.keyChip}>{chipLabel(binding.key)}</span>
+          <Kbd keys={[chipLabel(binding.key)]} />
         ) : (
           /* The row a resolved-bindings list cannot draw. "Unbound" is what the user did;
              "no shortcut" is what shipped, and telling them apart is the whole point of
@@ -353,14 +344,14 @@ function Line({
       </td>
       <td className={styles.actions}>
         {bindable(row) && (
-          <button type="button" className={styles.action} data-audit="keymapEdit" onClick={onEdit}>
+          <Button size="sm" variant="quiet" data-audit="keymapEdit" onClick={onEdit}>
             {binding === null ? 'Add' : 'Edit'}
-          </button>
+          </Button>
         )}
         {bindable(row) && binding !== null && (
-          <button type="button" className={styles.action} onClick={onUnbind}>
+          <Button size="sm" variant="quiet" onClick={onUnbind}>
             Unbind
-          </button>
+          </Button>
         )}
         {/*
           * Restore default is a **deletion** — every user entry aimed at this (command,
@@ -369,9 +360,9 @@ function Line({
           * which is the same mistake as saving the whole resolved table.
           */}
         {customised(row) && (
-          <button type="button" className={styles.action} onClick={onReset}>
+          <Button size="sm" variant="quiet" onClick={onReset}>
             Restore default
-          </button>
+          </Button>
         )}
       </td>
     </tr>
@@ -404,48 +395,46 @@ function RecorderPopup({
   const key = recording.strokes.join(' ')
   const bare = key === '' ? null : bareKeyWarning(key)
 
-  return popup(
-    <div className={styles.scrim} data-audit="keymapRecorderScrim" onMouseDown={onCancel}>
-      <div
-        className={styles.popup}
+  return (
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={`Shortcut for ${target.title}`}
+        width="narrow"
         data-audit="keymapRecorder"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`Shortcut for ${target.title}`}
-        onMouseDown={(ev) => ev.stopPropagation()}
+        footNote={
+          <Button
+            size="sm"
+            variant="quiet"
+            icon="plus"
+            disabled={!canExtend(recording)}
+            onClick={onExtend}
+          >
+            second stroke
+          </Button>
+        }
+        actions={
+          <>
+            <Button onClick={onCancel}>Cancel</Button>
+            <Button
+              variant="primary"
+              data-audit="keymapRecorderSave"
+              disabled={!canSave(recording)}
+              onClick={onSave}
+            >
+              Save
+            </Button>
+          </>
+        }
       >
-        <div className={styles.head}>Shortcut for {target.title}</div>
         <div className={styles.capture} aria-live="polite">
-          {chip === '' ? <span className={styles.rowNote}>Press a shortcut…</span> : chip}
+          {chip === '' ? <span className={styles.rowNote}>Press a shortcut…</span> : <Kbd keys={[chip]} />}
         </div>
         <div className={styles.hint}>
           {target.current !== null && <>Currently {chipLabel(target.current)}. </>}
           {bare ?? 'Enter saves, Escape cancels — so those two, unmodified, cannot be recorded here.'}
         </div>
-        <div className={styles.buttons}>
-          <button
-            type="button"
-            className={styles.action}
-            disabled={!canExtend(recording)}
-            onClick={onExtend}
-          >
-            + second stroke
-          </button>
-          <button type="button" className={styles.action} onClick={onCancel}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className={styles.primary}
-            data-audit="keymapRecorderSave"
-            disabled={!canSave(recording)}
-            onClick={onSave}
-          >
-            Save
-          </button>
-        </div>
-      </div>
-    </div>,
+      </Dialog>
+    </Modal>
   )
 }
 
@@ -471,25 +460,54 @@ function ConfirmPopup({
       ? [{ kind: 'rebind', command: pending.command, when: pending.when, key: pending.key }]
       : [{ kind: 'resetAll' }]
 
-  return popup(
-    <div className={styles.scrim} data-audit="keymapConfirmScrim" onMouseDown={onCancel}>
-      <div
-        className={styles.popup}
+  const title = pending.kind === 'clash' ? 'That shortcut is taken' : 'Reset all shortcuts'
+  return (
+    <Modal onDismiss={onCancel}>
+      <Dialog
+        title={title}
+        width="narrow"
         data-audit="keymapConfirm"
-        role="dialog"
-        aria-modal="true"
-        aria-label={pending.kind === 'clash' ? 'That shortcut is taken' : 'Reset all shortcuts'}
-        onMouseDown={(ev) => ev.stopPropagation()}
         onKeyDown={(ev) => {
           if (ev.key !== 'Escape') return
           ev.stopPropagation()
           onCancel()
         }}
+        actions={
+          <>
+            <Button onClick={onCancel}>Cancel</Button>
+            {pending.kind === 'clash' && (
+              <Button
+                data-audit="keymapDisplace"
+                onClick={() =>
+                  onApply([
+                    // The removals first, so the file reads as "take it away, then put this
+                    // here" — and each carries the losing binding's own `when`, copied from the
+                    // resolved row rather than reconstructed.
+                    ...pending.clashes.map(
+                      (clash): KeymapEdit => ({
+                        kind: 'unbind',
+                        command: clash.command,
+                        when: clash.when,
+                      }),
+                    ),
+                    ...bind,
+                  ])
+                }
+              >
+                Bind and unbind the other
+              </Button>
+            )}
+            <Button
+              variant={pending.kind === 'resetAll' ? 'danger' : 'primary'}
+              data-audit="keymapConfirmApply"
+              onClick={() => onApply(bind)}
+            >
+              {pending.kind === 'clash' ? 'Bind anyway' : 'Reset all'}
+            </Button>
+          </>
+        }
       >
-        <div className={styles.head}>
-          {pending.kind === 'clash' ? 'That shortcut is taken' : 'Reset all shortcuts'}
-        </div>
-        <div className={styles.hint}>
+      <div className={styles.hint}>
           {pending.kind === 'resetAll' ? (
             <>
               Deletes all {pending.count} {pending.count === 1 ? 'entry' : 'entries'} from your
@@ -497,7 +515,7 @@ function ConfirmPopup({
             </>
           ) : (
             <>
-              <span className={styles.keyChip}>{chipLabel(pending.key)}</span>{' '}
+              <Kbd keys={[chipLabel(pending.key)]} />{' '}
               {pending.clashes.map((clash, i) => (
                 <span key={`${clash.command}-${i}`}>
                   {i > 0 && ' and '}
@@ -511,45 +529,8 @@ function ConfirmPopup({
             </>
           )}
         </div>
-        <div className={styles.buttons}>
-          <button type="button" className={styles.action} onClick={onCancel}>
-            Cancel
-          </button>
-          {pending.kind === 'clash' && (
-            <button
-              type="button"
-              className={styles.action}
-              data-audit="keymapDisplace"
-              onClick={() =>
-                onApply([
-                  // The removals first, so the file reads as "take it away, then put this
-                  // here" — and each carries the losing binding's own `when`, copied from the
-                  // resolved row rather than reconstructed.
-                  ...pending.clashes.map(
-                    (clash): KeymapEdit => ({
-                      kind: 'unbind',
-                      command: clash.command,
-                      when: clash.when,
-                    }),
-                  ),
-                  ...bind,
-                ])
-              }
-            >
-              Bind and unbind the other
-            </button>
-          )}
-          <button
-            type="button"
-            className={styles.primary}
-            data-audit="keymapConfirmApply"
-            onClick={() => onApply(bind)}
-          >
-            {pending.kind === 'clash' ? 'Bind anyway' : 'Reset all'}
-          </button>
-        </div>
-      </div>
-    </div>,
+      </Dialog>
+    </Modal>
   )
 }
 

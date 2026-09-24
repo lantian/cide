@@ -1,0 +1,282 @@
+/*
+ * Small marks that say what state something is in: the badge, the tag, the counter, the dot,
+ * the key hint and the avatar.
+ *
+ * Tones are the palette's hues and nothing else, and each means one thing everywhere:
+ *   - neutral — no state worth a colour (draft, closed, skipped, unknown)
+ *   - blue    — in progress, or informational (running, reviewing)
+ *   - green   — finished and fine (passed, open MR)
+ *   - yellow  — waiting on someone (pending, manual, needs review); an amber fill, dark ink
+ *   - red     — failed or blocked
+ *   - purple  — merged (git's convention, which GitLab and GitHub both follow)
+ *   - cyan    — a kind that is not a state (suggestion, docs)
+ *   - accent  — yours, or asking for you (an awaiting-input counter, an unsaved dot). **Never a
+ *               status**: the accent is the brand red, and "running" drawn in it read as
+ *               failed — the user's note on the second pass. Statuses take the hues above.
+ *
+ * **Filled, like the primary button.** The first pass took the GitLab pipeline badge as it was —
+ * the hue as text on a 12% wash — and on the page it read as washed out next to the gradient
+ * button; the user asked for the badges to be as expressive as the primary. So a badge, a
+ * counter and a dot are now the tone's gradient (`--grad-<tone>` in `tokens.css`) under a white
+ * label, with the button's 1px lit top edge (`--fill-sheen`). White clears 4.5:1 on both stops
+ * of every tone gradient, in both themes. The wash survives as `soft`, for a badge repeated down
+ * a dense list where thirty filled pills would be the loudest thing on screen.
+ *
+ * Each tone sets `--tone` (the flat hue, for text, washes and halos) and `--tone-fill` (the
+ * gradient) once, and every mark reads them, so adding a tone is one rule here. Scoped with
+ * `:is(...)` to this file's own classes: a bare `[data-tone]` rule in a module is global, and
+ * would repaint anything on the page that happened to carry one.
+ */
+
+:is(.badge, .tag, .counter, .dot, .avatar) {
+  --tone: var(--dim);
+  --tone-fill: var(--grad-neutral);
+  --tone-ink: var(--on-fill);
+}
+
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='accent'] {
+  --tone: var(--accent);
+  --tone-fill: var(--grad-accent-ink);
+}
+
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='green'] {
+  --tone: var(--green);
+  --tone-fill: var(--grad-green);
+}
+
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='yellow'] {
+  --tone: var(--yellow);
+  --tone-fill: var(--grad-yellow);
+  --tone-ink: var(--on-yellow);
+}
+
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='red'] {
+  --tone: var(--red);
+  --tone-fill: var(--grad-red);
+}
+
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='purple'] {
+  --tone: var(--purple);
+  --tone-fill: var(--grad-purple);
+}
+
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='blue'] {
+  --tone: var(--blue);
+  --tone-fill: var(--grad-blue);
+}
+
+/* A kind rather than a state: a suggestion, a docs label. */
+:is(.badge, .tag, .counter, .dot, .avatar)[data-tone='cyan'] {
+  --tone: var(--cyan);
+  --tone-fill: var(--grad-cyan);
+}
+
+/* --- badge ---------------------------------------------------------------------------------- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: calc(18px * var(--ui-scale));
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-full);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  color: var(--tone-ink);
+  background: var(--tone-fill);
+  box-shadow: var(--fill-sheen);
+}
+
+/* The leading dot: white on the fill, so the state still has a mark besides its colour. */
+.dotted::before {
+  content: '';
+  flex: none;
+  width: calc(6px * var(--ui-scale));
+  height: calc(6px * var(--ui-scale));
+  border-radius: var(--r-full);
+  background: currentColor;
+  opacity: 0.9;
+}
+
+/* A square-cornered badge: the MR state pill, a severity, a type. States are pills; kinds are
+   squared, so a row carrying both can tell them apart at a glance. */
+.squared {
+  border-radius: var(--r-1);
+}
+
+/* The quiet form: the hue as text on a 12% wash of itself, no fill. For a badge repeated down a
+   long list, where the filled form would outshout the list's titles. */
+.soft {
+  color: var(--tone);
+  font-weight: 500;
+  background: color-mix(in srgb, var(--tone) 12%, transparent);
+  box-shadow: none;
+}
+
+/* --- tag ------------------------------------------------------------------------------------ */
+
+/* A label the user attached or can remove: a filter in a search box, a task label. Bordered and
+   unfilled, so it reads as an object the user owns and not a state the system reports. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: calc(20px * var(--ui-scale));
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-1);
+  font-size: var(--fs-ui-11);
+  white-space: nowrap;
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.tag[data-tone]:not([data-tone='neutral']) {
+  border-color: color-mix(in srgb, var(--tone) 30%, transparent);
+  color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 8%, var(--panel));
+}
+
+.tagRemove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: calc(-1 * var(--sp-1));
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  transition: opacity var(--dur-1) var(--ease-out);
+}
+
+.tagRemove:hover {
+  opacity: 1;
+}
+
+.tagRemove:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* --- counter -------------------------------------------------------------------------------- */
+
+/* A number next to a tab or a section title. Filled like a badge; tabular figures, so a count
+   that ticks 9 → 10 does not shove its neighbours. */
+.counter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: calc(18px * var(--ui-scale));
+  height: calc(16px * var(--ui-scale));
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-full);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  color: var(--tone-ink);
+  background: var(--tone-fill);
+  box-shadow: var(--fill-sheen);
+}
+
+/* --- dot ------------------------------------------------------------------------------------ */
+
+/* A state with no words: a tab's unsaved mark, a running agent. Pair it with a `title`. */
+.dot {
+  flex: none;
+  display: inline-block;
+  width: calc(8px * var(--ui-scale));
+  height: calc(8px * var(--ui-scale));
+  border-radius: var(--r-full);
+  background: var(--tone-fill);
+  box-shadow: var(--fill-sheen);
+}
+
+/*
+ * Live: a halo one gap away from the dot rather than a smudge touching it. The first pass drew
+ * a 3px 22% ring flush against the dot, and at 8px it read as a blurred, larger dot of a muddier
+ * colour; a ring separated by a ground-coloured gap reads as a signal around a dot.
+ */
+.pulse {
+  box-shadow:
+    var(--fill-sheen),
+    0 0 0 2px var(--panel),
+    0 0 0 3.5px color-mix(in srgb, var(--tone) 55%, transparent);
+}
+
+/* --- key hint ------------------------------------------------------------------------------- */
+
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: calc(18px * var(--ui-scale));
+  height: calc(18px * var(--ui-scale));
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: var(--r-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1;
+  color: var(--dim);
+  background: var(--panel);
+}
+
+/* --- avatar and person ---------------------------------------------------------------------- */
+
+.avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(20px * var(--ui-scale));
+  height: calc(20px * var(--ui-scale));
+  border-radius: var(--r-full);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  line-height: 1;
+  color: var(--tone-ink);
+  background: var(--tone-fill);
+  box-shadow: var(--fill-sheen);
+  overflow: hidden;
+}
+
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.person {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: var(--fs-ui-12);
+  color: var(--text);
+}
+
+/* --- inline code ---------------------------------------------------------------------------- */
+
+/* A branch, a path, a sha inside a sentence. The GitLab panel's `.branches code`. */
+.code {
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--text);
+  background: var(--panel-2);
+  -webkit-user-select: text;
+  user-select: text;
+}

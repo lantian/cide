@@ -1,68 +1,60 @@
 /* Shared styling for the two sections that render data rather than a form: the keymap
    listing and the graphics ladder. */
 
-.keyChip {
-  display: inline-block;
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--panel-2);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  white-space: nowrap;
-}
-
 /* The filter and the one destructive button, on one line: the button is hard right so it is
    nowhere near the pointer's path to the rows. */
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
+  gap: var(--sp-4);
+  margin: var(--sp-5) 0;
 }
 
+/* The kit `SearchField`'s width in the toolbar. */
 .filter {
   flex: 1;
   min-width: 0;
-  max-width: 320px;
-  height: calc(26px * var(--ui-scale));
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
+  max-width: calc(320px * var(--ui-scale));
 }
 
-.filter:focus {
-  outline: 0;
-  border-color: var(--accent);
-}
-
+/* The kit `Table`'s drawing: a bordered box, a `--panel-2` header strip, soft row rules and the
+   row hover. Kept as a class on the app's own `<table>` because its rows are components with
+   their own buttons, which the kit's column-renderer `Table` would have to re-plumb. */
 .table {
   width: 100%;
-  border-collapse: collapse;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
   font-size: var(--fs-ui-12);
+}
+
+.table th,
+.table td {
+  padding: var(--sp-3) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
 }
 
 .table th {
-  text-align: left;
-  font-weight: 400;
-  font-size: var(--fs-ui-12);
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--faint);
-  padding: 0 10px 6px 0;
-  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  color: var(--dim);
+  background: var(--panel-2);
 }
 
 .table td {
-  padding: 6px 10px 6px 0;
-  border-bottom: 1px solid var(--border-soft);
   color: var(--text);
   vertical-align: top;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.table tbody tr:hover td {
+  background: var(--panel-2);
 }
 
 .command {
@@ -81,33 +73,17 @@
   color: var(--accent);
 }
 
-.conflict {
-  border: 1px solid var(--border);
-  border-left: 2px solid var(--red);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  padding: 9px 12px;
-  margin-bottom: 8px;
-  font-size: var(--fs-ui-12);
-  line-height: 1.5;
-  color: var(--dim);
-}
-
-.problem {
-  border-left-color: var(--yellow);
-}
-
 .clean {
   font-size: var(--fs-ui-12);
   color: var(--green);
-  margin-bottom: 18px;
+  margin-bottom: var(--sp-5);
 }
 
 .path {
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--faint);
-  margin-top: 16px;
+  margin-top: var(--sp-6);
   word-break: break-all;
 }
 
@@ -118,7 +94,7 @@
   font-size: var(--fs-ui-11);
   line-height: 1.45;
   color: var(--faint);
-  margin-top: 6px;
+  margin-top: var(--sp-3);
 }
 
 /* --- the keymap editor --- */
@@ -149,90 +125,9 @@
   white-space: nowrap;
 }
 
-.action {
-  height: calc(22px * var(--ui-scale));
-  padding: 0 8px;
-  margin-left: 4px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel-2);
-  color: var(--text);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-11);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.action:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.action:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.primary {
-  composes: primary from '../styles/buttons.module.css';
-  height: calc(22px * var(--ui-scale));
-  padding: 0 10px;
-  margin-left: 4px;
-  border: 1px solid transparent;
-  border-radius: var(--r-2);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-11);
-  cursor: pointer;
-}
-
-/*
- * The recorder and the confirm box: `overlays/GoToLine.module.css`'s geometry, which is
- * `chrome/Switcher.module.css`'s with a scrim added back. Deliberately not the 620px
- * `OverlayCard`, which is a search surface — a card that wide holding one chord reads as a
- * dialog that failed to load.
- */
-.scrim {
-  position: fixed;
-  inset: 0;
-  /* The overlay layer: above the panes and the status bar, below context menus at 80. */
-  z-index: 60;
-  background: var(--scrim, rgba(0, 0, 0, 0.42));
-}
-
-.popup {
-  position: fixed;
-  /* Centred with a transform rather than by flexing the scrim, so the box does not move when
-     the hint under it grows a sentence. */
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-
-  width: 400px;
-  max-width: calc(100vw - 48px);
-  display: flex;
-  flex-direction: column;
-
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--r-4);
-  box-shadow: var(--shadow-2);
-  overflow: hidden;
-}
-
-/* The same uppercase label the switcher and Go to line use, so the small popups read as
-   siblings. */
-.head {
-  flex: none;
-  padding: 9px 14px 7px;
-  border-bottom: 1px solid var(--border-soft);
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--faint);
+/* A table cell, so spacing between the kit buttons rather than a flex gap. */
+.actions > * + * {
+  margin-left: var(--sp-1);
 }
 
 /*
@@ -245,24 +140,19 @@
   align-items: center;
   justify-content: center;
   min-height: calc(52px * var(--ui-scale));
-  padding: 10px 14px;
+  margin-bottom: var(--sp-4);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel-2);
   font-family: var(--font-mono);
-  font-size: var(--fs-ui-20);
+  font-size: var(--fs-ui-16);
   color: var(--text);
 }
 
 .hint {
-  padding: 0 14px 10px;
-  font-family: var(--font-ui);
   font-size: var(--fs-ui-11);
   line-height: 1.4;
   color: var(--faint);
-}
-
-.buttons {
-  display: flex;
-  justify-content: flex-end;
-  padding: 0 10px 12px;
 }
 
 /* --- the graphics ladder --- */
@@ -270,8 +160,8 @@
 .rung {
   display: flex;
   align-items: flex-start;
-  gap: 16px;
-  padding: 11px 0;
+  gap: var(--sp-6);
+  padding: var(--sp-5) 0;
   border-bottom: 1px solid var(--border-soft);
 }
 
@@ -289,24 +179,19 @@
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--faint);
-  margin-top: 2px;
+  margin-top: var(--sp-1);
 }
 
 .rungCost {
   font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
-  margin-top: 4px;
+  margin-top: var(--sp-2);
 }
 
 .restart {
-  display: inline-block;
-  margin-top: 5px;
-  padding: 1px 6px;
-  border-radius: var(--r-2);
-  background: var(--sel);
-  color: var(--text);
-  font-size: var(--fs-ui-11);
+  display: inline-flex;
+  margin-top: var(--sp-2);
 }
 
 /*

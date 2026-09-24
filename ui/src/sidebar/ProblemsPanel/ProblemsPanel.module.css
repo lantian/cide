@@ -44,27 +44,15 @@
    * window, and a 4px step down the sidebar seam is what happens when they drift.
    */
 .header {
-  height: var(--h-panelheader);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  letter-spacing: 0;
-  text-transform: none;
-  color: var(--text);
+  /* The kit's `PanelHeader` (`kit/components/Surface.module.css`): every sidebar panel tops
+     with the same strip, title, count and tools, at `--h-panelheader`. */
+  composes: panelHeader from '../../kit/components/Surface.module.css';
   -webkit-user-select: none;
   user-select: none;
 }
 
 .headerTitle {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  composes: panelTitle from '../../kit/components/Surface.module.css';
 }
 
 /* Mono and tabular, matching the explorer's row counter — including when it holds the em
@@ -73,9 +61,8 @@
   flex: none;
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
-  letter-spacing: 0;
-  color: var(--faint);
   font-variant-numeric: tabular-nums;
+  color: var(--faint);
 }
 
 .body {
@@ -83,7 +70,7 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 12px 12px 16px;
+  padding: var(--sp-5) var(--sp-5) var(--sp-6);
   /* Prose, and the explainer is the point of the surface in v1 — it has to be selectable
      and quotable, unlike the chrome around it which sets `user-select: none` globally. */
   -webkit-user-select: text;
@@ -114,7 +101,7 @@
 }
 
 .detail {
-  margin: 4px 0 0;
+  margin: var(--sp-2) 0 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--faint);
@@ -122,12 +109,12 @@
 
 .note {
   margin-top: 14px;
-  padding-top: 12px;
+  padding-top: var(--sp-5);
   border-top: 1px solid var(--border-soft);
 }
 
 .noteHead {
-  margin: 12px 0 0;
+  margin: var(--sp-5) 0 0;
   font-size: var(--fs-ui-12);
   letter-spacing: 0;
   text-transform: none;
@@ -139,10 +126,10 @@
 }
 
 .list {
-  margin: 4px 0 0;
+  margin: var(--sp-2) 0 0;
   /* The marker sits in the padding; 16px keeps the text flush with the paragraphs above so
      the block reads as one column rather than two indents. */
-  padding-left: 16px;
+  padding-left: var(--sp-6);
   font-size: var(--fs-ui-12);
   line-height: 1.55;
   color: var(--faint);
@@ -180,7 +167,7 @@
 .groupHead {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-4);
   font-size: var(--fs-ui-11);
   color: var(--dim);
 }
@@ -207,9 +194,9 @@
 .row {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   width: 100%;
-  padding: 2px 4px;
+  padding: var(--sp-1) var(--sp-2);
   border: 0;
   border-radius: var(--r-2);
   background: transparent;
@@ -225,14 +212,9 @@
   cursor: pointer;
 }
 
-/* The same hover the other two sidebars now use, so a row under the pointer means one thing
-   across the three panels the rail swaps between. `--chrome-hi` is the fallback for an engine
-   without `color-mix()`; the reason it is not the first choice any more is in
-   `sidebar/FileTree.module.css` — on the white panel it is a heavier wash than the selected
-   band it is supposed to sit under. */
+/* The kit's row hover, `--panel-2` — see `FileTree.module.css`. */
 .rowButton:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
+  background: var(--panel-2);
 }
 
 .rowButton:focus-visible {
@@ -345,8 +327,8 @@
 .footerHead {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-3);
 }
 
 .footerTitle {
@@ -364,37 +346,16 @@
  * alone is not enough.
  */
 .action {
-  flex: none;
-  padding: 2px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: transparent;
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
+  composes: button sm secondary from '../../kit/components/Button.module.css';
 }
 
-.action:hover {
-  background: var(--chrome-hi);
-  background: color-mix(in srgb, var(--sel) 55%, transparent);
-}
 
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
 
-.action:disabled {
-  cursor: default;
-  color: var(--faint);
-  border-color: var(--border-soft);
-}
 
 .source {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--sp-3);
   padding: 3px 0;
 }
 
@@ -429,7 +390,7 @@
   flex: none;
   width: 8px;
   height: 8px;
-  margin: 0 2px;
+  margin: 0 var(--sp-1);
   border-radius: 50%;
   background: currentColor;
   color: var(--faint);

@@ -1,34 +1,14 @@
 /*
  * IDEA's *Push Commits*. (M31)
  *
- * Inside `OverlayCard`, which owns the scrim and the 620px card, so this stylesheet is only the
- * contents: a heading, a scrolling two-level tree, and a footer.
- *
- * `ConflictsDialog.module.css` is the sibling this was cut from and the two are deliberately
- * alike: they are the app's two git modals that list rows, and a user who has read one should
- * not have to learn the other's shape.
+ * The frame, the footer, the checkbox and the buttons are the UI kit's (`Modal` + `Dialog`,
+ * `Checkbox`, `Button`, `IconButton` for the twisty); this stylesheet is only the two-level
+ * tree the kit has no part for: a repository row, and its outgoing commits under it. Rows
+ * share the kit's 28px side inset so they line up with the dialog's own text.
  */
-.head {
-  padding: 14px 16px 10px;
-  border-bottom: 1px solid var(--border);
-}
-
-.title {
-  margin: 0;
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-.body {
-  margin: 6px 0 0;
-  font-size: var(--fs-ui-12);
-  color: var(--dim);
-  line-height: 1.45;
-}
-
 /* Capped so a branch with eighty unpushed commits scrolls rather than growing a card taller
-   than the window. `OverlayCard` has no scroll of its own. */
+   than the window. The dialog body would scroll too; this keeps the footer
+   and the summary in view. */
 .list {
   list-style: none;
   margin: 0;
@@ -48,40 +28,16 @@
 .repoRow {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 16px;
+  gap: var(--sp-4);
+  padding: var(--sp-2) calc(28px * var(--ui-scale)) var(--sp-2) var(--sp-5);
   font-size: var(--fs-ui-12);
 }
 
-/* The disclosure arrow. A button and not a bare span, so it is reachable by keyboard in a
-   dialog whose whole content is below it. */
-.twisty {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: calc(16px * var(--ui-scale));
-  height: calc(16px * var(--ui-scale));
-  padding: 0;
-  border: none;
-  background: none;
-  color: var(--dim);
-  cursor: pointer;
-}
-
-.twisty:disabled {
-  color: var(--faint);
-  cursor: default;
-}
-
-.twisty:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 1px;
-}
-
+/* Native, like the kit's `Checkbox` — which needs a visible label this row does not have. */
 .tick {
   flex: none;
   margin: 0;
+  accent-color: var(--accent);
 }
 
 .repoName {
@@ -113,7 +69,7 @@
 /* The blocked sentence and the divergence warning share a row shape: indented under the repo,
    full width, wrapping. They never appear together — a blocked row has nothing to diverge. */
 .note {
-  padding: 0 16px 7px calc(40px * var(--ui-scale));
+  padding: 0 calc(28px * var(--ui-scale)) var(--sp-3) calc(64px * var(--ui-scale));
   font-size: var(--fs-ui-11);
   color: var(--dim);
   line-height: 1.45;
@@ -126,21 +82,22 @@
 .commits {
   list-style: none;
   margin: 0;
-  padding: 0 0 6px;
+  padding: 0 0 var(--sp-3);
 }
 
 .commit {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  padding: 2px 16px 2px calc(40px * var(--ui-scale));
+  gap: var(--sp-4);
+  padding: var(--sp-1) calc(28px * var(--ui-scale)) var(--sp-1) calc(64px * var(--ui-scale));
   font-size: var(--fs-ui-11);
 }
 
 .oid {
   flex: none;
   font-family: var(--font-mono);
-  color: var(--accent-dim);
+  /* Not `--accent-dim`: with the red accent that is a pale pink, unreadable on white. */
+  color: var(--dim);
 }
 
 .summary {
@@ -162,90 +119,7 @@
 }
 
 .more {
-  padding: 2px 16px 2px calc(40px * var(--ui-scale));
+  padding: var(--sp-1) calc(28px * var(--ui-scale)) var(--sp-1) calc(64px * var(--ui-scale));
   font-size: var(--fs-ui-11);
   color: var(--faint);
-}
-
-.foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 16px 14px;
-  border-top: 1px solid var(--border);
-}
-
-/*
- * Pushed hard left, away from the two answers — `PasteConfirm`'s rule, restated in
- * `ConfirmDestructive`'s header: a checkbox next to the destructive button is one that gets
- * toggled by a click that was 4px off, and this one decides whether somebody else's commits
- * survive.
- */
-.force {
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--fs-ui-12);
-  color: var(--text);
-  cursor: pointer;
-}
-
-.forceOff {
-  color: var(--faint);
-  cursor: default;
-}
-
-.action {
-  flex: none;
-  height: calc(22px * var(--ui-scale));
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-2);
-  background: var(--panel);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--fs-ui-12);
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.action:hover:not(:disabled) {
-  border-color: var(--accent-dim);
-  color: var(--text-hi);
-}
-
-.action:focus-visible {
-  outline: var(--focus-ring);
-  outline-offset: 2px;
-}
-
-.action:disabled {
-  color: var(--faint);
-  border-color: var(--border-soft);
-  cursor: default;
-}
-
-/*
- * The accent is on **Cancel**, and the focus goes with it. `ConfirmDestructive`'s rule 3: the
- * Enter already in flight when the dialog appeared must back out, not send.
- */
-.primary {
-  composes: primary from '../styles/buttons.module.css';
-}
-
-/*
- * `--red` on the Push button only while Force is ticked. It means "this destroys work" in
- * exactly one place in this app, and an ordinary push destroys nothing.
- */
-.danger {
-  color: var(--red);
-}
-
-.danger:hover:not(:disabled) {
-  border-color: var(--red);
-  color: var(--red);
 }

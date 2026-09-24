@@ -28,7 +28,10 @@
  * viewer that shows nothing because a tokenizer would not load is worse than an uncoloured one.
  */
 import { useEffect, useRef, useState } from 'react'
-import { OverlayCard } from '@/overlays/ModalShell'
+import { Modal } from '@/overlays/ModalShell'
+import { Button } from '@/kit/components/Button'
+import { Dialog } from '@/kit/components/Overlay'
+import { Badge } from '@/kit/components/Status'
 import { copyText } from '@/sidebar/copyText'
 import { notify } from './notices'
 import { useLogDetail } from './logDetailStore'
@@ -117,54 +120,44 @@ export function LogDetailCard() {
           : 'Log line'
 
   return (
-    <OverlayCard label={heading} onDismiss={dismiss}>
-      <div
-        className={styles.dialog}
+    <Modal onDismiss={dismiss}>
+      <Dialog
+        title={heading}
+        lead={
+          view?.kind === 'tool' && view.title !== '' ? (
+            <span className={styles.subtitle} title={view.title}>
+              {view.title}
+            </span>
+          ) : undefined
+        }
+        width="wide"
+        onClose={dismiss}
         onKeyDown={(ev) => {
           if (ev.key === 'Escape') {
             ev.stopPropagation()
             dismiss()
           }
         }}
-      >
-        <div className={styles.head}>
-          <div className={styles.heading}>
-            <h2 className={styles.title}>{heading}</h2>
-            {view?.kind === 'tool' && view.title !== '' && (
-              <span className={styles.subtitle} title={view.title}>
-                {view.title}
-              </span>
-            )}
-          </div>
-          <div className={styles.actions}>
+        below={pending.detail?.run != null ? <RunFooter run={pending.detail.run} /> : undefined}
+        actions={
+          <>
             {view?.kind === 'tool' && view.output !== '' && (
-              <button
-                type="button"
-                className={styles.button}
-                onClick={() => copy(view.output, 'Output')}
-              >
-                Copy output
-              </button>
+              <Button onClick={() => copy(view.output, 'Output')}>Copy output</Button>
             )}
-            <button
-              type="button"
-              className={styles.button}
+            <Button
               disabled={pending.detail === null}
               onClick={() => {
-                // The *raw* line, not the pretty one: what goes in a ticket or through `grep`
-                // is the bytes the program emitted, and reformatting somebody's evidence on
-                // the way to their clipboard is not this card's business.
                 if (raw !== null) copy(raw, 'Log line')
               }}
             >
               Copy JSON
-            </button>
-            <button ref={closeRef} type="button" className={styles.button} onClick={dismiss}>
+            </Button>
+            <Button ref={closeRef} variant="primary" onClick={dismiss}>
               Close
-            </button>
-          </div>
-        </div>
-        <div className={styles.body}>
+            </Button>
+          </>
+        }
+      >
           {pending.gone ? (
             <p className={styles.note}>
               This line is no longer kept. cide holds the last couple of thousand log lines per
@@ -199,28 +192,11 @@ export function LogDetailCard() {
                   ))}
             </pre>
           )}
-        </div>
-        {pending.detail?.run != null && <RunFooter run={pending.detail.run} />}
-      </div>
-    </OverlayCard>
+      </Dialog>
+    </Modal>
   )
 }
 
-/**
- * Who ran this line, on what, and how much of the model's context the conversation is taking.
- * (M80)
- *
- * The three facts a run's pane does not carry. A row reads `● bash  cargo test  1.2s #7`
- * whatever forked it, and on one machine a role may be an opencode pool that has failed over
- * twice, a codex the project's overrides redirected it to, or the claude its file names — read
- * back days later, in the same colours. `LogRunInfo` is filled from the registry by the same
- * command that fetched the line, so this costs no second round trip and is absent, whole,
- * for every shell pane's log line.
- *
- * Every value renders a **sentence** where it is missing rather than a blank — `TaskDetailPending`'s
- * rule, and the reason is the same: a blank beside a label reads as a dialog that half failed,
- * while "the CLI's own default" is a fact somebody can act on.
- */
 function RunFooter({ run }: { run: LogRunInfo }) {
   // `u64` on the wire is a `bigint` here, exactly as `recordedUnixMs` above is — the conversion
   // is the card's, so `logDetailModel` stays import-free and drivable by `check:json-log`.
@@ -235,7 +211,7 @@ function RunFooter({ run }: { run: LogRunInfo }) {
           cacheWrite: Number(run.usage.cacheWrite),
         }
   return (
-    <footer className={styles.foot} data-audit="logRunFooter">
+    <div className={styles.foot} data-audit="logRunFooter">
       <div className={styles.footRow}>
         <span className={styles.footLabel}>Run by</span>
         <span className={styles.footValue} title={run.model ?? undefined}>
@@ -272,7 +248,7 @@ function RunFooter({ run }: { run: LogRunInfo }) {
           </span>
         )}
       </div>
-    </footer>
+    </div>
   )
 }
 
@@ -301,13 +277,13 @@ function ToolDetail({ view, recordedAt }: { view: ToolView; recordedAt: number |
   return (
     <div className={styles.sections}>
       <div className={styles.meta}>
-        <span className={failed ? styles.badgeBad : styles.badgeOk}>
+        <Badge tone={failed ? 'red' : 'green'} dot>
           {view.status === 'error'
             ? 'failed'
             : view.exit !== null && view.exit !== 0
               ? `exit ${view.exit}`
               : view.status || 'done'}
-        </span>
+        </Badge>
         <When at={view.startedAt ?? recordedAt} own={view.startedAt !== null} />
         {view.duration !== null && <span className={styles.metaItem}>{view.duration}</span>}
       </div>
