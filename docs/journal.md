@@ -14676,3 +14676,89 @@ The user asked for six changes to the MR review surface, all built on the UI kit
   script, `tsc`, clippy and the build. Nobody has seen it in a running cide yet: the fold rows
   on a real MR, the walk's focus ring, the note's three tones, a real reviewer answering a
   Discuss (live, stopped and revived), and opencode's respawn delivery.
+
+
+## Small freezes, found by reading and removed without changing behaviour (M102)
+
+The user reported occasional small UI freezes and asked for them to be found without changing
+any logic. Four read-only reviews (store fan-out, the terminal path, backend main-thread
+blocking, webview rendering) and a spot check of each claim against the code came first. The
+fixes followed in four phases, one commit each.
+
+- **The multi-second ones were on the GTK thread.** In Tauri 2 a command that is not `async`
+  runs on the main thread, and several of them waited on a thread or a lock.
+  - `lsp::respawn` and `sync_servers` dropped `LspHandle`s, and a drop joins a shutdown ladder
+    of up to three seconds, while they still held the handles lock. The synchronous
+    `diagnostics_did_change` needs that lock, so typing during a restart froze every window.
+    Both now take the handles out under the lock and drop them after it, the shape
+    `stop_servers` already had. The restart order is unchanged.
+  - `project_close` ran the IDE server's drain and every language server's ladder inline.
+    - `IdeServers::stop_in_background` runs the drain on a thread and starts the session ladder
+      after it on the same thread, so `run_teardown`'s order still holds.
+    - `DiagnosticsRegistry::close_in_background` drops the project's servers on a thread.
+    - `ensure` joins a pending teardown whose roots overlap, so a quick reopen never runs two
+      rust-analyzers over one workspace.
+    - `close_all` joins every pending teardown on quit.
+    - The GitLab review paths keep the synchronous `close`, because they delete the checkout
+      next.
+  - `diagnostics_get`, `project_running_counts` and `session_resumable` moved to the blocking
+    pool. The diagnostics snapshot now sorts references and clones only the capped thousand.
+    `claude_session_names` stays synchronous, for the reason its own doc gives.
+- **The fan-out.**
+  - **The workspace mirror.** Every `workspace-changed` replaced the whole mirror with fresh
+    objects, and every pane of every tab re-rendered on each revision.
+    - `store/shareEqual.ts` gives structural sharing, and `check:share` pins it.
+    - `applySnapshot` and `hydrate` pass the tree through it.
+    - `App`'s per-pane closure is now a memoised `TabPane`: ids, the pane node and flags in, and
+      callbacks built from the store's stable actions.
+    - An audit found three places that relied on identity churn to mean "a snapshot landed".
+      `SplitTree`'s track re-assert now subscribes to the import-free `store/snapshotRev.ts`,
+      because `check:rows` renders it under node. The sidebar and tool-window splitters re-adopt
+      on `rev`.
+  - **The agents roster.** The coalescer's flush re-sent an identical roster on every marker.
+    That is every role's prompt, parsed by every window. `emit::agents_changed_unless_repeat`
+    now skips a repeat, and the payload size is logged at debug level. It was never measured,
+    and the doc's "a few kilobytes" is gone: selfcraft's role prompts alone are 50 KB.
+  - **App's subscriptions.** `App` reads the task and agent counts, the awaiting flag and the
+    GitLab review list instead of whole stores. The header's git-op indicator and branch
+    selector select the project id instead of `boot`. The diagnostics store no longer sets an
+    unchanged snapshot.
+  - **The git log.** Its rows are a memoised `LogRow`. `LogTab`'s replacing load keeps the
+    objects of unchanged commits (`shareRows`), so the once-a-second soft refresh under agent
+    load renders only the rows that moved.
+- **The hitches.**
+  - **The resize burst.** On a resize settle, `resizeGesture` refitted every terminal of every
+    tab in one frame. Deferred work may now carry an on-screen probe (`PaneSlot` passes
+    `checkVisibility`). A background tab's panes refit afterwards, one per task and
+    visible-first at each step, and a gesture that begins mid-trickle takes them back.
+    `check:resize` pins this.
+  - **Diff highlighting.** `diffHighlight` keeps the last four tokenized sides, so an agent
+    rewriting a file no longer re-tokenizes the unchanged old side on every refetch.
+  - **A doc correction.** `FLUSH_BYTES`' doc claimed every PTY frame takes the custom-protocol
+    path. The idle flush sends sub-1024-byte frames through `webview.eval`, and coalescing
+    bounds the frame *rate*.
+- **Planned and not done, and why.**
+  - Adding small sizes to `ipcBench` would measure nothing relevant, because it times `invoke`
+    replies and not `Channel` frames.
+  - Memoised diff rows were not done: `cell` closes over staging, blame, tokens and
+    `renderAfterLine`, and `check:diff-render` pins its markup.
+  - A dependency list on `SplitTree`'s track effect would break its re-assert contract.
+  - Gating the Agents panel's one-second tick could freeze relative times on finished runs.
+  - A single `iterLines` pass in `scanFolds` gains little against its character scan, and the
+    incremental scan is the real fix.
+  - Deferred as needing a design, a contract change or a display:
+    - `session_attach`/`session_resize` off the main thread
+    - the `sinks` lock split
+    - pausing hidden-tab xterm rendering
+    - a per-visibility PTY flush interval
+    - removing `systemPrompt` from the roster
+- **Not confirmed on a display.** Everything above was checked by `cargo test --workspace`,
+  clippy, every `check:*` script, `tsc` and the build. It has not been seen in a running cide.
+  The things to try:
+  - a language-server restart while typing
+  - closing a project that has rust-analyzer up, and reopening it at once
+  - releasing a splitter with several terminal tabs open
+  - a clamped or cancelled pane-divider drag snapping back
+  - the log tab open during an agent run
+  - a diff open while an agent edits the file
+  - `./run.sh --audit-panes`
