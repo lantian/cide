@@ -67,6 +67,25 @@ pub fn path_of(root: &Path, agent: &str) -> PathBuf {
     root.join(WORKTREES_DIR).join(agent)
 }
 
+/// The project root `checkout` is an agent worktree of — `<root>` for
+/// `<root>/.cide/worktrees/<name>` — or `None` for any other directory. Pure, like [`path_of`],
+/// which it inverts: a pane standing in a run's checkout asks it to find the project whose
+/// `.cide/config.json` says how that checkout's children are isolated.
+#[must_use]
+pub fn root_of_checkout(checkout: &Path) -> Option<PathBuf> {
+    let parent = checkout.parent()?;
+    checkout.file_name()?;
+    parent
+        .ends_with(WORKTREES_DIR)
+        .then(|| {
+            parent
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .flatten()
+}
+
 /// The ref namespace agent branches live in. `cide/` rather than a bare name so `git branch`
 /// groups them, and so a user's own `developer` branch is never the one an agent commits to.
 const BRANCH_PREFIX: &str = "cide";
@@ -451,6 +470,74 @@ pub fn unmerged(root: &Path, agent: &str) -> Result<Option<usize>> {
     Ok(Some(ahead))
 }
 
+/// What [`remove_if_integrated`] did — and, when it kept the checkout, why. (M89)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retired {
+    /// The checkout is gone; `cide/<agent>` is kept, exactly as [`remove`] keeps it.
+    Removed,
+    /// There was no checkout to remove.
+    Absent,
+    /// `cide/<agent>` still holds this many commits the project's `HEAD` lacks.
+    Unmerged { commits: usize },
+    /// The checkout has this many uncommitted or untracked paths, which removing would destroy.
+    Dirty { paths: usize },
+    /// The checkout's `HEAD` is not on `cide/<agent>` — somebody checked something else out in
+    /// there, and "the branch is merged" says nothing about what that is.
+    Elsewhere { branch: String },
+}
+
+/// Remove an agent's worktree **only when nothing in it would be lost**. (M89)
+///
+/// The reason it exists: integrating a task's branch left `.cide/worktrees/<role>-<task>` on
+/// disk for ever. Every merged task was a full checkout nobody would open again, and the Agents
+/// panel's History offered Integrate beside each one because its worktree was still there.
+///
+/// Three facts are checked, and any one of them keeps the checkout:
+///
+/// * **the branch is in** — [`unmerged`] answers `None`, the same content-aware test the task
+///   tracker's `done` gate uses, so a branch whose commits were taken some other way counts;
+/// * **the tree is clean** — no modified, staged or untracked file (ignored files do not
+///   count: they are build output, and `target/` in a Rust checkout is the usual reason this
+///   directory is large at all). Uncommitted work is the one thing the branch does *not* hold,
+///   and [`remove`]'s own doc says it does not survive;
+/// * **`HEAD` is on `cide/<agent>`** — otherwise "merged" is a claim about a branch the checkout
+///   is not on.
+///
+/// Whether a *process* is still standing in the directory is not this crate's question — it has
+/// no registry. The caller asks that first (`cide_app::agents`), because deleting the cwd of a
+/// live, idle `claude` would leave it running with no directory under it.
+pub fn remove_if_integrated(root: &Path, agent: &str) -> Result<Retired> {
+    validate_agent(agent)?;
+    let root = repo_mod::canonical(root);
+    let path = path_of(&root, agent);
+    if !path.is_dir() {
+        return Ok(Retired::Absent);
+    }
+    if let Some(commits) = unmerged(&root, agent)? {
+        return Ok(Retired::Unmerged { commits });
+    }
+    let described = describe(agent, &path)?;
+    if described.branch != branch_name(agent) {
+        return Ok(Retired::Elsewhere {
+            branch: described.branch,
+        });
+    }
+    let repo = repo_mod::open(&path)?;
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .include_unmodified(false);
+    let dirty = repo.statuses(Some(&mut opts)).wrap()?.len();
+    if dirty > 0 {
+        return Ok(Retired::Dirty { paths: dirty });
+    }
+    // Closed before the prune: libgit2 holds files under the worktree open on some platforms.
+    drop(repo);
+    remove(&root, agent)?;
+    Ok(Retired::Removed)
+}
+
 // --- internals ------------------------------------------------------------------------------
 
 /// `cide/<agent>`.
@@ -536,6 +623,18 @@ fn changed(repo: &Repository, from: &Tree<'_>, to: &Tree<'_>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkout_names_its_project_root_and_nothing_else_does() {
+        let root = Path::new("/work/game");
+        assert_eq!(
+            root_of_checkout(&path_of(root, "qa-tester-t-301")).as_deref(),
+            Some(root)
+        );
+        assert_eq!(root_of_checkout(root), None);
+        assert_eq!(root_of_checkout(&root.join(".cide/worktrees")), None);
+        assert_eq!(root_of_checkout(&root.join("src/worktrees/x")), None);
+    }
 
     /// Run `git` in `dir` with the user's own configuration kept out of it.
     ///
@@ -784,6 +883,50 @@ mod tests {
             integrate(&root, "developer"),
             Ok(Integration::Merged { .. })
         ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_merged_clean_worktree_is_retired_and_anything_else_is_kept() {
+        let root = project("retire");
+        let made = ensure(&root, "developer").expect("ensure");
+        commit(&made.path, "agent.txt", "work\n", "agent work");
+
+        assert_eq!(
+            remove_if_integrated(&root, "developer").expect("unmerged"),
+            Retired::Unmerged { commits: 1 },
+            "work the base lacks keeps the checkout"
+        );
+        assert!(matches!(
+            integrate(&root, "developer"),
+            Ok(Integration::Merged { .. })
+        ));
+
+        write(&made.path, "scratch.txt", "not committed\n");
+        assert_eq!(
+            remove_if_integrated(&root, "developer").expect("dirty"),
+            Retired::Dirty { paths: 1 },
+            "an untracked file is work the branch does not hold"
+        );
+        assert!(made.path.is_dir(), "and nothing was deleted");
+        std::fs::remove_file(made.path.join("scratch.txt")).expect("clean up");
+
+        assert_eq!(
+            remove_if_integrated(&root, "developer").expect("retire"),
+            Retired::Removed
+        );
+        assert!(!made.path.exists(), "the checkout is gone");
+        assert!(
+            !git(&root, &["rev-parse", "cide/developer"])
+                .trim()
+                .is_empty(),
+            "and the branch is kept, as `remove` keeps it"
+        );
+        assert_eq!(
+            remove_if_integrated(&root, "developer").expect("twice"),
+            Retired::Absent
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

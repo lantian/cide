@@ -213,6 +213,24 @@ export function PoolStateCard({ onDismiss }: { onDismiss: () => void }) {
                   </ol>
                 </section>
               ))}
+              {report.offPool.length > 0 && (
+                <section className={styles.pool} data-audit="poolStateOffPool">
+                  <h3 className={styles.poolName}>Off any pool ({report.offPool.length})</h3>
+                  <p className={styles.dim}>
+                    These runs' roles are not pointed at a pool, so no pool above applies to them: each runs on its
+                    role's own model or, with none, opencode's default model. Point a role or a whole project at a
+                    pool under Settings → Agents.
+                  </p>
+                  <ul className={styles.list}>
+                    {report.offPool.map((run) => (
+                      <li key={run.run} className={styles.line}>
+                        <span className={styles.who}>{run.agentLabel}</span>
+                        <span className={styles.dim}> — {run.model ?? 'the CLI default model'}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
               {report.waiting.length > 0 && (
                 <section className={styles.pool}>
                   <h3 className={styles.poolName}>Waiting</h3>

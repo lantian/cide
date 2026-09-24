@@ -869,6 +869,8 @@ impl LiveRun {
             openable: self.session.is_some() || self.reopenable,
             model,
             pool_position,
+            // Filled by the roster builder, which has the root; see `AgentRun::worktree`.
+            worktree: false,
         }
     }
 }
@@ -1213,6 +1215,7 @@ impl AgentRegistry {
             project: live.project,
             state: live.state.clone(),
             position: live.using().1.unwrap_or_default(),
+            model: live.using().0,
             note: compose_note(None, &live.pool_note, &live.note),
         };
         let pools = llm
@@ -1265,10 +1268,20 @@ impl AgentRegistry {
             .filter(|live| matches!(live.state, RunState::Queued) && !live.pool.is_empty())
             .collect();
         waiting.sort_by_key(|live| live.seq);
+        // A pool applies only to a harness that reads the provider document, so only those can
+        // be "off" one — a claude run on no pool is not a run that missed one.
+        let mut off_pool: Vec<&LiveRun> = inner
+            .runs
+            .values()
+            .filter(|live| live.slot && live.pool.is_empty())
+            .filter(|live| live.harness.reads_provider_document())
+            .collect();
+        off_pool.sort_by_key(|live| live.seq);
         cide_ipc::PoolStateReport {
             now_unix_ms: now,
             pools,
             waiting: waiting.into_iter().map(run_ref).collect(),
+            off_pool: off_pool.into_iter().map(run_ref).collect(),
             events: inner.pool_events.iter().rev().cloned().collect(),
         }
     }
@@ -6174,6 +6187,33 @@ impl AgentRegistry {
     }
 
     /// Which project a run belongs to.
+    /// Is a run that is not over standing in — or queued to stand in — this checkout? (M89)
+    /// [`retire_worktree`]'s first half; its doc says why `Interrupted` does not count.
+    fn checkout_in_use(&self, project: ProjectId, name: &str) -> bool {
+        self.inner.lock().runs.values().any(|run| {
+            run.project == project
+                && run.checkout.as_deref() == Some(name)
+                && !matches!(
+                    run.state,
+                    RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+                )
+        })
+    }
+
+    /// This run's checkout, if the run is over and had one. What [`after_transition`] offers
+    /// [`retire_worktree`].
+    fn ended_checkout(&self, run: RunId) -> Option<(ProjectId, String)> {
+        let inner = self.inner.lock();
+        let live = inner.runs.get(&run)?;
+        if !matches!(
+            live.state,
+            RunState::Finished { .. } | RunState::Failed { .. }
+        ) {
+            return None;
+        }
+        Some((live.project, live.checkout.clone()?))
+    }
+
     fn project_of(&self, run: RunId) -> Option<ProjectId> {
         self.inner.lock().runs.get(&run).map(|live| live.project)
     }
@@ -6768,6 +6808,7 @@ fn start_child(
         }
         RunPurpose::MrReview { .. } => None,
     };
+    let in_worktree = checkout.is_some();
     let cwd = match checkout {
         Some(name) => {
             // One worktree per (role, task), and the name's determinism is load-bearing — a
@@ -6825,6 +6866,17 @@ fn start_child(
         },
     };
 
+    // The project's isolated XDG directories for this worktree (`agents.isolateEnv`), from the
+    // same fresh `project.get` as the rest of the fork. Only a run in a checkout of its own: a
+    // run in the project root stands where the user stands, in the user's environment, and an
+    // MR review is nobody's branch to verify. `milestones::before_integrate` calls the same
+    // function on the same path, so the verify of this branch sees these very directories.
+    let isolated = if in_worktree {
+        project.config.agents.isolated_env(&cwd)
+    } else {
+        Vec::new()
+    };
+
     // What this role actually runs as *here*: the committed definition folded with this
     // machine's local override. Pure, and computed before anything is forked or written, so its
     // one refusal costs nothing when it fires. (M45)
@@ -6878,6 +6930,7 @@ fn start_child(
         // process's own environment and the scope decision belongs to the settings layer. A
         // subagent is a `claude`, so it takes the `claude` column.
         proxy: cide_core::proxy::ProxyEnv::for_target(&facts.proxy, facts.proxy.scope.claude),
+        env: isolated,
         // A headless run has no pane and therefore no measurement. `PaneRestore`'s "only the
         // frontend knows a pane's size" is why the default is written down as a decision: a run
         // later opened into a pane is resized then, through the path a re-docked pane uses.
@@ -7096,6 +7149,170 @@ pub(crate) fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, r
         registry.mark_changed(app, project);
     }
     registry.pump(app);
+    // A run that has ended may have been the last thing standing in a checkout whose branch was
+    // already taken — the ordinary order is "the run hands its turn back, the orchestrator
+    // integrates, the run is wound down", and at the integrate the idle child still held the
+    // directory. See `retire_worktree`.
+    if let Some((project, name)) = registry.ended_checkout(run) {
+        retire_worktree(app, registry, project, name);
+    }
+}
+
+/// Remove a task's worktree once its work has landed and nothing is standing in it. (M89)
+///
+/// Called after every integrate — the panel's and the orchestrator's — and after a run ends.
+/// Integrating used to leave `.cide/worktrees/<role>-<task>` on disk for good: a full checkout
+/// per merged task, and a History row offering Integrate beside each because its worktree was
+/// still there.
+///
+/// Three checks, each asked where its facts live:
+///
+/// * **no run that is not over holds this checkout** — asked of the registry, because
+///   deleting the cwd of a live `claude` (an *idle* one is the usual case at merge time: it
+///   handed its turn back and the orchestrator integrated) leaves a process running in a
+///   directory that no longer exists. `Interrupted` does not hold it: there is no child, and a
+///   Resume's `bring_up` calls `worktree::ensure`, which re-makes the checkout from the kept
+///   branch. A queued run does hold it — it is about to stand there;
+/// * **no pane's child stands in it** — asked of the session registry by [`a_pane_stands_in`].
+///   The registry of runs is not enough, and the case that proved it is **the reviewer**: the
+///   tab cide opens for a finished run (M79) is started *in the worktree it reviews*, is not a
+///   run, and is usually the very session that called `cide_agent_integrate`. Without this, the
+///   developer run's end would delete the directory under a reviewer that had just merged and
+///   was about to comment and close the task. An Open pane re-opening a finished run's
+///   conversation, and a shell somebody `cd`'d into, are the same case. Each such pane's exit
+///   offers the checkout again ([`retire_after_pane_exit`]), so a worktree kept for a reviewer
+///   goes when the reviewer's tab does;
+/// * **nothing in the checkout would be lost** — asked of git, by
+///   `cide_git::worktree::remove_if_integrated`: the branch is in, the tree is clean, `HEAD` is
+///   on the branch. Any doubt keeps the directory, and says why in the log.
+///
+/// On a thread of its own, because the second half is a revwalk, an in-memory merge and a
+/// status walk, and the first caller of this is the transition path. A dispatch admitted in the
+/// gap between the two halves re-makes the checkout through `ensure` at its `bring_up`, so the
+/// race costs a checkout, never work. The branch is always kept, as `worktree::remove` keeps it.
+pub(crate) fn retire_worktree(
+    app: &AppHandle,
+    registry: &Arc<AgentRegistry>,
+    project: ProjectId,
+    name: String,
+) {
+    if registry.checkout_in_use(project, &name) {
+        tracing::debug!(checkout = %name, "a run still holds this worktree; keeping it for now");
+        return;
+    }
+    let Some(root) = app
+        .try_state::<crate::workspace_state::WorkspaceState>()
+        .and_then(|state| crate::tasks_state::project_root(&state, project).ok())
+    else {
+        return;
+    };
+    let app = app.clone();
+    let registry = Arc::clone(registry);
+    let spawned = std::thread::Builder::new()
+        .name("cide-retire-worktree".into())
+        .spawn(move || {
+            let dir = cide_git::worktree::path_of(&root, &name);
+            if a_pane_stands_in(&app, &dir) {
+                tracing::info!(checkout = %name, "a pane is standing in this worktree; keeping it");
+                return;
+            }
+            match cide_git::worktree::remove_if_integrated(&root, &name) {
+                Ok(cide_git::worktree::Retired::Removed) => {
+                    tracing::info!(checkout = %name, "its work has landed; removed the worktree");
+                    // The roster's `AgentRun::worktree` just changed, and History's Integrate
+                    // with it.
+                    registry.mark_changed(&app, project);
+                }
+                Ok(cide_git::worktree::Retired::Absent) => {}
+                Ok(kept) => {
+                    tracing::info!(checkout = %name, ?kept, "keeping the worktree");
+                }
+                Err(error) => {
+                    tracing::warn!(checkout = %name, %error, "could not retire the worktree");
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not start the worktree retirement thread");
+    }
+}
+
+/// Is a live pane's child standing in `dir`, or anywhere under it? (M89)
+///
+/// Two readings per session, because each misses what the other sees: where the child was
+/// **started** (`PtySession::spawn_cwd` — every platform, and the whole answer for a `claude`,
+/// which never changes directory), and where it is **now** (`/proc/<pid>/cwd` — Linux only, and
+/// the answer for a shell somebody `cd`'d into the worktree). Both are compared canonically, since
+/// a spawn directory is whatever path the caller built and `/proc` hands back a resolved one.
+///
+/// Exited sessions do not count: the registry keeps their entries after the reap on purpose (see
+/// `lifecycle::report_exit`), and a corpse is standing nowhere. With no session registry at all —
+/// a state the app never has — the answer is *yes*, because the cost of a wrong *no* is a
+/// deleted directory under somebody.
+fn a_pane_stands_in(app: &AppHandle, dir: &std::path::Path) -> bool {
+    let Some(sessions) = app.try_state::<crate::state::SessionRegistry>() else {
+        return true;
+    };
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let under = |path: &std::path::Path| {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        path.starts_with(&dir)
+    };
+    sessions.ids().into_iter().any(|id| {
+        let Some(session) = sessions.get(id) else {
+            return false;
+        };
+        if session.has_exited() {
+            return false;
+        }
+        under(session.spawn_cwd())
+            || session
+                .child_pid()
+                .and_then(crate::cmd::session::cwd_of_pid)
+                .is_some_and(|cwd| under(&cwd))
+    })
+}
+
+/// A pane's child has exited; if it was started inside an agent worktree, offer that worktree
+/// for retirement again. (M89)
+///
+/// The other half of [`a_pane_stands_in`]: a worktree kept because a reviewer tab was standing
+/// in it has no run left whose end would ask again, so the tab's own exit is what does. Called
+/// from `lifecycle::report_exit` for every watched session; anything not under some open
+/// project's `.cide/worktrees/` returns at the first check.
+pub(crate) fn retire_after_pane_exit(app: &AppHandle, spawn_cwd: &std::path::Path) {
+    let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() else {
+        return;
+    };
+    // `root_of_checkout` is `path_of` inverted, so this matches exactly the directories cide
+    // starts things in — a checkout itself, which is where a reviewer and an Open pane start.
+    let Some(checkout_root) = cide_git::worktree::root_of_checkout(spawn_cwd) else {
+        return;
+    };
+    let Some(name) = spawn_cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let found = state.with(|ws| {
+        ws.projects
+            .values()
+            .find(|project| {
+                project
+                    .roots
+                    .first()
+                    .is_some_and(|root| root.path == checkout_root)
+            })
+            .map(|project| project.id)
+    });
+    let Some(project) = found else {
+        return;
+    };
+    if let Some(registry) = app.try_state::<Arc<AgentRegistry>>() {
+        retire_worktree(app, &registry, project, name);
+    }
 }
 
 // ==========================================================================================
@@ -7454,6 +7671,56 @@ mod tests {
         }
     }
 
+    /// **A checkout is held while any run that is not over stands in it, and only then.** (M89)
+    ///
+    /// `retire_worktree`'s first half. The case that matters is `Idle`: the orchestrator
+    /// integrates right after a run hands its turn back, and the child is still sitting in the
+    /// directory. Removing it then would leave a live `claude` with no cwd. The run's end is what
+    /// frees it, and `ended_checkout` is what offers it for retirement at that edge.
+    #[test]
+    fn a_checkout_is_held_until_the_run_standing_in_it_is_over() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(DispatchSpec {
+            checkout: Some("developer-t-7".into()),
+            ..spec(project, "developer", 4, 4)
+        });
+        assert!(
+            registry.checkout_in_use(project, "developer-t-7"),
+            "a queued run is about to stand there"
+        );
+        assert!(
+            !registry.checkout_in_use(project, "developer-t-8"),
+            "another task's is free"
+        );
+        assert!(
+            !registry.checkout_in_use(ProjectId::new(), "developer-t-7"),
+            "and so is the same name in another project"
+        );
+        assert_eq!(
+            registry.ended_checkout(run),
+            None,
+            "a run that is not over offers nothing"
+        );
+
+        registry.inner.lock().runs.get_mut(&run).expect("run").state = RunState::Idle;
+        assert!(
+            registry.checkout_in_use(project, "developer-t-7"),
+            "an idle child is still in the directory"
+        );
+
+        assert!(registry.set_state(None, run, RunState::Finished { code: 0 }));
+        assert!(
+            !registry.checkout_in_use(project, "developer-t-7"),
+            "over frees it"
+        );
+        assert_eq!(
+            registry.ended_checkout(run),
+            Some((project, "developer-t-7".to_string())),
+            "and the ended run offers its checkout for retirement"
+        );
+    }
+
     // ==========================================================================================
     // The pool failover's decision half (M45). Everything that decides is under the lock and
     // app-free, so it is driven directly here; everything that forks is `fork_failover`'s.
@@ -7661,6 +7928,7 @@ mod tests {
                 entries: pool.clone(),
             }],
         });
+        assert!(report.off_pool.is_empty(), "both runs are on the pool");
         let entries = &report.pools[0].entries;
         let bench = entries[0].bench.as_ref().expect("entry 0 benched");
         assert_eq!(bench.reason, cide_ipc::PoolRefusal::Unreachable);
@@ -7681,6 +7949,24 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// **The second report**: a project whose roles were never pointed at a pool runs on the
+    /// CLI's default model, and the card must list those runs rather than show the pool idle.
+    #[test]
+    fn an_opencode_run_with_no_pool_is_listed_as_off_pool() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(pooled_spec(project, &[]));
+        registry.enqueue(spec(project, "claude-role", 8, 8));
+        registry.take_admissions();
+        let report = registry.pool_state(&cide_ipc::LlmSettings::default());
+        let off: Vec<RunId> = report.off_pool.iter().map(|r| r.run).collect();
+        assert_eq!(
+            off,
+            vec![run],
+            "the claude run is not \"off\" a pool it could never use"
+        );
     }
 
     /// A bench is a preference: when nothing after a benched entry has room, the run is placed

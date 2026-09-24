@@ -13762,7 +13762,35 @@ as work to plan from, and nothing a program could check said what the project wa
   - A run row: a dim `harness · model · pool …` line (`usingLabel`) under a live run, and in
     place of the bare harness on a History row. A finished run with a task gets a `git-merge`
     mark (a new vendored icon) that arms and then confirms. It merges `cide/<role>-<task>`
-    through `useAgents.integrate(agent, task)`, and the armed key is the run id.
+    through `useAgents.integrate(agent, task)`, and the armed key is the run id. The mark is
+    drawn only while that run's worktree is on disk. `AgentRun::worktree` is filled by the
+    roster builder in `cmd::agents`, which stats `.cide/worktrees/<role>-<task>`, and the test
+    `a_run_says_whether_its_worktree_is_still_on_disk` covers it. Other readers of `runs_for` get
+    `false`.
+  - A merged task's worktree is removed. Before this, integrating left
+    `.cide/worktrees/<role>-<task>` on disk for good.
+    - `cide_git::worktree::remove_if_integrated` removes the checkout only when three things
+      hold: the branch is in (`unmerged` is `None`), the tree is clean (untracked counts,
+      ignored does not), and `HEAD` is on `cide/<name>`. Otherwise it keeps the checkout and
+      answers why. The branch is always kept.
+    - `agents::retire_worktree` asks the registry first whether any run that is not over holds
+      the checkout. Queued and idle runs do; `Interrupted` does not, because Resume's `ensure`
+      re-makes the checkout from the branch. The removal itself runs on a thread and then
+      pushes the roster.
+    - It also keeps the checkout while any live pane's child stands in it (`a_pane_stands_in`).
+      The reviewer tab (M79) is started in the worktree it reviews, is not a run, and is
+      usually the session that integrates. Without this check, the developer run's end would
+      have deleted the directory under it. The check reads the new `PtySession::spawn_cwd`
+      (every platform) and `/proc/<pid>/cwd` (Linux, for a shell that `cd`'d in). When a pane
+      started in a checkout exits, `lifecycle::report_exit` offers that checkout again
+      (`retire_after_pane_exit`). So a worktree kept for a reviewer goes when the reviewer's tab
+      closes.
+    - It is called after the panel's `agents_integrate` and after the orchestrator's
+      `cide_agent_integrate`, on `Merged` or `UpToDate` with a task. It is also called from
+      `after_transition` when a run ends. That last one is the usual path, since the run that
+      did the work is normally idle when it is merged.
+    - Tests: `a_merged_clean_worktree_is_retired_and_anything_else_is_kept` in `cide-git` and
+      `a_checkout_is_held_until_the_run_standing_in_it_is_over` in `cide-app`.
   - Settings: Description is a wrapping textarea. It is still one line on disk, because
     `defs::normalize` folds newlines into spaces.
 - **Checked.** `tsc`, every `check:*` script and `pnpm build` pass. `check:agents-render` has new
@@ -13780,6 +13808,11 @@ as work to plan from, and nothing a program could check said what the project wa
   the contract were regenerated.
 - **Not confirmed.** Nothing has been looked at on a display yet, including the tab strip at
   sidebar width, the Configure mark's baseline on the name line, and the armed merge's yellow.
+  A worktree removed by hand while the panel is open is not noticed until the roster next
+  refreshes. No real merge has been watched removing its worktree, in either the panel or the
+  orchestrator path, and no reviewer tab has been watched keeping its worktree alive and then
+  releasing it. Off Linux, a pane that `cd`'d into a worktree after starting elsewhere is not
+  seen, because there is no `/proc` there.
   No run has been integrated from History in a running build. A run restored from a snapshot
   written before this change shows its harness alone until its next fork.
 
@@ -13871,20 +13904,28 @@ notification sometimes names no console, and tapping one sometimes opens a conso
   a milestone that is not the active one. The phone has a Milestones row on the machine screen
   and a screen with a card per milestone: verdict, the end of the output, *Run gate*, *Accept*,
   and a full log that follows while the gate runs.
+- **Proposals.** New frames `proposalAccept` and `proposalReject`, answered with the new view and
+  going through the same `proposals::{accept,reject}` as the desk's card. The phone shows each
+  waiting proposal first: who proposed it, why, and on a tap the change itself (a plan as the
+  lines that differ, files as their diffs). *Accept* and *Reject* each ask first. The machine
+  screen's Milestones row counts the proposals waiting and is marked while any are.
+- **Test servers left running.** The phone's end-to-end test killed only the last `cargo run` it
+  started, and cargo does not pass the signal on, so every run left dozens of `fake_cide`
+  listening. It now starts each one in its own process group and kills every group.
 - **Swipe.** `ProjectSwipe` (gesture-handler's `Pan`: 24 points sideways to start, gives up
   after 14 vertical) steps through the chips (`nextChoice`: All, then projects, no wrapping) on
   the machine, Consoles, Agents, Tasks and Milestones screens. The chip rows use
   gesture-handler's `ScrollView`, so dragging one scrolls it. The console screen is left alone,
   because there a sideways drag pans.
 - **Checked:**
-  - `cargo test -p cide-remote` (89, including `keys::page` and
+  - `cargo test -p cide-remote` (90, including `keys::page`, `a_proposal_is_decided_and_answered` and
     `a_page_scrolls_the_desk_on_the_normal_screen_and_the_program_on_the_alternate`).
   - `cargo test -p cide-app -- remote emit windows`, `cargo test -p cide-ipc -- remote screen`
     and `cargo test -p xtask protocol`.
   - Clippy for `cide-remote`, `cide-ipc` and `cide-app`, plus `contract-check`,
     `codegen --check`, `tsc` and every `check:*` (with `check:remote`'s known frames grown by
-    five).
-  - In `../cide-mobile`, `npm run check`: 227 tests, including new ones for the notification
+    seven).
+  - In `../cide-mobile`, `npm run check`: 230 tests, including new ones for the notification
     wording and the hold-back, watch replay, per-socket `seq`, `paged`, `nextChoice`, the
     milestone cards, and an end-to-end test against `fake_cide` that watches a console asked for
     before the connection was up.
@@ -13894,3 +13935,80 @@ notification sometimes names no console, and tapping one sometimes opens a conso
   - a real gate running from the phone.
 
   The APK has not been rebuilt (`cd ../cide-mobile/android && ./gradlew assembleRelease`).
+
+## Concurrent runs no longer fail each other's verify, and a refused verify is honest about why (M92)
+
+The incident (selfcraft, 2026-09-23): integrate refused the branch
+`cide/content-designer-t-295`, which changed 17 data files and no code, twice. The project's
+`tools/dev/check.sh` guard snapshots Godot's real `user://`
+(`~/.local/share/godot/app_userdata/SELFCRAFT`). It saw a `.recovery_mode_lock` appear and a log
+rotate, both written by Godot processes in two *other* worktrees. The refusal then said *"Hand it
+back with this output as the feedback"*, which would have sent a correct branch back to an author
+who could not fix it. The second refusal was word for word the first, because verify's cache
+answered it by commit, so no reader could tell that nothing had re-run.
+
+- **`agents.isolateEnv`**, an opt-in list drawn from `XDG_DATA_HOME`, `XDG_CACHE_HOME`,
+  `XDG_STATE_HOME`, `XDG_CONFIG_HOME` and `TMPDIR`. Each worktree gets its own directory for each
+  listed variable, under `cache_dir()/isolated-env/<slug>`, from `cide_core::isolated_env`. It
+  applies to:
+  - the run: `RunPlan::env`, applied by all four spawners after the proxy and before `CIDE_*`;
+  - the verify of that branch: `check::run_logged`'s new `env`, also written to the log header;
+  - any pane whose cwd is a cide checkout (`worktree::root_of_checkout`).
+
+  All three call `AgentsConfig::isolated_env` on the same path. The harnesses' logins and state
+  (`DEFAULT_SHARED`, which includes `mimocode`), `gh`, `git` and cide's own leaf are symlinked
+  back to the real directories, and `agents.isolateEnvShare` adds more. `HOME` is refused. A
+  `worktree` marker in each directory lets `sweep` delete the ones whose worktree is gone,
+  because nothing in the app removes worktrees.
+- **`agents.verifyExclusive`.** A project's verifies take one slot (`ExclusiveSlot`, released
+  in `Drop`), queue for it and are never refused. The integrate answer says how long a verify
+  waited and whose verify it waited for. Role runs are not paused.
+- **The refusal** (`cide_agents::milestones::verify_refusal`) gives both roads: hand the branch
+  back if the failure is in the change, or leave the task in review and retry if it came from the
+  environment. It gives the verify's start and end times, and says whether it ran now (`fresh`)
+  or was `reused`. It lists every other run alive before or after the verify (`suspect`:
+  Starting, Running, Idle or AwaitingPermission, by role, task and worktree), and points to
+  `isolateEnv` when the project doesn't isolate anything. `Integrated`'s success arms carry
+  `verify_ran_line` too.
+- **A failure is no longer cached as a fact about the commit.** A prewarm's failure is handed to
+  the next integrate once, and an integrate's own failure is never kept, so a retry always runs
+  verify again.
+- **The orchestrator can set the three keys** through `cide_agents_config`. They were added to
+  `OrchestrationPatch` and `OrchestrationConfig`, and the bindings were regenerated. The handler
+  comment gives the argument its rule asks for: the keys only narrow what a run can reach, or
+  order verifies, and every change is undone by the same call. Details:
+  - A bad name or path is refused whole, by the reader's own `check_var`/`check_share`, and
+    nothing is written.
+  - `[]` or `null` turns a key off, and `config::write` removes it from the file
+    (`CLEARED_WHEN_EMPTY`), because a merge alone would have kept the old value.
+  - The answer warns when `XDG_CONFIG_HOME` is isolated.
+  - `config_sentence`, and so `cide_agents_list`, reports isolation while it is on.
+  - The tool's description says when to reach for it, and the refusal names the tool rather
+    than the file.
+  - `AgentsConfig::apply` normalises what it is handed (trims, dedupes, drops what the reader
+    would skip).
+- Documentation for project authors is in `docs/worktree-isolation.md`. `docs/checks.md` has a
+  new section.
+- **Checked:**
+  - `cargo test -p cide-core -- isolated_env check`, including
+    `two_runs_writing_user_data_are_invisible_to_each_other_and_to_a_third_verify` through
+    `run_logged`.
+  - `cargo test -p cide-agents`, including
+    `the_isolated_environment_reaches_every_harness_and_cannot_shadow_cides_own`, the refusal's
+    wording, and the config keys surviving a settings save.
+  - `cargo test -p cide-app -- milestones`:
+    `exclusive_verifies_run_one_after_the_other_and_answer_for_themselves` (and side by side
+    with the setting off), `a_failed_verify_runs_again_and_a_passed_one_is_reused`,
+    `verify_runs_with_the_environment_it_is_given` and `a_suspect_is_a_live_run_somewhere_else`.
+  - `cargo test -p cide-git worktree`.
+  - `the_config_tool_sets_isolation_and_refuses_what_the_reader_would_skip`.
+  - The full workspace suite, clippy, `codegen --check`, `tsc`, and `check:settings-agents`,
+    `check:agents`, `check:agents-render`, `check:pools` and `check:selectors`.
+- **Not confirmed.** No real run has been dispatched with `isolateEnv` set. Not yet observed:
+  - a Godot run on selfcraft writing its `user://` under the isolated directory;
+  - an opencode or mimo run staying logged in through the symlinks;
+  - a refusal naming real suspects.
+
+  No model has set these keys through the tool in a real session yet. `isolateEnv` has no
+  Settings control: it is set by hand in `.cide/config.json` or by the orchestrator through
+  `cide_agents_config`.

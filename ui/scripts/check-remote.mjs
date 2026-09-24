@@ -191,6 +191,9 @@ const KNOWN_CLIENT_FRAMES = [
   'pair',
   'paste',
   'ping',
+  // M91: proposals decided from the phone's Milestones screen.
+  'proposalAccept',
+  'proposalReject',
   'runPause',
   'runResume',
   'runStop',

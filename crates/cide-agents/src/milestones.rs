@@ -547,6 +547,140 @@ fn proposed_files(
     Ok(out)
 }
 
+/// What the app knows about one verify it ran, or answered from an earlier run, before a merge —
+/// the facts [`verify_ran_line`] and [`verify_refusal`] turn into sentences. (M92)
+///
+/// Built by `cide_app::milestones::before_integrate`; phrased here, where a test can construct
+/// one, on the rule `tools::Integrated` states: the app decides, this crate phrases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport<'a> {
+    /// `cide/<role>-<task>`.
+    pub branch: &'a str,
+    pub result: &'a cide_ipc::CheckResult,
+    /// Answered from a run of the same commit that had already finished (the one started when
+    /// the task went to review, usually) rather than run for this call.
+    pub reused: bool,
+    /// How long it queued behind another branch's verify under `agents.verifyExclusive`, and
+    /// whose. `None` when it did not wait.
+    pub waited: Option<(u64, &'a str)>,
+    /// The other runs of this project that were alive while it ran: `role on task (where)`.
+    pub live: &'a [String],
+    /// Whether the project isolates any per-user directory (`agents.isolateEnv`).
+    pub isolating: bool,
+    /// Where the whole output is, when it was logged.
+    pub log: Option<&'a str>,
+}
+
+/// `HH:MM:SS`, local — read beside the reader's own clock, and the same form as a plan's title.
+fn clock(unix_ms: u64) -> String {
+    use chrono::TimeZone;
+    i64::try_from(unix_ms)
+        .ok()
+        .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
+        .map(|at| at.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn span(ms: u64) -> String {
+    match ms / 1000 {
+        s if s < 60 => format!("{s}s"),
+        s => format!("{}m{:02}s", s / 60, s % 60),
+    }
+}
+
+/// One line saying when verify ran, whether it ran for this call, and what it queued behind.
+///
+/// # Why a verify that passed says it too, and why the times are wall-clock
+///
+/// The incident this answers: integrate refused one branch twice, four minutes apart, in
+/// identical words. The second refusal was a cached verdict about the same commit, and nothing
+/// in the text could say so — so a model retrying because "maybe it was the other runs" had no
+/// way to learn that its retry had not retried anything. Start and end times are what a reader
+/// can hold against the other runs' activity; "fresh" or "reused" is the question they asked.
+#[must_use]
+pub fn verify_ran_line(report: &VerifyReport<'_>) -> String {
+    let result = report.result;
+    let mut line = format!(
+        "Verify ran {}–{} ({})",
+        clock(result.started_unix_ms),
+        clock(result.started_unix_ms.saturating_add(result.duration_ms)),
+        if report.reused {
+            "reused: it had already run on this commit; call integrate again to run it anew"
+        } else {
+            "fresh: it ran for this call"
+        }
+    );
+    if let Some((ms, behind)) = report.waited {
+        line.push_str(&format!(
+            ", after waiting {} for `{behind}`'s verify",
+            span(ms)
+        ));
+    }
+    line.push('.');
+    line
+}
+
+/// The refusal for a branch whose verify failed.
+///
+/// # Why it no longer says "hand it back"
+///
+/// It used to end its first sentence with *"Hand it back with this output as the feedback."*
+/// In the incident that changed it (selfcraft, 2026-09-23) the branch was seventeen data files
+/// and the failure was a guard in the project's own check noticing that some *other* worktree's
+/// Godot had written the shared user directory. Following the instruction would have sent a
+/// correct branch back to an author who could not fix it, and the re-run would have failed
+/// again for the same reason: a retry loop that burns runs. The verdict is the project's
+/// program's and the diagnosis is the reader's, so the text gives both roads and the facts to
+/// choose between them — which other runs were alive, and whether the project isolates the
+/// directories they share.
+#[must_use]
+pub fn verify_refusal(report: &VerifyReport<'_>) -> String {
+    let result = report.result;
+    let at = result
+        .head
+        .as_deref()
+        .map(|h| format!(" at {}", &h[..h.len().min(10)]))
+        .unwrap_or_default();
+    let mut text = format!(
+        "not merged: the verify command failed on {}{at}. Read the output: if the failure is in \
+         this branch's change, hand it back; if it comes from the environment (other runs, \
+         shared state), leave the task in review and retry.\n{}",
+        report.branch,
+        verify_ran_line(report)
+    );
+    if report.live.is_empty() {
+        text.push_str("\nNo other run of this project was alive while it ran.");
+    } else {
+        text.push_str(&format!(
+            "\nOther runs alive while it ran: {}.",
+            report.live.join("; ")
+        ));
+        if !report.isolating {
+            text.push_str(&format!(
+                " They share this machine's per-user directories (~/.local/share, ~/.cache, …) \
+                 with the verify; if the output points there, {} with `isolateEnv` gives each \
+                 worktree its own.",
+                crate::tools::tool::AGENTS_CONFIG
+            ));
+        }
+    }
+    if let Some(log) = report.log {
+        text.push_str(&format!("\nThe whole output is in {log}."));
+    }
+    let ending = match (result.timed_out, result.exit_code) {
+        (true, _) => "timed out".to_string(),
+        (false, Some(code)) => format!("exit {code}"),
+        (false, None) => "killed".to_string(),
+    };
+    let tail: Vec<&str> = result.tail.lines().collect();
+    text.push_str(&format!(
+        "\n\n`{}` — {ending}\n```\n{}\n```",
+        result.command,
+        tail[tail.len().saturating_sub(30)..].join("\n")
+    ));
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,5 +1029,100 @@ mod tests {
             "the open tasks are named, done ones are not: {line}"
         );
         assert!(facts_line(&MilestonePlan::default(), &rows, None).is_none());
+    }
+
+    fn failed_verify() -> cide_ipc::CheckResult {
+        cide_ipc::CheckResult {
+            command: "tools/dev/check.sh".into(),
+            passed: false,
+            exit_code: Some(1),
+            timed_out: false,
+            tail:
+                "user_data_guard:   added: '.recovery_mode_lock'\nFAIL lint (real user dir touched)"
+                    .into(),
+            started_unix_ms: 1_790_000_000_000,
+            duration_ms: 148_000,
+            head: Some("0123456789abcdef".into()),
+        }
+    }
+
+    /// The incident's refusal, rewritten: both roads, the named suspects, whether it re-ran.
+    #[test]
+    fn a_failed_verify_leaves_the_diagnosis_to_the_reader_and_names_the_suspects() {
+        let result = failed_verify();
+        let live = vec![
+            "`worldgen-dev` on t-312 (.cide/worktrees/worldgen-dev-t-312)".to_string(),
+            "`qa-tester` on t-301 (.cide/worktrees/qa-tester-t-301)".to_string(),
+        ];
+        let report = VerifyReport {
+            branch: "cide/content-designer-t-295",
+            result: &result,
+            reused: false,
+            waited: None,
+            live: &live,
+            isolating: false,
+            log: Some("/state/verify-t-295.log"),
+        };
+        let text = verify_refusal(&report);
+        assert!(!text.contains("Hand it back with this output"), "{text}");
+        assert!(
+            text.contains("failed on cide/content-designer-t-295 at 0123456789"),
+            "{text}"
+        );
+        assert!(text.contains("if the failure is in this branch's change, hand it back"));
+        assert!(text.contains("leave the task in review and retry"));
+        assert!(text.contains("qa-tester-t-301") && text.contains("worldgen-dev-t-312"));
+        assert!(
+            text.contains("cide_agents_config with `isolateEnv`"),
+            "the fix is named, as the tool that makes it: {text}"
+        );
+        assert!(text.contains("(fresh: it ran for this call)"), "{text}");
+        assert!(text.contains(&format!(
+            "Verify ran {}–{}",
+            clock(result.started_unix_ms),
+            clock(result.started_unix_ms + 148_000)
+        )));
+        assert!(text.contains("The whole output is in /state/verify-t-295.log."));
+        assert!(text.contains("`tools/dev/check.sh` — exit 1"));
+        assert!(text.contains(".recovery_mode_lock"));
+
+        let isolated = verify_refusal(&VerifyReport {
+            isolating: true,
+            ..report.clone()
+        });
+        assert!(
+            !isolated.contains("isolateEnv"),
+            "no advice to turn on what is on"
+        );
+        let alone = verify_refusal(&VerifyReport {
+            live: &[],
+            ..report
+        });
+        assert!(
+            alone.contains("No other run of this project was alive"),
+            "{alone}"
+        );
+    }
+
+    #[test]
+    fn the_ran_line_says_reused_and_what_it_queued_behind() {
+        let result = failed_verify();
+        let line = verify_ran_line(&VerifyReport {
+            branch: "cide/a-t-1",
+            result: &result,
+            reused: true,
+            waited: Some((72_000, "cide/qa-tester-t-301")),
+            live: &[],
+            isolating: true,
+            log: None,
+        });
+        assert!(
+            line.contains("(reused: it had already run on this commit"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(", after waiting 1m12s for `cide/qa-tester-t-301`'s verify."),
+            "{line}"
+        );
     }
 }

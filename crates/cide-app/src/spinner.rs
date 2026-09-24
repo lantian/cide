@@ -83,7 +83,9 @@ pub(crate) struct Quiet {
     pub open_tasks: usize,
     /// How long every one of the above has continuously looked quiet.
     pub quiet_for: Duration,
-    /// The active milestone's gate passed and its task waits in review for the user. (M83)
+    /// The active milestone's gate passed against what is checked out now, so the milestone
+    /// waits for the user to accept it. (M83) Read off the gate's verdict, **not** off the
+    /// milestone task being in `review` — see [`milestone_ready`].
     pub milestone_waiting: bool,
 }
 
@@ -107,11 +109,12 @@ pub(crate) struct Quiet {
 ///   asking a model to invent work, which is the one thing nobody wants a timer to do
 ///   unattended; the board being empty is a decision for a person.
 ///
-/// * **No milestone waiting on the user.** (M83) When the active milestone's gate has passed, its
-///   task sits in review until somebody accepts it, and that is the one moment the next step is a
+/// * **No milestone waiting on the user.** (M83) When the active milestone's gate has passed, the
+///   milestone waits until somebody accepts it, and that is the one moment the next step is a
 ///   person's: planning more work then either re-does what is met or starts on a milestone the
 ///   user has not agreed to. The gate is what a project is *for*; a spinner that ran past it
-///   would make the goal decorative.
+///   would make the goal decorative. *Passed* is the gate's verdict, never the milestone task's
+///   status — see [`milestone_ready`].
 ///
 /// And then the dwell. `quiet_for` is compared against `AgentsConfig::spin_after`, which clamps
 /// — this function deliberately reads the clamped value rather than the stored one, so a
@@ -329,10 +332,13 @@ fn wake(
             prompt = format!("{prompt} {facts}");
         }
     }
+    // Dated, and the same string names the tab and the session: see `plan_title`.
+    let title = cide_agents::config::plan_title_now();
     crate::claude_tab::open_with_prompt(
         app,
         project,
-        "Plan",
+        &title,
+        Some(&title),
         &prompt,
         // The same stance as every other unattended child cide starts (`agents.permissionMode`,
         // `auto` by default): a planner parked on a permission prompt nobody answers is the
@@ -481,18 +487,10 @@ fn facts(
     let looks_quiet = live_runs == 0 && busy_panes == 0 && dispatching;
     let quiet_for = dwell(project, now, looks_quiet);
 
-    // Read per tick like the config: the plan is committed and the gate's verdict lands on the
-    // milestone's task as a status, so both are one small read. (M83)
+    // Read per tick like the config: the plan is committed and the gate's verdict is in memory.
     let milestone_waiting = crate::tasks_state::project_root(state, project)
         .ok()
-        .map(|root| cide_agents::config::load_milestones(&root))
-        .and_then(|plan| plan.current().and_then(|m| m.task.clone()))
-        .and_then(|task| {
-            app.try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>()
-                .and_then(|stores| stores.get(project))
-                .and_then(|store| store.get(&task))
-        })
-        .is_some_and(|task| task.status == TaskStatus::Review);
+        .is_some_and(|root| milestone_ready(app, &root));
 
     Some(Quiet {
         dispatching,
@@ -502,6 +500,39 @@ fn facts(
         quiet_for,
         milestone_waiting,
     })
+}
+
+/// Whether the active milestone is ready to be accepted: its gate's last verdict passed, and
+/// that verdict is about the commit checked out now.
+///
+/// Until this, the fact was *the milestone's task is in `review`*, on the reasoning that
+/// `milestones::announce_met` is what puts it there. It is not the only thing that can. In
+/// selfcraft a planning turn moved `slice`'s task `todo → review` by hand while the gate was
+/// red, and from then on the spinner read the project as waiting on the user and never woke it
+/// again — no log line, just a *Quiet for* that never fired. A status any agent can set is a
+/// claim; the gate's result is the evidence, so the spinner reads the evidence and ignores
+/// review entirely.
+///
+/// **Current HEAD only.** A pass at an older commit says nothing about what is checked out now,
+/// and treating it as ready would park the project until something happened to re-run the gate.
+/// Letting it through is safe: [`wake`] re-runs a stale gate before planning and stops there
+/// if it passes. The `git rev-parse` is only paid when the last verdict passed, which is rare.
+fn milestone_ready(app: &AppHandle, root: &std::path::Path) -> bool {
+    let plan = cide_agents::config::load_milestones(root);
+    let Some(current) = plan.current() else {
+        return false;
+    };
+    let Some(checks) = app.try_state::<std::sync::Arc<crate::milestones::Checks>>() else {
+        return false;
+    };
+    if !checks
+        .last_gate(root, &current.id)
+        .is_some_and(|gate| gate.passed)
+    {
+        return false;
+    }
+    let head = cide_core::check::head_of(root);
+    !checks.gate_is_stale(root, &current.id, head.as_deref())
 }
 
 /// How long this project has looked quiet, updating the record.

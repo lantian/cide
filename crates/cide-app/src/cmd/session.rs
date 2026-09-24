@@ -1212,6 +1212,21 @@ pub(crate) async fn spawn_session(
         spec = with_task_tools(spec, &plan.inject, agent_mcp_config);
     }
 
+    // A pane standing in one of cide's agent checkouts — a finished run reopened on its
+    // conversation (`continues`), a reviewer tab opened in the run's worktree — gets that
+    // worktree's isolated directories (`agents.isolateEnv`), the very ones the run had and the
+    // verify of its branch gets. Otherwise a person continuing a run would see a different
+    // `user://` from the one the run's tests wrote, and a test that failed in the run would pass
+    // in the pane for no reason anyone could find. Keyed on the directory rather than on
+    // `continues`, so every road into a checkout agrees; empty for a project that isolates
+    // nothing, so this is a no-op everywhere else.
+    if let Some(root) = cide_git::worktree::root_of_checkout(&spec.cwd) {
+        let isolated = cide_agents::config::load(&root)
+            .agents
+            .isolated_env(&spec.cwd);
+        spec = spec.apply(isolated);
+    }
+
     // The caller's own variables, **last**, so they outrank everything composed above. (M79)
     //
     // Last rather than first because a variable a caller states by name is the most specific
@@ -1617,7 +1632,7 @@ fn contain(cwd: PathBuf, roots: &[PathBuf]) -> Option<PathBuf> {
 /// it stays platform-independent and keeps its tests on every host. Only the *reading* is
 /// per-platform.
 #[cfg(target_os = "linux")]
-fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+pub(crate) fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
@@ -1643,7 +1658,7 @@ fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
 /// `not(target_os = "linux")` rather than a macOS arm: everything that is not Linux is honestly
 /// unimplemented here, not merely untested.
 #[cfg(not(target_os = "linux"))]
-fn cwd_of_pid(_pid: u32) -> Option<PathBuf> {
+pub(crate) fn cwd_of_pid(_pid: u32) -> Option<PathBuf> {
     None
 }
 

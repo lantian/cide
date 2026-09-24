@@ -17,6 +17,17 @@ nowUnixMs: number, pools: Array<PoolState>,
  */
 waiting: Array<PoolRunRef>, 
 /**
+ * Slot-holding runs on an opencode-shaped harness **with no pool** — each on its role's own
+ * `model:` or, failing that, the CLI's own default model.
+ *
+ * Asked for by the report that followed the card's first version: a project whose roles
+ * were never pointed at a pool ran eleven agents on `deepseek/deepseek-flash` — opencode's
+ * configured default, which happened to be the last entry of the pool named `default` —
+ * while the card showed that pool with one run on it and said nothing about the rest. A
+ * pool named "default" is a default for nothing; this list is where that becomes visible.
+ */
+offPool: Array<PoolRunRef>, 
+/**
  * Newest first.
  */
 events: Array<PoolEvent>, };

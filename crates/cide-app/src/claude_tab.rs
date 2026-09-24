@@ -103,6 +103,9 @@ pub(crate) fn open_with_prompt(
     app: &tauri::AppHandle,
     project: ProjectId,
     title: &str,
+    // `claude --name`: what the CLI shows in its prompt box and in `/resume`. `None` leaves the
+    // session unnamed, which is what a reviewer wants — its tab title is a task, not a name.
+    session_name: Option<&str>,
     prompt: &str,
     mode: TabMode,
     // Where the child stands. `None` is the project root; `Some` is a run's worktree, which is
@@ -136,6 +139,10 @@ pub(crate) fn open_with_prompt(
     if let Some(permission) = permission {
         args.push("--permission-mode".into());
         args.push(permission.into());
+    }
+    if let Some(name) = session_name {
+        args.push("--name".into());
+        args.push(name.into());
     }
 
     // `Geometry::default()` is 80×24, byte-identical to the webview's own `FALLBACK`, and it

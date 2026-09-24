@@ -1103,13 +1103,18 @@ impl AgentSink for RegistrySink {
         // The milestone checks first (M83): a branch that moves a gate, leaves work uncommitted,
         // or fails the project's verify command is refused here with the reason — this is the
         // model's road, and the panel's Integrate (the user's) does not pass through it.
-        crate::milestones::before_integrate(&self.app, self.project, &root, agent, task)?;
+        let verified =
+            crate::milestones::before_integrate(&self.app, self.project, &root, agent, task)?;
         let outcome =
             cide_git::worktree::integrate(&root, &cide_agents::checkout_name(agent, task))
                 .map(|outcome| match outcome {
-                    cide_git::worktree::Integration::UpToDate => Integrated::UpToDate,
+                    cide_git::worktree::Integration::UpToDate => Integrated::UpToDate { verified },
                     cide_git::worktree::Integration::Merged { commit, files } => {
-                        Integrated::Merged { commit, files }
+                        Integrated::Merged {
+                            commit,
+                            files,
+                            verified,
+                        }
                     }
                     cide_git::worktree::Integration::Conflicts { paths } => {
                         Integrated::Conflicts { paths }
@@ -1120,6 +1125,24 @@ impl AgentSink for RegistrySink {
         // because the answer is for whoever plans next, not for this call.
         if matches!(outcome, Integrated::Merged { .. }) {
             crate::milestones::run_gate(&self.app, self.project);
+        }
+        // And the task's checkout, whose work is now in, is removed — the same rule and the same
+        // guards as the panel's Integrate (`agents::retire_worktree`): not while a run stands in
+        // it, not while it holds anything the branch does not. (M89) The run that did the work
+        // is usually idle at this point, so the removal normally lands when it ends instead.
+        if task.is_some()
+            && matches!(
+                outcome,
+                Integrated::Merged { .. } | Integrated::UpToDate { .. }
+            )
+            && let Some(registry) = self.app.try_state::<Arc<crate::agents::AgentRegistry>>()
+        {
+            crate::agents::retire_worktree(
+                &self.app,
+                &registry,
+                self.project,
+                cide_agents::checkout_name(agent, task),
+            );
         }
         Ok(outcome)
     }
@@ -2147,6 +2170,7 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
             app,
             project,
             &review_tab_title(&turns),
+            None,
             &prompt,
             // The project's own stance for an unattended child, read from the same file in the
             // same breath as the switch that opened this tab. A reviewer that parks on a

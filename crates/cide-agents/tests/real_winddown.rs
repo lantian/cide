@@ -100,6 +100,7 @@ fn a_real_turn_is_interrupted_by_esc_and_the_next_line_is_taken_up() {
         events_path: None,
         theme: Theme::Dark,
         proxy: cide_core::proxy::ProxyEnv::default(),
+        env: Vec::new(),
         geometry: Geometry::default(),
         claude: cide_ipc::ClaudeSettings::default(),
         llm: cide_ipc::LlmSettings::default(),

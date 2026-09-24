@@ -11,6 +11,11 @@
       `main.tsx` all reintroduce the flash. See `public/theme-boot.js`.
     -->
     <script src="/theme-boot.js"></script>
+    <!--
+      Ctrl+Shift+R reloads, dev server only. Classic and outside the module graph so it still
+      listens when `main.tsx` failed to evaluate and the window is white. See the file.
+    -->
+    <script src="/dev-reload.js"></script>
   </head>
   <body>
     <!--

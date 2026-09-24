@@ -592,6 +592,7 @@ fn assemble(
         cli.env,
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
+    spec = spec.apply(plan.env.clone());
 
     // The IDE integration, switched off. See the module header — this is the run-hangs-for-ever
     // case, not a tidy-up.
@@ -874,6 +875,7 @@ mod tests {
             events_path: None,
             theme: Theme::Dark,
             proxy: cide_core::proxy::ProxyEnv::default(),
+            env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
             llm: cide_ipc::LlmSettings::default(),

@@ -610,6 +610,22 @@ impl RemoteHost for AppRemoteHost {
         Ok(crate::milestones::view(&self.app, project))
     }
 
+    /// The same `proposals::{accept,reject}` the desk's Proposal card calls. Not limited to the
+    /// active milestone: a proposal names itself by id, and a stale id is refused by `proposals`.
+    fn proposal_decide(
+        &self,
+        project: ProjectId,
+        id: String,
+        accept: bool,
+    ) -> Result<Option<cide_ipc::MilestonesView>, String> {
+        if accept {
+            crate::proposals::accept(&self.app, project, &id)?;
+        } else {
+            crate::proposals::reject(&self.app, project, &id)?;
+        }
+        Ok(crate::milestones::view(&self.app, project))
+    }
+
     fn check_log(
         &self,
         project: ProjectId,

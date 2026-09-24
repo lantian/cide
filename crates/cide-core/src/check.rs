@@ -39,7 +39,7 @@ const GRACE: Duration = Duration::from_secs(5);
 /// Run `command` in `dir` with `sh -c`, for at most `timeout`. Never fails: a command that could
 /// not be started is a failed check whose tail says why.
 pub fn run(dir: &Path, command: &str, timeout: Duration) -> CheckResult {
-    run_logged(dir, command, timeout, None)
+    run_logged(dir, command, timeout, None, &[])
 }
 
 /// [`run`], writing **every** line to `log` as it arrives as well as keeping the tail. (M83)
@@ -49,7 +49,19 @@ pub fn run(dir: &Path, command: &str, timeout: Duration) -> CheckResult {
 /// happens rather than at the end, so a viewer polling the file watches a running check — and so
 /// a check that is killed, or a cide that dies, still leaves what it had printed. The file is
 /// truncated at the start: one log per check key, the latest run.
-pub fn run_logged(dir: &Path, command: &str, timeout: Duration, log: Option<&Path>) -> CheckResult {
+///
+/// `env` is laid over the child's environment after `prepare_command` — `None` removes a
+/// variable. A verify passes its worktree's isolated directories here
+/// (`cide_core::isolated_env`), the list the run on that worktree was spawned with, so the two
+/// see one `$XDG_DATA_HOME`. Each one is written to the log's header: a verify that failed on
+/// shared state is only diagnosable if the log says which directory it saw.
+pub fn run_logged(
+    dir: &Path,
+    command: &str,
+    timeout: Duration,
+    log: Option<&Path>,
+    env: &[(String, Option<String>)],
+) -> CheckResult {
     let started_unix_ms = now_ms();
     let started = Instant::now();
     let head = head_of(dir);
@@ -62,6 +74,12 @@ pub fn run_logged(dir: &Path, command: &str, timeout: Duration, log: Option<&Pat
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::child_env::prepare_command(&mut cmd);
+    for (name, value) in env {
+        match value {
+            Some(value) => cmd.env(name, value),
+            None => cmd.env_remove(name),
+        };
+    }
     crate::child_env::arm(&mut cmd);
     #[cfg(unix)]
     {
@@ -98,10 +116,18 @@ pub fn run_logged(dir: &Path, command: &str, timeout: Duration, log: Option<&Pat
         let mut file = std::fs::File::create(path).ok()?;
         let _ = writeln!(
             file,
-            "$ {command}\n# in {} at {} (unix ms)\n",
+            "$ {command}\n# in {} at {} (unix ms)",
             dir.display(),
             started_unix_ms
         );
+        for (name, value) in env {
+            let _ = writeln!(
+                file,
+                "# env: {name}={}",
+                value.as_deref().unwrap_or("(unset)")
+            );
+        }
+        let _ = writeln!(file);
         Some(file)
     })));
     let readers: Vec<_> = [
@@ -365,6 +391,7 @@ mod tests {
             "for i in $(seq 1 100); do echo line $i; done; exit 4",
             Duration::from_secs(20),
             Some(&log),
+            &[],
         );
         assert_eq!(result.exit_code, Some(4));
         let text = std::fs::read_to_string(&log).expect("written");
@@ -374,6 +401,34 @@ mod tests {
             "every line, not the tail"
         );
         assert!(text.trim_end().ends_with("# exit 4"), "{text}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn the_given_environment_is_what_the_check_sees_and_the_log_says_so() {
+        let log = std::env::temp_dir().join(format!("cide-check-env-{}.log", std::process::id()));
+        let result = run_logged(
+            &dir(),
+            "echo \"data=$XDG_DATA_HOME\"; echo \"gone=${CIDE_CHECK_GONE-unset}\"",
+            Duration::from_secs(20),
+            Some(&log),
+            &[
+                ("XDG_DATA_HOME".into(), Some("/tmp/cide-isolated".into())),
+                ("CIDE_CHECK_GONE".into(), None),
+            ],
+        );
+        assert!(result.passed, "{result:?}");
+        assert!(
+            result.tail.contains("data=/tmp/cide-isolated"),
+            "{}",
+            result.tail
+        );
+        assert!(result.tail.contains("gone=unset"), "{}", result.tail);
+        let text = std::fs::read_to_string(&log).expect("written");
+        assert!(
+            text.contains("# env: XDG_DATA_HOME=/tmp/cide-isolated\n"),
+            "{text}"
+        );
         let _ = std::fs::remove_file(&log);
     }
 

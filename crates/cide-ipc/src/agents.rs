@@ -548,6 +548,18 @@ pub struct AgentRun {
     /// prose to learn its model is a row that breaks on the next rewording.
     #[serde(default)]
     pub pool_position: Option<String>,
+    /// Whether this run's own checkout — `.cide/worktrees/<role>-<task>` — is on disk right now.
+    /// (M89) What History's Integrate is gated on: no worktree, nothing of the run's to merge
+    /// from the panel, so no button.
+    ///
+    /// **Filled only where a roster is built** (`cide_app::cmd::agents::roster`), which is the one
+    /// place that has the project root and already reads the disk; the registry's own
+    /// [`Self`] says `false`, and so does every other reader of `runs_for`. One `stat` per run
+    /// with a task, at most the registry's fifty — the same order of cost as the `.cide/` read
+    /// that roster already makes, and none at all on the per-run broadcasts that carry no root.
+    /// A run with no task stood in the project root and never had one.
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 /// What pressing **Open** on a run should do, as `agents_run_open` answers it. (M42)
@@ -702,6 +714,13 @@ pub struct OrchestrationConfig {
     /// What a reviewer tab is told, as a template with `{placeholders}`. Empty means *use the
     /// one cide ships*, decided in `AgentsConfig::review_prompt_template`. (M84)
     pub review_prompt: String,
+    /// `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
+    /// Empty when the project isolates nothing, which is the default. (M92)
+    pub isolate_env: Vec<String>,
+    /// `agents.isolateEnvShare`: entries linked back to the real directories.
+    pub isolate_env_share: Vec<String>,
+    /// `agents.verifyExclusive`: whether the project's verifies run one at a time.
+    pub verify_exclusive: bool,
 }
 
 impl Default for OrchestrationConfig {
@@ -718,6 +737,9 @@ impl Default for OrchestrationConfig {
             auto_spin_after_secs: 900,
             auto_spin_prompt: String::new(),
             review_prompt: String::new(),
+            isolate_env: Vec::new(),
+            isolate_env_share: Vec::new(),
+            verify_exclusive: false,
         }
     }
 }
@@ -758,6 +780,17 @@ pub struct OrchestrationPatch {
     /// Flattened to one line by `AgentsConfig::apply`, `auto_spin_prompt`'s reason.
     #[ts(optional)]
     pub review_prompt: Option<String>,
+    /// `agents.isolateEnv`, whole: the list replaces the file's, and an empty one turns
+    /// isolation off. `AgentsConfig::apply` drops a name `cide_core::isolated_env::check_var`
+    /// refuses; the `cide_agents_config` tool refuses it first, with the sentence. (M92)
+    #[ts(optional)]
+    pub isolate_env: Option<Vec<String>>,
+    /// `agents.isolateEnvShare`, whole, `isolate_env`'s terms.
+    #[ts(optional)]
+    pub isolate_env_share: Option<Vec<String>>,
+    /// `agents.verifyExclusive`.
+    #[ts(optional)]
+    pub verify_exclusive: Option<bool>,
 }
 
 /// Dispatch one run. Inbound.
@@ -1373,8 +1406,10 @@ pub struct PoolRunRef {
     pub agent_label: String,
     pub project: ProjectId,
     pub state: RunState,
-    /// `2 of 6`, as the run's own row says it.
+    /// `default entry 2 of 6`, as the run's own row says it — empty for a run on no pool.
     pub position: String,
+    /// The model the run is on, `provider/model`, where one is known.
+    pub model: Option<String>,
     /// The row's sentence — why a waiting run is waiting, or what its last failover was.
     pub note: Option<String>,
 }
@@ -1428,6 +1463,15 @@ pub struct PoolStateReport {
     pub pools: Vec<PoolState>,
     /// Queued runs with a pool, in dispatch order — the ones a Reset can move.
     pub waiting: Vec<PoolRunRef>,
+    /// Slot-holding runs on an opencode-shaped harness **with no pool** — each on its role's own
+    /// `model:` or, failing that, the CLI's own default model.
+    ///
+    /// Asked for by the report that followed the card's first version: a project whose roles
+    /// were never pointed at a pool ran eleven agents on `deepseek/deepseek-flash` — opencode's
+    /// configured default, which happened to be the last entry of the pool named `default` —
+    /// while the card showed that pool with one run on it and said nothing about the rest. A
+    /// pool named "default" is a default for nothing; this list is where that becomes visible.
+    pub off_pool: Vec<PoolRunRef>,
     /// Newest first.
     pub events: Vec<PoolEvent>,
 }
@@ -1630,6 +1674,7 @@ mod tests {
             openable: false,
             model: None,
             pool_position: None,
+            worktree: false,
         };
         let json = serde_json::to_string(&run).expect("serialize");
         // snake_case on both sides would round-trip happily and read `undefined` in the webview.

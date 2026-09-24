@@ -181,7 +181,20 @@ model: string | null,
  * standing fact of what the run is on, and a note is for events. A row that has to parse
  * prose to learn its model is a row that breaks on the next rewording.
  */
-poolPosition: string | null, };
+poolPosition: string | null, 
+/**
+ * Whether this run's own checkout — `.cide/worktrees/<role>-<task>` — is on disk right now.
+ * (M89) What History's Integrate is gated on: no worktree, nothing of the run's to merge
+ * from the panel, so no button.
+ *
+ * **Filled only where a roster is built** (`cide_app::cmd::agents::roster`), which is the one
+ * place that has the project root and already reads the disk; the registry's own
+ * [`Self`] says `false`, and so does every other reader of `runs_for`. One `stat` per run
+ * with a task, at most the registry's fifty — the same order of cost as the `.cide/` read
+ * that roster already makes, and none at all on the per-run broadcasts that carry no root.
+ * A run with no task stood in the project root and never had one.
+ */
+worktree: boolean, };
 
 /**
  * Which of the two directories a definition lives in.
@@ -307,7 +320,7 @@ expectScreen?: string, } | { "t": "paste", session: SessionId, text: string, seq
 /**
  * See [`Self::Input`]'s field of the same name.
  */
-expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "ping" };
+expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "ping" };
 
 /**
  * One frame from a device.

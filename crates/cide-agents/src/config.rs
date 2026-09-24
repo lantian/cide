@@ -159,6 +159,26 @@ pub const DEFAULT_SPIN_PROMPT: &str = "Nothing is running in this project and th
 /// that function still carries the argument for every clause, and still owns the task-less case,
 /// which has no task, branch or role to fill a template with.
 ///
+/// The name of a planning tab, and of the `claude` session in it: `Plan - 2026-09-23 20:27:19`.
+///
+/// Dated because the spinner and the Tasks panel's **Plan tasks** button open a fresh one every
+/// time, and a row of tabs — or a `/resume` list — that all read `Plan` gives nobody a way to
+/// tell yesterday's planner from the one that just opened. Local time on a 24-hour clock: it is
+/// read by the person who pressed the button, next to their own clock.
+///
+/// A parameter rather than reading the clock, `pasted_image_name`'s reason: a function that reads
+/// `Local::now` can only be asserted against itself.
+#[must_use]
+pub fn plan_title(at: chrono::DateTime<chrono::Local>) -> String {
+    format!("Plan - {}", at.format("%Y-%m-%d %H:%M:%S"))
+}
+
+/// The name for a planning tab opened **now**.
+#[must_use]
+pub fn plan_title_now() -> String {
+    plan_title(chrono::Local::now())
+}
+
 /// One line for [`DEFAULT_SPIN_PROMPT`]'s reason: it is typed into a terminal.
 pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, on {task}. You \
      own that task now — nobody else is reviewing it and the product owner has not been told, so \
@@ -523,6 +543,58 @@ pub struct AgentsConfig {
     /// [`DEFAULT_REVIEW_PROMPT`] and [`fill_review_prompt`]. Blank reads as the default, on
     /// [`Self::auto_spin_prompt`]'s argument — [`Self::review_prompt_template`] decides it.
     pub review_prompt: String,
+    /// Which of `cide_core::isolated_env::VARS` (`XDG_DATA_HOME`, `XDG_CACHE_HOME`,
+    /// `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `TMPDIR`) every worktree gets its own copy of, for
+    /// its run and for the verify of its branch alike.
+    ///
+    /// # Why a worktree is not isolation enough
+    ///
+    /// A worktree separates the source tree. A tool's per-user directory — a Godot game's
+    /// `user://` under `$XDG_DATA_HOME`, a test runner's cache — is shared by every concurrent run
+    /// and every verify, so one run's test writing there fails another branch's verify, and
+    /// integrate refuses a correct branch. The module header of `cide_core::isolated_env` has the
+    /// incident and the rules; the short version is that the harnesses' own logins (`opencode`,
+    /// `mimocode`, …), `gh`, git and cide's own directory stay linked to the real ones, and
+    /// [`Self::isolate_env_share`] adds more.
+    ///
+    /// `XDG_CONFIG_HOME` is allowed and rarely wanted: a tool that keeps its credentials there
+    /// and is not in the shared list is logged out in every run. `HOME` is not allowed at all.
+    ///
+    /// Off (empty) by default: an isolated `XDG_CACHE_HOME` is a cold cache per worktree, which is
+    /// a cost only the project can decide to pay. Disk-only and read fresh at each spawn and each
+    /// verify, like its neighbours. Only a run in a worktree of its own is isolated — a run in
+    /// the project root is standing where the user stands, in the user's environment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub isolate_env: Vec<String>,
+    /// Entries (relative paths, `godot/export_templates` as well as `gh`) each isolated directory
+    /// links back to the real one, on top of `cide_core::isolated_env::DEFAULT_SHARED`. For what a
+    /// run must still read from the user's own directory: installed export templates, an SDK, a
+    /// browser download (`ms-playwright`) a cold cache would fetch again in every worktree.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub isolate_env_share: Vec<String>,
+    /// Whether this project's verifies run one at a time.
+    ///
+    /// For shared state [`Self::isolate_env`] cannot reach — a fixed port, a system service, a
+    /// device. A verify then waits for the one ahead of it rather than failing beside it; it is
+    /// queued, never refused, and the wait is said in the integrate answer. Role runs are not
+    /// paused meanwhile: a run's tests can still collide with a verify, which is what
+    /// `isolate_env` is for. Off by default: it makes a busy board's reviews wait on each other.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub verify_exclusive: bool,
+}
+
+impl AgentsConfig {
+    /// The environment a child working in `worktree` gets for [`Self::isolate_env`], its
+    /// directories made. Empty when the project isolates nothing. A run and the verify of its
+    /// branch both call this on the same path, which is what makes them see the same directory
+    /// — a green run is then a green verify.
+    #[must_use]
+    pub fn isolated_env(&self, worktree: &Path) -> Vec<(String, Option<String>)> {
+        cide_core::isolated_env::prepare(worktree, &self.isolate_env, &self.isolate_env_share)
+            .into_iter()
+            .map(|(name, value)| (name, Some(value)))
+            .collect()
+    }
 }
 
 impl Default for AgentsConfig {
@@ -552,6 +624,9 @@ impl Default for AgentsConfig {
             auto_spin_after_secs: DEFAULT_SPIN_AFTER_SECS,
             auto_spin_prompt: DEFAULT_SPIN_PROMPT.to_string(),
             review_prompt: DEFAULT_REVIEW_PROMPT.to_string(),
+            isolate_env: Vec::new(),
+            isolate_env_share: Vec::new(),
+            verify_exclusive: false,
         }
     }
 }
@@ -657,10 +732,16 @@ impl AgentsConfig {
             auto_spin_prompt: self.auto_spin_prompt.clone(),
             // The stored string, for `auto_spin_prompt`'s reason above.
             review_prompt: self.review_prompt.clone(),
+            isolate_env: self.isolate_env.clone(),
+            isolate_env_share: self.isolate_env_share.clone(),
+            verify_exclusive: self.verify_exclusive,
         }
     }
 
     /// Apply a wire patch. `None` means "leave this alone", per `OrchestrationPatch`'s contract.
+    ///
+    /// The M92 isolation keys are on the wire (the `cide_agents_config` tool sets them), and
+    /// [`write`] removes one from the file when it is set back to empty.
     ///
     /// The three disk-only fields are untouched by any patch, deliberately: `isolation`,
     /// `allow_dangerous_permissions` and `nudge_orchestrator` are not on the wire, so a UI
@@ -706,6 +787,33 @@ impl AgentsConfig {
         if let Some(prompt) = patch.review_prompt {
             // Flattened on the way in, `auto_spin_prompt`'s rule and reason.
             self.review_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        // Normalised on the way in — trimmed, deduplicated, and anything the reader would skip
+        // dropped — so the committed file holds exactly what takes effect. The tool refuses a bad
+        // name with a sentence before it gets here; this is the file's own guard.
+        if let Some(vars) = patch.isolate_env {
+            let mut kept: Vec<String> = Vec::new();
+            for var in vars {
+                if let Ok(name) = cide_core::isolated_env::check_var(&var)
+                    && !kept.iter().any(|k| k == name)
+                {
+                    kept.push(name.to_string());
+                }
+            }
+            self.isolate_env = kept;
+        }
+        if let Some(entries) = patch.isolate_env_share {
+            let mut kept: Vec<String> = Vec::new();
+            for entry in entries {
+                let entry = entry.trim().to_string();
+                if cide_core::isolated_env::check_share(&entry).is_ok() && !kept.contains(&entry) {
+                    kept.push(entry);
+                }
+            }
+            self.isolate_env_share = kept;
+        }
+        if let Some(exclusive) = patch.verify_exclusive {
+            self.verify_exclusive = exclusive;
         }
     }
 }
@@ -883,6 +991,20 @@ pub fn write(project_root: &Path, config: &CideConfig) -> io::Result<()> {
 
     let ours = serde_json::to_value(config).map_err(io::Error::other)?;
     merge_object(&mut doc, &ours);
+    // The keys serialised only when set are *cleared* by leaving the file, not by being absent
+    // from `ours` — a merge keeps what it was not handed, so without this turning isolation off
+    // would write nothing and leave it on. `ours` came from the file (`load`, then a patch), so a
+    // key missing from it is one the config now says is empty.
+    if let (Some(agents), Some(ours)) = (
+        doc.get_mut("agents").and_then(Value::as_object_mut),
+        ours.get("agents").and_then(Value::as_object),
+    ) {
+        for key in CLEARED_WHEN_EMPTY {
+            if !ours.contains_key(*key) {
+                agents.remove(*key);
+            }
+        }
+    }
 
     let mut body = serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?;
     // A committed text file without a trailing newline shows as "\ No newline at end of file" in
@@ -890,6 +1012,10 @@ pub fn write(project_root: &Path, config: &CideConfig) -> io::Result<()> {
     body.push(b'\n');
     write_0644(&path, &body)
 }
+
+/// `agents` keys written only while set (`skip_serializing_if`), which [`write`] therefore has to
+/// remove itself when a patch empties one.
+const CLEARED_WHEN_EMPTY: &[&str] = &["isolateEnv", "isolateEnvShare", "verifyExclusive"];
 
 /// Overwrite the keys of `ours` into `doc`, one level deep on nested objects.
 ///
@@ -993,6 +1119,21 @@ fn create_shared(path: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_is_titled_with_its_local_24_hour_time() {
+        use chrono::TimeZone;
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 9, 23, 20, 27, 19)
+            .unwrap();
+        assert_eq!(plan_title(at), "Plan - 2026-09-23 20:27:19");
+        let morning = chrono::Local.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        assert_eq!(
+            plan_title(morning),
+            "Plan - 2026-01-02 03:04:05",
+            "zero-padded, never 12-hour"
+        );
+    }
 
     /// A scratch project root, built the way `cide-core`'s tests build theirs — this workspace
     /// has no temp-dir dependency and is not gaining one.
@@ -1185,6 +1326,84 @@ mod tests {
         assert!(doc.get("milestones").is_none(), "{doc}");
         assert!(load(&root).agents.enabled);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The isolation keys are hand-written, so they are read in their JSON spelling, survive a
+    /// save of the settings the panel does edit, and are absent — not `[]` and `false` — from a
+    /// file that never asked for them.
+    #[test]
+    fn isolation_keys_are_read_and_survive_a_settings_save() {
+        let root = temp("isolate-env");
+        put(
+            &root,
+            r#"{ "version": 1, "agents": { "enabled": true,
+                "isolateEnv": ["XDG_DATA_HOME", "TMPDIR"],
+                "isolateEnvShare": ["godot/export_templates"],
+                "verifyExclusive": true } }"#,
+        );
+        let agents = load(&root).agents;
+        assert_eq!(agents.isolate_env, ["XDG_DATA_HOME", "TMPDIR"]);
+        assert_eq!(agents.isolate_env_share, ["godot/export_templates"]);
+        assert!(agents.verify_exclusive);
+
+        let mut config = load(&root);
+        config.agents.apply(cide_ipc::OrchestrationPatch {
+            max_concurrent: Some(4),
+            ..Default::default()
+        });
+        write(&root, &config).expect("write agents");
+        assert_eq!(load(&root).agents.isolate_env, ["XDG_DATA_HOME", "TMPDIR"]);
+        assert!(load(&root).agents.verify_exclusive);
+
+        // A patch normalises what it is handed, and emptying a key takes it out of the file.
+        let mut config = load(&root);
+        config.agents.apply(cide_ipc::OrchestrationPatch {
+            isolate_env: Some(vec![
+                " XDG_CACHE_HOME ".into(),
+                "HOME".into(),
+                "XDG_CACHE_HOME".into(),
+                "NOPE".into(),
+            ]),
+            isolate_env_share: Some(vec!["../out".into(), "ms-playwright".into()]),
+            ..Default::default()
+        });
+        assert_eq!(config.agents.isolate_env, ["XDG_CACHE_HOME"]);
+        assert_eq!(config.agents.isolate_env_share, ["ms-playwright"]);
+        write(&root, &config).expect("write");
+        assert_eq!(load(&root).agents.isolate_env, ["XDG_CACHE_HOME"]);
+
+        let mut config = load(&root);
+        config.agents.apply(cide_ipc::OrchestrationPatch {
+            isolate_env: Some(Vec::new()),
+            isolate_env_share: Some(Vec::new()),
+            verify_exclusive: Some(false),
+            ..Default::default()
+        });
+        write(&root, &config).expect("write");
+        let doc: Value = serde_json::from_slice(&std::fs::read(config_path(&root)).expect("read"))
+            .expect("json");
+        for key in ["isolateEnv", "isolateEnvShare", "verifyExclusive"] {
+            assert!(doc["agents"].get(key).is_none(), "{key} was cleared: {doc}");
+        }
+        assert!(
+            load(&root).agents.enabled,
+            "and nothing else went with them"
+        );
+
+        let fresh = serde_json::to_value(AgentsConfig::default()).expect("json");
+        for key in ["isolateEnv", "isolateEnvShare", "verifyExclusive"] {
+            assert!(
+                fresh.get(key).is_none(),
+                "{key} is written only when set: {fresh}"
+            );
+        }
+        assert!(
+            AgentsConfig::default()
+                .isolated_env(Path::new("/nonexistent/wt"))
+                .is_empty(),
+            "off by default"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1450,6 +1669,9 @@ mod tests {
             auto_spin_after_secs: 120,
             auto_spin_prompt: "have a look".into(),
             review_prompt: "review {task_id}".into(),
+            isolate_env: vec!["XDG_DATA_HOME".into()],
+            isolate_env_share: vec!["gh".into()],
+            verify_exclusive: true,
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.max_concurrent, 5);
@@ -1463,6 +1685,8 @@ mod tests {
 
         // No disk-only field is on the wire, so no patch can reach any of them.
         assert_eq!(config.isolation, Isolation::Shared);
+        assert_eq!(config.isolate_env, ["XDG_DATA_HOME"]);
+        assert!(config.verify_exclusive);
         assert!(config.allow_dangerous_permissions);
         assert!(
             !config.nudge_orchestrator,

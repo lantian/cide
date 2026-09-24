@@ -224,6 +224,17 @@ pub trait RemoteHost: Send + Sync + 'static {
         Err("this cide does not accept milestones from a device".to_owned())
     }
 
+    /// Accept (`true`) or reject a milestone proposal, as the desk's Proposal card does. (M91)
+    fn proposal_decide(
+        &self,
+        project: ProjectId,
+        id: String,
+        accept: bool,
+    ) -> Result<Option<cide_ipc::MilestonesView>, String> {
+        let _ = (project, id, accept);
+        Err("this cide does not decide proposals from a device".to_owned())
+    }
+
     /// The last MiB of a gate's (`kind: "gate"`) or a verify's (`"verify"`) log.
     fn check_log(
         &self,

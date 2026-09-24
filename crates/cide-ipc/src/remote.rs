@@ -539,6 +539,13 @@ pub enum ClientBody {
         project: ProjectId,
         milestone: String,
     },
+    /// The user accepts a proposal an agent made — a new plan, files, or a note — and cide applies
+    /// it exactly as the desk's Proposal card would. Answered with the new
+    /// [`ServerBody::Milestones`]; refused, with nothing changed, when a file it changes has moved
+    /// since it was proposed. (M91)
+    ProposalAccept { project: ProjectId, id: String },
+    /// Dequeue a proposal; nothing is changed. Answered with the new [`ServerBody::Milestones`].
+    ProposalReject { project: ProjectId, id: String },
     /// The full output of a gate (`kind: "gate"`, `key` a milestone id) or of a verify
     /// (`"verify"`, `key` a task id) — the last MiB of it. Answered with [`ServerBody::CheckLog`].
     CheckLog {

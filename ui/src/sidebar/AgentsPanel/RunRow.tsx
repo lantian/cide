@@ -467,7 +467,11 @@ function RunControls({
  *  * **finished** (`isDonePhase`): a live run is still writing its branch, and merging half a
  *    turn's commits is not a thing anybody means to do from a sidebar;
  *  * **with a task**: a task-less run stands in the project root and mints no branch — its edits
- *    are already in the user's tree, and a merge button there would merge nothing.
+ *    are already in the user's tree, and a merge button there would merge nothing;
+ *  * **whose worktree is still on disk** (`run.worktree`, stat'd by Rust when the roster is
+ *    built): the user's rule — no working tree, no button. A run whose checkout has been removed
+ *    has handed its work on already, or been retired, and an Integrate beside it would be a
+ *    control promising something the panel cannot see is there.
  *
  * It stays offered whether or not the branch has anything the base lacks, for the reason the
  * role-level control was: the wire does not carry that, and `upToDate` is a perfectly good answer
@@ -499,7 +503,7 @@ function IntegrateControl({
 }) {
   const { run } = row
   const task = run.task
-  if (task === null || !isDonePhase(run.phase)) return null
+  if (task === null || !isDonePhase(run.phase) || !run.worktree) return null
   const branch = `cide/${run.agent}-${task}`
   if (armed && onIntegrate !== undefined) {
     return (

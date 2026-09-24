@@ -147,4 +147,17 @@ model: string | null,
  * standing fact of what the run is on, and a note is for events. A row that has to parse
  * prose to learn its model is a row that breaks on the next rewording.
  */
-poolPosition: string | null, };
+poolPosition: string | null, 
+/**
+ * Whether this run's own checkout — `.cide/worktrees/<role>-<task>` — is on disk right now.
+ * (M89) What History's Integrate is gated on: no worktree, nothing of the run's to merge
+ * from the panel, so no button.
+ *
+ * **Filled only where a roster is built** (`cide_app::cmd::agents::roster`), which is the one
+ * place that has the project root and already reads the disk; the registry's own
+ * [`Self`] says `false`, and so does every other reader of `runs_for`. One `stat` per run
+ * with a task, at most the registry's fifty — the same order of cost as the `.cide/` read
+ * that roster already makes, and none at all on the per-run broadcasts that carry no root.
+ * A run with no task stood in the project root and never had one.
+ */
+worktree: boolean, };

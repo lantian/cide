@@ -941,8 +941,9 @@ try {
     eq(
       un.integrates,
       ['r-0005'],
-      'Integrate is offered on exactly the finished run with a task — `cide/qa-t-15` — and not on ' +
-        'the live run (still writing its branch) nor the task-less failure (it minted no branch)',
+      'Integrate is offered on exactly the finished run with a task and a worktree — `cide/qa-t-15` ' +
+        '— and not on the live run (still writing its branch), the task-less failure (it minted no ' +
+        'branch), nor the finished run whose worktree is gone (r-0014: no working tree, no button)',
     )
     ok(
       !un.labels?.includes(INTEGRATE_CONFIRM),

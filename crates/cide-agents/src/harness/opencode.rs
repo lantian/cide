@@ -1722,6 +1722,7 @@ fn child(
         Vec::new(),
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
+    spec = spec.apply(plan.env.clone());
     spec = spec.env(flavor.config_env(), config);
     // What scopes this child's MCP connection to this run's task tools, and nothing else — the
     // app resolves the header's `run` against the registry rather than trusting anything the
@@ -1991,6 +1992,7 @@ mod tests {
             events_path: None,
             theme: Theme::Dark,
             proxy: cide_core::proxy::ProxyEnv::default(),
+            env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
             // Empty in the fixture, so every existing assertion is about the document as it was

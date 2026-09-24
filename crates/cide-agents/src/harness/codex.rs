@@ -881,6 +881,7 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
         Vec::new(),
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
+    spec = spec.apply(plan.env.clone());
     spec = spec.env("CIDE_RUN", plan.run.to_string());
     if let Some(sock) = &plan.agent_sock {
         spec = spec.env("CIDE_AGENT_SOCK", sock.to_string_lossy().to_string());
@@ -1067,6 +1068,7 @@ mod tests {
             events_path: Some(PathBuf::from("/run/user/1000/cide-run-7.events")),
             theme: Theme::Dark,
             proxy: cide_core::proxy::ProxyEnv::default(),
+            env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
             llm: cide_ipc::LlmSettings::default(),

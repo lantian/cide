@@ -1476,6 +1476,36 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
                 }
             }
 
+            (
+                true,
+                ClientBody::ProposalAccept {
+                    project,
+                    id: proposal,
+                },
+            ) => {
+                if decide_proposal(&inner, &out_tx, id_of, project, proposal, true)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            (
+                true,
+                ClientBody::ProposalReject {
+                    project,
+                    id: proposal,
+                },
+            ) => {
+                if decide_proposal(&inner, &out_tx, id_of, project, proposal, false)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
             (true, ClientBody::CheckLog { project, kind, key }) => {
                 let (k, c) = (kind.clone(), key.clone());
                 let sent = match ask(&inner, move |host| host.check_log(project, &k, &c)).await {
@@ -1653,6 +1683,36 @@ fn envelope_id(plaintext: &[u8]) -> Option<u32> {
 /// Silence on success is deliberate and is the same choice every write frame here makes: a device
 /// that needs to know what happened is already subscribed to the board, and an acknowledgement
 /// frame per gesture would be a second, weaker source of truth about the same thing.
+/// Accept or reject a milestone proposal and answer with the new milestone view, or with the
+/// refusal. (M91)
+async fn decide_proposal(
+    inner: &Arc<Inner>,
+    out: &mpsc::Sender<ServerFrame>,
+    id: Option<u32>,
+    project: cide_ipc::ProjectId,
+    proposal: String,
+    accept: bool,
+) -> Result<(), ()> {
+    match ask(inner, move |host| {
+        host.proposal_decide(project, proposal, accept)
+    })
+    .await
+    {
+        Ok(view) => {
+            say(
+                out,
+                id,
+                ServerBody::Milestones {
+                    project,
+                    view: view.map(Box::new),
+                },
+            )
+            .await
+        }
+        Err(why) => refused(out, id, Err(why)).await,
+    }
+}
+
 async fn refused(
     out: &mpsc::Sender<ServerFrame>,
     id: Option<u32>,
@@ -2022,6 +2082,8 @@ mod tests {
         gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
         /// Every `scroll_view` the server asked of the desk.
         paged: Mutex<Vec<(SessionId, i8)>>,
+        /// Every proposal decided, and how.
+        decided: Mutex<Vec<(String, bool)>>,
     }
 
     impl FakeHost {
@@ -2054,6 +2116,7 @@ mod tests {
                 details: Mutex::new(std::collections::HashMap::new()),
                 gate: Mutex::new(None),
                 paged: Mutex::new(Vec::new()),
+                decided: Mutex::new(Vec::new()),
             });
             (host, first, second)
         }
@@ -2180,6 +2243,19 @@ mod tests {
         fn scroll_view(&self, session: SessionId, pages: i8) -> Result<(), String> {
             self.paged.lock().push((session, pages));
             Ok(())
+        }
+
+        fn proposal_decide(
+            &self,
+            _project: ProjectId,
+            id: String,
+            accept: bool,
+        ) -> Result<Option<cide_ipc::MilestonesView>, String> {
+            if id == "moved" {
+                return Err("a file it changes has moved since".to_owned());
+            }
+            self.decided.lock().push((id, accept));
+            Ok(None)
         }
 
         fn prompt(&self, session: SessionId) -> Option<cide_ipc::remote::PermissionPrompt> {
@@ -2517,6 +2593,7 @@ mod tests {
             openable: false,
             model: None,
             pool_position: None,
+            worktree: false,
         });
         h.host.agents.lock().push(cide_ipc::remote::RemoteAgent {
             id: "reviewer".to_owned().into(),
@@ -3625,6 +3702,72 @@ mod tests {
             String::from_utf8_lossy(&written[0].bytes),
             "\x1b[<64;11;1M\x1b[<64;11;1M"
         );
+    }
+
+    /// A proposal decided on a phone is answered with the milestone view, or with the refusal in
+    /// cide's words — never silence, which on a phone reads as a button that did nothing. (M91)
+    #[tokio::test]
+    async fn a_proposal_is_decided_and_answered() {
+        let (h, first, _second) = harness().await;
+        let (device, key) = pair(&h).await;
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        for _ in 0..3 {
+            heard(&mut ws).await.expect("the snapshot");
+        }
+
+        for (asked, body) in [
+            (
+                1,
+                ClientBody::ProposalAccept {
+                    project: first,
+                    id: "p1".to_owned(),
+                },
+            ),
+            (
+                2,
+                ClientBody::ProposalReject {
+                    project: first,
+                    id: "p2".to_owned(),
+                },
+            ),
+        ] {
+            say(&mut ws, Some(asked), body).await;
+            let frame = loop {
+                let frame = heard_frame(&mut ws).await.expect("an answer");
+                if frame.id == Some(asked) {
+                    break frame;
+                }
+            };
+            assert!(matches!(frame.body, ServerBody::Milestones { .. }));
+        }
+        assert_eq!(
+            *h.host.decided.lock(),
+            vec![("p1".to_owned(), true), ("p2".to_owned(), false)]
+        );
+
+        say(
+            &mut ws,
+            Some(3),
+            ClientBody::ProposalAccept {
+                project: first,
+                id: "moved".to_owned(),
+            },
+        )
+        .await;
+        let frame = loop {
+            let frame = heard_frame(&mut ws).await.expect("an answer");
+            if frame.id == Some(3) {
+                break frame;
+            }
+        };
+        match frame.body {
+            ServerBody::Error { kind, detail } => {
+                assert_eq!(kind, error_kind::REFUSED);
+                assert!(detail.contains("moved"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     /// PgUp on a phone scrolls the desk's pane where the history is the terminal's, and asks the

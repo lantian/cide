@@ -1152,14 +1152,30 @@ pub enum AgentIntegration {
 /// application for the length of a merge. Same rule as the rest of the module.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn agents_integrate(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
+    agents: State<'_, Arc<AgentRegistry>>,
     project: ProjectId,
     agent: AgentId,
     task: Option<TaskId>,
 ) -> Result<AgentIntegration> {
     // Resolved on the caller's thread, so no workspace guard crosses the await. See `blocking`.
     let root = project_root(&state, project)?;
-    blocking(move || integrate(&root, &agent, task.as_ref())).await
+    let name = cide_agents::checkout_name(&agent, task.as_ref());
+    let for_a_task = task.is_some();
+    let outcome = blocking(move || integrate(&root, &agent, task.as_ref())).await?;
+    // The work is in (or was already): the task's checkout has nothing left to give, so it goes
+    // — unless a run still stands in it or it holds something the branch does not. (M89) Only
+    // for a task's checkout; the bare role's base branch has no worktree since M40.
+    if for_a_task
+        && matches!(
+            outcome,
+            AgentIntegration::Merged { .. } | AgentIntegration::UpToDate
+        )
+    {
+        crate::agents::retire_worktree(&app, &agents, project, name);
+    }
+    Ok(outcome)
 }
 
 /// [`agents_integrate`]'s body, as a free function over a path — so it is reachable from a test
@@ -1662,7 +1678,21 @@ fn roster(
         // Both come from the registry, which is the only thing in the process that knows them —
         // and they are read *before* this function is called rather than in it, so a roster can
         // still be built from a bare path by a test with no Tauri state. See `project_roster`.
-        runs,
+        runs: runs
+            .into_iter()
+            .map(|mut run| {
+                // Here and not in the registry: this is the one builder with the root in hand,
+                // and it already reads the disk. See `AgentRun::worktree`.
+                run.worktree = run.task.as_ref().is_some_and(|task| {
+                    cide_git::worktree::path_of(
+                        root,
+                        &cide_agents::checkout_name(&run.agent, Some(task)),
+                    )
+                    .is_dir()
+                });
+                run
+            })
+            .collect(),
         dispatching,
     }
 }
@@ -2019,6 +2049,62 @@ mod tests {
         }
         // And a project role is never folded away into `Empty`.
         assert!(!developer.system_prompt.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **History's Integrate is drawn only where the run's worktree is on disk**, and this is
+    /// where that fact is made: the roster builder stats `.cide/worktrees/<role>-<task>` for each
+    /// run with a task. (M89) Two finished runs of one role, one whose checkout exists and one
+    /// whose checkout was removed, plus a task-less run, which never had one.
+    #[test]
+    fn a_run_says_whether_its_worktree_is_still_on_disk() {
+        let root = temp("roster-worktree");
+        enable(&root);
+        role(
+            &root,
+            "developer",
+            "---\nname: developer\ndescription: Implements one task.\n---\nYou are the developer.\n",
+        );
+        let name = cide_agents::checkout_name(
+            &cide_ipc::AgentId("developer".into()),
+            Some(&cide_ipc::TaskId("t-7".into())),
+        );
+        std::fs::create_dir_all(cide_git::worktree::path_of(&root, &name)).expect("worktree dir");
+
+        let run = |task: Option<&str>| cide_ipc::AgentRun {
+            run: cide_ipc::RunId::new(),
+            agent: cide_ipc::AgentId("developer".into()),
+            agent_label: "Developer".into(),
+            harness: cide_ipc::Harness::Claude,
+            project: ProjectId::new(),
+            session: None,
+            state: cide_ipc::RunState::Finished { code: 0 },
+            task: task.map(|id| cide_ipc::TaskId(id.into())),
+            started_unix_ms: 0,
+            worked_ms: 0,
+            working_since_unix_ms: None,
+            notify: cide_ipc::RunNotify::Primary,
+            stale_turn: false,
+            note: None,
+            openable: false,
+            model: None,
+            pool_position: None,
+            worktree: false,
+        };
+        let AgentRoster::Ready { runs, .. } = roster(
+            &root,
+            vec![run(Some("t-7")), run(Some("t-8")), run(None)],
+            true,
+            bridge(),
+        ) else {
+            panic!("an enabled project with a role is ready");
+        };
+        assert_eq!(
+            runs.iter().map(|r| r.worktree).collect::<Vec<_>>(),
+            [true, false, false],
+            "t-7's checkout is on disk; t-8's is not; a task-less run never had one"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

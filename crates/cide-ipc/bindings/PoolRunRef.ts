@@ -8,9 +8,13 @@ import type { RunState } from "./RunState";
  */
 export type PoolRunRef = { run: RunId, agentLabel: string, project: ProjectId, state: RunState, 
 /**
- * `2 of 6`, as the run's own row says it.
+ * `default entry 2 of 6`, as the run's own row says it — empty for a run on no pool.
  */
 position: string, 
+/**
+ * The model the run is on, `provider/model`, where one is known.
+ */
+model: string | null, 
 /**
  * The row's sentence — why a waiting run is waiting, or what its last failover was.
  */

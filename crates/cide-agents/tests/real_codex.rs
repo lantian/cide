@@ -76,6 +76,7 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         events_path: None,
         theme: Theme::Dark,
         proxy: cide_core::proxy::ProxyEnv::default(),
+        env: Vec::new(),
         geometry: Geometry::default(),
         claude: cide_ipc::ClaudeSettings::default(),
         llm: cide_ipc::LlmSettings::default(),

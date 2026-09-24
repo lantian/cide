@@ -32,7 +32,7 @@
 //! whichever comes first, capped at [`MAX_FRAME`].
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
@@ -721,6 +721,8 @@ pub struct PtySession {
     /// [`SpawnSpec::fixed_size`], carried so [`Self::resize`] can refuse.
     fixed_size: bool,
     child_pid: Option<u32>,
+    /// [`SpawnSpec::cwd`] — where the child was **started**, kept for [`Self::spawn_cwd`]. (M89)
+    spawn_cwd: PathBuf,
     exited: Arc<AtomicBool>,
     /// The reaper's answer. Separate from `exited` on purpose: `exited` is *also* set by the
     /// coalescer when the master reaches EOF, which can happen before — or, if a descendant
@@ -892,6 +894,7 @@ impl PtySession {
             geometry: Mutex::new(spec.geometry),
             fixed_size: spec.fixed_size,
             child_pid,
+            spawn_cwd: spec.cwd.clone(),
             exited,
             exit,
             credit: spec.credit,
@@ -905,6 +908,19 @@ impl PtySession {
     /// `ide_connected` notification, so one WebSocket connection maps to exactly one pane.
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// The directory the child was **started** in — [`SpawnSpec::cwd`], verbatim. (M89)
+    ///
+    /// Kept because "is anything standing in this directory" is a question the app has to answer
+    /// before it deletes one: a merged task's worktree is removed only when no pane's child is in
+    /// it, and the pane most likely to be — the reviewer tab cide opens *in* that worktree — is not
+    /// an agent run, so the run registry cannot see it. This is the start directory and not the
+    /// current one; a later `cd` is only visible through `/proc/<pid>/cwd`, which the caller asks
+    /// as well where there is a `/proc`. For an exec into a container it is a path inside the
+    /// container, which simply never matches a host path.
+    pub fn spawn_cwd(&self) -> &Path {
+        &self.spawn_cwd
     }
 
     /// Whether this pane's child is gone, as early as anything here can tell.

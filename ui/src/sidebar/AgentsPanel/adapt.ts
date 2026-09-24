@@ -182,6 +182,7 @@ function run(from: WireRun): RunView {
     openable: from.openable,
     model: from.model,
     poolPosition: from.poolPosition,
+    worktree: from.worktree,
   }
 }
 

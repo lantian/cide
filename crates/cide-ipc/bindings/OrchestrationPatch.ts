@@ -31,4 +31,18 @@ autoSpinPrompt?: string,
 /**
  * Flattened to one line by `AgentsConfig::apply`, `auto_spin_prompt`'s reason.
  */
-reviewPrompt?: string, };
+reviewPrompt?: string, 
+/**
+ * `agents.isolateEnv`, whole: the list replaces the file's, and an empty one turns
+ * isolation off. `AgentsConfig::apply` drops a name `cide_core::isolated_env::check_var`
+ * refuses; the `cide_agents_config` tool refuses it first, with the sentence. (M92)
+ */
+isolateEnv?: Array<string>, 
+/**
+ * `agents.isolateEnvShare`, whole, `isolate_env`'s terms.
+ */
+isolateEnvShare?: Array<string>, 
+/**
+ * `agents.verifyExclusive`.
+ */
+verifyExclusive?: boolean, };

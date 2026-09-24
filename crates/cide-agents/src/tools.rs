@@ -125,7 +125,8 @@
 //!
 //! # `enabled` is reported by the roster and written by nobody here
 //!
-//! [`tool::AGENTS_CONFIG`] patches `maxConcurrent` and `harness` and refuses `enabled` — by name,
+//! [`tool::AGENTS_CONFIG`] patches `maxConcurrent`, `harness` and the M92 isolation keys
+//! (`isolateEnv`, `isolateEnvShare`, `verifyExclusive`) and refuses `enabled` — by name,
 //! with a sentence, rather than by ignoring an argument it was sent. `crate::config`'s header is
 //! the argument: a project that has never heard of subagents can never spawn one, every unreadable
 //! or half-written file funnels to `enabled: false`, and *"guessing `true` … means unattended
@@ -636,9 +637,19 @@ pub trait TaskSink: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Integrated {
     /// The role's branch has nothing the checked-out branch lacks.
-    UpToDate,
+    UpToDate { verified: Option<String> },
     /// Merged, naming the commit and how many files moved. A fast-forward reports this too.
-    Merged { commit: String, files: usize },
+    ///
+    /// `verified` on both success arms is the app's one line about the project's verify command
+    /// when one ran first — when, whether it ran now or its answer was reused, and how long it
+    /// queued behind another branch's (`agents.verifyExclusive`). Said on success as well as on
+    /// refusal because the two refusals of the incident that asked for it were word for word
+    /// the same, and nobody reading them could tell whether verify had run again.
+    Merged {
+        commit: String,
+        files: usize,
+        verified: Option<String>,
+    },
     /// Refused **before touching anything**, listing the conflicting paths.
     Conflicts { paths: Vec<String> },
 }
@@ -1118,7 +1129,22 @@ pub fn description(name: &str) -> &'static str {
              is switch subagents **on or off**: that is the user's opt-in to processes that edit \
              their repository unattended, it lives in the Agents panel, and asking for it here is \
              refused rather than ignored. A raised cap takes effect on the next admission, so a \
-             run already queued starts without being re-dispatched."
+             run already queued starts without being re-dispatched.\n\n\
+             It also sets how runs are kept apart **outside** their git worktrees. A worktree \
+             separates source files only: whatever a project's tools keep in per-user \
+             directories (a Godot game's `user://` under ~/.local/share, a test runner's cache, \
+             $TMPDIR) is shared by every concurrent run and by the verify command integrate runs, \
+             so one run's tests can fail another branch's verify. `isolateEnv` gives each \
+             worktree its own copy of the listed directories — for its run, for the verify of \
+             its branch, and for a pane opened in it, identically. Reach for it when a verify \
+             failure names files or state no branch under review touched and \
+             cide_agent_integrate lists other runs as alive. The harnesses' own logins, `gh`, \
+             git and cide stay linked to the real directories; `isolateEnvShare` links more (an \
+             SDK, export templates, a browser download). Leave `XDG_CONFIG_HOME` out unless you \
+             know every tool the runs need: a tool keeping credentials there and not shared is \
+             logged out in every run. `verifyExclusive` makes the project's verifies run one at \
+             a time, for shared state no directory can hold (a fixed port, a service); it \
+             queues, never refuses, and it does not pause running roles."
         }
         tool::AGENT_OVERRIDE => {
             "Point a role at a different harness, model, pool, effort or permission mode **on this \
@@ -1652,6 +1678,38 @@ pub fn input_schema(name: &str) -> Value {
                          project rather than per machine, because which CLI a team runs is a \
                          property of the team's repository — and this file is committed beside \
                          the role definitions, so the two are reviewed together.",
+                },
+                "isolateEnv": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "string",
+                        "enum": cide_core::isolated_env::VARS
+                            .iter()
+                            .map(|(var, _)| *var)
+                            .collect::<Vec<_>>(),
+                    },
+                    "description":
+                        "The whole list of per-user directories each worktree gets its own copy \
+                         of; it replaces the current list. [] or null turns isolation off. \
+                         Usually XDG_DATA_HOME (application data, a game's user://), \
+                         XDG_CACHE_HOME (caches; each worktree starts cold) and TMPDIR. \
+                         XDG_CONFIG_HOME logs out any tool keeping credentials there that is not \
+                         shared. HOME is never isolated.",
+                },
+                "isolateEnvShare": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description":
+                        "The whole list of extra entries each isolated directory links back to \
+                         the real one: relative paths such as `ms-playwright` or \
+                         `godot/export_templates`, never `..`. The harnesses' logins, `gh`, \
+                         git and cide are always linked. [] or null clears it.",
+                },
+                "verifyExclusive": {
+                    "type": "boolean",
+                    "description":
+                        "Run this project's verifies one at a time, queued. For shared state \
+                         isolateEnv cannot reach: a fixed port, a local service, a device.",
                 },
             },
         }),
@@ -3797,20 +3855,59 @@ fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(field) => field.onto(None),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
     };
+    // Refused whole, with the sentence, rather than filtered: a list that quietly lost a name
+    // would be a call that reported success and isolated less than it was asked to.
+    let isolate_env = match checked_list(arguments, "isolateEnv", "variable names", |var| {
+        cide_core::isolated_env::check_var(var).map(|_| ())
+    }) {
+        Ok(list) => list,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
+    };
+    let isolate_env_share = match checked_list(
+        arguments,
+        "isolateEnvShare",
+        "relative paths",
+        cide_core::isolated_env::check_share,
+    ) {
+        Ok(list) => list,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
+    };
+    let verify_exclusive = match optional_bool(arguments, "verifyExclusive") {
+        Ok(value) => value,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
+    };
     // A call that names nothing is a *read*, and this vocabulary has one of those already. It is
     // answered with the name of it rather than with the config, so there is one place a model
     // learns this project's settings and one shape of answer to remember.
-    if max_concurrent.is_none() && harness.is_none() {
+    if max_concurrent.is_none()
+        && harness.is_none()
+        && isolate_env.is_none()
+        && isolate_env_share.is_none()
+        && verify_exclusive.is_none()
+    {
         return ToolResult::error(format!(
-            "{}: name `maxConcurrent`, `harness`, or both. To *read* this project's settings, \
-             call {}, which reports them beside the roles they apply to.",
+            "{}: name at least one of `maxConcurrent`, `harness`, `isolateEnv`, \
+             `isolateEnvShare` or `verifyExclusive`. To *read* this project's settings, call {}, \
+             which reports them beside the roles they apply to.",
             tool::AGENTS_CONFIG,
             tool::AGENTS_LIST
         ));
     }
+    let config_home = isolate_env
+        .as_ref()
+        .is_some_and(|vars| vars.iter().any(|v| v.trim() == "XDG_CONFIG_HOME"));
 
     // `..Default::default()` and not a field per key, and the omission is the point: every
     // other key in this struct is `None` here **for ever**, not until somebody gets round to it.
+    //
+    // The three isolation keys (M92) are here with the argument the paragraph below asks for.
+    // Each one only **narrows** what a run can reach or **orders** work already asked for: a run
+    // writes its scratch into a directory of its own instead of the user's, or a verify waits
+    // for the one ahead of it. None starts a process, spends anything, or puts anything on the
+    // user's screen, and each is undone by the same call. And the model is who meets the need:
+    // a verify refused over state another worktree wrote is read by the orchestrator first, and
+    // the refusal names this tool as the fix. The worst a bad list does is log tools out
+    // (`XDG_CONFIG_HOME`), which the answer warns about and the next call reverses.
     //
     // `enabled` is refused by name above, loudly. The five M79 keys are refused by silence, and
     // they are the stronger case of the two: `autoSpin` starts a billed `claude` off a *timer*,
@@ -3823,12 +3920,22 @@ fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         enabled: None,
         max_concurrent,
         harness,
+        isolate_env,
+        isolate_env_share,
+        verify_exclusive,
         ..Default::default()
     };
     match sink.set_config(patch) {
         Ok(config) => ToolResult::text(format!(
-            "Saved to .cide/config.json, which your next commit carries. {}",
-            config_sentence(&config)
+            "Saved to .cide/config.json, which your next commit carries. {}{}",
+            config_sentence(&config),
+            if config_home {
+                " XDG_CONFIG_HOME is isolated: a tool keeping its login there that is not in \
+                 the shared list (gh and git are) starts logged out in every run — add it to \
+                 isolateEnvShare, or drop XDG_CONFIG_HOME, if a run needs it."
+            } else {
+                ""
+            }
         )),
         Err(why) => ToolResult::error(format!("{}: {why}", tool::AGENTS_CONFIG)),
     }
@@ -3838,8 +3945,12 @@ fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
 ///
 /// One producer, because the two would otherwise be two accounts of one file printed into the
 /// same conversation a few turns apart.
+///
+/// Isolation is said only when the project has some: every roster naming three settings that
+/// are off would be noise read in every planning turn, and the tool's own description is where
+/// a model learns they exist.
 fn config_sentence(config: &OrchestrationConfig) -> String {
-    format!(
+    let mut sentence = format!(
         "Subagents are {}, up to {} run(s) at once across the project, default harness {}.",
         match config.enabled {
             true => "on",
@@ -3847,7 +3958,21 @@ fn config_sentence(config: &OrchestrationConfig) -> String {
         },
         config.max_concurrent,
         harness_wire(config.harness)
-    )
+    );
+    if !config.isolate_env.is_empty() {
+        sentence.push_str(&format!(
+            " Each worktree has its own {}{}.",
+            config.isolate_env.join(", "),
+            match config.isolate_env_share.is_empty() {
+                true => String::new(),
+                false => format!(" (sharing {})", config.isolate_env_share.join(", ")),
+            }
+        ));
+    }
+    if config.verify_exclusive {
+        sentence.push_str(" Verifies run one at a time.");
+    }
+    sentence
 }
 
 /// Patch one row of this project's local overrides — or the row every role falls back to. (M71)
@@ -4886,14 +5011,20 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     let branch = crate::checkout_name(&agent, task.as_ref());
 
     match sink.integrate(&agent, task.as_ref()) {
-        Ok(Integrated::UpToDate) => ToolResult::text(format!(
+        Ok(Integrated::UpToDate { verified }) => ToolResult::text(format!(
             "`cide/{branch}` has nothing this branch does not already have, so nothing was \
-             merged."
+             merged.{}",
+            verified_suffix(verified.as_deref())
         )),
-        Ok(Integrated::Merged { commit, files }) => ToolResult::text(format!(
+        Ok(Integrated::Merged {
+            commit,
+            files,
+            verified,
+        }) => ToolResult::text(format!(
             "Merged `cide/{branch}` into this project's branch: commit {}, {files} file(s) \
-             changed.",
-            short(&commit)
+             changed.{}",
+            short(&commit),
+            verified_suffix(verified.as_deref())
         )),
         // An error, so the model gets a sentence it acts on rather than a success it reports.
         // Nothing was changed — `cide_git::worktree::integrate` computes the merge in memory and
@@ -4911,6 +5042,14 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         )),
         Err(why) => ToolResult::error(format!("{}: {why}", tool::AGENT_INTEGRATE)),
     }
+}
+
+/// The app's verify line, on a line of its own after an integrate's answer.
+fn verified_suffix(verified: Option<&str>) -> String {
+    verified
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| format!("\n{}", line.trim()))
+        .unwrap_or_default()
 }
 
 /// A role name argument, refused when blank.
@@ -5371,6 +5510,40 @@ fn nullable_tools(arguments: &Value, key: &str) -> Result<Field<Vec<String>>, St
         return Ok(Field::Null);
     }
     Ok(Field::Value(tools))
+}
+
+/// A whole-list argument: absent is `None`, `null` or `[]` is `Some(empty)` — "none" — and a
+/// list is every item passing `check`, or the first item's refusal. `what` names the items.
+fn checked_list(
+    arguments: &Value,
+    key: &str,
+    what: &str,
+    check: impl Fn(&str) -> Result<(), String>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`{key}` must be an array of {what}, or null, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut list = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(format!(
+                "`{key}` must contain {what} as strings, not {}",
+                kind_of(item)
+            ));
+        };
+        check(text).map_err(|why| format!("{why}. Nothing was written."))?;
+        list.push(text.to_string());
+    }
+    Ok(Some(list))
 }
 
 /// Which definition file to act on, when the caller says.
@@ -6688,6 +6861,95 @@ mod tests {
         assert!(text.contains("default harness opencode"), "{text}");
         assert_eq!(sink.config.lock().max_concurrent, 3);
         assert_eq!(sink.config.lock().harness, Harness::Opencode);
+    }
+
+    /// The isolation keys (M92): set, reported back and in the roster, warned about when they
+    /// log tools out, refused whole when a name is wrong, and turned off by `[]` or `null`.
+    #[test]
+    fn the_config_tool_sets_isolation_and_refuses_what_the_reader_would_skip() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENTS_CONFIG,
+            json!({
+                "isolateEnv": ["XDG_DATA_HOME", "TMPDIR"],
+                "isolateEnvShare": ["godot/export_templates"],
+                "verifyExclusive": true
+            }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        assert!(
+            text.contains(
+                "Each worktree has its own XDG_DATA_HOME, TMPDIR (sharing godot/export_templates)."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Verifies run one at a time."), "{text}");
+        assert!(
+            !text.contains("logged out"),
+            "no warning without XDG_CONFIG_HOME: {text}"
+        );
+        assert!(sink.config.lock().verify_exclusive);
+        assert_eq!(
+            sink.config.lock().max_concurrent,
+            2,
+            "an unnamed key is left alone"
+        );
+        let listed = text_of(&ask(tool::AGENTS_LIST, json!({}), &sink));
+        assert!(
+            listed.contains("Each worktree has its own XDG_DATA_HOME"),
+            "{listed}"
+        );
+
+        let warned = text_of(&ask(
+            tool::AGENTS_CONFIG,
+            json!({ "isolateEnv": ["XDG_CONFIG_HOME"] }),
+            &sink,
+        ));
+        assert!(
+            warned.contains("starts logged out in every run"),
+            "{warned}"
+        );
+
+        for (arguments, expect) in [
+            (
+                json!({ "isolateEnv": ["HOME"] }),
+                "`HOME` is never isolated",
+            ),
+            (
+                json!({ "isolateEnv": ["XDG_DATA"] }),
+                "not a variable cide isolates",
+            ),
+            (json!({ "isolateEnv": "XDG_DATA_HOME" }), "must be an array"),
+            (
+                json!({ "isolateEnvShare": ["../ssh"] }),
+                "not a relative path",
+            ),
+            (json!({ "verifyExclusive": "yes" }), "verifyExclusive"),
+        ] {
+            let answer = ask(tool::AGENTS_CONFIG, arguments.clone(), &sink);
+            assert!(answer.is_error, "{arguments}");
+            assert!(
+                text_of(&answer).contains(expect),
+                "{arguments}: {}",
+                text_of(&answer)
+            );
+        }
+        assert_eq!(
+            sink.config.lock().isolate_env,
+            ["XDG_CONFIG_HOME"],
+            "a refused call writes nothing"
+        );
+
+        let off = text_of(&ask(
+            tool::AGENTS_CONFIG,
+            json!({ "isolateEnv": null, "isolateEnvShare": [], "verifyExclusive": false }),
+            &sink,
+        ));
+        assert!(!off.contains("Each worktree"), "{off}");
+        assert!(sink.config.lock().isolate_env.is_empty());
+        assert!(sink.config.lock().isolate_env_share.is_empty());
     }
 
     /// A call that names nothing is a read, and there is already a tool for that.
@@ -8640,6 +8902,15 @@ mod tests {
             if let Some(enabled) = patch.enabled {
                 config.enabled = enabled;
             }
+            if let Some(vars) = patch.isolate_env {
+                config.isolate_env = vars;
+            }
+            if let Some(entries) = patch.isolate_env_share {
+                config.isolate_env_share = entries;
+            }
+            if let Some(exclusive) = patch.verify_exclusive {
+                config.verify_exclusive = exclusive;
+            }
             Ok(config.clone())
         }
 
@@ -8765,6 +9036,7 @@ mod tests {
             openable: false,
             model: None,
             pool_position: None,
+            worktree: false,
         }
     }
 
@@ -8803,7 +9075,7 @@ mod tests {
                 secs: 60,
                 task: Some(TaskId::from("t-1".to_string())),
             }),
-            integration: Integrated::UpToDate,
+            integration: Integrated::UpToDate { verified: None },
             broken: None,
             now: NOW,
             // The default project shape; `the_list_prints_the_effective_concurrency` flips it.
@@ -9473,6 +9745,10 @@ mod tests {
             integration: Integrated::Merged {
                 commit: "0123456789abcdef".into(),
                 files: 3,
+                verified: Some(
+                    "Verify ran 23:03:12–23:05:40 (fresh), after waiting 12s for `cide/qa-tester-t-301`."
+                        .into(),
+                ),
             },
             ..roster()
         };
@@ -9484,6 +9760,10 @@ mod tests {
         assert!(
             text.contains("commit 01234567, 3 file(s) changed"),
             "{text}"
+        );
+        assert!(
+            text.contains("\nVerify ran 23:03:12–23:05:40 (fresh), after waiting 12s"),
+            "the verify line rides the success answer: {text}"
         );
 
         let text = text_of(&ask(

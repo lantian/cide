@@ -641,6 +641,17 @@ pub struct RunPlan<'a> {
     /// scope decision (`ProxyScope::claude` versus `::shells`) belongs to the settings layer.
     /// A subagent is a `claude`, so it takes the `claude` column.
     pub proxy: ProxyEnv,
+    /// The project's isolated per-worktree directories (`agents.isolateEnv`), laid over the
+    /// child's environment after [`Self::proxy`] and before every `CIDE_*` variable, so a
+    /// project's list can never shadow cide's own routing keys. Empty for a run in the project
+    /// root and for a project that isolates nothing.
+    ///
+    /// **The same list the verify of this run's branch gets** — both come from
+    /// `AgentsConfig::isolated_env` on the same worktree path — which is the point: a test that
+    /// passes in the run passes in the verify, rather than passing on a machine that happened to
+    /// be quiet. Computed by the caller because it makes directories and this crate reads no
+    /// disk.
+    pub env: Vec<(String, Option<String>)>,
     /// The terminal size the child is told it has.
     ///
     /// A headless run has no pane and therefore no measurement, so this is a default — which is a
@@ -1098,6 +1109,124 @@ pub fn for_kind(kind: cide_ipc::Harness) -> Option<&'static dyn Harness> {
 mod tests {
     use super::*;
 
+    /// `agents.isolateEnv` reaches every harness's child as the plan carries it — the list
+    /// `AgentsConfig::isolated_env` answers, which is the list the verify of the branch runs
+    /// with — and cannot shadow cide's own routing keys. An empty list adds nothing, so a
+    /// project that isolates nothing spawns exactly as before.
+    #[test]
+    fn the_isolated_environment_reaches_every_harness_and_cannot_shadow_cides_own() {
+        use cide_ipc::{AgentDef, AgentId};
+        let isolated = vec![
+            (
+                "XDG_DATA_HOME".to_string(),
+                Some("/cache/isolated-env/wt/xdg_data_home".to_string()),
+            ),
+            (
+                "TMPDIR".to_string(),
+                Some("/cache/isolated-env/wt/tmpdir".to_string()),
+            ),
+            ("CIDE_RUN".to_string(), Some("forged".to_string())),
+        ];
+        for harness in registry() {
+            let kind = harness.kind();
+            let agent = LoadedAgent {
+                def: AgentDef {
+                    id: AgentId("developer".into()),
+                    label: "Developer".into(),
+                    scope: cide_ipc::agents::AgentScope::Project,
+                    harness: kind,
+                    description: "Implements one task end to end.".into(),
+                    system_prompt: "Do it.".into(),
+                    model: None,
+                    color: None,
+                    unavailable: None,
+                    max_concurrent: 1,
+                    worktree: true,
+                },
+                origin: PathBuf::from("/repo/.cide/agents/developer.md"),
+                shadows: None,
+                tools: Vec::new(),
+                permission_mode: None,
+                effort: None,
+                extras: Vec::new(),
+            };
+            let spawn = |env: Vec<(String, Option<String>)>| {
+                let run = RunId::new();
+                let plan = RunPlan {
+                    run,
+                    session: SessionId::new(),
+                    agent: &agent,
+                    cwd: PathBuf::from("/repo/.cide/worktrees/developer-t-1"),
+                    project: ProjectId::new(),
+                    task: Some(TaskId("t-1".into())),
+                    task_title: Some("A task".into()),
+                    change: None,
+                    spec_cli: None,
+                    spec_apply: None,
+                    prompt: "Do the task described above.".into(),
+                    hook_bin: Some(PathBuf::from("/opt/cide/cide-hook")),
+                    hook_sock: Some(PathBuf::from("/run/user/1000/cide-hooks-42.sock")),
+                    agent_sock: Some(PathBuf::from("/run/user/1000/cide-agents-42.sock")),
+                    events_path: None,
+                    theme: Theme::Dark,
+                    proxy: ProxyEnv::default(),
+                    env,
+                    geometry: Geometry::default(),
+                    claude: cide_ipc::ClaudeSettings::default(),
+                    llm: cide_ipc::LlmSettings::default(),
+                    choice: None,
+                    harness: kind,
+                    unattended: crate::config::Unattended::Ask,
+                    tracker_paragraphs: true,
+                };
+                let spec = harness
+                    .spawn_spec(&plan)
+                    .unwrap_or_else(|e| panic!("{kind:?}: {e}"))
+                    .spec;
+                (run, spec)
+            };
+            // The value a child actually gets: the last set of a name wins.
+            let last = |spec: &cide_pty::SpawnSpec, name: &str| {
+                spec.env
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            };
+
+            let (run, spec) = spawn(isolated.clone());
+            assert_eq!(
+                last(&spec, "XDG_DATA_HOME").as_deref(),
+                Some("/cache/isolated-env/wt/xdg_data_home"),
+                "{kind:?}"
+            );
+            assert_eq!(
+                last(&spec, "TMPDIR").as_deref(),
+                Some("/cache/isolated-env/wt/tmpdir"),
+                "{kind:?}"
+            );
+            assert_eq!(
+                last(&spec, "CIDE_RUN"),
+                Some(run.to_string()),
+                "{kind:?}: a project's list must not shadow cide's routing key"
+            );
+
+            let (_, plain) = spawn(Vec::new());
+            for name in [
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "TMPDIR",
+            ] {
+                assert_eq!(
+                    last(&plain, name),
+                    None,
+                    "{kind:?}: isolation is off by default"
+                );
+            }
+        }
+    }
+
     /// Exactly the harnesses that can be typed into have something to interrupt, and it is Esc.
     ///
     /// Written against [`Self::deliver`]'s answer rather than against a list of names, because
@@ -1428,6 +1557,7 @@ mod tests {
                 events_path: None,
                 theme: Theme::Dark,
                 proxy: ProxyEnv::default(),
+                env: Vec::new(),
                 geometry: Geometry::default(),
                 claude: cide_ipc::ClaudeSettings::default(),
                 llm: cide_ipc::LlmSettings::default(),

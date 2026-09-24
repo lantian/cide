@@ -121,6 +121,32 @@ impl TempRepo {
         std::fs::read(self.root.join(path)).expect("read file")
     }
 
+    /// Overwrite a file whose current bytes were *just* staged, so that stat-based change
+    /// detection sees the edit.
+    ///
+    /// The index entry records the file's mtime and size. Rewriting it microseconds later
+    /// usually keeps the same second, and often (a mutation that swaps a line for one of the
+    /// same length) the same size — and a `git` built without `USE_NSEC`, which is the macOS
+    /// one on CI, compares mtimes to the second. The entry then looks clean, and since
+    /// `restore_index` gives the index file a fresh mtime it does not look *racy* either, so
+    /// `git add` skips the rehash and keeps the stale blob. `synthesized_patches_agree_with_git_apply_cached`
+    /// failed exactly that way on macOS (seed 191, a CRLF rename): libgit2's `add_path`, which
+    /// always hashes, staged the edit and the `git add` reference did not. Linux git compares
+    /// nanoseconds and never showed it. An editor saving the file a second later is the real
+    /// world this stands in for, so the mtime is moved two seconds past the staged one.
+    pub fn rewrite(&self, path: &str, bytes: &[u8]) {
+        let full = self.root.join(path);
+        let staged = std::fs::metadata(&full)
+            .and_then(|meta| meta.modified())
+            .unwrap_or_else(|e| panic!("mtime of {path}: {e}"));
+        self.write(path, bytes);
+        std::fs::File::options()
+            .write(true)
+            .open(&full)
+            .and_then(|file| file.set_modified(staged + std::time::Duration::from_secs(2)))
+            .unwrap_or_else(|e| panic!("bumping mtime of {path}: {e}"));
+    }
+
     pub fn remove(&self, path: &str) {
         let _ = std::fs::remove_file(self.root.join(path));
     }

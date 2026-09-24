@@ -530,6 +530,7 @@ function asRun(chip: Chip): RunView {
     openable: chip.openable,
     model: null,
     poolPosition: null,
+    worktree: false,
   }
 }
 

@@ -28,6 +28,8 @@ pub mod format;
 pub mod handshake;
 /// Images: what a file is, from its own bytes. The sibling of [`document`], never its pixels.
 pub mod image;
+/// A worktree's own copies of the per-user XDG directories, for a run and its verify alike.
+pub mod isolated_env;
 pub mod jsonlog;
 pub mod keymap;
 pub mod layout;

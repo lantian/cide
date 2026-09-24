@@ -1347,6 +1347,17 @@ fn report_exit(app: &AppHandle, id: SessionId, pid: Option<u32>, exit: &Exit) {
         agents.forget_viewer(id);
     }
 
+    // And a worktree this child was standing in (M89): a merged task's checkout is kept while any
+    // live pane is in it — the reviewer tab cide opens *in* the worktree it reviews is the usual
+    // one — and nothing else would ask again once that pane is gone. The entry is still in the
+    // registry here (see the note at the foot of this function), which is where the spawn
+    // directory is read from.
+    if let Some(sessions) = app.try_state::<crate::state::SessionRegistry>()
+        && let Some(session) = sessions.get(id)
+    {
+        crate::agents::retire_after_pane_exit(app, session.spawn_cwd());
+    }
+
     // And the IDE server's pid → pane table, for the same "do not answer for a corpse"
     // reason one rung sideways.
     //

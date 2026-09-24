@@ -156,6 +156,7 @@ function run(over: Partial<RunView> & Pick<RunView, 'run' | 'agent' | 'agentLabe
     openable: (over.session ?? null) !== null,
     model: null,
     poolPosition: null,
+    worktree: false,
     ...over,
   }
 }
@@ -323,6 +324,26 @@ const FINISHED = run({
   workedMs: 372_000,
   exitCode: 0,
   model: 'sonnet',
+  // Its checkout `.cide/worktrees/qa-t-15` is still on disk, so History offers Integrate.
+  worktree: true,
+})
+
+/*
+ * The same finished run after its worktree was removed — the branch may still exist, but the
+ * checkout is gone, so History offers no Integrate. (M89) The pair with `FINISHED` is the
+ * assertion: same phase, same task, and only the worktree differs.
+ */
+const FINISHED_NO_WORKTREE = run({
+  run: 'r-0014',
+  agent: 'developer',
+  agentLabel: 'Developer',
+  session: 's-0014',
+  phase: 'finished',
+  task: 't-14',
+  startedMs: NOW_MS - 9_400_000,
+  workedMs: 200_000,
+  exitCode: 0,
+  model: 'opus',
 })
 
 const FAILED = run({
@@ -656,7 +677,10 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
    * root and minted no branch) and `RUNNING` is still writing, so neither may carry it. (M89: it
    * was on every role row, merging a base branch per-task worktrees had emptied.)
    */
-  'integrate-unarmed': story({ roster: ready([RUNNING, FINISHED, FAILED]), tab: 'history' }),
+  'integrate-unarmed': story({
+    roster: ready([RUNNING, FINISHED, FINISHED_NO_WORKTREE, FAILED]),
+    tab: 'history',
+  }),
 
   /*
    * Integrate, armed — the confirm-on-second-click state, which changes the user's *own* branch

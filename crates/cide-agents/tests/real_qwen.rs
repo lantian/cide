@@ -78,6 +78,7 @@ fn a_real_turn_ends_in_a_result_event_and_the_child_stays_interactive() {
         events_path: Some(fifo.clone()),
         theme: Theme::Dark,
         proxy: cide_core::proxy::ProxyEnv::default(),
+        env: Vec::new(),
         geometry: Geometry::default(),
         claude: cide_ipc::ClaudeSettings::default(),
         llm: cide_ipc::LlmSettings::default(),

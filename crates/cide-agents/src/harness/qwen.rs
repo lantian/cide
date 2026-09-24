@@ -476,6 +476,7 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
         Vec::new(),
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
+    spec = spec.apply(plan.env.clone());
     spec = spec
         .env_remove("QWEN_CODE_IDE_SERVER_PORT")
         .env_remove("QWEN_CODE_IDE_WORKSPACE_PATH");
@@ -605,6 +606,7 @@ mod tests {
             events_path: Some(PathBuf::from("/run/user/1000/cide-run-7.events")),
             theme: Theme::Dark,
             proxy: cide_core::proxy::ProxyEnv::default(),
+            env: Vec::new(),
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
             llm: cide_ipc::LlmSettings::default(),

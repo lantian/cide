@@ -289,6 +289,11 @@ interface AgentsStore {
    * three; the surfaces that *do* move — the file tree, the Git panel — are driven by the
    * filesystem watcher, which sees the checkout. A refresh here would be a round trip asking a
    * question whose answer cannot have changed.
+   *
+   * One thing *does* move since M89: a merged task's worktree is removed afterwards
+   * (`agents::retire_worktree`), which flips `AgentRun::worktree` and takes History's Integrate
+   * away. That removal happens on a Rust thread after this call has answered, and it pushes the
+   * roster itself (`mark_changed`), so a refresh here would still arrive too early to see it.
    */
   integrate: (agent: AgentId, task?: string) => Promise<AgentIntegration>
 }

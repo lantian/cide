@@ -84,4 +84,17 @@ autoSpinPrompt: string,
  * What a reviewer tab is told, as a template with `{placeholders}`. Empty means *use the
  * one cide ships*, decided in `AgentsConfig::review_prompt_template`. (M84)
  */
-reviewPrompt: string, };
+reviewPrompt: string, 
+/**
+ * `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
+ * Empty when the project isolates nothing, which is the default. (M92)
+ */
+isolateEnv: Array<string>, 
+/**
+ * `agents.isolateEnvShare`: entries linked back to the real directories.
+ */
+isolateEnvShare: Array<string>, 
+/**
+ * `agents.verifyExclusive`: whether the project's verifies run one at a time.
+ */
+verifyExclusive: boolean, };

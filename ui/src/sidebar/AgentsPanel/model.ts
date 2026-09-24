@@ -555,6 +555,12 @@ export interface RunView {
   model: string | null
   /** The pool that chose `model` and how far down it — `fast 2 of 3` — or `null`. (M89) */
   poolPosition: string | null
+  /**
+   * Whether the run's own checkout, `.cide/worktrees/<role>-<task>`, is on disk. (M89)
+   * `AgentRun::worktree`, stat'd by the roster builder. History's Integrate is drawn only when
+   * it is `true`: with no worktree there is nothing of this run's to take from the panel.
+   */
+  worktree: boolean
 }
 
 /**

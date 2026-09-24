@@ -480,7 +480,7 @@ fn generate(corpus: &Corpus, rng: &mut Rng) -> Case {
                 index
                     .add_path(Path::new(RENAME_TO))
                     .expect("add rename target");
-                repo.write(
+                repo.rewrite(
                     RENAME_TO,
                     &mutate(rng, &source.bytes, source.eol, source.trailing),
                 );
@@ -550,7 +550,7 @@ fn text_part(repo: &TempRepo, index: &mut git2::Index, rng: &mut Rng, path: &'st
             let base = text(rng, lines, eol, trailing);
             repo.write(path, &base);
             index.add_path(Path::new(path)).expect("add");
-            repo.write(path, &mutate(rng, &base, eol, trailing));
+            repo.rewrite(path, &mutate(rng, &base, eol, trailing));
         }
         Shape::Emptied => {
             let lines = 3 + rng.below(8);

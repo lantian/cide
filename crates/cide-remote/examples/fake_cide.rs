@@ -279,6 +279,7 @@ impl RemoteHost for Constants {
             openable: true,
             model: None,
             pool_position: None,
+            worktree: false,
         };
         vec![
             base.clone(),
