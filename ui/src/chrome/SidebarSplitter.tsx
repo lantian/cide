@@ -209,6 +209,8 @@ export interface SidebarSplitterProps {
 
 export function SidebarSplitter({ panel }: SidebarSplitterProps) {
   const stored = useWorkspace((s) => s.boot?.workspace.settings.sidebar ?? null)
+  // Every snapshot, as a primitive — see the adopt effect below for why it is subscribed.
+  const rev = useWorkspace((s) => s.boot?.workspace.rev)
 
   const [active, setActive] = useState(false)
   const dragging = useRef(false)
@@ -252,7 +254,12 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     live.current = painted(held)[panel]
     writeCache(held)
     paint(held)
-  }, [stored, panel])
+    // `rev` is read by nothing here and is in the list on purpose. "The next snapshot corrects
+    // it" is this effect's contract — after a rejected write, or a cancelled drag that `stop`
+    // left painted at `live` — and it used to hold because `stored` was a new object on every
+    // snapshot. Since the mirror is structurally shared (`store/shareEqual`) an unchanged
+    // `settings.sidebar` keeps its identity, so the revision is what says a snapshot landed.
+  }, [stored, panel, rev])
 
   useEffect(
     () => () => {

@@ -146,6 +146,7 @@ import {
   toolWindow as toolWindowApi,
   windowLabel,
   windowRole,
+  type Pane,
   type PaneRestore,
   type Project,
   type ProjectId,
@@ -2428,24 +2429,19 @@ const WorkspaceContent = memo(function WorkspaceContent({
   const closeTabs = useWorkspace((s) => s.closeTabs)
   const reorderTab = useWorkspace((s) => s.reorderTab)
   const splitPane = useWorkspace((s) => s.splitPane)
-  const closePane = useWorkspace((s) => s.closePane)
   const focusPane = useWorkspace((s) => s.focusPane)
-  const maximizePane = useWorkspace((s) => s.maximizePane)
-  const movePane = useWorkspace((s) => s.movePane)
   const setRatio = useWorkspace((s) => s.setRatio)
-  const bindSession = useWorkspace((s) => s.bindSession)
-  const detachPane = useWorkspace((s) => s.detachPane)
-  const detachTab = useWorkspace((s) => s.detachTab)
 
   // Hoisted out of `renderPane`, which built them per pane per render: both depend only on
   // the project.
-  const rootPaths = useMemo(
-    () => (activeProject === null ? [] : activeProject.roots.map((r) => r.path)),
-    [activeProject],
-  )
+  // Keyed on what each reads, not on `activeProject`: the project object is new whenever any of
+  // its panes changes, and both of these are props of every memoised `TabPane`.
+  const roots = activeProject?.roots
+  const rootPaths = useMemo(() => (roots === undefined ? [] : roots.map((r) => r.path)), [roots])
+  const openProjectId = activeProject?.id
   const onOpenPath = useMemo(
-    () => (activeProject === null ? undefined : openTerminalPath(activeProject.id)),
-    [openTerminalPath, activeProject],
+    () => (openProjectId === undefined ? undefined : openTerminalPath(openProjectId)),
+    [openTerminalPath, openProjectId],
   )
 
   /*
@@ -2589,186 +2585,36 @@ const WorkspaceContent = memo(function WorkspaceContent({
                       onRatioCommit={(split, ratio) =>
                         void setRatio(activeProject.id, tab.id, split, ratio)
                       }
-                      renderPane={(paneNode, index) => {
-                        /*
-                         * What this pane's corner cluster acts on — `windows/windowTabs.ts`
-                         * holds the rule. A tab's only pane closes and detaches as the
-                         * *tab*: `layout::close` and `layout::take_pane` both refuse a
-                         * tab's last pane, and these two buttons used to run straight into
-                         * that refusal and print `lastPane` at the user. Its maximize is
-                         * withheld outright — one pane already fills its tab. The pinned
-                         * console is exempt so its primary pane keeps the role-based
-                         * refusals `PaneFrame` already words.
-                         *
-                         * (`clusterPlan` reads the tab, not the pane, and is cheap enough
-                         * that a per-pane call costs only tidiness — it stays here because
-                         * this comment is about *what the plan means*, and the callback is
-                         * where a reader meets it.)
-                         */
-                        const plan = clusterPlan(
-                          Object.keys(tab.tree.panes).length,
-                          activeProject.tabs[0]?.id === tab.id,
-                        )
-                        const tabScoped = plan.close === 'tab'
-                        return (
-                        <PaneFrame
+                      /*
+                       * One memoised `TabPane` per pane, handed only ids, the pane's own node and
+                       * plain flags. Inline, this closure built ~10 callbacks per pane and
+                       * rendered `PaneFrame` and `PaneBody` for every pane of every tab (they are
+                       * all mounted — `TabContent` hides with CSS) on every workspace revision:
+                       * a focus click or a dirty dot re-rendered each editor and terminal in the
+                       * project. With the snapshot structurally shared (`store/shareEqual`), a
+                       * pane whose node, tab and flags did not move now skips the render.
+                       */
+                      renderPane={(paneNode, index) => (
+                        <TabPane
+                          project={activeProject.id}
+                          primarySession={activeProject.primarySession}
+                          projectRoot={activeProject.roots[0]?.path}
+                          pinnedTab={activeProject.tabs[0]?.id === tab.id}
+                          tab={tab.id}
+                          tabKind={tab.kind}
+                          paneCount={Object.keys(tab.tree.panes).length}
+                          tabFocused={tab.tree.focused}
+                          tabMaximized={tab.tree.maximized}
                           pane={paneNode}
                           index={index}
-                          focused={tab.tree.focused === paneNode.id}
-                          maximized={tab.tree.maximized === paneNode.id}
-                          tabScoped={tabScoped}
-                          onFocus={() => void focusPane(activeProject.id, tab.id, paneNode.id)}
-                          // `row` is a tile beside this one, in this pane's own row — the axis
-                          // the command layer routes to `add_tile`. The row gesture is on the
-                          // tree, not here, because it is not about any one pane.
-                          onAddTile={() =>
-                            void splitPane(activeProject.id, tab.id, paneNode.id, 'row', 'after')
-                          }
-                          // Both were drawn disabled, and that mattered more once the pane's
-                          // title bar was deleted: the right-click menu became the primary route
-                          // to splitting, so two of its items naming "use the header instead"
-                          // was most of the gesture missing.
-                          onSplitDown={() =>
-                            void splitPane(activeProject.id, tab.id, paneNode.id, 'col', 'after')
-                          }
-                          onAddRow={() =>
-                            void splitPane(activeProject.id, tab.id, tab.tree.focused, 'col', 'after')
-                          }
-                          /*
-                           * The grab handle's commit. Withheld for a tab's only pane — there
-                           * is nowhere to move it to — and `PaneFrame` withholds it again for
-                           * a pane that is not a terminal, which is the kind gate.
-                           *
-                           * The DOM focus has to be put back by hand: the move re-parents the
-                           * pane into a different chain grid, so React unmounts its slot and
-                           * `parkHost` blurs the terminal on the way out. Without this the
-                           * ring lands on the moved pane and the keystrokes go nowhere — the
-                           * defect `panes/paneFocus.ts` was written about.
-                           */
-                          onMove={
-                            plan.move
-                              ? (outcome) => {
-                                  void movePane(
-                                    activeProject.id,
-                                    tab.id,
-                                    outcome.pane,
-                                    outcome.target,
-                                    outcome.axis,
-                                    outcome.side,
-                                  ).then(() => {
-                                    focusPaneDom(outcome.pane)
-                                  })
-                                }
-                              : undefined
-                          }
-                          onMaximize={
-                            plan.maximize
-                              ? () =>
-                                  void maximizePane(
-                                    activeProject.id,
-                                    tab.id,
-                                    tab.tree.maximized === paneNode.id ? null : paneNode.id,
-                                  )
-                              : undefined
-                          }
-                          onDetach={
-                            plan.detach === 'tab'
-                              ? // A tab already in a window of its own has nowhere further
-                                // out to go; withholding the handler hides the button and
-                                // greys the menu row with that sentence.
-                                tabWindow
-                                ? undefined
-                                : () => void detachTab(activeProject.id, tab.id)
-                              : () => void detachPane(activeProject.id, tab.id, paneNode.id)
-                          }
-                          onClose={
-                            plan.close === 'tab'
-                              ? // Through `closeTab`, which asks about a live session or an
-                                // unsaved buffer before it discards either — the same dialog
-                                // the strip's × raises for this tab.
-                                () => void closeTab(activeProject.id, tab.id)
-                              : () => void closePane(activeProject.id, tab.id, paneNode.id)
-                          }
-                        >
-                          {/*
-                            * A git diff replaces the pane rather than living in one, the way a
-                            * settings tab does. A Claude diff is different and stays in
-                            * `PaneBody`: it is answering a blocked agent turn and belongs
-                            * beside the terminal that is waiting on it.
-                            */}
-                          {tab.kind.kind === 'diff' && tab.kind.spec.origin.kind === 'git' ? (
-                            /*
-                             * `visible` is passed, and the pane's own fallback is the safety
-                             * net rather than the mechanism. `diffTabs.diffTabOnScreen` exists
-                             * because a deferral switched on by a prop is a deferral that is
-                             * off — but it can only answer once a `cide://workspace-changed`
-                             * has arrived, and `onScreen` starts `true`, so a workspace
-                             * restored with six diff tabs had all six believing they were in
-                             * front until the first mutation. That window is where the boot
-                             * storm lived: six `git_diff_file` calls, six whole-file wires,
-                             * six tokenizes. `active` is the flag `TabContent` already hands
-                             * this closure, and the line below hands it to `PaneBody`.
-                             */
-                            <GitDiffPane
-                              project={activeProject.id}
-                              spec={tab.kind.spec}
-                              visible={active}
-                            />
-                          ) : (
-                          <PaneBody
-                            pane={paneNode}
-                            // The run's worktree for a pane opened onto a run's conversation
-                            // (M42); the project root for every other pane.
-                            cwd={paneNode.continues?.cwd ?? activeProject.roots[0]?.path ?? '.'}
-                            project={activeProject.id}
-                            primarySession={activeProject.primarySession}
-                            diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}
-                            editor={
-                              tab.kind.kind === 'file'
-                                ? { tab: tab.id, path: tab.kind.path }
-                                : undefined
-                            }
-                            restore={restorePlan.get(paneNode.id)}
-                            roots={rootPaths}
-                            onOpenPath={onOpenPath}
-                            /*
-                             * A ctrl+click on a *directory* in terminal output.
-                             *
-                             * Straight to `file.reveal` and to nothing else, so the sidebar is
-                             * brought to Files first and a path with no row reports itself in a
-                             * sentence — both of which are that arm's rules, and neither of which
-                             * is worth a second copy here. It is the same routing
-                             * `Explorer`'s ⌖ button makes (`onSelectOpened` above), for the same
-                             * reason: a second call site with its own preconditions is how three
-                             * gestures come to behave in three ways.
-                             *
-                             * Passed only in the shell branch. The detached-pane window above has
-                             * no sidebar, so it passes no handler, and `pathLinks.ts` then draws
-                             * no directory underline there at all rather than one whose command
-                             * would refuse.
-                             */
-                            onRevealPath={(path) => runCommand('file.reveal', { path })}
-                            onSessionBound={(session) =>
-                              void bindSession(activeProject.id, tab.id, paneNode.id, session)
-                            }
-                            /*
-                             * Which tab is in front, which `TabContent` computes and has offered
-                             * through this callback's second argument since M4 — and which this
-                             * call site wrote `(tab) =>` and discarded.
-                             *
-                             * The editor is the only pane kind that needs it, and needs it because
-                             * the hiding here is pure CSS: a background tab's panes are mounted,
-                             * laid out at full size and painting, so nothing below can tell them
-                             * from the visible one. Without it the status bar's file readout was
-                             * claimed by whichever restored tab's `file_read` resolved last, and a
-                             * Ctrl+Tab moved nothing. See `editor/statusReadout.ts`.
-                             */
-                            onScreen={active}
-                          />
-                          )}
-                        </PaneFrame>
-                        )
-                      }}
+                          tabWindow={tabWindow}
+                          restore={restorePlan.get(paneNode.id)}
+                          roots={rootPaths}
+                          onOpenPath={onOpenPath}
+                          runCommand={runCommand}
+                          active={active}
+                        />
+                      )}
                     />
                     )
                   }
@@ -2787,6 +2633,246 @@ const WorkspaceContent = memo(function WorkspaceContent({
  * pointing at nothing, and the honest answer is a sentence rather than a blank column. `PanelView`
  * is restored from `sidebar.last` on the next gesture.
  */
+
+/**
+ * One pane of one tab: its frame and its body. (Split out of `WorkspaceContent`'s `renderPane`.)
+ *
+ * A `memo`, and every prop is chosen so that it can hold: ids and flags rather than the tab or
+ * project objects (which change whenever any pane in them does), the pane's own node (which,
+ * with the workspace structurally shared, keeps its identity until *this* pane changes), and the
+ * tab's `kind` (the same). The callbacks are built here from the store's actions, which are
+ * stable, instead of arriving as fresh closures. `roots`, `onOpenPath` and `runCommand` are
+ * memoised by `WorkspaceContent` on what they actually read.
+ *
+ * The markup is exactly what the inline closure produced; only when it renders changed.
+ */
+const TabPane = memo(function TabPane({
+  project,
+  primarySession,
+  projectRoot,
+  pinnedTab,
+  tab,
+  tabKind,
+  paneCount,
+  tabFocused,
+  tabMaximized,
+  pane,
+  index,
+  tabWindow,
+  restore,
+  roots,
+  onOpenPath,
+  runCommand,
+  active,
+}: {
+  project: ProjectId
+  primarySession: Project['primarySession']
+  projectRoot: string | undefined
+  pinnedTab: boolean
+  tab: TabId
+  tabKind: Tab['kind']
+  paneCount: number
+  tabFocused: Tab['tree']['focused']
+  tabMaximized: Tab['tree']['maximized']
+  pane: Pane
+  index: number
+  tabWindow: boolean
+  restore: PaneRestore | undefined
+  roots: readonly string[]
+  onOpenPath: ((path: string, at: { line: number; column: number } | null) => void) | undefined
+  runCommand: (command: string, args: unknown) => void
+  active: boolean
+}) {
+  const closeTab = useWorkspace((s) => s.closeTab)
+  const splitPane = useWorkspace((s) => s.splitPane)
+  const closePane = useWorkspace((s) => s.closePane)
+  const focusPane = useWorkspace((s) => s.focusPane)
+  const maximizePane = useWorkspace((s) => s.maximizePane)
+  const movePane = useWorkspace((s) => s.movePane)
+  const bindSession = useWorkspace((s) => s.bindSession)
+  const detachPane = useWorkspace((s) => s.detachPane)
+  const detachTab = useWorkspace((s) => s.detachTab)
+  // The same object for as long as the path is: `PaneBody` hands it on, and a literal here
+  // would be a new prop every render — the thing this component exists to stop.
+  const filePath = tabKind.kind === 'file' ? tabKind.path : null
+  const editor = useMemo(
+    () => (filePath === null ? undefined : { tab, path: filePath }),
+    [tab, filePath],
+  )
+
+  /*
+   * What this pane's corner cluster acts on — `windows/windowTabs.ts`
+   * holds the rule. A tab's only pane closes and detaches as the
+   * *tab*: `layout::close` and `layout::take_pane` both refuse a
+   * tab's last pane, and these two buttons used to run straight into
+   * that refusal and print `lastPane` at the user. Its maximize is
+   * withheld outright — one pane already fills its tab. The pinned
+   * console is exempt so its primary pane keeps the role-based
+   * refusals `PaneFrame` already words.
+   *
+   * (`clusterPlan` reads the tab, not the pane, and is cheap enough
+   * that a per-pane call costs only tidiness — it stays here because
+   * this comment is about *what the plan means*, and the callback is
+   * where a reader meets it.)
+   */
+  const plan = clusterPlan(paneCount, pinnedTab)
+  const tabScoped = plan.close === 'tab'
+  return (
+    <PaneFrame
+      pane={pane}
+      index={index}
+      focused={tabFocused === pane.id}
+      maximized={tabMaximized === pane.id}
+      tabScoped={tabScoped}
+      onFocus={() => void focusPane(project, tab, pane.id)}
+      // `row` is a tile beside this one, in this pane's own row — the axis
+      // the command layer routes to `add_tile`. The row gesture is on the
+      // tree, not here, because it is not about any one pane.
+      onAddTile={() =>
+        void splitPane(project, tab, pane.id, 'row', 'after')
+      }
+      // Both were drawn disabled, and that mattered more once the pane's
+      // title bar was deleted: the right-click menu became the primary route
+      // to splitting, so two of its items naming "use the header instead"
+      // was most of the gesture missing.
+      onSplitDown={() =>
+        void splitPane(project, tab, pane.id, 'col', 'after')
+      }
+      onAddRow={() =>
+        void splitPane(project, tab, tabFocused, 'col', 'after')
+      }
+      /*
+       * The grab handle's commit. Withheld for a tab's only pane — there
+       * is nowhere to move it to — and `PaneFrame` withholds it again for
+       * a pane that is not a terminal, which is the kind gate.
+       *
+       * The DOM focus has to be put back by hand: the move re-parents the
+       * pane into a different chain grid, so React unmounts its slot and
+       * `parkHost` blurs the terminal on the way out. Without this the
+       * ring lands on the moved pane and the keystrokes go nowhere — the
+       * defect `panes/paneFocus.ts` was written about.
+       */
+      onMove={
+        plan.move
+          ? (outcome) => {
+              void movePane(
+                project,
+                tab,
+                outcome.pane,
+                outcome.target,
+                outcome.axis,
+                outcome.side,
+              ).then(() => {
+                focusPaneDom(outcome.pane)
+              })
+            }
+          : undefined
+      }
+      onMaximize={
+        plan.maximize
+          ? () =>
+              void maximizePane(
+                project,
+                tab,
+                tabMaximized === pane.id ? null : pane.id,
+              )
+          : undefined
+      }
+      onDetach={
+        plan.detach === 'tab'
+          ? // A tab already in a window of its own has nowhere further
+            // out to go; withholding the handler hides the button and
+            // greys the menu row with that sentence.
+            tabWindow
+            ? undefined
+            : () => void detachTab(project, tab)
+          : () => void detachPane(project, tab, pane.id)
+      }
+      onClose={
+        plan.close === 'tab'
+          ? // Through `closeTab`, which asks about a live session or an
+            // unsaved buffer before it discards either — the same dialog
+            // the strip's × raises for this tab.
+            () => void closeTab(project, tab)
+          : () => void closePane(project, tab, pane.id)
+      }
+    >
+      {/*
+        * A git diff replaces the pane rather than living in one, the way a
+        * settings tab does. A Claude diff is different and stays in
+        * `PaneBody`: it is answering a blocked agent turn and belongs
+        * beside the terminal that is waiting on it.
+        */}
+      {tabKind.kind === 'diff' && tabKind.spec.origin.kind === 'git' ? (
+        /*
+         * `visible` is passed, and the pane's own fallback is the safety
+         * net rather than the mechanism. `diffTabs.diffTabOnScreen` exists
+         * because a deferral switched on by a prop is a deferral that is
+         * off — but it can only answer once a `cide://workspace-changed`
+         * has arrived, and `onScreen` starts `true`, so a workspace
+         * restored with six diff tabs had all six believing they were in
+         * front until the first mutation. That window is where the boot
+         * storm lived: six `git_diff_file` calls, six whole-file wires,
+         * six tokenizes. `active` is the flag `TabContent` already hands
+         * this closure, and the line below hands it to `PaneBody`.
+         */
+        <GitDiffPane
+          project={project}
+          spec={tabKind.spec}
+          visible={active}
+        />
+      ) : (
+      <PaneBody
+        pane={pane}
+        // The run's worktree for a pane opened onto a run's conversation
+        // (M42); the project root for every other pane.
+        cwd={pane.continues?.cwd ?? projectRoot ?? '.'}
+        project={project}
+        primarySession={primarySession}
+        diff={tabKind.kind === 'diff' ? tabKind.spec : undefined}
+        editor={editor}
+        restore={restore}
+        roots={roots}
+        onOpenPath={onOpenPath}
+        /*
+         * A ctrl+click on a *directory* in terminal output.
+         *
+         * Straight to `file.reveal` and to nothing else, so the sidebar is
+         * brought to Files first and a path with no row reports itself in a
+         * sentence — both of which are that arm's rules, and neither of which
+         * is worth a second copy here. It is the same routing
+         * `Explorer`'s ⌖ button makes (`onSelectOpened` above), for the same
+         * reason: a second call site with its own preconditions is how three
+         * gestures come to behave in three ways.
+         *
+         * Passed only in the shell branch. The detached-pane window above has
+         * no sidebar, so it passes no handler, and `pathLinks.ts` then draws
+         * no directory underline there at all rather than one whose command
+         * would refuse.
+         */
+        onRevealPath={(path) => runCommand('file.reveal', { path })}
+        onSessionBound={(session) =>
+          void bindSession(project, tab, pane.id, session)
+        }
+        /*
+         * Which tab is in front, which `TabContent` computes and has offered
+         * through this callback's second argument since M4 — and which this
+         * call site wrote `(tab) =>` and discarded.
+         *
+         * The editor is the only pane kind that needs it, and needs it because
+         * the hiding here is pure CSS: a background tab's panes are mounted,
+         * laid out at full size and painting, so nothing below can tell them
+         * from the visible one. Without it the status bar's file readout was
+         * claimed by whichever restored tab's `file_read` resolved last, and a
+         * Ctrl+Tab moved nothing. See `editor/statusReadout.ts`.
+         */
+        onScreen={active}
+      />
+      )}
+    </PaneFrame>
+  )
+})
+
 function ExtSidebarPanel({
   view,
   panels,

@@ -20,6 +20,8 @@ import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { pruneNotices, setNoticeScope } from '@/chrome/notices'
 import type { CloseScope } from '@/chrome/closeConfirmModel'
 import { planFileIndex, type IndexTarget } from './fileIndex'
+import { shareEqual } from './shareEqual'
+import { noteSnapshot } from './snapshotRev'
 import { useSessionStatus } from './sessionStatus'
 import {
   app as appApi,
@@ -801,7 +803,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   tabMru: {},
 
   hydrate: async () => {
-    const boot = await appApi.getBootstrap()
+    const fetched = await appApi.getBootstrap()
+    // Shared with the tree already held, `applySnapshot`'s reason: a re-hydrate that found most
+    // of the workspace unchanged must not hand every project, tab and pane a new identity.
+    const boot = { ...fetched, workspace: shareEqual(get().boot?.workspace, fetched.workspace) }
     // Before `set`, and before anything can render. The language table decides how a buffer folds,
     // and `foldSpecFor` is called inside the editor's mount dispatch where it cannot await — a
     // table that arrived one tick after the first editor would restore the remembered scroll
@@ -816,6 +821,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       mru: mruFor(get().mru, boot),
       tabMru: nextTabMru(get().tabMru, boot),
     })
+    noteSnapshot()
     // After the state is set, not before: the explorer and the picker read the project from
     // the store, and an index that started against a project the window has not adopted yet
     // would race the components that are about to ask it questions.
@@ -1289,12 +1295,24 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // boot-time copy left it stale until something happened to hydrate. Kept from `current`
     // when the map stops naming this window: that is a window mid-close (a redock pruned
     // the role), and repainting its last frame as an empty shell is a flash nobody wants.
-    const role = workspace.windows[windowLabel()] ?? current.role
-    const boot = { ...current, workspace, role }
+    /*
+     * Structurally shared with the tree already held — see `shareEqual`. The snapshot is the whole
+     * `Workspace` off the wire, so without this every project, tab and pane was a new object on
+     * every revision, and a focus click or a dirty dot re-rendered every pane of every tab: no
+     * `memo` or dependency array keyed on one of them could tell "equal" from "changed". Shared,
+     * an unchanged subtree keeps its object and a changed one is new up to the root — the same
+     * data, with identity meaning what a reader assumes. `boot` and `workspace` are still new on
+     * every revision (`rev` moved), so anything keyed on them fires exactly as before.
+     */
+    const shared = shareEqual(current.workspace, workspace)
+    // From the shared tree, so an unchanged role keeps its object too.
+    const role = shared.windows[windowLabel()] ?? current.role
+    const boot = { ...current, workspace: shared, role }
     // Both MRU stacks follow the snapshot, not the action: a project or a tab activated, opened
     // or closed in another window reaches this one only here. See `nextMru`, `nextTabMru`.
     // (`nextMru` also finally sees the *fresh* `role.active` on a cross-window switch.)
     set({ boot, mru: mruFor(get().mru, boot), tabMru: nextTabMru(get().tabMru, boot) })
+    noteSnapshot()
     // A project opened or closed in *another* window reaches this one only here. Without
     // this line the second window's tree and picker stay empty until something in it happens
     // to call `hydrate`.

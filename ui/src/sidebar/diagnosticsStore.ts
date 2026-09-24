@@ -24,6 +24,7 @@ import { create } from 'zustand'
 import { diagnostics as diagnosticsApi, pendingCommand, type ProjectId } from '@/ipc/client'
 import { adaptSnapshot } from './ProblemsPanel/adapt'
 import { NO_SOURCE, type DiagnosticsSnapshot } from './ProblemsPanel/model'
+import { shareEqual } from '@/store/shareEqual'
 
 const COALESCE_MS = 120
 
@@ -93,7 +94,19 @@ export const useDiagnostics = create<DiagnosticsStore>((set, get) => ({
     // Both guards: a newer call has superseded this one, or the user moved to another project
     // while it was in flight.
     if (mine !== generation || get().project !== project) return
-    set({ snapshot })
+    /*
+     * Shared with the snapshot already held, and not set at all when nothing in it moved.
+     *
+     * A busy server publishes continuously, every publish ends in this fetch, and most of them
+     * change nothing a reader draws — a re-check that found the same problems. `App` reads this
+     * snapshot for the rail's counts and the status bar, so each `set` re-rendered the whole
+     * shell; the Problems panel's list re-rendered every row. Unchanged items now keep their
+     * objects, and an unchanged snapshot is no update.
+     */
+    const held = get().snapshot
+    const shared = shareEqual(held, snapshot)
+    if (shared === held) return
+    set({ snapshot: shared })
   },
 
   schedule: () => {

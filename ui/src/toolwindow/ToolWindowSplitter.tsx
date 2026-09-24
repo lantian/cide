@@ -196,6 +196,8 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
    * source is already one stable object and only the projection is new.
    */
   const windows = useWorkspace((s) => s.boot?.workspace.windows)
+  // Every snapshot, as a primitive — see the adopt effect below.
+  const rev = useWorkspace((s) => s.boot?.workspace.rev)
   const labels = useMemo(() => Object.keys(windows ?? {}), [windows])
 
   const [active, setActive] = useState(false)
@@ -234,7 +236,9 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
     live.current = painted(held)
     writeCache(held, labels)
     paint(held)
-  }, [stored, labels])
+    // `rev` for `SidebarSplitter`'s reason: a snapshot is what corrects a cancelled drag's paint,
+    // and with the mirror structurally shared `stored` no longer changes identity on every one.
+  }, [stored, labels, rev])
 
   useEffect(
     () => () => {

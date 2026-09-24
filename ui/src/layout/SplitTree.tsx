@@ -30,6 +30,7 @@ import type {
   SplitId,
   SplitIntent,
 } from '@/ipc/generated'
+import { useSnapshotRev } from '@/store/snapshotRev'
 import { applyTracks, Splitter, trackTemplate } from './Splitter'
 import styles from './SplitTree.module.css'
 
@@ -190,6 +191,17 @@ function ChainNode({
   const gridRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
   const { axis, fractions, dividers, members } = chain
+  /*
+   * Subscribed so this chain re-renders — and the effect below re-asserts — on every snapshot,
+   * which is the contract that effect states. It used to get that for free: every snapshot gave
+   * every tab a new identity and re-rendered every `SplitTree`. With the mirror structurally
+   * shared and panes memoised, a snapshot that did not touch this tab re-renders nothing here,
+   * and a clamped commit or a cancelled drag would keep its divider where the pointer let go.
+   * A primitive, so this costs one cheap render of the chain (its children are memoised
+   * elements) per revision — not the whole tab. Through `snapshotRev`, not the store, because
+   * `check:rows` renders this file under node and the store's import graph cannot load there.
+   */
+  useSnapshotRev()
 
   // Deliberately runs on every render, with no dependency array.
   //
