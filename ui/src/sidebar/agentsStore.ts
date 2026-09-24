@@ -392,7 +392,9 @@ export const useAgents = create<AgentsStore>((set, get) => ({
      * writer means the last emit is the newest by construction, so there is nothing to compare
      * a counter against. The store does not fabricate object identity either — a fresh `Roster`
      * per event is correct, because an event that carried the same roster twice is a thing the
-     * registry does not do.
+     * registry does not do — by construction since the coalescer's flush started comparing with
+     * the roster it last sent (`emit::agents_changed_unless_repeat`). Before that it re-sent an
+     * identical roster on every marker, and this `set` re-rendered every roster reader each time.
      */
     set({ roster: adaptRoster(wire) })
   },

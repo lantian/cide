@@ -6905,7 +6905,9 @@ impl AgentRegistry {
                 // can have moved under a running app, and `cide_agents`' module header is
                 // explicit that nothing caches them.
                 if let Some(roster) = crate::cmd::agents::project_roster(&app, project) {
-                    crate::emit::agents_changed(&app, project, &roster);
+                    // Unless it is the roster already sent: this flush rebuilds on every
+                    // marker, and most markers move nothing a window draws.
+                    crate::emit::agents_changed_unless_repeat(&app, project, &roster);
                 }
             }
             // The durable half rides the same coalescing: every burst that changed a roster

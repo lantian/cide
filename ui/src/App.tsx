@@ -1,7 +1,7 @@
 import { ReviewPanel } from '@/gitlab/ReviewPanel'
 import { GitLabDialogs } from '@/gitlab/Dialogs'
 import { GitLabInbox } from '@/gitlab/Inbox'
-import { startGitLab, useGitLab } from '@/gitlab/store'
+import { startGitLab, useGitLabReviews } from '@/gitlab/store'
 import { PushMRPrompt } from '@/gitlab/PushMRPrompt'
 /**
  * The shell.
@@ -352,7 +352,9 @@ export function App() {
   // Closed from the first render in a torn-out tab window, which draws no rail: the
   // initialiser runs once, and `SIDEBAR_INITIAL` there would mount a Files panel with no
   // button anywhere that could ever dismiss it.
-  const gitLab = useGitLab()
+  // The reviews alone, not `useGitLab()`: the whole snapshot is replaced on every patch, and
+  // this component is the whole shell. See `useGitLabReviews`.
+  const gitLabReviews = useGitLabReviews()
   function hideToolWindow() {
     void toolWindowApi.setLayout(activeProject?.id ?? null, {open:false}).catch(() => {})
   }
@@ -885,7 +887,9 @@ export function App() {
    * `null` in a detached-pane window, exactly as diagnostics is: that window has no rail, no
    * sidebar and no panel, so attaching would read a file for a surface nobody is looking at.
    */
-  const taskBoard = useTasks((s) => s.board)
+  // The count, not the board: a board is a new object on every `tasks-changed`, and this
+  // component is the whole shell. The rail's badge is the only thing here that reads it.
+  const openTasks = useTasks((s) => openCount(s.board))
   const attachTasks = useTasks((s) => s.attach)
   const adoptTasks = useTasks((s) => s.adopt)
   /*
@@ -991,7 +995,12 @@ export function App() {
    * rail, no sidebar and no panel, so attaching would read a project's config for a surface
    * nobody is looking at.
    */
-  const agentRoster = useAgents((s) => s.roster)
+  // Two primitives, not the roster: `adopt` builds a new roster per `agents-changed`, which
+  // arrives continuously while runs are active, and this component is the whole shell.
+  const liveAgents = useAgents((s) => liveCount(s.roster))
+  const agentsAwaiting = useAgents(
+    (s) => s.roster.kind === 'ready' && s.roster.runs.some((run) => run.phase === 'awaitingPermission'),
+  )
   const attachAgents = useAgents((s) => s.attach)
   const adoptAgents = useAgents((s) => s.adopt)
 
@@ -1078,18 +1087,18 @@ export function App() {
     [extPanels, railHidden],
   )
   const railExtras = useMemo(
-    () => [...gitLab.board.reviews.map(r => ({ id: `mr:${r.id}` as ActivityView,
+    () => [...gitLabReviews.map(r => ({ id: `mr:${r.id}` as ActivityView,
       path: 'M12 22 2 14l2-11 4 8h8l4-8 2 11-10 8ZM2 14h20M8 11l4 11 4-11', label: `!${r.iid} ${r.title}` })),
       ...sidebarPanels.filter((p) => !p.hidden).map((p) => p.item)],
-    [sidebarPanels, gitLab.board.reviews],
+    [sidebarPanels, gitLabReviews],
   )
   useEffect(() => {
     setSidebar(old => {
-      const alive = (view: string) => !view.startsWith('mr:') || gitLab.board.reviews.some(r => `mr:${r.id}` === view)
+      const alive = (view: string) => !view.startsWith('mr:') || gitLabReviews.some(r => `mr:${r.id}` === view)
       if (old.view && !alive(old.view)) return { view: 'gitlab', last: 'gitlab' }
       return alive(old.last) ? old : { ...old, last: 'gitlab' }
     })
-  }, [gitLab.board.reviews])
+  }, [gitLabReviews])
   /*
    * The ones the user took off the strip. They still reach the rail — as menu entries under
    * `···` rather than as buttons — because a rail button is the only route into a contributed
@@ -1627,21 +1636,18 @@ export function App() {
                because a project with no tracker has no count, it has no tracker. The rail draws
                nothing for `null` and nothing for `0`, and those are two different claims: nobody
                looked, against looked and the tracker is clear. */
-            tasks={openCount(taskBoard)}
+            tasks={openTasks}
             /* `liveCount` answers `null` for every roster arm but `ready` — nobody has looked,
                subagents are off, or no roles are defined — and a *number* only when something
                counted. The rail draws nothing for `null` and nothing for `0`, and those are two
                different claims: nobody looked, against looked and every role is idle. With no
                registry behind this slice a `ready` roster has no runs, so the honest badge is
                absent, which is exactly what `0` produces. */
-            agents={liveCount(agentRoster)}
+            agents={liveAgents}
             /* The one agent state that is a call to action, drawn in the error tone. It cannot
                make a badge appear on its own — with `agents` `null` or `0` there is no pill to
                recolour — which is why it is a separate flag rather than a fourth count. */
-            agentsAwaiting={
-              agentRoster.kind === 'ready' &&
-              agentRoster.runs.some((run) => run.phase === 'awaitingPermission')
-            }
+            agentsAwaiting={agentsAwaiting}
             /*
              * The buttons extensions contribute, in registry order. (M22)
              *

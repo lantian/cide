@@ -142,6 +142,7 @@ import { Dialog, PickerList, PickerRow } from '@/kit/components/Overlay'
 import { Select } from '@/kit/components/Select'
 import { gestureOf, logFileClick } from '@/sidebar/clickSemantics'
 import { copyText } from '@/sidebar/copyText'
+import { shareEqual } from '@/store/shareEqual'
 import { useWorkspace } from '@/store/workspace'
 import {
   applyLocalText,
@@ -483,6 +484,9 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
   const rowsRef = useRef<readonly CommitRow[]>([])
   rowsRef.current = rows
   const [graph, setGraph] = useState<readonly GraphRow[]>([])
+  // Read by a replacing load, beside `rowsRef`, so `shareRows` can match the two together.
+  const graphRef = useRef<readonly GraphRow[]>([])
+  graphRef.current = graph
   const [graphOff, setGraphOff] = useState<string | null>(null)
   const [page, setPage] = useState<CommitPage | null>(null)
   /**
@@ -718,14 +722,24 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         )
         .then((next) => {
           if (generation.current !== tag) return
-          setRows((prev) => (more ? mergePage(prev, next) : next.commits))
-          setGraph((prev) =>
-            next.graph.kind === 'rows'
-              ? more
-                ? [...prev, ...next.graph.rows]
-                : next.graph.rows
-              : [],
-          )
+          if (more) {
+            setRows((prev) => mergePage(prev, next))
+            setGraph((prev) => (next.graph.kind === 'rows' ? [...prev, ...next.graph.rows] : []))
+          } else {
+            /*
+             * A replacing load keeps the previous objects for every commit it found unchanged
+             * — see `shareRows`. Read from the refs rather than inside two updaters, because the
+             * two arrays are matched *together* (a graph row belongs to the commit at its index).
+             */
+            const shared = shareRows(
+              rowsRef.current,
+              graphRef.current,
+              next.commits,
+              next.graph.kind === 'rows' ? next.graph.rows : [],
+            )
+            setRows(shared.rows)
+            setGraph(shared.graph)
+          }
           setGraphOff(next.graph.kind === 'off' ? graphOffReason(next.graph.reason) : null)
           setPage(next)
         })
@@ -769,8 +783,10 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
      * `logStatus` already covers the rest of it — `loading && rows === 0` is the only path to
      * *Reading the log…*, and `rows > 0` returns no status at all — so leaving the rows in place
      * means the reload is invisible until it lands and then swaps in one paint. React reconciles
-     * an unchanged row to nothing, which is why a refresh that finds no new commits now costs
-     * exactly zero visible change instead of a full clear and repaint.
+     * an unchanged row to no DOM change, which is why a refresh that finds no new commits costs
+     * zero visible change instead of a full clear and repaint. It still *rendered* every row
+     * until `shareRows` kept the unchanged ones' objects and `LogRow` became a `memo` — a
+     * thousand renders a second under agent load, for nothing on screen.
      *
      * This matters more than it looks because of what triggers a refresh. `gitRefsMoved` returns
      * true for any *truncated* burst — it cannot know what was dropped from the path list — and
@@ -2299,6 +2315,41 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
  * `BranchType::Local` and then `BranchType::Remote`, so `origin/main` resolves today; a picker
  * that offered only locals would be hiding half of what the backend accepts.
  */
+/**
+ * A replacing page, with the previous objects kept for every commit that did not change.
+ *
+ * The soft refresh re-walks the log about once a second on a tree agents are writing to, and a
+ * page off the wire is all new objects even when it found the very same commits. `LogView`'s
+ * `LogRow` is a `memo`, and it can only skip a row whose props kept their identity — so this is
+ * what turns "React reconciled a thousand rows to no DOM change" into "React rendered the rows
+ * that moved".
+ *
+ * Matched by `repo:oid`, the row key, and not by index: one new commit on top shifts every row
+ * down one, and an index match would share nothing. A commit's graph row is matched with it, the
+ * graph array being parallel to the rows; lanes can move when history above them does, which is
+ * why each is still compared by content (`shareEqual`) rather than assumed equal.
+ */
+function shareRows(
+  prevRows: readonly CommitRow[],
+  prevGraph: readonly GraphRow[],
+  nextRows: readonly CommitRow[],
+  nextGraph: readonly GraphRow[],
+): { rows: readonly CommitRow[]; graph: readonly GraphRow[] } {
+  if (prevRows.length === 0) return { rows: nextRows, graph: nextGraph }
+  const before = new Map<string, number>()
+  prevRows.forEach((row, i) => before.set(`${row.repo}:${row.oid}`, i))
+  const rows = nextRows.map((row) => {
+    const i = before.get(`${row.repo}:${row.oid}`)
+    return i === undefined ? row : shareEqual(prevRows[i], row)
+  })
+  const graph = nextGraph.map((cell, j) => {
+    const row = nextRows[j]
+    const i = row === undefined ? undefined : before.get(`${row.repo}:${row.oid}`)
+    return i === undefined ? cell : shareEqual(prevGraph[i], cell)
+  })
+  return { rows, graph }
+}
+
 function namesOf(lists: readonly BranchList[]): string[] {
   const seen = new Set<string>()
   const out: string[] = []

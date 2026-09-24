@@ -18,7 +18,7 @@
  * about what is currently being asked — a box with its own `useState` would be the source of
  * truth for one frame per keystroke, which is exactly long enough to paint a stale answer.
  */
-import { useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import type {
   CommitPage,
   CommitRow,
@@ -233,6 +233,21 @@ export function LogView({
    * name and one that merely has to be on screen.
    */
   const revealedRow = useRef<HTMLDivElement | null>(null)
+  /*
+   * The two callbacks every row gets, held behind refs so their identity never changes. `LogTab`
+   * builds a new `onSelect` whenever the selection or the rows move, and passing that through
+   * would re-render every memoised `LogRow` on each click — the cost `LogRow` exists to remove.
+   * Assigned during render, `PaneSlot`'s `onResizeRef` shape: a click reads the latest one.
+   */
+  const onSelectRef = useRef(onSelect)
+  onSelectRef.current = onSelect
+  const onFilterRef = useRef(onFilter)
+  onFilterRef.current = onFilter
+  const stableSelect = useCallback<LogViewProps['onSelect']>(
+    (oid, mods) => onSelectRef.current(oid, mods),
+    [],
+  )
+  const stableFilter = useCallback((next: LogFilter) => onFilterRef.current(next), [])
   useEffect(() => {
     if (reveal.kind !== 'found') return
     revealedRow.current?.scrollIntoView({ block: 'nearest' })
@@ -305,98 +320,25 @@ export function LogView({
             </div>
           )}
           {rows.map((row, i) => {
-            const { shown, more } = orderChips(row.refs)
             const chip = strip ? repoChipFor(repos, row.repo) : null
-            // Both ends of a comparison are selected rows. `secondary` is `null` for every
-            // one-commit selection, so this is exactly the old predicate until a pair exists.
-            const picked = row.oid === selected || row.oid === secondary
             return (
-              <div
+              <LogRow
                 key={`${row.repo}:${row.oid}`}
-                role="option"
-                aria-selected={picked}
-                // Only the selected row is held, and only so the reveal effect above can scroll
-                // to it. A ref on every row would be a map to keep in step with the page.
-                ref={row.oid === selected ? revealedRow : null}
-                title={rowTitle(row)}
-                data-audit="logRow"
-                /*
-                 * The row's identity, for the context menu to resolve what was right-clicked.
-                 *
-                 * `repo:oid` and not the oid alone, because a merged walk interleaves several
-                 * repositories and two roots can — a submodule vendored from the same history,
-                 * a fork — hold the same commit. It is the same key React is given above, and
-                 * the same `[data-row-id]` convention `sidebar/GitPanel` uses, so the host's
-                 * `closest()` lookup reads identically in both panels.
-                 *
-                 * Unconditional, not gated on `rowMenu`: it is a fact about the row rather than
-                 * a feature of the menu, and an attribute that appears only when a handler was
-                 * passed is one the SSR check cannot see.
-                 */
-                data-row-id={`${row.repo}:${row.oid}`}
-                className={picked ? `${styles.row} ${styles.rowActive}` : styles.row}
-                /*
-                 * `metaKey` folded into `ctrl` here and nowhere else.
-                 *
-                 * ⌘ is the multi-select modifier on macOS and Ctrl is everywhere else, which is a
-                 * fact about the *platform's pointer conventions* rather than about the log — so
-                 * it is resolved at the event, the way `sidebar/clickSemantics.ts` resolves its
-                 * own `primary` from `ctrl || meta`. `logModel::selectRow` then has one modifier
-                 * to reason about instead of two that must never disagree.
-                 */
-                onClick={(e) =>
-                  onSelect(row.oid, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
-                }
-              >
-                {/* The graph gutter. Absent entirely when the graph is off, rather than drawn
-                    empty: a blank column of the same width would read as a history with no
-                    branches in it, which is a claim this view has not checked. */}
-                {graph.length > 0 && <GraphCell row={graph[i]} />}
-                {/* The repo strip. Before the oid rather than after the subject, because it is
-                    the column the eye groups by when several repositories are interleaved —
-                    the same position the graph gutter would occupy if a merged walk had one. */}
-                {chip !== null && (
-                  <span
-                    className={styles.repo}
-                    data-audit="logRepo"
-                    style={{ borderColor: chip.color, color: chip.color }}
-                    title={chip.name}
-                  >
-                    {chip.name}
-                  </span>
-                )}
-                <span className={styles.oid} data-audit="logOid">
-                  {row.shortOid}
-                </span>
-                {shown.map((chipRef) => (
-                  <RefChipCell
-                    key={chipRef.full}
-                    chip={chipRef}
-                    filter={filter}
-                    onFilter={onFilter}
-                  />
-                ))}
-                {/*
-                 * The overflow chip stays a `<span>`, and that is a decision rather than an
-                 * omission: `+38` names a count, not a ref, so there is nothing for it to
-                 * re-root the walk on. Making it *expand* the row into its full list of refs
-                 * would be a reasonable feature and a different one.
-                 */}
-                {more > 0 && (
-                  <span className={styles.chip} data-audit="logChipMore" title={`${more} more refs`}>
-                    +{more}
-                  </span>
-                )}
-                <span className={styles.subject} data-audit="logSubject">
-                  {row.summary}
-                </span>
-                <span className={styles.author} data-audit="logRowAuthor">
-                  {row.author}
-                </span>
-                <span className={styles.when} data-audit="logWhen">
-                  {when(row.authored, now)}
-                </span>
-              </div>
+                row={row}
+                graphShown={graph.length > 0}
+                graphRow={graph[i]}
+                chipName={chip?.name ?? null}
+                chipColor={chip?.color ?? null}
+                // Both ends of a comparison are selected rows. `secondary` is `null` for every
+                // one-commit selection, so this is exactly the old predicate until a pair exists.
+                picked={row.oid === selected || row.oid === secondary}
+                revealTarget={row.oid === selected}
+                revealedRow={revealedRow}
+                whenText={when(row.authored, now)}
+                filter={filter}
+                onFilter={stableFilter}
+                onSelect={stableSelect}
+              />
             )
           })}
           {/*
@@ -494,6 +436,136 @@ export function LogView({
  * change; closing it means giving the list a roving tabindex over its rows, which is a piece of
  * work of its own and would make these chips reachable for free once it exists.
  */
+/**
+ * One commit row, memoised. (Split out of `LogView`'s map, markup unchanged.)
+ *
+ * The list is up to `log::LIMIT_MAX` rows and it is *refreshed* about once a second on a tree
+ * agents are writing to (`LogTab`'s soft refresh, on every truncated `gitRefsMoved` burst). Inline,
+ * each refresh and each click re-rendered every row — chips, title, graph edges — even when the
+ * walk found the same commits: React only spared the DOM, not the render. As a `memo` with
+ * primitive props, a row renders again only when something it draws moved.
+ *
+ * That holds only because every prop is stable across a refresh that changed nothing:
+ * `LogTab` keeps the previous row and graph objects for an unchanged commit (`shareRows`), the
+ * chip goes in as two strings rather than the fresh object `repoChipFor` builds, the relative
+ * date goes in as its text — `now` moves on every load, the text mostly does not — and the two
+ * callbacks go through refs so a new `onSelect` per selection does not reach the rows.
+ */
+const LogRow = memo(function LogRow({
+  row,
+  graphShown,
+  graphRow,
+  chipName,
+  chipColor,
+  picked,
+  revealTarget,
+  revealedRow,
+  whenText,
+  filter,
+  onFilter,
+  onSelect,
+}: {
+  row: CommitRow
+  graphShown: boolean
+  graphRow: GraphRow | undefined
+  chipName: string | null
+  chipColor: string | null
+  picked: boolean
+  revealTarget: boolean
+  revealedRow: RefObject<HTMLDivElement | null>
+  whenText: string
+  filter: LogFilter
+  onFilter: (next: LogFilter) => void
+  onSelect: LogViewProps['onSelect']
+}) {
+  const { shown, more } = orderChips(row.refs)
+  return (
+    <div
+      role="option"
+      aria-selected={picked}
+      // Only the selected row is held, and only so `LogView`'s reveal effect can scroll
+      // to it. A ref on every row would be a map to keep in step with the page.
+      ref={revealTarget ? revealedRow : null}
+      title={rowTitle(row)}
+      data-audit="logRow"
+      /*
+       * The row's identity, for the context menu to resolve what was right-clicked.
+       *
+       * `repo:oid` and not the oid alone, because a merged walk interleaves several
+       * repositories and two roots can — a submodule vendored from the same history,
+       * a fork — hold the same commit. It is the same key `LogView`'s map gives React, and
+       * the same `[data-row-id]` convention `sidebar/GitPanel` uses, so the host's
+       * `closest()` lookup reads identically in both panels.
+       *
+       * Unconditional, not gated on `rowMenu`: it is a fact about the row rather than
+       * a feature of the menu, and an attribute that appears only when a handler was
+       * passed is one the SSR check cannot see.
+       */
+      data-row-id={`${row.repo}:${row.oid}`}
+      className={picked ? `${styles.row} ${styles.rowActive}` : styles.row}
+      /*
+       * `metaKey` folded into `ctrl` here and nowhere else.
+       *
+       * ⌘ is the multi-select modifier on macOS and Ctrl is everywhere else, which is a
+       * fact about the *platform's pointer conventions* rather than about the log — so
+       * it is resolved at the event, the way `sidebar/clickSemantics.ts` resolves its
+       * own `primary` from `ctrl || meta`. `logModel::selectRow` then has one modifier
+       * to reason about instead of two that must never disagree.
+       */
+      onClick={(e) => onSelect(row.oid, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })}
+    >
+      {/* The graph gutter. Absent entirely when the graph is off, rather than drawn
+          empty: a blank column of the same width would read as a history with no
+          branches in it, which is a claim this view has not checked. */}
+      {graphShown && <GraphCell row={graphRow} />}
+      {/* The repo strip. Before the oid rather than after the subject, because it is
+          the column the eye groups by when several repositories are interleaved —
+          the same position the graph gutter would occupy if a merged walk had one. */}
+      {chipName !== null && chipColor !== null && (
+        <span
+          className={styles.repo}
+          data-audit="logRepo"
+          style={{ borderColor: chipColor, color: chipColor }}
+          title={chipName}
+        >
+          {chipName}
+        </span>
+      )}
+      <span className={styles.oid} data-audit="logOid">
+        {row.shortOid}
+      </span>
+      {shown.map((chipRef) => (
+        <RefChipCell
+          key={chipRef.full}
+          chip={chipRef}
+          filter={filter}
+          onFilter={onFilter}
+        />
+      ))}
+      {/*
+       * The overflow chip stays a `<span>`, and that is a decision rather than an
+       * omission: `+38` names a count, not a ref, so there is nothing for it to
+       * re-root the walk on. Making it *expand* the row into its full list of refs
+       * would be a reasonable feature and a different one.
+       */}
+      {more > 0 && (
+        <span className={styles.chip} data-audit="logChipMore" title={`${more} more refs`}>
+          +{more}
+        </span>
+      )}
+      <span className={styles.subject} data-audit="logSubject">
+        {row.summary}
+      </span>
+      <span className={styles.author} data-audit="logRowAuthor">
+        {row.author}
+      </span>
+      <span className={styles.when} data-audit="logWhen">
+        {whenText}
+      </span>
+    </div>
+  )
+})
+
 function RefChipCell({
   chip,
   filter,

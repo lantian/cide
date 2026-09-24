@@ -706,9 +706,12 @@ pub fn tasks_changed(
 /// `git_status` and `diagnostics` carry no revision either: a number on this stream would make
 /// every window re-hydrate its whole workspace because an agent started a tool call.
 ///
-/// The whole roster rather than a signal to re-ask, on `workspace_changed`'s argument: it is a
-/// few kilobytes, the emitter has it in hand, and a window that answered by re-reading would be
-/// reading files that may have changed again in between.
+/// The whole roster rather than a signal to re-ask, on `workspace_changed`'s argument: the
+/// emitter has it in hand, and a window that answered by re-reading would be reading files that
+/// may have changed again in between. It was called "a few kilobytes" here, unmeasured; it
+/// carries every role's system prompt, which in a project with a dozen roles is tens of
+/// kilobytes, and [`agents_changed`] now logs the real figure at debug level. The coalescer's
+/// flush sends through [`agents_changed_unless_repeat`], so an unchanged roster is not re-sent.
 ///
 /// The markers have multiplied since that paragraph was first written — the Settings commands
 /// (`agents_config_set`/`agents_save`/`agents_delete`), the run registry's activity, and
@@ -731,16 +734,68 @@ pub fn agents_changed(
     project: cide_ipc::ProjectId,
     roster: &cide_ipc::AgentRoster,
 ) {
+    remember_roster(project, roster);
     let payload = AgentsChanged {
         project,
         roster: roster.clone(),
     };
+    // Measured, not asserted: the paragraph on `AGENTS_CHANGED` called this "a few kilobytes",
+    // the sentence `tasks_changed` carried until M68 measured 2.19 MB. Every role's whole system
+    // prompt rides here. A second encode only when someone is reading the debug log.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let bytes = serde_json::to_vec(&payload).map_or(0, |json| json.len());
+        tracing::debug!(%project, bytes, "agents-changed payload");
+    }
     // See `tasks_changed`: the project, and the device re-reads. An `AgentRoster` carries every
     // role's whole system prompt, which is exactly what `RemoteAgent` exists to leave behind.
     tee(|| cide_remote::RemoteEvent::AgentsChanged { project });
     if let Err(error) = app.emit(AGENTS_CHANGED, payload) {
         tracing::debug!(%error, "agents-changed reached no window");
     }
+}
+
+/// [`agents_changed`], unless this project's last roster sent was this very roster.
+///
+/// For the coalescer's flush (`AgentRegistry::flush`), which rebuilds the roster from disk on
+/// every marker — a run's activity, a watcher event under `.cide/` — and used to broadcast it
+/// whether or not anything in it had moved. Each broadcast is every role's prompt parsed by every
+/// window and a fresh roster adopted by each store, so an identical one was a re-render of every
+/// view that reads the roster, for nothing.
+///
+/// The memory is shared with [`agents_changed`] itself, so a roster the Settings commands sent
+/// directly counts as sent: a flush that rebuilds what Settings just broadcast stays quiet, and
+/// one that finds the roster moved *back* is not mistaken for a repeat. The Settings commands
+/// keep the unconditional emit — their screen may be waiting on the event as its answer.
+pub fn agents_changed_unless_repeat(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    roster: &cide_ipc::AgentRoster,
+) {
+    let repeat = LAST_ROSTER
+        .lock()
+        .get(&project)
+        .is_some_and(|last| last == roster);
+    if repeat {
+        return;
+    }
+    agents_changed(app, project, roster);
+}
+
+/// The roster each project was last sent. A handful of projects, a few tens of kilobytes each;
+/// cleared outright past [`LAST_ROSTER_CAP`] rather than evicted with care, because forgetting
+/// only costs one broadcast that could have been skipped.
+static LAST_ROSTER: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<cide_ipc::ProjectId, cide_ipc::AgentRoster>>,
+> = std::sync::LazyLock::new(Default::default);
+
+const LAST_ROSTER_CAP: usize = 64;
+
+fn remember_roster(project: cide_ipc::ProjectId, roster: &cide_ipc::AgentRoster) {
+    let mut last = LAST_ROSTER.lock();
+    if last.len() >= LAST_ROSTER_CAP && !last.contains_key(&project) {
+        last.clear();
+    }
+    last.insert(project, roster.clone());
 }
 
 // --- milestones (M83) --------------------------------------------------------------------

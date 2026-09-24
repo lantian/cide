@@ -35,14 +35,15 @@ import styles from './GitOpIndicator.module.css'
 
 export function GitOpIndicator() {
   /*
-   * The window's project, the way `BranchSelector`'s `useBranchData` reads it — one subscription
-   * to `boot` and a pure derivation. `chrome/Failures.tsx` selects it with the identical
-   * expression, and that is not a coincidence worth removing: both surfaces are answering "does
-   * this belong to what the user is looking at", and two derivations of that are two chances to
-   * disagree about it.
+   * The window's project, the way `BranchSelector`'s `useBranchData` reads it — `activeProjectIdOf`
+   * inside the selector. `chrome/Failures.tsx` selects it with the identical expression, and that
+   * is not a coincidence worth removing: both surfaces are answering "does this belong to what the
+   * user is looking at", and two derivations of that are two chances to disagree about it.
+   *
+   * Inside the selector, not over a selected `boot`: that subscription re-rendered this on every
+   * workspace revision (a focus click, a dirty dot), and the id is all it reads.
    */
-  const boot = useWorkspace((s) => s.boot)
-  const project = activeProjectIdOf(boot)
+  const project = useWorkspace((s) => activeProjectIdOf(s.boot))
 
   /*
    * A **string** out of the store, never the array.

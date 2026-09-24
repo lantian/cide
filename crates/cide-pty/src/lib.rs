@@ -49,8 +49,16 @@ pub use jobs::{JobEvent, JobWatch};
 
 /// Flush as soon as this many bytes have accumulated.
 ///
-/// Chosen to sit comfortably above Tauri's 1024-byte raw threshold so frames always take
-/// the fast custom-protocol path.
+/// Chosen to sit comfortably above Tauri's 1024-byte raw threshold, so a frame this flush
+/// produces takes the custom-protocol path. **Only this flush.** The [`FLUSH_INTERVAL`] one sends
+/// whatever is pending however small, and for interactive output and a streaming TUI — the 20-200
+/// byte reads the module header names — that is the flush that fires, so most frames of a quiet or
+/// chatty session are below the threshold and go through `webview.eval` as a JSON number array.
+/// This said "frames always take the fast path" until that was checked against
+/// `tauri/src/ipc/channel.rs`. Either path costs one `eval` on the GTK main loop per frame (the
+/// large one's evaluates a `fetch`), so what coalescing bounds is the *frame rate* — at most one
+/// frame per interval per session — and that is the number to watch with many agent panes open.
+/// `ui/src/bench/ipcBench.ts` times `invoke` replies, not `Channel` frames, and cannot see this.
 pub const FLUSH_BYTES: usize = 8 * 1024;
 
 /// Flush a partial buffer after this long, so an idle prompt still appears promptly.

@@ -123,6 +123,23 @@ export function useGitLab() {
     () => snapshot,
   )
 }
+/**
+ * Only the open reviews, for a reader that draws nothing else — `App`'s rail and its view guard.
+ * `useGitLab` hands back the whole snapshot, which `set` replaces on every patch and every
+ * `touch`, so `App` re-rendered its whole shell for a draft keystroke in a review it was not
+ * showing. `board` is replaced only by a patch that carries one, so this reference holds across
+ * everything else.
+ */
+export function useGitLabReviews() {
+  return useSyncExternalStore(
+    (l) => {
+      listeners.add(l)
+      return () => listeners.delete(l)
+    },
+    () => snapshot.board.reviews,
+    () => snapshot.board.reviews,
+  )
+}
 function boardChanged(board: GitLabBoard) {
   if (board.revision < snapshot.board.revision) return
   const alive = new Set(board.reviews.map((r) => r.id))

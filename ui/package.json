@@ -89,6 +89,7 @@
     "check:search": "node scripts/check-search.mjs",
     "check:select-opened": "node scripts/check-select-opened.mjs",
     "check:selectors": "node scripts/check-selectors.mjs",
+    "check:share": "node scripts/check-share.mjs",
     "check:settings-agents": "node scripts/check-settings-agents.mjs",
     "check:sidebar": "node scripts/check-sidebar.mjs",
     "check:speed-search": "node scripts/check-speed-search.mjs",

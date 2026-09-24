@@ -223,8 +223,9 @@ export function openBranchPopup(intent: 'list' | 'new' = 'list'): void {
  * popup so it works in a window whose status bar does not mount the widget.
  */
 function useBranchData(): { project: ProjectId | null; lists: BranchList[]; loaded: boolean } {
-  const boot = useWorkspace((s) => s.boot)
-  const project = activeProjectIdOf(boot)
+  // The id, not `boot`: a whole-`boot` subscription re-rendered this on every workspace
+  // revision (a focus click, a dirty dot), and the id is all it reads — `chrome/Failures.tsx`'s form.
+  const project = useWorkspace((s) => activeProjectIdOf(s.boot))
   const lists = useBranches((s) => s.lists)
   const loaded = useBranches((s) => s.loaded)
 
