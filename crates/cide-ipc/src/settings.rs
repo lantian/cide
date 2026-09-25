@@ -1235,6 +1235,9 @@ pub struct CodexInjections {
     /// role's `permission-mode` and the project's unattended default are no longer expressed,
     /// so a run may stop on an approval prompt nobody is watching.
     pub permissions: bool,
+    /// For MR reviews, suppress approval prompts while leaving the wrapper or Codex config in
+    /// charge of the workspace sandbox boundary.
+    pub review_permissions: bool,
 }
 
 impl Default for CodexInjections {
@@ -1246,6 +1249,7 @@ impl Default for CodexInjections {
             resume: true,
             fork: true,
             permissions: true,
+            review_permissions: true,
         }
     }
 }

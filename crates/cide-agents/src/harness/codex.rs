@@ -276,7 +276,14 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     }
     // Refused before anything is built, so a role naming a mode this harness cannot honour is
     // refused at dispatch with the mode in the sentence.
-    let policy = permission_policy(plan.agent.permission_mode.as_deref(), plan.unattended)?;
+    let review_permissions = !plan.tracker_paragraphs && plan.codex.cli.inject.review_permissions;
+    let policy = if review_permissions {
+        // The shorthand also selects a sandbox and conflicts with wrappers that pass -s.
+        // Route requests to the automatic reviewer without overriding the wrapper's sandbox.
+        &["-a", "on-request", "-c", "approvals_reviewer=\"auto_review\""][..]
+    } else {
+        permission_policy(plan.agent.permission_mode.as_deref(), plan.unattended)?
+    };
 
     // The user's launch configuration — Settings → Harness → Codex — filtered as a console's is.
     let cli = codex_cli::plan_here(&plan.codex.cli);
@@ -301,7 +308,11 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     }
 
     // ---- 2. the user's own arguments, before cide's ----
-    args.extend(cli.args);
+    // A wrapper separator belongs after cide's options, otherwise `-C <cwd>` is parsed by the
+    // wrapper as a positional argument instead of reaching Codex.
+    let mut user_args = cli.args;
+    let wrapper_separator = codex_cli::remove_wrapper_separator(&mut user_args);
+    args.extend(user_args);
 
     // ---- 3. where the work is ----
     //
@@ -315,7 +326,7 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     //
     // Unless Settings says a wrapper decides (M108, `CodexInjections::permissions`). The policy
     // is still computed above, so a role naming a mode codex cannot honour is still refused.
-    if plan.codex.cli.inject.permissions {
+    if plan.codex.cli.inject.permissions || review_permissions {
         args.extend(policy.iter().map(|token| token.to_string()));
     }
 
@@ -366,6 +377,9 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     if let Some(thread) = resume {
         args.push(thread.to_string());
     }
+    if wrapper_separator {
+        args.push("--".into());
+    }
     if !plan.prompt.trim().is_empty() {
         args.push(plan.prompt.clone());
     }
@@ -400,7 +414,6 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
 
     Ok(HarnessSpawn {
         spec,
-        // The prompt went in the argv; see step 9 and the module header.
         opening: None,
         binding: SessionBinding::Caller,
         // Hooks are this harness's channel now.
@@ -691,6 +704,22 @@ mod tests {
             env_value(&spawned.spec, "CIDE_HOOK_SOCK"),
             Some("/run/user/1000/cide-hooks-42.sock")
         );
+    }
+
+    #[test]
+    fn a_review_can_use_the_checkout_without_approval_prompts() {
+        let agent = role();
+        let session = SessionId::new();
+        let mut plan = plan_for(&agent, session);
+        plan.tracker_paragraphs = false;
+        plan.codex.cli.inject.permissions = false;
+        plan.codex.cli.inject.review_permissions = true;
+
+        let args = CodexHarness.spawn_spec(&plan).expect("spawnable").spec.args;
+        assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
+        assert_eq!(config_value(&args, "approvals_reviewer"), "\"auto_review\"");
+        assert!(!args.iter().any(|arg| arg == "--approve-for-me"));
+        assert!(!args.iter().any(|arg| arg == "-s"));
     }
 
     /// The hook table: one override per codex event, then the trust bypass without which none

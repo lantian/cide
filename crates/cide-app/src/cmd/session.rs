@@ -296,7 +296,9 @@ pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
     if let Some((subcommand, _)) = continues {
         args.push(subcommand.to_string());
     }
-    args.extend(c.user_args.iter().cloned());
+    let mut user_args = c.user_args.clone();
+    let wrapper_separator = codex_cli::remove_wrapper_separator(&mut user_args);
+    args.extend(user_args);
     args.push("-C".into());
     args.push(c.cwd.clone());
     args.extend(codex_cli::quiet_start());
@@ -326,6 +328,9 @@ pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
             args.push("--include-non-interactive".into());
         }
         args.push(thread.to_string());
+    }
+    if wrapper_separator {
+        args.push("--".into());
     }
     if let Some(prompt) = &c.prompt {
         args.push(prompt.clone());
@@ -2626,6 +2631,21 @@ mod tests {
             !args.iter().any(|a| a == "-s" || a == "-a"),
             "a person's console: their config decides"
         );
+    }
+
+    #[test]
+    fn a_wrapper_separator_is_after_cide_options() {
+        let mut c = codex_console(None, false);
+        c.user_args = vec!["agent".into(), "codex".into(), "--".into()];
+        let args = codex_console_argv(&c);
+        let separator = args.iter().position(|arg| arg == "--").expect("separator");
+        assert!(separator > args.iter().position(|arg| arg == "-C").unwrap());
+        assert_eq!(args.last().map(String::as_str), Some("--"));
+
+        c.prompt = Some("hi".into());
+        let args = codex_console_argv(&c);
+        let separator = args.iter().position(|arg| arg == "--").expect("separator");
+        assert_eq!(args.get(separator + 1).map(String::as_str), Some("hi"));
     }
 
     /// (M93) A resume puts the subcommand first and the thread last; a fork likewise; a fork with

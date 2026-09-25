@@ -71,6 +71,18 @@ pub const BYPASS_HOOK_TRUST: &str = "--dangerously-bypass-hook-trust";
 /// the model sees (`mcp__cide__cide_task_get`).
 pub const SERVER: &str = "cide";
 
+/// Removes the wrapper separator from user arguments so cide can put it after its own options.
+/// A configured wrapper such as `o3 agent codex --` must see cide's `-C`, hooks and MCP options
+/// on the Codex side of that separator rather than treating them as wrapper positionals.
+pub fn remove_wrapper_separator(args: &mut Vec<String>) -> bool {
+    if let Some(index) = args.iter().position(|arg| arg == "--") {
+        args.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
 /// Which of cide's additions a spawn makes. Resolved from [`cide_ipc::CodexInjections`] once, in
 /// [`plan`], so the verdicts on the user's own tokens and the argv agree — `claude_cli`'s rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -701,6 +713,14 @@ mod tests {
                 fork: true,
             }
         );
+    }
+
+    #[test]
+    fn a_wrapper_separator_is_removed_from_user_args() {
+        let mut args = vec!["agent".into(), "codex".into(), "--".into()];
+        assert!(remove_wrapper_separator(&mut args));
+        assert_eq!(args, ["agent", "codex"]);
+        assert!(!remove_wrapper_separator(&mut args));
     }
 
     #[test]

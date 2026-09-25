@@ -70,6 +70,11 @@ const INJECTIONS: readonly { key: keyof CodexInjections; label: string; cost: st
     label: 'Sandbox and approvals for runs (-s, -a, --dangerously-bypass-approvals-and-sandbox)',
     cost: 'Off: runs, reviews and tabs cide opens pass no sandbox or approval flag — your codex config, or the wrapper named above, decides. A role’s permission-mode and the project’s unattended default are no longer applied, so a run may wait on an approval nobody is watching.',
   },
+  {
+    key: 'reviewPermissions',
+    label: 'MR-review permissions without prompts',
+    cost: 'Off: Codex uses the wrapper’s own approval policy. On: approval requests go to Codex’s automatic reviewer, which may approve or deny them. The wrapper or Codex config controls the sandbox.',
+  },
 ]
 
 export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps) {
