@@ -1,4 +1,4 @@
-//! The twenty-two MCP tools cide serves a `claude`: their names, their schemas, and handlers that
+//! The twenty-three MCP tools cide serves a `claude`: their names, their schemas, and handlers that
 //! touch nothing. (M18)
 //!
 //! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
@@ -251,6 +251,10 @@ pub mod tool {
     /// Hand a task to a role. **Enqueues and answers with a run id at once** — see the crate's
     /// `enqueue` and `agents_dispatch`, which both carry this rule in full.
     pub const AGENT_DISPATCH: &str = "cide_agent_dispatch";
+    /// Open a tab running a harness in a worktree of its own, on one piece of work, for a
+    /// project **without** roles to dispatch. (M104) The twin of [`AGENT_DISPATCH`], and exactly
+    /// one of the two is ever accepted — see [`super::Mode`].
+    pub const SESSION_OPEN: &str = "cide_session_open";
     /// What has been dispatched, and what each run is doing now.
     pub const AGENT_RUNS: &str = "cide_agent_runs";
     /// End a run: cancel it if it is queued, kill its child if it is working.
@@ -305,6 +309,7 @@ pub mod tool {
         LLM_PROVIDER,
         LLM_POOL,
         AGENT_DISPATCH,
+        SESSION_OPEN,
         AGENT_RUNS,
         AGENT_STOP,
         AGENT_INTEGRATE,
@@ -316,7 +321,7 @@ pub mod tool {
     ///
     /// Spelled out rather than concatenated, because a `const fn` concatenation of two slices is
     /// not expressible and a `Vec` would give up the `&'static [&'static str]` that lets a
-    /// connection's allow-list be a borrowed slice. `the_twenty_two_are_the_only_twenty_two` is what
+    /// connection's allow-list be a borrowed slice. `the_twenty_three_are_the_only_twenty_three` is what
     /// keeps the three lists from drifting — a name added to either family and forgotten here is
     /// a test failure, not a tool nobody is served.
     pub const EVERY: &[&str] = &[
@@ -337,6 +342,7 @@ pub mod tool {
         LLM_PROVIDER,
         LLM_POOL,
         AGENT_DISPATCH,
+        SESSION_OPEN,
         AGENT_RUNS,
         AGENT_STOP,
         AGENT_INTEGRATE,
@@ -422,6 +428,100 @@ pub enum Notify {
 /// Every [`Notify`], in the order the schema's `enum` lists them. [`STATUSES`]' rule: the schema
 /// is built from this and the parser accepts exactly this, so they cannot disagree.
 const NOTIFIES: &[Notify] = &[Notify::Here, Notify::Main, Notify::None];
+
+/// Which of the two ways of starting work this project takes right now. (M104)
+///
+/// # Why there is a rule at all, rather than two tools an orchestrator picks between
+///
+/// Both start a harness on a piece of work in a worktree of its own, so a model holding both would
+/// pick by whatever its last turn happened to mention — and the two are not interchangeable. A
+/// dispatched run is a **role**: the project's author wrote down who does this kind of work, on
+/// what CLI and model, with what prompt, and cide tracks it, reviews it and integrates it. A
+/// session is a plain console tab with a brief. Where roles exist, bypassing them is ignoring what
+/// the project's author said; where none exist, dispatch has nobody to hand work to. So the choice
+/// is a fact about the project, decided here, and the tool on the wrong side of it refuses with a
+/// sentence naming the other one — the user's own rule, stated when the feature was asked for.
+///
+/// Decided **per call**, from [`AgentSink::agents`], and not once per connection like the tool
+/// list: a role written mid-conversation (`cide_agent_create`) takes effect immediately, and the
+/// orchestrator that just wrote it should be able to dispatch to it on its next call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// At least one role can be dispatched now: `cide_agent_dispatch`, and only it.
+    Dispatch,
+    /// Subagents are off, or no role can currently be dispatched: `cide_session_open`, and only it.
+    Sessions,
+}
+
+/// The rule, over what the roster answered.
+///
+/// A role whose `unavailable` is set does not count: a project whose only role is refused (a bad
+/// definition, a bypass nobody authorised) has nobody to dispatch to *now*, and an orchestrator
+/// told "use dispatch" there would be told a road that ends in a refusal. An `Err` — subagents
+/// switched off — is [`Mode::Sessions`] for the same reason.
+pub fn mode_of(agents: &Result<Vec<AgentDef>, String>) -> Mode {
+    match agents {
+        Ok(defs) if defs.iter().any(|def| def.unavailable.is_none()) => Mode::Dispatch,
+        _ => Mode::Sessions,
+    }
+}
+
+/// The harnesses a session tab can run. (M104)
+///
+/// A **closed** list, unlike [`harnesses`], because a session is an interactive tab a person may
+/// type into and only these three have one cide can host with the task tools attached: claude and
+/// codex as consoles (`cmd::session`'s two console arms), opencode as its own TUI with cide's MCP
+/// server handed over in `OPENCODE_CONFIG_CONTENT`. Qwen and MiMo are refused by name rather than
+/// offered and then failing at the spawn.
+pub const SESSION_HARNESSES: &[Harness] = &[Harness::Claude, Harness::Codex, Harness::Opencode];
+
+/// What a session or a run is to work on. (M104)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Work {
+    /// A task in this project's tracker, which the child reads itself.
+    Task(TaskId),
+    /// Anything else: an issue in another system, or a sentence the user typed.
+    External(cide_ipc::ExternalWork),
+}
+
+/// `cide_session_open`'s arguments, validated. (M104)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
+    pub work: Work,
+    /// `None` is Settings → Harness, the CLI the user's own consoles run.
+    pub harness: Option<Harness>,
+    pub model: Option<String>,
+    /// One extra line on top of the work, as `cide_agent_dispatch`'s.
+    pub instructions: Option<String>,
+}
+
+/// What `cide_session_open` did. (M104)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedSession {
+    pub title: String,
+    pub harness: Harness,
+    pub cwd: PathBuf,
+    /// The branch the worktree has out, when the session stands in one.
+    pub branch: Option<String>,
+    /// The task already had a live session, and this is it: no second tab was opened.
+    pub reused: bool,
+}
+
+/// Everything `cide_agent_dispatch` can say, as one value. (M104)
+///
+/// A struct rather than three more positional arguments on [`AgentSink::dispatch`], whose seven
+/// implementations — five of them test doubles — would each have grown a parameter they ignore.
+/// [`AgentSink::dispatch_with`] takes this and falls back to `dispatch` for the ordinary case.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchArgs<'a> {
+    pub agent: &'a AgentId,
+    pub task: Option<&'a TaskId>,
+    pub external: Option<&'a cide_ipc::ExternalWork>,
+    pub instructions: Option<&'a str>,
+    pub notify: Notify,
+    pub harness: Option<Harness>,
+    pub model: Option<&'a str>,
+}
 
 /// The four scopes a definition can live in, as a slice, for [`STATUSES`]' reason. (M33)
 ///
@@ -776,6 +876,28 @@ pub trait AgentSink: Send + Sync {
         notify: Notify,
     ) -> Result<RunId, String>;
 
+    /// [`Self::dispatch`] with the M104 additions: work that is not a task, and a harness and
+    /// model for this run only.
+    ///
+    /// Defaulted to refuse anything `dispatch` cannot carry, so a sink that predates them — every
+    /// test double — keeps answering the ordinary case unchanged; the app's `RegistrySink`
+    /// implements it whole.
+    fn dispatch_with(&self, args: &DispatchArgs<'_>) -> Result<RunId, String> {
+        if args.external.is_some() || args.harness.is_some() || args.model.is_some() {
+            return Err("this cide cannot dispatch external work or choose a harness".into());
+        }
+        self.dispatch(args.agent, args.task, args.instructions, args.notify)
+    }
+
+    /// Open a tab on one piece of work, in a worktree of its own, and type the work into it.
+    /// (M104)
+    ///
+    /// **Must not wait for the work**, for [`Self::dispatch`]'s reason: it answers once the child
+    /// exists and its tab is in the tree. The prompt is typed on another thread.
+    fn open_session(&self, _request: &SessionRequest) -> Result<OpenedSession, String> {
+        Err("sessions are not available here".into())
+    }
+
     /// End a run. Idempotent on one that has already finished.
     ///
     /// # `reason` is no longer a log line, and that is the whole of M67
@@ -966,7 +1088,7 @@ pub trait AgentSink: Send + Sync {
 /// `cide_ide_mcp::tools`'s rule, and its `every_advertised_tool_has_a_schema_and_a_description`
 /// has a twin below.
 ///
-/// **All twenty-two, always.** The per-connection filtering is `cide_app::agent_rpc`'s
+/// **All twenty-three, always.** The per-connection filtering is `cide_app::agent_rpc`'s
 /// `descriptors_for`, which keeps this order and drops what the connection may not call: one
 /// definition of each tool, and the scope decided in exactly one place.
 pub fn descriptors() -> Vec<Value> {
@@ -1223,7 +1345,31 @@ pub fn description(name: &str) -> &'static str {
              where cide announces the run's turn endings: `here` (this pane, the default), \
              `main` (the project's primary Claude pane) or `none` (nothing is typed anywhere — \
              then cide_agent_runs with includeFinished, and the task's comments, are how you \
-             check on it)."
+             check on it). Work that is **not on this board** \u{2014} an issue from another system, \
+             or something the user described in words \u{2014} is `title` + one-line `brief` (+ `ref` \
+             when it has an id or URL) instead of `task`, and still gets its own worktree. \
+             `harness` and `model` run this one dispatch on another CLI or model without \
+             changing the role. Every run opens in a tab of its own that the user can watch and \
+             type into; closing that tab does not stop the run. This is only for a project that \
+             has roles: without any, open a session per piece of work with cide_session_open."
+        }
+        tool::SESSION_OPEN => {
+            "Open a new tab in cide running a coding agent on **one piece of work, in a git \
+             worktree of its own** \u{2014} the road for a project **with no subagent roles** (where \
+             this project has roles, this is refused: use cide_agent_dispatch). To implement \
+             several things in parallel, call it once per piece of work: each call makes its own \
+             worktree (`.cide/worktrees/task-<key>`, branch `cide/task-<key>`) and its own tab, \
+             behind the one the user is on, and returns at once without waiting for the work. The \
+             work is either a task on this project's board (`task`, e.g. `t-17` \u{2014} the session \
+             reads it with cide_task_get, is moved to doing, and sets it to review when done) or \
+             anything else: an issue you read from another system through its own tools, or \
+             something the user asked for in words \u{2014} give `title`, a one-line `brief`, and \
+             `ref` when it has an id or URL (it names the worktree). `harness` picks the CLI the \
+             tab runs (claude, codex or opencode; default: the user's console setting) and \
+             `model` its model. The tab is a real, writable session the user can watch and type \
+             into. Asking again for a task that already has a live session answers with that \
+             one rather than opening a second. Nothing is merged for you: when a session \
+             reports done, review its branch and merge it with git yourself."
         }
         tool::AGENT_RUNS => {
             "What this project's subagents are doing: one row per run, with the task it is on, \
@@ -1977,6 +2123,36 @@ pub fn input_schema(name: &str) -> Value {
                          is typed into the run's terminal, where a newline would submit it as a \
                          turn of its own.",
                 },
+                "title": {
+                    "type": "string",
+                    "description":
+                        "Instead of `task`, for work that is not on this board: a short title. \
+                         Needs `brief`.",
+                },
+                "brief": {
+                    "type": "string",
+                    "description":
+                        "With `title`: the statement of the work, on one line. The run cannot \
+                         read it anywhere else, so say what done looks like.",
+                },
+                "ref": {
+                    "type": "string",
+                    "description":
+                        "With `title`: where the work is written down, e.g. `PROJ-123` or a URL. \
+                         Names the worktree; the run is told to report back there if it has a \
+                         tool that reaches it.",
+                },
+                "harness": {
+                    "type": "string",
+                    "enum": harnesses().map(harness_wire).collect::<Vec<_>>(),
+                    "description":
+                        "Run this dispatch on this CLI instead of the role's own. This run only.",
+                },
+                "model": {
+                    "type": "string",
+                    "description":
+                        "Run this dispatch on this model instead of the role's own. This run only.",
+                },
                 "notify": {
                     "type": "string",
                     "enum": NOTIFIES.iter().map(|n| notify_wire(*n)).collect::<Vec<_>>(),
@@ -1989,6 +2165,48 @@ pub fn input_schema(name: &str) -> Value {
                 },
             },
             "required": ["agent"],
+        }),
+        tool::SESSION_OPEN => json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description":
+                        "The id of a task on this project's board, e.g. `t-17`. Leave it out for \
+                         work that is not on the board and give `title` and `brief` instead.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Instead of `task`: a short title for the work.",
+                },
+                "brief": {
+                    "type": "string",
+                    "description":
+                        "With `title`: the statement of the work, on one line — typed into a \
+                         terminal, where a newline would submit half of it. Say what done looks \
+                         like.",
+                },
+                "ref": {
+                    "type": "string",
+                    "description":
+                        "With `title`: where the work is written down, e.g. `PROJ-123` or a URL. \
+                         Names the worktree.",
+                },
+                "harness": {
+                    "type": "string",
+                    "enum": SESSION_HARNESSES.iter().map(|h| harness_wire(*h)).collect::<Vec<_>>(),
+                    "description":
+                        "The CLI the tab runs. Default: the user's own console setting.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "The model the tab runs, in that CLI's own spelling.",
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "One extra sentence on top of the work. One line.",
+                },
+            },
         }),
         tool::AGENT_RUNS => json!({
             "type": "object",
@@ -2894,6 +3112,7 @@ pub fn dispatch_orchestration(
         tool::LLM_PROVIDER => Some(llm_provider(arguments, sink)),
         tool::LLM_POOL => Some(llm_pool(arguments, sink)),
         tool::AGENT_DISPATCH => Some(agent_dispatch(arguments, sink)),
+        tool::SESSION_OPEN => Some(session_open(arguments, sink)),
         tool::AGENT_RUNS => Some(agent_runs(arguments, sink)),
         tool::AGENT_STOP => Some(agent_stop(arguments, sink)),
         tool::AGENT_INTEGRATE => Some(agent_integrate(arguments, sink)),
@@ -4779,10 +4998,32 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(value) => value.filter(|text| !text.trim().is_empty()),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
     };
+    // Work that is not on the board (M104). Parsed after `task` so the blank-task sentence above
+    // keeps its priority, and refused beside a task rather than silently preferring one.
+    let external = match external_work(arguments, tool::AGENT_DISPATCH) {
+        Ok(external) => external,
+        Err(result) => return result,
+    };
+    if task.is_some() && external.is_some() {
+        return ToolResult::error(format!(
+            "{}: give either `task` or `title` + `brief`, not both — a run works on one thing.",
+            tool::AGENT_DISPATCH
+        ));
+    }
+    let harness = match chosen_harness(arguments, tool::AGENT_DISPATCH, None) {
+        Ok(harness) => harness,
+        Err(result) => return result,
+    };
+    let model = match optional_string(arguments, "model") {
+        Ok(value) => value
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
+    };
     // No task and nothing to do is refused at the gesture, with both roads named: `plan_dispatch`
     // would refuse it too ("this run has nothing to do"), but its sentence does not know which
     // tool the caller is holding. (M40)
-    if task.is_none() && instructions.is_none() {
+    if task.is_none() && external.is_none() && instructions.is_none() {
         return ToolResult::error(format!(
             "{}: name a `task` for this run — the ordinary road; create one with {} first — or, \
              for a quick run with no task, give it a one-line `instructions`. Neither was given.",
@@ -4836,7 +5077,37 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         }
         false => "",
     };
-    match sink.dispatch(&agent, task.as_ref(), instructions.as_deref(), notify) {
+    let args = DispatchArgs {
+        agent: &agent,
+        task: task.as_ref(),
+        external: external.as_ref(),
+        instructions: instructions.as_deref(),
+        notify,
+        harness,
+        model: model.as_deref(),
+    };
+    let dispatched = sink.dispatch_with(&args);
+    // An external piece of work reads like a task in the answer: it has a worktree and a branch.
+    if let (Ok(run), Some(work)) = (&dispatched, &external) {
+        return ToolResult::text(format!(
+            "Dispatched `{agent}` on \"{}\"{}. Run {run}.\nIt works in a worktree of its own, \
+             named after {}. Nothing waits on it; call {} to see how it is getting on — there is \
+             no task on this board for it to report into, so its pane, its tab and its turn \
+             endings are where it answers. {announced}{paused}",
+            one_line(&work.title),
+            work.reference
+                .as_deref()
+                .map(|r| format!(" ({})", one_line(r)))
+                .unwrap_or_default(),
+            if work.reference.is_some() {
+                "its ref"
+            } else {
+                "its title"
+            },
+            tool::AGENT_RUNS
+        ));
+    }
+    match dispatched {
         // Deliberately does not claim the run has started. It has been *enqueued* — behind the
         // role's concurrency, or behind another run in the same checkout — and a sentence saying
         // "started" would have a model watching for output that is minutes away.
@@ -4859,7 +5130,184 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
                 tool::AGENT_RUNS
             )),
         },
-        Err(why) => ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
+        // The user's rule (M104): a project with nobody to dispatch to opens sessions instead.
+        // Appended rather than substituted, so the sink's own sentence — which says *why* this
+        // role or this project cannot be dispatched — is never lost.
+        Err(why) => ToolResult::error(match mode_of(&sink.agents()) {
+            Mode::Sessions => format!(
+                "{}: {why}\nThis project has no role that can be dispatched right now, so open a \
+                 session per piece of work with {} instead.",
+                tool::AGENT_DISPATCH,
+                tool::SESSION_OPEN
+            ),
+            Mode::Dispatch => format!("{}: {why}", tool::AGENT_DISPATCH),
+        }),
+    }
+}
+
+/// `title` + `brief` (+ `ref`), when the caller named work that is not on the board. (M104)
+///
+/// `Ok(None)` when neither `title` nor `brief` is present; a refusal when only one is, because a
+/// title with no statement is work the child cannot do, and a statement with no title is a
+/// worktree with no name.
+fn external_work(
+    arguments: &Value,
+    tool: &str,
+) -> Result<Option<cide_ipc::ExternalWork>, ToolResult> {
+    let read = |key: &str| {
+        optional_string(arguments, key)
+            .map(|value| value.map(|v| one_line(&v)).filter(|v| !v.trim().is_empty()))
+            .map_err(|why| ToolResult::error(format!("{tool}: {why}")))
+    };
+    let title = read("title")?;
+    let brief = read("brief")?;
+    let reference = read("ref")?;
+    match (title, brief) {
+        (None, None) if reference.is_none() => Ok(None),
+        (Some(title), Some(brief)) => Ok(Some(cide_ipc::ExternalWork {
+            reference,
+            title,
+            brief,
+        })),
+        _ => Err(ToolResult::error(format!(
+            "{tool}: work that is not on this board needs both `title` and a one-line `brief` \
+             (and `ref` when it has an id or URL)."
+        ))),
+    }
+}
+
+/// `harness`, checked against `allowed` (every registered harness when `None`). (M104)
+fn chosen_harness(
+    arguments: &Value,
+    tool: &str,
+    allowed: Option<&[Harness]>,
+) -> Result<Option<Harness>, ToolResult> {
+    let text = match optional_string(arguments, "harness") {
+        Ok(None) => return Ok(None),
+        Ok(Some(text)) => text,
+        Err(why) => return Err(ToolResult::error(format!("{tool}: {why}"))),
+    };
+    let offered: Vec<Harness> = match allowed {
+        Some(allowed) => allowed.to_vec(),
+        None => harnesses().collect(),
+    };
+    match harness_from_wire(text.trim()) {
+        Some(harness) if offered.contains(&harness) => Ok(Some(harness)),
+        _ => Err(ToolResult::error(format!(
+            "{tool}: `harness` must be one of {}, not `{}`.",
+            offered
+                .iter()
+                .map(|h| format!("`{}`", harness_wire(*h)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            one_line(&text)
+        ))),
+    }
+}
+
+/// `cide_session_open`: one tab, one worktree, one piece of work. (M104)
+fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    // The rule first, before anything is parsed: a caller on the wrong road is told which road
+    // is right regardless of what it asked for.
+    let roster = sink.agents();
+    if mode_of(&roster) == Mode::Dispatch {
+        let names = roster
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|def| def.unavailable.is_none())
+            .map(|def| format!("`{}`", def.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return ToolResult::error(format!(
+            "{}: this project has subagent roles ({names}), so work is handed to them with {} — \
+             each run still gets its own worktree and its own tab, and `harness` there picks the \
+             CLI for one run.",
+            tool::SESSION_OPEN,
+            tool::AGENT_DISPATCH
+        ));
+    }
+
+    let task = match optional_string(arguments, "task") {
+        Ok(task) => task.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
+    };
+    let external = match external_work(arguments, tool::SESSION_OPEN) {
+        Ok(external) => external,
+        Err(result) => return result,
+    };
+    let work = match (task, external) {
+        (Some(task), None) => Work::Task(TaskId(task)),
+        (None, Some(external)) => Work::External(external),
+        (Some(_), Some(_)) => {
+            return ToolResult::error(format!(
+                "{}: give either `task` or `title` + `brief`, not both — a session works on one \
+                 thing. Call this once per piece of work.",
+                tool::SESSION_OPEN
+            ));
+        }
+        (None, None) => {
+            return ToolResult::error(format!(
+                "{}: name the work — `task` for one on this board (see {}), or `title` and a \
+                 one-line `brief` for anything else.",
+                tool::SESSION_OPEN,
+                tool::TASK_LIST
+            ));
+        }
+    };
+    let harness = match chosen_harness(arguments, tool::SESSION_OPEN, Some(SESSION_HARNESSES)) {
+        Ok(harness) => harness,
+        Err(result) => return result,
+    };
+    let model = match optional_string(arguments, "model") {
+        Ok(value) => value
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
+    };
+    let instructions = match optional_string(arguments, "instructions") {
+        Ok(value) => value.filter(|text| !text.trim().is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
+    };
+
+    let request = SessionRequest {
+        work,
+        harness,
+        model,
+        instructions,
+    };
+    match sink.open_session(&request) {
+        Ok(opened) if opened.reused => ToolResult::text(format!(
+            "\"{}\" already has a live session, in its own tab ({} in {}); no second one was \
+             opened.",
+            opened.title,
+            harness_wire(opened.harness),
+            opened.cwd.display()
+        )),
+        Ok(opened) => {
+            let report = match &request.work {
+                Work::Task(task) => format!(
+                    "It reads {task} itself, which is now doing, and sets it to review when it is \
+                     done — watch the board, or {} it.",
+                    tool::TASK_GET
+                ),
+                Work::External(_) => "There is no task on this board for it: it answers in its \
+                     own tab, and reports to the source if it has a tool that reaches it."
+                    .to_string(),
+            };
+            ToolResult::text(format!(
+                "Opened \"{}\" in a new tab, on {}, in {}{}. Nothing waits on it. {report} \
+                 When it is done, review the branch and merge it yourself.",
+                opened.title,
+                harness_wire(opened.harness),
+                opened.cwd.display(),
+                opened
+                    .branch
+                    .as_deref()
+                    .map(|b| format!(" (branch `{b}`)"))
+                    .unwrap_or_default(),
+            ))
+        }
+        Err(why) => ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
     }
 }
 
@@ -7841,7 +8289,7 @@ mod tests {
     }
 
     #[test]
-    fn the_twenty_two_are_the_only_twenty_two() {
+    fn the_twenty_three_are_the_only_twenty_three() {
         assert_eq!(
             tool::ORCHESTRATION,
             [
@@ -7855,6 +8303,9 @@ mod tests {
                 "cide_llm_provider",
                 "cide_llm_pool",
                 "cide_agent_dispatch",
+                // Beside dispatch, because it is dispatch's other half: the one a project with no
+                // roles is served instead. (M104)
+                "cide_session_open",
                 "cide_agent_runs",
                 "cide_agent_stop",
                 "cide_agent_integrate",
@@ -8813,6 +9264,9 @@ mod tests {
         /// When set, a settings write fails with this sentence: the disk-refused road, which no
         /// argument can provoke.
         refuse_settings: Option<String>,
+        /// Every session `cide_session_open` asked for, and whether the next one is a reuse.
+        /// (M104)
+        sessions: Mutex<Vec<SessionRequest>>,
     }
 
     const NOW: u64 = 1_700_000_000_000;
@@ -8900,6 +9354,21 @@ mod tests {
                 notify,
             ));
             Ok(RunId::new())
+        }
+
+        fn open_session(&self, request: &SessionRequest) -> Result<OpenedSession, String> {
+            self.sessions.lock().push(request.clone());
+            let (title, key) = match &request.work {
+                Work::Task(task) => (format!("{task} · Fix it"), task.0.clone()),
+                Work::External(work) => (work.title.clone(), work.title.to_lowercase()),
+            };
+            Ok(OpenedSession {
+                title,
+                harness: request.harness.unwrap_or(Harness::Claude),
+                cwd: PathBuf::from(format!("/p/.cide/worktrees/task-{key}")),
+                branch: Some(format!("cide/task-{key}")),
+                reused: false,
+            })
         }
 
         fn stop(&self, run: RunId, reason: Option<&str>, force: bool) -> Result<Stopped, String> {
@@ -9160,6 +9629,7 @@ mod tests {
             llm: Mutex::new(LlmSettings::default()),
             resolutions: Vec::new(),
             refuse_settings: None,
+            sessions: Mutex::new(Vec::new()),
         }
     }
 
@@ -9356,6 +9826,141 @@ mod tests {
         // The default is said back, so a caller that never thought about `notify` still knows
         // where to expect the knock.
         assert!(text.contains("announced here"), "{text}");
+    }
+
+    /// The user's rule (M104): roles exist → dispatch, and only dispatch.
+    #[test]
+    fn a_project_with_a_dispatchable_role_refuses_a_session_and_names_the_role() {
+        let sink = roster();
+        let answer = ask(tool::SESSION_OPEN, json!({ "task": "t-7" }), &sink);
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        // `qa` is unavailable in the fixture, so it is not offered as somebody to hand work to.
+        assert!(text.contains("(`developer`)"), "{text}");
+        assert!(text.contains(tool::AGENT_DISPATCH), "{text}");
+        assert!(sink.sessions.lock().is_empty());
+    }
+
+    /// And the other half: nobody to dispatch to → sessions, and dispatch says so.
+    #[test]
+    fn a_project_with_no_dispatchable_role_opens_sessions_and_dispatch_points_at_them() {
+        let broken = FakeAgents::broken("subagents are off for this project");
+        assert_eq!(mode_of(&broken.agents()), Mode::Sessions);
+        let answer = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7" }),
+            &broken,
+        );
+        assert!(answer.is_error);
+        let text = text_of(&answer);
+        // The sink's own reason survives, and the other road is named after it.
+        assert!(
+            text.contains("subagents are off for this project"),
+            "{text}"
+        );
+        assert!(text.contains(tool::SESSION_OPEN), "{text}");
+
+        let unavailable = FakeAgents {
+            defs: vec![def("qa", "QA", "Checks.", Some("no claude"))],
+            ..roster()
+        };
+        assert_eq!(mode_of(&unavailable.agents()), Mode::Sessions);
+        let answer = ask(
+            tool::SESSION_OPEN,
+            json!({ "task": "t-7", "harness": "opencode", "model": "anthropic/claude-sonnet-5" }),
+            &unavailable,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        eprintln!("{text}");
+        assert!(text.contains("on opencode"), "{text}");
+        assert!(text.contains("branch `cide/task-t-7`"), "{text}");
+        assert!(text.contains("Nothing waits on it"), "{text}");
+        assert_eq!(
+            *unavailable.sessions.lock(),
+            vec![SessionRequest {
+                work: Work::Task(TaskId("t-7".into())),
+                harness: Some(Harness::Opencode),
+                model: Some("anthropic/claude-sonnet-5".into()),
+                instructions: None,
+            }]
+        );
+    }
+
+    /// Work that is not on the board: `title` + `brief` (+ `ref`), and one or the other only.
+    #[test]
+    fn a_session_takes_external_work_and_refuses_half_a_statement() {
+        let sink = FakeAgents::broken("subagents are off for this project");
+        let answer = ask(
+            tool::SESSION_OPEN,
+            json!({ "ref": "PROJ-12", "title": "Add --version", "brief": "print the\nversion" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(text_of(&answer).contains("no task on this board"));
+        assert_eq!(
+            sink.sessions.lock()[0].work,
+            Work::External(cide_ipc::ExternalWork {
+                reference: Some("PROJ-12".into()),
+                title: "Add --version".into(),
+                // Flattened at the edge: it is typed into a terminal.
+                brief: "print the version".into(),
+            })
+        );
+
+        for (arguments, needle) in [
+            (
+                json!({ "title": "Add --version" }),
+                "both `title` and a one-line `brief`",
+            ),
+            (json!({}), "name the work"),
+            (
+                json!({ "task": "t-1", "title": "x", "brief": "y" }),
+                "not both",
+            ),
+            (
+                json!({ "task": "t-1", "harness": "qwen" }),
+                "`harness` must be one of",
+            ),
+        ] {
+            let answer = ask(tool::SESSION_OPEN, arguments.clone(), &sink);
+            assert!(answer.is_error, "{arguments}");
+            assert!(
+                text_of(&answer).contains(needle),
+                "{arguments}: {}",
+                text_of(&answer)
+            );
+        }
+        assert_eq!(sink.sessions.lock().len(), 1);
+    }
+
+    /// A sink that predates M104 refuses what it cannot carry instead of dropping it.
+    #[test]
+    fn a_dispatch_with_a_harness_reaches_the_sink_or_is_refused_whole() {
+        let sink = roster();
+        let answer = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7", "harness": "codex" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(
+            text_of(&answer).contains("choose a harness"),
+            "{}",
+            text_of(&answer)
+        );
+        assert!(sink.dispatched.lock().is_empty());
+        let answer = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "title": "x" }),
+            &sink,
+        );
+        assert!(
+            text_of(&answer).contains("both `title`"),
+            "{}",
+            text_of(&answer)
+        );
     }
 
     /// The negative twin of [`a_dispatch_answers_with_a_run_and_never_claims_it_started`]. (M66)

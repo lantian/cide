@@ -1182,6 +1182,7 @@ pub fn tab_new_claude(
                 harness: None,
                 title: format!("{name} : claude"),
                 docker: None,
+                origin: None,
             },
         )
     })
@@ -1705,6 +1706,7 @@ mod tests {
             harness: None,
             title: "p : claude".into(),
             docker: None,
+            origin: None,
         };
 
         let mine = SessionId::new();
@@ -1778,6 +1780,7 @@ mod tests {
             harness: None,
             title: "p : bash".into(),
             docker: None,
+            origin: None,
         };
         let mirror = Pane {
             session: Some(primary),
@@ -1987,6 +1990,7 @@ mod tests {
                 harness: None,
                 title: "f".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("a tab opens");
@@ -2056,6 +2060,7 @@ mod tests {
                     harness: None,
                     title: "f".into(),
                     docker: None,
+                    origin: None,
                 },
             )
             .expect("a tab opens");
@@ -2231,6 +2236,7 @@ mod tests {
                 harness: None,
                 title: "lib.rs".into(),
                 docker: None,
+                origin: None,
             }),
         };
 
@@ -2256,6 +2262,7 @@ mod tests {
                 harness: None,
                 title: "lib.rs".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("opens");
@@ -2298,6 +2305,7 @@ mod tests {
                 harness: None,
                 title: "a.rs".into(),
                 docker: None,
+                origin: None,
             }),
         };
         assert_eq!(reopen_plan(&ws, &orphan), Reopen::Skip);

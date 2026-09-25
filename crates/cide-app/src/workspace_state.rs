@@ -42,6 +42,18 @@ pub struct WorkspaceState {
     app: OnceLock<AppHandle>,
 }
 
+/// Tell `cide_agents::defs` which binaries Settings → Harness configures, so every availability
+/// probe — the Agents panel's roster, a dispatch's refusal, the MR review dialog — asks about the
+/// binary a run will actually start rather than a bare name on `PATH`. (M107) See
+/// `cide_agents::defs::set_configured_binary` for why this is pushed rather than passed.
+fn publish_binaries(settings: &cide_ipc::Settings) {
+    cide_agents::defs::set_configured_binary(
+        cide_ipc::Harness::Claude,
+        &settings.claude.cli.binary,
+    );
+    cide_agents::defs::set_configured_binary(cide_ipc::Harness::Codex, &settings.codex.cli.binary);
+}
+
 impl WorkspaceState {
     /// Load from disk, or start from defaults.
     ///
@@ -58,6 +70,7 @@ impl WorkspaceState {
             tracing::warn!(%error, "loaded workspace failed validation; starting from defaults");
             workspace = Workspace::default();
         }
+        publish_binaries(&workspace.settings);
 
         Self {
             inner: Mutex::new(workspace),
@@ -195,6 +208,12 @@ impl WorkspaceState {
             // commands read `state.rev()` after this returns, which is always honest.
             guard.rev = rev_before;
             return outcome;
+        }
+        // Settings → Harness's binaries, handed to the harness probe whenever they move. (M107)
+        if content_before.settings.claude.cli.binary != guard.settings.claude.cli.binary
+            || content_before.settings.codex.cli.binary != guard.settings.codex.cli.binary
+        {
+            publish_binaries(&guard.settings);
         }
         if guard.rev == rev_before {
             // Changed, but the mutator never bumped — true of every layout mutation in

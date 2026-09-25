@@ -437,7 +437,7 @@ pub(crate) fn developer_brief(plan: &RunPlan<'_>) -> String {
                 &CodexHarness,
             ));
         }
-        if plan.task.is_none() {
+        if plan.adhoc() {
             say(ADHOC_PREAMBLE.to_string());
         }
     }
@@ -608,6 +608,7 @@ mod tests {
             harness: agent.def.harness,
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            server: None,
         }
     }
 
@@ -742,9 +743,18 @@ mod tests {
 
         let mut adhoc = plan_for(&agent, session);
         adhoc.task = None;
+        // No title either: a run with a title and no task is one on external work (M104), which
+        // has a worktree and is told to commit — `RunPlan::adhoc`.
+        adhoc.task_title = None;
         adhoc.change = Some("m28-openspec".into());
         let brief = developer_brief(&adhoc);
         assert!(brief.ends_with(ADHOC_PREAMBLE), "{brief}");
+        // External work keeps its title and loses the ad-hoc paragraph: it stands in a worktree
+        // of its own and must commit there.
+        let mut external = plan_for(&agent, session);
+        external.task = None;
+        assert!(!external.adhoc());
+        assert!(!developer_brief(&external).contains(ADHOC_PREAMBLE));
 
         let mut silent = role();
         silent.def.system_prompt = "   ".into();

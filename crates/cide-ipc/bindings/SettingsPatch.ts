@@ -8,6 +8,7 @@ import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
+import type { OpenRunIn } from "./OpenRunIn";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
@@ -44,6 +45,11 @@ uiFontSize?: number, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: bo
  * Which CLI a new console runs. (M93) See [`crate::settings::Settings::console_harness`].
  */
 consoleHarness?: ConsoleHarness, 
+/**
+ * Where the Agents panel's Open shows a run. (M108) See
+ * [`crate::settings::Settings::open_run_in`].
+ */
+openRunIn?: OpenRunIn, 
 /**
  * How `codex` is launched. (M93)
  */

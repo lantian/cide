@@ -210,6 +210,8 @@ Chapters are anchors on the page: `kit.html#<id>`.
   `onChange` receives the value, not an event.
 - **`Textarea`** follows the same focus rule as the other fields.
 - **`FormRow`**: a settings row, with label and hint on the left and the control on the right.
+  The text keeps a floor of about 260px; a control too wide to leave it that (a four-way
+  `Segmented`) wraps onto its own line under the text rather than squeezing the text column.
 
 ### Choices: `Choice.tsx`
 

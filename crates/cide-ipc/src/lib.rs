@@ -71,7 +71,7 @@ pub use settings::{
     CodexInjections, CodexSettings, ConsoleHarness, DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE,
     EditorSettings, ExplorerSettings, GitSettings, GraphicsSettings, HighlightLevel,
     InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MAX_UI_FONT_SIZE,
-    MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, ProxyMode, ProxyScope,
+    MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, OpenRunIn, ProxyMode, ProxyScope,
     ProxySettings, ProxyTarget, RemoteBind, RemoteSettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
     Settings, SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size,
     clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
@@ -83,9 +83,9 @@ pub use settings_ops::{
 pub use theme::{BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, SCHEME_TOKENS, scheme_roles};
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, HistoryTab, LayoutNode,
-    LogLineDetail, MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry,
-    RecentProject, SettingsSection, SpecSubject, TOOL_WINDOW_MAX_HEIGHT, TOOL_WINDOW_MIN_HEIGHT,
-    Tab, TabKind, ToolWindowState, WindowRole, Workspace,
+    LogLineDetail, MAX_RATIO, MIN_RATIO, Pane, PaneOrigin, PaneTree, Project, ProjectRoot,
+    RecentEntry, RecentProject, SettingsSection, SpecSubject, TOOL_WINDOW_MAX_HEIGHT,
+    TOOL_WINDOW_MIN_HEIGHT, Tab, TabKind, ToolWindowState, WindowRole, Workspace,
 };
 
 // --- M8: file tree, watcher, pickers ---
@@ -133,10 +133,10 @@ pub mod agents;
 pub mod tasks;
 
 pub use agents::{
-    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, LlmLimitsProbe, LlmModelTest,
-    LogRunInfo, OrchestrationConfig, OrchestrationPatch, PoolBench, PoolEntryState, PoolEvent,
-    PoolEventKind, PoolProviderState, PoolRefusal, PoolRunRef, PoolSkip, PoolSkipped, PoolState,
-    PoolStateReport, RunNotify, RunOpen, RunState, TokenUsage,
+    AgentDef, AgentRoster, AgentRun, DispatchRequest, ExternalWork, Harness, LlmLimitsProbe,
+    LlmModelTest, LogRunInfo, OrchestrationConfig, OrchestrationPatch, PoolBench, PoolEntryState,
+    PoolEvent, PoolEventKind, PoolProviderState, PoolRefusal, PoolRunRef, PoolSkip, PoolSkipped,
+    PoolState, PoolStateReport, RunNotify, RunOpen, RunState, TokenUsage,
 };
 pub use tasks::{
     ATTACHMENTS_DIR, ATTACHMENTS_LEAF, AttachTarget, AttachmentKind, LinkType, StagedFile,

@@ -1376,6 +1376,29 @@ fn plan_dispatch(
         return Err(CoreError::Io(why));
     }
 
+    // A run works on one thing (M104). The MCP tool refuses both at the gesture; this is the
+    // funnel every door passes through.
+    if request.task.is_some() && request.external.is_some() {
+        return Err(CoreError::Io(
+            "a run works on one thing: give a task or external work, not both.".into(),
+        ));
+    }
+    let options = crate::agents::WorkOptions {
+        external: request.external.clone(),
+        harness: request.harness,
+        model: request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+    };
+    // This run's own overrides laid over the machine's, when it asked for any: the table every
+    // resolution below reads, so the queued row, the pool and the tool spelling all agree with
+    // the child `start_child` will fork from the same `WorkOptions`.
+    let run_overrides = options.overrides(&request.agent, overrides);
+    let overrides = run_overrides.as_ref().unwrap_or(overrides);
+
     let task = request
         .task
         .as_ref()
@@ -1386,80 +1409,10 @@ fn plan_dispatch(
         })
         .transpose()?;
 
-    /*
-     * An inbox task is not work yet, so nothing dispatches it. (M83)
-     *
-     * The quiet half is `autodispatch`, which starts `Todo | Doing` only; this is the named one,
-     * for the same reason the blocking rule below has one — an explicit gesture's refusal must
-     * say why and what to do instead. Moving a task out of the inbox is the decision that it is
-     * worth doing now, and a dispatch that skipped it would make the inbox a place tasks run from.
-     */
     if let Some(task) = task.as_ref()
-        && task.status == cide_ipc::TaskStatus::Inbox
+        && let Some(why) = task_refusal(root, store, task)
     {
-        return Err(CoreError::Io(format!(
-            "{} is in the inbox, which is where noticed work waits until something needs it: \
-             move it to todo first (cide_task_update with status todo), then dispatch it.",
-            task.id
-        )));
-    }
-
-    /*
-     * Work on a later milestone waits for the current one. (M83)
-     *
-     * A task under milestone P3 started while the slice is still red is effort spent on a goal the
-     * project has not reached, and it competes for the same concurrency the current goal needs.
-     * A task under no milestone is not caught: that is the orchestrator's call, and the placement
-     * rule already sends new loose work to the inbox.
-     */
-    if let Some(task) = task.as_ref() {
-        let plan = cide_agents::config::load_milestones(root);
-        if let Some(why) = cide_agents::milestones::outside_active(&plan, &store.list(), &task.id) {
-            return Err(CoreError::Io(why));
-        }
-    }
-
-    /*
-     * The named refusal half of the blocking rule. (M30)
-     *
-     * The quiet half is `autodispatch::trigger`'s early return — an assignment on a blocked task
-     * records intent and starts nothing, with a debug line. But an *explicit* dispatch (the
-     * panel's button, `cide_agent_dispatch`, and auto-dispatch re-entering through
-     * `agents_dispatch`) is a gesture whose refusal must say why, and this function is the single
-     * funnel all three pass through — so neither path can be forgotten alone.
-     *
-     * Refused only while a blocker is live and not done: a blocker that no longer exists cannot
-     * gate (it can never become done, and its id is never reused — `blocker_statuses` has the
-     * argument). A run already *queued* when its task became blocked still spawns; the gate is at
-     * dispatch decision time, the same line the enqueue-vs-spawn note above draws.
-     */
-    if let Some(task) = task.as_ref() {
-        let board = store.list();
-        let blockers: Vec<String> = task
-            .links
-            .iter()
-            .filter(|l| l.link == cide_ipc::LinkType::BlockedBy && !l.deleted)
-            .filter_map(|l| board.iter().find(|t| t.id == l.target))
-            .filter(|t| t.status != cide_ipc::TaskStatus::Done)
-            .map(|t| {
-                let status = match t.status {
-                    cide_ipc::TaskStatus::Inbox => "inbox",
-                    cide_ipc::TaskStatus::Todo => "todo",
-                    cide_ipc::TaskStatus::Doing => "doing",
-                    cide_ipc::TaskStatus::Review => "review",
-                    cide_ipc::TaskStatus::Done => "done",
-                };
-                format!("{} ({status})", t.id)
-            })
-            .collect();
-        if !blockers.is_empty() {
-            return Err(CoreError::Io(format!(
-                "{} is blocked by {}: a task is dispatched only once every task it is blocked \
-                 by is done. Finish or dispatch the blockers first, or remove the link.",
-                task.id,
-                blockers.join(", ")
-            )));
-        }
+        return Err(CoreError::Io(why));
     }
 
     // The bridge is established above — `dispatch_refusal` refused this dispatch if `cide-hook`
@@ -1472,7 +1425,10 @@ fn plan_dispatch(
     // producer the fork uses too. (M78)
     let kind = cide_agents::overrides::effective_harness(agent, overrides);
     let harness = cide_agents::harness::for_kind(kind);
-    let prompt = opening_prompt(task.as_ref(), request.prompt.as_deref(), harness);
+    let prompt = match request.external.as_ref() {
+        Some(work) => external_prompt(work, request.prompt.as_deref(), harness),
+        None => opening_prompt(task.as_ref(), request.prompt.as_deref(), harness),
+    };
     if prompt.is_empty() {
         // Refused here as well as in `ClaudeHarness::spawn_spec`, which has the same guard for the
         // same reason: an interactive `claude` with no opening prompt starts perfectly, sits at
@@ -1495,7 +1451,12 @@ fn plan_dispatch(
         task: request.task.clone(),
         // Copied now, not looked up at spawn: it ends up in the child's terminal title and in
         // `/resume`, and those must still read correctly after the task has been renamed.
-        task_title: task.as_ref().map(|task| task.title.clone()),
+        // An external run carries its work's title here, which is also what tells the harness it
+        // is not an ad-hoc run (`RunPlan::adhoc`): it has a worktree and must commit.
+        task_title: task
+            .as_ref()
+            .map(|task| task.title.clone())
+            .or_else(|| request.external.as_ref().map(|work| work.title.clone())),
         // **From the task, never from the request.** (M28) `DispatchRequest` has no `change`
         // field and deliberately gains none: a dispatch that could name a different change than
         // its task's would put the board and the branch in disagreement, with nothing in a
@@ -1517,11 +1478,15 @@ fn plan_dispatch(
         // root: shared isolation, a role whose file says `worktree: false`, or a dispatch with
         // no task (M40). One function decides, and `start_child` calls the same one at the
         // fork, so the directory gated on is the directory taken.
-        checkout: cide_agents::run_checkout(agent, &project.config.agents, request.task.as_ref()),
+        checkout: cide_agents::run_checkout(
+            agent,
+            &project.config.agents,
+            options.checkout_key(request.task.as_ref()).as_ref(),
+        ),
         // `None` on the wire means the caller had no session to name — the panel, the Tasks
         // panel's assignment — and the primary pane is the honest address for that.
         notify: request.notify.clone().unwrap_or_default(),
-        purpose: crate::agents::RunPurpose::Work,
+        purpose: crate::agents::RunPurpose::Work(options),
         // The pool this run falls down, resolved now so admission can place it on an entry
         // with room (`PoolEntry::max_running`). Empty on a refusal: the fork resolves again
         // and refuses with its sentence, which is where that refusal has always been said.
@@ -1533,6 +1498,141 @@ fn plan_dispatch(
             }
         },
     })
+}
+
+/// Whether this task may be started now, as the sentence saying why not. (M104: extracted from
+/// [`plan_dispatch`] so `cide_session_open` refuses exactly what a dispatch refuses, with the same
+/// words — two funnels with two copies of the rule would drift on the first edit.)
+///
+/// Three rules, in the order a caller can act on them: the inbox, the active milestone, and the
+/// blockers.
+pub(crate) fn task_refusal(root: &Path, store: &TaskStore, task: &Task) -> Option<String> {
+    /*
+     * An inbox task is not work yet, so nothing dispatches it. (M83)
+     *
+     * The quiet half is `autodispatch`, which starts `Todo | Doing` only; this is the named one,
+     * for the same reason the blocking rule below has one — an explicit gesture's refusal must
+     * say why and what to do instead. Moving a task out of the inbox is the decision that it is
+     * worth doing now, and a dispatch that skipped it would make the inbox a place tasks run from.
+     */
+    if task.status == cide_ipc::TaskStatus::Inbox {
+        return Some(format!(
+            "{} is in the inbox, which is where noticed work waits until something needs it: \
+             move it to todo first (cide_task_update with status todo), then start it.",
+            task.id
+        ));
+    }
+
+    /*
+     * Work on a later milestone waits for the current one. (M83)
+     *
+     * A task under milestone P3 started while the slice is still red is effort spent on a goal the
+     * project has not reached, and it competes for the same concurrency the current goal needs.
+     * A task under no milestone is not caught: that is the orchestrator's call, and the placement
+     * rule already sends new loose work to the inbox.
+     */
+    {
+        let plan = cide_agents::config::load_milestones(root);
+        if let Some(why) = cide_agents::milestones::outside_active(&plan, &store.list(), &task.id) {
+            return Some(why);
+        }
+    }
+
+    /*
+     * The named refusal half of the blocking rule. (M30)
+     *
+     * The quiet half is `autodispatch::trigger`'s early return — an assignment on a blocked task
+     * records intent and starts nothing, with a debug line. But an *explicit* dispatch (the
+     * panel's button, `cide_agent_dispatch`, and auto-dispatch re-entering through
+     * `agents_dispatch`) is a gesture whose refusal must say why, and this function is the single
+     * funnel all three pass through — so neither path can be forgotten alone.
+     *
+     * Refused only while a blocker is live and not done: a blocker that no longer exists cannot
+     * gate (it can never become done, and its id is never reused — `blocker_statuses` has the
+     * argument). A run already *queued* when its task became blocked still spawns; the gate is at
+     * dispatch decision time, the same line the enqueue-vs-spawn note above draws.
+     */
+    {
+        let board = store.list();
+        let blockers: Vec<String> = task
+            .links
+            .iter()
+            .filter(|l| l.link == cide_ipc::LinkType::BlockedBy && !l.deleted)
+            .filter_map(|l| board.iter().find(|t| t.id == l.target))
+            .filter(|t| t.status != cide_ipc::TaskStatus::Done)
+            .map(|t| {
+                let status = match t.status {
+                    cide_ipc::TaskStatus::Inbox => "inbox",
+                    cide_ipc::TaskStatus::Todo => "todo",
+                    cide_ipc::TaskStatus::Doing => "doing",
+                    cide_ipc::TaskStatus::Review => "review",
+                    cide_ipc::TaskStatus::Done => "done",
+                };
+                format!("{} ({status})", t.id)
+            })
+            .collect();
+        if !blockers.is_empty() {
+            return Some(format!(
+                "{} is blocked by {}: a task is dispatched only once every task it is blocked \
+                 by is done. Finish or dispatch the blockers first, or remove the link.",
+                task.id,
+                blockers.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// The first line for work that is **not on this board**. (M104)
+///
+/// [`opening_prompt`]'s twin, one line for its reason. The difference is where the statement of
+/// the work lives: there is no `cide_task_get` that could hand it over through the tools, so the
+/// brief is inline — flattened, and the caller's own words rather than another agent's prose out
+/// of a tracker, which is the same argument M40 made for a task-less run's `instructions`.
+pub(crate) fn external_prompt(
+    work: &cide_ipc::ExternalWork,
+    extra: Option<&str>,
+    tools: Option<&dyn Harness>,
+) -> String {
+    let reference = work
+        .reference
+        .as_deref()
+        .map(one_line)
+        .filter(|reference| !reference.is_empty());
+    let mut parts = vec![format!(
+        "Work on {}{}: {}",
+        one_line(&work.title),
+        reference
+            .as_deref()
+            .map(|reference| format!(" ({reference})"))
+            .unwrap_or_default(),
+        one_line(&work.brief)
+    )];
+    parts.push(match reference.as_deref() {
+        Some(reference) => format!(
+            "This is not a task on this project's cide board, so do not look for it there; if \
+             you have a tool that reaches {reference}, read it and report progress there."
+        ),
+        None => "This is not a task on this project's cide board, so do not look for it there."
+            .to_string(),
+    });
+    parts.push(
+        "Commit each coherent step as you go — your branch is the record that survives if this \
+         session dies. When the work is complete, stop and summarise what you did and where."
+            .to_string(),
+    );
+    // Anything the work turns up that is not the work still goes on the board — to the inbox.
+    if let Some(harness) = tools {
+        parts.push(format!(
+            "Anything you notice that is not this work goes on the board as a new task with {} \
+             and inbox: true.",
+            harness.tool_name("cide_task_create")
+        ));
+    }
+    if let Some(extra) = extra.map(one_line).filter(|extra| !extra.is_empty()) {
+        parts.push(extra);
+    }
+    parts.join(" ")
 }
 
 /// The first thing the run is told, as **one line**.
@@ -2161,6 +2261,9 @@ mod tests {
             task: Some(task.clone()),
             prompt: None,
             notify: None,
+            external: None,
+            harness: None,
+            model: None,
         }
     }
 
@@ -2381,6 +2484,9 @@ mod tests {
                 task: None,
                 prompt: Some("check the build".into()),
                 notify: None,
+                external: None,
+                harness: None,
+                model: None,
             },
         )
         .expect_err("this project was never enabled")
@@ -2419,6 +2525,9 @@ mod tests {
                 task: None,
                 prompt: Some("do the thing".into()),
                 notify: None,
+                external: None,
+                harness: None,
+                model: None,
             },
         )
         .expect_err("a project that never enabled this refuses everything");
@@ -2509,6 +2618,37 @@ mod tests {
             opening_prompt(None, Some(" run the tests\n and say what fails "), claude()),
             "run the tests and say what fails"
         );
+    }
+
+    /// External work (M104): the brief inline and flattened, the reference named as where to
+    /// report, and the commit discipline a worktree run needs — never the ad-hoc "do not commit".
+    #[test]
+    fn external_work_is_stated_inline_and_committed_on_its_branch() {
+        let work = cide_ipc::ExternalWork {
+            reference: Some("PROJ-12".into()),
+            title: "Add --version".into(),
+            brief: "print the crate version\nand exit 0".into(),
+        };
+        let prompt = external_prompt(&work, Some("keep it small"), claude());
+        eprintln!("{prompt}");
+        assert!(!prompt.contains('\n'), "{prompt}");
+        assert!(
+            prompt
+                .starts_with("Work on Add --version (PROJ-12): print the crate version and exit 0"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("reaches PROJ-12"), "{prompt}");
+        assert!(prompt.contains("Commit each coherent step"), "{prompt}");
+        assert!(prompt.contains("mcp__cide__cide_task_create"), "{prompt}");
+        assert!(prompt.ends_with("keep it small"), "{prompt}");
+
+        let bare = cide_ipc::ExternalWork {
+            reference: None,
+            ..work
+        };
+        let prompt = external_prompt(&bare, None, None);
+        assert!(!prompt.contains("reaches"), "{prompt}");
+        assert!(!prompt.contains("cide_task_create"), "{prompt}");
     }
 
     /// The opening line spells its tools the way the run's own CLI will present them.

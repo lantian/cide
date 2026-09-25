@@ -261,6 +261,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         graphics,
         claude,
         console_harness,
+        open_run_in,
         codex,
         proxy,
         sidebar,
@@ -319,6 +320,10 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // pane is touched by a switch. See `Settings::console_harness`.
     if let Some(v) = console_harness {
         settings.console_harness = v;
+    }
+    // Read by the Agents panel's Open, at the press; nothing open moves.
+    if let Some(v) = open_run_in {
+        settings.open_run_in = v;
     }
     if let Some(v) = codex {
         settings.codex = v;
@@ -433,6 +438,7 @@ pub fn tab_open_settings(
                 harness: None,
                 title: "settings".into(),
                 docker: None,
+                origin: None,
             },
         )?;
         Ok(id)
@@ -1766,6 +1772,29 @@ mod tests {
         let mut cli = named("claude");
         cli.inject.settings.flag = "--sid".into();
         assert!(inject_reasons(&cli).is_empty(), "a usable rename is silent");
+    }
+
+    #[test]
+    fn where_open_shows_a_run_defaults_to_a_tab_and_patches_to_a_split() {
+        // M108: a tab unless the user says otherwise — and a `settings.json` written before the
+        // field existed reads as that default rather than failing to load.
+        assert_eq!(Settings::default().open_run_in, cide_ipc::OpenRunIn::Tab);
+        let older: Settings = serde_json::from_str("{}").expect("an older file loads");
+        assert_eq!(older.open_run_in, cide_ipc::OpenRunIn::Tab);
+
+        let mut settings = Settings::default();
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                open_run_in: Some(cide_ipc::OpenRunIn::Split),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(settings.open_run_in, cide_ipc::OpenRunIn::Split);
+        assert_eq!(
+            serde_json::to_value(settings.open_run_in).expect("json"),
+            serde_json::json!("split")
+        );
     }
 
     #[test]

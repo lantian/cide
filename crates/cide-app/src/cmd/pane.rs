@@ -86,6 +86,7 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         SplitIntent::Adopt { title, .. } => (PaneKind::Shell, title.as_str()),
     };
     Pane {
+        origin: None,
         id: PaneId::new(),
         kind,
         // Only the console's founding pane is Primary; everything a split creates can be
@@ -583,6 +584,7 @@ mod tests {
             harness: None,
             title: "cide : claude".into(),
             docker: None,
+            origin: None,
         };
         let mut tree = new_tree(first);
         let mut last = tree.focused;

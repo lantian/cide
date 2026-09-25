@@ -323,6 +323,97 @@ impl Flavor {
     }
 }
 
+/// How to start this CLI's **interactive TUI** in a tab cide opens on one piece of work. (M104)
+///
+/// # Not a run, and not [`Flavor::continue_spec`]
+///
+/// A run is `opencode run --format json`, one process per turn, rendered as a log — the shape the
+/// user asked `cide_session_open` specifically *not* to have ("a write session, not just a read
+/// only log"). `continue_spec` is the TUI, but re-opened on a conversation with no configuration
+/// at all, so a pane it starts has no task tools. This is the third shape: the TUI, fresh, with
+/// the opening line in `--prompt` and a configuration document that carries **cide's MCP server
+/// and the machine's providers, and no role** — a session is not a role, and an inline agent here
+/// would be a system prompt nobody wrote.
+///
+/// The bridge the `mcp` entry names reads `CIDE_SESSION` and `CIDE_AGENT_SOCK` from the
+/// environment it inherits from this TUI, which is how the tab's own connection is scoped by
+/// `agent_rpc` without anything here knowing the id — `cmd::session` sets both on the child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabLaunch {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl Flavor {
+    /// The TUI on one piece of work. `Err` is a sentence for the caller: the CLI is not installed.
+    ///
+    /// `unattended` passes the CLI's own skip-permissions flag (`--auto` for opencode), for the
+    /// reason `claude_tab::TabMode::unattended` gives: a tab cide opens on its own is a tab nobody
+    /// may be watching when the first permission prompt arrives.
+    pub fn tab_launch(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        unattended: bool,
+        llm: &cide_ipc::LlmSettings,
+        hook_bin: Option<&std::path::Path>,
+    ) -> Result<TabLaunch, String> {
+        let binary = self.binary()?;
+        let mut args: Vec<String> = Vec::new();
+        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+            args.push("--model".into());
+            args.push(model.to_string());
+        }
+        if unattended {
+            args.push(self.skip_permissions.to_string());
+        }
+        // Last and as one token: a value, so nothing after it can be mistaken for its tail.
+        if !prompt.trim().is_empty() {
+            args.push("--prompt".into());
+            args.push(prompt.to_string());
+        }
+        let mut env = Vec::new();
+        if let Some(document) = self.tab_config(llm, hook_bin) {
+            env.push((self.config_env(), document));
+        }
+        Ok(TabLaunch {
+            program: binary.to_string_lossy().into_owned(),
+            args,
+            env,
+        })
+    }
+
+    /// The tab's configuration document: providers and cide's MCP server. `None` when there is
+    /// nothing to say, so the variable is not set at all and the user's own configuration is all
+    /// the CLI reads.
+    fn tab_config(
+        &self,
+        llm: &cide_ipc::LlmSettings,
+        hook_bin: Option<&std::path::Path>,
+    ) -> Option<String> {
+        let mut config = serde_json::Map::new();
+        config.insert("$schema".into(), json!(self.schema));
+        config.extend(provider_members(llm));
+        if let Some(hook) = hook_bin {
+            let mut servers = serde_json::Map::new();
+            servers.insert(
+                SERVER.into(),
+                json!({
+                    "type": "local",
+                    "command": [hook.to_string_lossy(), "mcp"],
+                    "enabled": true,
+                }),
+            );
+            config.insert("mcp".into(), Value::Object(servers));
+        }
+        if config.len() == 1 {
+            return None;
+        }
+        serde_json::to_string(&Value::Object(config)).ok()
+    }
+}
+
 /// The opencode CLI as a harness. A unit struct: it holds nothing, and must not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpencodeHarness;
@@ -1679,6 +1770,13 @@ fn child(
     args.push("--dir".into());
     args.push(plan.cwd.to_string_lossy().to_string());
 
+    // The run's own server (M104 follow-up): this turn is a client of it, so the conversation
+    // lives where a pane can attach the full TUI to it. See `RunPlan::server`.
+    if let Some(server) = &plan.server {
+        args.push("--attach".into());
+        args.push(server.url.clone());
+    }
+
     match resume {
         // The harness's own id, captured off this run's output. Deliberately no `--title`: the
         // session already has one, and passing a second would rename a conversation mid-flight.
@@ -1714,22 +1812,10 @@ fn child(
         spec = spec.arg(arg);
     }
 
-    // The same list a pane and a claude run get, with an **empty** `extra` — see the module
-    // header: the user's Claude launch variables are not this child's to inherit.
-    spec = spec.apply(cide_core::child_env::terminal_child_env(
-        &plan.claude,
-        env!("CARGO_PKG_VERSION"),
-        Vec::new(),
-    ));
-    spec = spec.apply(plan.proxy.changes().to_vec());
-    spec = spec.apply(plan.env.clone());
-    spec = spec.env(flavor.config_env(), config);
-    // What scopes this child's MCP connection to this run's task tools, and nothing else — the
-    // app resolves the header's `run` against the registry rather than trusting anything the
-    // child says about itself.
-    spec = spec.env("CIDE_RUN", plan.run.to_string());
-    if let Some(sock) = &plan.agent_sock {
-        spec = spec.env("CIDE_AGENT_SOCK", sock.to_string_lossy().to_string());
+    spec = run_env(flavor, plan, spec, config);
+    // The client proves itself to the run's server with the password the server was started with.
+    if let Some(server) = &plan.server {
+        spec = spec.env(flavor.password_env(), server.password.clone());
     }
 
     Ok(HarnessSpawn {
@@ -1747,6 +1833,120 @@ fn child(
 }
 
 /// The `--title`: the role, then the task it was dispatched for. `claude.rs`'s `-n`, verbatim.
+/// Everything a run's process is given in its environment: the terminal, the proxy, the isolated
+/// directories, the configuration document and cide's two identities.
+///
+/// One function for the turn and for the server (M104 follow-up), and the server is the one that
+/// matters most: attached, a `run` child is a thin client and it is the **server** that loads the
+/// role, starts cide's MCP bridge — which reads `CIDE_RUN` and `CIDE_AGENT_SOCK` from the process
+/// that forks it — and runs every tool. A server built with a second, hand-copied environment
+/// would be a run whose tools could not reach the tracker, or whose tests escaped `isolateEnv`.
+fn run_env(flavor: &Flavor, plan: &RunPlan<'_>, spec: SpawnSpec, config: String) -> SpawnSpec {
+    // The same list a pane and a claude run get, with an **empty** `extra` — see the module
+    // header: the user's Claude launch variables are not this child's to inherit.
+    let mut spec = spec.apply(cide_core::child_env::terminal_child_env(
+        &plan.claude,
+        env!("CARGO_PKG_VERSION"),
+        Vec::new(),
+    ));
+    spec = spec.apply(plan.proxy.changes().to_vec());
+    spec = spec.apply(plan.env.clone());
+    spec = spec.env(flavor.config_env(), config);
+    // What scopes this child's MCP connection to this run's task tools, and nothing else — the
+    // app resolves the header's `run` against the registry rather than trusting anything the
+    // child says about itself.
+    spec = spec.env("CIDE_RUN", plan.run.to_string());
+    if let Some(sock) = &plan.agent_sock {
+        spec = spec.env("CIDE_AGENT_SOCK", sock.to_string_lossy().to_string());
+    }
+
+    spec
+}
+
+impl Flavor {
+    /// The variable the CLI reads its server password from — both as a server and as a client
+    /// (`run --attach`, `attach`). Measured in `--help` for both flavours.
+    pub fn password_env(&self) -> String {
+        format!("{}_SERVER_PASSWORD", self.env_prefix)
+    }
+
+    /// The basic-auth user the server expects when none is configured: the CLI's own name.
+    /// Measured: `mimo serve` answers 200 to `mimocode:<pw>` and 401 to `opencode:<pw>`. Its
+    /// clients default to the same name, so only a caller speaking HTTP itself needs this.
+    pub fn server_user(&self) -> String {
+        self.env_prefix.to_ascii_lowercase()
+    }
+
+    /// The run's headless server: `<cli> serve` on `port`, in the run's directory, with the run's
+    /// whole environment. (M104 follow-up) See [`RunPlan::server`].
+    ///
+    /// # Why a server at all
+    ///
+    /// `opencode run --port` looks like it would do this and does not: measured on 1.18.32, a run
+    /// given `--port` listens on nothing. `serve` does, and a `run --attach` turn against it is
+    /// visible there live — `/session/status` answered `busy` for it — while `attach --session`
+    /// draws that session in the real TUI. So the run's conversation lives in the server, each
+    /// turn is a client of it, and a pane opened on the run is another client: the full,
+    /// writable TUI on the very conversation the run is working, rather than a rendering of its
+    /// JSON.
+    ///
+    /// The configuration document is the **first fork's**, and that is enough: a later turn on
+    /// another pool entry names its model with `--model` on its own argv, and every provider
+    /// that entry can name is already in the document (`provider_members` writes them all).
+    pub fn serve_spec(
+        &self,
+        plan: &RunPlan<'_>,
+        port: u16,
+        password: &str,
+    ) -> Result<SpawnSpec, HarnessError> {
+        if plan.harness != self.kind {
+            return Err(HarnessError::WrongHarness {
+                plan: plan.harness,
+                harness: self.kind,
+            });
+        }
+        let config = config_json(self, plan).ok_or(HarnessError::NoConfig)?;
+        let mut spec = SpawnSpec::new(self.program(), plan.cwd.clone())
+            .geometry(PtyGeometry::new(
+                RUN_COLS,
+                RUN_ROWS,
+                plan.geometry.cell_width,
+                plan.geometry.cell_height,
+            ))
+            .fixed_size();
+        for arg in [
+            "serve".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--hostname".to_string(),
+            "127.0.0.1".to_string(),
+        ] {
+            spec = spec.arg(arg);
+        }
+        spec = run_env(self, plan, spec, config);
+        Ok(spec.env(self.password_env(), password.to_string()))
+    }
+
+    /// A pane's child on a conversation a live run server holds: the full TUI, attached.
+    ///
+    /// The password is not here — it travels in the environment ([`Self::password_env`]), which
+    /// the caller sets, because an argv is readable by every process on the machine.
+    pub fn attach_spec(&self, conversation: &HarnessSession, url: &str) -> ContinueSpec {
+        ContinueSpec {
+            program: self.program().to_string(),
+            args: vec![
+                "attach".into(),
+                url.to_string(),
+                "--dir".into(),
+                conversation.cwd.to_string_lossy().into_owned(),
+                "--session".into(),
+                conversation.id.trim().to_string(),
+            ],
+            resume: None,
+        }
+    }
+}
+
 fn session_name(plan: &RunPlan<'_>) -> String {
     match plan
         .task_title
@@ -1860,7 +2060,7 @@ fn config_json(flavor: &Flavor, plan: &RunPlan<'_>) -> Option<String> {
                 // And, for a run with no task, the correction to the tracker paragraph — last,
                 // exactly where the claude side folds it, so `harness.rs`'s parity test holds.
                 // (M40)
-                if plan.task.is_none() {
+                if plan.adhoc() {
                     prompt.push_str("\n\n");
                     prompt.push_str(ADHOC_PREAMBLE);
                 }
@@ -1926,6 +2126,97 @@ mod tests {
     /// `mcp__cide__cide_task_get`. Derived from the one definition, never quoted.
     fn tracker() -> String {
         tracker_preamble(&OpencodeHarness)
+    }
+
+    /// The run's server and the turns attached to it (M104 follow-up): one environment for both,
+    /// the password never in an argv, and `--attach` before the positional message.
+    #[test]
+    fn a_served_run_attaches_each_turn_and_the_server_carries_the_runs_environment() {
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.server = Some(crate::RunServer {
+            url: "http://127.0.0.1:47000".into(),
+            password: "pw".into(),
+        });
+
+        let server = OPENCODE_CLI
+            .serve_spec(&plan, 47000, "pw")
+            .expect("a server");
+        assert_eq!(
+            server.args,
+            ["serve", "--port", "47000", "--hostname", "127.0.0.1"]
+        );
+        assert_eq!(env_value(&server, "OPENCODE_SERVER_PASSWORD"), Some("pw"));
+        assert_eq!(
+            env_value(&server, "CIDE_RUN"),
+            Some(plan.run.to_string().as_str())
+        );
+        // The role and cide's MCP server live in the server: it is what loads them.
+        let config: Value =
+            serde_json::from_str(env_value(&server, "OPENCODE_CONFIG_CONTENT").expect("a config"))
+                .expect("json");
+        assert!(config["agent"]["developer"].is_object(), "{config}");
+        assert!(config["mcp"][SERVER].is_object(), "{config}");
+
+        let turn = OpencodeHarness.spawn_spec(&plan).expect("a turn").spec;
+        let at = turn
+            .args
+            .iter()
+            .position(|a| a == "--attach")
+            .expect("attached");
+        assert_eq!(turn.args[at + 1], "http://127.0.0.1:47000");
+        assert_eq!(turn.args.last(), Some(&plan.prompt));
+        assert!(!turn.args.iter().any(|a| a == "pw"), "{:?}", turn.args);
+        assert_eq!(env_value(&turn, "OPENCODE_SERVER_PASSWORD"), Some("pw"));
+
+        // Standalone, as every run was before: no flag, no password.
+        plan.server = None;
+        let turn = OpencodeHarness.spawn_spec(&plan).expect("a turn").spec;
+        assert!(!turn.args.iter().any(|a| a == "--attach"));
+        assert_eq!(env_value(&turn, "OPENCODE_SERVER_PASSWORD"), None);
+
+        let attach = MIMO_CLI.attach_spec(
+            &HarnessSession {
+                harness: cide_ipc::Harness::Mimo,
+                id: SESSION.into(),
+                cwd: PathBuf::from("/repo/.cide/worktrees/developer-t-14"),
+            },
+            "http://127.0.0.1:47001",
+        );
+        assert_eq!(
+            attach.args,
+            [
+                "attach",
+                "http://127.0.0.1:47001",
+                "--dir",
+                "/repo/.cide/worktrees/developer-t-14",
+                "--session",
+                SESSION
+            ]
+        );
+        assert_eq!(MIMO_CLI.password_env(), "MIMOCODE_SERVER_PASSWORD");
+        assert_eq!(MIMO_CLI.server_user(), "mimocode");
+        assert_eq!(OPENCODE_CLI.server_user(), "opencode");
+    }
+
+    /// M104's tab: the TUI, `--prompt` last, and a document with cide's server and no role.
+    #[test]
+    fn a_tab_is_the_tui_with_the_task_tools_and_no_role() {
+        let hook = PathBuf::from("/opt/cide/cide-hook");
+        let document = OPENCODE_CLI
+            .tab_config(&cide_ipc::LlmSettings::default(), Some(&hook))
+            .expect("a document");
+        let value: Value = serde_json::from_str(&document).expect("json");
+        assert_eq!(
+            value["mcp"][SERVER]["command"],
+            json!(["/opt/cide/cide-hook", "mcp"])
+        );
+        assert!(value.get("agent").is_none(), "{document}");
+        // Nothing to say, nothing set: the user's own configuration is all the CLI reads.
+        assert_eq!(
+            OPENCODE_CLI.tab_config(&cide_ipc::LlmSettings::default(), None),
+            None
+        );
     }
 
     use crate::defs::LoadedAgent;
@@ -2005,6 +2296,7 @@ mod tests {
             // and the plan actually said; the skip default has tests of its own.
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            server: None,
         }
     }
 

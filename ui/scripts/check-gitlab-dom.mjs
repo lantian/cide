@@ -452,6 +452,37 @@ try {
     container.querySelector('[title="zeta/file.go"]'),
     'a new selection after Collapse all still opens its folder',
   )
+  // The maximize toggle: drawn only when the host can hide the rest of the panel, and it
+  // reports the flipped state rather than holding one of its own.
+  assert.equal(
+    container.querySelector('[aria-label="Maximize file tree"]'),
+    null,
+    'no maximize button without a host to act on it',
+  )
+  const maximizeCalls = []
+  for (const maximized of [false, true]) {
+    await render(
+      React.createElement(FileTree, {
+        files: sortedFiles,
+        selected: null,
+        onOpen: () => {},
+        label: 'Maximize',
+        maximized,
+        onMaximize: (on) => maximizeCalls.push(on),
+      }),
+    )
+    const toggle = container.querySelector(
+      maximized ? '[aria-label="Restore file tree"]' : '[aria-label="Maximize file tree"]',
+    )
+    assert.equal(toggle?.getAttribute('aria-pressed'), String(maximized))
+    assert.equal(
+      toggle?.previousElementSibling?.getAttribute('aria-label'),
+      'Collapse all',
+      'the maximize toggle sits right after Collapse all',
+    )
+    await click(toggle)
+  }
+  assert.deepEqual(maximizeCalls, [true, false], 'the toggle reports the flipped state')
   await render(
     React.createElement(FileTree, {
       // Keyed: the prop is read once, which is why ReviewPanel keys the tree on its mode.
@@ -777,7 +808,14 @@ try {
   const harness = document.querySelector('#gitlab-review-harness')
   assert.ok(harness, 'the agent review dialog opens')
   await act(async () => new Promise((r) => setTimeout(r, 0)))
-  assert.equal(harness.value, 'claude', 'the first runnable harness is chosen')
+  // Settings → Harness is preselected (M107): the harness the user has already set up, with its
+  // binary and arguments — not whichever runnable harness happens to come first in the list.
+  assert.equal(harness.value, 'default', 'Default (Settings → Harness) is chosen')
+  assert.match(
+    harness.querySelector('option[value="default"]')?.textContent ?? '',
+    /Default .*Settings/,
+    'the default entry says where it comes from',
+  )
   assert.equal(
     harness.querySelector('option[value="opencode"]')?.disabled,
     true,

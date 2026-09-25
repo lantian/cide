@@ -8,6 +8,7 @@ import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
+import type { OpenRunIn } from "./OpenRunIn";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
@@ -101,6 +102,11 @@ confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: Terminal
  * only where somebody chose it, here or there.
  */
 consoleHarness: ConsoleHarness, 
+/**
+ * Where the Agents panel's *Open* shows a run: a tab of its own, or a row in the project
+ * console. (M108) Only that button reads it — nothing opens a run's view by itself.
+ */
+openRunIn: OpenRunIn, 
 /**
  * Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
  */

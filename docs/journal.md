@@ -14811,3 +14811,284 @@ with Node's own `WebSocket`, with no puppeteer and no new dependency.
 - **Settings → Models: the pool entry's model box is squeezed to one character.**
 - **The Extensions panel truncates a nine-character marketplace name.**
 - **A task card renders `- [x]` checklist items with the box and the text on separate lines.**
+
+## "Check the tasks and implement them": a worktree and a writable tab per piece of work (M104)
+
+Asked for: in the console, *check the tasks and implement them* should find, say, two pieces of
+work, make two worktrees, and open two new tabs, each a real, writable harness session working its
+own piece in its own worktree. The orchestrator may choose the harness. The work is not always a
+cide task: it can be a Jira issue the console read through its own MCP server, or plain text.
+
+**Roles decide which tool the orchestrator uses** (the user's rule, `tools::Mode`, `mode_of`).
+- **Some role can be dispatched now:** `cide_agent_dispatch`, and only it.
+- **No roles, subagents off, or every role refused:** the new `cide_session_open`, and only it.
+- **Checked per call, not per connection.** A role written mid-conversation takes effect on the
+  next call.
+- **Each tool refuses on the wrong side and names the other one.** Dispatch appends its hint after
+  the sink's own reason, so that reason is never lost.
+- **Consoles are told which road applies before their first turn.** A project with subagents off
+  used to get no paragraph at all. Its consoles now get `SESSIONS_PARAGRAPH`. A project with
+  subagents on but nobody dispatchable gets the roster paragraph with that paragraph appended.
+
+**`cide_session_open` (Sessions mode).** It takes `task`, or `title` + one-line `brief` (+ `ref`),
+plus optional `harness` (claude | codex | opencode) and `model`.
+- **Checkout:** `worktree::ensure(root, "task-<key>")`, on branch `cide/task-<key>`, via
+  `cide_agents::session_checkout`. The key is the task id, or the external work's ref, else its
+  title.
+- **Tab:** opened by `claude_tab::open`, the M79 opener generalised into `Open { harness, model,
+  voice, origin, … }`. It opens behind the current tab and is ephemeral. The prompt is
+  `opening_prompt` for a task, or the new `external_prompt` for anything else.
+- **Checks:** a task gets the same refusals a dispatch gives (`task_refusal`, extracted from
+  `plan_dispatch`: inbox, milestone, blockers) and is refused when done.
+- **Board:** after the tab exists, the task is linked (`SetSession`) and moved Todo → Doing.
+- **A second ask for a task with a live session answers with that session.** No second tab.
+
+**Opencode in a tab is its real TUI, not a console.** `ConsoleHarness::Opencode` was planned and
+dropped. That enum's own doc argues against it: no hooks, no resume. Settings → Harness would also
+have grown a console that cannot do either.
+- **The tab is a Shell-kind pane** running `opencode [--model] [--auto] --prompt <line>`. That is
+  the shape `pane_for` already gives a re-opened opencode conversation.
+- **It gets the task tools through `Flavor::tab_launch`.** `OPENCODE_CONFIG_CONTENT` carries
+  cide's MCP server and the machine's providers, and no role.
+- **The bridge reaches this pane.** It inherits `CIDE_SESSION` and `CIDE_AGENT_SOCK` through the
+  new `SpawnRequest::task_tools`, because only `spawn_session` knows the id.
+
+**Worker sessions cannot fan out.** `PaneOrigin::Worker` (new durable `Pane::origin`) makes
+`agent_rpc` answer `Scope::Worker`: the nine task tools, never the orchestration ones.
+- **It signs as the agent `task` (label "Session"), not `Orchestrator`.** Orchestrator passes
+  `autodispatch`'s author gate, so a worker assigning a role would have started a run through the
+  back door.
+- **`task` is also its worktree's prefix.** The review-time prewarm therefore verifies the branch
+  this session actually committed to.
+- **The paragraph is `Voice::Worker`'s**, and is re-inferred from the tree when a restored pane
+  respawns without a voice. That keeps the tool list and the prompt from disagreeing after a
+  restart.
+
+**Dispatch (Dispatch mode)** gains `title`/`brief`/`ref`, `harness` and `model`, all for this one
+run.
+- **They travel on `RunPurpose::Work(WorkOptions)`.** Every re-admission road (restart, follow-up,
+  failover) already clones the purpose, and the options are persisted in `SavedRun`.
+- **The harness and model are laid over the role's own override row** (`WorkOptions::overrides`).
+  The pool is dropped when the run leaves an opencode-shaped CLI or names a model.
+- **External work names its checkout** exactly as a task does (`checkout_key`).
+- **External work is never ad hoc.** It carries its title in `task_title`, and the new
+  `RunPlan::adhoc` is `task.is_none() && task_title.is_none()`. So such a run is not told
+  `ADHOC_PREAMBLE`'s "do not commit".
+
+**Every work run opens in its own tab** at its first fork (`AgentRegistry::first_tab` latch,
+`open_run_tab`). The tab opens behind the current one and is not ephemeral. It is a mirror of the
+registry's child, marked `PaneOrigin::RunMirror`.
+- **Rust already refuses to kill the child.** `session_kill` refuses a run's session.
+  `closePane` now also refuses to ask, reading the durable origin, because a Rust-built pane never
+  sets `PaneHost.mirrored`. That flag was the M42 close-kills-the-agent trap.
+- **A claude run's pane carries `continues`**, so it can re-open the conversation once the child
+  ends.
+- **A tab the user closed stays closed.** Restored runs come back latched.
+
+**Not verified — nothing here has been seen on a display or driven by a real model.** The whole CI
+list is green, including every `check:*`, plus new unit tests:
+- the mode rule both ways;
+- session argument parsing;
+- worker scoping for a Claude and a Shell pane;
+- external prompts;
+- `WorkOptions`;
+- the opencode tab document.
+
+The end-to-end check is for the user, under `./run.sh`:
+- **No roles, two todo tasks:** "check tasks and implement them" should give two tabs,
+  `git worktree list` should show `.cide/worktrees/task-*`, and `cide-headless tasks` should show
+  both as Doing.
+- **"The second one with opencode"** should give an opencode TUI tab.
+- **A plain-text task** should get a worktree named from its title.
+- **Then add a role:** `cide_session_open` should be refused with the reason, and each run should
+  get a tab.
+
+**Known gaps, stated rather than hidden:**
+- **An opencode session tab is not resumable after a restart.** Its `ses_…` id is never told to
+  anybody, so `continues` is left unset and the restored pane is a shell in the worktree.
+- **An opencode tab's awaiting and running chips stay dark.** It has no hooks.
+- **A run's tab shows the child it opened on.** A restart or failover under a new session leaves it
+  on the old one, and the Agents panel's Open is the road back. For opencode and mimo runs M105
+  replaced this tab with an attached TUI.
+- **Nothing merges a session's branch.** `cide_agent_integrate` takes a role and a task. The
+  orchestrator is told to merge `cide/task-<key>` with git itself.
+- **A worker's relative `cide_task_attach` path resolves against the project root**, not its
+  worktree (`cwd: None` in `Scope::Worker`).
+
+**Measured and not built: opencode and mimo runs on the TUI itself.** Measured against opencode
+1.18.32 with no model call: the TUI started with `--port P --hostname 127.0.0.1` serves the whole
+HTTP API. That includes:
+- `/event` (SSE: `session.status`, `session.idle`, `session.error`, `message.updated`,
+  `permission.asked`);
+- `/session`;
+- `/tui/append-prompt` and `/tui/submit-prompt`.
+
+The design is to replace the per-turn `opencode run --format json` with `opencode --agent <role>
+--port P --prompt …`:
+- **Configuration:** the same `OPENCODE_CONFIG_CONTENT` role and MCP document, but with the model
+  and variant in the agent config (the TUI has no `--variant`).
+- **State:** an SSE tap beside `event_tap` feeding `Observation::Line`, with
+  `OpencodeHarness::observe` parsing both shapes by `type`.
+- **Follow-ups:** delivered through `/tui/submit-prompt`.
+- **Failover:** a respawn with `--session`.
+
+It is not built because it rewrites how every opencode and mimo run is hosted: per-turn respawn,
+pool failover, usage and the rendered log. That needs a real turn to prove, which is the user's
+call to spend.
+
+## Opening an opencode run gives the real opencode TUI, attached to the run (M105)
+
+Asked for right after M104: opening a subagent's log should show the full opencode TUI, not a
+rendering of its JSON.
+
+**Every opencode or mimo run now works behind a headless server of its own.**
+- **The server:** `<cli> serve --port P --hostname 127.0.0.1` (`Flavor::serve_spec`), started in
+  the run's directory with the run's whole environment (`run_env`, shared with the turn).
+- **Each turn** is the same `run --format json` as before, plus `--attach <url>` (`RunPlan::server`).
+  So state, usage, failover and the rendered log are unchanged.
+- **Opening a live run** from the Agents panel (`open_plan` answers `Continue`), or the run's own
+  M104 tab, runs `<cli> attach <url> --dir <cwd> --session <ses_…>` in a Shell pane. That is the
+  full TUI on the very conversation the run is working, and it is writable.
+- **The pane's route is decided when it spawns.** `session_spawn` asks
+  `AgentRegistry::server_for(conversation)`, so nothing about the server is stored on the pane. A
+  pane restored after a restart finds no server and falls back to the old `<cli> --session`.
+- **The attached pane is not a "viewer".** It is a client of the same server rather than a second
+  writer, so it does not block a follow-up the way M42's one-writer rule does.
+
+**Measured, and each measurement shaped the code:**
+- **`opencode run --port` listens on nothing.** Only `serve` does. That is why there is a server.
+- **A `run --attach` turn shows as `busy` on the server's `/session/status`.** `attach --session`
+  draws that conversation.
+- **The server honours `<PREFIX>_SERVER_PASSWORD`:** 401 without it, 200 with it. Every server
+  gets a fresh uuid password. Clients get it in their environment, never in an argv.
+- **The basic-auth user is the CLI's own name:** mimo answers `mimocode:`, not `opencode:`
+  (`Flavor::server_user`). The first mimo run of the new test found this.
+- **`mimo attach` ignores SIGTERM.** A pane's kill still lands, because portable-pty's kill
+  escalates to SIGKILL.
+
+**The server's life** (`ensure_server`, `retire_server`, `stop_servers`):
+- **Started before the turn's child**, or found alive from an earlier turn. The health route gets
+  ten seconds.
+- **If it cannot start, the run goes on standalone**, exactly as before, with a log line.
+- **Stopped when the run no longer holds its task *and* no pane is attached.** An opencode turn
+  ends as `Finished` (one process per turn), so a server tied only to the run would have killed the
+  TUI being read after every reply. `note_attached` and `forget_viewer` track the attached panes.
+- **Killed at quit after the ladder.** It is not a session, so the ladder never sees it.
+
+**The run's own tab (M104) waits for the conversation id.** For a served run, the tab opens when
+the first turn prints its `ses_…` (`attached_tab`, on a thread off the coalescer). It is a Shell
+pane that owns only its `attach` child, so closing it never touches the run.
+
+**Verified:**
+- **Real binaries, no model reached:** `cargo test -p cide-agents --test real_served -- --ignored`
+  runs the real opencode *and* mimo against a provider on a local port that accepts and never
+  answers. Both pass: the server comes up behind its password, the attached turn is busy on it,
+  and the attached TUI draws the run's message.
+- **Unit tests** cover the specs, the health probe (right user, right password), basic auth, and
+  the retire rule with a real child process.
+- **The CI list is green:** fmt, clippy `-D warnings`, the workspace tests, codegen and the
+  contract, plus the run-surface `check:*` scripts.
+
+**Not verified:**
+- **No real model turn has run through a served run.** That costs quota and is the user's call.
+- **Nothing here has been seen in cide's own window.**
+- **A turn typed into the attached TUI is invisible to cide's run state.** cide still reads each
+  `run` child's JSON, and a person's own turn in the TUI has no such child. Reading the server's
+  `/event` stream is the step that would close this.
+
+
+## Open puts a run in a tab of its own (M106)
+
+The Agents panel's Open used to add a full-width row under the console's conversation. Now it
+opens the run in a **tab of its own**, raised, titled `<role> · <task>`, the same title as the tab
+M104 opens by itself.
+- **Why:** the user asked for it. A row made the console, the conversation they are actually
+  talking to, share its height with every run they opened. A tab is full height, and closing it
+  leaves the console's layout alone.
+- **How:** `openRun.ts` calls `newRunTab` (`tab_new_run`, M85's MR-review road) instead of
+  `addRow`. The spawn plan is still recorded before the snapshot, so a mirror still adopts the run
+  and closing the tab closes only the view. A continuation still gets the real harness, and for a
+  live opencode run that is `attach` (M105).
+- **A run already showing in any pane or tab is revealed, not opened twice.** That now includes
+  the tab M104 opened by itself.
+- **Checks:** tsc, `check:agents`, `check:agents-render`, `check:attach`, `check:rows`,
+  `check:detached`, `check:tab-overflow` and `check:tab-drag` pass.
+- **Not seen on a display.**
+
+## The MR review dialog defaults to the harness in Settings (M107)
+
+The *Harness* select in *Review with an agent* now starts on **Default — <Claude Code | Codex>
+(Settings → Harness)**. That entry is the CLI the user's consoles run, with the binary and
+arguments configured there. It used to start on the first runnable entry of the list.
+- **The setting is read when the dialog opens and resolved when the review starts.** It is never
+  copied into the choice. Concrete harnesses stay below it, for choosing another one on purpose.
+- **`gitlab_review_harnesses` now judges claude and codex by the binary Settings names**
+  (`configured_missing`): a path is checked where it points, a bare name on the search path.
+  Probing only the bare name greyed out a Claude that Settings points at an absolute path, which
+  is exactly the setup *Default* is for.
+- **The run itself already used Settings' binary and arguments** (`plan.claude.cli`,
+  `plan.codex.cli`). Only the availability probe and the preselection were wrong.
+- **`check:gitlab-dom`** now pins the Default preselection. It used to pin "the first runnable
+  harness is chosen", which this change reverses on purpose.
+- **Checks:** tsc, `check:gitlab`, `check:gitlab-render`, `check:gitlab-dom`, `check:ui-scale`,
+  `check:theme`, clippy, fmt, the contract check and a unit test for `configured_missing` pass.
+  **Not seen on a display.**
+- **Left alone:** the Agents panel's `defs::installed` still probes the bare name for a role's
+  harness, so a role on claude with Settings pointing elsewhere may still show as unavailable
+  there.
+
+**Follow-up in the same milestone: the Agents panel too.** `defs::installed` itself now asks about
+the binary Settings names for claude and codex (`defs::set_configured_binary`, `configured_missing`).
+So every availability probe agrees: the roster, `dispatch_refusal`, and the review dialog, whose
+local check folded back into `installed`.
+- **Pushed rather than passed.** The app calls `set_configured_binary` at load and whenever
+  `workspace_state::update` sees either binary change. This crate reads no settings, and threading
+  one through every `load_project` caller is how one of them would have been forgotten.
+- **A test pins all three branches:** a configured path, a configured bare name, and a cleared
+  setting that falls back to the bare-name probe.
+
+## Open decides where a run goes, and nothing opens one by itself (M108)
+
+The user, twice over: a run's view should open **only when Open is pressed**, and a setting
+should choose where.
+
+**Removed: every automatic run tab.**
+- M104's mirror tab at a run's first fork (`first_tab`, `open_run_tab`, the `tabbed` latch).
+- M105's attached-TUI tab when a served run names its conversation (`attached_tab`,
+  `open_attached_tab`).
+- `PaneOrigin::RunMirror`, which only those tabs set, and `closePane`'s read of it. The spawn plan
+  is back to being the only marker, and `session_kill` still refuses a run's session in Rust.
+
+M105's server and the attach are unchanged. Open on a live opencode run still gets the full TUI.
+
+**New setting: Settings → Projects & windows → *Open a run in*** (`Settings::open_run_in`,
+`OpenRunIn { Tab, Split }`).
+- **Tab** is the default: a tab of its own, as in M106.
+- **Split** is the original M18 behaviour: a full-width row under the project console's
+  conversation.
+- **Where the code lives:** `openRun.ts` branches on it and records the spawn plan before the
+  snapshot either way (`newRunTab` / `addRow`).
+- **Why that page:** the Agents page writes role files and never a setting.
+- **Compatibility:** an older `settings.json` reads as Tab.
+
+**A run's exact command line is now in its post-mortem log.** This came from the user's report that
+an opencode MR review "prints `opencode run [message..]` with help info". Measured on 1.18.32,
+yargs prints that help, with no reason line, in two cases:
+- a flag `run` does not know;
+- a message that starts with `-`, which it reads as flags. A `--` before the message is no cure:
+  `run` then never takes the message and waits.
+
+Neither could be reproduced:
+- **The argv a review builds parses cleanly.** It was printed from a synthetic review plan and
+  checked flag by flag against the real binary.
+- **The review's opening line always starts with "Review GitLab merge request".**
+- **No run log anywhere contains the help text.** So the process that printed it may not have been
+  a run child at all.
+
+So `start_child` now writes `# cide forked: <program and quoted args>` (never the environment) into
+`run-logs/<run>.log` before each child. The next occurrence names its argv. The logs are under
+`~/.local/state/cide-<profile>/run-logs/`.
+
+**Checks:** fmt, clippy, the workspace tests (including new ones for the setting's default, patch
+and wire spelling, and for the argv line), codegen, the contract, tsc and every settings and
+run-surface `check:*` pass. **Not seen on a display.**

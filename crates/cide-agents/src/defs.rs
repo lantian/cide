@@ -1365,6 +1365,56 @@ pub fn harness_binary(harness: Harness) -> &'static str {
     }
 }
 
+/// The binaries Settings → Harness names, as the app last told this crate. (M107)
+///
+/// # Why a process-wide value and not a parameter
+///
+/// This crate reads no settings — `Settings` is the app's, and it rides the workspace, not the
+/// disk this crate is allowed to read. The honest alternative was a parameter on `load`, which
+/// every one of `load_project`'s callers in the app would have had to thread through from a
+/// workspace lock most of them do not hold; the one that forgot would be the roster that greys a
+/// working role. The app sets this once at start and again whenever the setting changes
+/// (`workspace_state`), and every probe in the process agrees with it from then on.
+///
+/// Empty in a test, and for a harness Settings does not configure: [`installed`] then probes
+/// the bare name exactly as it always did.
+static CONFIGURED: std::sync::Mutex<Vec<(Harness, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Record the binary Settings names for `harness`; blank clears it (the bare name then applies).
+pub fn set_configured_binary(harness: Harness, binary: &str) {
+    let mut configured = CONFIGURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    configured.retain(|(h, _)| *h != harness);
+    let binary = binary.trim();
+    if !binary.is_empty() {
+        configured.push((harness, binary.to_string()));
+    }
+}
+
+fn configured_binary(harness: Harness) -> Option<String> {
+    CONFIGURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(h, _)| *h == harness)
+        .map(|(_, binary)| binary.clone())
+}
+
+/// The sentence for a configured binary that cannot be found, or `None` when it can: a path is
+/// checked where it points, a bare name through the same search a spawn uses.
+pub fn configured_missing(binary: &str) -> Option<String> {
+    let path = Path::new(binary);
+    let found = if path.components().count() > 1 {
+        path.is_file()
+    } else {
+        cide_core::toolchain::which(binary).is_some()
+    };
+    (!found).then(|| {
+        format!("Settings → Harness names “{binary}”, which could not be found on this machine.")
+    })
+}
+
 /// The default probe: is this harness's binary on the app's `PATH`?
 ///
 /// **Only half of `AgentDef::unavailable`** — see the section banner above and [`implemented`],
@@ -1383,6 +1433,13 @@ pub fn harness_binary(harness: Harness) -> &'static str {
 /// is not a `rustup`-style shim that fails at exec. `claude_cli::BinaryProblem`'s doc records why
 /// that distinction is kept — the probe is a fast, honest "we could not find it", not a promise.
 pub fn installed(harness: Harness) -> Option<String> {
+    // The binary Settings names wins, for a harness Settings configures (M107): claude and codex
+    // run *that* binary, with its arguments, in every role and every review — so a role on claude
+    // is available when the configured path exists, whether or not a bare `claude` is on `PATH`,
+    // and unavailable when Settings points at nothing, however many `claude`s the PATH holds.
+    if let Some(binary) = configured_binary(harness) {
+        return configured_missing(&binary);
+    }
     let binary = harness_binary(harness);
     if cide_core::toolchain::which(binary).is_some() {
         return None;
@@ -2749,6 +2806,24 @@ mod tests {
         ]
     }
     use super::*;
+
+    /// Settings' binary decides a claude or codex role's availability (M107): a path where it
+    /// points, a bare name on the search path, and the bare-name probe again once it is cleared.
+    #[test]
+    fn a_configured_binary_is_what_installed_asks_about() {
+        set_configured_binary(Harness::Codex, "/nowhere/codex");
+        let missing = installed(Harness::Codex).expect("a configured path that is not there");
+        assert!(missing.contains("/nowhere/codex"), "{missing}");
+        set_configured_binary(Harness::Codex, "/bin/sh");
+        assert_eq!(installed(Harness::Codex), None);
+        set_configured_binary(Harness::Codex, "  ");
+        assert!(
+            installed(Harness::Codex).is_none_or(|why| !why.contains("Settings")),
+            "a cleared setting falls back to the bare-name probe"
+        );
+        assert!(configured_missing("cide-no-such-cli-here").is_some());
+        assert_eq!(configured_missing("sh"), None);
+    }
 
     /// A scratch directory, built the way `cide-core`'s tests build theirs.
     ///

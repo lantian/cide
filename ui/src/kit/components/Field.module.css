@@ -196,10 +196,24 @@
 /* --- a form's rows ------------------------------------------------------------------------- */
 
 /* Label left, control right: the settings pages' row, the wizard's summary. */
+/*
+ * The row wraps, and the text asks for a floor of `--form-row-text` before it shares a line.
+ * Without that, a wide control won: `.rowControl` is `flex: none`, so Settings › Git's
+ * four-way Segmented (Ask / Merge / Rebase / Fast-forward only — every segment as wide as the
+ * longest label, ~450px) squeezed its label and a nine-line hint into a 140px column, four
+ * words a line, with the control floating in the middle of that column's height. Letting the
+ * control shrink instead was the option that lost: the segments clip their labels
+ * ("Fast-forwa…") rather than wrap. So a control that leaves the text less than its floor
+ * drops to its own line under the text, left-aligned where the eye already is; a switch or a
+ * small select leaves the text far more than that and stays hard right as before.
+ */
 .row {
+  --form-row-text: calc(260px * var(--ui-scale));
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--sp-6);
+  column-gap: var(--sp-6);
+  row-gap: var(--sp-4);
   padding: var(--sp-5) 0;
   border-bottom: 1px solid var(--border-soft);
 }
@@ -209,7 +223,7 @@
 }
 
 .rowText {
-  flex: 1;
+  flex: 1 1 var(--form-row-text);
   min-width: 0;
 }
 
@@ -227,4 +241,5 @@
 
 .rowControl {
   flex: none;
+  max-width: 100%;
 }

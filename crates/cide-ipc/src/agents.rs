@@ -831,6 +831,46 @@ pub struct DispatchRequest {
     #[serde(default)]
     #[ts(optional)]
     pub notify: Option<RunNotify>,
+    /// Work that lives somewhere other than this project's tracker — a Jira issue the caller read
+    /// through its own MCP server, or a sentence the user typed into the console. (M104)
+    ///
+    /// Exclusive with [`Self::task`]. It differs from a task-less run in the one way that made
+    /// the user ask for it: such a run still gets **a worktree of its own**, named after
+    /// [`ExternalWork::reference`] (or its title), because "implement these two things in
+    /// parallel" is the case, and two runs editing one project root is the collision M40's
+    /// task-less road was never meant to carry.
+    #[serde(default)]
+    #[ts(optional)]
+    pub external: Option<ExternalWork>,
+    /// Run this dispatch on this harness rather than the one the role resolves to. (M104)
+    ///
+    /// One run only: the role's file and the machine's overrides are untouched, so the next
+    /// dispatch of the same role is back on its own harness. `None` is the ordinary road.
+    #[serde(default)]
+    #[ts(optional)]
+    pub harness: Option<Harness>,
+    /// And this model, for this run only. Passed through as the harness's `--model`. (M104)
+    #[serde(default)]
+    #[ts(optional)]
+    pub model: Option<String>,
+}
+
+/// A piece of work that is not a task in this project's tracker. (M104)
+///
+/// See [`DispatchRequest::external`]. Carried whole into the run's opening line, because there is
+/// no `cide_task_get` that could hand the run its statement later — which is also why `brief` is
+/// flattened to one line at the edge like every other prompt, and why a long statement belongs in
+/// the source the reference points at rather than here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct ExternalWork {
+    /// Where the work is written down, e.g. `JIRA-123` or a URL. Names the worktree when present.
+    #[serde(default)]
+    #[ts(optional)]
+    pub reference: Option<String>,
+    pub title: String,
+    pub brief: String,
 }
 
 /// Where cide announces a run's turn endings — handed back, finished, failed. (M40)

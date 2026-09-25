@@ -109,6 +109,7 @@ fn a_real_turn_is_interrupted_by_esc_and_the_next_line_is_taken_up() {
         harness: agent.def.harness,
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: true,
+        server: None,
     };
 
     let spawn = ClaudeHarness.spawn_spec(&plan).expect("spawnable");

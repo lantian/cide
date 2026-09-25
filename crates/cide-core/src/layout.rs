@@ -1674,6 +1674,7 @@ mod tests {
             harness: None,
             title: "cide : claude".into(),
             docker: None,
+            origin: None,
         }
     }
 
@@ -1689,6 +1690,7 @@ mod tests {
             harness: None,
             title: "cide : bash".into(),
             docker: None,
+            origin: None,
         }
     }
 
@@ -3078,6 +3080,7 @@ mod tests {
             harness: None,
             title: "workspace.rs".into(),
             docker: None,
+            origin: None,
         };
         let e = editor.id;
         let mut tree = new_tree(editor);

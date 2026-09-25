@@ -69,6 +69,10 @@ pub struct SettingsPatch {
     /// Which CLI a new console runs. (M93) See [`crate::settings::Settings::console_harness`].
     #[ts(optional)]
     pub console_harness: Option<crate::settings::ConsoleHarness>,
+    /// Where the Agents panel's Open shows a run. (M108) See
+    /// [`crate::settings::Settings::open_run_in`].
+    #[ts(optional)]
+    pub open_run_in: Option<crate::settings::OpenRunIn>,
     /// How `codex` is launched. (M93)
     #[ts(optional)]
     pub codex: Option<crate::settings::CodexSettings>,

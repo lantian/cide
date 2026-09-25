@@ -89,7 +89,76 @@ pub(crate) struct TabMode {
     pub behind: bool,
 }
 
+/// Which CLI a tab cide opens runs. (M104)
+///
+/// Until M104 this was always Settings → Harness, read inside [`open`]. `cide_session_open` lets
+/// the orchestrator choose per tab, and adds the one CLI that is not a console: opencode, whose
+/// TUI runs as a program in a `Shell`-kind pane — `cmd::pane::pane_for` makes the same call for a
+/// re-opened opencode conversation, and `cide_ipc::ConsoleHarness`' doc is why opencode is not
+/// made a console to get here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabHarness {
+    Console(cide_ipc::ConsoleHarness),
+    Opencode,
+}
+
+/// Everything [`open`] needs beyond the project. (M104)
+///
+/// A struct because the list grew past what a reader can match positionally: two of M79's
+/// parameters were already `Option`s of the same shape, and M104 adds four more.
+pub(crate) struct Open<'a> {
+    pub title: &'a str,
+    /// `claude --name`: what the CLI shows in its prompt box and in `/resume`. `None` leaves the
+    /// session unnamed, which is what a reviewer wants — its tab title is a task, not a name.
+    pub session_name: Option<&'a str>,
+    pub prompt: &'a str,
+    pub mode: TabMode,
+    /// Where the child stands. `None` is the project root; `Some` is a worktree — see the `cwd`
+    /// note in the body.
+    pub cwd: Option<std::path::PathBuf>,
+    /// `None` is Settings → Harness, which is what every M79 caller wants.
+    pub harness: Option<TabHarness>,
+    /// Passed as the CLI's `--model`. `None` is the CLI's own default.
+    pub model: Option<&'a str>,
+    /// Which paragraph the child is told it is. [`Voice::Acting`] for the reviewer and the
+    /// planner; [`Voice::Worker`] for a `cide_session_open` tab.
+    pub voice: crate::cmd::session::Voice,
+    /// Recorded on the pane — see `cide_ipc::Pane::origin`.
+    pub origin: Option<cide_ipc::PaneOrigin>,
+}
+
 /// Spawn a `claude`, open a tab holding it, and type `prompt` into it.
+///
+/// The M79 entry point, kept for its two callers: Settings → Harness, the product owner's voice.
+/// [`open`] is the whole of it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_with_prompt(
+    app: &tauri::AppHandle,
+    project: ProjectId,
+    title: &str,
+    session_name: Option<&str>,
+    prompt: &str,
+    mode: TabMode,
+    cwd: Option<std::path::PathBuf>,
+) -> Result<(SessionId, TabId), CoreError> {
+    open(
+        app,
+        project,
+        Open {
+            title,
+            session_name,
+            prompt,
+            mode,
+            cwd,
+            harness: None,
+            model: None,
+            voice: crate::cmd::session::Voice::Acting,
+            origin: None,
+        },
+    )
+}
+
+/// Spawn the tab's CLI, open a tab holding it, and give it `prompt`.
 ///
 /// Answers the new session and tab once the child exists and the tree has been mutated. The
 /// prompt is delivered asynchronously by [`crate::agents::type_submitted_line`], which returns
@@ -99,19 +168,22 @@ pub(crate) struct TabMode {
 /// **Callable only from a thread that is neither the GTK loop nor a Tauri runtime worker**: it
 /// enters the runtime with `block_on` to reach the spawn, which is `async` because forking a
 /// process is not work for the webview's thread. `crate::agent_rpc`'s header states the rule.
-pub(crate) fn open_with_prompt(
+pub(crate) fn open(
     app: &tauri::AppHandle,
     project: ProjectId,
-    title: &str,
-    // `claude --name`: what the CLI shows in its prompt box and in `/resume`. `None` leaves the
-    // session unnamed, which is what a reviewer wants — its tab title is a task, not a name.
-    session_name: Option<&str>,
-    prompt: &str,
-    mode: TabMode,
-    // Where the child stands. `None` is the project root; `Some` is a run's worktree, which is
-    // what a reviewer is given — see the `cwd` note below.
-    cwd: Option<std::path::PathBuf>,
+    open: Open<'_>,
 ) -> Result<(SessionId, TabId), CoreError> {
+    let Open {
+        title,
+        session_name,
+        prompt,
+        mode,
+        cwd,
+        harness: chosen,
+        model,
+        voice,
+        origin,
+    } = open;
     let state = app
         .try_state::<WorkspaceState>()
         .ok_or_else(|| CoreError::Io("the workspace is going away".into()))?;
@@ -121,16 +193,30 @@ pub(crate) fn open_with_prompt(
     // forking one into whatever directory cide happens to be in.
     // Settings → Harness decides which CLI a tab cide opens runs (M93), exactly as it decides a
     // fresh console: these tabs *are* consoles, doing the product owner's job.
-    let (root, name, harness) = state.with(|ws| {
+    let (root, name, setting, llm) = state.with(|ws| {
         let project = cide_core::workspace::project(ws, project)?;
         let root = project
             .roots
             .first()
             .map(|root| root.path.clone())
             .ok_or(CoreError::NoRoots)?;
-        Ok::<_, CoreError>((root, project.name.clone(), ws.settings.console_harness))
+        Ok::<_, CoreError>((
+            root,
+            project.name.clone(),
+            ws.settings.console_harness,
+            ws.settings.llm.clone(),
+        ))
     })?;
-    let codex = harness == cide_ipc::ConsoleHarness::Codex;
+    let tab_harness = chosen.unwrap_or(TabHarness::Console(setting));
+    let codex = tab_harness == TabHarness::Console(cide_ipc::ConsoleHarness::Codex);
+    let opencode = tab_harness == TabHarness::Opencode;
+    // The console identity where there is one; opencode borrows claude's only for the argv arm
+    // below that it never reaches.
+    let harness = match tab_harness {
+        TabHarness::Console(console) => console,
+        TabHarness::Opencode => cide_ipc::ConsoleHarness::Claude,
+    };
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
 
     // One flag, spelled once. `Ask` passes nothing, which is the CLI's own default.
     let mut args: Vec<String> = Vec::new();
@@ -158,6 +244,11 @@ pub(crate) fn open_with_prompt(
             args.push("--name".into());
             args.push(name.into());
         }
+    }
+    // Both consoles spell it the same. Opencode's goes through `tab_launch` below.
+    if !opencode && let Some(model) = model {
+        args.push("--model".into());
+        args.push(model.into());
     }
 
     // `Geometry::default()` is 80×24, byte-identical to the webview's own `FALLBACK`, and it
@@ -209,8 +300,25 @@ pub(crate) fn open_with_prompt(
     // newline would be harmless; flattened anyway, so the two CLIs are told the same thing.)
     let line = crate::agent_rpc::one_line(prompt);
 
+    // Opencode is not a console, so none of the above applies to it: the TUI, the line in
+    // `--prompt`, and cide's server in its configuration document (M104).
+    let (program, args, env) = if opencode {
+        let launch = cide_agents::harness::opencode::OPENCODE_CLI
+            .tab_launch(
+                &line,
+                model,
+                mode.unattended != cide_agents::Unattended::Ask,
+                &llm,
+                crate::agents::cide_hook_binary().as_deref(),
+            )
+            .map_err(CoreError::Io)?;
+        (launch.program, launch.args, launch.env)
+    } else {
+        (harness.program().to_string(), args, Vec::new())
+    };
+
     let request = crate::cmd::session::SpawnRequest {
-        program: harness.program().into(),
+        program,
         args,
         cwd: cwd.to_string_lossy().into_owned(),
         geometry: Geometry::default(),
@@ -226,11 +334,13 @@ pub(crate) fn open_with_prompt(
         // a task, merge the branch and close it or dispatch it back, which *is* the job, and a
         // system prompt calling it a bystander who could orchestrate left it arguing with itself
         // about whether it was allowed to. Reported as exactly that.
-        voice: Some(crate::cmd::session::Voice::Acting),
-        // Nothing here needs a variable of its own.
-        env: Vec::new(),
+        voice: Some(voice),
+        // Opencode's configuration document; nothing for a console.
+        env,
         // Codex takes its opening line in the argv; claude's is typed below.
         prompt: codex.then(|| line.clone()),
+        // A console has the task tools by being one; opencode's bridge needs the id handed down.
+        task_tools: opencode,
     };
 
     let registry = app
@@ -240,7 +350,14 @@ pub(crate) fn open_with_prompt(
     let session =
         tauri::async_runtime::block_on(crate::cmd::session::spawn_session(app, &registry, request))
             .map_err(|error| {
-                CoreError::Io(format!("could not start claude for a new tab: {error}"))
+                CoreError::Io(format!(
+                    "could not start {} for a new tab: {error}",
+                    if opencode {
+                        "opencode"
+                    } else {
+                        harness.program()
+                    }
+                ))
             })?;
 
     // **Whether the strip moves is the one thing the two modes disagree about on screen.**
@@ -275,7 +392,13 @@ pub(crate) fn open_with_prompt(
             },
             Pane {
                 id: pane,
-                kind: PaneKind::Claude,
+                // A console is a Claude pane; the opencode TUI is a program in a terminal, which
+                // is what `pane_for` makes a re-opened opencode conversation too.
+                kind: if opencode {
+                    PaneKind::Shell
+                } else {
+                    PaneKind::Claude
+                },
                 // Auxiliary like every pane in a `ClaudeFull` tab: closing the last one closes
                 // the tab. Only the pinned console has a pane that cannot go.
                 role: PaneRole::Auxiliary,
@@ -283,15 +406,28 @@ pub(crate) fn open_with_prompt(
                 conversation: None,
                 conversation_since: None,
                 // The id is the one `--session-id` was handed, which is what `--resume` takes.
-                continues: in_worktree.then(|| cide_ipc::HarnessSession {
+                //
+                // Not for opencode: its conversation is a `ses_…` the TUI mints and never tells
+                // anybody, so there is no id to continue — and a `continues` naming cide's own
+                // session id would make a restart run `opencode --session <uuid>`, which opens
+                // nothing. Restored, the pane is a shell in the worktree. (M104's stated gap.)
+                continues: (in_worktree && !opencode).then(|| cide_ipc::HarnessSession {
                     harness: harness.harness(),
                     id: session.to_string(),
                     cwd: cwd.clone(),
                 }),
                 // Written directly, as `session` is: this road never passes `pane_bind_session`.
                 harness: codex.then_some(cide_ipc::Harness::Codex),
-                title: format!("{name} : {}", harness.program()),
+                title: format!(
+                    "{name} : {}",
+                    if opencode {
+                        "opencode"
+                    } else {
+                        harness.program()
+                    }
+                ),
                 docker: None,
+                origin,
             },
         )
     });
@@ -324,8 +460,8 @@ pub(crate) fn open_with_prompt(
         servers.bind_pane(project, pid, pane);
     }
 
-    if codex {
-        // Already submitted, as the argv's last token.
+    if codex || opencode {
+        // Already submitted, as the argv's last token (codex) or its `--prompt` (opencode).
         return Ok((session, tab));
     }
     if let (Some(bytes), Some(pty)) = (crate::agent_rpc::submit(&line), registry.get(session)) {

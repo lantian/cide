@@ -4,7 +4,7 @@ import { Button, IconButton } from '../../components/Button'
 import { Field, FormRow, SearchField, Textarea, TextInput } from '../../components/Field'
 import { Select } from '../../components/Select'
 import { Kbd } from '../../components/Status'
-import { Switch } from '../../components/Choice'
+import { Segmented, Switch } from '../../components/Choice'
 import { Cell, Chapter, Line, Specimen, Stack } from '../Specimen'
 
 export function Fields(): ReactElement {
@@ -14,6 +14,7 @@ export function Fields(): ReactElement {
   const [format, setFormat] = useState(true)
   const [sort, setSort] = useState('updated')
   const [tab, setTab] = useState('2')
+  const [pull, setPull] = useState('ask')
   const [lang, setLang] = useState<string | null>(null)
   return (
     <Chapter
@@ -233,7 +234,7 @@ export function Fields(): ReactElement {
       <Specimen
         name="Settings row"
         source="Field.tsx › FormRow"
-        use="A setting: label and one-line hint on the left, the control on the right, a soft rule between rows."
+        use="A setting: label and one-line hint on the left, the control on the right, a soft rule between rows. A control too wide to share the line wraps under the text."
         ground="panel"
       >
         <div style={{ width: '100%' }}>
@@ -249,6 +250,23 @@ export function Fields(): ReactElement {
               options={[
                 { value: '2', label: '2 spaces' },
                 { value: '4', label: '4 spaces' },
+              ]}
+            />
+          </FormRow>
+          <FormRow
+            label="When your branch has diverged"
+            hint="A control too wide to leave the text its floor drops under the text instead of squeezing it into a narrow column."
+          >
+            <Segmented
+              size="sm"
+              label="Diverged pull"
+              value={pull}
+              onChange={setPull}
+              options={[
+                { value: 'ask', label: 'Ask' },
+                { value: 'merge', label: 'Merge' },
+                { value: 'rebase', label: 'Rebase' },
+                { value: 'ff', label: 'Fast-forward only' },
               ]}
             />
           </FormRow>

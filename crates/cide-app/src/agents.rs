@@ -814,6 +814,14 @@ struct Frozen {
 }
 
 impl LiveRun {
+    /// This run's per-dispatch choices, for a work run. (M104)
+    fn options(&self) -> Option<&WorkOptions> {
+        match &self.purpose {
+            RunPurpose::Work(options) => Some(options),
+            RunPurpose::MrReview { .. } => None,
+        }
+    }
+
     fn key(&self) -> AgentKey {
         (self.project, self.agent.clone())
     }
@@ -912,10 +920,15 @@ pub struct RunScope {
 /// Carried on the run rather than looked up from its role id, because the id `mr-review` is a
 /// name a user could also give a real role file; a run is a review because it was *started* as
 /// one, and nothing on disk can make it one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Work` carries what one dispatch asked for beyond its role (M104) — see [`WorkOptions`] — on
+/// the purpose rather than beside it, because the purpose is what every road that re-admits a run
+/// (a restart, a follow-up, a provider failover) already clones from the live row: a field beside
+/// it would have to be threaded through each of those by hand, and the one that forgot it would
+/// resume a run on a harness the caller never chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunPurpose {
-    #[default]
-    Work,
+    Work(WorkOptions),
     MrReview {
         review: String,
         /// The review checkout the child stands in.
@@ -928,6 +941,63 @@ pub enum RunPurpose {
         /// travel together.
         harness: Harness,
     },
+}
+
+impl Default for RunPurpose {
+    fn default() -> Self {
+        Self::Work(WorkOptions::default())
+    }
+}
+
+/// What one dispatch asked for beyond its role. (M104) All `None` is every dispatch before M104.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkOptions {
+    /// Work that is not a task on the board — `DispatchRequest::external`. Its key names the
+    /// checkout, exactly as a task id does, so the run gets a worktree of its own.
+    pub external: Option<cide_ipc::ExternalWork>,
+    /// This run's harness, over the role's and the machine's overrides.
+    pub harness: Option<Harness>,
+    /// This run's model, likewise.
+    pub model: Option<String>,
+}
+
+impl WorkOptions {
+    /// The key a run's checkout is named by: its task, or its external work. (M104)
+    pub fn checkout_key(&self, task: Option<&TaskId>) -> Option<TaskId> {
+        task.cloned().or_else(|| {
+            self.external
+                .as_ref()
+                .map(|work| TaskId(cide_agents::external_key(work).to_string()))
+        })
+    }
+
+    /// The machine's overrides with this run's choices laid over the role's own row. `None` when
+    /// this run chose nothing, so the ordinary road reads the table it always read.
+    pub fn overrides(
+        &self,
+        agent: &AgentId,
+        base: &cide_ipc::ProjectOverrides,
+    ) -> Option<cide_ipc::ProjectOverrides> {
+        if self.harness.is_none() && self.model.is_none() {
+            return None;
+        }
+        let mut overrides = base.clone();
+        let row = overrides.roles.entry(agent.0.clone()).or_default();
+        if let Some(harness) = self.harness {
+            row.harness = Some(harness);
+            // A pool is an opencode-shaped choice; a run moved to another CLI must not carry the
+            // role's pool into a resolution that would refuse it.
+            if !matches!(harness, Harness::Opencode | Harness::Mimo) {
+                row.pool = None;
+            }
+        }
+        if let Some(model) = &self.model {
+            row.model = Some(model.clone());
+            // A model named for this run is the model: not a pool's first entry.
+            row.pool = None;
+        }
+        Some(overrides)
+    }
 }
 
 /// Everything the command worker resolved before the queue was touched.
@@ -1084,6 +1154,14 @@ struct Inner {
     /// reaped. Consulted by [`AgentRegistry::respawn`] and the interrupted-run requeue, which
     /// refuse rather than race.
     viewers: HashMap<(Harness, String), SessionId>,
+    /// Each opencode-shaped run's own headless server, while the run is not over. (M104
+    /// follow-up) See `cide_agents::RunPlan::server` for why it exists, and
+    /// [`AgentRegistry::ensure_server`] / [`AgentRegistry::retire_server`] for its life.
+    ///
+    /// Not in [`SessionRegistry`]: nothing draws it, nothing types into it, and a pane must
+    /// never adopt it. That also keeps it off the shutdown ladder, which is why
+    /// [`AgentRegistry::stop_servers`] is called after the ladder rather than relying on it.
+    servers: HashMap<RunId, LiveServer>,
     /// Restarts a Resume has decided and the old child's exit has not yet carried out, keyed by
     /// the session that child was filed under. See [`AgentRegistry::plan_restarts`].
     ///
@@ -2974,6 +3052,23 @@ impl AgentRegistry {
         let cwd = run_cwd(root, live);
         let conversation = conversation_of(live, &cwd);
 
+        // An opencode-shaped run behind a live server opens as the **full TUI attached to it**
+        // (M104 follow-up), not as a mirror of its turn's rendered JSON — the user's ask: open a
+        // subagent and get the real opencode. `Continue` is the road because the pane runs a child
+        // of its own (`session_spawn` turns this conversation into `attach` while the server
+        // lives), and closing that pane ends only the attached client, never the run.
+        if let Some(conversation) = conversation.as_ref()
+            && matches!(live.harness, Harness::Opencode | Harness::Mimo)
+            && inner
+                .servers
+                .get(&run)
+                .is_some_and(|server| !server.pty.has_exited())
+        {
+            return Ok(RunOpen::Continue {
+                conversation: conversation.clone(),
+            });
+        }
+
         if let Some(session) = live.session
             && let Some(pty) = sessions.get(session)
             && !pty.has_exited()
@@ -3046,11 +3141,40 @@ impl AgentRegistry {
 
     /// Drop every viewer row naming `session`. Called from `lifecycle::report_exit` when the
     /// pane's child is reaped — the earliest moment the conversation is free again.
+    ///
+    /// The same moment an attached pane leaves its run's server (M104 follow-up), so a server
+    /// kept only for that pane is retired here.
     pub fn forget_viewer(&self, session: SessionId) {
-        self.inner
-            .lock()
-            .viewers
-            .retain(|_, viewer| *viewer != session);
+        let released: Vec<RunId> = {
+            let mut inner = self.inner.lock();
+            inner.viewers.retain(|_, viewer| *viewer != session);
+            inner
+                .servers
+                .iter_mut()
+                .filter_map(|(run, server)| {
+                    let before = server.clients.len();
+                    server.clients.retain(|client| *client != session);
+                    (server.clients.len() != before).then_some(*run)
+                })
+                .collect()
+        };
+        for run in released {
+            self.retire_server(run);
+        }
+    }
+
+    /// Record that `session` — a pane's `attach` child — is a client of the run server holding
+    /// `conversation`. Called by `session_spawn` once the child is registered. (M104 follow-up)
+    pub fn note_attached(&self, conversation: &HarnessSession, session: SessionId) {
+        let mut inner = self.inner.lock();
+        let run = inner.runs.iter().find_map(|(run, live)| {
+            (live.harness == conversation.harness
+                && live.harness_session.as_deref() == Some(conversation.id.as_str()))
+            .then_some(*run)
+        });
+        if let Some(server) = run.and_then(|run| inner.servers.get_mut(&run)) {
+            server.clients.push(session);
+        }
     }
 
     /// Sessions of runs that are idle with a child still alive **in this checkout**.
@@ -4941,6 +5065,16 @@ struct SavedRun {
     /// before this field) reads as non-terminal.
     #[serde(default)]
     state: Option<RunState>,
+    /// [`WorkOptions`], so a run dispatched onto another harness, model or external piece of work
+    /// resumes as what it was. (M104) Without them a restored run would resolve to its role's own
+    /// harness and resume a conversation that CLI never had. Absent in an older file, which reads
+    /// as a run that chose nothing — every run before M104.
+    #[serde(default)]
+    external: Option<cide_ipc::ExternalWork>,
+    #[serde(default)]
+    chosen_harness: Option<Harness>,
+    #[serde(default)]
+    chosen_model: Option<String>,
 }
 
 const RUNS_SNAPSHOT_VERSION: u32 = 1;
@@ -5137,6 +5271,10 @@ fn line_stamp(line: &str) -> Option<u64> {
 /// run's durable transcript already exists under `~/.claude/projects` (the shutdown ladder's
 /// graces exist so it finishes writing), so a second copy here would be two records of one
 /// conversation.
+///
+/// Every run's log does start with one line of cide's own, whatever its harness (M108):
+/// `# cide forked: <argv>`, written by `start_child` before each child. A claude run's log is
+/// therefore that line and nothing else. It is not JSON, so the replay (`keep`) never draws it.
 pub(crate) fn run_logs_dir() -> std::path::PathBuf {
     cide_core::persist::state_dir().join("run-logs")
 }
@@ -5283,7 +5421,7 @@ impl AgentRegistry {
             let mut runs: Vec<&LiveRun> = inner
                 .runs
                 .values()
-                .filter(|live| matches!(live.purpose, RunPurpose::Work))
+                .filter(|live| matches!(live.purpose, RunPurpose::Work(_)))
                 .collect();
             runs.sort_by_key(|live| live.seq);
             RunsFile {
@@ -5325,6 +5463,9 @@ impl AgentRegistry {
                         checkout: live.checkout.clone(),
                         notify: live.notify.clone(),
                         state: Some(live.state.clone()),
+                        external: live.options().and_then(|o| o.external.clone()),
+                        chosen_harness: live.options().and_then(|o| o.harness),
+                        chosen_model: live.options().and_then(|o| o.model.clone()),
                     })
                     .collect(),
             }
@@ -5491,7 +5632,11 @@ impl AgentRegistry {
                     checkout: saved.checkout,
                     notify: saved.notify,
                     // Review runs are never saved (see `save_snapshot`), so a restored run was work.
-                    purpose: RunPurpose::Work,
+                    purpose: RunPurpose::Work(WorkOptions {
+                        external: saved.external,
+                        harness: saved.chosen_harness,
+                        model: saved.chosen_model,
+                    }),
                     // A restored run has no child until it is resumed, and the resume calls
                     // `note_cwd` like a first start does.
                     cwd: None,
@@ -5956,18 +6101,6 @@ impl AgentRegistry {
             sessions.insert(session_id, Arc::clone(&started.session));
         }
 
-        // And only now the opening prompt. `None` for a harness that took the prompt in its argv
-        // instead; for `claude` it is written into the terminal, because a bare prompt does not
-        // begin with `-` and `--mcp-config <configs...>` would swallow it — see
-        // `HarnessSpawn::opening`. Through `type_submitted_line`, not a plain write: the TUI
-        // does not exist yet, and a chunk this long read whole off the boot buffer is bundled
-        // as a paste with its Enter eaten — a run that starts, idles at a full composer, and
-        // holds its slot and worktree while reporting nothing. See the helper's measurements.
-        //
-        // `type_opening_line` rather than the plain helper, because that measurement is not the
-        // whole story: under load the paste trap still springs, and the run it springs on holds
-        // its concurrency slot for ever — see `type_opening_line` for the selfcraft queue it
-        // stalled.
         if let Some(opening) = started.opening {
             let registry = Arc::clone(self);
             let for_stuck = app.clone();
@@ -6024,6 +6157,129 @@ impl AgentRegistry {
     /// finding its run `Queued` and answering `Finished` over it — `respawn`'s rebind-before-kill
     /// rule. The successor is a fresh cide session that forks the conversation, which is what
     /// makes the unbinding safe for a `claude` continuation whose id *was* the session.
+    /// This run's server, started if it has none alive in `cwd`. `None` means the run goes on
+    /// standalone, as every run did before — logged, never a refusal. (M104 follow-up)
+    ///
+    /// Called from `start_child`, on the blocking pool, so the health wait blocks nobody who
+    /// matters. The lock is not held across the spawn or the wait.
+    fn ensure_server(
+        &self,
+        run: RunId,
+        flavor: &cide_agents::harness::opencode::Flavor,
+        plan: &cide_agents::RunPlan<'_>,
+    ) -> Option<cide_agents::RunServer> {
+        let stale = {
+            let mut inner = self.inner.lock();
+            match inner.servers.get(&run) {
+                Some(server)
+                    if !server.pty.has_exited()
+                        && server.cwd == plan.cwd
+                        && server.harness == flavor.kind =>
+                {
+                    return Some(cide_agents::RunServer {
+                        url: server.url.clone(),
+                        password: server.password.clone(),
+                    });
+                }
+                _ => inner.servers.remove(&run),
+            }
+        };
+        if let Some(stale) = stale {
+            stale.pty.kill();
+        }
+
+        let port = free_port()?;
+        // A fresh uuid: unguessable, and nothing but this registry and the processes it hands
+        // it to ever holds it.
+        let password = SessionId::new().to_string();
+        let spec = match flavor.serve_spec(plan, port, &password) {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!(%run, %error, "no server for this run; it runs standalone");
+                return None;
+            }
+        };
+        let pty = match PtySession::spawn(spec) {
+            Ok(pty) => pty,
+            Err(error) => {
+                tracing::warn!(%run, %error, "the run's server did not start; it runs standalone");
+                return None;
+            }
+        };
+        let deadline = std::time::Instant::now() + SERVER_READY;
+        let user = flavor.server_user();
+        while !server_healthy(port, &user, &password) {
+            if pty.has_exited() || std::time::Instant::now() > deadline {
+                tracing::warn!(%run, port, "the run's server never answered; it runs standalone");
+                pty.kill();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let url = format!("http://127.0.0.1:{port}");
+        tracing::info!(%run, %url, "a run's server is up");
+        self.inner.lock().servers.insert(
+            run,
+            LiveServer {
+                url: url.clone(),
+                password: password.clone(),
+                harness: flavor.kind,
+                cwd: plan.cwd.clone(),
+                pty,
+                clients: Vec::new(),
+            },
+        );
+        Some(cide_agents::RunServer { url, password })
+    }
+
+    /// Stop a run's server once nothing needs it: the run no longer holds its task (finished,
+    /// failed, interrupted — and an opencode turn ends as `Finished`) **and** no pane is attached.
+    /// While either is true it stays, so the next turn and the TUI being read keep the one
+    /// conversation. A follow-up after it has gone simply starts a new one: the conversation is
+    /// on disk, the server only hosts it.
+    fn retire_server(&self, run: RunId) {
+        let server = {
+            let mut inner = self.inner.lock();
+            let running = inner
+                .runs
+                .get(&run)
+                .is_some_and(|live| holds_a_pair(&live.state));
+            let watched = inner
+                .servers
+                .get(&run)
+                .is_some_and(|server| !server.clients.is_empty());
+            if running || watched {
+                return;
+            }
+            inner.servers.remove(&run)
+        };
+        if let Some(server) = server {
+            tracing::info!(%run, url = %server.url, "a run is over; stopping its server");
+            server.pty.kill();
+        }
+    }
+
+    /// Every server, at quit, after the ladder has taken the runs. See [`Inner::servers`].
+    pub fn stop_servers(&self) {
+        let servers: Vec<LiveServer> = self.inner.lock().servers.drain().map(|(_, s)| s).collect();
+        for server in servers {
+            server.pty.kill();
+        }
+    }
+
+    /// The live server holding this conversation, for a pane about to open it: its URL and
+    /// password, and the CLI to attach with. (M104 follow-up)
+    pub fn server_for(&self, conversation: &HarnessSession) -> Option<(String, String)> {
+        let inner = self.inner.lock();
+        inner.servers.iter().find_map(|(run, server)| {
+            let live = inner.runs.get(run)?;
+            (server.harness == conversation.harness
+                && live.harness_session.as_deref() == Some(conversation.id.as_str())
+                && !server.pty.has_exited())
+            .then(|| (server.url.clone(), server.password.clone()))
+        })
+    }
+
     fn abandon_unsubmitted(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -6955,7 +7211,7 @@ fn start_child(
     // A review's role is built here rather than read, from what its launcher composed (M85) —
     // see `RunPurpose`. Everything below it is the same fork every run takes.
     let synthetic = match &admission.purpose {
-        RunPurpose::Work => None,
+        RunPurpose::Work(_) => None,
         RunPurpose::MrReview {
             brief,
             tools,
@@ -6982,7 +7238,7 @@ fn start_child(
     // refusal to give: the rest of the gate — the bridge, the harness being installed, a
     // dangerous mode — is. The queue's pause still holds it, which is the user's own brake.
     let gate = match &admission.purpose {
-        RunPurpose::Work => project.config.agents.clone(),
+        RunPurpose::Work(_) => project.config.agents.clone(),
         RunPurpose::MrReview { .. } => cide_agents::AgentsConfig {
             enabled: true,
             ..project.config.agents.clone()
@@ -6997,9 +7253,11 @@ fn start_child(
     // as the refusal, so a role's `worktree: false` flipped mid-queue is honoured at the fork —
     // and a run with no task lands in the project root under every isolation (M40).
     let checkout = match &admission.purpose {
-        RunPurpose::Work => {
-            cide_agents::run_checkout(agent, &project.config.agents, admission.task.as_ref())
-        }
+        RunPurpose::Work(options) => cide_agents::run_checkout(
+            agent,
+            &project.config.agents,
+            options.checkout_key(admission.task.as_ref()).as_ref(),
+        ),
         RunPurpose::MrReview { .. } => None,
     };
     let in_worktree = checkout.is_some();
@@ -7046,7 +7304,7 @@ fn start_child(
         // `agents_config_set` refuses to arrange by accident). Nothing is wound down to reclaim
         // the root either: the user is standing in it.
         None => match &admission.purpose {
-            RunPurpose::Work => facts.root.clone(),
+            RunPurpose::Work(_) => facts.root.clone(),
             // The MR's own checkout, which the launcher made. Gone means the review was closed
             // while this run queued, and a reviewer standing in the project root would review
             // the wrong tree without knowing it.
@@ -7077,7 +7335,10 @@ fn start_child(
     // A review is pinned to the harness the user picked in the MR panel: a local override that
     // redirects "every role that names nothing" is about the project's roles, not this one.
     let resolved = match &admission.purpose {
-        RunPurpose::Work => facts.resolve(agent),
+        RunPurpose::Work(options) => match options.overrides(&admission.agent, &facts.overrides) {
+            Some(overrides) => facts.resolve_with(agent, &overrides),
+            None => facts.resolve(agent),
+        },
         RunPurpose::MrReview { .. } => facts.resolve_pinned(agent),
     };
     // The only refusal this fold produces: an override naming a pool that is not configured
@@ -7156,8 +7417,16 @@ fn start_child(
         unattended: project.config.agents.unattended(),
         // A review's connection lists the `cide_mr_*` tools only; its brief is the whole of
         // what it is told. See `RunPlan::tracker_paragraphs`.
-        tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work),
+        tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work(_)),
+        server: None,
     };
+    // An opencode-shaped run works behind a server of its own, so a pane can attach the full TUI
+    // to the conversation while it runs (M104 follow-up). Started — or found alive from an earlier
+    // turn — before the turn's child, which is a client of it.
+    let mut plan = plan;
+    if let Some(flavor) = cide_agents::harness::opencode::Flavor::of(resolved.harness) {
+        plan.server = registry.ensure_server(admission.run, flavor, &plan);
+    }
 
     // `resolved.harness`, not `agent.def.harness`: a local override may have redirected this role
     // onto another CLI, and reading the definition here would fork the harness the file names
@@ -7268,6 +7537,19 @@ fn start_child(
         }
         None => spec,
     };
+    // What was forked, as the first word of this child in the run's post-mortem log: the program
+    // and every argument, never the environment (it carries keys). A child that dies on its own
+    // argv — a CLI printing its usage because a flag it does not know, or a message that starts
+    // with `-` and is read as one — leaves only that usage behind, and "which argument?" was
+    // unanswerable without it.
+    RunLog::at(
+        run_logs_dir().join(format!("{}.log", admission.run)),
+        RUN_LOG_CAP,
+    )
+    .append(&format!(
+        "# cide forked: {}",
+        argv_line(&spec.program, &spec.args)
+    ));
     let pty = PtySession::spawn(spec).map_err(|error| CoreError::Io(error.to_string()))?;
 
     Ok(Started {
@@ -7283,6 +7565,111 @@ fn start_child(
 /// The same helper `cmd::agents`, `cmd::tasks` and `cmd::git` each carry, for the same reason:
 /// `#[tauri::command(async)]` only moves the call onto the async runtime, where a blocking
 /// `read_dir` still occupies a runtime worker for its whole duration.
+/// One run's headless server. (M104 follow-up)
+struct LiveServer {
+    url: String,
+    password: String,
+    /// Which CLI serves it: a pane attaching to it must run the same one.
+    harness: Harness,
+    /// Where it was started. A run whose directory moved (it never does, but a checkout can be
+    /// reclaimed and remade) gets a fresh server rather than one answering for the old path.
+    cwd: std::path::PathBuf,
+    pty: Arc<PtySession>,
+    /// The panes attached to it right now — their children's sessions. Kept because an opencode
+    /// run's turn *ends as `Finished`* (one process per turn, `OpencodeHarness::observe`'s
+    /// table), and a server that went with the turn would take the TUI the user is reading down
+    /// with it after every reply. So the server outlives the run's turn for as long as somebody
+    /// is attached, and goes when the last of them leaves.
+    clients: Vec<SessionId>,
+}
+
+/// How long a fresh server gets to answer its health route before the run goes on without it.
+///
+/// Measured: `opencode serve` answered in about a second on a warm machine. Ten is generous
+/// enough for a cold start and short enough that a server that will never come up costs a run
+/// less than its first model call does.
+const SERVER_READY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a server at `port` answers its health route with this password. One blocking HTTP/1.1
+/// request by hand: the route is a fixed string and a whole client crate is not worth one probe.
+fn server_healthy(port: u16, user: &str, password: &str) -> bool {
+    use std::io::{Read as _, Write as _};
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+    let auth = basic_auth(user, password);
+    let request = format!(
+        "GET /global/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Basic {auth}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut head = [0u8; 16];
+    let read = stream.read(&mut head).unwrap_or(0);
+    // `HTTP/1.1 200 OK`: the status is the second word.
+    std::str::from_utf8(&head[..read]).is_ok_and(|line| line.split(' ').nth(1) == Some("200"))
+}
+
+/// RFC 7617's credential, `base64(user:password)`, without a crate for eleven lines.
+fn basic_auth(user: &str, password: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let input = format!("{user}:{password}");
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(TABLE[((n >> shift) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A port nothing is listening on right now, from the kernel. Racy by nature — another process
+/// can take it before the server binds — and the answer to losing the race is the health probe
+/// failing and the run going on standalone, which is the fallback anyway.
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()?
+        .local_addr()
+        .ok()
+        .map(|address| address.port())
+}
+
+/// A command line as one readable line: each word single-quoted when it needs to be, so a
+/// message with spaces reads as the one argument it is.
+fn argv_line(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(|word| {
+            if !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c))
+            {
+                word.to_string()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn blocking<T>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
 where
     T: Send + 'static,
@@ -7343,6 +7730,7 @@ pub(crate) fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, r
     if let Some(project) = registry.project_of(run) {
         registry.mark_changed(app, project);
     }
+    registry.retire_server(run);
     registry.pump(app);
     // A run that has ended may have been the last thing standing in a checkout whose branch was
     // already taken — the ordinary order is "the run hands its turn back, the orchestrator
@@ -7902,6 +8290,56 @@ mod tests {
 
     use cide_pty::SpawnSpec;
 
+    /// One dispatch's choices (M104): external work names its checkout like a task does, and a
+    /// chosen harness or model is laid over the role's own row without touching the others.
+    #[test]
+    fn a_runs_own_choices_name_its_checkout_and_override_only_its_role() {
+        let none = WorkOptions::default();
+        let base = cide_ipc::ProjectOverrides::default();
+        let developer = AgentId("developer".into());
+        assert_eq!(none.overrides(&developer, &base), None);
+        assert_eq!(none.checkout_key(None), None);
+
+        let options = WorkOptions {
+            external: Some(cide_ipc::ExternalWork {
+                reference: Some("PROJ-12".into()),
+                title: "Add --version".into(),
+                brief: "x".into(),
+            }),
+            harness: Some(Harness::Codex),
+            model: None,
+        };
+        assert_eq!(options.checkout_key(None), Some(TaskId("PROJ-12".into())));
+        assert_eq!(
+            cide_agents::checkout_name(&developer, options.checkout_key(None).as_ref()),
+            "developer-proj-12"
+        );
+
+        let mut base = cide_ipc::ProjectOverrides::default();
+        base.roles.insert(
+            "developer".into(),
+            cide_ipc::AgentOverride {
+                pool: Some("fast".into()),
+                ..Default::default()
+            },
+        );
+        base.roles.insert(
+            "qa".into(),
+            cide_ipc::AgentOverride {
+                model: Some("haiku".into()),
+                ..Default::default()
+            },
+        );
+        let laid = options
+            .overrides(&developer, &base)
+            .expect("a choice was made");
+        let row = &laid.roles["developer"];
+        assert_eq!(row.harness, Some(Harness::Codex));
+        // A pool is opencode's; moving the run to codex drops it rather than refusing the run.
+        assert_eq!(row.pool, None);
+        assert_eq!(laid.roles["qa"], base.roles["qa"]);
+    }
+
     /// A dispatch as `cmd::agents::plan_dispatch` would have produced it.
     ///
     /// `checkout: None` — shared isolation's stamp — so the numeric limits stay the whole
@@ -7921,7 +8359,7 @@ mod tests {
             project_limit,
             checkout: None,
             notify: RunNotify::Primary,
-            purpose: RunPurpose::Work,
+            purpose: RunPurpose::default(),
             pool: Vec::new(),
         }
     }
@@ -11825,6 +12263,126 @@ mod tests {
         let admitted = registry.take_admissions();
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].run, queued);
+    }
+
+    /// The forked command line as the post-mortem log shows it.
+    #[test]
+    fn a_forked_argv_reads_as_one_line_with_each_argument_intact() {
+        assert_eq!(
+            argv_line(
+                "opencode",
+                &[
+                    "run".into(),
+                    "--agent".into(),
+                    "mr-review".into(),
+                    "Review it's !12".into(),
+                    String::new(),
+                ]
+            ),
+            "opencode run --agent mr-review 'Review it'\\''s !12' ''"
+        );
+    }
+
+    /// RFC 7617's example credential, and one whose length needs padding.
+    #[test]
+    fn basic_auth_is_base64_of_user_colon_password() {
+        assert_eq!(
+            basic_auth("Aladdin", "open sesame"),
+            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+        assert_eq!(basic_auth("opencode", "s3cret"), "b3BlbmNvZGU6czNjcmV0");
+    }
+
+    /// The health probe against a server that checks the credential the way `opencode serve`
+    /// does: 401 without it, 200 with it. (M104 follow-up)
+    #[test]
+    fn a_run_server_is_healthy_only_with_its_password() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let expected = format!("Authorization: Basic {}", basic_auth("opencode", "right"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let status =
+                    if request.contains(&expected) && request.starts_with("GET /global/health ") {
+                        "200 OK"
+                    } else {
+                        "401 Unauthorized"
+                    };
+                let _ = stream.write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes());
+            }
+        });
+        assert!(!server_healthy(port, "opencode", "wrong"));
+        assert!(!server_healthy(port, "mimocode", "right"));
+        assert!(server_healthy(port, "opencode", "right"));
+        // And nothing listening is simply not healthy, quickly.
+        let dead = free_port().expect("a port");
+        assert!(!server_healthy(dead, "opencode", "right"));
+    }
+
+    /// A run's server outlives the run's turn while a pane is attached, and goes when the last
+    /// one leaves — because an opencode turn ends as `Finished`, and the TUI being read must not
+    /// die with every reply. (M104 follow-up)
+    #[test]
+    fn a_run_server_stays_for_its_attached_panes_and_goes_with_the_last() {
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(opencode_spec(project, "developer"));
+        registry.take_admissions();
+        assert!(registry.note_harness_session(run, "ses_served".into()));
+        let pty = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("sleep 30"),
+        )
+        .expect("spawn sh");
+        registry.inner.lock().servers.insert(
+            run,
+            LiveServer {
+                url: "http://127.0.0.1:1".into(),
+                password: "pw".into(),
+                harness: Harness::Opencode,
+                cwd: std::env::temp_dir(),
+                pty: Arc::clone(&pty),
+                clients: Vec::new(),
+            },
+        );
+        let conversation = HarnessSession {
+            harness: Harness::Opencode,
+            id: "ses_served".into(),
+            cwd: std::env::temp_dir(),
+        };
+        assert_eq!(
+            registry.server_for(&conversation),
+            Some(("http://127.0.0.1:1".into(), "pw".into()))
+        );
+
+        // Still working: the server stays whatever the panes do.
+        registry.retire_server(run);
+        assert!(registry.inner.lock().servers.contains_key(&run));
+
+        // The turn ends — `Finished`, as every opencode turn does — with a pane attached.
+        let client = SessionId::new();
+        registry.note_attached(&conversation, client);
+        registry.inner.lock().runs.get_mut(&run).expect("run").state =
+            RunState::Finished { code: 0 };
+        registry.retire_server(run);
+        assert!(registry.inner.lock().servers.contains_key(&run));
+        assert!(!pty.has_exited());
+
+        // The pane leaves: the server goes, and its process with it.
+        registry.forget_viewer(client);
+        assert!(!registry.inner.lock().servers.contains_key(&run));
+        assert_eq!(registry.server_for(&conversation), None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pty.has_exited() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(pty.has_exited());
     }
 
     /// **A follow-up is the same run, continuing.**

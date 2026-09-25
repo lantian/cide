@@ -911,3 +911,9 @@
   background: var(--panel-2);
   color: var(--text);
 }
+/* The maximize toggle's "on": the kit's pressed icon button (`Button.module.css`'s `.icon`). */
+.treeAction[aria-pressed='true'],
+.treeAction[aria-pressed='true']:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}

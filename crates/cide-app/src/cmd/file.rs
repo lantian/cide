@@ -102,6 +102,7 @@ pub(crate) fn open_file_tab(
                 harness: None,
                 title,
                 docker: None,
+                origin: None,
             },
         )
     })
@@ -666,6 +667,7 @@ pub(super) fn diff_pane(title: String) -> Pane {
         harness: None,
         title,
         docker: None,
+        origin: None,
     }
 }
 
@@ -1080,6 +1082,7 @@ fn revision_pane(title: String) -> Pane {
         harness: None,
         title,
         docker: None,
+        origin: None,
     }
 }
 
@@ -3177,6 +3180,7 @@ mod tests {
             harness: None,
             title: title.into(),
             docker: None,
+            origin: None,
         }
     }
 
@@ -3192,6 +3196,7 @@ mod tests {
             harness: None,
             title: title.into(),
             docker: None,
+            origin: None,
         }
     }
 
@@ -3416,6 +3421,7 @@ mod tests {
                 harness: None,
                 title: "main.rs".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("opens a file tab");

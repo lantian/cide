@@ -725,6 +725,49 @@ pub struct RunPlan<'a> {
     /// attached (it is `hook_bin`'s question, not this one); such a run's whole brief is its
     /// role's own system prompt.
     pub tracker_paragraphs: bool,
+    /// The run's own headless server, when its harness is hosted behind one (opencode and MiMo
+    /// since M104's follow-up). Each turn's `run` child attaches to it (`--attach`), so the
+    /// conversation lives in a process a pane can attach a **full TUI** to while the run is
+    /// working — the user's ask: open a subagent and get the real opencode, not a log.
+    ///
+    /// `None` is every other harness, and an opencode run whose server would not come up: it
+    /// runs standalone exactly as before, which is the fallback rather than a failure.
+    pub server: Option<RunServer>,
+}
+
+/// Where a run's server listens, and the password that guards it. See [`RunPlan::server`].
+///
+/// The password is not decoration: the server binds 127.0.0.1 and answers every route of
+/// opencode's API — prompt a session, run a shell command, read any file — so an unguarded port
+/// is a local privilege nobody asked to grant. Measured on 1.18.32: `serve` with
+/// `OPENCODE_SERVER_PASSWORD` set answers 401 without basic auth and 200 with it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunServer {
+    pub url: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for RunServer {
+    // Never the password: a plan is logged at debug level on a failed spawn.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunServer")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunPlan<'_> {
+    /// Whether this run stands in the project root with nothing on the board — the M40 road
+    /// [`ADHOC_PREAMBLE`] is written for.
+    ///
+    /// Not simply `task.is_none()` since M104: a run dispatched on **external** work (an issue in
+    /// another system, a sentence the user typed) has no task either, but it has a worktree and a
+    /// branch of its own, and the preamble telling it not to commit would be telling it to throw
+    /// its work away. Such a run carries the work's title in `task_title`, which a genuinely
+    /// ad-hoc run never has.
+    pub fn adhoc(&self) -> bool {
+        self.task.is_none() && self.task_title.is_none()
+    }
 }
 
 /// How the real harness is put back on a conversation, as `session_spawn` wants it. (M42)
@@ -1198,6 +1241,7 @@ mod tests {
                     harness: kind,
                     unattended: crate::config::Unattended::Ask,
                     tracker_paragraphs: true,
+                    server: None,
                 };
                 let spec = harness
                     .spawn_spec(&plan)
@@ -1588,6 +1632,7 @@ mod tests {
                 // and the plan actually said; the skip default has tests of its own.
                 unattended: crate::config::Unattended::Ask,
                 tracker_paragraphs: true,
+                server: None,
             }
         }
 

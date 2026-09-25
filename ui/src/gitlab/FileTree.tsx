@@ -212,6 +212,8 @@ export function FileTree({
   label,
   theme = 'dark',
   defaultExpanded = false,
+  maximized = false,
+  onMaximize,
 }: {
   theme?: IconTheme
   files: readonly TreeFile[]
@@ -225,6 +227,17 @@ export function FileTree({
    * tree on the mode so switching modes starts from that mode's default.
    */
   defaultExpanded?: boolean
+  /**
+   * Whether the host is showing the tree alone, at the panel's full height.
+   *
+   * The review panel stacks the MR's heading, approval, section buttons and file controls above
+   * the tree, and in a sidebar of ordinary height that left the tree a handful of rows — the one
+   * part of the panel a reviewer scrolls. The toggle lives here, beside Expand/Collapse all,
+   * because that strip is sticky and stays in reach; the *hiding* is the host's, since the tree
+   * cannot know what else the panel draws. Absent `onMaximize` ⇒ no button.
+   */
+  maximized?: boolean
+  onMaximize?: ((maximized: boolean) => void) | undefined
 }) {
   const root = useMemo(() => build(files), [files])
   // The initial state already holds the reveal, so a tree opened on a selected file draws it
@@ -263,6 +276,18 @@ export function FileTree({
         >
           <Icon name="chevrons-down-up" size={1} />
         </button>
+        {onMaximize && (
+          <button
+            type="button"
+            className={styles.treeAction}
+            title={maximized ? 'Restore file tree' : 'Maximize file tree'}
+            aria-label={maximized ? 'Restore file tree' : 'Maximize file tree'}
+            aria-pressed={maximized}
+            onClick={() => onMaximize(!maximized)}
+          >
+            <Icon name="maximize" size={1} />
+          </button>
+        )}
       </div>
       <FileRows
         root={root}

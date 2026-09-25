@@ -1243,6 +1243,7 @@ mod tests {
             harness: None,
             title: format!("{name} : claude"),
             docker: None,
+            origin: None,
         };
         let mut tree = PaneTree {
             root: LayoutNode::Leaf { pane: console.id },
@@ -1262,6 +1263,7 @@ mod tests {
                 harness: None,
                 title: format!("{name} : bash"),
                 docker: None,
+                origin: None,
             };
             tree.root = LayoutNode::Split {
                 id: SplitId::new(),
@@ -1290,6 +1292,7 @@ mod tests {
             harness: None,
             title: "settings".into(),
             docker: None,
+            origin: None,
         };
         let settings = Tab {
             id: TabId::new(),
@@ -1961,6 +1964,7 @@ mod tests {
             harness: None,
             title: "main.rs — diff".into(),
             docker: None,
+            origin: None,
         };
         let project = workspace.projects.values_mut().next().expect("a project");
         project.tabs.push(Tab {
@@ -2023,6 +2027,7 @@ mod tests {
 
         let mut workspace = fixture();
         let pane = Pane {
+            origin: None,
             id: PaneId::new(),
             // A `Shell` pane, deliberately — see `cide_ipc::Pane::docker` for why a container's
             // pane is not a kind of its own.
@@ -2383,6 +2388,7 @@ mod tests {
             harness: None,
             title: "cide : claude".into(),
             docker: None,
+            origin: None,
         };
         let tab_id = TabId::new();
         workspace
@@ -2471,6 +2477,7 @@ mod tests {
             harness: None,
             title: "main.rs".into(),
             docker: None,
+            origin: None,
         };
         project.tabs.push(Tab {
             id: TabId::new(),

@@ -251,6 +251,7 @@ pub async fn tab_open_docs(
                 harness: None,
                 title: "docs".into(),
                 docker: None,
+                origin: None,
             },
         )
     })

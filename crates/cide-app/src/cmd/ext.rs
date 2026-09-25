@@ -345,6 +345,7 @@ pub async fn tab_open_extension(
                 harness: None,
                 title: "extension".into(),
                 docker: None,
+                origin: None,
             },
         )
     })

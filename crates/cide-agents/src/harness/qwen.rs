@@ -421,7 +421,7 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
                 ),
             );
         }
-        if plan.task.is_none() {
+        if plan.adhoc() {
             cide_core::claude_cli::fold_append_system_prompt(&mut args, ADHOC_PREAMBLE);
         }
     }
@@ -615,6 +615,7 @@ mod tests {
             harness: agent.def.harness,
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            server: None,
         }
     }
 

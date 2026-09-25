@@ -53,7 +53,8 @@
 //! | the header names | served |
 //! | --- | --- |
 //! | a run this process dispatched | the **nine** `cide_task_*` tools, scoped to that run's project, signing every comment as that run's role |
-//! | a Claude pane of a project — its console (`primary_session`) or any other | those nine **and** the eleven orchestration tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
+//! | a pane `cide_session_open` opened (`PaneOrigin::Worker`, any kind) — M104 | the **nine** `cide_task_*` tools, scoped to its project, signing as the agent `task` ([`Scope::Worker`]) |
+//! | a Claude pane of a project — its console (`primary_session`) or any other | those nine **and** the orchestration tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
 //! | anything else, or nothing | a valid `initialize` and an **empty** tool list |
 //!
 //! Never a crash, and never another project's tasks. The primary-session question is still asked,
@@ -303,6 +304,21 @@ enum Scope {
         project: ProjectId,
         session: SessionId,
         primary: bool,
+    },
+    /// The header named a pane `cide_session_open` opened to implement one piece of work —
+    /// `PaneOrigin::Worker`, any kind: a claude or codex console, or the opencode TUI in a Shell
+    /// pane. (M104) The task tools and nothing else, like a run: the user asked for a session per
+    /// task, not a session that opens more sessions, and a worker that could dispatch is the
+    /// fan-out the run row exists to close.
+    ///
+    /// Signed as the agent `task`, labelled `Session`, rather than as the orchestrator: an
+    /// `Orchestrator` author passes `autodispatch::trigger`'s author gate, so a worker assigning
+    /// a role would have started a run by the back door. And `task` is the prefix of the
+    /// worktree it stands in (`cide_agents::session_checkout`), so the review-time prewarm that
+    /// verifies `cide/<agent>-<task>` verifies the branch this session actually committed to.
+    Worker {
+        project: ProjectId,
+        session: SessionId,
     },
     /// The header named a run this process dispatched. The task tools, and nothing else.
     Run {
@@ -727,6 +743,35 @@ struct RegistrySink {
     session: SessionId,
 }
 
+impl RegistrySink {
+    /// Whether a session a task already points at is still running: a pane of this project holds
+    /// it and its child is alive. (M104)
+    fn live_session(&self, session: SessionId) -> bool {
+        let Some(workspace) = self.app.try_state::<WorkspaceState>() else {
+            return false;
+        };
+        let held = workspace
+            .with(|ws| {
+                cide_core::workspace::project(ws, self.project)
+                    .ok()
+                    .map(|project| {
+                        project
+                            .tabs
+                            .iter()
+                            .flat_map(|tab| tab.tree.panes.values())
+                            .chain(project.detached.values())
+                            .any(|pane| pane.session == Some(session))
+                    })
+            })
+            .unwrap_or(false);
+        held && self
+            .app
+            .try_state::<SessionRegistry>()
+            .and_then(|registry| registry.get(session))
+            .is_some_and(|pty| !pty.has_exited())
+    }
+}
+
 impl AgentSink for RegistrySink {
     fn agents(&self) -> Result<Vec<AgentDef>, String> {
         // `project_roster` and not `cide_agents::load_project`, so the `unavailable` sentence a
@@ -1025,6 +1070,27 @@ impl AgentSink for RegistrySink {
         instructions: Option<&str>,
         notify: cide_agents::tools::Notify,
     ) -> Result<RunId, String> {
+        self.dispatch_with(&cide_agents::tools::DispatchArgs {
+            agent,
+            task,
+            external: None,
+            instructions,
+            notify,
+            harness: None,
+            model: None,
+        })
+    }
+
+    fn dispatch_with(&self, args: &cide_agents::tools::DispatchArgs<'_>) -> Result<RunId, String> {
+        let cide_agents::tools::DispatchArgs {
+            agent,
+            task,
+            external,
+            instructions,
+            notify,
+            harness,
+            model,
+        } = *args;
         let (workspace, agents, tasks) = self.dispatch_state()?;
         let request = DispatchRequest {
             project: self.project,
@@ -1044,6 +1110,9 @@ impl AgentSink for RegistrySink {
                 cide_agents::tools::Notify::Main => RunNotify::Primary,
                 cide_agents::tools::Notify::None => RunNotify::Silent,
             }),
+            external: external.cloned(),
+            harness,
+            model: model.map(str::to_string),
         };
         tauri::async_runtime::block_on(crate::cmd::agents::agents_dispatch(
             self.app.clone(),
@@ -1053,6 +1122,158 @@ impl AgentSink for RegistrySink {
             request,
         ))
         .map_err(|error| error.to_string())
+    }
+
+    /// One worktree, one tab, one piece of work. (M104)
+    ///
+    /// On the connection's own thread, which may block: `claude_tab::open` enters the runtime
+    /// with `block_on` for the spawn, as the reviewer tab below does from the same kind of thread.
+    fn open_session(
+        &self,
+        request: &cide_agents::tools::SessionRequest,
+    ) -> Result<cide_agents::tools::OpenedSession, String> {
+        use cide_agents::tools::{OpenedSession, Work};
+        use cide_ipc::{TaskAuthor, TaskEdit, TaskStatus};
+
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        let root = crate::tasks_state::project_root(&workspace, self.project)
+            .map_err(|error| error.to_string())?;
+        let setting = workspace.with(|ws| ws.settings.console_harness);
+        let chosen = request.harness.unwrap_or(setting.harness());
+        let tab_harness = match chosen {
+            Harness::Claude => {
+                crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Claude)
+            }
+            Harness::Codex => {
+                crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Codex)
+            }
+            Harness::Opencode => crate::claude_tab::TabHarness::Opencode,
+            // The tool's schema offers only the three, and says why; this is the belt.
+            other => {
+                return Err(format!(
+                    "a session tab cannot run {other:?}: choose claude, codex or opencode"
+                ));
+            }
+        };
+
+        // The work: a task on the board, checked by the rules a dispatch applies, or something
+        // from elsewhere. The key names the checkout, so asking twice lands in the same one.
+        let store = self
+            .app
+            .try_state::<Arc<TasksStores>>()
+            .map(|stores| stores.ensure(self.project, &root))
+            .ok_or_else(|| gone().to_string())?;
+        let (task, key, title) = match &request.work {
+            Work::Task(id) => {
+                let task = store.get(id).ok_or_else(|| {
+                    format!("there is no task {id} on this project's board — see cide_task_list")
+                })?;
+                if task.status == TaskStatus::Done {
+                    return Err(format!(
+                        "{id} is done. Move it back to todo first if there is more to do."
+                    ));
+                }
+                if let Some(why) = crate::cmd::agents::task_refusal(&root, &store, &task) {
+                    return Err(why);
+                }
+                // A second ask for the same task answers with the session it already has.
+                if let Some(session) = task.session
+                    && self.live_session(session)
+                {
+                    return Ok(OpenedSession {
+                        title: format!("{} · {}", task.id, one_line(&task.title)),
+                        harness: chosen,
+                        cwd: cide_git::worktree::path_of(
+                            &root,
+                            &cide_agents::session_checkout(&id.0),
+                        ),
+                        branch: None,
+                        reused: true,
+                    });
+                }
+                let title = format!("{} · {}", task.id, one_line(&task.title));
+                (Some(task), id.0.clone(), title)
+            }
+            Work::External(work) => (
+                None,
+                cide_agents::external_key(work).to_string(),
+                one_line(&work.title),
+            ),
+        };
+
+        let name = cide_agents::session_checkout(&key);
+        let checkout = cide_git::worktree::ensure(&root, &name).map_err(|error| {
+            format!("could not make the worktree {name} for this session: {error}")
+        })?;
+
+        // Spelled the way the tab's own CLI presents cide's tools.
+        let tools = cide_agents::harness::for_kind(chosen);
+        let prompt = match (&request.work, task.as_ref()) {
+            (Work::External(work), _) => {
+                crate::cmd::agents::external_prompt(work, request.instructions.as_deref(), tools)
+            }
+            (Work::Task(_), task) => {
+                crate::cmd::agents::opening_prompt(task, request.instructions.as_deref(), tools)
+            }
+        };
+        let unattended = cide_agents::config::load(&root).agents.unattended();
+
+        let (session, _tab) = crate::claude_tab::open(
+            &self.app,
+            self.project,
+            crate::claude_tab::Open {
+                title: &title,
+                session_name: Some(&title),
+                prompt: &prompt,
+                mode: crate::claude_tab::TabMode {
+                    unattended,
+                    // Behind the tab the user is on: the orchestrator may open several in one
+                    // turn, and each raising itself would take the view away from the one pane
+                    // the user is reading — the console that is telling them what it did.
+                    behind: true,
+                },
+                cwd: Some(checkout.path.clone()),
+                harness: Some(tab_harness),
+                model: request.model.as_deref(),
+                voice: crate::cmd::session::Voice::Worker,
+                origin: Some(cide_ipc::PaneOrigin::Worker),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+        // The board learns where the work is, and it starts: `spec_dispatch_to_session`'s two
+        // edits, in its order — recorded after the tab exists, because a task pointing at a
+        // session that failed to spawn is a task nobody can open.
+        if let Some(task) = task.as_ref() {
+            let _ = store.edit(
+                &task.id,
+                TaskEdit::SetSession {
+                    session: Some(session),
+                },
+                TaskAuthor::Orchestrator,
+            );
+            if task.status == TaskStatus::Todo {
+                let _ = store.edit(
+                    &task.id,
+                    TaskEdit::SetStatus {
+                        status: TaskStatus::Doing,
+                    },
+                    TaskAuthor::Orchestrator,
+                );
+            }
+            crate::tasks_state::broadcast(&self.app, self.project, &store);
+        }
+
+        Ok(OpenedSession {
+            title,
+            harness: chosen,
+            cwd: checkout.path,
+            branch: Some(checkout.branch),
+            reused: false,
+        })
     }
 
     fn stop(&self, run: RunId, reason: Option<&str>, force: bool) -> Result<Stopped, String> {
@@ -1249,6 +1470,20 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 session: Some(session),
                 cwd: None,
             }),
+            Scope::Worker { project, session } => Box::new(ProjectTools {
+                app: app.clone(),
+                project,
+                author: TaskAuthor::Agent {
+                    agent: AgentId(WORKER_AGENT.to_string()),
+                    label: "Session".to_string(),
+                },
+                // The line the variant exists to draw.
+                orchestrator: false,
+                // Kept, so an edit this session makes that reaches `task_triggers` names it as
+                // the pane to report to; the author gate above refuses the start anyway.
+                session: Some(session),
+                cwd: None,
+            }),
             Scope::Run {
                 project,
                 agent,
@@ -1421,7 +1656,7 @@ fn run_scope_of(runs: &[crate::agents::RunScope], run: RunId) -> Option<Scope> {
     runs.iter()
         .find(|live| live.run == run)
         .map(|live| match &live.purpose {
-            crate::agents::RunPurpose::Work => Scope::Run {
+            crate::agents::RunPurpose::Work(_) => Scope::Run {
                 project: live.project,
                 agent: live.agent.clone(),
                 label: live.label.clone(),
@@ -1474,6 +1709,12 @@ fn scope_of(ws: &Workspace, hello: &Hello) -> Scope {
         };
     }
 
+    // A worker before the wider question, which would otherwise answer a claude worker as an
+    // ordinary pane and hand it the orchestration tools. (M104)
+    if let Some(project) = project_of_worker_pane(ws, session) {
+        return Scope::Worker { project, session };
+    }
+
     match project_of_claude_pane(ws, session) {
         Some(project) => Scope::Pane {
             project,
@@ -1482,6 +1723,27 @@ fn scope_of(ws: &Workspace, hello: &Hello) -> Scope {
         },
         None => Scope::Unscoped,
     }
+}
+
+/// The agent id a worker session signs as. (M104) See [`Scope::Worker`].
+const WORKER_AGENT: &str = "task";
+
+/// The project one of whose `PaneOrigin::Worker` panes holds this session, if any. (M104)
+///
+/// Any pane kind, unlike [`project_of_claude_pane`]: an opencode worker is a Shell pane, and it is
+/// given `CIDE_SESSION` precisely so that this row can find it (`SpawnRequest::task_tools`).
+fn project_of_worker_pane(ws: &Workspace, session: SessionId) -> Option<ProjectId> {
+    ws.projects.iter().find_map(|(id, project)| {
+        project
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.tree.panes.values())
+            .chain(project.detached.values())
+            .any(|pane| {
+                pane.origin == Some(cide_ipc::PaneOrigin::Worker) && pane.session == Some(session)
+            })
+            .then_some(*id)
+    })
 }
 
 /// The project whose console this session is, if it is any project's.
@@ -2901,6 +3163,7 @@ mod tests {
             harness: None,
             title: "cide : claude".into(),
             docker: None,
+            origin: None,
         }
     }
 
@@ -2989,6 +3252,27 @@ mod tests {
             scope_of(&ws, &hello(Some("developer"), None)),
             Scope::Unscoped
         );
+    }
+
+    /// M104's row: a `cide_session_open` tab — claude, or the opencode TUI in a Shell pane — is
+    /// a worker, served the task tools and signing as a session, never as the orchestrator.
+    #[test]
+    fn a_worker_pane_of_any_kind_is_a_worker_and_never_an_orchestrator() {
+        let (mut ws, project, _) = workspace_with_a_project();
+        for kind in [PaneKind::Claude, PaneKind::Shell] {
+            let session = SessionId::new();
+            let mut pane = a_pane(kind, session);
+            pane.origin = Some(cide_ipc::PaneOrigin::Worker);
+            ws.projects[&project].tabs[0]
+                .tree
+                .panes
+                .insert(pane.id, pane);
+            assert_eq!(
+                scope_of(&ws, &hello(Some(&session.to_string()), None)),
+                Scope::Worker { project, session },
+                "{kind:?}"
+            );
+        }
     }
 
     /// The row M28 needed and M18's table did not have.
@@ -3107,7 +3391,7 @@ mod tests {
             agent: AgentId(agent.to_string()),
             label: format!("{agent} (label)"),
             cwd: PathBuf::from(format!("/repo/.cide/worktrees/{agent}")),
-            purpose: crate::agents::RunPurpose::Work,
+            purpose: crate::agents::RunPurpose::default(),
             harness: cide_ipc::Harness::Claude,
         }
     }
@@ -3497,7 +3781,7 @@ mod tests {
     /// through the transport, the header line and the JSON-RPC layer, exactly as `cide-hook mcp`
     /// drives them.
     ///
-    /// Three connections, three answers: twenty-two tools for the project's primary session, nine for
+    /// Three connections, three answers: twenty-three tools for the project's primary session, nine for
     /// a run, none for anything else. And the enforcement half beside the advertisement: the run
     /// connection asks for `cide_agent_dispatch` by name and is answered `METHOD_NOT_FOUND`
     /// **without the call reaching the sink at all**, which is the assertion that matters — an
@@ -3542,7 +3826,7 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 22, "{names:?}");
+            assert_eq!(names.len(), 23, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));

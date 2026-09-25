@@ -100,6 +100,9 @@ pub struct Settings {
     /// project's `agents.harness`) names, which stays Claude when nothing names one — codex runs
     /// only where somebody chose it, here or there.
     pub console_harness: ConsoleHarness,
+    /// Where the Agents panel's *Open* shows a run: a tab of its own, or a row in the project
+    /// console. (M108) Only that button reads it — nothing opens a run's view by itself.
+    pub open_run_in: OpenRunIn,
     /// Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
     pub codex: CodexSettings,
     pub proxy: ProxySettings,
@@ -140,6 +143,7 @@ impl Default for Settings {
             graphics: GraphicsSettings::default(),
             claude: ClaudeSettings::default(),
             console_harness: ConsoleHarness::default(),
+            open_run_in: OpenRunIn::default(),
             codex: CodexSettings::default(),
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
@@ -1104,6 +1108,23 @@ impl ConsoleHarness {
             Self::Codex => "codex",
         }
     }
+}
+
+/// Where the Agents panel's *Open* shows a run. (M108)
+///
+/// A tab by default, which the user asked for: a row makes the console — the conversation they
+/// are actually talking to — share its height with every run they open. The row stays available,
+/// because it is how Open worked from M18 to M105 and reading a run beside the console that
+/// dispatched it is a real way to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum OpenRunIn {
+    /// A tab of its own, raised, titled `<role> · <task>`.
+    #[default]
+    Tab,
+    /// A full-width row under the project console's conversation.
+    Split,
 }
 
 /// Everything about how `codex` is launched: Settings → Harness → Codex. (M93)

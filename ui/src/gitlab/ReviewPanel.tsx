@@ -61,6 +61,9 @@ export function ReviewPanel({
   const [source, setSource] = useState(false)
   const [files, setFiles] = useState<string[]>([])
   const [query, setQuery] = useState('')
+  // The file tree alone, at full height: see `FileTree`'s `maximized`. Errors still show — a
+  // refusal hidden behind a layout toggle reads as a tree that silently stopped updating.
+  const [treeMaximized, setTreeMaximized] = useState(false)
   useEffect(() => {
     let current = true
     void loadReview(review).catch((e) => {
@@ -195,239 +198,249 @@ export function ReviewPanel({
       className={`${styles.reviewSidebar} ${chrome.reviewPanel}`}
       aria-label={`Review ${d.mr.title}`}
     >
-      <div className={chrome.reviewHeading}>
-        <header className={chrome.reviewTopline}>
-          <span className={chrome.mrNumber}>!{d.mr.iid}</span>
-          <MRState state={d.mr.state} draft={d.mr.draft} />
-          <div className={chrome.headerTools}>
-            <IconButton
-              icon="refresh-cw"
-              label="Refresh merge request"
-              disabled={busy}
-              onClick={() =>
-                void run(async () => {
-                  await loadReview(review, true)
-                  setUpdated(false)
-                  setSource(false)
-                  setFiles([])
-                })
+      {!treeMaximized && (
+        <>
+          <div className={chrome.reviewHeading}>
+            <header className={chrome.reviewTopline}>
+              <span className={chrome.mrNumber}>!{d.mr.iid}</span>
+              <MRState state={d.mr.state} draft={d.mr.draft} />
+              <div className={chrome.headerTools}>
+                <IconButton
+                  icon="refresh-cw"
+                  label="Refresh merge request"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      await loadReview(review, true)
+                      setUpdated(false)
+                      setSource(false)
+                      setFiles([])
+                    })
+                  }
+                />
+                <IconButton
+                  icon="eye"
+                  label="Review with an agent"
+                  disabled={busy}
+                  onClick={() => showLaunchReview(review)}
+                />
+                <IconButton
+                  icon="arrow-up-right"
+                  label="Open in GitLab"
+                  onClick={() => void gitlab.openUrl(d.mr.web_url)}
+                />
+                <IconButton
+                  icon="x"
+                  label="Close MR review"
+                  disabled={busy}
+                  onClick={() => void run(() => closeReview(review))}
+                />
+              </div>
+            </header>
+            <h2 className={chrome.reviewTitle}>{d.mr.title}</h2>
+            <div
+              className={chrome.branches}
+              title={`${d.mr.source_branch} → ${d.mr.target_branch}`}
+            >
+              <Icon name="git-branch" size={1} />
+              <code>{d.mr.source_branch}</code>
+              <Icon name="arrow-right" size={1} />
+              <code>{d.mr.target_branch}</code>
+            </div>
+            <div className={chrome.assignees}>
+              <span>Assignees: </span>
+              <Users users={d.mr.assignees} review={review} />
+            </div>
+            <ApprovalStatus
+              approval={d.approval}
+              stale={updated}
+              error={d.approvalError}
+            />
+            <button
+              className={chrome.approvalAction}
+              disabled={
+                busy ||
+                updated ||
+                d.mr.state !== 'opened' ||
+                d.approval === null ||
+                (d.approval.user_can_approve === false &&
+                  !d.approval.user_has_approved)
               }
-            />
-            <IconButton
-              icon="eye"
-              label="Review with an agent"
-              disabled={busy}
-              onClick={() => showLaunchReview(review)}
-            />
-            <IconButton
-              icon="arrow-up-right"
-              label="Open in GitLab"
-              onClick={() => void gitlab.openUrl(d.mr.web_url)}
-            />
-            <IconButton
-              icon="x"
-              label="Close MR review"
-              disabled={busy}
-              onClick={() => void run(() => closeReview(review))}
-            />
+              data-approved={!!d.approval?.user_has_approved}
+              title={d.approvalError ?? ''}
+              onClick={() => void run(approve)}
+            >
+              <Icon
+                name={d.approval?.user_has_approved ? 'circle-check' : 'check'}
+                size={1}
+              />
+              {d.approval?.user_has_approved ? 'Remove approval' : 'Approve'}
+            </button>
           </div>
-        </header>
-        <h2 className={chrome.reviewTitle}>{d.mr.title}</h2>
-        <div
-          className={chrome.branches}
-          title={`${d.mr.source_branch} → ${d.mr.target_branch}`}
-        >
-          <Icon name="git-branch" size={1} />
-          <code>{d.mr.source_branch}</code>
-          <Icon name="arrow-right" size={1} />
-          <code>{d.mr.target_branch}</code>
-        </div>
-        <div className={chrome.assignees}>
-          <span>Assignees: </span>
-          <Users users={d.mr.assignees} review={review} />
-        </div>
-        <ApprovalStatus
-          approval={d.approval}
-          stale={updated}
-          error={d.approvalError}
-        />
-        <button
-          className={chrome.approvalAction}
-          disabled={
-            busy ||
-            updated ||
-            d.mr.state !== 'opened' ||
-            d.approval === null ||
-            (d.approval.user_can_approve === false &&
-              !d.approval.user_has_approved)
-          }
-          data-approved={!!d.approval?.user_has_approved}
-          title={d.approvalError ?? ''}
-          onClick={() => void run(approve)}
-        >
-          <Icon
-            name={d.approval?.user_has_approved ? 'circle-check' : 'check'}
-            size={1}
-          />
-          {d.approval?.user_has_approved ? 'Remove approval' : 'Approve'}
-        </button>
-      </div>
-      {updated && (
-        <Banner
-          action={
-            <Button
-              size="sm"
-              variant="link"
-              disabled={busy}
-              onClick={() =>
-                void run(async () => {
-                  await loadReview(review, true)
-                  setUpdated(false)
-                  setSource(false)
-                  setFiles([])
-                })
+          {updated && (
+            <Banner
+              action={
+                <Button
+                  size="sm"
+                  variant="link"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      await loadReview(review, true)
+                      setUpdated(false)
+                      setSource(false)
+                      setFiles([])
+                    })
+                  }
+                >
+                  Refresh
+                </Button>
               }
             >
-              Refresh
-            </Button>
-          }
-        >
-          New commits available.
-        </Banner>
+              New commits available.
+            </Banner>
+          )}
+        </>
       )}
       {(error || snap.error || d.approvalError) && (
         <div role="alert" className={styles.error}>
           {error || snap.error || d.approvalError}
         </div>
       )}
-      {agent && (
-        <div className={chrome.agentNote}>
-          <Note
-            tone={
-              agent.state === 'failed'
-                ? 'bad'
-                : agent.state === 'waiting'
-                  ? 'warn'
-                  : agent.state === 'idle' || agent.state === 'finished'
-                    ? 'ok'
-                    : 'info'
-            }
-            title={`${HARNESS_LABEL[agent.harness]} review`}
-            actions={
-              <>
-                {(agent.state === 'idle' || agent.state === 'finished') && (
-                  <Button
-                    size="sm"
-                    icon="pencil"
-                    onClick={() => showReviewInfo(review, 'drafts')}
-                  >
-                    Open drafts
-                  </Button>
+      {!treeMaximized && (
+        <>
+          {agent && (
+            <div className={chrome.agentNote}>
+              <Note
+                tone={
+                  agent.state === 'failed'
+                    ? 'bad'
+                    : agent.state === 'waiting'
+                      ? 'warn'
+                      : agent.state === 'idle' || agent.state === 'finished'
+                        ? 'ok'
+                        : 'info'
+                }
+                title={`${HARNESS_LABEL[agent.harness]} review`}
+                actions={
+                  <>
+                    {(agent.state === 'idle' || agent.state === 'finished') && (
+                      <Button
+                        size="sm"
+                        icon="pencil"
+                        onClick={() => showReviewInfo(review, 'drafts')}
+                      >
+                        Open drafts
+                      </Button>
+                    )}
+                    {agent.state !== 'queued' && (
+                      <Button
+                        size="sm"
+                        variant="quiet"
+                        icon="square-terminal"
+                        title="Show the review's tab"
+                        onClick={() => void run(() => showAgentReview(review))}
+                      >
+                        Show
+                      </Button>
+                    )}
+                    {agent.state !== 'finished' && agent.state !== 'failed' && (
+                      <Button
+                        size="sm"
+                        variant="quiet"
+                        icon="square"
+                        title="Stop the agent; drafts it wrote are kept"
+                        onClick={() => void run(() => stopAgentReview(review))}
+                      >
+                        Stop
+                      </Button>
+                    )}
+                  </>
+                }
+              >
+                <span className={chrome.agentDetail}>
+                  {(agent.state === 'queued' || agent.state === 'running') && (
+                    <Spinner />
+                  )}
+                  {agent.detail}
+                </span>
+              </Note>
+            </div>
+          )}
+          <nav className={chrome.reviewActions} aria-label="MR information">
+            {sections.map(({ section, label, icon, count }) => (
+              <button key={section} onClick={() => showReviewInfo(review, section)}>
+                <Icon name={icon} size={1} />
+                {label}
+                {/* A zero draws nothing: three dark "0" discs read as three things needing a look. */}
+                {!!count && (
+                  <span className={chrome.sectionCount}>
+                    <Counter value={count} />
+                  </span>
                 )}
-                {agent.state !== 'queued' && (
-                  <Button
-                    size="sm"
-                    variant="quiet"
-                    icon="square-terminal"
-                    title="Show the review's tab"
-                    onClick={() => void run(() => showAgentReview(review))}
-                  >
-                    Show
-                  </Button>
-                )}
-                {agent.state !== 'finished' && agent.state !== 'failed' && (
-                  <Button
-                    size="sm"
-                    variant="quiet"
-                    icon="square"
-                    title="Stop the agent; drafts it wrote are kept"
-                    onClick={() => void run(() => stopAgentReview(review))}
-                  >
-                    Stop
-                  </Button>
-                )}
-              </>
-            }
-          >
-            <span className={chrome.agentDetail}>
-              {(agent.state === 'queued' || agent.state === 'running') && (
-                <Spinner />
-              )}
-              {agent.detail}
-            </span>
-          </Note>
-        </div>
-      )}
-      <nav className={chrome.reviewActions} aria-label="MR information">
-        {sections.map(({ section, label, icon, count }) => (
-          <button key={section} onClick={() => showReviewInfo(review, section)}>
-            <Icon name={icon} size={1} />
-            {label}
-            {/* A zero draws nothing: three dark "0" discs read as three things needing a look. */}
-            {!!count && (
-              <span className={chrome.sectionCount}>
-                <Counter value={count} />
+              </button>
+            ))}
+          </nav>
+          <div className={`${styles.sidebarSummary} ${chrome.fileControls}`}>
+            <div className={styles.row}>
+              <strong>Changes ({totals.files})</strong>
+              <span className={styles.additions}>+{totals.additions}</span>
+              <span className={styles.deletions}>−{totals.deletions}</span>
+            </div>
+            {incomplete && (
+              <span className={styles.muted}>
+                GitLab omitted part of the diff; totals are incomplete.
               </span>
             )}
-          </button>
-        ))}
-      </nav>
-      <div className={`${styles.sidebarSummary} ${chrome.fileControls}`}>
-        <div className={styles.row}>
-          <strong>Changes ({totals.files})</strong>
-          <span className={styles.additions}>+{totals.additions}</span>
-          <span className={styles.deletions}>−{totals.deletions}</span>
-        </div>
-        {incomplete && (
-          <span className={styles.muted}>
-            GitLab omitted part of the diff; totals are incomplete.
-          </span>
-        )}
-        <input
-          aria-label="Filter review files"
-          placeholder="Filter files"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        <label className={chrome.excludedToggle}>
-          <input
-            type="checkbox"
-            checked={showExcluded}
-            onChange={(e) => setShowExcluded(e.target.checked)}
-          />{' '}
-          Show excluded files{' '}
-          <span className={styles.muted}>
-            ({all.length - visible.length} hidden)
-          </span>
-        </label>
-        <button
-          className={chrome.sourceToggle}
-          aria-pressed={source}
-          disabled={busy}
-          onClick={() =>
-            void run(async () => {
-              if (source) {
-                setSource(false)
-                return
+            <input
+              aria-label="Filter review files"
+              placeholder="Filter files"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            <label className={chrome.excludedToggle}>
+              <input
+                type="checkbox"
+                checked={showExcluded}
+                onChange={(e) => setShowExcluded(e.target.checked)}
+              />{' '}
+              Show excluded files{' '}
+              <span className={styles.muted}>
+                ({all.length - visible.length} hidden)
+              </span>
+            </label>
+            <button
+              className={chrome.sourceToggle}
+              aria-pressed={source}
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  if (source) {
+                    setSource(false)
+                    return
+                  }
+                  await prepareSource(review)
+                  setFiles(
+                    await api<string[]>({
+                      kind: 'sourceTree',
+                      review,
+                      sha: refs.head_sha,
+                    }),
+                  )
+                  setSource(true)
+                })
               }
-              await prepareSource(review)
-              setFiles(
-                await api<string[]>({
-                  kind: 'sourceTree',
-                  review,
-                  sha: refs.head_sha,
-                }),
-              )
-              setSource(true)
-            })
-          }
-        >
-          <Icon name={source ? 'file-text' : 'folder'} size={1} />
-          {source ? 'Changed files' : 'Browse MR source'}
-        </button>
-      </div>
+            >
+              <Icon name={source ? 'file-text' : 'folder'} size={1} />
+              {source ? 'Changed files' : 'Browse MR source'}
+            </button>
+          </div>
+        </>
+      )}
       <div className={styles.sidebarTree}>
         <FileTree
+          maximized={treeMaximized}
+          onMaximize={setTreeMaximized}
           key={source ? 'source' : 'changes'}
           defaultExpanded={!source}
           theme={theme}
@@ -481,9 +494,11 @@ export function ReviewPanel({
           <p className={styles.muted}>No visible changes.</p>
         )}
       </div>
-      <footer className={styles.sidebarFooter}>
-        Alt+PageUp / Alt+PageDown · Previous / next MR file
-      </footer>
+      {!treeMaximized && (
+        <footer className={styles.sidebarFooter}>
+          Alt+PageUp / Alt+PageDown · Previous / next MR file
+        </footer>
+      )}
     </section>
   )
 }

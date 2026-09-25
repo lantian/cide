@@ -652,6 +652,7 @@ mod tests {
                 harness: None,
                 title: "f".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("opens")

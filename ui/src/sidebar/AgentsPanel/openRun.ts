@@ -1,6 +1,6 @@
 /**
- * *Open* — put the **real harness** on a run's conversation, in a pane of this window's project
- * console. (M18, rewritten in M42)
+ * *Open* — put the **real harness** on a run's conversation, in a tab of its own or a row of this
+ * window's project console, as Settings says. (M18, rewritten in M42; the choice is M108's)
  *
  * The Agents panel's third run gesture. It asks Rust one question — `agentRuns.open` — and builds
  * the pane itself through the split machinery with the intent the answer names. Three answers:
@@ -32,7 +32,7 @@
  * never runs, `mirrored` is never set, and the pane adopts the run's session through the
  * `sessionIsHeld` route that exists for a re-docked pane which genuinely owns what it holds.
  * **Closing the pane you were reading an agent in would have killed that agent mid-turn.** That
- * shipped once; `addRow` calling `rememberSpawnPlan` *before* the snapshot that makes the pane
+ * shipped once; `addRow` — and now `newRunTab` — calling `rememberSpawnPlan` *before* the snapshot that makes the pane
  * renderable is what makes the flag correct by construction, for a mirror and — the other way
  * round — for a continuation, whose pane spawned the child and must end it.
  *
@@ -71,7 +71,14 @@
  * that it needs none of it. Import it by path, from the store.
  */
 import { revealPane } from '@/editor/revealPane'
-import { agentRuns, type HarnessSession, type Pane, type PaneId, type Project } from '@/ipc/client'
+import {
+  agentRuns,
+  type HarnessSession,
+  type Pane,
+  type PaneId,
+  type Project,
+  type SplitIntent,
+} from '@/ipc/client'
 import { activeProjectOf, consolePaneOf } from '@/keys/target'
 import { paneSessionId } from '@/layout/paneHosts'
 import { useWorkspace } from '@/store/workspace'
@@ -207,52 +214,59 @@ export async function openRunInPane(run: RunView): Promise<void> {
   }
 
   /*
-   * 4. A row in the **project console**, not a split of the focused pane.
+   * 4. Where it goes: Settings → Projects & windows → *Open a run in* (M108). A **tab of its own**
+   * by default, or a full-width **row in the project console** — how Open worked until M106.
    *
-   * The focused pane may be an editor in a File tab, and a subagent's transcript landing beside a
-   * source file is a pane in a place nobody asked for. `tabs[0]` is the pinned console by
-   * invariant — `open_tab` refuses a second `ClaudeHome` and `close_tab` refuses index 0 — so
-   * this is the same tab `consolePaneOf` just answered for, and the `undefined` arm fires only
-   * for a window with no project, which the check above has already excluded.
+   * The tab is the default because of what a row costs: the console's own conversation — the
+   * product owner the user is talking to — shrinks to share its height with every run they open,
+   * and a second or third Open turns it into a stack of strips nobody can read. The row stays a
+   * choice, because reading a run beside the console that dispatched it is a real way to work.
+   * Nothing opens a run's view by itself any more; this button is the only road (M108 reverted
+   * M104's automatic tabs at the user's word).
    *
-   * A full-width row rather than a tile beside something: a transcript is read down the page, and
-   * this is what splitting downwards has always produced.
+   * Either way the intent is the whole of it, and both `newRunTab` and `addRow` record the spawn
+   * plan before the snapshot that makes the pane renderable — the other order races, and
+   * `TerminalPane` mounts, finds no plan, and spawns a fresh `claude` where the user asked to
+   * watch an existing conversation. On the far side the mirror branch adopts the id, marks the
+   * host `mirrored` and starts no process, so closing the view never ends the run; the continue
+   * branch leaves `mirrored` unset and lets `session_spawn` put the harness on the conversation —
+   * for a live opencode run, `attach` to the run's own server (M105).
    */
-  const tab = project.tabs[0]
-  if (tab === undefined) throw new Error(NO_CONSOLE)
-
-  /*
-   * 5. The pane itself — a mirror or a continuation, and the intent is the whole of it.
-   *
-   * `addRow` records the spawn plan before the snapshot that makes the pane renderable — the
-   * other order races, and `TerminalPane` mounts, finds no plan, and spawns a fresh `claude`
-   * where the user asked to watch an existing conversation. On the far side the mirror branch
-   * adopts the id, marks the host `mirrored` and starts no process; the continue branch leaves
-   * `mirrored` unset and lets `session_spawn` put the harness on the conversation.
-   */
-  const created = await ws.addRow(
-    target.project,
-    tab.id,
-    target.pane,
-    'after',
+  const intent: SplitIntent =
     plan.kind === 'continue'
       ? { kind: 'continue', conversation: plan.conversation }
       : plan.continues !== null
         ? { kind: 'mirror', session: plan.session, continues: plan.continues }
-        : { kind: 'mirror', session: plan.session },
-  )
+        : { kind: 'mirror', session: plan.session }
+  const asTab = boot?.workspace.settings.openRunIn !== 'split'
+  let pane: PaneId
+  if (asTab) {
+    const title = run.task !== null ? `${run.agentLabel} · ${run.task}` : run.agentLabel
+    pane = (await ws.newRunTab(target.project, title, intent)).pane
+  } else {
+    /*
+     * The row goes in the **project console**, not beside the focused pane: the focused pane may
+     * be an editor in a File tab, and a transcript landing beside a source file is a pane in a
+     * place nobody asked for. `tabs[0]` is the pinned console by invariant, the same tab
+     * `consolePaneOf` answered for. Full width, because a transcript is read down the page.
+     */
+    const tab = project.tabs[0]
+    if (tab === undefined) throw new Error(NO_CONSOLE)
+    pane = (await ws.addRow(target.project, tab.id, target.pane, 'after', intent)).pane
+  }
 
   /*
-   * And then take the user to it, for the reason step 4 exists: the console is routinely not the
-   * tab in front of them, and a row added to a tab nobody is looking at is the same "nothing
-   * happened" the tab choice was made to avoid. `addRow` has already focused the pane in the
-   * domain, so this is mostly the tab switch and the caret.
+   * And then take the user to it: a tab opens in front already, a row may be in a console the
+   * user is not looking at. This is the tab switch, the domain focus, the caret, and — when the
+   * panel is in a detached window — raising the window the pane is in.
    *
    * A reason here is worth saying but is not a failure of the gesture — the pane exists and the
    * user can reach it — so it names both halves rather than reading as a refusal.
    */
-  const why = await revealPane(target.project, created.pane)
+  const why = await revealPane(target.project, pane)
   if (why !== null) {
-    throw new Error(`The run was opened in the project console, but ${why}.`)
+    throw new Error(
+      `The run was opened ${asTab ? 'in a tab of its own' : 'in the project console'}, but ${why}.`,
+    )
   }
 }

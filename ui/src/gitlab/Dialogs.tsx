@@ -282,7 +282,14 @@ export function LaunchReviewDialog() {
   const [harnesses, setHarnesses] = useState<GitLabReviewHarness[] | null>(
     null,
   )
-  const [harness, setHarness] = useState<Harness | ''>('')
+  /*
+   * `default` is Settings → Harness — the CLI the user's own consoles run, with the binary and
+   * arguments configured there (M107). Preselected, because that is the harness the user has
+   * already set up; the concrete entries below it are for choosing another one on purpose.
+   * Resolved when the review starts, so the setting is read, never copied into this state.
+   */
+  const [harness, setHarness] = useState<Harness | 'default'>('default')
+  const [consoleHarness, setConsoleHarness] = useState<Harness | null>(null)
   /*
    * Pre-filled from Settings → Git → Agent review instructions: the MR's repository's entry, else
    * the global one. Re-applied while the user has not typed, because the dialog can mount before
@@ -301,24 +308,28 @@ export function LaunchReviewDialog() {
     let alive = true
     gitlab.reviewHarnesses().then(
       (list) => {
-        if (!alive) return
-        setHarnesses(list)
-        setHarness((old) => old || (list.find((h) => !h.unavailable)?.harness ?? ''))
+        if (alive) setHarnesses(list)
       },
       (e) => alive && setError(message(e)),
     )
+    // Dynamically, like every other read of the workspace store in this directory.
+    void import('@/store/workspace').then(({ useWorkspace }) => {
+      const setting = useWorkspace.getState().boot?.workspace.settings.consoleHarness
+      if (alive) setConsoleHarness(setting === 'codex' ? 'codex' : 'claude')
+    })
     return () => {
       alive = false
     }
   }, [])
   if (!launch || !d) return null
-  const chosen = harnesses?.find((h) => h.harness === harness)
+  const resolved: Harness | null = harness === 'default' ? consoleHarness : harness
+  const chosen = harnesses?.find((h) => h.harness === resolved)
   async function submit() {
-    if (busy || !harness || !launch) return
+    if (busy || !resolved || !launch) return
     setBusy(true)
     setError('')
     try {
-      await startAgentReview(launch, harness, prompt)
+      await startAgentReview(launch, resolved, prompt)
       closeOverlay()
     } catch (e) {
       setError(message(e))
@@ -348,9 +359,15 @@ export function LaunchReviewDialog() {
           id="gitlab-review-harness"
           value={harness}
           disabled={!harnesses}
-          onChange={(e) => setHarness(e.target.value as Harness)}
+          onChange={(e) => setHarness(e.target.value as Harness | 'default')}
         >
-          {!harnesses && <option value="">Checking installed harnesses…</option>}
+          {!harnesses && <option value="default">Checking installed harnesses…</option>}
+          {harnesses && (
+            <option value="default">
+              Default{consoleHarness ? ` — ${HARNESS_LABEL[consoleHarness]}` : ''} (Settings →
+              Harness)
+            </option>
+          )}
           {harnesses?.map((h) => (
             <option key={h.harness} value={h.harness} disabled={!!h.unavailable}>
               {HARNESS_LABEL[h.harness]}
@@ -386,7 +403,7 @@ export function LaunchReviewDialog() {
           <button
             className={styles.primary}
             type="submit"
-            disabled={busy || !harness || !!chosen?.unavailable}
+            disabled={busy || !resolved || !!chosen?.unavailable}
           >
             {busy ? 'Preparing checkout…' : 'Start review'}
           </button>

@@ -4121,6 +4121,9 @@ mod tests {
                     task: Some(cide_ipc::TaskId("t-1".to_owned())),
                     prompt: None,
                     notify: None,
+                    external: None,
+                    harness: None,
+                    model: None,
                 },
             },
         )

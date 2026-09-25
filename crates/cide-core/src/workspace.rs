@@ -132,6 +132,7 @@ pub fn open_project(
             harness: None,
             title: format!("{name} : claude"),
             docker: None,
+            origin: None,
         }),
     };
     let active_tab = console.id;
@@ -2636,6 +2637,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         harness: None,
         title: title.to_string(),
         docker: None,
+        origin: None,
     }
 }
 

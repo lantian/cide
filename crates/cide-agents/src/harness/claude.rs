@@ -454,7 +454,7 @@ fn assemble(
         // `TRACKER_PREAMBLE`'s commit-as-you-go rule, and a run told nothing about the tracker
         // has nothing to be corrected on. A `change` derives from the task (`plan_dispatch`), so
         // the two folds are never both taken; this one goes last for the opencode side's parity.
-        if plan.task.is_none() {
+        if plan.adhoc() {
             cide_core::claude_cli::fold_append_system_prompt(&mut args, ADHOC_PREAMBLE);
         }
     }
@@ -886,6 +886,7 @@ mod tests {
             // and the plan actually said; the skip default has tests of its own.
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            server: None,
         }
     }
 

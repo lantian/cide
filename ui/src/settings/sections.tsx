@@ -25,6 +25,7 @@ import type {
   EditorSettings,
   ExplorerSettings,
   GitSettings,
+  OpenRunIn,
   Settings,
   SettingsPatch,
   SettingsSection,
@@ -318,9 +319,28 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
         checked={settings.confirmCloseWithLiveSession}
         onChange={(v) => patch({ confirmCloseWithLiveSession: v })}
       />
+      {/* M108. Here rather than under Agents, whose page writes role files and no setting at
+          all: this is about where a view lands, which is this page's whole subject. */}
+      <Row
+        label="Open a run in"
+        hint="Where the Agents panel’s Open shows a subagent: a tab of its own, or a row under the project console’s conversation. Only the button opens one — a run never opens a view by itself."
+        control={
+          <Segmented
+            label="Open a run in"
+            value={settings.openRunIn}
+            options={OPEN_RUN_IN}
+            onChange={(openRunIn) => patch({ openRunIn })}
+          />
+        }
+      />
     </>
   )
 }
+
+const OPEN_RUN_IN: readonly { value: OpenRunIn; label: string }[] = [
+  { value: 'tab', label: 'Tab' },
+  { value: 'split', label: 'Split' },
+]
 
 /**
  * What the last `claude` to complete the IDE handshake on this machine was.

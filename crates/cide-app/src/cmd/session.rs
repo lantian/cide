@@ -539,6 +539,23 @@ fn orchestrator_paragraph(
     // sentence*: the product owner is told it is, and any other pane is told it may act as one.
     let (root, inferred) = state.with(|ws| {
         let primary = is_primary_console_spawn(ws, registry, project, resume, forking);
+        // A worker restored after a restart is respawned by the webview, which passes no voice:
+        // the tree still says what it is, and `agent_rpc` scopes it by the same mark, so the
+        // paragraph and the tool list cannot disagree. (M104)
+        let worker = !forking
+            && resume.is_some_and(|resume| {
+                cide_core::workspace::project(ws, project).is_ok_and(|project| {
+                    project
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| tab.tree.panes.values())
+                        .chain(project.detached.values())
+                        .any(|pane| {
+                            pane.session == Some(resume)
+                                && pane.origin == Some(cide_ipc::PaneOrigin::Worker)
+                        })
+                })
+            });
         let root = cide_core::workspace::project(ws, project)
             .ok()?
             .roots
@@ -546,7 +563,9 @@ fn orchestrator_paragraph(
             .map(|root| root.path.clone())?;
         Some((
             root,
-            if primary {
+            if worker {
+                Voice::Worker
+            } else if primary {
                 Voice::ProductOwner
             } else {
                 Voice::Pane
@@ -560,9 +579,13 @@ fn orchestrator_paragraph(
     // console pane spawn, which is once per launch or restart. `claude_cli::resolve` above already
     // pays a comparable price on the same thread for the same reason: the alternative is a pane
     // that starts before cide knows what to tell it.
+    // A worker is told what it is and nothing about orchestration (M104): see `Voice::Worker`.
+    if voice.unwrap_or(inferred) == Voice::Worker {
+        return Some(WORKER_PARAGRAPH.to_string());
+    }
     let agents = cide_agents::load_project(&root);
     if !agents.enabled() {
-        return None;
+        return Some(SESSIONS_PARAGRAPH.to_string());
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
@@ -583,7 +606,13 @@ fn orchestrator_paragraph(
                 total: cide_agents::overrides::capacity(ready.map(|(_, r)| r), project_max),
             }
         });
-    Some(roster_paragraph(&roles, voice.unwrap_or(inferred), limits))
+    let paragraph = roster_paragraph(&roles, voice.unwrap_or(inferred), limits);
+    // Subagents on, but nobody can be dispatched right now — no roles, or every one refused:
+    // `cide_agent_dispatch` would refuse, and `cide_session_open` is the road (M104).
+    if roles.iter().all(|def| def.unavailable.is_some()) {
+        return Some(format!("{paragraph} {SESSIONS_PARAGRAPH}"));
+    }
+    Some(paragraph)
 }
 
 /// Which opening sentence a pane's roster paragraph gets. (M79)
@@ -610,7 +639,44 @@ pub(crate) enum Voice {
     /// it is allowed to. There is no second identity to be confused with, because nobody handed
     /// this session a task to work; cide opened it to run the loop.
     Acting,
+    /// A tab `cide_session_open` opened to implement **one** piece of work in a worktree of its
+    /// own. (M104) *You are the worker, not the product owner.*
+    ///
+    /// Gets none of the orchestration manual: `agent_rpc` serves such a session the task tools
+    /// and nothing else (`PaneOrigin::Worker`), so a paragraph describing dispatch would be a
+    /// system prompt naming tools this session does not have — and the one identity it is given
+    /// is the job its opening line states.
+    Worker,
 }
+
+/// The worker's paragraph. (M104) A constant because nothing about the project changes it: the
+/// work itself arrives as the opening line, and the tracker is read with the tools.
+const WORKER_PARAGRAPH: &str = "cide opened this session to implement one piece of work, which \
+     your first message states, in a git worktree of its own: the directory you are in, on its \
+     own branch. Work only there, and commit your work on that branch as you go — the person or \
+     session that opened you reviews the branch and merges it, so an uncommitted change is a \
+     change nobody sees. You are the worker, not the product owner: you cannot dispatch or open \
+     other sessions, and you do not merge. When the work is on this project's board, the \
+     `mcp__cide__cide_task_*` tools read and write it — comment on the task as you make \
+     decisions, and set it to `review` when you are done. Anything you notice that is not your \
+     work goes on the board as a new task with `inbox: true` rather than into this branch.";
+
+/// The sentence a console gets when the project has **nobody to dispatch to**. (M104)
+///
+/// The user's rule: roles exist → dispatch; none → one session per piece of work. A console in a
+/// project with subagents off used to get no paragraph at all, which was right while the only
+/// orchestration there was was dispatch; now there is something it can do, and a tool it is not
+/// told about is a tool it will not reach for when the user says "check the tasks and implement
+/// them".
+const SESSIONS_PARAGRAPH: &str = "This project in cide has no subagent roles to hand work to, but \
+     you can still run work in parallel: `mcp__cide__cide_session_open` opens a new tab running a \
+     coding agent on one piece of work, in a git worktree and branch of its own, and returns at \
+     once. Call it once per piece of work — a task on this project's board (`task`, which you \
+     find with `mcp__cide__cide_task_list`), or anything else, such as an issue you read from \
+     another system through its own tools, as `title` + a one-line `brief` (+ `ref`). \
+     `harness` picks the CLI for that tab (claude, codex or opencode) when the user asks for \
+     one. Each session commits on its own branch and, for a board task, sets it to review when \
+     done; you review the branch and merge it with git.";
 
 /// The paragraph itself, as a pure function of the roles and of which pane is being told.
 ///
@@ -666,6 +732,8 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<
              work to its roles exactly as the project's product owner — its primary console pane \
              — does: decompose a goal into tasks, hand each one to a role, and check the result."
         }
+        // Never reached: `orchestrator_paragraph` answers a worker before it builds a roster.
+        Voice::Worker => WORKER_PARAGRAPH,
         Voice::Acting => {
             "You are acting as the product owner for this project in cide. cide opened this tab \
              by itself, with nobody at the keyboard, to run the orchestration loop: the \
@@ -927,6 +995,8 @@ pub async fn session_spawn(
             env: Vec::new(),
             // A webview's console types its own first line.
             prompt: None,
+            // A console gets the task tools by being one; a shell the webview spawns never does.
+            task_tools: false,
         },
     )
     .await
@@ -961,6 +1031,16 @@ pub(crate) struct SpawnRequest {
     /// into a TUI whose readiness it never announces. Claude ignores it — a positional after
     /// the variadic `--mcp-config` would be swallowed, which is why claude's is typed.
     pub prompt: Option<String>,
+    /// Hand a **non-console** child the two variables cide's MCP bridge reads — `CIDE_SESSION`
+    /// (this spawn's id) and `CIDE_AGENT_SOCK` — so a bridge its own configuration starts can
+    /// reach `agent_rpc` as this pane. (M104)
+    ///
+    /// For the opencode TUI a `cide_session_open` tab runs: its MCP entry travels in
+    /// `OPENCODE_CONFIG_CONTENT` (`Flavor::tab_launch`), but the id does not exist until this
+    /// function mints it, so the caller cannot put it in `env`. A console gets both already, and
+    /// an ordinary shell must not — see the note on the `CIDE_SESSION` hook block: a `claude`
+    /// typed into a shell must not drive that pane's chrome.
+    pub task_tools: bool,
 }
 
 /// Spawn a child for a pane. The body of [`session_spawn`], callable from Rust. (M79)
@@ -987,6 +1067,7 @@ pub(crate) async fn spawn_session(
         voice,
         env: extra_env,
         prompt: opening,
+        task_tools,
     } = request;
     let app = app.clone();
     // Read before the blocking closure: `WorkspaceState` is Tauri-managed state and the
@@ -1018,8 +1099,37 @@ pub(crate) async fn spawn_session(
     // in a terminal. Decided *here*, above the shell substitution and above
     // `program_is_claude`, so the placeholder `program: ''` the frontend sends for such a pane
     // never reaches either.
-    let (program, args, cwd, resume) = match continues.as_ref() {
-        Some(conversation) => {
+    // A conversation a live run server still holds is **attached to**, not re-opened (M104
+    // follow-up): the full TUI as one more client of the server the run's turns go through, so the
+    // pane shows the run working and anything typed there lands in the same conversation through
+    // the same process. `opencode --session` beside a live run would be a second process writing
+    // that conversation — the thing `Inner::viewers` refuses. Asked of the registry at spawn time,
+    // never stored on the pane: a restored pane finds the server gone and falls to the ordinary
+    // road below.
+    let attached = continues.as_ref().and_then(|conversation| {
+        let flavor = cide_agents::harness::opencode::Flavor::of(conversation.harness)?;
+        let (url, password) = app
+            .try_state::<Arc<crate::agents::AgentRegistry>>()?
+            .server_for(conversation)?;
+        Some((
+            flavor.attach_spec(conversation, &url),
+            flavor.password_env(),
+            password,
+        ))
+    });
+    let is_attached = attached.is_some();
+    let mut extra_env = extra_env;
+    let (program, args, cwd, resume) = match (continues.as_ref(), attached) {
+        (Some(conversation), Some((spec, password_env, password))) => {
+            extra_env.push((password_env, password));
+            (
+                spec.program,
+                spec.args,
+                conversation.cwd.to_string_lossy().into_owned(),
+                resume,
+            )
+        }
+        (Some(conversation), None) => {
             let harness = cide_agents::for_kind(conversation.harness).ok_or_else(|| {
                 SessionError::Pty(format!(
                     "this build has no implementation for the {:?} harness",
@@ -1036,8 +1146,11 @@ pub(crate) async fn spawn_session(
                 spec.resume.or(resume),
             )
         }
-        None => (program, args, cwd, resume),
+        (None, _) => (program, args, cwd, resume),
     };
+    // An attached pane is a client of the run's own server, not a second writer: the one-writer
+    // rule (`note_viewer`, at the end of this function) is for a standalone re-open only.
+    let viewer = continues.as_ref().filter(|_| !is_attached);
 
     // Only for an empty string. A pane that names a program gets that program, so this cannot
     // reach a Claude pane, a test harness, or anything else that knows what it wants.
@@ -1506,6 +1619,17 @@ pub(crate) async fn spawn_session(
         }
     }
 
+    // A non-console child that asked for the task tools (M104): see `SpawnRequest::task_tools`.
+    if task_tools
+        && !is_console
+        && let Some(agents) = app.try_state::<crate::agent_rpc::AgentRpcServer>()
+    {
+        spec = spec.env("CIDE_SESSION", id.to_string()).env(
+            "CIDE_AGENT_SOCK",
+            agents.socket().to_string_lossy().to_string(),
+        );
+    }
+
     // A pane standing in one of cide's agent checkouts — a finished run reopened on its
     // conversation (`continues`), a reviewer tab opened in the run's worktree — gets that
     // worktree's isolated directories (`agents.isolateEnv`), the very ones the run had and the
@@ -1622,10 +1746,18 @@ pub(crate) async fn spawn_session(
     // to start a second harness process on it while this child lives — a respawn, or a Resume
     // of the interrupted run — and `report_exit` clears the row when the child is reaped.
     // After the insert, so a refusal that races this spawn finds a session it can check.
-    if let Some(conversation) = continues.as_ref()
+    if let Some(conversation) = viewer
         && let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>()
     {
         agents.note_viewer(conversation, id);
+    }
+    // An attached pane keeps its run's server alive past the run's turn, until it leaves: the
+    // registry learns it here and forgets it where it forgets a viewer, in `report_exit`.
+    if is_attached
+        && let Some(conversation) = continues.as_ref()
+        && let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>()
+    {
+        agents.note_attached(conversation, id);
     }
     Ok(id)
 }

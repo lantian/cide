@@ -1777,6 +1777,7 @@ mod tests {
             harness: None,
             title: title.into(),
             docker: None,
+            origin: None,
         }
     }
 

@@ -502,7 +502,8 @@ mod review_tab_tests {
 ///
 /// `defs::implemented` then `defs::installed`, the order `defs::load` asks them in, so the
 /// dialog greys a harness out with the sentence the Agents panel would show for a role on it.
-/// On a worker: `installed` probes `PATH`.
+/// On a worker: `installed` probes `PATH` — or, for claude and codex, the binary Settings →
+/// Harness names (M107), which is what a review on either actually runs.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn gitlab_review_harnesses() -> Result<Vec<GitLabReviewHarness>, String> {
     tauri::async_runtime::spawn_blocking(|| {

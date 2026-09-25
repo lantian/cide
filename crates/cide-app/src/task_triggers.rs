@@ -266,6 +266,9 @@ fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, n
             // no extra line. Anything more is `cide_agent_dispatch`'s `instructions`.
             prompt: None,
             notify: Some(notify),
+            external: None,
+            harness: None,
+            model: None,
         };
         match crate::cmd::agents::dispatch_or_duplicate(
             app.clone(),

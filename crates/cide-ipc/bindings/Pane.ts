@@ -4,6 +4,7 @@ import type { Harness } from "./Harness";
 import type { HarnessSession } from "./HarnessSession";
 import type { PaneId } from "./PaneId";
 import type { PaneKind } from "./PaneKind";
+import type { PaneOrigin } from "./PaneOrigin";
 import type { PaneRole } from "./PaneRole";
 import type { SessionId } from "./SessionId";
 
@@ -105,4 +106,18 @@ title: string,
  *
  * `#[serde(default)]` so a `workspace.json` written before this field loads unchanged.
  */
-docker?: DockerPane, };
+docker?: DockerPane, 
+/**
+ * Why this pane exists, where that changes what connecting from it means. (M104)
+ *
+ * A [`PaneOrigin::Worker`] pane owns its child — closing it ends the child, as any tab cide
+ * opened itself does — and is marked for `agent_rpc`, which serves such a session the task
+ * tools and not the orchestration ones, so a session opened to implement one task cannot
+ * fan out into more. Durable rather than a spawn plan, because a restart must scope the
+ * restored session the same way.
+ *
+ * `None` is every other pane: one a person split, or one cide opened that owns its child and
+ * may orchestrate (the console, a reviewer, the spinner's planner). Not written when `None`,
+ * so every `workspace.json` written before this field loads and saves unchanged.
+ */
+origin?: PaneOrigin, };

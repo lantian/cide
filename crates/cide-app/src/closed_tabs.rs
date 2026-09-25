@@ -209,6 +209,7 @@ mod tests {
             harness: None,
             title: "x".into(),
             docker: None,
+            origin: None,
         })
     }
 

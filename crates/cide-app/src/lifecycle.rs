@@ -399,6 +399,11 @@ fn run_teardown(app: &AppHandle) {
     stop_children_reporting(&children, Ladder::default(), &mut |rung, count| {
         notice::say(rung_line(rung, count));
     });
+    // The runs' opencode servers, which are not sessions and so not on the ladder: after it, so
+    // a run's last turn is not cut off from the server it is a client of. (M104 follow-up)
+    if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+        agents.stop_servers();
+    }
 
     join_language_servers(servers);
 }
@@ -2615,6 +2620,7 @@ mod tests {
                 harness: None,
                 title: "secondary : claude".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("split in a second claude pane");
@@ -2634,6 +2640,7 @@ mod tests {
                 harness: None,
                 title: "fixture : bash".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("split in a shell pane");

@@ -1335,6 +1335,32 @@ pub struct Pane {
     #[serde(default)]
     #[ts(optional)]
     pub docker: Option<DockerPane>,
+    /// Why this pane exists, where that changes what connecting from it means. (M104)
+    ///
+    /// A [`PaneOrigin::Worker`] pane owns its child — closing it ends the child, as any tab cide
+    /// opened itself does — and is marked for `agent_rpc`, which serves such a session the task
+    /// tools and not the orchestration ones, so a session opened to implement one task cannot
+    /// fan out into more. Durable rather than a spawn plan, because a restart must scope the
+    /// restored session the same way.
+    ///
+    /// `None` is every other pane: one a person split, or one cide opened that owns its child and
+    /// may orchestrate (the console, a reviewer, the spinner's planner). Not written when `None`,
+    /// so every `workspace.json` written before this field loads and saves unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub origin: Option<PaneOrigin>,
+}
+
+/// Why a pane exists, where that changes what connecting from it means. (M104)
+///
+/// See [`Pane::origin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PaneOrigin {
+    /// A session `cide_session_open` started to implement one piece of work in its own
+    /// worktree. Owns its child; is served the task tools only.
+    Worker,
 }
 /// Which container a pane is attached to, and how. (M42)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

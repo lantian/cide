@@ -388,6 +388,7 @@ pub async fn docker_open_inspect(
                 harness: None,
                 title: "docker".into(),
                 docker: None,
+                origin: None,
             },
         )
     })
@@ -467,6 +468,7 @@ pub async fn docker_open_files(
                 harness: None,
                 title: "docker files".into(),
                 docker: None,
+                origin: None,
             },
         )
     })

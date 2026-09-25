@@ -1065,6 +1065,7 @@ mod tests {
                 harness: None,
                 title: "Cargo.toml".into(),
                 docker: None,
+                origin: None,
             },
         )
         .expect("a file tab opens");
@@ -1112,6 +1113,7 @@ mod tests {
             harness: None,
             title: "atlas : claude — mirror".into(),
             docker: None,
+            origin: None,
         };
         let mirror_id = mirror.id;
         {
@@ -1173,6 +1175,7 @@ mod tests {
             harness: None,
             title: "atlas : claude".into(),
             docker: None,
+            origin: None,
         };
         let second_id = second.id;
         {
@@ -1225,6 +1228,7 @@ mod tests {
             harness: None,
             title: "atlas : claude".into(),
             docker: None,
+            origin: None,
         };
         let second_id = second.id;
         {

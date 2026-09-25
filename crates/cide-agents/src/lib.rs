@@ -70,7 +70,7 @@ pub use defs::{AgentProblem, Catalog, LoadedAgent, Severity};
 pub use harness::{
     ClaudeHarness, CodexHarness, ContinueSpec, Delivery, ERASE_MARKER, FailoverReason, Harness,
     HarnessError, HarnessSpawn, MimoHarness, Observation, OpencodeHarness, QwenHarness,
-    RenderState, RunPlan, SessionBinding, for_kind, registry,
+    RenderState, RunPlan, RunServer, SessionBinding, for_kind, registry,
 };
 pub use tools::{Content, TaskSink, ToolResult, descriptors, dispatch};
 
@@ -322,6 +322,31 @@ pub fn checkout_name(agent: &AgentId, task: Option<&cide_ipc::TaskId>) -> String
 /// `Shared` isolation and a role's own `worktree: false` put every run in the root exactly as
 /// before — the `Some` arm is the *intersection* of "the project isolates", "this role wants a
 /// checkout" and "there is a task to name it by".
+/// The worktree a `cide_session_open` tab stands in: `task-<key>`, where the key is the task id,
+/// or an external piece of work's reference or title. (M104)
+///
+/// Through [`checkout_name`], so the grammar, the cap and the determinism are the ones a run's
+/// checkout has — asking twice for the same work lands in the same checkout and branch, which is
+/// what lets a second session on a task find the first one's commits. `task` is a prefix no role
+/// can shadow in practice (a role named `task` would share its checkouts, and degrade to the
+/// shared-checkout status quo `checkout_name` describes, not to corruption).
+pub fn session_checkout(key: &str) -> String {
+    checkout_name(
+        &AgentId("task".to_string()),
+        Some(&cide_ipc::TaskId(key.to_string())),
+    )
+}
+
+/// The key an external piece of work names its checkout by: its reference when it has one, else
+/// its title. (M104)
+pub fn external_key(work: &cide_ipc::ExternalWork) -> &str {
+    work.reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .unwrap_or(work.title.as_str())
+}
+
 pub fn run_checkout(
     agent: &LoadedAgent,
     config: &AgentsConfig,

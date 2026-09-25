@@ -578,6 +578,7 @@ pub(crate) fn open_subject_tab(
                 harness: None,
                 title: "openspec".into(),
                 docker: None,
+                origin: None,
             },
         )
     })
