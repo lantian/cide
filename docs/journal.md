@@ -15092,3 +15092,74 @@ So `start_child` now writes `# cide forked: <program and quoted args>` (never th
 **Checks:** fmt, clippy, the workspace tests (including new ones for the setting's default, patch
 and wire spelling, and for the argv line), codegen, the contract, tsc and every settings and
 run-surface `check:*` pass. **Not seen on a display.**
+
+**Two causes found from real logs, both fixed in M108.**
+
+**An older opencode was handed flags it does not know.** The argv log did its job. The user's Mac
+review log showed `run --help` from an opencode with **no `--auto` and no `--password`**. So:
+- **cide probes the installed binary.** `Flavor::probe_cli_flags` reads `run --help` and `--help`,
+  cached per binary path and modification time, on the blocking pool before the first spec
+  (`CliFlags`).
+- **It passes the skip-permissions flag only where the CLI has it** (`child`, `tab_launch`).
+  An older CLI predates the prompts that flag answers.
+- **It uses the M105 server only where `run` has `--password`.** Otherwise the run is standalone,
+  as before M105, rather than served unguarded.
+- **An unknown answer reads as the current CLI**, so a failed probe changes nothing on a working
+  machine.
+- **Tests:** a pure `CliFlags::from_help`, with the old usage as a fixture.
+- **Not tested against an old binary.** None is installed here.
+
+**A wrapper that pins the codex sandbox refused every review.** The user's Settings binary for
+codex wraps it. It rejected every run with *always uses sandbox workspace-write*, while the console
+it opens worked.
+- **Why:** a console under the default *ask* passes no policy flag, but a run always passed one
+  (`--dangerously-bypass-approvals-and-sandbox` under the default unattended *bypass*).
+- **Fix:** a new `CodexInjections::permissions`, Settings → Harness → Codex → *Sandbox and
+  approvals for runs*, on by default. Off, neither a run (`codex.rs`) nor a tab cide opens
+  (`claude_tab`) passes `-s`/`-a`/the bypass flag, so the wrapper decides.
+- **The policy is still computed**, so a role naming a mode codex cannot honour is still refused.
+- **Tested** by `a_wrapper_that_decides_the_sandbox_is_given_no_policy_flags`.
+
+**Claude (not changed):** a claude run passes `--permission-mode auto|bypassPermissions` on the
+same default, and a console passes nothing. The same kind of wrapper would refuse that too. Not
+changed yet, because the report quoted only codex's message. The next Claude run log's
+`# cide forked:` line will show what a wrapper refuses.
+
+## A workspace that does not read whole is read as far as it goes, and backed up before it is overwritten (M109)
+
+**What happened.** The `dev` profile came up empty. Its `workspace.json` had been quarantined as
+`workspace.corrupt-2.json` over five panes carrying `"origin": "runMirror"`. Builds from M104 to
+M107 wrote that variant, and M108 removed it without a migration. `persist::load` answered
+`unknown variant` in one pane by throwing away both projects, sixteen tabs and every split.
+A newer schema was refused the same way, so one launch of an older build also cost the layout.
+The file was restored by hand, by dropping the five mirror tabs.
+
+**What changed.** `persist::load_report`:
+- **Reads a current document as before.** An older one is migrated.
+- **Salvages the rest.** A document that fails to deserialise is re-read with `serde_path_to_error`
+  (a new dependency). Each time, the smallest unit holding the error is dropped:
+  - a **whole tab** for anything inside one, and a detached pane likewise. Dropping just the
+    field would have turned a run's mirror into an ordinary Claude pane that resumes the run's
+    conversation.
+  - otherwise **the offending value**, whose field then takes its default. A field with no
+    default climbs to its container.
+  - `workspace::repair_after_salvage` then drops projects that lost their console, re-points a
+    lost `active_tab`, drops detached windows with nothing to show, and rebuilds the shells.
+- **Reads a newer schema as the current one**, relabelled, salvaged the same way.
+- **Still quarantines** only what cannot be read at all: not JSON, no `schemaVersion`, too old to
+  migrate, or a salvage that reached the root.
+
+**The backup.** `Loaded::backup_before_save` is set for a migrated, newer or salvaged document,
+and by `WorkspaceState::load` when validation still fails. `WorkspaceState::write_now` then copies
+the bytes to `workspace.backup-<n>.json` once, before the first write. If the copy fails, the write
+is refused rather than risking the only copy. A read that never saves (`cide-headless tree`) leaves
+no copy.
+
+**Settings.** `migrate` keeps its refusal to quietly default a corrupt `settings` value. Salvage does
+default the one value, logged, with the backup. The alternative was the quarantine, which defaulted
+every setting and the layout besides.
+
+**Checks:** fmt, clippy on the touched crates, `cargo test -p cide-core -p cide-ipc -p cide-headless
+-p cide-app`, and the contract. New tests cover each case above, and the real quarantined `dev` file
+now loads with its 9 readable tabs. `codegen --check` reports `generated.ts` stale on `Project`,
+from a parallel session's in-flight change rather than this one. **Not seen on a display.**

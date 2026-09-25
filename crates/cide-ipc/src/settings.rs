@@ -1224,6 +1224,17 @@ pub struct CodexInjections {
     pub resume: bool,
     /// `codex fork <thread>`. Off: Split → fork resumes the parent instead of branching it.
     pub fork: bool,
+    /// The sandbox and approval flags a run and a tab cide opens by itself are given (`-s … -a
+    /// …`, `--dangerously-bypass-approvals-and-sandbox`, `--approve-for-me`). (M108)
+    ///
+    /// Off: none are passed, and codex's own configuration — or a wrapper Settings names —
+    /// decides, exactly as it does for a console the user opens. Reported as the reason this
+    /// exists: a wrapper that pins `workspace-write` itself refused every MR review with *always
+    /// uses sandbox workspace-write*, while the console it wraps opened fine, because a console
+    /// under the default *ask* carries no policy flag and a run always did. What it costs: a
+    /// role's `permission-mode` and the project's unattended default are no longer expressed,
+    /// so a run may stop on an approval prompt nobody is watching.
+    pub permissions: bool,
 }
 
 impl Default for CodexInjections {
@@ -1234,6 +1245,7 @@ impl Default for CodexInjections {
             developer_instructions: true,
             resume: true,
             fork: true,
+            permissions: true,
         }
     }
 }

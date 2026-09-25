@@ -529,6 +529,14 @@ try {
       'path that already toasts, so the symptom is two toasts for one failed push',
   )
 
+  const dispatchSrc = stripComments(read('../src/keys/dispatch.ts'))
+  ok(
+    /beginGitOp\(project, pulling \? 'pull' : 'fetch', repos\.length\)/.test(dispatchSrc)
+      && /void attempt\.then\(settle, settle\)/.test(dispatchSrc),
+    'dispatch.pullPass begins a gesture too — Ctrl+T, the Git panel\'s Update and the palette ' +
+      'all pull through it, and until it did the bar spun for a push and stayed blank for a pull',
+  )
+
   // Comments stripped, and in this repository that is mandatory rather than tidy: the house
   // style is to name the failure a rule prevents, so this stylesheet's own prose spells
   // `prefers-reduced-motion` and `font-size` while stating that it declares neither. Both

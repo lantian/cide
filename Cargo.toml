@@ -267,6 +267,9 @@ subtle = "2.6.1"
 # --- data ---
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+# Where in a document a deserialise failed, so `cide_core::persist` can drop the one element a
+# newer or intermediate build wrote rather than the whole `workspace.json`.
+serde_path_to_error = "0.1.20"
 ts-rs = { version = "12.0.1", features = [
     "serde-compat",
     "no-serde-warnings",

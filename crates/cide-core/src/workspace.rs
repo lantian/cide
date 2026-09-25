@@ -2100,6 +2100,61 @@ pub fn repair_tab_mru(ws: &mut Workspace) {
     }
 }
 
+/// Make a workspace that `persist::salvage` read with parts missing pass [`validate`] again,
+/// dropping what no longer holds together rather than the whole of it. (M109)
+///
+/// Salvage drops whole tabs, detached panes, projects and window entries, and each can leave a
+/// reference behind: an `active_tab` that was dropped, a console that was, a detached window
+/// whose pane or home tab is gone, a shell listing a project that is. `WorkspaceState::load`
+/// answers any of those by starting from defaults, which is the loss salvage exists to avoid.
+///
+/// - A project with no console at index 0 is dropped. Its console tab *is* the project's
+///   primary session, and inventing a fresh one would present a new conversation as the one
+///   the user left; the project reopens from the recents list like any closed one.
+/// - An `active_tab` that is gone falls back to the console, which every surviving project has.
+/// - A detached window whose pane, home tab or project is gone is dropped, and so is the
+///   detached pane it showed, with its dock anchor — the pair is only ever valid together.
+/// - The shells are rebuilt from the projects that survived, keeping their labels.
+///
+/// Only called after a salvage. A document that read whole is valid or it is not, and repairing
+/// it would hide a bug in whatever wrote it.
+pub fn repair_after_salvage(ws: &mut Workspace) {
+    ws.projects.retain(|_, p| {
+        !p.roots.is_empty() && matches!(p.tabs.first().map(|t| &t.kind), Some(TabKind::ClaudeHome))
+    });
+    for p in ws.projects.values_mut() {
+        if !p.tabs.iter().any(|t| t.id == p.active_tab) {
+            p.active_tab = p.tabs[0].id;
+        }
+    }
+    let projects = &ws.projects;
+    let mut orphaned: Vec<(ProjectId, PaneId)> = Vec::new();
+    ws.windows.retain(|_, role| match role {
+        WindowRole::Shell { .. } => true,
+        WindowRole::DetachedPane { project, tab, pane } => {
+            let keep = projects.get(project).is_some_and(|p| {
+                p.tabs.iter().any(|t| t.id == *tab) && p.detached.contains_key(pane)
+            });
+            if !keep {
+                orphaned.push((*project, *pane));
+            }
+            keep
+        }
+        WindowRole::DetachedTab { project, tab } => projects
+            .get(project)
+            .is_some_and(|p| p.tabs.iter().any(|t| t.id == *tab)),
+    });
+    // Only the panes whose window went here: a detached pane is otherwise none of this
+    // function's business, and dropping one would unbind its session from the project.
+    for (project, pane) in orphaned {
+        if let Some(p) = ws.projects.get_mut(&project) {
+            p.detached.shift_remove(&pane);
+            p.dock_anchors.shift_remove(&pane);
+        }
+    }
+    rebuild_windows(ws);
+}
+
 pub fn clear_dirty_flags(ws: &mut Workspace) {
     for p in ws.projects.values_mut() {
         for t in &mut p.tabs {

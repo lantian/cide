@@ -12,6 +12,7 @@ license.workspace = true
 cide-ipc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 indexmap = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

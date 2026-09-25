@@ -7425,7 +7425,22 @@ fn start_child(
     // turn — before the turn's child, which is a client of it.
     let mut plan = plan;
     if let Some(flavor) = cide_agents::harness::opencode::Flavor::of(resolved.harness) {
-        plan.server = registry.ensure_server(admission.run, flavor, &plan);
+        // Asked of the installed binary before the first spec is built (M108): which of cide's
+        // flags it has. Forks once per binary version, here on the blocking pool, so the spec
+        // below reads the answer without forking. See `CliFlags`.
+        let flags = flavor.probe_cli_flags();
+        plan.server = if flags.run_password {
+            registry.ensure_server(admission.run, flavor, &plan)
+        } else {
+            // A CLI whose `run` cannot send a password could only use an unguarded server. It
+            // runs standalone, as before M105 — the full TUI on a live run is what it gives up.
+            tracing::info!(
+                run = %admission.run,
+                "this {} predates --password; the run goes without a server",
+                flavor.program()
+            );
+            None
+        };
     }
 
     // `resolved.harness`, not `agent.def.harness`: a local override may have redirected this role

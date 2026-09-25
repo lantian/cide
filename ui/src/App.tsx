@@ -128,6 +128,7 @@ import { PaneBody } from '@/panes/PaneBody'
 import { GitDiffPane } from '@/panes/GitDiffPane'
 import { changeNavPresent, subscribeChangeNav } from '@/panes/changeNav'
 import { focusPaneDom } from '@/panes/paneFocus'
+import { activateTabFocused } from '@/panes/activateTab'
 import { liveHosts } from '@/layout/paneHosts'
 import { SettingsTab, lastFrameSection } from '@/settings/SettingsTab'
 import { SettingsFrame } from '@/settings/SettingsFrame'
@@ -2424,7 +2425,6 @@ const WorkspaceContent = memo(function WorkspaceContent({
     project: ProjectId,
   ) => (path: string, at: { line: number; column: number } | null) => void
 }) {
-  const activateTab = useWorkspace((s) => s.activateTab)
   const closeTab = useWorkspace((s) => s.closeTab)
   const closeTabs = useWorkspace((s) => s.closeTabs)
   const reorderTab = useWorkspace((s) => s.reorderTab)
@@ -2470,7 +2470,9 @@ const WorkspaceContent = memo(function WorkspaceContent({
                     // drawing it here would be two windows claiming one tab.
                     tabs={visibleTabs}
                     activeTab={activeProject.activeTab}
-                    onActivate={(id) => void activateTab(activeProject.id, id)}
+                    // Not bare `activateTab`: a console tab should arrive with the caret in its
+                    // terminal, not on the strip's button — `panes/activateTab.ts`.
+                    onActivate={(id) => void activateTabFocused(activeProject.id, id)}
                     onClose={(id) => void closeTab(activeProject.id, id)}
                     onCloseMany={(ids) => void closeTabs(activeProject.id, ids)}
                     onReorder={(id, before) => void reorderTab(activeProject.id, id, before)}

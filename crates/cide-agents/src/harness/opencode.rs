@@ -323,6 +323,137 @@ impl Flavor {
     }
 }
 
+/// Which of cide's optional flags this installed CLI actually has. (M108)
+///
+/// # Why this is asked of the binary rather than assumed
+///
+/// Reported from a Mac: an opencode MR review printed `opencode run [message..]` and its whole
+/// usage, and did nothing else. The run's post-mortem log had the argv (`# cide forked: …`), and
+/// the usage it printed had **no `--auto` and no `--password`** — that machine's opencode predated
+/// both. yargs is strict and prints its usage, with no reason line, on any flag it does not know,
+/// so one unattended run's `--auto` turned every opencode run on that machine into a help page.
+///
+/// So the two flags cide adds on its own account are asked of `--help` once per binary (keyed by
+/// path and modification time, so an upgrade is noticed) and passed only where they exist:
+///
+/// * **the skip-permissions flag** (`--auto`, MiMo's `--dangerously-skip-permissions`) — absent on
+///   an older CLI, which predates the permission prompts it answers and allowed by default;
+/// * **`--password`** — absent means a `run --attach` client cannot authenticate, so the run's
+///   server (M105) could only be unguarded. The run goes standalone instead, as every run did
+///   before M105.
+///
+/// Unknown — never probed, or the probe failed — reads as the current CLI's answer, which is what
+/// every measurement in this file was taken against: a probe that cannot run must not quietly
+/// switch a working machine's runs to prompting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliFlags {
+    /// `run` takes this flavour's skip-permissions flag.
+    pub run_skip_permissions: bool,
+    /// `run` takes `--password`, so a turn can attach to a guarded server.
+    pub run_password: bool,
+    /// The TUI (`<cli> [project]`) takes the skip-permissions flag — M104's session tab.
+    pub tui_skip_permissions: bool,
+}
+
+impl Default for CliFlags {
+    fn default() -> Self {
+        Self {
+            run_skip_permissions: true,
+            run_password: true,
+            tui_skip_permissions: true,
+        }
+    }
+}
+
+impl CliFlags {
+    /// Read the flags off `run --help` and `--help`. Pure, so the usage a real old CLI printed is
+    /// a test fixture.
+    pub fn from_help(skip_permissions: &str, run_help: &str, tui_help: &str) -> Self {
+        let has = |help: &str, flag: &str| {
+            help.split(|c: char| c.is_whitespace() || c == ',')
+                .any(|word| word == flag)
+        };
+        Self {
+            run_skip_permissions: has(run_help, skip_permissions),
+            run_password: has(run_help, "--password"),
+            tui_skip_permissions: has(tui_help, skip_permissions),
+        }
+    }
+}
+
+/// One flavour's probed answer: which binary, at which modification time, said what.
+type ProbedFlags = (
+    cide_ipc::Harness,
+    std::path::PathBuf,
+    Option<std::time::SystemTime>,
+    CliFlags,
+);
+
+/// What each flavour's binary answered, and which binary that was. See [`CliFlags`].
+static CLI_FLAGS: std::sync::Mutex<Vec<ProbedFlags>> = std::sync::Mutex::new(Vec::new());
+
+impl Flavor {
+    /// Ask the installed binary which flags it has, once per binary version. **Forks** — call it
+    /// from a thread allowed to block, before building a spec; [`Self::cli_flags`] then answers
+    /// from the cache without forking, which keeps `spawn_spec` pure.
+    pub fn probe_cli_flags(&self) -> CliFlags {
+        let Ok(binary) = self.binary() else {
+            return self.cli_flags();
+        };
+        let modified = std::fs::metadata(&binary).and_then(|m| m.modified()).ok();
+        {
+            let cache = CLI_FLAGS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((_, _, _, flags)) = cache.iter().find(|(kind, path, at, _)| {
+                *kind == self.kind && *path == binary && *at == modified
+            }) {
+                return *flags;
+            }
+        }
+        let help = |args: &[&str]| -> Option<String> {
+            let mut command = std::process::Command::new(&binary);
+            command.args(args).env("NO_COLOR", "1");
+            let out = cide_core::child_env::run_filter_with(
+                command,
+                None,
+                std::time::Duration::from_secs(20),
+                &[],
+            )
+            .ok()?;
+            // yargs prints usage to stdout for `--help`; some builds use stderr. Either will do.
+            Some(format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                out.stderr
+            ))
+        };
+        let flags = match (help(&["run", "--help"]), help(&["--help"])) {
+            (Some(run), Some(tui)) if run.contains("--format") => {
+                CliFlags::from_help(self.skip_permissions, &run, &tui)
+            }
+            // A probe that could not read a usage says nothing; see `CliFlags`' last paragraph.
+            _ => CliFlags::default(),
+        };
+        let mut cache = CLI_FLAGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|(kind, _, _, _)| *kind != self.kind);
+        cache.push((self.kind, binary, modified, flags));
+        flags
+    }
+
+    /// The flags the last probe found for this flavour, or the current CLI's when none has run.
+    pub fn cli_flags(&self) -> CliFlags {
+        CLI_FLAGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(kind, _, _, _)| *kind == self.kind)
+            .map_or_else(CliFlags::default, |(_, _, _, flags)| *flags)
+    }
+}
+
 /// How to start this CLI's **interactive TUI** in a tab cide opens on one piece of work. (M104)
 ///
 /// # Not a run, and not [`Flavor::continue_spec`]
@@ -365,7 +496,7 @@ impl Flavor {
             args.push("--model".into());
             args.push(model.to_string());
         }
-        if unattended {
+        if unattended && self.probe_cli_flags().tui_skip_permissions {
             args.push(self.skip_permissions.to_string());
         }
         // Last and as one token: a value, so nothing after it can be mistaken for its tail.
@@ -1751,7 +1882,10 @@ fn child(
     //
     // Unlike the three other harnesses, this ignores the role's `permission-mode`. That was true
     // before M82 and is left alone: opencode has no counterpart to map a mode onto.
-    if plan.unattended != Unattended::Ask {
+    // Only where this CLI has the flag (M108): an older opencode rejects it and prints its usage
+    // instead of running — see `CliFlags`. It also predates the prompts the flag answers.
+    let flags = flavor.cli_flags();
+    if plan.unattended != Unattended::Ask && flags.run_skip_permissions {
         args.push(flavor.skip_permissions.into());
     }
 
@@ -1772,7 +1906,10 @@ fn child(
 
     // The run's own server (M104 follow-up): this turn is a client of it, so the conversation
     // lives where a pane can attach the full TUI to it. See `RunPlan::server`.
-    if let Some(server) = &plan.server {
+    // Guarded by `run_password` too: the app starts no server for a CLI without it, and a plan
+    // that names one anyway must not produce a client that cannot authenticate.
+    let server = plan.server.as_ref().filter(|_| flags.run_password);
+    if let Some(server) = server {
         args.push("--attach".into());
         args.push(server.url.clone());
     }
@@ -1814,7 +1951,7 @@ fn child(
 
     spec = run_env(flavor, plan, spec, config);
     // The client proves itself to the run's server with the password the server was started with.
-    if let Some(server) = &plan.server {
+    if let Some(server) = server {
         spec = spec.env(flavor.password_env(), server.password.clone());
     }
 
@@ -2197,6 +2334,31 @@ mod tests {
         assert_eq!(MIMO_CLI.password_env(), "MIMOCODE_SERVER_PASSWORD");
         assert_eq!(MIMO_CLI.server_user(), "mimocode");
         assert_eq!(OPENCODE_CLI.server_user(), "opencode");
+    }
+
+    /// The usage a real older opencode printed on a Mac (M108), trimmed to its options, against
+    /// the 1.18.32 one here: only the flags that exist are passed.
+    #[test]
+    fn an_older_cli_is_given_only_the_flags_it_has() {
+        const OLD_RUN: &str = "opencode run [message..]\n\nOptions:\n  -h, --help  show help\n      \
+            --model  model\n      --agent  agent\n      --format  format\n      --title  title\n      \
+            --attach  attach\n      --dir  dir\n      --port  port\n      --variant  variant\n      \
+            --thinking  show thinking blocks";
+        let old = CliFlags::from_help("--auto", OLD_RUN, "opencode [project]\n  --model");
+        assert_eq!(
+            old,
+            CliFlags {
+                run_skip_permissions: false,
+                run_password: false,
+                tui_skip_permissions: false,
+            }
+        );
+        const NEW_RUN: &str = "      --attach  attach\n  -p, --password  basic auth password\n      \
+            --auto  auto-approve permissions";
+        let new = CliFlags::from_help("--auto", NEW_RUN, "      --auto  auto-approve");
+        assert_eq!(new, CliFlags::default());
+        // A word that merely contains the flag is not the flag.
+        assert!(!CliFlags::from_help("--auto", "--autocomplete", "").run_skip_permissions);
     }
 
     /// M104's tab: the TUI, `--prompt` last, and a document with cide's server and no role.

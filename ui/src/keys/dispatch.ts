@@ -77,10 +77,12 @@ import { openFileProperties } from '@/chrome/filePropertiesOpen'
 import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { notify, notifyFailure } from '@/chrome/notices'
+import { beginGitOp } from '@/chrome/gitOpStore'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
 import { openTerminalFind } from '@/terminal/findStore'
 import { paneRestarter } from '@/panes/paneRestart'
 import { focusPaneDom } from '@/panes/paneFocus'
+import { activateTabFocused } from '@/panes/activateTab'
 import { useGitCount } from '@/chrome/gitCountStore'
 import { toggleBlame } from '@/editor/blameStore'
 import { requestFocus } from '@/chrome/focusRequests'
@@ -292,6 +294,25 @@ function pullPass(
         })
       : branchApi.fetch(project, repo.id),
   )
+
+  /*
+   * The status bar's indicator, which this path went without from M65 until now.
+   *
+   * M65 wired `beginGitOp` into the branch popup's Pull/Fetch/Merge (through `trackGitOp`) and
+   * into `pushRun.pushPass` — and missed this function, which is where **Ctrl+T, the Git panel's
+   * Update and the palette** all land. So the pull people actually use drew nothing on the bar
+   * while push next to it spun: "I don't see git pull animation on bottom line, only when push".
+   *
+   * `repos.length`, as `pushPass` does, so a four-repository project counts `Pulling 0/4…` up.
+   * The strategy dialog's retry re-enters this function and begins a gesture of its own over the
+   * repositories that asked, which is right: the first gesture has settled by then — a
+   * divergence is a rejection, and `then(settle, settle)` counts it — and the second is a new
+   * wait on the network. `then(settle, settle)` and never `.finally`, for the reason
+   * `gitOpStore.trackGitOp` gives at length: a derived promise that rejects with nothing
+   * attached is a second toast for one failure.
+   */
+  const settle = beginGitOp(project, pulling ? 'pull' : 'fetch', repos.length)
+  for (const attempt of attempts) void attempt.then(settle, settle)
 
   for (const attempt of attempts) {
     void attempt.catch((error: unknown) => {
@@ -749,7 +770,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           command === 'tab.next' ? 1 : -1,
         )
         if (next === null) return unmet(command, 'only one tab is open')
-        return void ws.activateTab(project.id, next)
+        return void activateTabFocused(project.id, next)
       }
 
       /*

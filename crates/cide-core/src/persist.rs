@@ -208,34 +208,100 @@ fn home() -> PathBuf {
 }
 
 /// Read the workspace at `path`, falling back to [`Workspace::default`] for anything that
-/// cannot be understood.
+/// cannot be understood at all.
 ///
-/// This function does not fail and does not panic. A corrupt, truncated, empty,
-/// wrong-schema or unreadable file is moved aside as `workspace.corrupt-<n>.json` first, so
-/// the user can recover it by hand and the next launch is not stuck rejecting the same
-/// bytes forever.
+/// This function does not fail and does not panic. See [`load_report`] for what it reads and
+/// what it drops; this is that function for a caller that will never write the file back —
+/// `cide-headless`, and a test reading what a save produced.
 pub fn load(path: &Path) -> Workspace {
+    load_report(path).workspace
+}
+
+/// What [`load_report`] made of a `workspace.json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Loaded {
+    pub workspace: Workspace,
+    /// The file on disk is **not** what the next save would write, and the difference is not
+    /// something this build can put back: an older schema it migrated, a newer one it read as
+    /// far as it could, or elements it had to drop to read the rest. The caller that saves must
+    /// [`back_up`] the file first, once — see `WorkspaceState::write_now`.
+    ///
+    /// Deferred to the first save rather than done here because a read that is never written
+    /// back (`cide-headless tree`) leaves the file exactly as it was and so owes no copy, and
+    /// because a copy per read would pile one up per launch of a build that never saves.
+    pub backup_before_save: bool,
+    /// Each element dropped to read the rest, as `path: serde's message`. Empty for a document
+    /// that read whole.
+    pub dropped: Vec<String>,
+}
+
+/// Read the workspace at `path` as far as it can be read.
+///
+/// # What costs what (M109)
+///
+/// Until M109 any document that failed to deserialise was quarantined whole and the user was
+/// handed an empty workspace. What that cost, on the machine it was found on: an M104–M107
+/// build wrote five panes with `"origin": "runMirror"`, M108 removed the variant with no
+/// migration, and the next launch of the `dev` profile met `unknown variant` in one pane and
+/// threw away both projects, sixteen tabs and every split — for a marker on five tabs.
+/// A newer schema was refused the same way, so running an older build once cost a layout too.
+///
+/// Now, in order of how much is lost:
+/// - **A current-schema document that reads** is returned as it is.
+/// - **An older schema** is migrated ([`migrate`]'s ladder), and `backup_before_save` is set —
+///   the migrated file is unreadable by the build that wrote the old one.
+/// - **A document that does not deserialise**, at the current schema or after migration, is
+///   [salvaged](salvage): the smallest unit containing each error is dropped — a whole *tab*
+///   for anything inside one, a detached pane, else the offending value, whose field then takes
+///   its default — and the rest is read. The quarantine loses more than this in every case.
+/// - **A newer schema** is read as though it were the current one, salvaged the same way, and
+///   the fields this build does not know are lost on the next save — which is why that save
+///   backs the file up first. A downgrade that keeps the layout and says so beats a reset.
+/// - **Only what cannot be read at all** — not JSON, not an object, no `schemaVersion`, a schema
+///   too old to migrate, or a salvage that had to go as far as the root — is quarantined as
+///   `workspace.corrupt-<n>.json`, as before, and the defaults are returned.
+///
+/// The one thing salvage gives up is `migrate`'s refusal to *quietly* default a corrupt
+/// `settings` value (see `a_settings_block_that_is_not_an_object_is_not_rewritten`). The
+/// alternative on offer here was never "keep your settings", it was the quarantine — which
+/// defaults every setting and the layout besides. Salvage defaults the one value, logs it,
+/// and the backup keeps what was there.
+pub fn load_report(path: &Path) -> Loaded {
     match read_workspace(path) {
-        Ok(Some(mut workspace)) => {
+        Ok(Some(mut loaded)) => {
+            let workspace = &mut loaded.workspace;
+            for dropped in &loaded.dropped {
+                tracing::warn!(path = %path.display(), %dropped, "dropped an unreadable part of the workspace");
+            }
+            if !loaded.dropped.is_empty() {
+                // A dropped tab can have been the active one or the console, a dropped window
+                // entry leaves no shell. `validate` refuses all of that, and a refusal in
+                // `WorkspaceState::load` is the whole-workspace reset salvage exists to avoid.
+                crate::workspace::repair_after_salvage(workspace);
+            }
             // The stored `display_path` was abbreviated against whatever `$HOME` wrote the
             // file, which is not necessarily the one reading it.
-            crate::workspace::refresh_display_paths(&mut workspace);
+            crate::workspace::refresh_display_paths(workspace);
             // `dirty` describes a buffer, and buffers do not survive the process — only the
             // path is stored. A restored tab is showing the file as it is on disk, so the
             // flag has to start false or `close_tab` refuses it over edits that no longer
             // exist. See `workspace::clear_dirty_flags`.
-            crate::workspace::clear_dirty_flags(&mut workspace);
+            crate::workspace::clear_dirty_flags(workspace);
             // `tab_mru` arrived after `Project` did and is `#[serde(default)]`, so every file
             // written before it reads back with an empty order — which `workspace::validate`
             // refuses, and `WorkspaceState::load` answers a refusal by discarding the whole
             // workspace. Repairing here is what keeps an upgrade from costing the user their
             // layout; see `workspace::repair_tab_mru` for what it will and will not invent.
-            crate::workspace::repair_tab_mru(&mut workspace);
-            workspace
+            crate::workspace::repair_tab_mru(workspace);
+            loaded
         }
         // First launch, or the user deleted the file. Nothing to warn about, and nothing to
         // move aside.
-        Ok(None) => Workspace::default(),
+        Ok(None) => Loaded {
+            workspace: Workspace::default(),
+            backup_before_save: false,
+            dropped: Vec::new(),
+        },
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
@@ -247,16 +313,24 @@ pub fn load(path: &Path) -> Workspace {
             // probably fine and will be readable next launch; renaming it would turn a
             // transient failure into permanent data loss and present it to the user as a
             // reset they did not ask for.
-            if matches!(error, CoreError::Serde(_)) {
+            let quarantined = matches!(error, CoreError::Serde(_));
+            if quarantined {
                 quarantine(path);
             }
-            Workspace::default()
+            Loaded {
+                workspace: Workspace::default(),
+                // A quarantined file is no longer at `path`, so there is nothing to copy. An
+                // unreadable one still is, and the save that follows would overwrite it with
+                // defaults: that is the one case where the copy matters most.
+                backup_before_save: !quarantined,
+                dropped: Vec::new(),
+            }
         }
     }
 }
 
 /// `Ok(None)` means there is no file yet, which is not an error.
-fn read_workspace(path: &Path) -> Result<Option<Workspace>> {
+fn read_workspace(path: &Path) -> Result<Option<Loaded>> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -264,15 +338,27 @@ fn read_workspace(path: &Path) -> Result<Option<Workspace>> {
     };
     let value: Value = serde_json::from_str(&raw)?;
 
-    // `serde_json::Value` holds object keys in a sorted map, and `projects` insertion order
-    // *is* the header tab order: reading through `Value` would re-sort the user's project
-    // tabs by uuid on every launch. A document already at the current schema is therefore
-    // deserialised straight from the text; only one that must be migrated goes through
-    // `Value` at all, and migrating it is already a rewrite.
-    if is_current_schema(&value) {
-        return Ok(Some(serde_json::from_str(&raw)?));
+    // A document already at the current schema is deserialised straight from the text, which
+    // is the one path that reads byte-for-byte what `save_atomic` wrote; only one that must be
+    // migrated or salvaged goes through `Value`. Key order survives either way — `projects`
+    // insertion order is the header tab order — because of `preserve_order`; see `migrate`.
+    if is_current_schema(&value)
+        && let Ok(workspace) = serde_json::from_str::<Workspace>(&raw)
+    {
+        return Ok(Some(Loaded {
+            workspace,
+            backup_before_save: false,
+            dropped: Vec::new(),
+        }));
     }
-    migrate(value).map(Some)
+
+    let (value, changed_format) = upgrade(value)?;
+    let (workspace, dropped) = salvage(value)?;
+    Ok(Some(Loaded {
+        workspace,
+        backup_before_save: changed_format || !dropped.is_empty(),
+        dropped,
+    }))
 }
 
 /// Whether a raw document can be read as-is, without passing through [`migrate`].
@@ -287,8 +373,9 @@ fn is_current_schema(value: &Value) -> bool {
 ///
 /// Two documents are refused rather than guessed at. One with no `schemaVersion` is pre-1
 /// and predates any format worth honouring. One from a *newer* schema may carry fields this
-/// build would silently drop on the next save, and a downgrade that quietly discards half
-/// the user's layout is worse than a visible reset.
+/// build would silently drop on the next save. **This function stays strict**: it is the
+/// ladder, and `load_report` is what decides that a newer document is still worth reading as
+/// far as it goes — with a backup, which a pure function on a `Value` cannot take.
 ///
 /// Key order **is** preserved through here, and it has to be: `projects` insertion order is
 /// the header tab order, and a plain `serde_json::Value` sorts object keys into a `BTreeMap`.
@@ -296,6 +383,25 @@ fn is_current_schema(value: &Value) -> bool {
 /// turned on for exactly this, the first migration this ladder has ever run. A user upgrading
 /// into schema 2 keeps their tab strip in the order they left it.
 pub fn migrate(value: Value) -> Result<Workspace> {
+    const CURRENT: u64 = Workspace::CURRENT_SCHEMA as u64;
+    if let Some(v) = value.get("schemaVersion").and_then(Value::as_u64)
+        && v > CURRENT
+    {
+        return Err(CoreError::Serde(format!(
+            "workspace schema {v} is newer than this build's {CURRENT}; refusing to downgrade it"
+        )));
+    }
+    Ok(serde_json::from_value(upgrade(value)?.0)?)
+}
+
+/// [`migrate`]'s ladder without the final deserialise, and with a newer schema **relabelled**
+/// as the current one rather than refused. The flag says whether the document's format
+/// changed on the way, which is what obliges the next save to back the file up.
+///
+/// Relabelled, not left at its number: a file this build saves holds only what this build
+/// understood, and stamping it with the newer schema would tell the newer build that nothing
+/// was lost from it.
+fn upgrade(mut value: Value) -> Result<(Value, bool)> {
     const CURRENT: u64 = Workspace::CURRENT_SCHEMA as u64;
 
     let Some(version) = value.get("schemaVersion").and_then(Value::as_u64) else {
@@ -307,18 +413,195 @@ pub fn migrate(value: Value) -> Result<Workspace> {
     // A ladder: each supported older schema gets an arm that rewrites the document one step
     // forward and re-enters here. Adding version 3 is an arm, not a restructuring.
     match version {
-        CURRENT => Ok(serde_json::from_value(value)?),
-        1 => migrate(v1_to_v2(value)),
-        2 => migrate(v2_to_v3(value)),
-        3 => migrate(v3_to_v4(value)),
-        4 => migrate(v4_to_v5(value)),
-        v if v > CURRENT => Err(CoreError::Serde(format!(
-            "workspace schema {v} is newer than this build's {CURRENT}; refusing to downgrade it"
-        ))),
+        CURRENT => Ok((value, false)),
+        1 => Ok((upgrade(v1_to_v2(value))?.0, true)),
+        2 => Ok((upgrade(v2_to_v3(value))?.0, true)),
+        3 => Ok((upgrade(v3_to_v4(value))?.0, true)),
+        4 => Ok((upgrade(v4_to_v5(value))?.0, true)),
+        v if v > CURRENT => {
+            tracing::warn!(
+                schema = v,
+                current = CURRENT,
+                "workspace was written by a newer cide; reading what this build understands"
+            );
+            if let Some(root) = value.as_object_mut() {
+                root.insert("schemaVersion".into(), Value::from(CURRENT));
+            }
+            Ok((value, true))
+        }
         v => Err(CoreError::Serde(format!(
             "workspace schema {v} is no longer supported"
         ))),
     }
+}
+
+/// How many elements [`salvage`] may drop before it decides the document is not a workspace.
+///
+/// Each drop strictly shrinks the document, so the loop ends anyway; the bound is for a file
+/// that is some *other* JSON, where dropping element after element would eventually "succeed"
+/// with a workspace that holds nothing of the file and merely looks like it was read.
+const SALVAGE_LIMIT: usize = 64;
+
+/// One step of a path into a JSON document, as [`serde_path_to_error`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Key(String),
+    Index(usize),
+    /// An enum variant. An externally tagged one is a key in the JSON; an internally tagged
+    /// one is not there at all — [`remove_at`] descends through it only when it is.
+    Variant(String),
+}
+
+/// Deserialise `value`, dropping the smallest unit that contains each error until the rest
+/// reads. See [`load_report`] for the policy; `Err` means it had to drop the document itself.
+fn salvage(mut value: Value) -> Result<(Workspace, Vec<String>)> {
+    let mut dropped = Vec::new();
+    for _ in 0..SALVAGE_LIMIT {
+        let error = match serde_path_to_error::deserialize::<_, Workspace>(value.clone()) {
+            Ok(workspace) => return Ok((workspace, dropped)),
+            Err(error) => error,
+        };
+        let path: Vec<Step> = error
+            .path()
+            .iter()
+            .map_while(|segment| match segment {
+                serde_path_to_error::Segment::Map { key } => Some(Step::Key(key.clone())),
+                serde_path_to_error::Segment::Seq { index } => Some(Step::Index(*index)),
+                serde_path_to_error::Segment::Enum { variant } => {
+                    Some(Step::Variant(variant.clone()))
+                }
+                // Past an untagged or buffered value serde no longer knows where it is; the
+                // prefix before it is the most that can be said.
+                serde_path_to_error::Segment::Unknown => None,
+            })
+            .collect();
+        // Climb until something is actually removable: a "missing field" is reported at the
+        // struct that lacks it, which has to go as a whole, and an internally tagged variant
+        // names nothing in the JSON.
+        let mut target = unit_of(&path);
+        while !remove_at(&mut value, &target) {
+            if target.pop().is_none() {
+                return Err(CoreError::Serde(error.into_inner().to_string()));
+            }
+        }
+        if target.is_empty() {
+            return Err(CoreError::Serde(error.into_inner().to_string()));
+        }
+        dropped.push(format!("{}: {}", render_path(&target), error.inner()));
+    }
+    Err(CoreError::Serde(format!(
+        "dropped {SALVAGE_LIMIT} elements and the document still does not read as a workspace"
+    )))
+}
+
+/// The smallest unit worth keeping whole that contains `path`.
+///
+/// **A tab is one unit.** Dropping the one field that failed inside it — a pane's `origin`,
+/// which is the case that motivated all of this — yields a pane that is still there but no
+/// longer what was written: a run's mirror read back as an ordinary Claude pane on the run's
+/// session, which on restore would resume a second `claude` on a conversation the run owns. A
+/// layout without one of its panes fails `validate`. The tab, dropped whole, is simply not
+/// there, and every other tab is. A detached pane is its own unit for the same reason.
+///
+/// Anywhere else — `settings`, `toolWindow`, a project's own fields — the failing value is
+/// the unit, and its field takes its `#[serde(default)]`; a field with no default climbs to
+/// its container on the next pass, which for a project means the project.
+fn unit_of(path: &[Step]) -> Vec<Step> {
+    match path {
+        [
+            Step::Key(projects),
+            Step::Key(_),
+            Step::Key(field),
+            Step::Index(_) | Step::Key(_),
+            ..,
+        ] if projects == "projects" && (field == "tabs" || field == "detached") => {
+            path[..4].to_vec()
+        }
+        _ => path.to_vec(),
+    }
+}
+
+/// Remove the element `path` names from `value`. `false` when the path does not name a
+/// removable element — the root, a variant, or a step the document does not have.
+fn remove_at(value: &mut Value, path: &[Step]) -> bool {
+    let Some((last, parents)) = path.split_last() else {
+        return false;
+    };
+    let mut at = value;
+    for step in parents {
+        at = match step {
+            Step::Key(key) => match at.get_mut(key.as_str()) {
+                Some(next) => next,
+                None => return false,
+            },
+            Step::Index(index) => match at.get_mut(*index) {
+                Some(next) => next,
+                None => return false,
+            },
+            Step::Variant(variant) => {
+                if at.get(variant.as_str()).is_none() {
+                    continue;
+                }
+                match at.get_mut(variant.as_str()) {
+                    Some(next) => next,
+                    None => return false,
+                }
+            }
+        };
+    }
+    match (last, at) {
+        // `shift_remove`, not `remove`: under `preserve_order` the latter swaps the last key
+        // into the hole, and `projects`' key order is the header's tab order.
+        (Step::Key(key), Value::Object(map)) => map.shift_remove(key.as_str()).is_some(),
+        (Step::Index(index), Value::Array(items)) if *index < items.len() => {
+            items.remove(*index);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn render_path(path: &[Step]) -> String {
+    let mut out = String::new();
+    for step in path {
+        match step {
+            Step::Key(key) | Step::Variant(key) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(key);
+            }
+            Step::Index(index) => out.push_str(&format!("[{index}]")),
+        }
+    }
+    out
+}
+
+/// Copy the file at `path` to the first free `workspace.backup-<n>.json` beside it, before a
+/// save overwrites it with something that holds less. `Ok(None)` when there is no file.
+///
+/// Written through [`write_atomic`] rather than `fs::copy`, for the order of the two writes: a
+/// crash between this copy and the save must leave a complete copy, and only a synced one is.
+/// The copy is the bytes as they were, not the workspace as read — the point is the part this
+/// build could not read.
+pub fn back_up(path: &Path) -> Result<Option<PathBuf>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(target) = (1..=999u32)
+        .map(|n| sibling_path(path, "backup", n))
+        .find(|c| matches!(c.try_exists(), Ok(false)))
+    else {
+        return Err(CoreError::Invariant(format!(
+            "no free backup name beside {}",
+            path.display()
+        )));
+    };
+    write_atomic(&target, &bytes)?;
+    tracing::warn!(from = %path.display(), to = %target.display(), "backed up the workspace before overwriting it");
+    Ok(Some(target))
 }
 
 /// Schema 4 → 5: forget `settings.git.autoApplyNonConflicting`.
@@ -1077,13 +1360,19 @@ pub fn free_quarantine_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn quarantine_path(path: &Path, n: u32) -> PathBuf {
+    sibling_path(path, "corrupt", n)
+}
+
+/// `<stem>.<label>-<n>.<ext>` beside `path`: the quarantine's `corrupt` and [`back_up`]'s
+/// `backup`, one naming scheme so both are found by the same glance at the directory.
+fn sibling_path(path: &Path, label: &str, n: u32) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".into());
     let name = match path.extension() {
-        Some(ext) => format!("{stem}.corrupt-{n}.{}", ext.to_string_lossy()),
-        None => format!("{stem}.corrupt-{n}"),
+        Some(ext) => format!("{stem}.{label}-{n}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.{label}-{n}"),
     };
     path.with_file_name(name)
 }
@@ -2131,8 +2420,9 @@ mod tests {
     /// **`CURRENT_SCHEMA` does not move for it.** The same argument `tab_mru` makes: the two
     /// bumps that did happen guard a default whose movement would silently re-scope a proxy or
     /// stop writing the user's files, and a panel the user closes again with one click does not
-    /// qualify. A bump is not free — `migrate` refuses a document from a newer schema, so it
-    /// would quarantine the whole workspace of anyone who ran an older build afterwards.
+    /// qualify. A bump is not free — `migrate` refuses a document from a newer schema, and
+    /// although `load` has read one as far as it goes since M109, anyone who ran an older build
+    /// afterwards would lose whatever that build did not know on its first save.
     ///
     /// **The history tab carries a query and nothing else.** No commits, no diffs, no blob text —
     /// the same rule `DiffSpec` follows, and for the stronger of its two reasons: a saved log
@@ -2712,27 +3002,219 @@ mod tests {
         assert!(dir.entries().is_empty(), "load must not write");
     }
 
+    /// `migrate` still refuses a newer schema — it is the ladder, and stays strict — but `load`
+    /// reads one as far as this build understands it, and says the file must be backed up
+    /// before it is overwritten. (M109) Until then this test was named
+    /// `a_newer_schema_is_refused_rather_than_half_understood`, and running an older build once
+    /// cost the user every project and tab they had.
     #[test]
-    fn a_newer_schema_is_refused_rather_than_half_understood() {
-        let newer = serde_json::json!({
-            "schemaVersion": Workspace::CURRENT_SCHEMA + 1,
-            "rev": 3,
-            "settings": {},
-            "projects": {},
-            "windows": {},
-            "somethingThisBuildWouldDrop": true,
-        });
+    fn a_newer_schema_is_read_as_far_as_it_goes_and_owed_a_backup() {
+        let workspace = fixture();
+        let mut newer = serde_json::to_value(&workspace).expect("serialise");
+        let root = newer.as_object_mut().expect("an object");
+        root.insert(
+            "schemaVersion".into(),
+            serde_json::json!(Workspace::CURRENT_SCHEMA + 1),
+        );
+        root.insert(
+            "somethingThisBuildWouldDrop".into(),
+            serde_json::json!(true),
+        );
 
-        assert!(migrate(newer.clone()).is_err());
+        assert!(
+            migrate(newer.clone()).is_err(),
+            "the ladder itself stays strict"
+        );
 
         let dir = TempDir::new("newer");
         let path = dir.join("workspace.json");
         fs::write(&path, newer.to_string()).expect("write");
 
-        assert_eq!(load(&path), Workspace::default());
+        let loaded = load_report(&path);
+        assert!(loaded.dropped.is_empty(), "{:?}", loaded.dropped);
         assert!(
-            dir.join("workspace.corrupt-1.json").exists(),
-            "the newer file must stay recoverable by the build that wrote it"
+            loaded.backup_before_save,
+            "the next save loses `somethingThisBuildWouldDrop`, so the file is copied first"
+        );
+        assert_eq!(
+            loaded.workspace.schema_version,
+            Workspace::CURRENT_SCHEMA,
+            "relabelled: what this build saves holds only what this build understood"
+        );
+        assert_eq!(
+            loaded.workspace.projects.keys().collect::<Vec<_>>(),
+            workspace.projects.keys().collect::<Vec<_>>(),
+            "every project, in header order"
+        );
+        assert_eq!(
+            dir.entries(),
+            vec!["workspace.json".to_owned()],
+            "nothing quarantined, and a read writes nothing"
+        );
+    }
+
+    /// The key a map entry is stored under, as the JSON spells it.
+    fn json_key<T: Serialize>(id: &T) -> String {
+        serde_json::to_value(id)
+            .expect("serialise")
+            .as_str()
+            .expect("a string id")
+            .to_owned()
+    }
+
+    /// **One unreadable pane costs its tab and nothing else.** (M109)
+    ///
+    /// The reported case, reduced: an M104–M107 build wrote `"origin": "runMirror"` on five
+    /// panes, M108 removed the variant, and the next launch quarantined the whole `dev`
+    /// workspace over it.
+    #[test]
+    fn an_unknown_variant_in_one_pane_costs_its_tab_and_nothing_else() {
+        // The demo rather than `fixture()`, because this test asserts the result is *valid* and
+        // the fixture is deliberately not (a maximized pane that is not the focused one).
+        let workspace = crate::workspace::demo_workspace();
+        let (&b_id, b) = workspace.projects.get_index(0).expect("a project");
+        let doomed = &b.tabs[1];
+        assert_eq!(
+            b.active_tab, doomed.id,
+            "the dropped tab is the active one, on purpose"
+        );
+        let pane = *doomed.tree.panes.keys().next().expect("a pane");
+        let mut value = serde_json::to_value(&workspace).expect("serialise");
+        value["projects"][json_key(&b_id)]["tabs"][1]["tree"]["panes"][json_key(&pane)]["origin"] =
+            serde_json::json!("runMirror");
+
+        let dir = TempDir::new("salvage-tab");
+        let path = dir.join("workspace.json");
+        fs::write(&path, serde_json::to_vec_pretty(&value).expect("encode")).expect("write");
+
+        let loaded = load_report(&path);
+        assert_eq!(loaded.dropped.len(), 1, "{:?}", loaded.dropped);
+        assert!(
+            loaded.dropped[0].contains("tabs[1]"),
+            "the tab went, not just the field: {}",
+            loaded.dropped[0]
+        );
+        assert!(loaded.backup_before_save);
+
+        let ws = &loaded.workspace;
+        crate::workspace::validate(ws).expect("what was read is a valid workspace");
+        let tabs = |p: &Project| p.tabs.iter().map(|t| t.id).collect::<Vec<_>>();
+        let mut expected = tabs(b);
+        expected.remove(1);
+        assert_eq!(tabs(&ws.projects[&b_id]), expected);
+        assert_eq!(
+            ws.projects[&b_id].active_tab, b.tabs[0].id,
+            "the active tab fell back to the console"
+        );
+        for (id, before) in &workspace.projects {
+            if *id != b_id {
+                assert_eq!(
+                    tabs(&ws.projects[id]),
+                    tabs(before),
+                    "the other projects are whole"
+                );
+            }
+        }
+        assert_eq!(
+            ws.projects.keys().collect::<Vec<_>>(),
+            workspace.projects.keys().collect::<Vec<_>>(),
+            "in header order"
+        );
+        assert_eq!(
+            ws.windows.keys().collect::<Vec<_>>(),
+            workspace.windows.keys().collect::<Vec<_>>(),
+            "and the windows keep their labels"
+        );
+        assert_eq!(dir.entries(), vec!["workspace.json".to_owned()]);
+    }
+
+    /// A project whose console cannot be read goes, and the shell stops listing it.
+    #[test]
+    fn a_project_without_a_readable_console_is_dropped_and_the_shell_rebuilt() {
+        let workspace = crate::workspace::demo_workspace();
+        let (&b_id, _) = workspace.projects.get_index(1).expect("three projects");
+        let mut value = serde_json::to_value(&workspace).expect("serialise");
+        value["projects"][json_key(&b_id)]["tabs"][0]["kind"] =
+            serde_json::json!({ "kind": "aKindFromTheFuture" });
+
+        let dir = TempDir::new("salvage-console");
+        let path = dir.join("workspace.json");
+        fs::write(&path, value.to_string()).expect("write");
+
+        let loaded = load_report(&path);
+        assert!(!loaded.dropped.is_empty());
+        let ws = &loaded.workspace;
+        crate::workspace::validate(ws).expect("valid after the repair");
+        assert!(!ws.projects.contains_key(&b_id));
+        assert_eq!(ws.projects.len(), workspace.projects.len() - 1);
+        assert!(ws.windows.values().all(|role| match role {
+            WindowRole::Shell { projects, .. } => !projects.contains(&b_id),
+            _ => true,
+        }));
+    }
+
+    /// An unreadable setting takes its default and every other setting stays.
+    #[test]
+    fn an_unreadable_setting_defaults_alone() {
+        let mut workspace = fixture();
+        workspace.settings.editor.autosave = !cide_ipc::Settings::default().editor.autosave;
+        let mut value = serde_json::to_value(&workspace).expect("serialise");
+        value["settings"]["theme"] = serde_json::json!("plaid");
+
+        let dir = TempDir::new("salvage-setting");
+        let path = dir.join("workspace.json");
+        fs::write(&path, value.to_string()).expect("write");
+
+        let loaded = load_report(&path);
+        assert_eq!(loaded.dropped.len(), 1, "{:?}", loaded.dropped);
+        assert!(loaded.dropped[0].starts_with("settings.theme"));
+        assert_eq!(
+            loaded.workspace.settings.theme,
+            cide_ipc::Settings::default().theme
+        );
+        assert_eq!(
+            loaded.workspace.settings.editor.autosave, workspace.settings.editor.autosave,
+            "the setting beside it survived"
+        );
+        assert_eq!(loaded.workspace.projects.len(), workspace.projects.len());
+    }
+
+    /// A migrated file is owed a backup; a current one that read whole is not.
+    #[test]
+    fn only_a_changed_format_is_owed_a_backup() {
+        let dir = TempDir::new("backup-flag");
+        let path = dir.join("workspace.json");
+
+        save_atomic(&path, &fixture()).expect("save");
+        let current = load_report(&path);
+        assert!(!current.backup_before_save);
+        assert!(current.dropped.is_empty());
+
+        let mut stale = serde_json::to_value(fixture()).expect("serialise");
+        stale["schemaVersion"] = serde_json::json!(4);
+        fs::write(&path, stale.to_string()).expect("write");
+        let migrated = load_report(&path);
+        assert!(migrated.backup_before_save);
+        assert_eq!(migrated.workspace.schema_version, Workspace::CURRENT_SCHEMA);
+    }
+
+    /// `back_up` copies the bytes as they were, beside the file, never over an earlier copy.
+    #[test]
+    fn a_backup_is_the_file_verbatim_and_never_overwrites_one() {
+        let dir = TempDir::new("backup");
+        let path = dir.join("workspace.json");
+        assert_eq!(back_up(&path).expect("no file is no error"), None);
+
+        fs::write(&path, b"{\"schemaVersion\": 99}").expect("write");
+        let first = back_up(&path).expect("backed up").expect("a file");
+        let second = back_up(&path).expect("backed up").expect("a file");
+        assert_eq!(first, dir.join("workspace.backup-1.json"));
+        assert_eq!(second, dir.join("workspace.backup-2.json"));
+        assert_eq!(fs::read(&first).expect("read"), b"{\"schemaVersion\": 99}");
+        assert_eq!(
+            fs::read(&path).expect("read"),
+            b"{\"schemaVersion\": 99}",
+            "the original is untouched"
         );
     }
 

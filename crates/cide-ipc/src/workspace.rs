@@ -286,11 +286,12 @@ pub struct Project {
     /// default `open` ever flips, the worst outcome is a panel that appears once and that the
     /// user closes with one click. A panel is not a proxy scope and is not autosave.
     ///
-    /// And a bump is not free in the other direction: it makes an older build's read of a newer
-    /// document *certainly* fatal — `persist::load` quarantines a schema it does not know —
-    /// where an unbumped document with one unknown key is read perfectly by every build that
-    /// predates the key. Downgrading across a bump costs the user their whole layout; downgrading
-    /// across this field costs them nothing at all.
+    /// And a bump is not free in the other direction. Until M109 it made an older build's read
+    /// of a newer document *certainly* fatal — `persist::load` quarantined a schema it did not
+    /// know — and it still marks the file as one the older build must back up before its first
+    /// save, and relabels it, so the newer build's next read is a migration of what the older
+    /// one understood. An unbumped document with one unknown key is read perfectly by every
+    /// build that predates the key, and costs nothing at all.
     #[serde(default)]
     pub tool_window: ToolWindowState,
 }

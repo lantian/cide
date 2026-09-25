@@ -33,6 +33,15 @@ pub struct WorkspaceState {
     inner: Mutex<Workspace>,
     path: PathBuf,
     debounce: Debouncer,
+    /// The file on disk holds something the tree in memory does not — an older or newer
+    /// schema, or parts `persist::load_report` dropped to read the rest — so it is copied aside
+    /// before the first write replaces it. (M109) Cleared by the copy, and only by it: a copy
+    /// that failed leaves the flag set and the file untouched, and the next flush tries again.
+    ///
+    /// A `Mutex` rather than an `AtomicBool` because the check and the copy have to be one
+    /// step: the flusher thread and the shutdown write can race, and two copies of one file is
+    /// the smaller harm but still litter the user has to understand.
+    backup_before_save: Mutex<bool>,
     /// Set once, during setup, so mutations can broadcast to every window.
     ///
     /// A `OnceLock` rather than a constructor argument because the state is created before
@@ -61,14 +70,20 @@ impl WorkspaceState {
     /// broken file costs a layout rather than a launch.
     pub fn load() -> Self {
         let path = persist::workspace_path();
-        let mut workspace = persist::load(&path);
+        let persist::Loaded {
+            mut workspace,
+            mut backup_before_save,
+            ..
+        } = persist::load_report(&path);
 
         // A file that parses can still be internally inconsistent — hand-edited, or written
         // by a build whose invariants differed. Starting fresh is recoverable; running on a
-        // tree that fails its own validator is not.
+        // tree that fails its own validator is not. The file itself is still whole on disk,
+        // and the first save would replace it with the defaults, so it is backed up first.
         if let Err(error) = workspace::validate(&workspace) {
             tracing::warn!(%error, "loaded workspace failed validation; starting from defaults");
             workspace = Workspace::default();
+            backup_before_save = true;
         }
         publish_binaries(&workspace.settings);
 
@@ -76,6 +91,7 @@ impl WorkspaceState {
             inner: Mutex::new(workspace),
             path,
             debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
+            backup_before_save: Mutex::new(backup_before_save),
             app: OnceLock::new(),
         }
     }
@@ -281,6 +297,21 @@ impl WorkspaceState {
     /// Write unconditionally. Used on quit, where waiting out a debounce would lose the
     /// last change the user made.
     pub fn write_now(&self) {
+        {
+            let mut pending = self.backup_before_save.lock();
+            if *pending {
+                match persist::back_up(&self.path) {
+                    Ok(_) => *pending = false,
+                    // Refusing the write is the point: the file is the only copy of whatever
+                    // this build could not read, and a layout change the user made this session
+                    // is the smaller loss — it is still in memory, and the next flush retries.
+                    Err(error) => {
+                        tracing::error!(path = %self.path.display(), %error, "could not back up the workspace; not overwriting it");
+                        return;
+                    }
+                }
+            }
+        }
         let workspace = self.inner.lock().clone();
         if let Err(error) = persist::save_atomic(&self.path, &workspace) {
             tracing::error!(path = %self.path.display(), %error, "failed to save the workspace");
@@ -310,6 +341,7 @@ mod tests {
             inner: Mutex::new(ws),
             path: std::env::temp_dir().join("cide-workspace-state-test.json"),
             debounce: Debouncer::new(persist::SAVE_DEBOUNCE),
+            backup_before_save: Mutex::new(false),
             app: OnceLock::new(),
         }
     }
@@ -461,5 +493,40 @@ mod tests {
             before,
             "failure restores everything, rev included"
         );
+    }
+
+    /// **A file the load could not read whole is copied aside before the first write.** (M109)
+    ///
+    /// The copy is taken once, from the bytes on disk, and the write then goes ahead; the
+    /// second write owes nothing. Without it a salvaged or newer workspace would be overwritten
+    /// by the first debounce, and whatever this build dropped would be gone.
+    #[test]
+    fn the_first_write_backs_up_a_file_the_load_could_not_read_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "cide-workspace-state-backup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("workspace.json");
+        std::fs::write(&path, b"what a newer build wrote").expect("write");
+
+        let mut s = state();
+        s.path = path.clone();
+        *s.backup_before_save.lock() = true;
+
+        s.write_now();
+        let backup = dir.join("workspace.backup-1.json");
+        assert_eq!(
+            std::fs::read(&backup).expect("the old file was copied first"),
+            b"what a newer build wrote"
+        );
+        assert_eq!(persist::load(&path), s.snapshot(), "and then overwritten");
+
+        s.write_now();
+        assert!(
+            !dir.join("workspace.backup-2.json").exists(),
+            "one copy per load, not one per write"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

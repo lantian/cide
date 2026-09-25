@@ -312,7 +312,12 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     args.push(plan.cwd.to_string_lossy().to_string());
 
     // ---- 4. the sandbox and the approval policy ----
-    args.extend(policy.iter().map(|token| token.to_string()));
+    //
+    // Unless Settings says a wrapper decides (M108, `CodexInjections::permissions`). The policy
+    // is still computed above, so a role naming a mode codex cannot honour is still refused.
+    if plan.codex.cli.inject.permissions {
+        args.extend(policy.iter().map(|token| token.to_string()));
+    }
 
     // ---- 5. what the definition asked for ----
     if let Some(model) = &plan.agent.def.model {
@@ -802,6 +807,30 @@ mod tests {
     }
 
     /// Every row of the mapping, the project default, and the structural refusals.
+    #[test]
+    fn a_wrapper_that_decides_the_sandbox_is_given_no_policy_flags() {
+        let agent = role();
+        let session = SessionId::new();
+        let plan = plan_for(&agent, session);
+        let on = CodexHarness.spawn_spec(&plan).expect("spawnable").spec.args;
+        assert!(
+            on.iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox" || a == "-s"),
+            "{on:?}"
+        );
+        let mut off = plan_for(&agent, session);
+        off.codex.cli.inject.permissions = false;
+        let args = CodexHarness.spawn_spec(&off).expect("spawnable").spec.args;
+        for flag in [
+            "-s",
+            "-a",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--approve-for-me",
+        ] {
+            assert!(!args.iter().any(|a| a == flag), "{flag} in {args:?}");
+        }
+    }
+
     #[test]
     fn the_definitions_vocabulary_maps_to_a_sandbox_and_an_approval_policy() {
         let policy = |mode: Option<&str>, unattended| {

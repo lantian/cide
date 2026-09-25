@@ -62,6 +62,14 @@ const INJECTIONS: readonly { key: keyof CodexInjections; label: string; cost: st
     label: 'Fork (codex fork <thread>)',
     cost: 'Off: Split → fork starts a fresh conversation instead of branching this one.',
   },
+  {
+    // M108: for a wrapper that pins the sandbox itself and refuses cide's, which is what stopped
+    // every MR review while the console the wrapper opens worked — a console under *ask* carries
+    // no policy flag, a run always did.
+    key: 'permissions',
+    label: 'Sandbox and approvals for runs (-s, -a, --dangerously-bypass-approvals-and-sandbox)',
+    cost: 'Off: runs, reviews and tabs cide opens pass no sandbox or approval flag — your codex config, or the wrapper named above, decides. A role’s permission-mode and the project’s unattended default are no longer applied, so a run may wait on an approval nobody is watching.',
+  },
 ]
 
 export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps) {

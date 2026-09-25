@@ -193,7 +193,7 @@ pub(crate) fn open(
     // forking one into whatever directory cide happens to be in.
     // Settings → Harness decides which CLI a tab cide opens runs (M93), exactly as it decides a
     // fresh console: these tabs *are* consoles, doing the product owner's job.
-    let (root, name, setting, llm) = state.with(|ws| {
+    let (root, name, setting, llm, codex_policy) = state.with(|ws| {
         let project = cide_core::workspace::project(ws, project)?;
         let root = project
             .roots
@@ -205,6 +205,7 @@ pub(crate) fn open(
             project.name.clone(),
             ws.settings.console_harness,
             ws.settings.llm.clone(),
+            ws.settings.codex.cli.inject.permissions,
         ))
     })?;
     let tab_harness = chosen.unwrap_or(TabHarness::Console(setting));
@@ -225,7 +226,10 @@ pub(crate) fn open(
         // that mode gets (`harness::codex::permission_policy`), and nothing for `Ask`, where the
         // user's own `config.toml` decides and codex asks in the pane. No `--name`: codex has
         // none, and names a thread by itself.
+        //
+        // And nothing when Settings says a wrapper decides (M108, `CodexInjections::permissions`).
         let policy = match mode.unattended {
+            _ if !codex_policy => None,
             cide_agents::Unattended::Ask => None,
             unattended => cide_agents::harness::codex::permission_policy(None, unattended).ok(),
         };
