@@ -2882,12 +2882,33 @@ impl AgentRegistry {
     /// `a_real_childs_exit_finishes_its_run` and a reaped child's ending is still announced.
     /// Every *hook*-reached edge — through [`note_hook`] — carries an app of its own.
     fn set_state(&self, app: Option<&AppHandle>, run: RunId, next: RunState) -> bool {
+        self.set_state_from(app, run, None, next).unwrap_or(false)
+    }
+
+    /// [`Self::set_state`] as a compare-and-set: `None` when the run is no longer in `from`.
+    ///
+    /// For [`Self::observe`], which reads the state, drops the lock, asks the harness, and only
+    /// then writes. Two threads observe one run — the coalescer with its lines, the reaper with
+    /// its exit — and without the check a line read against `Starting` wrote `Running` over the
+    /// `Finished` the exit had just recorded: a dead child's run shown working for ever, with the
+    /// slot already given away. `absorbs` could not stop it, because it saw `Starting`. It lost
+    /// the race on the macOS runner in `a_harness_bound_run_moves_on_its_own_output`.
+    fn set_state_from(
+        &self,
+        app: Option<&AppHandle>,
+        run: RunId,
+        from: Option<&RunState>,
+        next: RunState,
+    ) -> Option<bool> {
         let mut inner = self.inner.lock();
         let Some(live) = inner.runs.get_mut(&run) else {
-            return false;
+            return Some(false);
         };
+        if from.is_some_and(|from| live.state != *from) {
+            return None;
+        }
         if live.state == next {
-            return false;
+            return Some(false);
         }
         let handed_back = matches!(
             (&live.state, &next),
@@ -2927,7 +2948,7 @@ impl AgentRegistry {
                 .retain(|_, frozen| frozen.run != Some(run));
         }
         let Some(live) = inner.runs.get_mut(&run) else {
-            return true;
+            return Some(true);
         };
         // Decided under the lock, acted on after it — the discipline the module header states,
         // and the nudge is the newest reason for it: `note_run_idle` reads `.cide/config.json`,
@@ -3016,7 +3037,7 @@ impl AgentRegistry {
         if let (Some(app), Some(project)) = (app, nudge) {
             crate::agent_rpc::note_run_over(app, project, run);
         }
-        true
+        Some(true)
     }
 
     /// End a task run still parked on the approval prompt it was parked on at `since`, when
@@ -3080,10 +3101,10 @@ impl AgentRegistry {
         session: SessionId,
         ob: Observation<'_>,
     ) -> Option<(RunId, RunState)> {
-        let (run, kind, current) = {
+        let (run, kind) = {
             let inner = self.inner.lock();
             let live = inner.runs.values().find(|r| r.session == Some(session))?;
-            (live.run, live.harness, live.state.clone())
+            (live.run, live.harness)
         };
         let harness = cide_agents::for_kind(kind)?;
         // A caller-bound harness whose *conversation* the CLI still mints announces it in a hook
@@ -3102,9 +3123,23 @@ impl AgentRegistry {
                 registry.mark_changed(app, project);
             }
         }
-        let next = harness.observe(current, ob)?;
-        self.set_state(app, run, next.clone())
-            .then_some((run, next))
+        // Read, decide, then compare-and-set, retrying when another thread moved the run in
+        // between. See `set_state_from` for the race; a retry re-decides against the state that
+        // won, so a line landing after an exit meets `Finished` and is absorbed.
+        loop {
+            let current = {
+                let inner = self.inner.lock();
+                let live = inner.runs.get(&run)?;
+                if live.session != Some(session) {
+                    return None;
+                }
+                live.state.clone()
+            };
+            let next = harness.observe(current.clone(), ob)?;
+            if let Some(moved) = self.set_state_from(app, run, Some(&current), next.clone()) {
+                return moved.then_some((run, next));
+            }
+        }
     }
 
     /// Every run this project has, in the order the panel's groups read them.
