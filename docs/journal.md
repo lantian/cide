@@ -16048,3 +16048,57 @@ into the active profile; unknown name refused and nothing written; delete keeps 
 
 Not yet seen on a display: the profile bar itself, and the Agents panel following a switch made
 through the MCP tool.
+
+## Spend less of a model subscription on the same work (M124)
+
+Asked for after `codex-usage-2026-09-27.md` (repo root, not committed): five hours of selfcraft and
+terrastrike runs took 69 points of the codex plan's weekly limit. Most of it is `gpt-6-astra` on
+sprite-artist — the user's choice of model for art, and left alone: the rule was that the task's
+quality comes first and only spend that buys nothing goes. Three things in cide bought nothing.
+
+**Polling a running command.** 28% of all input (39% of sprite-artist's) was a model asking a
+running `check.sh`/`e2e.sh`/render "done yet?" — 575 polls at `yield_time_ms: 1000`, each a whole
+request re-sending a 100–240k context. `harness.rs`'s `WAITING_PREAMBLE` now rides every brief,
+appended by `tracker_preamble` so all four harnesses carry it in one place and the parity tests
+still hold: wait in few calls with the longest wait the tool allows, never check every few
+seconds, send a long output to a file. selfcraft's own AGENTS.md said "keep polling … until it
+exits"; that is the project's to change and is in its `llm-cost-notes.md`.
+
+**The tracker reading a task back after every write.** Comment, update, link, unlink and attach
+answered with the whole task (11.5k characters a comment call, 165 calls). They now answer with
+`render_ack`: summary line, links, attachments, and only the comments other authors added since
+the caller's own last one — the one thing the whole task was there to show. `TaskSink::author`
+is new for it; `StoreSink` answers the connection's author. `cide_task_create` and `cide_task_get`
+are unchanged, and the two descriptions that matter say where the whole task is.
+
+**Continuing a conversation too big to be worth continuing.** A handed-back task resumed its last
+run's conversation however large; the second turns were 28% of the input, "rebase onto master" at
+150–200k tokens a request. `agents.freshAbove` (tokens, default 150000, `0` off, disk-only like
+`isolation`) makes `cmd::agents::continue_route` start fresh past it, with the size in the
+dispatch's answer. The size is `cide_core::codex_cli::context_tokens` — the last `token_count` in
+the rollout, which the status bar already reads — so **the rule only acts on codex**: Claude
+Code's transcripts are a format cide deliberately never opens (`lifecycle::transcript_exists`),
+and opencode's store is a database. On those a hand-back continues, as before.
+
+Not done, on purpose: guardian (`--approve-for-me`) stays — it is the safety of `auto`; parallel
+tasks editing one file are the project's planning, noted for it; models and override profiles are
+the user's.
+
+Also regenerated `CodexInjections.ts`/`generated.ts`: a doc comment on `review_permissions` had
+changed at HEAD without a codegen, so `codegen --check` was red before this work.
+
+Tests: `cargo test -p cide-agents` (`the_waiting_preamble_stays_within_its_budget_and_names_no_tool`,
+the two parity tests, `comment_appends_and_answers_with_only_what_others_said_since`,
+`cide_task_link_writes_the_edge_and_answers_with_it_resolved`, config), `cargo test -p cide-core
+codex_cli`, `cargo test -p cide-app` (`a_dispatch_starts_fresh_past_the_size_a_continuation_is_worth`),
+clippy, fmt, codegen and contract checks, `tsc`, `check:agents`, `check:agents-render`,
+`check:settings-agents`.
+
+Not yet seen live: no real codex run has been handed back past the threshold, and nobody has
+measured whether the waiting paragraph actually lengthens codex's `yield_time_ms`. The stronger
+fix — a codex config key that makes its shell block (`features.unified_exec=false`, or
+`default_exec_yield_time_ms`), both found only as strings in the 0.157.1 binary — is unmeasured and
+would cost real turns to measure.
+
+Per-project notes, written for the user and not acted on: `~/work/selfcraft/llm-cost-notes.md`,
+`~/work/terrastrike/llm-cost-notes.md`.

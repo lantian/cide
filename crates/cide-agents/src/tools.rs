@@ -700,6 +700,17 @@ pub trait TaskSink: Send + Sync {
     /// connection, as the author is — never from anything in a call's arguments.
     fn by_run(&self) -> bool;
 
+    /// Who this connection writes as — the author the store signs its comments with. (M124)
+    ///
+    /// Read by [`render_ack`] to tell the caller's own comments from everybody else's, so a
+    /// mutation can answer with only what *others* said since the caller last spoke. Decided by the
+    /// app from the connection, as [`Self::by_run`] is. Defaulted to the orchestrator because that
+    /// is what the test double signs its comments with, so the two agree without every test saying
+    /// so.
+    fn author(&self) -> TaskAuthor {
+        TaskAuthor::Orchestrator
+    }
+
     /// Ids of the tasks whose id, title or body contain `query`, ignoring case — the store's own
     /// `cide_tasks::search`, which reads bodies a row does not carry. (M83)
     fn search(&self, query: &str) -> Result<Vec<TaskId>, String>;
@@ -1217,13 +1228,16 @@ pub fn description(name: &str) -> &'static str {
              enabled, an assignment made by the user or the product owner also starts that role \
              on the task. `change` links the task to an OpenSpec change, or unlinks it when null. \
              `attachments` puts files on the task's body by path — the same as cide_task_attach; \
-             files already attached stay."
+             files already attached stay. The answer is the task's summary line plus any comments \
+             others added since your last one, not the whole task; that is cide_task_get."
         }
         tool::TASK_COMMENT => {
             "Append an entry to a task's log: what you did, what you found, or why you are \
              stopping. Comments are append-only and are how agents report back on a task. Your \
              identity is recorded by cide; do not sign the text. A person reads this, so give a \
-             report of any length structure — see `text` for the markdown the card draws."
+             report of any length structure — see `text` for the markdown the card draws. The \
+             answer is the task's summary line plus any comments others added since your previous \
+             one, not the whole task; that is cide_task_get."
         }
         tool::TASK_ASSIGN => {
             "Set the role a task is for, or pass agent: null to unassign it. This is the same as \
@@ -2979,7 +2993,7 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Updated {}.\n{}",
                 task.id,
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_ack(&task, &all, sink, false))
             ))
         }
         // Unreachable: `edits` was checked non-empty above and the loop returns on the first
@@ -3018,9 +3032,9 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         sink.attach(&id, AttachTarget::NewComment { text }, &attachments)
     };
     match outcome {
-        // The whole task comes back rather than an acknowledgement, so an agent that comments as
-        // its turn ends sees what the task now says — including any comment another agent added
-        // while it was working, which is the only way it would ever find out.
+        // Not a bare acknowledgement, so an agent that comments as its turn ends still sees any
+        // comment another author added while it was working — the only way it would ever find
+        // out. But only *those*, not the whole task: see `render_ack` for what that cost. (M124)
         Ok(task) => {
             let all = match board_for_render(tool::TASK_COMMENT, sink) {
                 Ok(all) => all,
@@ -3029,7 +3043,7 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Commented on {}.\n{}",
                 task.id,
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_ack(&task, &all, sink, true))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_COMMENT, &id, &why)),
@@ -3105,7 +3119,7 @@ fn task_link(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 task.id,
                 link_wire(link),
                 target,
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_ack(&task, &all, sink, false))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_LINK, &id, &why)),
@@ -3139,7 +3153,7 @@ fn task_unlink(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 task.id,
                 link_wire(link),
                 target,
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_ack(&task, &all, sink, false))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_UNLINK, &id, &why)),
@@ -3198,7 +3212,7 @@ fn task_attach(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 "Attached {} file(s) to {}.\n{}",
                 paths.len(),
                 task.id,
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_ack(&task, &all, sink, false))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_ATTACH, &id, &why)),
@@ -6844,6 +6858,133 @@ fn link_line(label: &str, target: &TaskId, all: &[TaskRow]) -> String {
 /// every answer, and a model has no "now" to compare one against. The information they carry that
 /// an agent can actually use — what happened after what — is already in the order: `Task::comments`
 /// is oldest first, and its doc says so.
+/// Every edge of `task`, both readings, direction labelled — the `links:` block of
+/// [`render_full`], shared with [`render_ack`] so a link answer shows the edge it wrote with its
+/// target's status and title resolved. Empty for an unlinked task.
+fn link_section(task: &Task, row: &TaskRow, all: &[TaskRow]) -> String {
+    let mut link_lines = String::new();
+    for edge in live_links(row) {
+        let label = match edge.link {
+            LinkType::BlockedBy => "blocked by",
+            LinkType::SubtaskOf => "subtask of",
+            LinkType::Related => "related to",
+        };
+        link_lines.push_str(&link_line(label, &edge.target, all));
+    }
+    let related_out: Vec<&TaskId> = live_links(row)
+        .filter(|l| l.link == LinkType::Related)
+        .map(|l| &l.target)
+        .collect();
+    for other in incoming_links(all, LinkType::BlockedBy, &task.id) {
+        link_lines.push_str(&link_line("blocks", &other.id, all));
+    }
+    for other in incoming_links(all, LinkType::SubtaskOf, &task.id) {
+        link_lines.push_str(&link_line("subtask", &other.id, all));
+    }
+    for other in incoming_links(all, LinkType::Related, &task.id) {
+        if !related_out.contains(&&other.id) {
+            link_lines.push_str(&link_line("related to", &other.id, all));
+        }
+    }
+    if link_lines.is_empty() {
+        String::new()
+    } else {
+        format!("  links:\n{link_lines}")
+    }
+}
+
+/// What a mutation answers with: the task's one-line summary, its files, and the comments other
+/// authors added since the caller's own last one. (M124)
+///
+/// # Why not the whole task, as it was
+///
+/// Every `cide_task_comment`, `cide_task_update`, `cide_task_link`, `cide_task_unlink` and
+/// `cide_task_attach` answered with [`render_full`] — body, every link, every comment since the
+/// task was opened — and a model's tool results stay in its conversation for every request after
+/// them. A day of codex runs on selfcraft (2026-09-27) averaged **11.5k characters per comment
+/// call** over 165 calls: the same body and the same log, pasted back into the context once per
+/// plan comment, progress note and status change, each copy re-sent with every later request.
+/// The caller wrote the change; it does not need the task read back to it.
+///
+/// # What is kept, and why
+///
+/// - **The summary line** ([`render_summary`], the list's own row) and **the links**, each with
+///   its target's status and title: enough to see the mutation landed as meant.
+/// - **The attachments**, the task's and the just-added comment's, paths included: a caller that
+///   just attached files needs the absolute path the store copied them to, and paths are small.
+/// - **Other authors' comments since the caller last commented** — the reason the whole task used
+///   to come back. An agent commenting as its turn ends must still see a review note or a
+///   question another author left while it worked; that is the only way it would find out. Its
+///   own comments, and everything before its last one, it has already seen or written.
+///
+/// "Since the caller's last comment" and not "since this run started", because the tracker keeps
+/// no per-reader state and the comment log already answers the question: whatever preceded the
+/// caller's own last word was on the task when it wrote it. For `cide_task_comment`, `commented`
+/// says the last comment is the one just added, so "last" means the one before it. A caller that
+/// has never commented sees every other author's comment once — the first time it mutates.
+///
+/// `cide_task_create` keeps [`render_full`] (a new task has no log to repeat) and `cide_task_get`
+/// is the explicit request for the whole task, which every tool description now points at.
+fn render_ack(task: &Task, all: &[TaskRow], sink: &dyn TaskSink, commented: bool) -> String {
+    let row = TaskRow::of(task);
+    let mut out = render_summary(&row, all);
+    out.push_str(&link_section(task, &row, all));
+    out.push_str(&attachment_lines(
+        &task.attachments,
+        &task.id,
+        sink.root(),
+        "  ",
+    ));
+    // The files of the comment just added, where the store copied them: the one part of the
+    // caller's own words it could not have known before the call.
+    if let (true, Some(new)) = (commented, task.comments.last()) {
+        out.push_str(&attachment_lines(
+            &new.attachments,
+            &task.id,
+            sink.root(),
+            "    ",
+        ));
+    }
+    let me = sink.author();
+    let log: &[cide_ipc::TaskComment] = match (commented, task.comments.split_last()) {
+        (true, Some((_, before))) => before,
+        _ => &task.comments,
+    };
+    let since = log
+        .iter()
+        .rposition(|comment| same_author(&comment.author, &me))
+        .map_or(0, |mine| mine + 1);
+    let news: Vec<&cide_ipc::TaskComment> = log[since..]
+        .iter()
+        .filter(|comment| !comment.deleted && !same_author(&comment.author, &me))
+        .collect();
+    if news.is_empty() {
+        out.push_str("  no new comments from others; the whole task is cide_task_get\n");
+    } else {
+        out.push_str("  new comments from others since your last one, oldest first:\n");
+        for comment in news {
+            out.push_str(&format!("  - from {}:\n", author_label(&comment.author)));
+            out.push_str(&indented(&comment.text));
+            out.push_str(&attachment_lines(
+                &comment.attachments,
+                &task.id,
+                sink.root(),
+                "    ",
+            ));
+        }
+    }
+    out
+}
+
+/// Whether two signatures are the same writer. A role by its id alone: the label is display text a
+/// config edit can change, and a renamed label must not make an agent a stranger to its own log.
+fn same_author(a: &TaskAuthor, b: &TaskAuthor) -> bool {
+    match (a, b) {
+        (TaskAuthor::Agent { agent: x, .. }, TaskAuthor::Agent { agent: y, .. }) => x == y,
+        _ => a == b,
+    }
+}
+
 fn render_full(task: &Task, all: &[TaskRow], root: &Path) -> String {
     // Projected once. (M68) `render_full` is handed a whole `Task` — it draws the body and the
     // log, which only a `Task` has — and needs the row for the three things that read one: the
@@ -6875,34 +7016,7 @@ fn render_full(task: &Task, all: &[TaskRow], root: &Path) -> String {
      * drawn once per pair, whichever side stores it: after a merge *both* sides can legally hold
      * the same related pair, and two lines saying one fact would read as two facts.
      */
-    let mut link_lines = String::new();
-    for edge in live_links(&row) {
-        let label = match edge.link {
-            LinkType::BlockedBy => "blocked by",
-            LinkType::SubtaskOf => "subtask of",
-            LinkType::Related => "related to",
-        };
-        link_lines.push_str(&link_line(label, &edge.target, all));
-    }
-    let related_out: Vec<&TaskId> = live_links(&row)
-        .filter(|l| l.link == LinkType::Related)
-        .map(|l| &l.target)
-        .collect();
-    for other in incoming_links(all, LinkType::BlockedBy, &task.id) {
-        link_lines.push_str(&link_line("blocks", &other.id, all));
-    }
-    for other in incoming_links(all, LinkType::SubtaskOf, &task.id) {
-        link_lines.push_str(&link_line("subtask", &other.id, all));
-    }
-    for other in incoming_links(all, LinkType::Related, &task.id) {
-        if !related_out.contains(&&other.id) {
-            link_lines.push_str(&link_line("related to", &other.id, all));
-        }
-    }
-    if !link_lines.is_empty() {
-        out.push_str("  links:\n");
-        out.push_str(&link_lines);
-    }
+    out.push_str(&link_section(task, &row, all));
     if !task.body.trim().is_empty() {
         out.push_str("  body:\n");
         out.push_str(&indented(&task.body));
@@ -8891,7 +9005,7 @@ mod tests {
     }
 
     #[test]
-    fn cide_task_link_writes_the_edge_and_answers_with_the_full_task() {
+    fn cide_task_link_writes_the_edge_and_answers_with_it_resolved() {
         let sink = board();
         let answer = call(
             tool::TASK_LINK,
@@ -8901,8 +9015,8 @@ mod tests {
         let text = text_of(&answer);
         assert!(!answer.is_error, "{text}");
         assert!(text.starts_with("Linked t-2 blockedBy t-1."), "{text}");
-        // The full task, so the model sees the edge in context — with the blocker's status and
-        // title resolved, because that is what it decides its next call from.
+        // The edge in context — with the blocker's status and title resolved, because that is
+        // what the model decides its next call from. (Not the whole task since M124.)
         assert!(
             text.contains("- blocked by t-1 [doing] Add the retry bar"),
             "{text}"
@@ -9598,8 +9712,12 @@ mod tests {
         assert_eq!(sink.tasks.lock().len(), 3);
     }
 
+    /// The answer is the summary and what *others* said since the caller last spoke — never the
+    /// caller's own words or the body read back to it (M124). The fake signs every comment as the
+    /// orchestrator, which is also its [`TaskSink::author`], so a comment by anybody else has to be
+    /// planted.
     #[test]
-    fn comment_appends_and_answers_with_the_whole_task() {
+    fn comment_appends_and_answers_with_only_what_others_said_since() {
         let sink = board();
         let answer = call(
             tool::TASK_COMMENT,
@@ -9609,8 +9727,37 @@ mod tests {
         assert!(!answer.is_error);
         let text = text_of(&answer);
         assert!(text.starts_with("Commented on t-1."), "{text}");
-        assert!(text.contains("worktree merged clean"), "{text}");
-        assert!(text.contains("- from the orchestrator"), "{text}");
+        assert!(text.contains("t-1"), "the summary line: {text}");
+        assert!(!text.contains("worktree merged clean"), "{text}");
+        assert!(text.contains("no new comments from others"), "{text}");
+
+        // A reviewer speaks after the caller's comment; the caller's next comment hears it once.
+        sink.tasks.lock()[0].comments.push(TaskComment {
+            id: CommentId::new(),
+            author: TaskAuthor::User,
+            text: "also fix the tooltip".into(),
+            at_unix_ms: 3,
+            edited_at_unix_ms: None,
+            deleted: false,
+            attachments: Vec::new(),
+        });
+        let text = text_of(&call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-1", "text": "on it" }),
+            &sink,
+        ));
+        assert!(text.contains("- from the user:"), "{text}");
+        assert!(text.contains("also fix the tooltip"), "{text}");
+        assert!(
+            !text.contains("worktree merged clean") && !text.contains("on it"),
+            "{text}"
+        );
+        let again = text_of(&call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-1", "text": "done" }),
+            &sink,
+        ));
+        assert!(!again.contains("also fix the tooltip"), "{again}");
 
         let blank = call(
             tool::TASK_COMMENT,

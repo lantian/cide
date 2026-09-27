@@ -90,6 +90,11 @@ pub const DEFAULT_VERIFY_RETRIES: u8 = 3;
 /// output, and past this a run that has not fixed it is not going to.
 pub const MAX_VERIFY_RETRIES: u8 = 20;
 
+/// The default for [`AgentsConfig::fresh_above`]: a conversation past 150k tokens is handed back
+/// fresh. (M124) The size at which the 2026-09-27 codex runs' second turns — a rebase, a review
+/// note — cost 150–200k tokens a request to carry history the task's own comments summarise.
+pub const DEFAULT_FRESH_ABOVE: u32 = 150_000;
+
 /// The default for [`AgentsConfig::stop_grace_secs`]. See that field for the argument.
 pub const DEFAULT_STOP_GRACE_SECS: u16 = 60;
 
@@ -617,6 +622,25 @@ pub struct AgentsConfig {
     /// skips it. Not on the `cide_agents_config` tool, for `verify_retries`' reason one field up:
     /// a model that could turn it on could buy itself turns.
     pub resume_after_restart: bool,
+    /// `agents.freshAbove`: past how many tokens of context a handed-back task starts its role in
+    /// a **fresh** conversation instead of continuing the last one. `0` never does. (M124)
+    ///
+    /// Continuing is right for a small conversation: the run keeps what it learned and pays
+    /// little for it. It is wrong for a large one, because every request of the new turn re-sends
+    /// the whole history — on 2026-09-27 a codex role's "rebase onto master" and "fix the review
+    /// note" turns cost 150–200k tokens *per request*, 28% of the day's input, to carry context
+    /// the task already records: the body, the run's own report comment, the review. A fresh run
+    /// reads the task and starts from those.
+    ///
+    /// Measured only where cide can measure: a codex conversation's size is the last
+    /// `token_count` in its rollout, which cide already reads for the status bar
+    /// (`cide_core::codex_cli::status_of`). Claude Code's transcripts are an internal format cide
+    /// deliberately never opens (`lifecycle::transcript_exists`), and opencode's store is a
+    /// database, so on those harnesses a hand-back continues as before whatever this says.
+    ///
+    /// Disk-only, like `isolation`: hand-edited in `.cide/config.json`, not on the wire, so no
+    /// panel round trip can reset it and no model can raise it to keep a context alive.
+    pub fresh_above: u32,
 }
 
 impl AgentsConfig {
@@ -665,6 +689,7 @@ impl Default for AgentsConfig {
             verify_exclusive: false,
             verify_retries: DEFAULT_VERIFY_RETRIES,
             resume_after_restart: true,
+            fresh_above: DEFAULT_FRESH_ABOVE,
         }
     }
 }
@@ -1742,6 +1767,11 @@ mod tests {
         assert_eq!(config.verify_retries(), 0);
         let wire: AgentsConfig = serde_json::from_str(r#"{"verifyRetries": 5}"#).expect("parses");
         assert_eq!(wire.verify_retries, 5);
+        // `agents.freshAbove` (M124): 150k unless the file says, `0` read as written (off).
+        assert_eq!(AgentsConfig::default().fresh_above, DEFAULT_FRESH_ABOVE);
+        assert_eq!(wire.fresh_above, DEFAULT_FRESH_ABOVE);
+        let off: AgentsConfig = serde_json::from_str(r#"{"freshAbove": 0}"#).expect("parses");
+        assert_eq!(off.fresh_above, 0);
     }
 
     /// `None` means "leave this alone", and a nonsense number lands as a sane one rather than as
@@ -1769,10 +1799,13 @@ mod tests {
             verify_exclusive: true,
             verify_retries: 7,
             resume_after_restart: false,
+            fresh_above: 42_000,
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.verify_retries, 7);
         assert!(!config.resume_after_restart);
+        // Disk-only: no patch field reaches it. (M124)
+        assert_eq!(config.fresh_above, 42_000);
         assert_eq!(config.max_concurrent, 5);
         assert!(config.enabled);
 

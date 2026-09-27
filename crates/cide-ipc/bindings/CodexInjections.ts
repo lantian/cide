@@ -53,7 +53,7 @@ fork: boolean,
  */
 permissions: boolean, 
 /**
- * For MR reviews, allow tools and writes inside the review checkout without approval
- * prompts, while keeping the workspace sandbox boundary.
+ * For MR reviews, suppress approval prompts while leaving the wrapper or Codex config in
+ * charge of the workspace sandbox boundary.
  */
 reviewPermissions: boolean, };

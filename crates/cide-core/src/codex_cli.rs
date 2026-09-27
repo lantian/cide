@@ -657,6 +657,25 @@ pub fn rollout_of(home: &std::path::Path, thread: &str) -> Option<PathBuf> {
     None
 }
 
+/// How full `thread`'s context was at its last model response, in tokens — the last
+/// `token_count`'s `last_token_usage.total_tokens`, [`status_of`]'s `current_usage`. `None` when
+/// the rollout is gone or has no count yet. (M124)
+///
+/// What `agents.freshAbove` weighs before a handed-back task continues this conversation: every
+/// request of a continued turn re-sends this much, so it is the per-request price of continuing.
+pub fn context_tokens(thread: &str) -> Option<u64> {
+    let rollout = rollout_of(&codex_home()?, thread)?;
+    context_tokens_in(&rollout)
+}
+
+/// [`context_tokens`] for a rollout already found — the part a test can hand a file.
+pub fn context_tokens_in(rollout: &std::path::Path) -> Option<u64> {
+    status_of(rollout, None)?
+        .get("context_window")?
+        .get("current_usage")?
+        .as_u64()
+}
+
 /// Whether codex still holds `thread`, with the resume addition switched on.
 pub fn resumable(thread: &str, resume_enabled: bool) -> bool {
     resume_enabled && codex_home().is_some_and(|home| rollout_of(&home, thread).is_some())
@@ -835,6 +854,8 @@ mod tests {
         assert_eq!(status["context_window"]["context_window_size"], 258400);
         assert_eq!(status["context_window"]["total_input_tokens"], 20000);
         assert_eq!(status["rate_limit"]["used_percent"], 90.0);
+        // What `agents.freshAbove` weighs: the same figure, as a number. (M124)
+        assert_eq!(context_tokens_in(&file), Some(14395));
 
         // Before any turn: the hook's model alone.
         let empty = dir.join("rollout-2026-09-24T10-21-08-x.jsonl");
@@ -843,6 +864,8 @@ mod tests {
         assert_eq!(status["model"]["id"], "gpt-6-astra");
         assert!(status.get("context_window").is_none());
         assert!(status_of(&empty, None).is_none());
+        // And no count yet is no size, not a size of zero — which would always continue.
+        assert_eq!(context_tokens_in(&empty), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

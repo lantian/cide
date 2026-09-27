@@ -874,10 +874,20 @@ fn tell_route(
 /// "not a conversation the codex harness can re-open". **qwen never continues**: its respawn
 /// resumes the new run's own id and ignores the one it is given, so it would open an empty
 /// conversation and look like a continuation.
+///
+/// **A conversation past `agents.freshAbove` is not continued either** (M124): `context` is its
+/// size in tokens where cide can read one (codex's rollout — see `AgentsConfig::fresh_above` for
+/// why only there), and every request of a continued turn re-sends that much. The task holds
+/// the body, the run's report and the review, which is what a fresh run starts from. Checked
+/// last, so a conversation that could not be continued anyway is refused for that reason, and
+/// `None` — no figure — always continues: a wrong "too big" would throw away a context that
+/// was cheap to keep.
 fn continue_route(
     previous: Option<(RunId, cide_ipc::Harness, String)>,
     harness: cide_ipc::Harness,
     fresh: bool,
+    context: Option<u64>,
+    fresh_above: u32,
 ) -> std::result::Result<(RunId, String), Option<String>> {
     let Some((from, was, conversation)) = previous else {
         return Err(None);
@@ -898,6 +908,18 @@ fn continue_route(
              CLI that started it",
             harness_word(was),
             harness_word(harness)
+        )));
+    }
+    if let Some(tokens) = context
+        && fresh_above > 0
+        && tokens > u64::from(fresh_above)
+    {
+        return Err(Some(format!(
+            "fresh: run {from}'s conversation had grown to {}k tokens, past agents.freshAbove \
+             ({}k), and continuing it would re-send all of it with every request — the new run \
+             starts from the task, its comments included",
+            tokens / 1000,
+            fresh_above / 1000
         )));
     }
     Ok((from, conversation))
@@ -978,7 +1000,17 @@ pub(crate) async fn dispatch_or_duplicate(
             .as_ref()
             .filter(|_| request.external.is_none())
             .and_then(|task| lookup.last_conversation(project, &spec.agent, task));
-        let route = continue_route(previous, spec.harness, request.fresh);
+        // How big that conversation is, where cide can tell — codex's rollout, on the same CLI
+        // (a conversation another CLI minted is refused before its size matters). Read here on
+        // the worker with the rest of the disk; the config per dispatch, `overrides`' reason.
+        let context = previous
+            .as_ref()
+            .filter(|(_, was, _)| {
+                *was == cide_ipc::Harness::Codex && spec.harness == cide_ipc::Harness::Codex
+            })
+            .and_then(|(_, _, thread)| cide_core::codex_cli::context_tokens(thread));
+        let fresh_above = cide_agents::config::load(&root).agents.fresh_above;
+        let route = continue_route(previous, spec.harness, request.fresh, context, fresh_above);
         Ok(Planned::Spec(Box::new(spec), route))
     })
     .await?;
@@ -2645,28 +2677,63 @@ mod tests {
         use cide_ipc::Harness::{Claude, Codex, Opencode, Qwen};
         let from = RunId::new();
         let previous = |harness| Some((from, harness, "thread".to_string()));
-        assert_eq!(continue_route(None, Codex, false), Err(None));
+        assert_eq!(continue_route(None, Codex, false, None, 150_000), Err(None));
         for harness in [Claude, Codex, Opencode] {
             assert_eq!(
-                continue_route(previous(harness), harness, false),
+                continue_route(previous(harness), harness, false, None, 150_000),
                 Ok((from, "thread".to_string())),
                 "{harness:?}"
             );
         }
-        let why = continue_route(previous(Opencode), Codex, false).expect_err("another CLI");
+        let why = continue_route(previous(Opencode), Codex, false, Some(900_000), 150_000)
+            .expect_err("another CLI");
         assert!(
             why.as_deref()
                 .is_some_and(|w| w.contains("opencode") && w.contains("codex")),
             "{why:?}"
         );
-        let why = continue_route(previous(Qwen), Qwen, false).expect_err("qwen");
+        let why = continue_route(previous(Qwen), Qwen, false, None, 150_000).expect_err("qwen");
         assert!(
             why.as_deref().is_some_and(|w| w.contains("qwen")),
             "{why:?}"
         );
-        let why = continue_route(previous(Codex), Codex, true).expect_err("fresh");
+        let why = continue_route(previous(Codex), Codex, true, None, 150_000).expect_err("fresh");
         assert!(
             why.as_deref().is_some_and(|w| w.contains("as asked")),
+            "{why:?}"
+        );
+    }
+
+    /// Past `agents.freshAbove` a conversation is not continued, at it or under it it is, `0`
+    /// switches the rule off, and no figure never counts as too big. (M124)
+    #[test]
+    fn a_dispatch_starts_fresh_past_the_size_a_continuation_is_worth() {
+        use cide_ipc::Harness::Codex;
+        let from = RunId::new();
+        let previous = || Some((from, Codex, "thread".to_string()));
+        let kept = Ok((from, "thread".to_string()));
+        assert_eq!(
+            continue_route(previous(), Codex, false, Some(150_000), 150_000),
+            kept
+        );
+        assert_eq!(
+            continue_route(previous(), Codex, false, Some(40_000), 150_000),
+            kept
+        );
+        assert_eq!(
+            continue_route(previous(), Codex, false, None, 150_000),
+            kept
+        );
+        assert_eq!(
+            continue_route(previous(), Codex, false, Some(900_000), 0),
+            kept,
+            "0 is off"
+        );
+        let why =
+            continue_route(previous(), Codex, false, Some(212_345), 150_000).expect_err("too big");
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("212k") && w.contains("agents.freshAbove (150k)")),
             "{why:?}"
         );
     }

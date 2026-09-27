@@ -666,6 +666,10 @@ impl TaskSink for StoreSink {
 
     // From the connection's identity, which `app_binder` decided — the same source as the author,
     // so nothing a call carries can make a run look like the orchestrator.
+    fn author(&self) -> TaskAuthor {
+        self.author.clone()
+    }
+
     fn by_run(&self) -> bool {
         matches!(self.author, TaskAuthor::Agent { .. })
     }

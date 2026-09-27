@@ -190,8 +190,38 @@ pub const TRACKER_TOOLS: &[&str] = &[
 /// const, so a harness whose namespacing differs cannot be told the other one's spelling — see
 /// [`Harness::tool_name`], which is required for the same reason.
 pub fn tracker_preamble(harness: &dyn Harness) -> String {
-    fill_tools(TRACKER_PREAMBLE, harness)
+    format!(
+        "{}\n\n{WAITING_PREAMBLE}",
+        fill_tools(TRACKER_PREAMBLE, harness)
+    )
 }
+
+/// How a run waits for its own long command. Rides with [`TRACKER_PREAMBLE`], in every harness's
+/// brief. (M124)
+///
+/// # The failure it prevents, as measured
+///
+/// A day of codex runs on selfcraft (2026-09-27, `codex-usage-2026-09-27.md` at the repo root at
+/// the time) spent **28% of all input tokens** — 39% for its most expensive role — on a model
+/// asking a running `check.sh`/`e2e.sh`/render "done yet?": 575 polls at `yield_time_ms: 1000`
+/// alone cost 71.9M tokens. Every poll is a whole request, and a request re-sends the whole
+/// conversation, so a minute-long build polled each second costs sixty times a 150k-token context
+/// to learn one exit code. The project's own AGENTS.md said "keep polling … until it exits"; cide
+/// said nothing, and nothing is exactly what a model fills with its tool's default.
+///
+/// # Why here and not in the tracker paragraph, and why in every harness
+///
+/// Not inside [`TRACKER_PREAMBLE`]: that paragraph has a budget and a subject, and this is
+/// neither. Appended by [`tracker_preamble`] rather than folded by each harness, because every
+/// fold already calls that function in the same gate and the same position — one place, so the
+/// parity between claude, qwen, codex and opencode briefs cannot drift, and a run cide dispatches
+/// hears it whatever CLI it lands on. Claude's Bash tool and opencode's block until the command
+/// ends or times out, so the sentence costs them nothing, but a Claude run that backgrounds a
+/// command and checks on it is the same failure in another spelling.
+///
+/// It names no tool, and says `yield_time_ms` only as an example — the parameter is codex's, and a
+/// model on another CLI reads it as "the longest wait your tool offers".
+pub const WAITING_PREAMBLE: &str = "Wait for a long command — a build, a test suite, a render, an e2e run — in as few calls as you can: start it once, give the call the longest wait its tool allows (on an exec tool with a yield time, `yield_time_ms` of 120000 or more), and if it is still running, wait again just as long. Never check on a running command every few seconds: each check is a whole request that re-sends this entire conversation to learn nothing new. When a command prints a lot, send its output to a file and read the tail or grep it, rather than letting pages of log into the conversation.";
 
 /// Replace every `{<tool>}` in `text` with the name `harness` makes of it.
 ///
@@ -1824,7 +1854,7 @@ mod tests {
         );
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),
-            format!("{BRIEF}\n\n{TRACKER_PREAMBLE}")
+            format!("{BRIEF}\n\n{TRACKER_PREAMBLE}\n\n{WAITING_PREAMBLE}")
         );
 
         // And each really is in its own spelling — otherwise the normalisation above could be
@@ -1859,7 +1889,26 @@ mod tests {
         );
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),
-            format!("{BRIEF}\n\n{TRACKER_PREAMBLE}\n\n{ADHOC_PREAMBLE}")
+            format!("{BRIEF}\n\n{TRACKER_PREAMBLE}\n\n{WAITING_PREAMBLE}\n\n{ADHOC_PREAMBLE}")
+        );
+    }
+
+    /// A budget ([`TRACKER_PREAMBLE`]'s rule), and the one fact the paragraph exists for (M124): a
+    /// run is told not to poll a running command every few seconds, in words that name no tool.
+    #[test]
+    fn the_waiting_preamble_stays_within_its_budget_and_names_no_tool() {
+        assert!(
+            WAITING_PREAMBLE.len() < 700,
+            "the waiting preamble has grown to {} bytes",
+            WAITING_PREAMBLE.len()
+        );
+        assert!(
+            WAITING_PREAMBLE.contains("Never check on a running command every few seconds"),
+            "{WAITING_PREAMBLE}"
+        );
+        assert!(
+            !WAITING_PREAMBLE.contains("mcp__") && !WAITING_PREAMBLE.contains("cide_task_"),
+            "a tool named here would need the namespacing test: {WAITING_PREAMBLE}"
         );
     }
 
