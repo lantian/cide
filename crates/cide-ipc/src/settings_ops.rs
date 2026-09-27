@@ -18,6 +18,18 @@ use crate::settings::{
     InspectionSettings, ProxySettings, SidebarSettings, TerminalSettings,
 };
 
+/// How [`SettingsPatch::accent`] moves the accent. A separate `Reset` rather than
+/// `Option<Option<_>>`, which serde cannot tell from an absent field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AccentPatch {
+    /// Any CSS-style hex; refused by `settings_set` if it is not one or has no hue.
+    Set { base: String },
+    /// Back to the shipped red.
+    Reset,
+}
+
 /// A partial update to [`crate::Settings`]. `None` means "leave this alone".
 ///
 /// Patching is per *top-level* field: a caller changing one editor option sends the whole
@@ -50,6 +62,11 @@ pub struct SettingsPatch {
     /// [`crate::settings::clamp_ui_font_size`] for what that would paint.
     #[ts(optional)]
     pub ui_font_size: Option<f32>,
+    /// Pick or reset the accent. Carries only the picked colour: the fitted variants are
+    /// computed where this lands, so no caller can store an illegible one. See
+    /// [`crate::settings::Accent`].
+    #[ts(optional)]
+    pub accent: Option<AccentPatch>,
     #[ts(optional)]
     pub each_project_keeps_claude_tab: Option<bool>,
     #[ts(optional)]
@@ -136,6 +153,10 @@ pub struct SettingsPatch {
     /// `0600` file precisely so this field can be an ordinary, round-trippable group.
     #[ts(optional)]
     pub remote: Option<crate::settings::RemoteSettings>,
+    /// The start-up update check and the one skipped version. Sent whole: *Skip this version*
+    /// and the Settings toggle both hold the group they read and change one field of it.
+    #[ts(optional)]
+    pub update: Option<crate::settings::UpdateSettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

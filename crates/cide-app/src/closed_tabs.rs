@@ -379,6 +379,27 @@ mod tests {
         assert_eq!(stack.depth(project), 1);
     }
 
+    /// A Review or Plan tab cide opened by itself is remembered like any other Claude tab.
+    ///
+    /// Its child is ended at the close, but the transcript is not, and `tab_reopen_closed`
+    /// resumes it. A refusal here — at the push, where this stack refuses things — would bring
+    /// back the reported bug by a second door: the tab could not be reopened at all.
+    #[test]
+    fn a_tab_cide_opened_by_itself_is_remembered() {
+        let stack = ClosedTabs::default();
+        let project = ProjectId::new();
+        stack.push(ClosedTab {
+            project,
+            kind: TabKind::ClaudeFull {
+                title: "Plan - 2026-09-26 10:00:00".into(),
+                ephemeral: true,
+            },
+            index: 1,
+            tree: tree(),
+        });
+        assert_eq!(stack.depth(project), 1);
+    }
+
     #[test]
     fn the_stack_forgets_the_oldest_rather_than_growing_without_end() {
         let stack = ClosedTabs::default();

@@ -308,23 +308,17 @@
 }
 
 /*
- * Filled amber with the background colour as the ink, exactly as the tab strip's badge and the
- * pane title bar's marker are, so the three levels of one signal read as one signal.
- *
- * `--yellow` and not `--accent`: the accent is this app's *here you are* — the active project
- * tab's own 2px top rule is drawn in it — and a mark meaning "come back to a project you are
- * **not** in" has to be distinguishable from that at a glance, most of all when both are on
- * the same 34px bar.
- *
- * The inversion is what makes one rule serve both themes; `TabStrip.module.css` states the
- * contrast measurements, and this uses the identical pair rather than restating them.
+ * The kit's `Counter` in `accent`, identical to the tab strip's chip so the two levels of one
+ * signal read as one: the accent gradient under white ink (`--on-accent`), with the fill's lit
+ * edge. `docs/ui-kit.md` names "an awaiting-input counter" as what `accent` is for; the amber
+ * this wore before the redesign meant *waiting on someone else*. `TabStrip.module.css`'s
+ * `.awaitingOn` carries the argument, including why the active tab's accent rule no longer
+ * forces amber here.
  */
-/* The kit's `Counter` in yellow ("waiting on someone"): the amber gradient under its dark ink
-   (`--on-yellow`, 6.8–8.8:1), with the fill's lit edge. */
 .awaitingOn {
-  background: var(--grad-yellow);
+  background: var(--grad-accent-ink);
   box-shadow: var(--fill-sheen);
-  color: var(--on-yellow);
+  color: var(--on-accent);
   font-weight: 600;
 }
 
@@ -409,6 +403,10 @@
  * over quiet projects animates nothing at all rather than turning inside a 0px box.
  */
 .runningSpin {
+  /* The mark in the user's accent (Settings → Appearance), the figure beside it stays dim. The
+     user's call (2026-09-26): inheriting `.runningOn`'s grey read as a disabled mark rather than
+     work, and the tab strip's spinner wears the same colour — `TabStrip.module.css`. */
+  color: var(--accent);
   animation: header-running-spin var(--dur-sweep) linear infinite;
   animation-play-state: var(--motion-loop, running);
 }

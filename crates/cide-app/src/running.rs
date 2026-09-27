@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use cide_ipc::{
     PaneKind, ProjectId, ProjectRunning, ProjectRunningSet, RunState, SessionId, SessionState,
-    TaskBoard, TaskId, TaskRow, Workspace,
+    TabId, TabRunning, TaskBoard, TaskId, TaskRow, Workspace,
 };
 use tauri::{AppHandle, Manager};
 
@@ -107,8 +107,24 @@ pub(crate) enum Busy {
 ///
 /// Everything with a child or a claim on one: `Queued` has no child yet but has a place in the
 /// queue, `Paused` is frozen but holds its worktree, `Idle` is alive between turns. Only the
-/// three that are genuinely over — `Finished`, `Failed`, and `Interrupted`, whose child died
-/// with a previous cide — say nothing about now.
+/// two that are genuinely over — `Finished` and `Failed` — say nothing about now.
+///
+/// ## `Interrupted` is a claim, not history
+///
+/// It used to sit with the two above, on the reading that its child died with a previous cide and
+/// so it says nothing about now. It says a great deal: it is the row a restart leaves behind for
+/// *every* run that still had a child — running, idle, or **paused** — and it holds its worktree,
+/// its task and its conversation, waiting for a person to press Resume or Discard. Counting it as
+/// over meant a restart turned a paused project's runs into a quiet project, and the spinner
+/// planned over them five minutes later (selfcraft, a `sprite-artist` run paused before the dev
+/// instance restarted: the planning tab opened while the Agents panel still offered Resume). A
+/// planner at that point either re-assigns the task the interrupted run holds or plans around a
+/// worktree somebody is about to resume into. Discard is the way to release it, and it ends the
+/// row as `Failed`.
+///
+/// The review carve-out applies to it as to `Idle`, for the same reason: a run whose task is
+/// already in review handed its work in before the restart, and waiting on it is waiting on a
+/// person — the situation the wake exists for.
 ///
 /// Wider than `RunState::counts_as_work`, and that is the point: that predicate answers *is this
 /// run accruing time*, which is a billing question. This one answers *is there anything in
@@ -138,12 +154,15 @@ pub(crate) enum Busy {
 /// badge that counted them would have gone from wrong to slightly-less-wrong. `Idle` is a live
 /// child between turns, which is the Agents panel's business and not a count of work in flight.
 ///
-/// `task_in_review` is not consulted at all here, and that is not an oversight: `Idle` is
-/// already out, and it was the only arm the flag ever qualified.
+/// `task_in_review` is not consulted at all here, and that is not an oversight: `Idle` and
+/// `Interrupted` are already out, and they are the only arms the flag qualifies.
 pub(crate) fn run_is_busy(state: &RunState, task_in_review: bool, asking: Busy) -> bool {
     match state {
         // Over, under every reading.
-        RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted => false,
+        RunState::Finished { .. } | RunState::Failed { .. } => false,
+        // No child — so never on the header's chip — but a claim waiting on Resume or Discard,
+        // which the spinner must not plan over. See `Interrupted is a claim` above.
+        RunState::Interrupted => asking == Busy::Claimed && !task_in_review,
         // A child exists and the turn is live.
         RunState::Starting | RunState::Running | RunState::AwaitingPermission => true,
         // A claim on a slot or a worktree, with nothing executing behind it.
@@ -267,6 +286,7 @@ pub(crate) fn counts_for(
             project,
             runs: 0,
             panes: 0,
+            tabs: Vec::new(),
         };
     };
 
@@ -294,11 +314,13 @@ pub(crate) fn counts_for(
     // badge that said `2` about one mirrored session would be counting windows onto a thing
     // rather than the thing, which is the point `awaitingRule::awaitingAmong` makes at length
     // for the chip sitting next to this one.
-    let sessions: BTreeSet<SessionId> = cide_core::workspace::session_panes(ws, Some(project))
-        .into_iter()
-        .filter(|found| found.pane.kind == PaneKind::Claude)
-        .map(|found| found.session)
-        .collect();
+    let found: Vec<(Option<TabId>, SessionId)> =
+        cide_core::workspace::session_panes(ws, Some(project))
+            .into_iter()
+            .filter(|found| found.pane.kind == PaneKind::Claude)
+            .map(|found| (found.tab, found.session))
+            .collect();
+    let sessions: BTreeSet<SessionId> = found.iter().map(|(_, session)| *session).collect();
 
     let ptys = app.try_state::<crate::state::SessionRegistry>();
     let alive = |session: SessionId| {
@@ -306,7 +328,8 @@ pub(crate) fn counts_for(
             .and_then(|ptys| ptys.get(session))
             .is_some_and(|pty| !pty.has_exited())
     };
-    let panes = match app.try_state::<crate::hooks::HookServer>() {
+    let hooks = app.try_state::<crate::hooks::HookServer>();
+    let panes = match &hooks {
         Some(hooks) => sessions
             .iter()
             .filter(|session| {
@@ -329,11 +352,67 @@ pub(crate) fn counts_for(
             .count(),
     };
 
+    // Per tab, for the strip. Asked only of the sessions a tab shows, and with the narrower
+    // reading `ProjectRunning::tabs` documents: `Busy` alone, so a permission prompt is the
+    // awaiting badge's and never also a turning spinner on the same one-console tab. No hook
+    // server means no tab spins — unlike the project count's fallback above there is no
+    // conservative direction worth taking for a decoration.
+    let tabs = match &hooks {
+        Some(hooks) => tabs_working(&found, |session| {
+            pane_is_turning(
+                alive(session),
+                registry.owns_session(session),
+                hooks.state(session),
+            )
+        }),
+        None => Vec::new(),
+    };
+
     ProjectRunning {
         project,
         runs: runs as u32,
         panes: panes as u32,
+        tabs,
     }
+}
+
+/// Whether a console pane should turn its **tab's** spinner: [`pane_is_busy`]'s `Working`
+/// reading, narrowed to a live turn. `ProjectRunning::tabs` says why a permission prompt is left
+/// to the awaiting badge.
+pub(crate) fn pane_is_turning(alive: bool, owned_by_run: bool, state: SessionState) -> bool {
+    state == SessionState::Busy && pane_is_busy(alive, owned_by_run, state, Busy::Working)
+}
+
+/// Group `(tab, session)` pairs into per-tab counts of turning sessions.
+///
+/// Pure, so the grouping is testable without an `AppHandle`. De-duplicated per tab — two panes
+/// in one tab mirroring one child are one console working — but **not** across tabs: a session
+/// visible in two tabs turns both, because each is showing it. A detached pane (`None`) is in no
+/// tab. Tabs come out in first-seen order, which `session_panes` makes tab order, and only with a
+/// count above zero.
+pub(crate) fn tabs_working(
+    found: &[(Option<TabId>, SessionId)],
+    turning: impl Fn(SessionId) -> bool,
+) -> Vec<TabRunning> {
+    let mut out: Vec<(TabId, BTreeSet<SessionId>)> = Vec::new();
+    for (tab, session) in found {
+        let Some(tab) = tab else { continue };
+        if !turning(*session) {
+            continue;
+        }
+        match out.iter_mut().find(|(seen, _)| seen == tab) {
+            Some((_, sessions)) => {
+                sessions.insert(*session);
+            }
+            None => out.push((*tab, BTreeSet::from([*session]))),
+        }
+    }
+    out.into_iter()
+        .map(|(tab, sessions)| TabRunning {
+            tab,
+            panes: sessions.len() as u32,
+        })
+        .collect()
 }
 
 /// Every open project with something running, in workspace order, plus a fresh generation.
@@ -593,7 +672,7 @@ mod tests {
     /// quiet — [`run_is_busy`]'s argument, asserted rather than left to the reader. And the
     /// three that are genuinely over say nothing about now, whatever the board says.
     #[test]
-    fn only_the_three_states_with_no_child_read_as_quiet() {
+    fn only_the_two_ended_states_read_as_quiet() {
         let busy = [
             RunState::Queued,
             RunState::Starting,
@@ -601,6 +680,8 @@ mod tests {
             RunState::Idle,
             RunState::AwaitingPermission,
             RunState::Paused { since_unix_ms: 1 },
+            // What a restart makes of every run that had a child, a paused one included.
+            RunState::Interrupted,
         ];
         for state in busy {
             assert!(
@@ -611,7 +692,6 @@ mod tests {
         let over = [
             RunState::Finished { code: 0 },
             RunState::Failed { reason: "x".into() },
-            RunState::Interrupted,
         ];
         for state in over {
             assert!(
@@ -621,6 +701,24 @@ mod tests {
             assert!(!run_is_busy(&state, true, Busy::Claimed));
             assert!(!run_is_busy(&state, false, Busy::Working));
         }
+    }
+
+    /// **A restart must not turn a paused run into a quiet project.** (Reported from selfcraft:
+    /// a run paused, the dev instance restarted, the run came back `Interrupted` with Resume on
+    /// its row — and five minutes later the spinner opened a planning tab over it.)
+    ///
+    /// It holds the spinner off unless its task has already gone to review, exactly like `Idle`,
+    /// and it never reaches the header's chip: there is no child, so nothing is running.
+    #[test]
+    fn an_interrupted_run_holds_the_spinner_but_not_the_chip() {
+        let interrupted = RunState::Interrupted;
+        assert!(run_is_busy(&interrupted, false, Busy::Claimed));
+        assert!(
+            !run_is_busy(&interrupted, true, Busy::Claimed),
+            "its task is in review: the work was handed in before the restart"
+        );
+        assert!(!run_is_busy(&interrupted, false, Busy::Working));
+        assert!(!run_is_busy(&interrupted, true, Busy::Working));
     }
 
     /// **Pause means nothing is running, and the header must say so.**
@@ -724,11 +822,13 @@ mod tests {
             project,
             runs: 1,
             panes: 0,
+            tabs: Vec::new(),
         }];
         let two = vec![ProjectRunning {
             project,
             runs: 2,
             panes: 0,
+            tabs: Vec::new(),
         }];
 
         // Whatever the static holds from another test in this binary, the first distinct set is
@@ -752,5 +852,72 @@ mod tests {
         let first = AT.fetch_add(1, Ordering::Relaxed);
         let second = AT.fetch_add(1, Ordering::Relaxed);
         assert!(second > first);
+    }
+
+    /// **The tab strip's spinner is a live turn, and nothing else.** A permission prompt is the
+    /// awaiting badge's — a one-console tab must never light both chips about one session —
+    /// while the header's wider reading still counts it.
+    #[test]
+    fn a_tab_turns_only_for_a_live_turn() {
+        assert!(pane_is_turning(true, false, SessionState::Busy));
+        assert!(!pane_is_turning(
+            true,
+            false,
+            SessionState::AwaitingPermission
+        ));
+        assert!(pane_is_busy(
+            true,
+            false,
+            SessionState::AwaitingPermission,
+            Busy::Working
+        ));
+        for quiet in [
+            SessionState::Idle,
+            SessionState::AwaitingInput,
+            SessionState::Spawning,
+            SessionState::Paused,
+            SessionState::Splash,
+            SessionState::Exited { code: 0 },
+        ] {
+            assert!(!pane_is_turning(true, false, quiet));
+        }
+        // A dead child, and a run's mirror, are not the tab's to spin for either.
+        assert!(!pane_is_turning(false, false, SessionState::Busy));
+        assert!(!pane_is_turning(true, true, SessionState::Busy));
+    }
+
+    /// Per-tab grouping: a mirror within one tab is one console, a session shown in two tabs
+    /// turns both, a detached pane is in no tab, and a tab with nothing turning is absent.
+    #[test]
+    fn tabs_count_their_own_turning_consoles() {
+        let (home, full, quiet) = (TabId::new(), TabId::new(), TabId::new());
+        let (a, b, c, idle) = (
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+        );
+        let found = [
+            (Some(home), a),
+            (Some(home), a), // mirrored in the grid
+            (Some(home), b),
+            (Some(full), b), // the same child shown in a second tab
+            (Some(quiet), idle),
+            (None, c), // detached
+        ];
+        let tabs = tabs_working(&found, |session| session != idle);
+        assert_eq!(
+            tabs,
+            vec![
+                TabRunning {
+                    tab: home,
+                    panes: 2
+                },
+                TabRunning {
+                    tab: full,
+                    panes: 1
+                },
+            ]
+        );
     }
 }

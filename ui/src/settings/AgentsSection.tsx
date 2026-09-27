@@ -76,6 +76,8 @@
  * too.
  */
 import { Select as KitSelect } from '@/kit/components/Select'
+import { Checkbox } from '@/kit/components/Choice'
+import { TextInput } from '@/kit/components/Field'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   agentDefs,
@@ -84,6 +86,8 @@ import {
   type AgentOverride,
   type OrchestrationConfig,
   type OrchestrationPatch,
+  type OverrideProfileOp,
+  type OverrideProfilesState,
   type ProjectId,
   type ProjectOverrides,
 } from '@/ipc/client'
@@ -110,6 +114,7 @@ import {
   EFFORT_SUGGESTIONS,
   HARNESSES,
   PERMISSION_MODES,
+  SANDBOX_NEEDS,
   SCOPES,
   blankDraft,
   canSave,
@@ -150,6 +155,7 @@ import {
   type Row,
   type Scope,
   type HarnessName,
+  takesPool,
 } from './agentsDraft'
 import { Icon } from '@/icons/Icon'
 
@@ -285,6 +291,12 @@ function AgentsEditor({ project }: { project: ProjectId }) {
    */
   const [overrides, setOverrides] = useState<ProjectOverrides | null>(null)
   const [overrideError, setOverrideError] = useState<string | null>(null)
+  /**
+   * The saved override profiles and which is live (M123), or `null` on a build with no handler —
+   * then no profile bar is drawn. Only the names travel: a profile's rows become visible by
+   * switching to it, which is what the live table below then shows.
+   */
+  const [profiles, setProfiles] = useState<ProfileNames | null>(null)
   /**
    * The pools a row may name, from **global** settings.
    *
@@ -509,6 +521,16 @@ function AgentsEditor({ project }: { project: ProjectId }) {
       .catch((error: unknown) => {
         if (live) setOverrideError(errorText(error))
       })
+    // The profiles on the same key: a switch made through `cide_agent_override_profile` emits the
+    // roster, which moves `rosterMark`, so the bar follows a switch nobody made on this screen.
+    void agentDefs
+      .overrideProfiles(project)
+      .then((next) => {
+        if (live) setProfiles(next === null ? null : profileNames(next))
+      })
+      .catch((error: unknown) => {
+        if (live) setOverrideError(errorText(error))
+      })
     return () => {
       live = false
     }
@@ -599,6 +621,24 @@ function AgentsEditor({ project }: { project: ProjectId }) {
       void agentDefs
         .setOverrides(project, next)
         .then(setOverrides)
+        .catch((error: unknown) => setOverrideError(errorText(error)))
+    },
+    [project],
+  )
+
+  /**
+   * One override-profile operation. The answer carries the live table as well as the names,
+   * because a switch rewrites every row and the screen must draw what Rust stored, not guess it.
+   */
+  const profileOp = useCallback(
+    (op: OverrideProfileOp) => {
+      setOverrideError(null)
+      void agentDefs
+        .overrideProfileOp(project, op)
+        .then((next) => {
+          setOverrides(next.overrides)
+          setProfiles(profileNames(next))
+        })
         .catch((error: unknown) => setOverrideError(errorText(error)))
     },
     [project],
@@ -991,6 +1031,46 @@ function AgentsEditor({ project }: { project: ProjectId }) {
             />
           )}
           {config !== null && (
+            /*
+             * M114. Not under `finishInNewTab`: the gate holds the reviewer whichever road the
+             * announcement takes, and a red verify goes back to the run on both.
+             */
+            <SettingRow
+              label="Verify failures before the orchestrator takes over"
+              hint={
+                'When a run sets its task to review, the project’s verify command runs on ' +
+                'its branch before any reviewer is told. If it fails, the output goes back to ' +
+                'the same run to fix, up to this many times in a row; the next failure goes to ' +
+                'the orchestrator instead. 0 sends every failure to the orchestrator.'
+              }
+              control={
+                <NumberField
+                  label="Verify failures before the orchestrator takes over"
+                  value={config.verifyRetries}
+                  min={0}
+                  max={20}
+                  onChange={(next) => patchConfig({ verifyRetries: Math.round(next) })}
+                />
+              }
+            />
+          )}
+          {config !== null && (
+            /*
+             * M118. On by default: a restart is cide's, not the work's, and a run it interrupted
+             * otherwise waits as an Interrupted row until somebody presses Resume.
+             */
+            <ToggleRow
+              label="Continue interrupted runs when cide starts"
+              hint={
+                'Runs that a cide restart or quit interrupted go back through the queue at the ' +
+                'next launch and continue their conversations, as pressing Resume would. A run ' +
+                'whose task has a newer run, or that is open in a pane, is left alone.'
+              }
+              checked={config.resumeAfterRestart}
+              onChange={(next) => patchConfig({ resumeAfterRestart: next })}
+            />
+          )}
+          {config !== null && (
             <ToggleRow
               label="Wake this project when it goes quiet"
               hint={
@@ -1140,6 +1220,7 @@ function AgentsEditor({ project }: { project: ProjectId }) {
         */}
       {overrides !== null && (
         <Group title="Local overrides">
+          {profiles !== null && <OverrideProfileBar profiles={profiles} onOp={profileOp} />}
           <ProjectOverrideRows
             overrides={overrides}
             roles={
@@ -1903,6 +1984,69 @@ function RoleForm({
         />
 
         {/*
+          * **Sandbox: what this role may do past its harness's sandbox.** (M119)
+          *
+          * cide's keys only — a Claude Code subagent runs under Claude Code, whose own settings
+          * decide its sandbox, and Rust refuses the three on one. Drawn for every cide role
+          * rather than only a codex one, because `allow-commands` means something on claude too
+          * (run without asking) and a role's harness can be redirected by a local override.
+          */}
+        {!isClaudeScope(draft.scope) && (
+          <>
+            <Field
+              label="Allowed commands"
+              hint="Command prefixes this role runs without being asked, as typed: blender -b, tools/ci/runners/e2e.sh. On codex a command that is wholly one of these runs outside the sandbox — so the run must call it directly, not under timeout, in a pipe or inside sh -c. On claude they join --allowedTools as Bash(<prefix>:*). Shells, launchers (env, timeout, sudo) and shell metacharacters are refused: they would allow everything."
+              errors={errorsFor('allowCommands')}
+              control={
+                <LineRows
+                  lines={draft.allowCommands}
+                  noun="command"
+                  onChange={(allowCommands) => onEdit('allowCommands', { allowCommands })}
+                />
+              }
+            />
+            <Field
+              label="Needs"
+              hint="What the work needs from a sandbox. On codex any of these turns the sandbox's network on: with it off, codex refuses unix sockets, so an X server cannot listen and Blender hangs on PulseAudio."
+              errors={errorsFor('needs')}
+              control={
+                <div className={styles.tools}>
+                  {SANDBOX_NEEDS.map(({ need, label, hint }) => (
+                    <Checkbox
+                      key={need}
+                      label={label}
+                      hint={hint}
+                      checked={draft.needs.includes(need)}
+                      onChange={(checked) =>
+                        onEdit('needs', {
+                          needs: checked
+                            ? SANDBOX_NEEDS.map((n) => n.need).filter(
+                                (n) => n === need || draft.needs.includes(n),
+                              )
+                            : draft.needs.filter((n) => n !== need),
+                        })
+                      }
+                    />
+                  ))}
+                </div>
+              }
+            />
+            <Field
+              label="Writable directories"
+              hint="Directories outside the worktree this role may write — a cache, an asset store — absolute or ~/…. The worktree itself is already writable. Added to codex's sandbox as writable roots."
+              errors={errorsFor('writableDirs')}
+              control={
+                <LineRows
+                  lines={draft.writableDirs}
+                  noun="directory"
+                  onChange={(writableDirs) => onEdit('writableDirs', { writableDirs })}
+                />
+              }
+            />
+          </>
+        )}
+
+        {/*
           * **Meta: every front-matter key cide does not model.** (M30)
           *
           * Shown on both families of scope, and the reason is not symmetry. For a Claude Code
@@ -2311,6 +2455,54 @@ function Suggest({
   )
 }
 
+/**
+ * One line per row, with add and remove — `ToolRows`' shape for a list whose entries are not
+ * tool names: an allowed command, a writable directory. (M119)
+ */
+function LineRows({
+  lines,
+  noun,
+  onChange,
+}: {
+  lines: readonly string[]
+  noun: string
+  onChange: (next: string[]) => void
+}) {
+  return (
+    <div className={styles.tools}>
+      {lines.map((line, index) => (
+        <div key={`${index}:${line}`} className={styles.toolRow}>
+          <input
+            className={styles.input}
+            type="text"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            aria-label={`${noun} ${index + 1}`}
+            value={line}
+            onChange={(e) => {
+              const next = [...lines]
+              next[index] = e.target.value
+              onChange(next)
+            }}
+          />
+          <button
+            type="button"
+            className={styles.remove}
+            aria-label={`Remove ${noun} ${index + 1}`}
+            onClick={() => onChange(lines.filter((_, i) => i !== index))}
+          >
+            <Icon name="x" size={1} />
+          </button>
+        </div>
+      ))}
+      <button type="button" className={styles.add} onClick={() => onChange([...lines, ''])}>
+        + Add {noun}
+      </button>
+    </div>
+  )
+}
+
 /** One tool name per row, with add and remove. The list is `--allowedTools`, in order. */
 function ToolRows({ tools, onChange }: { tools: readonly string[]; onChange: (next: string[]) => void }) {
   return (
@@ -2479,6 +2671,111 @@ function ProjectOverrideRows({
   )
 }
 
+/** The half of `OverrideProfilesState` the bar draws; `active` as `null` rather than absent. */
+interface ProfileNames {
+  active: string | null
+  names: string[]
+}
+
+function profileNames(state: OverrideProfilesState): ProfileNames {
+  return { active: state.active ?? null, names: state.names }
+}
+
+/**
+ * Named override profiles: a whole override table saved under a name and switched in one gesture.
+ * (M123)
+ *
+ * The case it exists for is "codex is out of quota — move every role elsewhere, and back
+ * tomorrow", which otherwise means re-picking harness, model and effort on every row twice.
+ *
+ * **Edits land in the active profile** (`AgentOverrides::set_project` mirrors them), so there is
+ * no unsaved state and no Save button for the rows. A snapshot saved on demand was refused: a
+ * switch that silently drops the afternoon's edits is found only on switching back.
+ *
+ * One inline name box serves both Save as and Rename, rather than a dialog: the name is one short
+ * token, and the gesture sits next to the list it changes.
+ */
+function OverrideProfileBar({
+  profiles,
+  onOp,
+}: {
+  profiles: ProfileNames
+  onOp: (op: OverrideProfileOp) => void
+}) {
+  const [naming, setNaming] = useState<'save' | 'rename' | null>(null)
+  const [name, setName] = useState('')
+  const active = profiles.active
+  const open = (mode: 'save' | 'rename') => {
+    setNaming(mode)
+    setName(mode === 'rename' ? (active ?? '') : '')
+  }
+  const commit = () => {
+    const next = name.trim()
+    if (next === '') return
+    if (naming === 'save') onOp({ op: 'save', name: next })
+    if (naming === 'rename' && active !== null) onOp({ op: 'rename', from: active, to: next })
+    setNaming(null)
+  }
+
+  return (
+    <>
+      <div className={styles.overrideActions}>
+        <Select
+          label="Override profile"
+          value={active ?? ''}
+          options={[
+            { value: '', label: profiles.names.length === 0 ? 'No profiles yet' : 'No profile' },
+            ...profiles.names.map((profile) => ({ value: profile, label: profile })),
+          ]}
+          onChange={(next) =>
+            onOp(next === '' ? { op: 'switch' } : { op: 'switch', name: next })
+          }
+        />
+        {naming === null ? (
+          <>
+            <ActionButton label="Save as profile…" onClick={() => open('save')} />
+            {active !== null && (
+              <>
+                <ActionButton label="Rename…" onClick={() => open('rename')} />
+                <ActionButton
+                  label="Delete profile"
+                  onClick={() => onOp({ op: 'delete', name: active })}
+                />
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            <TextInput
+              size="sm"
+              aria-label={naming === 'save' ? 'New profile name' : 'Profile name'}
+              placeholder={naming === 'save' ? 'e.g. codex, cheap-opencode' : undefined}
+              value={name}
+              autoFocus
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') commit()
+                if (event.key === 'Escape') setNaming(null)
+              }}
+            />
+            <ActionButton
+              label={naming === 'save' ? 'Save' : 'Rename'}
+              disabled={name.trim() === ''}
+              onClick={commit}
+            />
+            <ActionButton label="Cancel" onClick={() => setNaming(null)} />
+          </>
+        )}
+      </div>
+      <p className={styles.overrideNote}>
+        {active === null
+          ? 'Save the rows below as a profile to switch the whole set in one step — say, off a provider that is out of quota and back.'
+          : `Edits below save into “${active}”. Switching changes queued runs and runs resumed later; a run already working keeps what it started with.`}
+      </p>
+    </>
+  )
+}
+
 /**
  * Does this override say nothing at all?
  *
@@ -2542,6 +2839,13 @@ function OverrideFields({
   // before `skip_serializing_if` — or hand-edited — can carry a null, and reading one as "set"
   // is a control that cannot be returned to "leave as committed".
   const mode = value.pool != null ? 'pool' : value.model != null ? 'model' : 'none'
+  // A pool is offered only when this override itself names a harness that runs one — see
+  // `takesPool`. Elsewhere the backend ignores the pool without a word, so offering it would be a
+  // control that looks set and does nothing. The one exception is a pool *already* stored beside
+  // a harness that cannot use it (a hand-edited or pre-rule `agent-overrides.json`): hiding that
+  // option would leave an invisible key on disk, so it stays drawn, marked ignored, to be cleared.
+  const poolable = takesPool(value.harness)
+  const inertPool = mode === 'pool' && !poolable
   return (
     <div className={styles.overrideCard}>
       <div className={styles.overrideHead}>
@@ -2570,9 +2874,14 @@ function OverrideFields({
               { value: '', label: 'Leave as committed' },
               ...HARNESSES.map((h) => ({ value: h, label: harnessLabel(h) })),
             ]}
-            onChange={(next) =>
-              onChange(withField(value, 'harness', next === '' ? undefined : (next as HarnessName)))
-            }
+            onChange={(next) => {
+              const harness = next === '' ? undefined : (next as HarnessName)
+              const withHarness = withField(value, 'harness', harness)
+              // Moving to a harness that takes no pool drops the pool with it, so the stored
+              // override never carries one the run will ignore and the Model choice select is
+              // never left on a value its options no longer contain.
+              onChange(takesPool(harness) ? withHarness : withField(withHarness, 'pool', undefined))
+            }}
           />
         }
       />
@@ -2580,8 +2889,12 @@ function OverrideFields({
       <SettingRow
         label="Model choice"
         hint={
-          'A pool falls down its list when a provider rate-limits, cannot be reached, or refuses ' +
-          'the credential. A single model does not. Only opencode runs use either.'
+          inertPool
+            ? 'Ignored: only opencode and mimo runs use a pool. Pick one of them as the harness, ' +
+              'or choose something else here.'
+            : 'A pool falls down its list when a provider rate-limits, cannot be reached, or ' +
+              'refuses the credential. A single model does not. Only opencode runs use either.' +
+              (poolable ? '' : ' Pick opencode or mimo as the harness to use a pool.')
         }
         control={
           <Select
@@ -2589,7 +2902,7 @@ function OverrideFields({
             value={mode}
             options={[
               { value: 'none', label: 'Leave as committed' },
-              { value: 'pool', label: 'A pool' },
+              ...(poolable || inertPool ? [{ value: 'pool', label: 'A pool' }] : []),
               { value: 'model', label: 'One model' },
             ]}
             onChange={(next) =>

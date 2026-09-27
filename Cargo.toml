@@ -74,6 +74,12 @@ tauri-plugin-os = "2.3.2"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-log = "2.9.0"
+# Self-update from GitHub releases (`crates/cide-app/src/updater.rs`). 2.12, not 2.13: 2.13
+# requires tauri ^2.12 and this workspace pins 2.11.5 — bumping tauri for an updater would drag
+# the whole webview stack along with it. `default-features = false` drops `zip`, which is the
+# Windows installer path and nothing cide ships; `rustls-tls` keeps the TLS choice the one
+# `reqwest` above already makes, so no OpenSSL enters the graph through the updater.
+tauri-plugin-updater = { version = "=2.12.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
 # Only for parenting the folder picker to the app window; see `cmd::project::project_pick`.
 #
 # The same version and features tauri 2.11.5 already pins on Linux, deliberately: `gtk` is
@@ -312,6 +318,11 @@ signal-hook = "0.4.4"
 # For `kill(2)`. `PtySession` can only SIGKILL, and the shutdown ladder needs SIGHUP and
 # SIGTERM first so a `claude` gets to finish writing its transcript.
 libc = "0.2.189"
+# logind's delay inhibitor, so an OS shutdown announces itself before systemd SIGTERMs cide's
+# whole cgroup — see `cide-app/src/logind.rs`. Already in the graph at this exact version via
+# tauri-plugin-opener (its "reveal in folder" speaks D-Bus), default features included, so
+# naming it costs no new compilation; the blocking API is what a plain thread wants.
+zbus = "5.18.0"
 # Randomness for the IDE lockfile's auth token. Already in the graph transitively via uuid,
 # so naming it directly costs nothing and makes the credential's source explicit.
 getrandom = "0.4.3"

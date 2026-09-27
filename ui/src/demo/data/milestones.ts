@@ -129,7 +129,7 @@ export function milestonesView(project: string): MilestonesView {
       { milestone: 'm4', tasks: [] },
     ],
     verifies: [
-      { task: 't-41', agent: 'coder', running: true },
+      { task: 't-41', agent: 'coder', running: true, failures: 0, retries: 3 },
       {
         task: 't-37',
         agent: 'coder',
@@ -143,6 +143,8 @@ export function milestonesView(project: string): MilestonesView {
           startedUnixMs: NOW - 20 * MIN,
           durationMs: 71_000,
         },
+        failures: 0,
+        retries: 3,
       },
     ],
     proposals: [

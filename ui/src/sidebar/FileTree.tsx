@@ -68,7 +68,13 @@ import { groupIcon, groupIdOf, isSyntheticPath, opensSyntheticSection, rowVerbs 
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
 import { SCRATCH_TYPES } from '@/editor/languages'
 import { DEFAULT_DRAWING_SUFFIX } from '@/panes/excalidrawKinds'
-import { pasteEntries, planEntries, useFileClipboard } from './fileClipboard'
+import {
+  followFileClip,
+  pasteEntries,
+  planEntries,
+  sourceOf,
+  useFileClipboard,
+} from './fileClipboard'
 import {
   clipboardText,
   copyLabel,
@@ -210,6 +216,12 @@ interface Transfer {
   readonly mode: ClipMode
   /** The sources came off the clipboard, so a successful cut consumes it. */
   readonly fromClip: boolean
+  /**
+   * The project the clipboard was filled in, when it is not this one — a paste between
+   * projects, which Rust checks against that project's roots. Absent for a drag, which never
+   * leaves the tree it started in.
+   */
+  readonly from?: ProjectId | null
 }
 
 /**
@@ -435,6 +447,8 @@ export function FileTree({
   const [note, setNote] = useState<string | null>(null)
   /** What is on the tree's clipboard. Subscribed here because it dims rows and draws a strip. */
   const clip = useFileClipboard((s) => s.clip)
+  // The clip is Rust's and shared by every window; this starts the mirror once per window.
+  useEffect(followFileClip, [])
   /**
    * A paste is in flight, **or** waiting on the confirmation.
    *
@@ -639,7 +653,7 @@ export function FileTree({
       pasting.current = true
       setProblem(null)
       setNote(null)
-      void planEntries(project, transfer.sources, transfer.destDir, transfer.mode)
+      void planEntries(project, transfer.sources, transfer.destDir, transfer.mode, transfer.from)
         .then((collisions) => {
           if (collisions.length === 0) {
             commitTransfer(project, transfer, [])
@@ -677,6 +691,7 @@ export function FileTree({
         destDir: target.parent,
         mode: clip.mode,
         fromClip: true,
+        from: sourceOf(clip, project),
       })
     },
     [project, startTransfer],
@@ -2265,11 +2280,13 @@ export function FileTree({
   /**
    * The pending-cut strip, or `null`.
    *
-   * Gated on the clipboard belonging to *this* project. The clipboard deliberately survives a
-   * project switch (see `fileClipboard.ts`), so without this the panel for project B would
-   * carry a strip about a file in project A — one that `pasteRefusal` will not let it paste.
+   * Drawn in **every** project's panel, not only the one the cut was made in. It was gated on
+   * `clip.project === project` while a paste between projects was refused, so that B's panel
+   * would not advertise a file it could not take. Now B *can* take it, and a cut is the one clip
+   * whose paste destroys something at the source — so B says it is holding one, and says it
+   * without "Esc cancels", which only the source panel honours (`escapeCancels`).
    */
-  const pending = clip !== null && clip.project === project ? pendingNote(clip) : null
+  const pending = clip !== null ? pendingNote(clip, project) : null
 
   if (degraded && count === 0) {
     // Name the command that actually failed rather than a fixed one: `degraded` is set from

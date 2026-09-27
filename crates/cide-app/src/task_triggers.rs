@@ -269,6 +269,7 @@ fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, n
             external: None,
             harness: None,
             model: None,
+            fresh: false,
         };
         match crate::cmd::agents::dispatch_or_duplicate(
             app.clone(),
@@ -279,8 +280,17 @@ fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, n
         )
         .await
         {
-            Ok(DispatchOutcome::Started(run)) => {
+            Ok(DispatchOutcome::Started { run, .. }) => {
                 tracing::info!(%run, agent = %agent, %task, "an assignment started a subagent run");
+            }
+            // An assignment back to a role that worked the task before resumes its context. (M116)
+            Ok(DispatchOutcome::Continued { run, from }) => {
+                tracing::info!(%run, %from, agent = %agent, %task, "an assignment continued the role's conversation");
+            }
+            // Unreachable with no instructions — `tell_route` needs something to say — and harmless
+            // if it ever were: the run holding the pair was told nothing new.
+            Ok(DispatchOutcome::Told(run)) => {
+                tracing::debug!(%run, agent = %agent, %task, "an assignment reached a live run");
             }
             // The race the shortcut above cannot win, landing where it is harmless. `debug!` and
             // not `warn!`: nothing went wrong — the guard did its job, and the gesture that got

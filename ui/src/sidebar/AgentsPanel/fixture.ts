@@ -157,6 +157,7 @@ function run(over: Partial<RunView> & Pick<RunView, 'run' | 'agent' | 'agentLabe
     model: null,
     poolPosition: null,
     worktree: false,
+    reviewer: null,
     ...over,
   }
 }
@@ -243,6 +244,22 @@ const PAUSED = run({
   // until now was carried to the view and read by nothing.
   workedMs: 2_945_000,
   pausedSinceMs: NOW_MS - 900_000,
+})
+
+/*
+ * What every run looks like after a cide restart: the snapshot brings it back `interrupted`,
+ * whatever it was before — here a run the user paused from its row and then quit over. The queue
+ * is open (no project-scope pause), which is the case the header used to answer with Pause.
+ */
+const INTERRUPTED = run({
+  run: 'r-0003',
+  agent: 'developer',
+  agentLabel: 'Developer',
+  session: 's-0003',
+  phase: 'interrupted',
+  task: 't-14',
+  startedMs: NOW_MS - 3_845_000,
+  workedMs: 2_945_000,
 })
 
 /* A run with no task at all — the row that draws `no task` rather than a blank line. */
@@ -437,6 +454,7 @@ const HANDLERS = {
   onResume: () => {},
   onStop: () => {},
   onRevealTask: () => {},
+  onOpenReviewer: () => {},
   onRetryTurn: () => {},
   onAckStaleTurn: () => {},
   onEnable: () => {},
@@ -480,9 +498,14 @@ export type AgentsStoryName =
   | 'roles-resting'
   | 'role-running'
   | 'role-idle'
+  | 'role-gate-running'
+  | 'role-gate-handed-back'
+  | 'role-in-review'
+  | 'role-in-review-no-link'
   | 'role-queued'
   | 'project-paused-queued-run'
   | 'role-paused'
+  | 'role-interrupted'
   | 'role-awaiting'
   | 'role-finished-only'
   | 'role-multi-run'
@@ -545,6 +568,31 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
   'role-idle': story({ roster: ready([IDLE]) }),
 
   /*
+   * M114: an idle run is idle for a reason the row now says. The run set its task to review and
+   * handed back; verify is running on its branch, and the role reads `Verifying`, not `Idle` —
+   * the report was a run that looked stuck while its gate and its reviewer came and went.
+   */
+  'role-gate-running': story({
+    roster: ready([IDLE]),
+    taskGates: { 't-14': { agent: 'developer', running: true, passed: null, failures: 0, retries: 3 } },
+  }),
+  /* Red, and the output went back to the run: the count is on the row. */
+  'role-gate-handed-back': story({
+    roster: ready([{ ...IDLE, phase: 'running', workingSinceMs: NOW_MS - 30_000 }]),
+    taskGates: { 't-14': { agent: 'developer', running: false, passed: false, failures: 2, retries: 3 } },
+  }),
+  /* Green, and a review tab owns the task: the row links to it. */
+  'role-in-review': story({
+    roster: ready([{ ...IDLE, reviewer: 's-review' }]),
+    taskGates: { 't-14': { agent: 'developer', running: false, passed: true, failures: 0, retries: 3 } },
+  }),
+  /* The same row in a host that cannot open a pane: the words, never a dead link. */
+  'role-in-review-no-link': story({
+    roster: ready([{ ...IDLE, reviewer: 's-review' }]),
+    onOpenReviewer: undefined,
+  }),
+
+  /*
    * A role with a run and **still no Open**, for a different reason than `roles-resting`: the
    * run is queued, so there is no session to mirror. The pair is what makes the assertion mean
    * something — one absence is "nothing is happening", the other is "something is, and it has
@@ -553,6 +601,9 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
   'role-queued': story({ roster: ready([QUEUED]) }),
 
   'role-paused': story({ roster: ready([PAUSED]) }),
+
+  /* After a restart: an interrupted run under an open queue. The header must offer Resume. */
+  'role-interrupted': story({ roster: ready([INTERRUPTED]) }),
 
   /* Blocked on the user, and with no task — so the row also draws `no task`. */
   'role-awaiting': story({ roster: ready([ADRIFT]) }),

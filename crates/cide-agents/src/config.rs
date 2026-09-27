@@ -82,6 +82,14 @@ pub enum Isolation {
     Shared,
 }
 
+/// The default for [`AgentsConfig::verify_retries`]: three tries of its own, and the fourth red
+/// verify is the reviewer's. (M114)
+pub const DEFAULT_VERIFY_RETRIES: u8 = 3;
+
+/// The most hand-backs a project may ask for. Every one is a billed turn spent on the same red
+/// output, and past this a run that has not fixed it is not going to.
+pub const MAX_VERIFY_RETRIES: u8 = 20;
+
 /// The default for [`AgentsConfig::stop_grace_secs`]. See that field for the argument.
 pub const DEFAULT_STOP_GRACE_SECS: u16 = 60;
 
@@ -205,7 +213,9 @@ pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, o
      is not right: comment exactly what is wrong and what is still needed, set the task back to \
      doing with mcp__cide__cide_task_update, and hand it back to the same role with \
      mcp__cide__cide_agent_dispatch (agent `{role}`, task {task_id}) passing that same feedback \
-     as the instructions — do not fix it yourself, the role that built it has the context. One \
+     as the instructions — do not fix it yourself, the role that built it has the context, and \
+     the dispatch continues that role's own conversation on the task, so say only what is wrong \
+     rather than restating the task. One \
      exception, and read the comments for it before you dispatch: if this task has already been \
      sent back for the same reason, stop, say so plainly in a comment, leave it in review and do \
      not dispatch again. When the project configures a verify command, \
@@ -424,7 +434,10 @@ pub struct AgentsConfig {
     /// switch in total. So on those harnesses the project default `auto` keeps the promptless
     /// flag it always had, and each harness's own `unattended` mapping says so where it happens.
     /// A *role* that writes `permission-mode: auto` still gets each CLI's literal mapping,
-    /// because the role's author chose that trade.
+    /// because the role's author chose that trade. On codex that trade no longer includes the
+    /// commit (M118): a worktree run's git metadata is added to the sandbox's writable roots.
+    /// It does still include an X display and audio, which the sandbox denies and
+    /// `cide_agents_list` says against the role.
     ///
     /// # Reading the old key
     ///
@@ -581,6 +594,29 @@ pub struct AgentsConfig {
     /// `isolate_env` is for. Off by default: it makes a busy board's reviews wait on each other.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub verify_exclusive: bool,
+    /// How many times in a row a run's own branch may fail verify and be handed straight back to
+    /// that run, before the next failure goes to the reviewer instead. (M114)
+    ///
+    /// Verify runs the moment a run sets its task to review (`milestones::prewarm`), and the
+    /// reviewer now waits for it. A red answer used to reach a *fresh* reviewer, whose only move
+    /// was to write the output into a comment and dispatch the role again — a whole review spent
+    /// relaying a test log to the one context that already knew the change. So a failure goes
+    /// back into the run itself, which still holds that context; and because a run can also be
+    /// stuck on something it cannot fix (a test it may not edit, a broken environment), the
+    /// count is bounded and the next failure is the orchestrator's. `0` means never hand back:
+    /// every red verify goes to the reviewer, as before M114. The count is consecutive per task,
+    /// kept in memory, and reset by a green verify.
+    pub verify_retries: u8,
+    /// Whether the runs a cide restart interrupted go back through the queue by themselves at
+    /// the next launch, continuing their conversations — what pressing Resume on each did. (M118)
+    ///
+    /// On by default. The restart is cide's, not the work's: selfcraft lost eleven runs' turns
+    /// to restarts in one batch (exit 129), and each sat as an `Interrupted` row until somebody
+    /// noticed. The queue still decides — caps, pools and a paused project all apply — and a run
+    /// whose task has a newer run, or whose conversation is open in a pane, is skipped as Resume
+    /// skips it. Not on the `cide_agents_config` tool, for `verify_retries`' reason one field up:
+    /// a model that could turn it on could buy itself turns.
+    pub resume_after_restart: bool,
 }
 
 impl AgentsConfig {
@@ -627,6 +663,8 @@ impl Default for AgentsConfig {
             isolate_env: Vec::new(),
             isolate_env_share: Vec::new(),
             verify_exclusive: false,
+            verify_retries: DEFAULT_VERIFY_RETRIES,
+            resume_after_restart: true,
         }
     }
 }
@@ -735,6 +773,9 @@ impl AgentsConfig {
             isolate_env: self.isolate_env.clone(),
             isolate_env_share: self.isolate_env_share.clone(),
             verify_exclusive: self.verify_exclusive,
+            // The stored number, for `auto_spin_after_secs`' reason; `verify_retries()` clamps.
+            verify_retries: self.verify_retries,
+            resume_after_restart: self.resume_after_restart,
         }
     }
 
@@ -815,6 +856,20 @@ impl AgentsConfig {
         if let Some(exclusive) = patch.verify_exclusive {
             self.verify_exclusive = exclusive;
         }
+        if let Some(resume) = patch.resume_after_restart {
+            self.resume_after_restart = resume;
+        }
+        if let Some(retries) = patch.verify_retries {
+            // Clamped on the way in, `auto_spin_after_secs`' rule: the file holds what is used.
+            self.verify_retries = retries.min(MAX_VERIFY_RETRIES);
+        }
+    }
+
+    /// How many red verifies in a row go back to the run before the reviewer takes over, with the
+    /// ceiling applied. The one reader of [`Self::verify_retries`]. (M114)
+    #[must_use]
+    pub fn verify_retries(&self) -> u8 {
+        self.verify_retries.min(MAX_VERIFY_RETRIES)
     }
 }
 
@@ -1649,6 +1704,46 @@ mod tests {
         );
     }
 
+    /// The retries a red verify gets before the reviewer takes over: three unless the file says,
+    /// ceilinged on the way in and on the way out, and `0` is a real answer. (M114)
+    #[test]
+    fn interrupted_runs_resume_at_launch_unless_the_project_says_not() {
+        assert!(AgentsConfig::default().resume_after_restart);
+        let off: AgentsConfig =
+            serde_json::from_str(r#"{"resumeAfterRestart": false}"#).expect("parses");
+        assert!(!off.resume_after_restart);
+        let mut config = AgentsConfig::default();
+        config.apply(OrchestrationPatch {
+            resume_after_restart: Some(false),
+            ..OrchestrationPatch::default()
+        });
+        assert!(!config.to_wire().resume_after_restart);
+    }
+
+    #[test]
+    fn verify_retries_default_to_three_and_are_ceilinged() {
+        let mut config = AgentsConfig::default();
+        assert_eq!(config.verify_retries(), DEFAULT_VERIFY_RETRIES);
+        config.apply(OrchestrationPatch {
+            verify_retries: Some(200),
+            ..Default::default()
+        });
+        assert_eq!(config.verify_retries, MAX_VERIFY_RETRIES);
+        config.verify_retries = u8::MAX;
+        assert_eq!(
+            config.verify_retries(),
+            MAX_VERIFY_RETRIES,
+            "a hand-written value too"
+        );
+        config.apply(OrchestrationPatch {
+            verify_retries: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(config.verify_retries(), 0);
+        let wire: AgentsConfig = serde_json::from_str(r#"{"verifyRetries": 5}"#).expect("parses");
+        assert_eq!(wire.verify_retries, 5);
+    }
+
     /// `None` means "leave this alone", and a nonsense number lands as a sane one rather than as
     /// an error the frontend discards.
     #[test]
@@ -1672,8 +1767,12 @@ mod tests {
             isolate_env: vec!["XDG_DATA_HOME".into()],
             isolate_env_share: vec!["gh".into()],
             verify_exclusive: true,
+            verify_retries: 7,
+            resume_after_restart: false,
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
+        assert_eq!(config.verify_retries, 7);
+        assert!(!config.resume_after_restart);
         assert_eq!(config.max_concurrent, 5);
         assert!(config.enabled);
 

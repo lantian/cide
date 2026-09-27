@@ -284,6 +284,28 @@ pub fn fs_status(app: &AppHandle, project: cide_ipc::ProjectId, status: &cide_ip
     }
 }
 
+/// The file tree's Copy/Cut clipboard changed — taken, cleared, or consumed by a cut's paste.
+///
+/// To **every** window, because the clip is the one thing in the tree that is meant to cross
+/// them: copied in one project's window, pasted in another's. `clip` is `null` when nothing is
+/// held. Each window's `fileClipboard.ts` store is a mirror of this and nothing else.
+pub const FS_CLIP_CHANGED: &str = "cide://fs-clip-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsClipChanged {
+    clip: Option<cide_ipc::FileClip>,
+}
+
+pub fn fs_clip_changed(app: &AppHandle, clip: Option<&cide_ipc::FileClip>) {
+    let payload = FsClipChanged {
+        clip: clip.cloned(),
+    };
+    if let Err(error) = app.emit(FS_CLIP_CHANGED, payload) {
+        tracing::debug!(%error, "fs-clip-changed reached no window");
+    }
+}
+
 // --- the keymap ---------------------------------------------------------------------------
 
 /// The user's keybindings changed. Sent to **every** window after Settings → Keymap writes.
@@ -822,6 +844,74 @@ pub fn milestones_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
     tee(|| cide_remote::RemoteEvent::MilestonesChanged { project });
     if let Err(error) = app.emit(MILESTONES_CHANGED, MilestonesChanged { project }) {
         tracing::debug!(%error, "milestones-changed reached no window");
+    }
+}
+
+// --- pool notices (t-1090) ---------------------------------------------------------------
+
+/// A pool entry's configuration is wrong, and a run has just moved past it: which pool, which
+/// entry, and the provider's own sentence. Drawn as a warning toast in the project's windows.
+///
+/// A sentence rather than a structure, because it has one reader — a person who is going to open
+/// Settings and fix the entry — and the backend is where the pool, the entry's position and the
+/// provider's words are all in hand at once. The run's own row and the pool-state card already
+/// carry the structured account.
+pub const POOL_NOTICE: &str = "cide://pool-notice";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolNotice {
+    project: cide_ipc::ProjectId,
+    text: String,
+}
+
+pub fn pool_notice(app: &AppHandle, project: cide_ipc::ProjectId, text: String) {
+    if let Err(error) = app.emit(POOL_NOTICE, PoolNotice { project, text }) {
+        tracing::debug!(%error, "pool-notice reached no window");
+    }
+}
+
+// --- self-update ---------------------------------------------------------------------------
+
+/// A release newer than this build exists and the user has not skipped it. Sent once, by the
+/// start-up check (`updater::start`), to every window.
+///
+/// Not the only way a window learns it: the check runs a few seconds after the windows are
+/// restored, and a window whose listener was not yet installed would miss a bare event. Each
+/// window also asks `update_status` when it mounts; the event is for the windows that were
+/// already listening. Both roads end in the same notice, which the window de-duplicates by
+/// version.
+pub const UPDATE_AVAILABLE: &str = "cide://update-available";
+
+pub fn update_available(app: &AppHandle, update: &cide_ipc::UpdateInfo) {
+    if let Err(error) = app.emit(UPDATE_AVAILABLE, update) {
+        tracing::debug!(%error, "update-available reached no window");
+    }
+}
+
+/// How far the update download has got. Throttled at the source to one event per percent.
+pub const UPDATE_PROGRESS: &str = "cide://update-progress";
+
+pub fn update_progress(app: &AppHandle, progress: cide_ipc::UpdateProgress) {
+    if let Err(error) = app.emit(UPDATE_PROGRESS, progress) {
+        tracing::debug!(%error, "update-progress reached no window");
+    }
+}
+
+/// The new version is on disk and verified. The running process is still the old one until it
+/// restarts, which the user is asked about rather than subjected to — a restart stops every
+/// session and run this cide hosts.
+pub const UPDATE_READY: &str = "cide://update-ready";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateReady<'a> {
+    version: &'a str,
+}
+
+pub fn update_ready(app: &AppHandle, version: &str) {
+    if let Err(error) = app.emit(UPDATE_READY, UpdateReady { version }) {
+        tracing::debug!(%error, "update-ready reached no window");
     }
 }
 

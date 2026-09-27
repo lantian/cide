@@ -9,8 +9,9 @@
 //! cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn
 //! ```
 //!
-//! The third spends two short turns and one resume of the user's own quota, and is run
-//! deliberately:
+//! The other two spend the user's own quota and are run deliberately — two short turns and a
+//! resume, and (M118) one `codex exec` turn proving a sandboxed task run can commit from its
+//! worktree. Both are named `a_real_turn_…`, so the `--skip` above leaves them out:
 //!
 //! ```sh
 //! cargo test -p cide-agents --test real_codex -- --ignored
@@ -55,6 +56,7 @@ fn role(prompt: &str) -> LoadedAgent {
         permission_mode: None,
         effort: None,
         extras: Vec::new(),
+        sandbox: Default::default(),
     }
 }
 
@@ -90,6 +92,9 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: true,
         server: None,
+        git_dirs: Vec::new(),
+        sandbox_brief: None,
+        codex_trust_root: None,
     }
 }
 
@@ -376,4 +381,99 @@ fn a_real_turn_starts_a_thread_completes_and_resumes_from_anywhere() {
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&elsewhere).ok();
+}
+
+/// Run `git` in `dir` with the user's own configuration kept out of it.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "cide tests")
+        .env("GIT_AUTHOR_EMAIL", "tests@cide.invalid")
+        .env("GIT_COMMITTER_NAME", "cide tests")
+        .env("GIT_COMMITTER_EMAIL", "tests@cide.invalid")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A role that says `permission-mode: auto` runs under `--approve-for-me`, codex's
+/// workspace-write sandbox, and a task run in a linked worktree can still commit — because the
+/// harness adds the worktree's git dir and the common `.git` as `--add-dir`. (M118)
+///
+/// Selfcraft's t-572 was the failure: `index.lock: Read-only file system`, on every codex run.
+/// The sandbox and `--add-dir` tokens are taken **from the harness's own argv** and handed to
+/// `codex exec` (one turn, not the TUI), so this pins what cide passes rather than a copy of it.
+/// Measured on 0.157.1: commits with the tokens; the same command without them is refused.
+/// Spends one short turn.
+#[test]
+#[ignore = "spawns the real codex and spends the user's quota"]
+fn a_real_turn_commits_from_a_sandboxed_worktree() {
+    let root = temp_dir("commit");
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    std::fs::create_dir_all(root.join(".cide/worktrees")).unwrap();
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cide/probe-t-1",
+            ".cide/worktrees/probe-t-1",
+        ],
+    );
+    let checkout = root.join(".cide/worktrees/probe-t-1");
+    let absolute = |p: String| {
+        let p = PathBuf::from(p);
+        std::fs::canonicalize(if p.is_absolute() { p } else { checkout.join(p) }).unwrap()
+    };
+    let dirs = vec![
+        absolute(git(&checkout, &["rev-parse", "--git-dir"])),
+        absolute(git(&checkout, &["rev-parse", "--git-common-dir"])),
+    ];
+
+    let mut agent = role("Do exactly what you are asked.");
+    agent.permission_mode = Some("auto".into());
+    let mut run = plan(&agent, &checkout, "unused");
+    run.git_dirs = dirs;
+    let args = CodexHarness.spawn_spec(&run).expect("spawnable").spec.args;
+    assert!(args.iter().any(|a| a == "--approve-for-me"), "{args:?}");
+    let mut sandbox: Vec<String> = vec!["--approve-for-me".into()];
+    for pair in args.windows(2).filter(|w| w[0] == "--add-dir") {
+        sandbox.extend(pair.iter().cloned());
+    }
+    assert_eq!(sandbox.len(), 5, "both directories are added: {args:?}");
+
+    let before = git(&checkout, &["rev-list", "--count", "HEAD"]);
+    let out = std::process::Command::new(codex())
+        .current_dir(&checkout)
+        .arg("exec")
+        .args(&sandbox)
+        .arg("-C")
+        .arg(&checkout)
+        .arg(
+            "Run exactly this one shell command and nothing else, then reply with its output: \
+             sh -c 'echo probe > probe && git add probe && git -c user.name=probe \
+             -c user.email=probe@cide.invalid commit -qm probe && echo COMMITTED'",
+        )
+        .output()
+        .expect("codex exec runs");
+    let after = git(&checkout, &["rev-list", "--count", "HEAD"]);
+    assert_ne!(
+        before,
+        after,
+        "no commit landed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

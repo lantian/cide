@@ -66,6 +66,7 @@ import {
   type Tone,
 } from './model'
 import { Icon, asIcon } from '@/icons/Icon'
+import { Button } from '@/kit/components/Button'
 
 import styles from './AgentsPanel.module.css'
 
@@ -124,6 +125,8 @@ export interface RunRowProps {
   onStop?: ((run: string) => void) | undefined
   /** Open the task this run is against — its card, over this panel; no view is switched. */
   onRevealTask?: ((task: string) => void) | undefined
+  /** Reveal the review tab that owns this run's task. (M114) Without it the words are plain. */
+  onOpenReviewer?: ((session: string, task: string) => void) | undefined
   /** Re-send the turn the freeze may have killed. */
   onRetryTurn?: ((run: string) => void) | undefined
   /** Dismiss the stale-turn bar without re-sending anything. */
@@ -152,6 +155,7 @@ export function ActivityRow({
   onResume,
   onStop,
   onRevealTask,
+  onOpenReviewer,
   onRetryTurn,
   onAckStaleTurn,
 }: RunRowProps) {
@@ -206,6 +210,7 @@ export function ActivityRow({
         {usingLabel(run)}
       </p>
       <RunNotes row={row} />
+      <GateNotes row={row} onOpenReviewer={onOpenReviewer} />
       <StaleBar row={row} onRetryTurn={onRetryTurn} onAckStaleTurn={onAckStaleTurn} />
     </div>
   )
@@ -225,6 +230,7 @@ export function RunRow({
   onResume,
   onStop,
   onRevealTask,
+  onOpenReviewer,
   onRetryTurn,
   onAckStaleTurn,
   armed = false,
@@ -312,6 +318,7 @@ export function RunRow({
       </div>
 
       <RunNotes row={row} />
+      <GateNotes row={row} onOpenReviewer={onOpenReviewer} />
       <StaleBar row={row} onRetryTurn={onRetryTurn} onAckStaleTurn={onAckStaleTurn} />
     </div>
   )
@@ -552,6 +559,55 @@ function RunNotes({ row }: { row: RunRowData }) {
       {run.note !== null && (
         <p className={styles.rowNote} data-audit="agentsNote">
           {run.note}
+        </p>
+      )}
+    </>
+  )
+}
+
+/**
+ * **Who has this run's task now**, when it is not the run: the verify gate, and the reviewer.
+ * (M114)
+ *
+ * A run sets review and hands its turn back, and from then on its row said `Idle` while verify
+ * ran on its branch, failed, went back to it or on to a review tab — all of it invisible, so an
+ * ordinary wait read as a stuck run. The gate's line comes from `model.gateLine`; the review
+ * line is a link to that tab while it is open (`reviewer`), and plain words without a handler.
+ *
+ * Its own `data-audit`s, never `agentsOpen`: the render check counts Open elements per role, and
+ * a second one on a row that is not a transcript would break the rule those counts pin.
+ */
+function GateNotes({
+  row,
+  onOpenReviewer,
+}: {
+  row: RunRowData
+  onOpenReviewer?: ((session: string, task: string) => void) | undefined
+}) {
+  const { run } = row
+  const reviewer = row.reviewer
+  return (
+    <>
+      {row.gate !== null && (
+        <p className={styles.rowNote} data-audit="agentsGate">
+          {row.gate}
+        </p>
+      )}
+      {reviewer !== null && run.task !== null && (
+        <p className={styles.rowNote} data-audit="agentsReview">
+          {onOpenReviewer === undefined ? (
+            'In review by orchestrator'
+          ) : (
+            <Button
+              variant="link"
+              size="sm"
+              data-audit="agentsReviewTab"
+              title="Show the review tab"
+              onClick={() => onOpenReviewer(reviewer, run.task ?? '')}
+            >
+              In review by orchestrator
+            </Button>
+          )}
         </p>
       )}
     </>

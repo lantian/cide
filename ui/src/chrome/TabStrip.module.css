@@ -45,6 +45,15 @@
      between a file tab's title and its close button. */
   --awaiting-w: calc(18px * var(--ui-scale));
   --awaiting-slot: calc(var(--tab-gap) + var(--awaiting-w));
+  /* The running chip's pair, independent of the awaiting pair for the header's reason: the
+     two light for unrelated reasons and collapse separately (M115). A 12px `--icon-0` mark
+     plus a 2px gap, both **unscaled** (an SVG does not grow with the type scale), plus 14px of
+     scaled room for the figure — `9+` advances 13.2px at 11px mono, so the clip below never
+     engages; `check:running` derives that rather than trusting this sentence. A tab that shows
+     the bare mark (a one-console tab turning) narrows to the mark alone: see
+     `[data-running='bare']`. */
+  --running-w: calc(14px * var(--ui-scale) + 14px);
+  --running-slot: calc(var(--tab-gap) + var(--running-w));
   display: flex;
   align-items: center;
   gap: var(--tab-gap);
@@ -195,8 +204,8 @@
  * marker is `pointer-events: none`, so the click lands on the label underneath.
  */
 .labelPinned {
-  margin-right: calc(-1 * (var(--tab-pad) + var(--awaiting-slot)));
-  padding-right: calc(var(--tab-pad) + var(--awaiting-slot));
+  margin-right: calc(-1 * (var(--tab-pad) + var(--running-slot) + var(--awaiting-slot)));
+  padding-right: calc(var(--tab-pad) + var(--running-slot) + var(--awaiting-slot));
 }
 
 /*
@@ -285,30 +294,97 @@
 }
 
 /*
- * Filled amber, with the *background* colour as the ink.
+ * The kit's `Counter` in `accent`: the accent gradient under its white ink (`--on-accent`,
+ * ≥4.5:1 on both stops), with the fill's lit edge. A solid chip rather than a bare digit
+ * because a lone numeral 9px from a tab's title reads as part of the title.
  *
- * `--yellow` rather than `--accent` for the reason the pane marker gives: the accent is this
- * app's "here you are" — the active tab's own 2px rule is drawn in it, two pixels below this
- * chip — and a marker meaning "come back to a tab you are *not* in" has to read as different
- * from that at a glance.
- *
- * Inverting it is what makes one rule carry both themes. `--yellow` is pitched per theme as a
- * *text* colour against the app's surfaces — a dark amber (#8a5a00) on the white default, a
- * light amber (#dfae68) on dark — so amber-on-surface is legible by construction in both, and
- * so is the reverse: white ink (`--panel`) on dark amber in the light theme is 5.93:1, and
- * near-black `--panel` on light amber in the dark one is 9.02:1. Both clear AA for normal
- * text, which is the bar 9.5px has to clear; there is no `--on-yellow` token, and `--panel`
- * is the right stand-in precisely because `--yellow` was measured against it. A solid chip
- * rather than a bare digit because a lone numeral 9px from a tab's title reads as part of the
- * title.
+ * Accent, not the amber this chip wore before the redesign (M100). `docs/ui-kit.md` names this
+ * exact mark — "an awaiting-input counter" — as what `accent` is for: yellow means *waiting on
+ * someone else*, and a pane waiting on the user is asking for *them*. The old argument for amber
+ * (the accent is the active tab's 2px rule, so a "come back here" mark must differ from it) does
+ * not hold for a filled, numbered chip beside the title: shape and figure already separate the
+ * two, and the waiting tab is by definition usually not the active one. The pane title bar's
+ * wordless marker stays amber — the kit's "Waiting for input" `Dot` specimen is yellow, and a
+ * 7px dot has no figure to tell it apart from the focus colour.
  */
-/* The kit's `Counter` in yellow ("waiting on someone"): the amber gradient under its dark ink
-   (`--on-yellow`, 6.8–8.8:1), with the fill's lit edge. */
 .awaitingOn {
-  background: var(--grad-yellow);
+  background: var(--grad-accent-ink);
   box-shadow: var(--fill-sheen);
-  color: var(--on-yellow);
+  color: var(--on-accent);
   font-weight: 600;
+}
+
+/*
+ * "Consoles in this tab are mid-turn." (M115)
+ *
+ * The strip's three states for a console tab: this turning mark while a turn runs, the awaiting
+ * chip above once it ends unseen, and nothing once the user has looked. Rust counts a tab only
+ * while its session is `Busy`, so the two chips never describe one session on a one-console tab
+ * — a permission prompt is the awaiting chip's.
+ *
+ * Collapsed the way `.awaiting` is: the box and its slot zero together, and the negative
+ * `margin-left` hands back the flex gap a 0px item would keep. Unlike the awaiting marker it is
+ * **not** rendered while dark — it carries no live region (a turn starting is not news worth
+ * announcing; its end is, and that is the awaiting chip's `role="status"`), so an idle strip
+ * animates nothing inside a 0px box.
+ *
+ * Fixed width, `overflow: hidden` and `pointer-events: none` for `.awaiting`'s reasons: a lit
+ * box never changes size (`runningBadge` caps at `9+`), and the tab stays one box the pointer
+ * can hit anywhere — `.labelPinned` reaches over this slot too.
+ *
+ * Bare, dim ink rather than a pill: the header's running chip argues that a filled mark means
+ * *act*, and working is the ordinary state of a console somebody is using. The figure is dim;
+ * the mark alone wears the accent — see `.runningSpin`.
+ */
+.tab[data-running='false'] {
+  --running-w: 0px;
+  --running-slot: 0px;
+}
+
+.tab[data-running='bare'] {
+  --running-w: 12px;
+}
+
+.running {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 2px;
+  width: var(--running-w);
+  margin-left: calc(var(--running-slot) - var(--running-w) - var(--tab-gap));
+  height: calc(16px * var(--ui-scale));
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  font-variant-numeric: tabular-nums;
+  line-height: calc(16px * var(--ui-scale));
+  letter-spacing: 0;
+}
+
+/*
+ * The mark wears the **accent** — the user's chosen colour from Settings → Appearance — and not
+ * the kit `Spinner`'s blue. The user's call (2026-09-26): a blue mark beside a red-accented strip
+ * read as some other app's colour. Not `composes: spin` with an override, because which of two
+ * equal-specificity classes wins depends on stylesheet order in the bundle; the loop is written
+ * out instead, pausing under reduced motion through `--motion-loop` exactly as the kit's does.
+ */
+.runningSpin {
+  flex: none;
+  color: var(--accent);
+  animation: strip-running-spin var(--dur-sweep) linear infinite;
+  animation-play-state: var(--motion-loop, running);
+}
+
+@keyframes strip-running-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /*

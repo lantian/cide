@@ -1111,7 +1111,7 @@ pub fn project_activate(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
 ) -> Result<Mutated, CoreError> {
-    let out = state.update(|ws| {
+    let out = state.update_cosmetic(|ws| {
         // Resolved first so an unknown id is an error rather than a silent no-op — the
         // frontend passes an id it read from the tree, so a miss means they have diverged.
         workspace::project(ws, project)?;
@@ -1194,7 +1194,7 @@ pub fn tab_activate(
     project: ProjectId,
     tab: TabId,
 ) -> Result<Mutated, CoreError> {
-    state.update(|ws| {
+    state.update_cosmetic(|ws| {
         workspace::activate_tab(ws, project, tab)?;
         Ok(Mutated { rev: ws.rev })
     })
@@ -1234,8 +1234,8 @@ pub fn tab_close(
     // than a second `update`, so the record describes the tab as it stood one instant before it
     // went — the tree included, with its pane ids and session bindings.
     let record = state.with(|ws| closing_record(ws, project, tab));
-    // Read in the same borrow, before the close, for the same reason. One of the two is always
-    // empty: a tab is either remembered or ended, never both.
+    // Read in the same borrow, before the close, for the same reason. A tab cide opened by
+    // itself is both: its children are ended *and* it is remembered, to be resumed on reopen.
     let ending = state.with(|ws| ephemeral_sessions(ws, project, tab));
 
     let out = state.update(|ws| {
@@ -1249,8 +1249,10 @@ pub fn tab_close(
     //
     // `kill` and not the graceful ladder: this is a pane close, which is what `closePane` already
     // does to a session a pane owns, and the ladder is for shutdown, where a `claude` is given
-    // time to finish writing the transcript a resume depends on. Nothing resumes an ephemeral
-    // tab — `closing_record` answered `None` for it — so there is no transcript to protect.
+    // time to finish writing the transcript a resume depends on. An ephemeral tab *is* resumed
+    // now — Ctrl+Shift+T respawns `claude --resume` over it (`claude_tab::resume_closed`) — and
+    // the kill is still right: the CLI writes its transcript a message at a time, so what a kill
+    // can cost is the turn in flight, in a tab the user closed to say they were done with it.
     if !ending.is_empty()
         && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
     {
@@ -1392,12 +1394,13 @@ fn reorder_target(
 /// remember" rather than as an error: `close_tab` is about to fail on the same lookup and its
 /// refusal is the one the user should see.
 ///
-/// `None` also for an **ephemeral** tab (M79), and that is a second rule wearing the same return
-/// value. A tab cide opened by itself has a `claude` that `tab_close` is about to kill, so a
-/// record of it would let Ctrl+Shift+T put back a tab naming a session the registry has
-/// forgotten — the hole `closed_tabs.rs`' header is about, arriving by a new door. The two
-/// halves are deliberately decided in one place, here and at [`ephemeral_sessions`], so a tab
-/// cannot be killed and remembered or remembered and spared.
+/// An **ephemeral** tab (M79) — a Review or Plan tab cide opened by itself — is remembered like
+/// any other, with its `ephemeral` mark kept. It used to answer `None` here: `tab_close` kills
+/// its `claude`, and a record naming a killed session looked like the hole `closed_tabs.rs`'
+/// header is about. The cost was that Ctrl+Shift+T could not bring such a tab back at all, which
+/// was reported as exactly that. The session is dead but its transcript is not, so
+/// [`tab_reopen_closed`] resumes it before reinserting (`claude_tab::resume_closed`), and the
+/// kept mark makes closing the reopened tab end its child again.
 fn closing_record(
     ws: &cide_ipc::Workspace,
     project: ProjectId,
@@ -1406,15 +1409,6 @@ fn closing_record(
     let p = workspace::project(ws, project).ok()?;
     let index = p.tabs.iter().position(|t| t.id == tab)?;
     let t = &p.tabs[index];
-    if matches!(
-        t.kind,
-        TabKind::ClaudeFull {
-            ephemeral: true,
-            ..
-        }
-    ) {
-        return None;
-    }
     let kind = match &t.kind {
         TabKind::File { path, .. } => TabKind::File {
             path: path.clone(),
@@ -1439,7 +1433,9 @@ fn closing_record(
 /// `TabKind::ClaudeFull::ephemeral` marks the tabs cide opened by itself — one per finished
 /// subagent turn, one per quiet period — and for those, parking is a `claude` leaked per run,
 /// alive and billed-for until the app quits, in a tab the user closed precisely to say they
-/// were done with it. So those children are ended.
+/// were done with it. So those children are ended — and the tab is still remembered by
+/// [`closing_record`], because Ctrl+Shift+T resumes the transcript rather than re-adopting a
+/// child.
 ///
 /// Read from the tree **before** the close, like [`closing_record`] beside it and for the same
 /// reason: afterwards there is nothing left to read.
@@ -1501,15 +1497,26 @@ fn ephemeral_sessions(
 /// A `while let` over [`crate::closed_tabs::ClosedTabs::pop`] rather than a peek-then-commit:
 /// the stack is a `Mutex<Vec<_>>`, popping under one lock per iteration is simpler, and a record
 /// this call has decided against is one the *next* call must not see again.
+///
+/// # A tab cide opened by itself comes back live
+///
+/// Its children were ended at the close ([`ephemeral_sessions`]), so before it is reinserted
+/// `claude_tab::resume_closed` respawns `--resume` over each pane that can be resumed — session
+/// first, tab second, so the pane mounts onto a running child. That spawn is why this command is
+/// `async`: a synchronous command runs on the GTK loop, and forking a process there is the thing
+/// `claude_tab::open`'s doc forbids. Nothing on the wire changed.
 #[tauri::command(rename_all = "camelCase")]
-pub fn tab_reopen_closed(
+pub async fn tab_reopen_closed(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
 ) -> Result<Option<TabId>, CoreError> {
-    let stack = app.state::<crate::closed_tabs::ClosedTabs>();
-
-    while let Some(record) = stack.pop(project) {
+    loop {
+        // Popped in its own statement so the `State` borrow of the stack is not held across the
+        // spawn's `.await` below.
+        let Some(mut record) = app.state::<crate::closed_tabs::ClosedTabs>().pop(project) else {
+            return Ok(None);
+        };
         match state.with(|ws| reopen_plan(ws, &record)) {
             Reopen::Skip => continue,
             Reopen::Show(id) => {
@@ -1517,15 +1524,36 @@ pub fn tab_reopen_closed(
                 return Ok(Some(id));
             }
             Reopen::Reinsert => {
-                let id = state.update(|ws| {
+                let resumed = if matches!(
+                    record.kind,
+                    TabKind::ClaudeFull {
+                        ephemeral: true,
+                        ..
+                    }
+                ) {
+                    crate::claude_tab::resume_closed(&app, &mut record).await
+                } else {
+                    Vec::new()
+                };
+                let reinserted = state.update(|ws| {
                     workspace::reinsert_tab(ws, project, record.index, record.kind, record.tree)
-                })?;
-                return Ok(Some(id));
+                });
+                if reinserted.is_err()
+                    && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
+                {
+                    // The project closed between the spawn and the reinsert, or the mutation
+                    // failed its validator: a live `claude` with no pane is a leak and a billed
+                    // process, so it goes now — `claude_tab::open`'s rule on the same failure.
+                    for session in resumed {
+                        if let Some(pty) = registry.get(session) {
+                            pty.kill();
+                        }
+                    }
+                }
+                return reinserted.map(Some);
             }
         }
     }
-
-    Ok(None)
 }
 
 /// What [`tab_reopen_closed`] should do with one record. See that function for the reasoning.
@@ -1681,16 +1709,15 @@ mod tests {
     use super::*;
     use cide_ipc::{DiffOrigin, DiffSpec, RepoId, SettingsSection, Workspace, git::DiffSide};
 
-    /// **A tab cide opened by itself is ended and not remembered; a tab a person opened is
-    /// remembered and not ended.** (M79)
+    /// **A tab cide opened by itself is ended and remembered; a tab a person opened is
+    /// remembered and not ended.** (M79, and the reopen fix)
     ///
-    /// Both halves in one test because they are one decision wearing two return values, and the
-    /// two ways of splitting them are both bugs: a tab killed *and* recorded lets Ctrl+Shift+T
-    /// reopen a tab naming a session the registry has forgotten — the hole `closed_tabs.rs`'
-    /// header is about — while a tab recorded *and* spared is the `claude` leaked per finished
-    /// run that `TabKind::ClaudeFull::ephemeral` exists to stop.
+    /// Sparing the ephemeral tab's child is the `claude` leaked per finished run that
+    /// `TabKind::ClaudeFull::ephemeral` exists to stop. Not remembering it was M79's answer to a
+    /// record naming a killed session, and it left Review and Plan tabs impossible to bring
+    /// back; the record is fine because `tab_reopen_closed` resumes the transcript first.
     #[test]
-    fn an_ephemeral_tab_is_ended_and_an_ordinary_one_is_remembered() {
+    fn an_ephemeral_tab_is_ended_and_both_kinds_are_remembered() {
         let mut ws = Workspace::default();
         let project =
             workspace::open_project(&mut ws, vec![PathBuf::from("/p")], None).expect("open");
@@ -1738,10 +1765,34 @@ mod tests {
             vec![mine],
             "the review tab's claude would have been left running"
         );
+        // Ended *and* remembered: the child goes, the transcript stays, and Ctrl+Shift+T resumes
+        // it. A `None` here was the reported bug — a Review or Plan tab closed by mistake could
+        // not be brought back at all.
+        let record = closing_record(&ws, project, review)
+            .expect("a Review or Plan tab stopped being reopenable");
         assert!(
-            closing_record(&ws, project, review).is_none(),
-            "Ctrl+Shift+T would reopen a tab whose session is about to be killed"
+            matches!(
+                record.kind,
+                TabKind::ClaudeFull {
+                    ephemeral: true,
+                    ..
+                }
+            ),
+            "the reopened tab lost its mark, so closing it again would leak its claude"
         );
+        assert_eq!(
+            record
+                .tree
+                .panes
+                .values()
+                .filter_map(|p| p.session)
+                .collect::<Vec<_>>(),
+            vec![mine],
+            "the record must name the session a reopen resumes"
+        );
+        // And the plan for it, once the tab is gone, is to put it back — not to skip it.
+        workspace::close_tab(&mut ws, project, review, false).expect("close");
+        assert_eq!(reopen_plan(&ws, &record), Reopen::Reinsert);
 
         assert!(
             ephemeral_sessions(&ws, project, opened_by_hand).is_empty(),

@@ -40,6 +40,14 @@
 export interface Tally {
   readonly runs: number
   readonly panes: number
+  /**
+   * Consoles mid-turn per tab id, for the in-project tab strip's spinner. (M115)
+   *
+   * Only tabs with a count above zero, and a *narrower* reading than `panes`: Rust counts a
+   * session here only while it is `Busy`, so a permission prompt is the awaiting badge's and never
+   * also a turning tab. `ProjectRunning::tabs` in `cide-ipc` carries the argument.
+   */
+  readonly tabs: ReadonlyMap<string, number>
 }
 
 /** One entry of a `cide://project-running` broadcast, as this module reads it. */
@@ -47,13 +55,14 @@ export interface RunningEntry {
   readonly project: string
   readonly runs: number
   readonly panes: number
+  readonly tabs: readonly { readonly tab: string; readonly panes: number }[]
 }
 
 /** The table, keyed by project id. */
 export type Counts = ReadonlyMap<string, Tally>
 
 /** A project nothing is running in. */
-export const NOTHING: Tally = { runs: 0, panes: 0 }
+export const NOTHING: Tally = { runs: 0, panes: 0, tabs: new Map() }
 
 /**
  * Fold a whole broadcast into a table.
@@ -73,7 +82,11 @@ export function foldRunning(entries: readonly RunningEntry[]): Counts {
     if (entry.runs <= 0 && entry.panes <= 0) continue
     // Last one wins, rather than summing: a broadcast carries one entry per project, and
     // summing a malformed duplicate would inflate a badge rather than make the bug visible.
-    counts.set(entry.project, { runs: entry.runs, panes: entry.panes })
+    const tabs = new Map<string, number>()
+    // Zero tabs dropped for the same reason zero projects are: absence is the only spelling of
+    // "nothing turning here", so `runningInTab` cannot disagree with itself.
+    for (const one of entry.tabs) if (one.panes > 0) tabs.set(one.tab, one.panes)
+    counts.set(entry.project, { runs: entry.runs, panes: entry.panes, tabs })
   }
   return counts
 }
@@ -116,6 +129,22 @@ export function tallyIn(counts: Counts, project: string | null | undefined): Tal
 export function runningIn(counts: Counts, project: string | null | undefined): number {
   const tally = tallyIn(counts, project)
   return tally.runs + tally.panes
+}
+
+/**
+ * How many consoles are mid-turn in one tab of one project — the tab strip's spinner. `0` for a
+ * tab nothing is turning in, and for a tab of a project with nothing running at all.
+ *
+ * Keyed by project *and* tab rather than tab alone because the table is per project; a tab id is
+ * unique anyway, but looking it up under its own project costs nothing and cannot pick up a
+ * stale entry of a tab that was moved between projects.
+ */
+export function runningInTab(
+  counts: Counts,
+  project: string | null | undefined,
+  tab: string,
+): number {
+  return tallyIn(counts, project).tabs.get(tab) ?? 0
 }
 
 /** The agent-run half alone, which is what [`runningHint`] needs to word itself. */

@@ -44,7 +44,7 @@ pub fn tool_window_set_layout(
     log_split: Option<u16>,
     files_as_tree: Option<bool>,
 ) -> Result<()> {
-    state.update(|ws| {
+    state.update_cosmetic(|ws| {
         cide_core::toolwindow::set_layout(ws, project, open, height, log_split, files_as_tree)
     })
 }
@@ -58,7 +58,7 @@ pub fn tool_window_activate(
     project: Option<ProjectId>,
     tab: Option<HistoryTabId>,
 ) -> Result<()> {
-    state.update(|ws| cide_core::toolwindow::activate(ws, project, tab))
+    state.update_cosmetic(|ws| cide_core::toolwindow::activate(ws, project, tab))
 }
 
 /// Show a file's history — open-or-activate, keyed on the repository and the path.

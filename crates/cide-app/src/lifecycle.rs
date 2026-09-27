@@ -143,11 +143,24 @@ const EXIT_DEADLINE: Duration = Duration::from_millis(1_500);
 /// teardown. Both fall through to [`shutdown`], which blocks here exactly as every version
 /// before this one did: a frozen window is bad, an unflushed workspace is worse.
 pub fn exit_requested(app: &AppHandle, code: Option<i32>, api: &tauri::ExitRequestApi) {
+    begin_going_down(app);
     if code != Some(tauri::RESTART_EXIT_CODE) && defer_teardown(app) {
         api.prevent_exit();
         return;
     }
     shutdown(app);
+}
+
+/// Tell the run registry the process is on its way out, before anything else happens.
+///
+/// First on every road out — a quit, a window close, a signal, logind's `PrepareForShutdown` —
+/// and not inside [`run_teardown`], which is too late for the case it exists for: an OS
+/// shutdown SIGTERMs cide's children *together with* cide, and a child reaped before the
+/// teardown began was recorded as a finished run. See `AgentRegistry::going_down`.
+pub fn begin_going_down(app: &AppHandle) {
+    if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+        agents.begin_going_down();
+    }
 }
 
 /// Start the teardown on a worker thread. Returns whether the caller must hold the exit.
@@ -201,6 +214,7 @@ fn defer_teardown(app: &AppHandle) -> bool {
 /// rather than returning early. The signal thread ends the process 1.5 s after it returns, so returning early would
 /// hand `std::process::exit` a half-written shutdown.
 pub fn shutdown(app: &AppHandle) {
+    begin_going_down(app);
     if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
         wait_for_teardown();
         return;
@@ -238,9 +252,6 @@ impl Drop for ReleaseClaim {
 /// calling thread for a signal or a `RunEvent::Exit`. Nothing here touches the event loop, so
 /// it is correct on either — and that is the property that lets the loop keep painting.
 fn run_teardown(app: &AppHandle) {
-    if let Some(gitlab) = app.try_state::<crate::cmd::gitlab::GitLabState>() {
-        gitlab.shutdown(app);
-    }
     // The profile claim goes back when this function leaves, by whichever of its exits it
     // takes — hence a guard rather than a line at the bottom, which the early return below
     // would skip. A file left behind is not a failure (the next start finds a dead pid and
@@ -281,6 +292,30 @@ fn run_teardown(app: &AppHandle) {
     // is merged rather than overwritten on the way out.
     if let Some(stores) = app.try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>() {
         stores.flush_all();
+    }
+
+    // The runs, sealed and written — moved up from just before the ladder, and the budget is
+    // why. An OS shutdown or a logout gives this whole function **five seconds** before systemd
+    // SIGKILLs the cgroup (`TimeoutStopUSec` of the app unit, and logind's `InhibitDelayMaxSec`
+    // on the reboot road), and everything between here and the ladder — GitLab's review
+    // servers, the IDE servers, the screens — can spend them. The snapshot is the last of the
+    // four writes the next launch cannot do without, so it lands with the other three. Sealing
+    // this early costs nothing: a run that changes state between here and the ladder is still
+    // non-terminal on disk and comes back `Interrupted`, which is the truth about it once the
+    // ladder has run. The thaw stays where it was — it has to be the last thing before the
+    // signals, and see the note there.
+    if let (Some(agents), Some(sessions)) = (
+        app.try_state::<Arc<crate::agents::AgentRegistry>>(),
+        app.try_state::<SessionRegistry>(),
+    ) {
+        agents.final_snapshot(&sessions);
+    }
+
+    // After the durable writes, not first as it was: cancelling review workspaces and stopping
+    // their language servers is housekeeping, and it can take seconds the writes above cannot
+    // spare on a shutdown's budget.
+    if let Some(gitlab) = app.try_state::<crate::cmd::gitlab::GitLabState>() {
+        gitlab.shutdown(app);
     }
 
     // Before the children are signalled. A `claude` blocked on `openDiff` has to receive its
@@ -389,6 +424,10 @@ fn run_teardown(app: &AppHandle) {
         // `Finished`, and the coalescer's next flush overwrote this snapshot with the
         // shutdown's own wreckage recorded as outcomes — two paused runs restored as history,
         // and Resume had nothing to resume. The seal makes this write the last one.
+        //
+        // The write itself now happens near the top of this function, with the workspace's
+        // (see there for the five-second budget). This call is the idempotent backstop — a
+        // no-op once sealed — for the path that could not reach the registries up there.
         agents.final_snapshot(&registry);
         agents.thaw_for_shutdown(&registry);
     }
@@ -396,9 +435,32 @@ fn run_teardown(app: &AppHandle) {
     // The rung, not a precomputed count, is what the notice reports: a session that goes on
     // the first SIGHUP is never named, and the two rungs that cost real time say why they are
     // costing it. See `rung_line`.
+    // Read before the ladder, because after it the runs' orphans no longer say whose they were:
+    // a codex run's commands live in sessions of their own under its sandbox wrapper, which no
+    // rung reaches, and `PR_SET_PDEATHSIG` takes codex and not them. Runs only; see
+    // `AgentRegistry::run_sessions`. (M119)
+    let run_trees: Vec<cide_core::process_tree::Tree> = app
+        .try_state::<Arc<crate::agents::AgentRegistry>>()
+        .map(|agents| agents.run_sessions())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| registry.get(id)?.child_pid())
+        .map(cide_core::process_tree::capture)
+        .collect();
     stop_children_reporting(&children, Ladder::default(), &mut |rung, count| {
         notice::say(rung_line(rung, count));
     });
+    let left: usize = run_trees
+        .into_iter()
+        .map(cide_core::process_tree::Tree::end_now)
+        .sum();
+    if left > 0 {
+        tracing::info!(left, "ended processes the runs left running");
+    }
+    // The children are down: nothing left is worth making an OS shutdown wait for, and the
+    // language servers' ladders below can take seconds of logind's five. See `logind`.
+    #[cfg(target_os = "linux")]
+    crate::logind::release();
     // The runs' opencode servers, which are not sessions and so not on the ladder: after it, so
     // a run's last turn is not cut off from the server it is a client of. (M104 follow-up)
     if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
@@ -925,6 +987,10 @@ pub fn install_signal_handlers(app: &AppHandle) {
             let Some(signal) = signals.forever().next() else {
                 return;
             };
+            // Before the log line, before anything: the same SIGTERM reached every child in
+            // cide's cgroup at the same instant, and their reaper callbacks are already racing
+            // this thread. See `begin_going_down`.
+            begin_going_down(&app);
             tracing::info!(signal, "shutting down on a signal");
             // Blocking, and it has to be — including when the teardown is already running on
             // the `cide-shutdown` worker, in which case this waits for that one rather than
@@ -1569,6 +1635,25 @@ struct Resume {
     codex: bool,
 }
 
+/// What one pane of a tab Ctrl+Shift+T is about to put back could resume, right now.
+///
+/// `claude_tab::resume_closed` asks it for a tab cide opened by itself, whose children were
+/// ended at the close. It is [`restore_for`] with the directory [`entry_for`] would pick, and
+/// deliberately nothing of its own: the launch plan, the Resume splash and a reopen answering
+/// the same pane differently is how one of them comes to offer a conversation the others know
+/// is gone.
+pub(crate) fn resumable_on_reopen(ws: &Workspace, pane: &Pane, root: &Path) -> SessionRestore {
+    let cwd = pane
+        .continues
+        .as_ref()
+        .map_or(root, |conversation| conversation.cwd.as_path());
+    let resume_enabled = Resume {
+        claude: ws.settings.claude.cli.inject.resume.enabled,
+        codex: ws.settings.codex.cli.inject.resume,
+    };
+    restore_for(pane, cwd, claude_projects_dir().as_deref(), resume_enabled)
+}
+
 fn restore_for(
     pane: &Pane,
     cwd: &Path,
@@ -1915,6 +2000,16 @@ fn saved_screens() -> &'static std::collections::BTreeMap<String, SavedScreen> {
         let Ok(bytes) = std::fs::read(&path) else {
             return Default::default();
         };
+        // **Consumed**, now that it is in memory (M117). The file is written only by a clean
+        // quit, so after a crash or a power cut the one on disk was the quit *before* — and the
+        // next launch replayed those screens into shells that had run a whole session since,
+        // showing output that was stale by however many launches had ended badly. Removed, a
+        // crash leaves no file and the panes come back empty, which is the honest answer. This
+        // run still has every screen in the latch above for as long as it lives, and its own
+        // quit writes a fresh file.
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::debug!(%error, "could not consume the saved shell screens");
+        }
         serde_json::from_slice(&bytes).unwrap_or_else(|error| {
             tracing::warn!(%error, "the saved shell screens are unreadable; panes come back empty");
             Default::default()

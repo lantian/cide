@@ -4,7 +4,7 @@
  * Why a provider refused a run, as the pool-state card draws it. (M90)
  *
  * The wire twin of `cide_agents::FailoverReason`, which is not serialisable and lives in a crate
- * this one must not depend on. Three cases for the same reason that enum gives: each is a
+ * this one must not depend on. Five cases for the same reason that enum gives: each is a
  * different something a different candidate plausibly routes around.
  */
-export type PoolRefusal = "rateLimited" | "unreachable" | "auth";
+export type PoolRefusal = "rateLimited" | "unreachable" | "auth" | "variant" | "rejected";

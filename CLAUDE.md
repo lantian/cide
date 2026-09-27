@@ -122,6 +122,7 @@ before you change it.
 | [`editor/markdown/`, the markdown preview](docs/checks.md#editormarkdown-the-markdown-preview) | `check:markdown`, `check:editor`, `check:ui-scale` |
 | [Anything a CodeMirror surface draws](docs/checks.md#anything-a-codemirror-surface-draws) | `check:scheme` |
 | [A syntax colour, a `--tk-*`, or `TOKEN_ROLES`](docs/checks.md#a-syntax-colour-a---tk--or-token_roles) | `check:scheme`, `check:editor` |
+| [The accent colour, or any accent-family token](docs/checks.md#the-accent-colour-or-any-accent-family-token) | `check:accent`, `check:theme`, `cargo test -p cide-core accent`, `cargo test -p cide-app settings` |
 | [`ColorScheme::normalise`, and anything about an imported scheme's selection](docs/checks.md#colorschemenormalise-and-anything-about-an-imported-schemes-selection) | `cargo test -p cide-ipc theme` |
 | [Showing a rejected `invoke` to a user](docs/checks.md#showing-a-rejected-invoke-to-a-user) | `check:scheme` |
 | [Subscribing to a `cide://` event](docs/checks.md#subscribing-to-a-cide-event) | `check:unlisten`, `check:attach`, `check:detached` |
@@ -165,6 +166,8 @@ before you change it.
 | [An agent reviewing a GitLab MR, and its draft comments](docs/checks.md#an-agent-reviewing-a-gitlab-mr-and-its-draft-comments) | `cargo test -p cide-gitlab`, `cargo test -p cide-agents review`, `cargo test -p cide-app -- agent_rpc mr_review`, `check:gitlab`, `check:gitlab-render`, `check:gitlab-dom`, `cargo --locked xtask codegen --check` |
 | [The console harness, or anything that spawns codex](docs/checks.md#the-console-harness-or-anything-that-spawns-codex) | `cargo test -p cide-core -- codex_cli workspace`, `cargo test -p cide-claude`, `cargo test -p cide-agents`, `cargo test -p cide-app -- cmd::session agents spec`, `check:awaiting`, `check:claude-cli`, `check:menu-model`, `check:ext`, `cargo --locked xtask codegen --check`, `cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn` |
 | [The screenshot demo and the feature site](docs/checks.md#the-screenshot-demo-and-the-feature-site) | `check:demo`, `pnpm --dir ui demo:shots` |
+| [What survives a crash, a power cut or an OS shutdown](docs/checks.md#what-survives-a-crash-a-power-cut-or-an-os-shutdown) | `cargo test -p cide-core -- persist buffers document`, `cargo test -p cide-app -- agents workspace_state lifecycle`, `cargo test -p cide-tasks`, `cargo test -p cide-git`, `cargo test -p cide-gitlab`, `cargo test -p cide-remote`, `cargo test -p cide-fs`, `check:editor` |
+| [The updater](docs/checks.md#the-updater) | `cargo test -p cide-app updater`, `cargo test -p xtask`, `python3 scripts/updater-manifest.py --self-test`, `cargo --locked xtask contract-check`, `cargo --locked xtask codegen --check`, `check:commands`, `check:keys`, `check:switcher`, `check:selectors` |
 | [Added, renamed or moved any file](docs/checks.md#added-renamed-or-moved-any-file) | `check:casing` |
 | [The UI kit, or any new UI](docs/checks.md#the-ui-kit-or-any-new-ui) | `check:kit`, `check:ui-scale`, `check:motion`, `check:theme`, `check:ui-icons`, `check:menus` |
 

@@ -41,15 +41,40 @@
 
 /* --- pool entries --- */
 
-.entry {
-  display: flex;
+/*
+ * The heading and every entry share one grid (each `.entry` is `display: contents`), so the
+ * columns line up under their names. The model gets the widest share: its value is
+ * `provider/model`, the others are a provider id, an effort word and a number.
+ */
+.entries {
+  display: grid;
+  grid-template-columns:
+    auto minmax(0, 1fr) minmax(0, 2.4fr) minmax(0, 0.9fr) calc(64px * var(--ui-scale))
+    auto auto auto;
   align-items: center;
-  gap: var(--sp-3);
+  column-gap: var(--sp-3);
+  row-gap: var(--sp-3);
   padding: var(--sp-2) 0;
 }
 
+.entry {
+  display: contents;
+}
+
+.entryHead {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The three icon-button columns have no heading. */
+.entryHeadRest {
+  grid-column: span 3;
+}
+
 .entrySelect {
-  flex: 1;
   min-width: 0;
 }
 
@@ -83,7 +108,7 @@
 }
 
 .entryLimit {
-  flex: 0 0 calc(72px * var(--ui-scale));
+  width: 100%;
 }
 
 .entryField:focus {
@@ -172,19 +197,19 @@
   color: var(--dim);
 }
 
-/* --- a model id box with a picker beside it --- */
+/* --- a pool entry's check, on its readout line --- */
 
-.combo {
-  display: flex;
-  gap: var(--sp-3);
-  flex: 1;
-  min-width: 0;
+.checkRunning {
+  color: var(--dim);
 }
 
-/* The kit `Select` beside the model box: wide enough for "Pick…" and its chevron. */
-.comboPick {
-  flex: none;
-  width: calc(96px * var(--ui-scale));
+.checkOk {
+  color: var(--green);
+}
+
+.checkBad {
+  color: var(--yellow);
+  white-space: pre-wrap;
 }
 
 .testResultOk {

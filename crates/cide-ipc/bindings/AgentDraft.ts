@@ -4,6 +4,7 @@ import type { AgentId } from "./AgentId";
 import type { AgentLocation } from "./AgentLocation";
 import type { AgentScope } from "./AgentScope";
 import type { Harness } from "./Harness";
+import type { SandboxNeed } from "./SandboxNeed";
 
 /**
  * One role as a form edits it: every key the definition file may carry, plus where it lives.
@@ -126,6 +127,27 @@ maxConcurrent?: number,
  * silently *deleted* from a hand-written definition by the next panel save.
  */
 worktree?: boolean, 
+/**
+ * `allow-commands:` — command prefixes this role runs without being asked, written the way
+ * they are typed (`blender -b`, `tools/ci/runners/e2e.sh`). (M119)
+ *
+ * On codex these become execpolicy `prefix_rule`s, and a command every part of which one
+ * matches runs **outside** codex's sandbox; on claude they are `Bash(<prefix>:*)` entries in
+ * `--allowedTools`. Empty means none. `#[serde(default)]` because a draft from before M119 —
+ * and every form that does not show the field — must still deserialize, and `render` writes
+ * only what the draft carries, so the form carries all three of these keys even where it
+ * does not draw them (see [`Self::worktree`]'s doc for the deletion hazard).
+ */
+allowCommands: Array<string>, 
+/**
+ * `needs:` — what the role's work needs from a sandbox. See [`SandboxNeed`]. (M119)
+ */
+needs: Array<SandboxNeed>, 
+/**
+ * `writable-dirs:` — directories outside the worktree this role may write, absolute or
+ * `~/…`. Added to codex's sandbox as writable roots. (M119)
+ */
+writableDirs: Array<string>, 
 /**
  * The body of the file: the role's system prompt, verbatim.
  *

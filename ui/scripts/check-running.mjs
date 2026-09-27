@@ -25,6 +25,8 @@
  *    would pass with the call deleted.
  * 4. **The two chips stay independent.** The running chip must not read `--awaiting-*`: they
  *    light for unrelated reasons and must collapse separately.
+ * 5. **The tab strip's spinner** (M115): `runningInTab` driven, the strip's geometry, and its
+ *    wiring — every console tab turns while a turn runs, and the pinned grid spells its count.
  *
  * Run: `pnpm --dir ui run check:running`
  */
@@ -69,7 +71,8 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { foldRunning, isNewer, runningIn, runsIn, runningBadge, runningHint } = await import(
+  const { foldRunning, isNewer, runningIn, runningInTab, runsIn, runningBadge, runningHint } =
+    await import(
     `file://${join(out, 'runningRule.js')}`
   )
 
@@ -78,8 +81,17 @@ try {
   // ------------------------------------------------------------------------------------
 
   const table = foldRunning([
-    { project: 'a', runs: 2, panes: 1 },
-    { project: 'b', runs: 0, panes: 3 },
+    { project: 'a', runs: 2, panes: 1, tabs: [{ tab: 't1', panes: 1 }] },
+    {
+      project: 'b',
+      runs: 0,
+      panes: 3,
+      tabs: [
+        { tab: 'home', panes: 2 },
+        { tab: 'full', panes: 1 },
+        { tab: 'quiet', panes: 0 },
+      ],
+    },
   ])
 
   eq(runningIn(table, 'a'), 3, 'a project s count is its runs plus its console panes')
@@ -94,7 +106,7 @@ try {
 
   // A producer that ever sends an explicit zero must not make the table disagree with itself.
   eq(
-    runningIn(foldRunning([{ project: 'z', runs: 0, panes: 0 }]), 'z'),
+    runningIn(foldRunning([{ project: 'z', runs: 0, panes: 0, tabs: [] }]), 'z'),
     0,
     'an explicit zero entry is dropped rather than stored as a present-but-empty project',
   )
@@ -297,6 +309,82 @@ try {
       'light for unrelated reasons, and a project with an agent working and nothing waiting ' +
       'would otherwise draw a hole where the amber chip is not',
   )
+
+  // ------------------------------------------------------------------------------------
+  // 5. The tab strip's spinner. (M115)
+  // ------------------------------------------------------------------------------------
+
+  eq(runningInTab(table, 'b', 'home'), 2, 'a tab s count is its own consoles mid-turn')
+  eq(runningInTab(table, 'b', 'full'), 1, 'and each tab answers for itself')
+  eq(runningInTab(table, 'b', 'quiet'), 0, 'an explicit zero tab is dropped, reading 0')
+  eq(runningInTab(table, 'b', 'gone'), 0, 'a tab absent from the set has nothing turning')
+  eq(runningInTab(table, 'a', 'home'), 0, 'a tab is looked up under its own project only')
+  eq(runningInTab(table, 'never-heard-of', 't1'), 0, 'a quiet project has no turning tab')
+  eq(runningInTab(table, '', 't1'), 0, 'and a strip with no project draws no spinner')
+
+  const stripCss = stripComments(src('src/chrome/TabStrip.module.css'))
+  const tabBox = stripCss.match(
+    /--running-w:\s*calc\(([\d.]+)px \* var\(--ui-scale\)(?: \+ ([\d.]+)px)?\)/,
+  )
+  if (tabBox === null) {
+    console.error('FAIL the tab strip s running box is not a literal-first scaled calc()')
+    failed++
+  } else {
+    // The mark and its gap, both unscaled, then `9+` in mono (~0.6em). No rule: the tab's mark
+    // is bare, not a pill.
+    const font = 11
+    const slack = Number(tabBox[1]) + Number(tabBox[2] ?? 0) - 12 - 2 - 2 * 0.6 * font
+    ok(slack >= 0.5, `the tab s running box holds "9+" beside the mark (${slack.toFixed(1)}px spare)`)
+  }
+  ok(
+    /\.tab\[data-running='false'\]\s*\{\s*--running-w:\s*0px;\s*--running-slot:\s*0px;\s*\}/.test(
+      stripCss,
+    ),
+    'the tab strip collapses --running-w and --running-slot together',
+  )
+  const pinned = stripCss.slice(stripCss.indexOf('.labelPinned {'))
+  const pinnedReach = pinned.slice(0, pinned.indexOf('}'))
+  for (const prop of ['margin-right', 'padding-right']) {
+    const line = pinnedReach.match(new RegExp(`${prop}:[^;]*`))?.[0] ?? ''
+    ok(
+      line.includes('--awaiting-slot') && line.includes('--running-slot'),
+      `.labelPinned s ${prop} reaches over both chips on the pinned console tab`,
+    )
+  }
+  const tabRunning = stripCss.slice(stripCss.indexOf('.running {'))
+  ok(
+    !tabRunning.slice(0, tabRunning.indexOf('}')).includes('--awaiting-'),
+    'the tab s running box sizes itself from --running-*, never from the awaiting chip s',
+  )
+  const spinRule = (text) => text.match(/\.runningSpin\s*\{([^}]*)\}/)?.[1] ?? ''
+  for (const [where, text] of [
+    ['tab strip', stripCss],
+    ['header', css],
+  ]) {
+    const rule = spinRule(text)
+    ok(
+      /color:\s*var\(--accent\)/.test(rule),
+      `the ${where} s turning mark wears the user s accent colour (the user s call, 2026-09-26)`,
+    )
+    ok(
+      rule.includes('animation-play-state: var(--motion-loop'),
+      `the ${where} s turning mark pauses under reduced motion via --motion-loop`,
+    )
+  }
+
+  has(
+    'src/chrome/TabStrip.tsx',
+    '= useRunningInTab(',
+    'every console tab asks how many of its consoles are mid-turn',
+  )
+  has('src/chrome/TabStrip.tsx', 'data-running=', 'the tab row carries the state the CSS collapses on')
+  has(
+    'src/chrome/TabStrip.tsx',
+    "tab.kind.kind === 'claudeHome' || turning > 1 ? runningBadge(turning)",
+    'the pinned grid always spells its count; a closable console only once a split has two at work',
+  )
+  has('src/App.tsx', 'project={activeProject.id}', 'the live strip is told its project')
+  has('src/panes/running.ts', 'runningInTab(counts, project, tab)', 'the hook reads Rust s per-tab count')
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

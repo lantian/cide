@@ -160,4 +160,12 @@ poolPosition: string | null,
  * that roster already makes, and none at all on the per-run broadcasts that carry no root.
  * A run with no task stood in the project root and never had one.
  */
-worktree: boolean, };
+worktree: boolean, 
+/**
+ * The Claude session of the review tab that owns this run's task right now, while that tab
+ * is open. (M114) The row draws it as "In review by orchestrator", a link that reveals the
+ * tab: a run parked `Idle` because its task went to review otherwise looked stuck, with
+ * nothing saying that somebody else holds the task. Filled, like [`Self::worktree`], only
+ * where a roster is built — the review-tab table lives in the app.
+ */
+reviewer?: SessionId, };

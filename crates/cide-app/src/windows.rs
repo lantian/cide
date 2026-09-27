@@ -73,6 +73,31 @@ fn ui_font_size(app: &AppHandle) -> f32 {
     cide_ipc::clamp_ui_font_size(stored)
 }
 
+/// The saved accent as the `&accent=` parameter `public/theme-boot.js` reads — `rrggbb,rrggbb`
+/// (light, dark), or nothing for the shipped red, which is the stylesheet's own default and so
+/// needs no parameter at all. For [`theme`]'s first-frame reason: without it every window of a
+/// user who picked blue flashes red until the bootstrap round trip lands.
+///
+/// Re-validated rather than trusted, like [`ui_font_size`]: a hand-edited `workspace.json` can
+/// reach this, and it is spliced into a URL. Anything that is not two bare hexes is dropped.
+fn accent_param(app: &AppHandle) -> String {
+    let Some(accent) = app
+        .try_state::<WorkspaceState>()
+        .and_then(|state| state.with(|ws| ws.settings.accent.clone()))
+    else {
+        return String::new();
+    };
+    let bare = |hex: &str| {
+        cide_ipc::theme::normalise_hex(hex)
+            .filter(|h| h.len() == 7)
+            .map(|h| h[1..].to_string())
+    };
+    match (bare(&accent.light), bare(&accent.dark)) {
+        (Some(light), Some(dark)) => format!("&accent={light},{dark}"),
+        _ => String::new(),
+    }
+}
+
 /// Logical size of the design mock. Used as the first-run default so the app opens at the
 /// geometry the screenshot comparison in M3 is specified against.
 pub const DEFAULT_WIDTH: f64 = 1440.0;
@@ -223,9 +248,10 @@ pub fn create(
     // theme arriving late is a flash of the wrong palette; this arriving late is a *reflow* of
     // every row, tab and panel in the window, on every launch, at any size but the default.
     let ui_param = format!("&ui={}", ui_font_size(app));
+    let accent_param = accent_param(app);
     let url = WebviewUrl::App(
         format!(
-            "index.html?window={}{theme_param}{ui_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}{console_bridge}",
+            "index.html?window={}{theme_param}{ui_param}{accent_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}{console_bridge}",
             label.as_str()
         )
         .into(),

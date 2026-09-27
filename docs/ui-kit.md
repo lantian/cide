@@ -89,7 +89,7 @@ These are for anyone adding UI, Claude included.
 | `--sel` | the selected row, the focused menu item |
 | `--border` / `--border-soft` | edges of boxes / dividers between rows inside one |
 | `--text-hi` / `--text` / `--dim` / `--faint` | titles and typed values / body / secondary / hints, placeholders, disabled |
-| `--accent` | links, focus, the current thing. **Sparingly**: it marks the current thing and the one primary act. Proposed: `#dc1f2b` light (4.91:1 on white), `#ff5a5f` dark |
+| `--accent` | links, focus, the current thing. **Sparingly**: it marks the current thing and the one primary act. The default is `#dc1f2b` light (4.91:1 on white) and `#ff5a5f` dark. **The user can choose it** (Settings → Appearance → Accent colour), so never hardcode it, and never pick a status colour or a surface for how it looks next to red. A chosen accent is fitted to ≥ 4.5:1 in both themes, and black, greys and near-white are refused because black is danger. `tokens.css`'s `[data-accent='custom']` blocks derive every accent token from it, and `check:accent` keeps them complete |
 | `--grad-accent-ink` | anything carrying text on the accent: primary button, current step dot, switch when on, accent counter |
 | `--grad-accent` | decorative only. White on its orange end is 2.4:1, so never put text on it |
 | `--grad-accent-h` / `--grad-accent-soft` | horizontal bars (progress, tab underline) / art grounds (wizard rail, empty-state mark) |
@@ -228,6 +228,10 @@ Chapters are anchors on the page: `kit.html#<id>`.
 - **`ChoiceCards`**: one of 2–4 options that each need a picture or a paragraph (the wizard's
   project type).
 - **`ToggleCard`**: a checkbox that needs a sentence of why.
+- **`ColorSwatches`**: one colour. Hand-picked preset swatches (one may be `null`, a default), a
+  Custom swatch over the native colour dialog, and a hex field. It commits when the dialog
+  closes or the field is left, never on every drag, because its caller is usually a settings
+  write. A refusal goes in `error`, under the row. Settings → Appearance → Accent colour uses it.
 
 ### Status marks: `Status.tsx`
 
@@ -235,7 +239,10 @@ Tones are meanings: `blue` in progress or informational, `green` done, `yellow` 
 with dark ink) waiting on someone, `red` failed, `purple` merged, `cyan` a kind that is not a
 state (suggestion, docs), `neutral` no state worth a colour. **`accent` is never a status**: it
 is the brand red, and "running" drawn in it read as failed. It marks only "yours" or "asking for
-you" (an awaiting-input counter, an unsaved dot).
+you" (an awaiting-input counter, an unsaved dot). **One exception, the user's call
+(2026-09-26):** the turning mark of a working console, on the tab strip and on the header's
+project tab, wears `--accent`, so it matches the colour chosen in Settings. It is a bare glyph
+with a dim figure beside it, never a filled chip, so it does not read as a failure badge.
 
 - **`Badge`**: a state someone else named, filled with the tone's gradient. Use `dot` for a state
   (pipeline, job) and `squared` for a kind (MR state, severity). `soft` draws the quiet form (the

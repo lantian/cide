@@ -526,9 +526,15 @@ fn assemble(
     // There is no `--disallowedTools` counterpart because a definition cannot express one:
     // the front matter has a `tools` key and no `disallowed-tools` key (`defs::KNOWN_KEYS`).
     // Emitting an empty one would be a restriction the role's author never wrote.
-    if !plan.agent.tools.is_empty() && !subagent {
+    // The role's `allow-commands` (M119) ride the same flag as `Bash(<prefix>:*)`: claude's
+    // allow list is "run without asking", which is exactly the grant — and what lets a role in
+    // `auto` or `default` run its Blender or e2e runner without the classifier or a person in
+    // the way. A subagent never has them (`defs::canonical_key`).
+    let allowed = crate::sandbox::claude_allowed_tools(&plan.agent.sandbox.allow_commands);
+    if (!plan.agent.tools.is_empty() || !allowed.is_empty()) && !subagent {
         args.push("--allowedTools".into());
         args.extend(plan.agent.tools.iter().cloned());
+        args.extend(allowed);
     }
 
     // ---- 4b. and, for a Claude Code subagent, the definition itself ----
@@ -853,6 +859,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             extras: Vec::new(),
+            sandbox: Default::default(),
         }
     }
 
@@ -887,6 +894,9 @@ mod tests {
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
             server: None,
+            git_dirs: Vec::new(),
+            sandbox_brief: None,
+            codex_trust_root: None,
         }
     }
 

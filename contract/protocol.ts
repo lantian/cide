@@ -194,7 +194,15 @@ poolPosition: string | null,
  * that roster already makes, and none at all on the per-run broadcasts that carry no root.
  * A run with no task stood in the project root and never had one.
  */
-worktree: boolean, };
+worktree: boolean, 
+/**
+ * The Claude session of the review tab that owns this run's task right now, while that tab
+ * is open. (M114) The row draws it as "In review by orchestrator", a link that reveals the
+ * tab: a run parked `Idle` because its task went to review otherwise looked stuck, with
+ * nothing saying that somebody else holds the task. Filled, like [`Self::worktree`], only
+ * where a roster is built — the review-tab table lives in the app.
+ */
+reviewer?: SessionId, };
 
 /**
  * Which of the two directories a definition lives in.
@@ -434,7 +442,14 @@ harness?: Harness,
 /**
  * And this model, for this run only. Passed through as the harness's `--model`. (M104)
  */
-model?: string, };
+model?: string, 
+/**
+ * Start a new context rather than continue the role's own conversation on this task.
+ * (M116) Without it a dispatch onto a (role, task) that has been worked before continues it:
+ * its instructions go into the run still holding the pair, or a new run resumes the last
+ * ended one's conversation. `false`, and absent from older clients, is the default.
+ */
+fresh?: boolean, };
 
 /**
  * A piece of work that is not a task in this project's tracker. (M104)
@@ -449,6 +464,24 @@ export type ExternalWork = {
  * Where the work is written down, e.g. `JIRA-123` or a URL. Names the worktree when present.
  */
 reference?: string, title: string, brief: string, };
+
+/**
+ * When the active milestone's gate runs without being asked.
+ *
+ * A gate is a project's own acceptance run, and on the projects milestones were built for it is
+ * long: selfcraft's `slice` took 16 minutes and `items` 7, terrastrike's gates 7–15 with a
+ * `timeoutSecs` of one to two hours. `Merge` reruns it after every agent merge, so a batch of
+ * subagents finishing a few minutes apart keeps a gate running for the whole afternoon, each
+ * verdict about a commit already superseded by the next merge. `Idle` waits for the project to
+ * go quiet — the spinner's wake, which runs a stale gate before it plans — so a batch costs one
+ * run; `Manual` leaves it to the Run gate button. Every mode still runs it when asked, and when a
+ * plan is defined or a proposal changes it: those are deliberate and rare.
+ *
+ * Deserialised leniently: a value this build does not know reads as `Merge` rather than failing
+ * the plan, because a typo in one key must not cost the whole `milestones` block (see
+ * [`MilestonePlan`]).
+ */
+export type GateRuns = "merge" | "idle" | "manual";
 
 /**
  * A milestone's gate, as last seen. Outbound.
@@ -607,7 +640,12 @@ maxOpen?: number,
  * gate reads. A branch that touches one is refused at integration: the work may not move the
  * goal it is measured against.
  */
-guardPaths: Array<string>, };
+guardPaths: Array<string>, 
+/**
+ * When cide runs the active gate by itself. Absent is [`GateRuns::Merge`], the behaviour
+ * every plan had before this field existed.
+ */
+gateRuns?: GateRuns, };
 
 /**
  * One task under a milestone: enough to draw a row and open the card. Outbound.
@@ -1652,4 +1690,13 @@ running: boolean, last?: CheckResult,
 /**
  * The full output, as [`GateState::log`].
  */
-log?: string, };
+log?: string, 
+/**
+ * Red verifies in a row on this task since the last green one. (M114)
+ */
+failures: number, 
+/**
+ * `agents.verifyRetries` as it stood when this was drawn: while `failures` is at most this,
+ * a red verify went back to the run itself; past it, to the reviewer.
+ */
+retries: number, };

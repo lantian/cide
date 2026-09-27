@@ -428,6 +428,13 @@ try {
    * reasoning as above: they are one box's geometry, the frame's class is hashed out of
    * `SplitTree.module.css`'s reach, and a theme has no opinion on them. `check:rows` pins
    * both ends and which leaves get which marks.
+   *
+   * `--pane-top-strip` joined them when a file tab lost its cluster and the markdown view switch
+   * moved into the cluster's place: it is how far down the frame's content starts (an open find
+   * bar's height, else 0), the cluster already steps by it, and the switch has to step by the
+   * same amount or it lands on the find field. `MarkdownFrame.module.css` reads it with a `0px`
+   * fallback, so a renamed publisher would park the switch on the find bar in silence — the
+   * reason it is pinned here rather than excused.
    */
   const publishers = new Map()
   for (const file of cssModules('src')) {
@@ -462,9 +469,10 @@ try {
       '--pane-edge-bottom <- src/layout/SplitTree.module.css',
       '--pane-edge-left <- src/layout/SplitTree.module.css',
       '--pane-edge-top <- src/layout/SplitTree.module.css',
+      '--pane-top-strip <- src/layout/PaneTitleBar.module.css',
     ],
-    'the custom properties one CSS module publishes to another are the pane corner reserve ' +
-      'and the three flush-edge marks, each from exactly one file',
+    'the custom properties one CSS module publishes to another are the pane corner reserve, ' +
+      'the top-strip step and the three flush-edge marks, each from exactly one file',
   )
 
   // --- the three notice edges are three colours a person can tell apart --------------------

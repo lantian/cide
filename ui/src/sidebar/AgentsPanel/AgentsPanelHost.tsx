@@ -106,7 +106,10 @@ import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
 import { useTasks } from '@/sidebar/tasksStore'
 import { revealTask } from '@/chrome/taskReveal'
+import { followMilestones, useMilestones } from '@/sidebar/milestonesStore'
+import { openTaskSession } from '@/sidebar/TasksPanel/openSession'
 import { AgentsPanelView, type AgentsTab } from './AgentsPanel'
+import type { GateView } from './model'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
 const TICK_MS = 1_000
@@ -158,6 +161,29 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     if (board.kind === 'ready') for (const task of board.tasks) titles[task.id] = task.title
     return titles
   }, [board])
+
+  /*
+   * The verify gate per task (M114), for the line that says why an idle run is idle. The
+   * milestones store is the one mirror of `milestones::view`; it follows the Tasks panel's
+   * project, so a view of another project is ignored rather than drawn onto this one's rows.
+   * Memoised on the view for `taskTitles`' reason.
+   */
+  useEffect(() => followMilestones(), [])
+  const milestones = useMilestones((s) => s.view)
+  const taskGates = useMemo(() => {
+    const gates: Record<string, GateView> = {}
+    if (milestones === null || milestones.project !== project) return gates
+    for (const v of milestones.verifies) {
+      gates[String(v.task)] = {
+        agent: String(v.agent),
+        running: v.running,
+        passed: v.last === undefined ? null : v.last.passed,
+        failures: v.failures,
+        retries: v.retries,
+      }
+    }
+    return gates
+  }, [milestones, project])
 
   /**
    * Every write goes out the same way: fire it, and show the reason if it fails.
@@ -274,6 +300,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
       project={project}
       roster={roster}
       taskTitles={taskTitles}
+      taskGates={taskGates}
       nowMs={nowMs}
       /*
        * The write that touches the user's repository. Passed only with a project open, so the
@@ -308,6 +335,13 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
              */
             onStop: (run: string) => guarded(stop(run)),
             onOpen: (run: string) => guarded(openPane(run)),
+            /*
+             * The review tab that owns a run's task (M114): revealed where it is, or resumed into
+             * the console when its pane is gone. No `task` is passed on purpose — that option
+             * *hands* the task to the session, and this gesture only shows it.
+             */
+            onOpenReviewer: (session: string) =>
+              guarded(openTaskSession(session, { project })),
             /*
              * Pause and resume, per run. Gated by the view on `row.canPause` and on the row
              * reading `paused` — one or the other is drawn, never both — so the id that arrives

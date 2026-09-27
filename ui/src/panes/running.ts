@@ -36,6 +36,7 @@ import {
   foldRunning,
   isNewer,
   runningIn,
+  runningInTab,
   runsIn,
   type Counts,
   type RunningEntry,
@@ -53,6 +54,7 @@ const entryOf = (entry: ProjectRunning): RunningEntry => ({
   project: entry.project,
   runs: entry.runs,
   panes: entry.panes,
+  tabs: entry.tabs.map((one) => ({ tab: one.tab, panes: one.panes })),
 })
 
 let counts: Counts = new Map()
@@ -144,6 +146,22 @@ export function useRunsInProject(project: string): number {
   return useSyncExternalStore(
     subscribe,
     () => runsIn(counts, project),
+    () => 0,
+  )
+}
+
+/**
+ * How many consoles are mid-turn in one tab — the in-project tab strip's spinner. (M115)
+ *
+ * A scalar snapshot, for `useRunsInProject`'s reason: a tab re-renders only when *its* number
+ * moves, not on every tool call of every console in the app. Rust's answer rather than a fold of
+ * `cide://session-state` in this window, because two of the facts behind it — whether the child
+ * is alive, and whether the session is a run's mirror — are not in any window's tree.
+ */
+export function useRunningInTab(project: string, tab: string): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => runningInTab(counts, project, tab),
     () => 0,
   )
 }

@@ -1261,7 +1261,7 @@ pub fn tab_set_dirty(
     tab: TabId,
     dirty: bool,
 ) -> Result<Mutated> {
-    state.update(|ws| {
+    state.update_cosmetic(|ws| {
         let t = workspace::tab_mut(ws, project, tab)?;
         let TabKind::File { dirty: flag, .. } = &mut t.kind else {
             return Err(CoreError::Invariant(format!(
@@ -1623,6 +1623,88 @@ pub(crate) fn bytes_request(
         ))
     })?;
     Ok((write, payload.to_vec()))
+}
+
+/// Keep an unsaved buffer's text across a crash. (M117)
+///
+/// A **raw body**, framed like [`file_write_bytes`]'s: the head is a
+/// [`cide_ipc::BufferBackupWrite`], the payload the buffer's UTF-8 text. The editor calls this a
+/// moment after the typing pauses — never per keystroke; `ui/src/editor/hotExit.ts` owns that
+/// policy — and the write is fsynced, on the blocking pool. `cide_core::buffers` has the story.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_backup_write(request: tauri::ipc::Request<'_>) -> Result<()> {
+    let tauri::ipc::InvokeBody::Raw(raw) = request.body() else {
+        return Err(CoreError::Io(
+            "file_backup_write takes a raw body — a framed Uint8Array; see cide_ipc::frame".into(),
+        ));
+    };
+    let (head, payload) = cide_ipc::frame::unpack(raw)
+        .map_err(|e| CoreError::Io(format!("file_backup_write: {e}")))?;
+    let head: cide_ipc::BufferBackupWrite = serde_json::from_str(head)
+        .map_err(|e| CoreError::Io(format!("file_backup_write: a bad frame head: {e}")))?;
+    let text = String::from_utf8(payload.to_vec())
+        .map_err(|e| CoreError::Io(format!("file_backup_write: the text is not UTF-8: {e}")))?;
+    blocking(move || {
+        cide_core::buffers::write(
+            &cide_core::buffers::dir(),
+            &head.path,
+            text,
+            head.base_stamp,
+        )
+    })
+    .await
+}
+
+/// The unsaved text kept for `path` by an earlier run, if any. (M117)
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_backup_read(path: String) -> Result<Option<cide_ipc::BufferBackup>> {
+    blocking(move || Ok(cide_core::buffers::read(&cide_core::buffers::dir(), &path))).await
+}
+
+/// Forget `path`'s kept text: the buffer was saved, reverted or discarded. (M117)
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_backup_clear(path: String) -> Result<()> {
+    blocking(move || cide_core::buffers::clear(&cide_core::buffers::dir(), &path)).await
+}
+
+/// Drop every kept buffer no tab can ask for any more. Once, at launch, off the main thread.
+///
+/// "A tab" is a File tab of an open project **or** of a closed project's remembered layout —
+/// reopening that project brings the tab, and the tab its buffer. See
+/// `cide_core::buffers::sweep` for why a path no tab names must not keep one.
+pub fn sweep_backups(ws: &cide_ipc::Workspace) {
+    let file_paths = |project: &cide_ipc::Project| -> Vec<String> {
+        project
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                cide_ipc::TabKind::File { path, .. } => Some(path.display().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut wanted: std::collections::HashSet<String> =
+        ws.projects.values().flat_map(file_paths).collect();
+    wanted.extend(
+        cide_core::persist::load_closed(&cide_core::persist::closed_path())
+            .iter()
+            .flat_map(|closed| file_paths(&closed.project)),
+    );
+    let spawned = std::thread::Builder::new()
+        .name("cide-buffers-sweep".into())
+        .spawn(move || {
+            let removed = cide_core::buffers::sweep(
+                &cide_core::buffers::dir(),
+                |path| wanted.contains(path),
+                cide_core::buffers::MAX_AGE,
+            );
+            if removed > 0 {
+                tracing::info!(removed, "dropped kept buffers no tab can ask for");
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::debug!(%error, "no buffer sweep this launch");
+    }
 }
 
 /// Remember where the user is in a file. (M12)

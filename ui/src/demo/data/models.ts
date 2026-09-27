@@ -70,6 +70,7 @@ export const LLM: LlmSettings = {
 /** What `opencode models` answers with cide's document injected — every pool entry resolves. */
 export const OPENCODE_MODELS: AgentModels = {
   harness: 'opencode',
+  variantInModel: true,
   models: [
     'anthropic/claude-opus-4-1',
     'anthropic/claude-sonnet-4-5',

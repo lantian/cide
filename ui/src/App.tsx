@@ -37,7 +37,7 @@ import {
   type SidebarState,
 } from '@/chrome/sidebarView'
 import { registerPanelHost, registerSettingsFrameHost } from '@/chrome/panelRequests'
-import { StatusBar } from '@/chrome/StatusBar'
+import { CODEX_PLACEHOLDER, StatusBar } from '@/chrome/StatusBar'
 import {
   formatClaude,
   useSessionStatus,
@@ -106,6 +106,7 @@ import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { OutsideOpenGate } from '@/chrome/OutsideOpenGate'
+import { useUpdateNotices } from '@/chrome/updates'
 import { LogDetailCard } from '@/chrome/LogDetailCard'
 import { PullStrategyGate } from '@/chrome/PullStrategyGate'
 import { FileProperties } from '@/chrome/FileProperties'
@@ -118,7 +119,7 @@ import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
 import { jumpTo, pendingJump } from '@/editor/jump'
 import { UNKNOWN_LINE } from '@/editor/navHistory'
-import { claudeSend, dockerEvents, specEvents } from '@/ipc/client'
+import { claudeSend, dockerEvents, pools, specEvents } from '@/ipc/client'
 import { startFileDrop } from '@/sidebar/TasksPanel/fileDrop'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
@@ -328,6 +329,7 @@ export function App() {
   const bindSession = useWorkspace((st) => st.bindSession)
   const newClaudeTab = useWorkspace((st) => st.newClaudeTab)
   const detachPane = useWorkspace((st) => st.detachPane)
+  const detachTab = useWorkspace((st) => st.detachTab)
   const redockPane = useWorkspace((st) => st.redockPane)
   const redockTab = useWorkspace((st) => st.redockTab)
 
@@ -511,6 +513,27 @@ export function App() {
   // A window-manager close the Rust side refused. It raises the same dialog the command
   // paths raise; discarding re-issues `window_close` with `force: true`, which does have a
   // command behind it.
+  // A pool entry whose configuration is wrong: the run already moved on to the next entry, and
+  // this is the user being told which entry to fix and what the provider said. (t-1090)
+  // A newer cide release, its download and the restart that finishes it — shell windows only,
+  // see `chrome/updates.ts`.
+  useUpdateNotices(boot?.role.kind === 'shell')
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let gone = false
+    void pools
+      .onNotice((project, text) => notify(text, { kind: 'warn', project }))
+      .then((fn) => {
+        if (gone) fn()
+        else unlisten = fn
+      })
+    return () => {
+      gone = true
+      unlisten?.()
+    }
+  }, [])
+
   useEffect(() => {
     let unlisten: (() => void) | null = null
     void events
@@ -1606,8 +1629,23 @@ export function App() {
             ? {
                 onSplit: () =>
                   void splitPane(activeProject.id, focused.tab.id, focused.pane.id, 'row', 'after'),
-                onDetach: () =>
-                  void detachPane(activeProject.id, focused.tab.id, focused.pane.id),
+                /*
+                 * The same rule the pane cluster's ⧉ follows (`clusterPlan`, applied in
+                 * `TabPane`): a tab's only pane leaves as the whole *tab*. This used to call
+                 * `detachPane` unconditionally, and `layout::take_pane` refuses a tab's last
+                 * pane — so on every file tab, which is one pane by construction, the header's
+                 * detach printed `lastPane` at the user. It mattered more once file tabs lost
+                 * their cluster and this became the button for the job.
+                 */
+                onDetach: () => {
+                  const plan = clusterPlan(
+                    Object.keys(focused.tab.tree.panes).length,
+                    activeProject.tabs[0]?.id === focused.tab.id,
+                  )
+                  void (plan.detach === 'tab'
+                    ? detachTab(activeProject.id, focused.tab.id)
+                    : detachPane(activeProject.id, focused.tab.id, focused.pane.id))
+                },
               }
             : {})}
         />
@@ -2311,7 +2349,14 @@ export function App() {
           * to it directly (see `chrome/StatusBar.tsx`), so nothing is passed for it here.
           */}
         <StatusBar
-          claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
+          claude={
+            claudeReadout ??
+            // A codex console with nothing read yet says so, rather than showing the installed
+            // *claude*'s version under a pane that is not running it. (M93)
+            (focused?.pane.harness === 'codex'
+              ? CODEX_PLACEHOLDER
+              : (boot?.capabilities.claudeVersion ?? undefined))
+          }
           revealRoots={revealRoots}
           /*
            * Whether the bar says anything about a file at all. The same expression
@@ -2469,6 +2514,7 @@ const WorkspaceContent = memo(function WorkspaceContent({
                     // torn out into its own window keeps its slot in the domain's list, and
                     // drawing it here would be two windows claiming one tab.
                     tabs={visibleTabs}
+                    project={activeProject.id}
                     activeTab={activeProject.activeTab}
                     // Not bare `activateTab`: a console tab should arrive with the caret in its
                     // terminal, not on the strip's button — `panes/activateTab.ts`.
@@ -2726,6 +2772,9 @@ const TabPane = memo(function TabPane({
       focused={tabFocused === pane.id}
       maximized={tabMaximized === pane.id}
       tabScoped={tabScoped}
+      // A file tab's pane gets no corner cluster: the header's split/detach and the tab
+      // strip's × cover it, and the cluster sat on the code being read.
+      bare={tabKind.kind === 'file'}
       onFocus={() => void focusPane(project, tab, pane.id)}
       // `row` is a tile beside this one, in this pane's own row — the axis
       // the command layer routes to `add_tile`. The row gesture is on the

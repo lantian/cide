@@ -19,7 +19,7 @@
 //!   becomes *can you seal a frame this cide can open* — and nothing above this layer changes,
 //!   because the shape is already "the first frame proves who you are".
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -32,7 +32,8 @@ use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
 use crate::RemoteError;
 use crate::devices::DeviceStore;
@@ -61,6 +62,39 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// answer, so the code expires on cide's clock rather than on this one — one place decides when
 /// a pairing window has closed, and it is the one that minted it.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(crate::devices::CODE_TTL.as_secs() + 15);
+
+/// The largest message a device may send, and the largest frame it may be split into.
+///
+/// tungstenite's defaults are 64 MiB a message and 16 MiB a frame, and they apply **before**
+/// anybody has proved anything: the one handshake frame an unauthenticated socket may send was
+/// buffered whole at whatever size its sender claimed, so a script on the same network could
+/// make cide allocate 64 MiB per socket for the price of a TCP connection. A handshake is under
+/// a hundred bytes and the largest thing a device legitimately sends is a paste or a task's text,
+/// so a mebibyte is generous for every real frame and ruinous for none of them.
+///
+/// One limit for the whole life of the socket rather than a small one until the hello: the
+/// config is fixed at the upgrade (`tokio-tungstenite` exposes no `set_config` on a stream), and
+/// a limit that could only be raised by re-wrapping the socket mid-conversation is a second road
+/// into the authenticated state, which is the thing this file refuses to have.
+const MAX_MESSAGE: usize = 1 << 20;
+
+/// Sockets that have not yet proved who they are, across every peer.
+///
+/// Every one costs a task, a file descriptor and up to [`MAX_MESSAGE`] of buffer, and until the
+/// hello nobody knows whose it is. Without a ceiling, a loop of `connect()` on the LAN runs cide
+/// out of descriptors — and cide is also the process holding every terminal and every `claude`,
+/// so the symptom would be the IDE failing to open a file rather than a phone failing to connect.
+/// Authenticated connections are not counted: they hold the key, and the key is the permission.
+const MAX_UNPROVEN: usize = 128;
+
+/// The same, from any one address (an IPv6 peer counted by its `/64`, which is what one host
+/// is given and can rotate through at will).
+///
+/// The global ceiling alone would let one noisy machine take every slot and lock the owner's
+/// phone out; this keeps a single peer to a small share. Eight rather than one because a phone
+/// that lost Wi-Fi and reconnected leaves its old sockets waiting out their deadline, and several
+/// devices behind one NAT arrive from one address.
+const MAX_UNPROVEN_PER_PEER: usize = 8;
 
 /// How long [`RemoteServer::shutdown`] waits for connections to finish.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -256,6 +290,76 @@ struct Inner {
     /// The newest session state and awaiting set this server has fanned out, each with the
     /// sequence number it went out under. See [`Ordered`].
     ordered: Mutex<Ordered>,
+    /// Sockets still before their hello. See [`MAX_UNPROVEN`].
+    unproven: Arc<Mutex<Tally>>,
+}
+
+/// How many unauthenticated sockets are open, in total and per peer.
+#[derive(Default)]
+struct Tally {
+    total: usize,
+    by_peer: std::collections::HashMap<IpAddr, usize>,
+}
+
+/// One unauthenticated socket's place in the [`Tally`], given back when it is dropped.
+///
+/// A guard rather than a pair of calls because a connection task has a dozen ways to end — every
+/// `return None` in the handshake, every `break` in the loop, a panic — and a count decremented
+/// by hand on each of them is one that leaks a slot on the thirteenth, until the peer can no
+/// longer connect at all.
+struct Unproven {
+    tally: Arc<Mutex<Tally>>,
+    peer: IpAddr,
+}
+
+impl Unproven {
+    /// A slot for `peer`, or `None` when it or everyone together is at the limit.
+    fn admit(tally: &Arc<Mutex<Tally>>, peer: IpAddr) -> Option<Self> {
+        let peer = peer_key(peer);
+        let mut t = tally.lock();
+        let mine = t.by_peer.get(&peer).copied().unwrap_or(0);
+        if t.total >= MAX_UNPROVEN || mine >= MAX_UNPROVEN_PER_PEER {
+            return None;
+        }
+        t.total += 1;
+        t.by_peer.insert(peer, mine + 1);
+        Some(Self {
+            tally: Arc::clone(tally),
+            peer,
+        })
+    }
+}
+
+impl Drop for Unproven {
+    fn drop(&mut self) {
+        let mut t = self.tally.lock();
+        t.total = t.total.saturating_sub(1);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = t.by_peer.entry(self.peer) {
+            *e.get_mut() -= 1;
+            // Removed at zero, or the map grows by one entry per address that ever knocked.
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+    }
+}
+
+/// The address a peer is counted under.
+///
+/// A v4-mapped v6 address is its v4 address — a dual-stack listener sees a LAN phone that way —
+/// and any other v6 address is its `/64`, because a single host is routinely handed a whole `/64`
+/// and a limit per full address would be a limit it could step around by changing the suffix.
+fn peer_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
 }
 
 /// What the event stream last said about each session, so a snapshot can never contradict it.
@@ -442,6 +546,7 @@ impl RemoteServer {
             pairing: Mutex::new(None),
             projects_dirty: Mutex::new(std::collections::HashSet::new()),
             ordered: Mutex::new(Ordered::default()),
+            unproven: Arc::new(Mutex::new(Tally::default())),
         });
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&inner)));
         let coalescer = tokio::spawn(coalesce_workspace(Arc::clone(&inner)));
@@ -688,6 +793,14 @@ async fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // Counted before anything is spent on it — no task, no upgrade, no buffer. A
+                // refusal is a closed socket and a debug line: at a warning, the flood this
+                // exists for would become a flood in the log instead.
+                let Some(unproven) = Unproven::admit(&inner.unproven, peer.ip()) else {
+                    tracing::debug!(%peer, "remote: too many unauthenticated connections; refused");
+                    drop(stream);
+                    continue;
+                };
                 // Every frame here is small, so Nagle costs a round trip and buys nothing.
                 if let Err(error) = stream.set_nodelay(true) {
                     tracing::debug!(%error, "remote: could not disable Nagle");
@@ -696,7 +809,7 @@ async fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
                 let inner = Arc::clone(&inner);
                 tokio::spawn(async move {
                     let _alive = alive;
-                    serve(stream, peer, inner).await;
+                    serve(stream, peer, inner, unproven).await;
                 });
             }
             Err(error) => {
@@ -744,25 +857,9 @@ async fn shake_hands(
     >,
     inner: &Arc<Inner>,
     addr: &str,
+    deadline: Instant,
 ) -> Option<Agreed> {
-    // The greeting goes out **before** the handshake is read, and nothing waits on it. The two
-    // messages cross in flight: a handshake does not depend on `S` and a greeting does not
-    // depend on `e`, so a device that needs the key to derive against has it by the time it has
-    // anything to seal, and one that already had it pays nothing.
-    //
-    // It is sent to every connection rather than only to a pairing one, because refusing to
-    // greet a resuming device would make the key's *absence* the signal for which mode this is
-    // — readable off the wire by anyone watching, and a difference two implementations would
-    // eventually disagree about.
-    let greeting = crate::seal::Greeting {
-        seal_version: crate::seal::SEAL_VERSION,
-        server_public: inner.statik.public_bytes(),
-    };
-    if sink.send(Message::binary(greeting.encode())).await.is_err() {
-        return None;
-    }
-
-    let first = match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.next()).await {
+    let first = match tokio::time::timeout_at(deadline, stream.next()).await {
         Ok(Some(Ok(message))) => message,
         Ok(_) => return None,
         Err(_) => {
@@ -774,6 +871,39 @@ async fn shake_hands(
         tracing::debug!(%addr, "remote: a connection opened with something that was not a handshake");
         return None;
     };
+
+    // The greeting goes out only **after** something that starts like a handshake has arrived.
+    // It used to be sent the moment the upgrade finished, which made this port answer every
+    // scanner that completed a WebSocket upgrade with "cide-hail" and this instance's long-lived
+    // public key: a name for the service, and a fingerprint that follows the machine across
+    // addresses. Now a peer has to speak first, and in cide's own words.
+    //
+    // It costs a device nothing. Both of the app's roads send the handshake the moment the socket
+    // opens and never wait for the greeting (`cide-mobile`'s `net/pair.ts` and
+    // `net/connection.ts`), so the greeting still lands before any sealed frame, which is the one
+    // ordering they rely on. It does not hide cide from anyone who knows the protocol — the magic
+    // is public — only from anyone who does not.
+    //
+    // Gated on the **magic**, not on a handshake that decodes: a device built for another
+    // `SEAL_VERSION` fails [`Handshake::decode`], and the greeting's version is how it tells its
+    // user *that cide seals frames a different way* instead of a bare connection failure.
+    //
+    // Still sent to every mode rather than only to a pairing one, because refusing to greet a
+    // resuming device would make the key's *absence* the signal for which mode this is —
+    // readable off the wire by anyone watching, and a difference two implementations would
+    // eventually disagree about.
+    if !bytes.starts_with(crate::seal::MAGIC) {
+        tracing::debug!(%addr, "remote: a connection opened with something that was not a handshake");
+        return None;
+    }
+    let greeting = crate::seal::Greeting {
+        seal_version: crate::seal::SEAL_VERSION,
+        server_public: inner.statik.public_bytes(),
+    };
+    if sink.send(Message::binary(greeting.encode())).await.is_err() {
+        return None;
+    }
+
     let Some(handshake) = Handshake::decode(&bytes) else {
         tracing::debug!(%addr, "remote: an unreadable handshake");
         return None;
@@ -821,12 +951,37 @@ async fn shake_hands(
     })
 }
 
-async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner>) {
+async fn serve(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    inner: Arc<Inner>,
+    unproven: Unproven,
+) {
     let addr = peer.to_string();
-    let ws = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(error) => {
+    // Held until the hello is answered, then given back: from there the socket is a device's.
+    let mut unproven = Some(unproven);
+
+    // **One deadline for everything before the hello**, fixed at accept, rather than a timeout
+    // per read. The upgrade used to have none at all — a socket that sent half an HTTP request
+    // and then nothing held its task and descriptor for ever — and the loop below used to re-arm
+    // its timeout on every message, so a client with no key could stay unauthenticated
+    // indefinitely by sending a ping every nineteen seconds, which tungstenite answers and this
+    // loop skipped. A deadline cannot be refreshed by talking.
+    let accepted = Instant::now();
+    let mut deadline = accepted + HANDSHAKE_TIMEOUT;
+
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
+    let upgrade = tokio_tungstenite::accept_async_with_config(stream, Some(config));
+    let ws = match tokio::time::timeout_at(deadline, upgrade).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(error)) => {
             tracing::debug!(%error, %addr, "remote: a connection never became a websocket");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(%addr, "remote: a connection never finished its upgrade and was dropped");
             return;
         }
     };
@@ -836,9 +991,14 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
     // The handshake, in the clear, and the only thing this socket may say before it is sealed.
     // Everything in it is public — an ephemeral public key and a device id — and what it
     // establishes is not.
-    let Some(agreed) = shake_hands(&mut sink, &mut stream, &inner, &addr).await else {
+    let Some(agreed) = shake_hands(&mut sink, &mut stream, &inner, &addr, deadline).await else {
         return;
     };
+    // A pairing socket waits on a person rather than a packet — see [`PAIRING_TIMEOUT`] — but
+    // still on a deadline counted from accept, so the code's own expiry bounds it.
+    if agreed.mode == Mode::Pair {
+        deadline = accepted + PAIRING_TIMEOUT;
+    }
     let (opener, sealer) = agreed.channel;
 
     let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -885,14 +1045,7 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
         let next = if authenticated.load(Ordering::Relaxed) {
             stream.next().await
         } else {
-            // A pairing socket is allowed to be quiet for as long as its code could still be
-            // redeemed, because the silence is a person reading a number off another screen.
-            let patience = if agreed.mode == Mode::Pair {
-                PAIRING_TIMEOUT
-            } else {
-                HANDSHAKE_TIMEOUT
-            };
-            match tokio::time::timeout(patience, stream.next()).await {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(next) => next,
                 Err(_) => {
                     tracing::debug!(%addr, "remote: a connection said nothing and was dropped");
@@ -995,6 +1148,12 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
                         // Paired, and now it must say hello like anybody else. Treating the pair
                         // as a login would mean two roads into the authenticated state, and the
                         // second one would be the one nobody re-reads.
+                        //
+                        // The hello gets a fresh allowance: a person who paired in the last
+                        // second of the window must not be dropped before the phone's next frame.
+                        // Safe to extend here and nowhere else — the code is spent, so this
+                        // socket now holds a key.
+                        deadline = Instant::now() + HANDSHAKE_TIMEOUT;
                     }
                     Err(error) => {
                         let why = error.to_string();
@@ -1082,6 +1241,7 @@ async fn serve(stream: tokio::net::TcpStream, peer: SocketAddr, inner: Arc<Inner
                 // Flipped only once the welcome is away, so the fan-out cannot interleave a state
                 // change ahead of the snapshot that establishes what it is about.
                 authenticated.store(true, Ordering::Relaxed);
+                drop(unproven.take());
                 if send_snapshot(&out_tx, &desynced, &inner, None, Vec::new())
                     .await
                     .is_err()
@@ -2510,6 +2670,241 @@ mod tests {
         );
     }
 
+    /// Wait until exactly `n` sockets are counted as unauthenticated, then give their tasks a
+    /// moment to park.
+    ///
+    /// The settle matters to the paused-clock tests: a connection's deadline is read when its
+    /// task first runs, so advancing the clock before that would move the deadline with it and
+    /// the test would prove nothing.
+    async fn wait_for_unproven(h: &Harness, n: usize) {
+        for _ in 0..250 {
+            if h.server.inner.unproven.lock().total == n {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let total = h.server.inner.unproven.lock().total;
+        panic!("expected {n} unauthenticated sockets, the server counts {total}");
+    }
+
+    /// Whether the server has closed a raw socket: EOF or a reset, within five seconds.
+    async fn closed_by_server(socket: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
+                Err(_) => return false,
+                Ok(Ok(0) | Err(_)) => return true,
+                // A greeting or an HTTP error line; keep reading until it closes.
+                Ok(Ok(_)) => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_never_finishes_its_upgrade_is_dropped() {
+        // The upgrade had no timeout of its own — only the handshake after it did — so a peer
+        // that opened TCP and said nothing held a task and a descriptor for as long as it liked.
+        let (h, _, _) = harness().await;
+        let mut silent = tokio::net::TcpStream::connect(h.server.addr())
+            .await
+            .expect("connects");
+        wait_for_unproven(&h, 1).await;
+
+        tokio::time::pause();
+        tokio::time::advance(HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::resume();
+
+        assert!(
+            closed_by_server(&mut silent).await,
+            "a socket that never upgraded must be closed at the deadline"
+        );
+        wait_for_unproven(&h, 0).await;
+    }
+
+    #[tokio::test]
+    async fn talking_does_not_keep_an_unauthenticated_socket_open() {
+        // The loop re-armed its timeout on every message, so a client with no key could stay
+        // before its hello indefinitely by sending anything at all — a ping, a text frame, or a
+        // sealed frame that does not parse, which is answered and deliberately not fatal. Here
+        // it is the last, because the answer proves the server read it before the clock moves.
+        let (h, _, _) = harness().await;
+        let mut pairing = connect(&h).await;
+        assert!(wait_for_attempt(&h).await.is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::pause();
+        tokio::time::advance(PAIRING_TIMEOUT - Duration::from_secs(10)).await;
+        tokio::time::resume();
+        tokio::task::yield_now().await;
+
+        let boxed = pairing.sealer.seal(b"not a frame").expect("seals");
+        pairing
+            .ws
+            .send(Message::binary(boxed))
+            .await
+            .expect("sends");
+        assert!(
+            matches!(heard(&mut pairing).await, Some(ServerBody::Error { .. })),
+            "the unreadable frame is answered, so the server has read it"
+        );
+
+        // Past the deadline set at accept, though well inside a timeout restarted by that frame.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+        tokio::task::yield_now().await;
+
+        assert!(
+            heard_frame(&mut pairing).await.is_none(),
+            "an unauthenticated socket must close at its deadline however much it says"
+        );
+        wait_for_unproven(&h, 0).await;
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_hold_more_than_its_share_of_unauthenticated_sockets() {
+        let (h, _, _) = harness().await;
+
+        // A device that says hello gives its slot back, or a phone reconnecting through the day
+        // would eventually be refused by its own history.
+        let (device, key) = pair(&h).await;
+        let mut device_ws = resumed(&h, &device, &key).await;
+        assert!(matches!(
+            hello(&mut device_ws).await,
+            ServerBody::Welcome { .. }
+        ));
+        wait_for_unproven(&h, 0).await;
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_UNPROVEN_PER_PEER {
+            held.push(
+                tokio::net::TcpStream::connect(h.server.addr())
+                    .await
+                    .expect("connects"),
+            );
+        }
+        wait_for_unproven(&h, MAX_UNPROVEN_PER_PEER).await;
+
+        let mut one_more = tokio::net::TcpStream::connect(h.server.addr())
+            .await
+            .expect("the kernel accepts; cide closes");
+        assert!(
+            closed_by_server(&mut one_more).await,
+            "a peer past its share is closed at once"
+        );
+        assert_eq!(
+            h.server.inner.unproven.lock().total,
+            MAX_UNPROVEN_PER_PEER,
+            "the refusal took no slot"
+        );
+
+        // And a closed socket frees its slot, so the limit is on what is held, not on history.
+        drop(held.pop());
+        wait_for_unproven(&h, MAX_UNPROVEN_PER_PEER - 1).await;
+        let _pairing = connect(&h).await;
+        wait_for_unproven(&h, MAX_UNPROVEN_PER_PEER).await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_first_message_closes_the_socket() {
+        // tungstenite's default would buffer 64 MiB from a peer that has proved nothing.
+        let (h, _, _) = harness().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&h.url)
+            .await
+            .expect("connects");
+        // A send error is as good as a close: the server may hang up mid-write.
+        let _ = ws.send(Message::binary(vec![0u8; MAX_MESSAGE + 1])).await;
+        let mut closed = false;
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(None | Some(Err(_) | Ok(Message::Close(_)))) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue, // the greeting
+                Err(_) => break,
+            }
+        }
+        assert!(closed, "a message over the limit must close the socket");
+        wait_for_unproven(&h, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_scanner_is_not_greeted_and_a_device_on_another_seal_version_is() {
+        // The greeting names the service and carries this instance's long-lived key, so it was a
+        // fingerprint handed to anything that finished a WebSocket upgrade.
+        let (h, _, _) = harness().await;
+
+        // A scanner: upgrades, then either waits or says something that is not cide's.
+        let (mut silent, _) = tokio_tungstenite::connect_async(&h.url)
+            .await
+            .expect("connects");
+        let quiet = tokio::time::timeout(Duration::from_millis(400), silent.next()).await;
+        assert!(
+            quiet.is_err(),
+            "a peer that says nothing is told nothing: {quiet:?}"
+        );
+
+        let (mut prober, _) = tokio_tungstenite::connect_async(&h.url)
+            .await
+            .expect("connects");
+        prober
+            .send(Message::binary(b"GET / HTTP/1.1".to_vec()))
+            .await
+            .expect("sends");
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), prober.next())
+                .await
+                .expect("the server closes a stranger within five seconds")
+            {
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Binary(bytes))) => {
+                    assert!(
+                        !bytes.starts_with(crate::seal::HAIL),
+                        "a peer that does not speak cide must not be greeted"
+                    );
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+
+        // A device built for another sealing: its handshake does not decode, but the greeting's
+        // version is how it tells its user why, so it must still be greeted.
+        let (mut other, _) = tokio_tungstenite::connect_async(&h.url)
+            .await
+            .expect("connects");
+        let mut handshake = crate::seal::MAGIC.to_vec();
+        handshake.push(crate::seal::SEAL_VERSION.wrapping_add(1));
+        other.send(Message::binary(handshake)).await.expect("sends");
+        let hailed = tokio::time::timeout(Duration::from_secs(5), other.next())
+            .await
+            .expect("greeted within five seconds")
+            .expect("a message")
+            .expect("not an error");
+        let Message::Binary(bytes) = hailed else {
+            panic!("the greeting was not binary");
+        };
+        let greeting = crate::seal::Greeting::decode(&bytes).expect("a greeting");
+        assert_eq!(greeting.seal_version, crate::seal::SEAL_VERSION);
+    }
+
+    #[test]
+    fn a_v6_peer_is_counted_by_its_slash_64_and_a_mapped_one_by_its_v4() {
+        let ip = |s: &str| s.parse::<IpAddr>().expect("an address");
+        assert_eq!(
+            peer_key(ip("2001:db8:1:2::1")),
+            peer_key(ip("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            peer_key(ip("2001:db8:1:2::1")),
+            peer_key(ip("2001:db8:1:3::1"))
+        );
+        assert_eq!(peer_key(ip("::ffff:192.168.1.10")), ip("192.168.1.10"));
+        assert_eq!(peer_key(ip("192.168.1.10")), ip("192.168.1.10"));
+    }
+
     /// The attempt, once the server has recorded it. Polled because the connection task records
     /// it after `shake` has returned on the client's side.
     async fn wait_for_attempt(h: &Harness) -> Option<cide_ipc::remote::PairingAttempt> {
@@ -2594,6 +2989,7 @@ mod tests {
             model: None,
             pool_position: None,
             worktree: false,
+            reviewer: None,
         });
         h.host.agents.lock().push(cide_ipc::remote::RemoteAgent {
             id: "reviewer".to_owned().into(),
@@ -4124,6 +4520,7 @@ mod tests {
                     external: None,
                     harness: None,
                     model: None,
+                    fresh: false,
                 },
             },
         )

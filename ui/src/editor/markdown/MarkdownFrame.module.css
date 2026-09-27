@@ -129,15 +129,44 @@
   z-index: 3;
   display: flex;
   align-items: center;
-  gap: 1px;
-  padding: 2px;
-  border-radius: var(--r-2);
-  opacity: 0;
+  gap: 2px;
+  height: var(--h-panetitle);
+  padding: 0 3px;
+  /* So the scrim's `z-index: -1` stays behind the buttons and not behind the document. */
+  isolation: isolate;
+  color: var(--dim);
+  /*
+   * Faint at rest, and only the switch's own hover lifts it — see `ViewSwitch`. 0.3 is low
+   * enough that the heading underneath reads through glyphs and scrim together, and high enough
+   * that a user who has never seen the switch can still find it.
+   */
+  opacity: 0.3;
   transition: opacity var(--dur-1) var(--ease-out);
 }
 
+/*
+ * The pane cluster's scrim, restated: `--panel` at 0.82 behind the buttons only
+ * (`layout/PaneTitleBar.module.css` `.reveal::before` has the reasoning). A shared look without
+ * a shared class, because that one is hashed into another module.
+ */
+.switch::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: var(--r-2);
+  background: var(--panel);
+  opacity: 0.82;
+}
+
+/*
+ * Where the cluster sits: flush with the top of the pane's content — stepping below an open find
+ * bar exactly as the cluster does, through the `--pane-top-strip` the frame sets and this element
+ * inherits — and `--pane-corner-clear` in from the right, which on a file tab's cluster-less frame
+ * is the minimap's inset alone.
+ */
 .switch[data-corner='top'] {
-  top: 4px;
+  top: var(--pane-top-strip, 0px);
   right: calc(4px + var(--pane-corner-clear, 0px));
 }
 
@@ -152,32 +181,28 @@
 }
 
 /*
- * Revealed on hover or focus, exactly as the pane cluster is, and **pinned open whenever the
- * layout is not the default**. A switch that vanishes is a switch the user cannot use to undo
- * what it just did, and unlike the pane controls this one changes what the pane *is*.
- *
- * `opacity` rather than `visibility`, so it stays in the tab order while invisible — that is how
- * somebody who cannot hover reaches it.
+ * Full strength under the pointer or with focus inside — on the switch itself, not anywhere in
+ * the pane. It used to be `.frame:hover .switch`, which lit it up (with a chrome pill and a ring)
+ * for the whole time the mouse was over the document, i.e. over the text being read.
+ * `:focus-within` is how somebody who cannot hover reaches it.
  */
-.frame:hover .switch,
-.switch:focus-within,
-.switch[data-pinned='true'] {
+.switch:hover,
+.switch:focus-within {
   opacity: 1;
-  background: color-mix(in srgb, var(--chrome) 88%, transparent);
-  box-shadow: 0 0 0 1px var(--border);
 }
 
+/* The cluster's `.action`, restated: a 22px square, a background only under the pointer. */
 .switchButton {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 22px;
   height: 22px;
   padding: 0;
-  border: none;
+  border: 0;
   border-radius: var(--r-2);
   background: transparent;
-  color: var(--dim);
+  color: inherit;
   cursor: pointer;
   transition:
     background-color var(--dur-1) var(--ease-out),
@@ -188,6 +213,11 @@
 .switchButton:hover {
   color: var(--text-hi);
   background: var(--panel-2);
+}
+
+.switchButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .switchButton[aria-pressed='true'] {

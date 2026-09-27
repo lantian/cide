@@ -50,12 +50,9 @@ impl Proposals {
 
     fn access<T>(&self, root: &Path, save: bool, f: impl FnOnce(&mut Queue) -> T) -> T {
         let mut guard = self.inner.lock().expect("proposals lock");
-        let map = guard.get_or_insert_with(|| {
-            std::fs::read(store_path())
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default()
-        });
+        // A corrupt file is moved aside rather than read as empty and then saved over.
+        let map =
+            guard.get_or_insert_with(|| cide_core::persist::read_or_quarantine(&store_path()));
         let answer = f(map.entry(root.to_path_buf()).or_default());
         if !save {
             return answer;
@@ -235,22 +232,34 @@ fn apply_files(root: &Path, files: &[ProposedFile], proposal: &Proposal) -> Resu
     for f in files {
         let path = root.join(&f.path);
         match &f.content {
+            // Atomic, both roads (M117). This was a plain `fs::write`, which truncates in place:
+            // a power cut between the truncate and the last byte left a project file — a gate
+            // script, a config — empty or torn, in the user's repository, about to be committed.
+            //
+            // A rewritten file goes through the editor's own save, which keeps its mode (so an
+            // executable gate stays executable), writes through a symlink rather than replacing
+            // it, and fsyncs the file and its directory. That save needs the file to exist, so a
+            // new one goes through `persist`'s writer instead, with the mode set on the temp
+            // file: a new shell script is made executable, since a gate names it as a command.
             Some(text) => {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                if path.exists() {
+                    cide_core::document::write_bytes(&path, text.as_bytes())
+                } else {
+                    let mode = if f.path.ends_with(".sh") {
+                        0o755
+                    } else {
+                        cide_core::persist::SHARED_MODE
+                    };
+                    cide_core::persist::write_atomic_with_mode(&path, text.as_bytes(), mode)
                 }
-                // A rewritten file keeps its mode, so an executable gate stays executable; a new
-                // shell script is made executable, since a gate names it as a command.
-                std::fs::write(&path, text).map_err(|e| format!("{}: {e}", f.path))?;
-                #[cfg(unix)]
-                if f.before.is_none() && f.path.ends_with(".sh") {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-                }
+                .map_err(|e| format!("{}: {e}", f.path))?;
             }
             None => {
                 if path.exists() {
                     std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", f.path))?;
+                    if let Some(dir) = path.parent() {
+                        let _ = cide_core::persist::sync_dir(dir);
+                    }
                 }
             }
         }

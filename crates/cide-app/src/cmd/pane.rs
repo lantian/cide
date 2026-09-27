@@ -298,7 +298,7 @@ pub fn pane_focus(
     pane: PaneId,
 ) -> Result<Mutated, CoreError> {
     state
-        .update(|ws| {
+        .update_cosmetic(|ws| {
             let t = workspace::tab_mut(ws, project, tab)?;
             layout::focus(&mut t.tree, pane)
         })
@@ -317,7 +317,7 @@ pub fn pane_maximize(
     pane: Option<PaneId>,
 ) -> Result<Mutated, CoreError> {
     state
-        .update(|ws| {
+        .update_cosmetic(|ws| {
             let t = workspace::tab_mut(ws, project, tab)?;
             layout::maximize(&mut t.tree, pane)
         })
@@ -343,7 +343,7 @@ pub fn pane_distribute(
     axis: Axis,
 ) -> Result<Mutated, CoreError> {
     state
-        .update(|ws| {
+        .update_cosmetic(|ws| {
             let t = workspace::tab_mut(ws, project, tab)?;
             layout::distribute(&mut t.tree, pane, axis)
         })
@@ -364,7 +364,7 @@ pub fn pane_set_ratio(
     split: SplitId,
     ratio: f32,
 ) -> Result<f32, CoreError> {
-    state.update(|ws| {
+    state.update_cosmetic(|ws| {
         let t = workspace::tab_mut(ws, project, tab)?;
         layout::set_ratio(&mut t.tree, split, ratio)
     })

@@ -183,6 +183,9 @@ function run(from: WireRun): RunView {
     model: from.model,
     poolPosition: from.poolPosition,
     worktree: from.worktree,
+    // Optional on the wire (absent when no review tab owns the task); `null` here, the model's
+    // one spelling of "none".
+    reviewer: from.reviewer ?? null,
   }
 }
 

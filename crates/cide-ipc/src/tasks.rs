@@ -903,7 +903,7 @@ pub struct TaskContent {
 
 /// The index: the whole of `.cide/tasks.json`.
 ///
-/// `{ "schemaVersion": 2, "rev": 42, "nextId": 18, "tasks": [ … ] }`, written with
+/// `{ "schemaVersion": 2, "rev": 0, "nextId": 18, "tasks": [ … ] }`, written with
 /// `to_vec_pretty`, because a one-line JSON file makes every change a whole-file diff and this
 /// file's diffs are read by people.
 ///
@@ -923,6 +923,10 @@ pub struct TaskFile {
     /// not newer, exactly as `workspace_changed` does. This file genuinely has several writers —
     /// two cide windows and every dispatched agent — so out-of-order arrival is not theoretical
     /// here the way it is for a single-writer registry.
+    ///
+    /// **In memory only since M120.** The file always says `"rev": 0` (`cide_tasks::REV_ON_DISK`
+    /// has the argument): a live value was the line two branches always conflicted on. It is
+    /// written rather than omitted because builds before M120 cannot parse a tracker without it.
     pub rev: u64,
     /// The number the next created task takes: `t-<next_id>`. **Only a create advances it.**
     ///

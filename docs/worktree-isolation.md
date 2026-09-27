@@ -68,7 +68,30 @@ other.
   file, and integrate refuses a checkout with untracked files. They are deleted once their
   worktree is gone, on the next run or verify of any isolating project.
 
-### The `XDG_CONFIG_HOME` caveat
+### What a role may do past codex's sandbox (M119)
+
+Three keys in a role's front matter, also on the Settings → Agents form and on
+`cide_agent_create`/`cide_agent_update`:
+
+```yaml
+allow-commands: [blender -b, tools/ci/runners/e2e.sh]
+needs: [display, audio]
+writable-dirs: [~/.cache/godot]
+```
+
+- **`allow-commands`** — prefixes that run without a prompt. On codex, a command that consists of
+  one of these alone runs **outside** the sandbox. It stays sandboxed under `timeout`, after
+  `cd … &&`, in a pipe or inside `sh -c`, and the run's brief says so. cide writes the rules into
+  the run's worktree only. A run in the project root does not get them.
+- **`needs`** — `display`, `audio`, `network`. On codex any of them turns the sandbox's network
+  on, because its filter refuses unix sockets while the network is off. `display` also points
+  GL at Mesa.
+- **`writable-dirs`** — extra writable roots, absolute or `~/…`.
+
+When a run ends, cide ends everything it started, including a codex sandbox's own sessions. When
+a worktree is retired, anything still running in it that nobody owns is ended too.
+
+## The `XDG_CONFIG_HOME` caveat
 
 `XDG_CONFIG_HOME` is allowed but rarely what you want. Tools keep credentials and settings there
 (`gh`, git credential helpers, cloud CLIs, editors), and any tool not in the shared list is

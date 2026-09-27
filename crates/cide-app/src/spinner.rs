@@ -126,14 +126,39 @@ pub(crate) struct Quiet {
 /// — this function deliberately reads the clamped value rather than the stored one, so a
 /// hand-edited `5` cannot make the timer fire inside the nudge coalescer's settling window.
 pub(crate) fn should_spin(quiet: &Quiet, config: &AgentsConfig) -> bool {
+    still_quiet(quiet, config) && !quiet.milestone_waiting && quiet.quiet_for >= config.spin_after()
+}
+
+/// The subset of [`should_spin`] that must still be true **at the moment the tab is opened**,
+/// rather than at the moment the decision was taken.
+///
+/// # The window this exists for is up to an hour wide
+///
+/// [`tick`] decides, and then [`wake`] runs on a thread of its own — where, on the timer's road,
+/// it first runs the active milestone's **gate**: a command the project chose, with the timeout
+/// the project chose, which in terrastrike (where this was found) is `timeoutSecs: 3600`.
+/// Everything [`should_spin`] read can have moved while that command ran, and nothing looked
+/// again.
+///
+/// The one that matters is the pause. Somebody watching cide work presses Pause in the Agents
+/// panel — the queue shuts, every run is `SIGSTOP`ped, the project's own console is frozen — and
+/// then, minutes later, a planning tab opens by itself and starts a billed turn. That is the
+/// exact opposite of what the button they just pressed promises, and it is the report this
+/// function is the answer to. `auto_spin` has the same shape and was the second half of the same
+/// report: `.cide/config.json` is committed and hand-edited, so switching the timer off while a
+/// gate runs did not stop the tab that gate was preparing.
+///
+/// **Deliberately not `milestone_waiting`, and not the dwell.** The gate that just ran is the one
+/// thing that moves the first, and [`wake`] decides that question itself with more to go on than
+/// a bool ([`gate_blocks_planning`]); the second is restarted by [`mark_busy`] *before* the thread
+/// is spawned, so re-reading it here would refuse every spin there has ever been.
+fn still_quiet(quiet: &Quiet, config: &AgentsConfig) -> bool {
     config.enabled
         && config.auto_spin
         && quiet.dispatching
         && quiet.live_runs == 0
         && quiet.busy_panes == 0
         && quiet.open_tasks > 0
-        && !quiet.milestone_waiting
-        && quiet.quiet_for >= config.spin_after()
 }
 
 /// When each project was last seen *not* quiet.
@@ -258,8 +283,49 @@ enum Caller {
 /// The button ([`Caller::Button`]) skips the gate entirely: it reads whatever verdict is already
 /// known, for the facts line only, and never refuses on it.
 ///
+/// **The timer's decision is re-checked here, twice** — once before the gate and once after it,
+/// through [`stand_down`]. `should_spin` was answered in [`tick`], and the gate between the two
+/// is a command the project chose that may run for its whole `timeoutSecs`; a pause pressed
+/// meanwhile used to be ignored and the tab opened anyway. [`still_quiet`] carries the argument.
+/// The button is never re-checked: a person is standing at the keyboard.
+///
 /// `Ok(())` once the tab is open; `Err` with a sentence for why none was, which the timer logs and
 /// the Tasks panel's **Plan tasks** button shows ([`plan_now`]).
+/// Why a spin the timer decided on should be abandoned now, or `None` to go on.
+///
+/// The live facts and the committed config, read **again**: see [`still_quiet`] for the window
+/// this closes and the report that opened it. Only the timer asks — the button is a person
+/// standing at the keyboard, and its own answer is already on screen.
+///
+/// `None` when the workspace or the project has gone, which reads as "nothing to stand down
+/// from": [`wake`]'s next step fails on its own and says so in its own words.
+fn stand_down(app: &AppHandle, project: ProjectId, root: &std::path::Path) -> Option<String> {
+    let state = app.try_state::<WorkspaceState>()?;
+    let ws = state.snapshot();
+    let quiet = facts(app, &state, &ws, project, Instant::now())?;
+    // Off the disk rather than from the config `tick` read, for the same reason `tick` reads it
+    // per pass: `.cide/config.json` is committed, so a `git checkout` — or a person who has just
+    // decided they have had enough of the timer — can switch this off under a running app.
+    let config = cide_agents::config::load(root).agents;
+    if still_quiet(&quiet, &config) {
+        return None;
+    }
+    Some(if !quiet.dispatching {
+        "this project's agents are paused, and a pause means nothing new starts here".to_string()
+    } else if !config.enabled {
+        "subagents have been switched off for this project".to_string()
+    } else if !config.auto_spin {
+        "the timer has been switched off for this project".to_string()
+    } else if quiet.open_tasks == 0 {
+        "the board has nothing open left to plan around".to_string()
+    } else {
+        format!(
+            "the project is working again: {} run(s) and {} busy pane(s)",
+            quiet.live_runs, quiet.busy_panes
+        )
+    })
+}
+
 fn wake(
     app: &AppHandle,
     project: ProjectId,
@@ -267,6 +333,14 @@ fn wake(
     config: &AgentsConfig,
     caller: Caller,
 ) -> Result<(), String> {
+    // Before the gate, which is a project's own command and can run for its whole `timeoutSecs`:
+    // a project that was paused between the decision and this line should not have that command
+    // run in it either.
+    if caller == Caller::Timer
+        && let Some(why) = stand_down(app, project, root)
+    {
+        return Err(why);
+    }
     let plan = cide_agents::config::load_milestones(root);
     let mut prompt = config.spin_prompt().to_string();
     if let Some(current) = plan.current() {
@@ -286,7 +360,9 @@ fn wake(
                 let stale = checks
                     .as_ref()
                     .is_none_or(|c| c.gate_is_stale(root, &current.id, head.as_deref()));
-                if stale {
+                // `gateRuns: manual` plans on the last verdict, as the button does: the user
+                // asked that the gate run only when they say so, and a wake is not them.
+                if stale && plan.gate_on_wake() {
                     crate::milestones::run_gate_now(app, project)
                 } else {
                     known()
@@ -313,6 +389,14 @@ fn wake(
             let facts = facts.split_whitespace().collect::<Vec<_>>().join(" ");
             prompt = format!("{prompt} {facts}");
         }
+    }
+    // And again, because the gate above is where the time goes. This is the check that stops a
+    // planning tab opening in a project somebody paused while that gate was running — the one
+    // [`still_quiet`] was written for.
+    if caller == Caller::Timer
+        && let Some(why) = stand_down(app, project, root)
+    {
+        return Err(why);
     }
     // Dated, and the same string names the tab and the session: see `plan_title`.
     let title = cide_agents::config::plan_title_now();
@@ -614,6 +698,95 @@ mod tests {
     #[test]
     fn a_quiet_project_with_open_work_is_woken() {
         assert!(should_spin(&ready(), &asking()));
+    }
+
+    /// The re-check made between the decision and the tab ([`still_quiet`]): it refuses on
+    /// everything that can move while the milestone's gate runs, and reads neither of the two
+    /// facts that would make it refuse every spin.
+    ///
+    /// The pause line is the report this was written for: the gate ran, somebody pressed Pause
+    /// meanwhile, and the planning tab opened anyway into a project whose every child was frozen.
+    #[test]
+    fn the_recheck_stands_down_on_a_pause_and_ignores_the_dwell() {
+        assert!(still_quiet(&ready(), &asking()));
+
+        let refused: Vec<(&str, Quiet, AgentsConfig)> = vec![
+            (
+                "agents paused while the gate was running",
+                Quiet {
+                    dispatching: false,
+                    ..ready()
+                },
+                asking(),
+            ),
+            (
+                "the timer switched off while the gate was running",
+                ready(),
+                AgentsConfig {
+                    auto_spin: false,
+                    ..asking()
+                },
+            ),
+            (
+                "subagents switched off while the gate was running",
+                ready(),
+                AgentsConfig {
+                    enabled: false,
+                    ..asking()
+                },
+            ),
+            (
+                "a run started while the gate was running",
+                Quiet {
+                    live_runs: 1,
+                    ..ready()
+                },
+                asking(),
+            ),
+            (
+                "somebody started working in a pane of this project",
+                Quiet {
+                    busy_panes: 1,
+                    ..ready()
+                },
+                asking(),
+            ),
+            (
+                "the board was cleared while the gate was running",
+                Quiet {
+                    open_tasks: 0,
+                    ..ready()
+                },
+                asking(),
+            ),
+        ];
+        for (why, quiet, config) in refused {
+            assert!(!still_quiet(&quiet, &config), "opened anyway: {why}");
+        }
+
+        // And the two it must not read. `mark_busy` restarts the dwell before the thread is
+        // spawned, so a re-read of it is always zero; the milestone is what the gate that just
+        // ran decides, and `wake` decides it with `gate_blocks_planning` rather than this bool.
+        assert!(
+            still_quiet(
+                &Quiet {
+                    quiet_for: Duration::from_secs(0),
+                    ..ready()
+                },
+                &asking()
+            ),
+            "the dwell is spent by the time this runs"
+        );
+        assert!(
+            still_quiet(
+                &Quiet {
+                    milestone_waiting: true,
+                    ..ready()
+                },
+                &asking()
+            ),
+            "the gate's verdict is wake's own decision, not this one's"
+        );
     }
 
     /// The table, and it is the whole specification: every condition, broken one at a time,

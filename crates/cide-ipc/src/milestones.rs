@@ -64,6 +64,62 @@ pub struct MilestonePlan {
     /// gate reads. A branch that touches one is refused at integration: the work may not move the
     /// goal it is measured against.
     pub guard_paths: Vec<String>,
+    /// When cide runs the active gate by itself. Absent is [`GateRuns::Merge`], the behaviour
+    /// every plan had before this field existed.
+    #[ts(as = "Option<GateRuns>", optional)]
+    #[serde(skip_serializing_if = "GateRuns::is_default")]
+    pub gate_runs: GateRuns,
+}
+
+/// When the active milestone's gate runs without being asked.
+///
+/// A gate is a project's own acceptance run, and on the projects milestones were built for it is
+/// long: selfcraft's `slice` took 16 minutes and `items` 7, terrastrike's gates 7–15 with a
+/// `timeoutSecs` of one to two hours. `Merge` reruns it after every agent merge, so a batch of
+/// subagents finishing a few minutes apart keeps a gate running for the whole afternoon, each
+/// verdict about a commit already superseded by the next merge. `Idle` waits for the project to
+/// go quiet — the spinner's wake, which runs a stale gate before it plans — so a batch costs one
+/// run; `Manual` leaves it to the Run gate button. Every mode still runs it when asked, and when a
+/// plan is defined or a proposal changes it: those are deliberate and rare.
+///
+/// Deserialised leniently: a value this build does not know reads as `Merge` rather than failing
+/// the plan, because a typo in one key must not cost the whole `milestones` block (see
+/// [`MilestonePlan`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum GateRuns {
+    /// After every agent merge, and on the spinner's wake when stale.
+    #[default]
+    Merge,
+    /// Only on the spinner's wake (a quiet project) when stale, or when asked.
+    Idle,
+    /// Only when asked.
+    #[serde(other)]
+    Manual,
+}
+
+impl GateRuns {
+    pub fn is_default(&self) -> bool {
+        *self == Self::Merge
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Idle => "idle",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "merge" => Some(Self::Merge),
+            "idle" => Some(Self::Idle),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
 }
 
 /// [`MilestonePlan::max_open`] when unset. Twelve because a milestone with more open work than
@@ -122,6 +178,16 @@ impl MilestonePlan {
     pub fn next_after(&self, id: &str) -> Option<&Milestone> {
         let at = self.items.iter().position(|m| m.id == id)?;
         self.items.get(at + 1)
+    }
+
+    /// Whether an agent's merge should rerun the active gate.
+    pub fn gate_after_merge(&self) -> bool {
+        self.gate_runs == GateRuns::Merge
+    }
+
+    /// Whether the spinner, waking a quiet project, should rerun a gate that is stale.
+    pub fn gate_on_wake(&self) -> bool {
+        self.gate_runs != GateRuns::Manual
     }
 
     /// Whether `path` (relative to the project root, `/`-separated) is one a gate reads.
@@ -225,6 +291,13 @@ pub struct VerifyState {
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Red verifies in a row on this task since the last green one. (M114)
+    #[serde(default)]
+    pub failures: u8,
+    /// `agents.verifyRetries` as it stood when this was drawn: while `failures` is at most this,
+    /// a red verify went back to the run itself; past it, to the reviewer.
+    #[serde(default)]
+    pub retries: u8,
 }
 
 /// One milestone's tasks, as a tree flattened in board order. Outbound.
@@ -312,5 +385,51 @@ mod tests {
         assert_eq!(p.items[0].title, "");
         assert_eq!(p.max_open(), DEFAULT_MAX_OPEN);
         assert!(p.verify.is_empty());
+    }
+
+    #[test]
+    fn gate_runs_defaults_to_merge_and_says_when_each_mode_runs() {
+        let p: MilestonePlan = serde_json::from_str(r#"{"items":[]}"#).expect("parses");
+        assert_eq!(p.gate_runs, GateRuns::Merge);
+        assert!(
+            !serde_json::to_string(&p)
+                .expect("encodes")
+                .contains("gateRuns"),
+            "the default is not written, so a config saved by this build reads the same in an \
+             older one"
+        );
+        let modes = [
+            (GateRuns::Merge, true, true),
+            (GateRuns::Idle, false, true),
+            (GateRuns::Manual, false, false),
+        ];
+        for (mode, merge, wake) in modes {
+            let p = MilestonePlan {
+                gate_runs: mode,
+                ..MilestonePlan::default()
+            };
+            assert_eq!(p.gate_after_merge(), merge, "{mode:?} after a merge");
+            assert_eq!(p.gate_on_wake(), wake, "{mode:?} on a wake");
+            let back: MilestonePlan =
+                serde_json::from_str(&serde_json::to_string(&p).expect("encodes")).expect("parses");
+            assert_eq!(back.gate_runs, mode);
+            assert_eq!(GateRuns::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn an_unknown_gate_runs_value_costs_only_that_key() {
+        let p: MilestonePlan = serde_json::from_str(
+            r#"{"items":[{"id":"slice","gate":"true"}],"verify":"make","gateRuns":"weekly"}"#,
+        )
+        .expect("an unknown mode must not fail the plan");
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.verify, "make");
+        assert_eq!(
+            p.gate_runs,
+            GateRuns::Manual,
+            "an unknown mode falls to the one that runs nothing by itself: a long gate the user \
+             tried to tame should not start running after every merge because of a typo"
+        );
     }
 }

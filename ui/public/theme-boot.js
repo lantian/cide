@@ -66,4 +66,27 @@
   } catch (_) {
     // As above: :root already carries `--ui-scale: 1`.
   }
+
+  /*
+   * The user's accent, for the same first-frame reason: `rrggbb,rrggbb` (the light and dark
+   * variants `cide_core::accent::fit` stored), baked in by `windows.rs::accent_param`. Absent
+   * means the shipped red, which is `tokens.css`'s own default, so nothing is written.
+   *
+   * No arithmetic here — the fit is Rust's, and the tokens derived from these two are
+   * `tokens.css`'s `[data-accent='custom']` blocks. The attribute and property names are the
+   * ones `useSettings.ts`'s `paintAccent` writes, pinned by `check:accent`; the strict pattern is
+   * what keeps a hand-edited workspace from putting anything else into a style property.
+   */
+  try {
+    var accent = new URLSearchParams(window.location.search).get('accent')
+    var match = /^([0-9a-f]{6}),([0-9a-f]{6})$/.exec(accent || '')
+    if (match) {
+      var root = document.documentElement
+      root.style.setProperty('--accent-l', '#' + match[1])
+      root.style.setProperty('--accent-d', '#' + match[2])
+      root.dataset.accent = 'custom'
+    }
+  } catch (_) {
+    // The stylesheet's red stands.
+  }
 })()

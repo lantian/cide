@@ -11,5 +11,11 @@ import type { ProjectOverrides } from "./ProjectOverrides";
 export type AgentOverrides = { version: number, 
 /**
  * Absolute project root → that project's overrides.
+ *
+ * This is the **live** table, and the only one anything resolves against. Profiles
+ * ([`Self::profiles`]) are stored beside it and *copied into* it on a switch, so the fork,
+ * the queue's caps, the roster and `ChildSettings` read exactly what they read before
+ * profiles existed — a second place a run could take its harness from would be the
+ * "computed here, obeyed nowhere" split `cide_agents::overrides` keeps paying for.
  */
 projects: { [key in string]: ProjectOverrides }, };

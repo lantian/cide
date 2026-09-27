@@ -15163,3 +15163,888 @@ every setting and the layout besides.
 -p cide-app`, and the contract. New tests cover each case above, and the real quarantined `dev` file
 now loads with its 9 readable tabs. `codegen --check` reports `generated.ts` stale on `Project`,
 from a parallel session's in-flight change rather than this one. **Not seen on a display.**
+
+**The next two reports were not cide's argv.**
+- **opencode:** it failed inside its own SQLite migration (`CREATE TABLE project`). That is
+  opencode's store under `~/.local/share/opencode/`, not cide's. It is most likely two opencode
+  versions sharing one database: the older one cide finds, which also lacks `--auto`, meets a
+  schema a newer install already migrated.
+- **codex (wrapper, permissions off):** the model endpoint answered "Unable to get model config for
+  model alias". A review adds no `-m` and no model override. Unresolved; the run's argv is needed.
+- **So the forked line now also says what a bare program name resolves to** on cide's own PATH
+  (`# opencode resolves to …`).
+
+## One `opencode`, two command lines, chosen by what is installed (M110)
+
+opencode 2.0 is a different command line wearing the same name, and many users are still on 1.x.
+Both now work, picked by the binary rather than by anything a user types: no new
+`cide_ipc::Harness` variant, no role file that has to name a generation, nothing in the UI. A role
+says `opencode` and gets whichever one the machine has. MiMo Code is a fork of opencode **1** and
+is untouched.
+
+**Detection is the M108 help probe, widened, not `--version`.** `CliFlags` gained `generation` and
+`run_server`; `Generation` is read as "`run --help` has `--standalone` **and** has no `--dir`". Both
+halves are needed: 2.0's `--print-logs` description says `(server logs require --standalone)` and
+that line rides in every usage, 1.x's included — it fails to match today only because the token
+carries a paren, so `--dir` is what actually decides it and a test pins the description-only case.
+A version number lost because it is a proxy for the argv shape and the fork disproves the proxy:
+`mimo --version` is `0.1.15` in another format, so a threshold needs per-flavour knowledge and is
+wrong the day MiMo rebases. The fallback when the probe cannot run moved onto `Flavor` as
+`default_generation` — opencode's current release is 2, MiMo's is 1, which is what "unknown reads as
+the current CLI's answer" always meant.
+
+**`--standalone` is not an optimisation; it is the condition under which cide's configuration
+exists.** Measured on 2.0.16: a `run` that owns neither a private server nor a `--server` is a thin
+client of the machine-wide background service, started in another directory with another
+environment, and the whole `OPENCODE_CONFIG_CONTENT` document is invisible to it — the role, its
+system prompt, the providers and the `cide-hook mcp` bridge alike. `real_opencode.rs` proves it both
+ways in one free test: without the flag the inline role is `Agent not found`, with it the same
+invocation runs. A run that silently used somebody else's agent, in somebody else's directory,
+without cide's tools is every promise in `docs/worktree-isolation.md` broken at once.
+
+**The classifier was the one that failed silently, and it was already failing.** 2.0 renamed all
+three fields `failover` reads — `name` became `type`, the detail moved out of `data`, and
+`isRetryable` is gone — so on any machine that had already upgraded it answered `None` to every
+line: no pool ever failed over, every run died on its first candidate reporting that candidate's
+error, and not one test failed. `real_opencode.rs`'s header predicted exactly this for a renamed
+field; it did not predict three at once. The names are not guessed: 2.0.16 maps its internal
+reasons onto them in one `switch`, read out of the shipped binary, and a second function translates
+the 1.x names into the same set. Widened rather than branched, because `Harness::diagnose` is handed
+a `&str` on the coalescer thread and has no flavour in hand.
+
+**`parse_user_config` was failing the same way.** 2.0's `debug config` prints the *sources* it
+merged, not the merge — and that array is valid JSON, so the parse succeeded, `get("model")` on an
+array answered `None`, and every field came back empty from a document that read fine. That is the
+1.18.31 bug the function's own header exists to record, back with nothing failing: with no default
+model to fold in, a continued session keeps the model it was last on, for ever.
+
+The document is **translated, not rebuilt** (`as_v2`): `agent`→`agents`, `provider`→`providers`,
+`npm`→`package` under an `aisdk:` prefix, `options`→`settings`, `mcp.<name>`→`mcp.servers.<name>`
+with `enabled` inverted into `disabled`. One producer still, so the model probe and a run cannot
+disagree, and a test pins that the two documents carry byte-identical prompts. The variant is folded
+into `provider/model#variant` in one helper beside `child` and **not** in `PoolEntry::model_flag`,
+whose promise is about an entry whose target string is printed to people — a pool row must go on
+reading `openrouter/a`. An id that already carries a `#` is left alone.
+
+`--dir`, `--variant`, `--attach` and `--password` are 1.x's; `--server` is 2.0's `--attach`, and the
+run-server decision is re-keyed from `run_password` onto `CliFlags::can_attach`, or every 2.x
+machine would have silently lost M105's live TUI while logging a sentence blaming a flag.
+`attach_spec` becomes `--server … --session …`; `continue_spec` and the session tab own their
+servers; the tab loses `--model`, which 2.0's root TUI does not have (`mini` kept it and has no
+`--auto`, which cannot be recovered any other way).
+
+### What was measured, and what was not
+
+Measured on this machine, against opencode 2.0.16 and MiMo 0.1.15, mostly through the repo's own
+free trick — a provider on port 1, and a listener that never answers. The real-CLI suites now cover
+**both generations on one machine**: `real_opencode` (V2) and `real_mimo`/`real_served`'s mimo arm
+(V1) all pass, and `real_served` proves serve → client turn → attached TUI on each.
+
+Three things are **not** confirmed and are recorded rather than smoothed over:
+
+- **cide's providers are invisible in the Models dialog on 2.x.** `opencode models` answers out of
+  the background service, so `OPENCODE_CONFIG_CONTENT` is ignored however it is spelled — probed
+  with both document shapes, the same eighteen ids came back. `--standalone` is not the fix:
+  `opencode models --standalone` boots a private server and prints **nothing at all**, exit 0, which
+  would empty the menu rather than complete it. The field is free text, so a provider cide knows
+  about can still be typed. The way out is the run's own server plus `opencode api`, once its routes
+  are measured.
+- **`usage` is unverified on 2.0.** The emitter proves `step_finish` still carries `tokens`, but no
+  free turn here produced one, so whether `{total, input, output, reasoning, cache}` survived is
+  unknown. A wrong shape costs the context percentage in a log card, not a run.
+- **`small_model`'s 2.0 spelling.** The probed machine's configuration names none. An absent key is
+  `None`, which is the function's rule for every key, so a rename degrades to "opencode picks".
+
+Along the way: `/global/health` is **public** on 2.0 — a fresh `serve` and the background service
+both answer it 200 with no credential — so being up stopped meaning "and it is mine". Readiness is
+still that route; ownership is now one authenticated `GET /openapi.json` (401 without, 401 wrong,
+200 right, measured) before the server is recorded, or a run on a recycled port would put its turns
+into a stranger's conversation and report success.
+
+## The accent is the user's to choose (M111)
+
+Settings → Appearance → **Accent colour** repaints every accent token: primary buttons, focus
+rings, the current tab, selections, the rail and the awaiting counters. The swatches are the red
+default plus blue, indigo, violet, pink, orange, teal and green. A **Custom** swatch opens the
+system colour dialog, and there is a hex field. Red stays the default.
+
+- **Black is danger, so it is refused**, together with every colourless tone (the user chose this).
+  The rule is OKLCH, not a list: lightness below 0.30 is too dark, chroma below 0.06 is a grey,
+  and above 0.95 with no chroma is near-white. The refusal is a `CoreError::AccentRefused` whose
+  sentence Settings shows under the swatches.
+- **The fit is Rust's** (`cide_core::accent`). The picked colour keeps its hue and chroma; only
+  lightness moves. It becomes `light` (≥ 4.5:1 on white, so also the ink under white labels in
+  both themes) and `dark` (≥ 4.5:1 on the dark panel). A colour that already passes comes back
+  unchanged. `Settings::accent` stores all three, so a later change to the fit never repaints a
+  colour somebody chose.
+- **The default is untouched.** `None` means `tokens.css`'s hand-picked red. A custom accent
+  sets `data-accent="custom"` plus `--accent-l`/`--accent-d`, and two new blocks re-derive the
+  eight family tokens with `color-mix(in srgb …)`. `--red`, `--grad-red` and `--grad-danger`
+  never follow the accent. Choosing the red swatch sends `reset`, not `#dc1f2b`.
+- **First frame:** `windows.rs` adds `&accent=light,dark` and `theme-boot.js` writes it before
+  the first paint, so there is no red flash and detached windows get it too.
+- **Terminals:** xterm cannot parse `color-mix()`, and a custom property's computed value is
+  unevaluated tokens. `concreteColor` in `terminal/xterm.ts` evaluates anything with a function
+  through a probe element's `color`. It handles both the `color(srgb …)` and `rgb()`
+  serialisations. Without it a blue accent would have kept xterm's stock selection.
+- **Kit first:** `ColorSwatches` (in `Choice.tsx`, with a specimen and a `docs/ui-kit.md` entry).
+  It commits on the native `change`, not React's per-drag `input`.
+- **`check:accent`** guards all of this:
+  - every accent-family token has a custom-block line;
+  - status and danger tokens stay out;
+  - boot, paint and URL agree on names;
+  - the presets are the ones `accent.rs`'s test proves fit.
+
+Checked: `cargo test -p cide-core accent` (including a hue sweep that every accepted colour stays
+legible in both themes) and `-p cide-app settings`, plus clippy, fmt, codegen and contract. Every
+`check:*` passes; `check:markdown`'s timing assertion flaked once and passed on a rerun. **Not
+seen on a display.** Still unconfirmed:
+- that WebKitGTK's `color-mix` in custom properties paints as intended;
+- the `color(srgb …)` serialisation path;
+- the native colour dialog's `change` timing.
+
+## The pool card counts what each entry did, and its decisions are a table (M112)
+
+Asked for as: the Model pools card should track, per entry, the run count, requests, input and
+output tokens, and min / avg / max token speed, in memory only; and "Recent decisions" should be
+a table, not a log, with a project column when the pool is shared.
+
+- **One new harness hook**, `Harness::step_clock` (defaulted `None`, like `usage`). opencode and
+  mimo read both `step_start` and `step_finish` for their `timestamp` and `sessionID`. The
+  session is the key: opencode interleaves nested subagents' steps into the parent's stream, so
+  pairing a finish with "the run's last start" would time one subagent from another's start. A
+  line with no `timestamp` falls back to cide's arrival clock.
+- **`PoolEntryStats` on `PoolEntryState`**, kept in `Inner::pool_stats` and keyed by
+  `PoolEntry::same_target`, like benches. Two pools that name one server show that server's
+  figures under both. Counters: `started`, `requests`, `input`, `cacheRead`, `output` and
+  `reasoning`, plus the speed data (below). Every field is an integer, so the report keeps `Eq`.
+  Speed is `rated_tokens`/`rated_ms` and the slowest and fastest `PoolStepRate`s, compared by
+  cross-multiplication. The UI does the division.
+- **Speed** is generated tokens (output + reasoning) over a step's duration from start to finish.
+  That includes time to first token. The average is Σtokens / Σtime, not a mean of rates. A step
+  that wrote nothing, or has no seen start, still counts as a request and its tokens, but not
+  toward speed.
+- **Response time**, min / avg / max, is the same start-to-finish duration taken over *every*
+  timed request (`timed`, `timedMs`, `quickestMs`, `longestMs`). That includes steps that
+  generated nothing: a bare tool call still took that long to answer.
+- **The run count** is taken in `log_pool_event` on `Started`. Admission and a failover's fork
+  both log there, so each landing counts once.
+- **The card:** each entry gets a mono stats line under its head. "Recent decisions" is the kit's
+  `Table`, newest first, with columns Time · Pool · Event (badge) · Model · Run · Project ·
+  Details. The Project column appears only when the log holds more than one project, and names
+  come from the workspace (`closed project` otherwise). The dialog went from `picker` to `wide`
+  to fit the table.
+- **One pool at a time.** A kit `Select` at the top of the card replaces the stack of every
+  pool. Each option shows how many runs are on the pool and how many entries are benched. The
+  card opens on the most recently active pool: the newest event that names an existing pool, else
+  the pool with the most runs, else the first. It picks only on open, or when the chosen pool
+  disappears, so a poll never moves the selection away from what a person picked. "Recent
+  decisions" is filtered to the chosen pool, plus events that name no pool (a reset of every
+  bench). `Select` marks its Escape as handled but doesn't stop it, so the card ignores an
+  Escape that is already `defaultPrevented`. Closing the list no longer closes the card.
+- **Off-pool runs count toward their model.** The first report showed a pool idle on every entry
+  while `Developer`, a role never pointed at a pool, worked on `k3s/qwen-36-27b-fp8`, which is
+  entry 5. Stats were charged only to runs with a pool. Now `LiveRun::stats_target` charges a run
+  to its pool entry if it has one. Otherwise, for an opencode-shaped harness, it charges the model
+  the run was forked with, read as provider, model and effort as variant (or opencode 2's
+  `#variant`). An off-pool run's one landing is counted on its first fork in `stamp_and_choose`.
+  The load figure (`N of max running`) still counts pooled runs only, because it is what
+  admission limits. The card adds `+N off pool` beside it and names those runs under "on it".
+- **Live while open.** A finished step emits nothing, on purpose (see `note_usage`): a broadcast
+  per model call would redraw every window. So the card re-reads its report every 2 s while it is
+  open and the window is visible, on top of the existing `agents-changed` re-read.
+
+Checked: `cargo test -p cide-agents` (`a_step_is_timed_by_its_own_two_lines`), `-p cide-ipc`,
+`-p cide-app -- agents` (`a_pooled_step_is_charged_to_its_target_with_its_speed`, and run counts
+added to the failover test), clippy, fmt, codegen and contract. tsc passes, and so do
+`check:picker|pools|selectors|ui-scale|theme|kit|menus|motion|ui-icons|agents`. **Not seen on a
+display**, and not tested against a live opencode run.
+
+## Ctrl+Shift+T brings back a Review or Plan tab, live (M113)
+
+Reported: after closing a "Review …" or "Plan - …" tab, Ctrl+Shift+T could not bring it back.
+The cause was on purpose. Since M79, a tab cide opens by itself (`ClaudeFull { ephemeral: true }`:
+reviewers, planners, `cide_session_open` tabs) has its `claude` killed at the close, and
+`closing_record` wrote no `ClosedTabs` record for it, because a record would name a killed session.
+
+- **Remembered, still killed.** `closing_record` now records ephemeral tabs and keeps the mark.
+  The kill in `tab_close` is unchanged: parking a child per finished run is still the M79 leak.
+- **Resumed before it is reinserted.** `tab_reopen_closed` is now `async` (the wire is unchanged).
+  For an ephemeral record it calls `claude_tab::resume_closed`, which respawns `--resume` over
+  each pane `lifecycle::restore_for` calls resumable. That is the same decision the launch plan
+  and the Resume splash make: `/clear`ed conversations, codex threads, the injection switch, a
+  missing transcript. The respawn happens before the reinsert ("session first, tab second"), so
+  the pane mounts onto a running child. The pane is rebound to the id the spawn returned. The
+  stance argv (`stance_args`) and the IDE pid join (`bind_ide_pane`) are shared with `open`, and
+  the voice (Acting or Worker) is passed explicitly because the tab is not back in the tree yet.
+- **What is not resumed** comes back holding its exited session, with the ordinary restart bar:
+  opencode panes, a gone transcript, `--resume` switched off, and a spawn that failed (logged).
+  If the reinsert fails, the respawned children are killed.
+- The rejected option was restoring the dead screen and leaving the pane's Resume button to the
+  user.
+
+Checked: `cargo test -p cide-app` (the renamed
+`an_ephemeral_tab_is_ended_and_both_kinds_are_remembered`, `a_tab_cide_opened_by_itself_is_remembered`),
+clippy on `cide-app`/`cide-ipc`, fmt, contract, codegen, tsc, `check:agents|attach|exit`. **Not
+seen on a display.** The resume spawn itself has no test, since it needs a real `claude`.
+
+## The verify gate before the reviewer, and a run that says why it is idle (M114)
+
+Reported on terrastrike's t-1249: a codex run "finished and hung Idle, never closed, never called
+the Reviewer". The pipeline had in fact worked. The run set review at 09:27:42, and a reviewer tab
+opened ten seconds later, accepted the work, and was refused at the merge by verify (three tests
+still pinned the old river). It filed a follow-up task and left t-1249 in review. The run stayed
+`Idle` by design (`retire_done` ends idle children only on `done`), and nothing on its row said
+any of this. Two faults, then: the reviewer asked before verify answered, and an idle run could
+not say who held its task.
+
+- **The reviewer waits for the gate.** `milestones::prewarm` still starts verify when a run sets
+  review, and it now opens a gate (`agent_rpc::GATES`). A turn whose task is gated is parked
+  instead of announced. The verdict decides where it goes:
+  - Green: to the reviewer, whose `{outcome}` now says the gate passed.
+  - Red, within `agents.verifyRetries`: nowhere. The refusal is written onto the task, the task
+    goes back to `doing`, and a line pointing at the refusal is said to the **same run**
+    (`follow_up`, or a fresh dispatch of the role when its child is gone). That run has the
+    context to fix it.
+  - Red, past the retries: to the reviewer, told how many times in a row.
+
+  Both orders are real (a cached or dirty-checkout verdict can land before the turn ends), so
+  an early verdict is remembered for the turn it is about. A dirty checkout is now a red verdict
+  at review time rather than a surprise at the merge.
+- **`agents.verifyRetries`** (default 3, at most 20, `0` = every red to the reviewer) is in
+  Settings → Subagents. It is **not** on the `cide_agents_config` tool: a model that could raise
+  it could buy itself more billed turns on the same red output, which is the argument that tool's
+  header asks for before any key is added. The count is consecutive per task, kept in memory,
+  reset by green.
+- **The row says why.**
+  - An idle run's word is `Verifying`, `In review` or `Gate failed` instead of `Idle`, and the
+    role line takes it too.
+  - Under the run, one line says what the gate did (running, passed, failed k of N and handed
+    back, or failed N times and sent to the orchestrator). It comes from `VerifyState`'s new
+    `failures`/`retries`.
+  - A second line reads "In review by orchestrator". It is a kit link to the review tab while
+    that tab is open (`AgentRun::reviewer`, filled where rosters are built from the M79 reviewer
+    table, which now re-emits the roster when a reviewer opens). The click is `openTaskSession`
+    with no `task`, because that option would hand the task to the session.
+- Out of scope, per the user: run `fb668bf6` of the same task died because a local override moved
+  it from opencode to codex, and its respawn offered codex an opencode session id. The reviewer
+  handled it.
+
+Checked: `cargo test -p cide-app -p cide-agents -p cide-ipc -p cide-remote -p cide-tasks`, which
+includes the new gate tests (`a_turn_waits_for_its_gate…`, `a_red_gate_handed_back…`,
+`an_early_verdict…`, `a_gate_holds_only_its_own_task`,
+`a_red_gate_goes_back_to_the_run_until_the_retries_are_spent`,
+`verify_retries_default_to_three_and_are_ceilinged`). Also clippy, fmt, contract, codegen, tsc,
+and `check:agents|agents-render|settings-agents|selectors|ui-scale|theme|kit|ui-icons|menus|motion`,
+with four new render stories (`role-gate-running`, `role-gate-handed-back`, `role-in-review`,
+`role-in-review-no-link`). **Not seen on a display, and not run against a live verify:** the
+hand-back into a real codex/claude/opencode run and the reviewer opening only after a green gate
+are untested end to end.
+
+## Console tabs turn while they work, and the pinned grid counts them (M115)
+
+A claude or codex tab that was mid-turn looked exactly like an idle one; only the header's project
+tab had a running chip. Every console tab in the strip now has three states: a turning mark while
+a turn runs, the awaiting chip once it ends unseen, and a plain tab once the user has looked (the
+existing acknowledgement). The pinned `claudeHome` tab spells how many of its grid's consoles are
+working, like the header chip; a closable console tab shows the bare mark, and the figure only once
+a split puts two to work.
+
+- **Rust decides, per tab.** `ProjectRunning` gained `tabs: Vec<TabRunning>` on the same
+  `cide://project-running` broadcast, computed in `running::counts_for` by grouping
+  `session_panes` by tab (`tabs_working`, pure and tested). Alive-ness and run ownership are only
+  known in Rust, so the UI does not re-derive it. A mirror inside one tab counts once; a session
+  shown in two tabs turns both; a detached pane is in no tab.
+- **Narrower than the header's count, on purpose**: a tab counts a session only while it is
+  `Busy` (`pane_is_turning`). A permission prompt is the awaiting chip's, so a one-console tab
+  never lights both chips about one session. The header keeps its wider reading.
+- UI: `runningInTab` in `runningRule.ts`, `useRunningInTab` in `running.ts`, the chip in
+  `TabStrip.tsx` (`data-running` = `false` | `bare` | figure), geometry in `TabStrip.module.css`
+  with its own `--running-w`/`--running-slot` pair and `.labelPinned` reaching over both slots.
+  The mark, here and on the header's project tab, wears `--accent`, the user's chosen colour. The
+  user asked for it: the first cut took the kit `Spinner`'s blue on the strip and the chip's grey in
+  the header, and neither matched the colour set in Settings. It pauses under reduced motion.
+
+Checked: `cargo test -p cide-app -- running spinner` (new `a_tab_turns_only_for_a_live_turn`,
+`tabs_count_their_own_turning_consoles`), fmt, clippy on `cide-app`/`cide-ipc`, codegen and
+contract, tsc, and `check:running` (new section 5) plus
+`awaiting|tab-overflow|tab-drag|ui-scale|motion|theme|ui-icons|kit|casing|menu-model|menus|selectors`.
+**Not seen on a display.** An unprompted codex console stays `Spawning` and shows no mark until its
+first hook (M93's rule), and tabs that only mirror an agent run are left to the run count.
+
+## Dispatching again continues the role's own conversation (M116)
+
+Asked after M114: can the orchestrator continue a run's context, or does a dispatch always start
+a new one? It always started a new one, and it was worse than that.
+
+**Before:**
+- While a run held the (role, task) pair, including a run parked **Idle** after handing back, a
+  dispatch onto that pair was refused. So the reviewer brief's own instruction ("hand it back to
+  the same role with cide_agent_dispatch") was refused for every claude and codex run, and the
+  way out was to stop the run, which threw away the context.
+- Once the pair was free, a dispatch started an empty context that re-read everything from the
+  comments.
+
+**Now, keyed on the pair and not on a run id** (a model has no id to get wrong or keep stale):
+- **Told.** The pair is held by a run that can be spoken to, and the dispatch has instructions.
+  They go into that run through `follow_up`: now if its turn is over, else at its next
+  hand-back. The run's `notify` is re-pointed at the pane that said it (`renotify`). No new run.
+- **Continued.** The pair is free, and the newest ended run of the pair still has a conversation
+  on disk (`AgentRegistry::last_conversation`). A new run resumes it through
+  `enqueue_continuing`, and its first prompt is `handed_back_prompt`: "your task has been handed
+  back… read its newest comments first… What to do now: …".
+- **Started.** Otherwise a fresh run, as before. The answer says why, when a conversation existed
+  that was not used.
+- **`fresh: true`** (a new optional field on `DispatchRequest` and on the tool) asks for the clean
+  context. Onto a live run it is refused: stop that run first.
+- A dispatch with no instructions onto a live run is still refused. That covers an assignment
+  repeated while its run lives, which `task_triggers` logs as before.
+
+**Two guards, both silent if dropped** (`continue_route`):
+- A conversation continues only on the harness that minted it. A codex thread handed to opencode,
+  or an opencode `ses_…` handed to codex, is the respawn that killed terrastrike's `fb668bf6`.
+- qwen never continues. Its respawn resumes the new run's own id and ignores the one it is given,
+  so it would open an empty conversation that looks like a continuation.
+
+**Also changed:**
+- The tool's answers name what happened: "Told run …", "…continuing run X's conversation", or
+  "(fresh: …)". `AgentSink::dispatch_with` now returns `Dispatched { run, how }`.
+- `RegistrySink` reads `dispatch_or_duplicate` directly, so it can tell the three apart.
+- M114's `hand_back_to_run` is now one dispatch onto the pair.
+- The texts that taught the old rule were rewritten: the tool description, the idle-run advice
+  in `run_state_detail`, `duplicate_refusal`, the orchestrator's roster paragraph, the review
+  brief (which now says to write only what is wrong), and both "can be dispatched again"
+  sentences.
+
+Checked: `cargo test -p cide-app -p cide-agents -p cide-ipc -p cide-remote -p cide-tasks` and
+`-p xtask protocol`, with these new tests:
+- `a_dispatch_onto_a_live_run_with_instructions_is_said_to_it`
+- `a_dispatch_continues_only_a_conversation_its_harness_can_take_back`
+- `a_dispatch_continues_the_newest_ended_conversation_of_the_pair`
+- `a_run_told_something_reports_to_whoever_told_it`
+- `a_handed_back_run_is_told_it_is_continuing_and_what_is_wrong`
+- `a_repeated_dispatch_says_whether_it_continued`
+
+Also clippy, fmt, contract, codegen, tsc, and `check:agents|agents-render|settings-agents|remote`.
+
+**Not seen on a display, and not run against a real CLI.** Untested end to end: a claude fork
+through `--fork-session` after the checkout was retired and recreated, a codex `resume <thread>`,
+and an opencode `--session`.
+
+## What a crash, a power cut or an OS shutdown takes, made small (M117)
+
+The question was whether quitting cide mid-run, shutting the machine down or losing power can
+lose runs or sessions. The answers found by reading the code, and measured where noted:
+
+- **An OS shutdown or logout could turn every run into history.** cide runs as
+  `app-CIDE@….service` with `KillMode=control-group` and `TimeoutStopUSec=5s` (measured on this
+  machine), so systemd SIGTERMs every `claude`/`opencode`/`codex` child **together with** cide.
+  A child reaped before `run_teardown` reached `final_snapshot`'s seal was recorded
+  `Finished { 143 }`, restored as history, and offered no Resume. A death with a latched provider
+  failure could also fork a pool failover mid-teardown.
+- **A power cut** lost up to 0.75 s of task-tracker edits (a comment an agent had been told was
+  written), 0.75 s of workspace changes (settings, tabs, pane→conversation bindings), an opencode
+  `ses_…` id that no `mark_changed` followed, and up to five minutes of unsaved editor text. After
+  a crash, the last clean quit's `screens.json` was replayed into new shells. A failed debounced
+  save waited for an unrelated change. A corrupt `agent-runs.json`, `gates.json` or
+  `proposals.json` was read as empty and saved over. Several atomic writers skipped the directory
+  fsync, and accepting a proposal truncated project files in place.
+
+What changed:
+
+- **An outside stop is an interruption** (`AgentRegistry::external_stop`, before failover and
+  observe in `watch_exit_with`). The rule: not `stopping`, and either cide is going down or the
+  exit is 143/130. `going_down` is a new flag, separate from the seal. It is set first on every
+  road out (`lifecycle::begin_going_down`: signal thread, `exit_requested`, `shutdown`, logind),
+  and it stops admissions, failovers and restarts. `set_state` now releases the slot for
+  `Interrupted`, and `mark_reclaimed` latches `stopping`.
+  - **Measured:** SIGTERM to each CLI idle in a pty gives exit 143 for `claude` 2.1.283, signal 15
+    (143) for `codex` 0.157.1, and **130** for `opencode` 2.0.16, hence both codes. This was a
+    one-off script, not a committed test.
+- **logind delay inhibitor** (`crate::logind`, zbus blocking, already in the graph). On
+  `PrepareForShutdown(true)` cide calls `app.exit(0)`, which is the normal quit. The lock is
+  released right after the child ladder.
+- **The teardown writes first** the workspace, positions, tasks and the sealed run snapshot, then
+  GitLab and the rest, inside the 5 s budget.
+- **Urgent writes.** `Debouncer::note_urgent`/`wait` wake the flusher at once. The write stays on
+  its thread and never on the GTK main thread.
+  - Task edits are urgent (`cide_tasks::wait_for_urgent` parks the one flusher).
+  - `WorkspaceState::update` is urgent by default. `update_cosmetic` covers focus, splitters,
+    active tab/project, tool window, window mode and the dirty dot.
+  - Failed saves re-arm. The opencode session id is marked.
+- **Recovery.** `screens.json` is consumed on read. Corrupt stores are quarantined
+  (`persist::read_or_quarantine`).
+- **Fsync gaps closed.** A dir fsync was added to the editor's save, sidecars (the shelf), GitLab,
+  remote devices and `cide_fs::ops::write`, and the last of these also gained its missing
+  `sync_all`. Proposals now write atomically.
+- **Hot exit.**
+  - A dirty buffer is snapshotted to `<state>/buffers/<blake3(path)>.json` 1.5 s after typing
+    pauses, and at least every 10 s (`editor/hotExit.ts`; above 2 M characters, only on the
+    ceiling). The snapshot is fsynced and framed over IPC.
+  - It is cleared on clean, or when the tab closes.
+  - It is restored as a dirty change **over** the disk baseline, with the typed-against stamp as
+    the autosave precondition, so a file that moved raises the conflict bar.
+  - Swept at launch when no tab names the path, or after 30 days.
+  - Excalidraw scenes and merge state are out of scope. In passing: `MergePane`'s `tab_set_dirty`
+    is refused (not a File tab) and swallowed, so a merge's dirty flag never reaches Rust.
+
+**Deliberately not done, for performance:**
+
+- fsync of libgit2 objects. That is one fsync per loose object, seconds for a large commit or a
+  rebase.
+- Making the MCP reply wait for the tracker's fsync. That would serialise concurrent agents behind
+  each other's writes.
+
+Checked:
+
+- The CI Rust set for every touched crate.
+- `check:editor` (new hot-exit section).
+- New tests: `a_child_sigtermed_from_outside_is_interrupted_not_finished`,
+  `only_a_stop_cide_did_not_make_is_an_interruption`, `going_down_spends_no_candidate`,
+  `an_interrupted_run_is_restored_interrupted`, `an_unreadable_snapshot_is_quarantined`, the
+  urgent `Debouncer` trio, `an_ordinary_mutation_is_due_at_once`, `a_failed_save_is_retried`,
+  `an_edit_is_due_at_once`, the `read_or_quarantine` and `buffers` tests.
+
+**Not seen on a display, and not run end to end:** a real reboot through logind, a
+`systemctl --user stop` of a cide unit with a run going (the recipe is in `docs/checks.md`), and a
+buffer restored after a `kill -9`.
+
+## Codex task runs can commit, don't sit on prompts, and don't loop (M118)
+
+Reported from selfcraft (`problem.md`, t-573's analysis): every codex task run failed at its
+first git write with `fatal: Unable to create '<repo>/.git/worktrees/<name>/index.lock':
+Read-only file system`. That covers commit, merge, rebase and ref updates. The chain:
+- every selfcraft role says `permission-mode: auto`;
+- `permission_policy` maps an explicit `auto` to `--approve-for-me`, which keeps codex's
+  workspace-write sandbox;
+- that sandbox's only writable root is `-C <worktree>`, and codex re-binds `.git` read-only on
+  top of it;
+- the worktree's admin directory and the common `.git` sit outside that root anyway.
+
+M44's bypass only ever applied to a role that names no mode. The knock-on effects:
+- M114's verify gate handed the dirty branch back to runs that could not commit, 3 times and then
+  up to 6 in a row.
+- Runs sat on approval prompts nobody would answer.
+- Runs a restart interrupted waited for a Resume press.
+
+**Measured first, on codex 0.157.1, before any code:**
+- The failure reproduces without a model (`codex sandbox` with `sandbox_mode="workspace-write"`).
+  The scratch repo was under `/tmp`, which is writable, so the cause is the `.git` protection
+  and not the writable-root boundary.
+- Adding the git dir and the common dir as writable roots makes the commit work. codex does not
+  override paths it is given explicitly.
+- One real `codex exec --approve-for-me --add-dir <git-dir> --add-dir <common-dir>` turn
+  committed from a linked worktree.
+- `codex resume` accepts `--add-dir`.
+- clap refuses `--approve-for-me` next to `-a`. So "refuse instead of asking" cannot be
+  expressed for `auto`, and the approval-prompt fix below ends the parked run instead.
+
+What changed:
+- **The sandbox stays, and the git metadata is writable** (the user's choice over mapping `auto`
+  to bypass).
+  - `cide_git::worktree::git_dirs` resolves a checkout's admin dir and its common dir.
+  - `RunPlan::git_dirs` carries them. They are filled only for a run in a worktree, at the one
+    place a plan is built.
+  - `codex.rs::assemble` passes them as `--add-dir` under every policy `sandboxes_writes` names
+    (`auto`, `default`/`acceptEdits`, `dontAsk`, and a project that asks). They are not passed for
+    bypass, for `plan`, or when a wrapper decides the sandbox.
+  - The real-CLI proof is `a_real_turn_commits_from_a_sandboxed_worktree`. It spends one turn and
+    takes its tokens from the harness's own argv.
+- **The sandbox's other limits are said up front.** `harness::codex::sandbox_caveat` produces the
+  sentence.
+  - `cide_agents_list` puts it on the line of any codex role that names its own mode: no X display
+    (`/tmp/.X11-unix`) and no audio, so Xvfb e2e runs and Blender renders fail there, and
+    `permission-mode: bypassPermissions` is the way out. That mode is still behind `agents.allowDangerousPermissions`, which only a person sets, and the sentence says so.
+  - A run's row note adds the cases only the spawn can see: a wrapper deciding the sandbox, git
+    dirs that would not resolve, and `plan` being read-only.
+  - Xvfb and Blender themselves were left out of scope (A2 and A3).
+- **The verify gate stops on "nothing moved".**
+  - `milestones::RedMark` records each red verify's head and its uncommitted paths.
+  - A red verify whose mark equals the previous one is escalated at once with `stuck`, not handed
+    back. Its task comment and the orchestrator's line both say no new commit arrived since the
+    last hand-back, and point at `Read-only file system` as the likely cause.
+  - A run that commits something keeps its retries.
+- **A task run parked on an approval prompt is ended** after `PERMISSION_PARK_GRACE` (5 min).
+  - It is ended only if it is still on the same prompt, nobody has it open in a pane, and no stop
+    is already under way (`agents::park_due`).
+  - Nothing is typed into the prompt: a line and its Enter would approve the call.
+  - The new epitaph, `StopHow::Parked`, says nothing was approved and that dispatching again
+    continues the conversation. The ordinary end-of-run nudge tells the orchestrator.
+  - This applies to every harness, not only codex.
+- **Interrupted runs continue at launch.**
+  - `agents.resumeAfterRestart` is a new setting, on by default. It is in Settings → Subagents and
+    not on `cide_agents_config`, for `verifyRetries`' reason.
+  - Three seconds after the windows are restored, `AgentRegistry::resume_after_restart` requeues
+    every `Interrupted` run through the Resume button's own `requeue_interrupted`. It keeps that
+    function's skips: a run open in a pane, or a pair a newer run already holds.
+  - The quit itself still winds nothing down (`SEALED`): the turn in flight is lost, the
+    conversation is not.
+  - Two parts of A7 were already done: the orchestrator's stop asks first (M67), and a new run
+    continues rather than needing a stop (M116).
+
+Checked:
+- The full CI list: fmt, contract-check, build, `cargo test --workspace`, clippy,
+  `codegen --check`, tsc, every `check:*`, and the UI build.
+- The free real-codex tests (`--skip a_real_turn`).
+- The quota test above, which passes.
+- New tests:
+  - `a_linked_checkout_names_its_own_admin_dir_and_the_common_one`
+  - `a_worktree_run_can_write_its_git_metadata`
+  - `the_sandbox_caveat_is_said_only_where_the_sandbox_denies_something`
+  - `the_roster_says_what_codexs_sandbox_denies_a_role`
+  - `a_red_gate_with_no_new_commit_is_not_handed_back_twice`
+  - `a_dirty_checkout_is_a_red_mark`
+  - `a_task_run_parked_on_a_prompt_nobody_can_answer_is_due_to_end`
+  - `interrupted_runs_resume_at_launch_…` (two tests)
+  - a `Parked` row in the epitaph table
+
+**Not seen on a display, and not run end to end:**
+- a real codex task run in selfcraft committing through the TUI (only `codex exec` was run);
+- a parked run actually being ended after five minutes;
+- a relaunch that resumes runs;
+- the new Settings toggle.
+
+## Codex task runs leave nothing behind, and a role can be let through the sandbox (M119)
+
+Reported from selfcraft after M118 (`problem.md`), four problems:
+- processes from runs that had ended hours earlier were still running: Godot `-s` probes burning
+  CPU, Blender workers in a worktree that was already deleted;
+- a sandboxed sprite-artist and ui-dev could not render with Blender or capture under Xvfb, and
+  the only way out was `bypassPermissions`, which a Claude orchestrator's classifier refuses to
+  write;
+- the runs were never told what their sandbox denied, so each one found out by failing;
+- M118's park and "no new commit" stop had never fired live.
+
+**Measured first:**
+- **Orphans.** Ending a run was `pty.kill()`: portable-pty's one SIGHUP to the pid cide forked.
+  - Every codex command runs as `codex` → `codex-linux-sandbox` (its own session) →
+    `bwrap --unshare-pid --die-with-parent --as-pid-1` → the command.
+  - Neither the signal nor the pty hang-up crosses that session boundary, and the wrapper has no
+    death signal. When codex exits, the wrapper is adopted by `systemd --user` and keeps the
+    whole pid namespace alive.
+  - Killing the wrapper is enough: bwrap dies with its parent, the namespace's init dies with
+    bwrap, and the kernel kills the rest of the namespace.
+- **Display and audio are one denial, and it is not the one `problem.md` guessed.**
+  `/tmp/.X11-unix` is writable in the sandbox. What refuses is codex's seccomp filter, which with
+  the network off refuses **every** `AF_UNIX` socket, path or abstract (EPERM). Under
+  `codex sandbox`, codex 0.157.1:
+  - Xvfb: "Cannot establish any listening sockets".
+  - Blender: runs its script, then hangs at exit on `pa_write() … Operation not permitted`. That
+    is t-586's "stall" and the source of the orphaned Blender workers.
+  - With `-c sandbox_workspace_write.network_access=true`, both unix sockets work and Blender
+    exits in 0 s.
+  - Xvfb then crashes in NVIDIA's EGL during GLX setup, because the sandbox's `/dev` has no GPU
+    nodes. With `__EGL_VENDOR_LIBRARY_FILENAMES` pointed at Mesa's `50_mesa.json` and
+    `__GLX_VENDOR_LIBRARY_NAME=mesa`, `glxinfo` answers llvmpipe.
+- **Allowed commands can leave the sandbox.** codex's execpolicy `prefix_rule(…,
+  decision="allow")` makes codex run a command unsandboxed when every segment of it matches
+  (`BypassSandboxFirstAttempt` in its source). Three real `codex exec` turns in a scratch repo
+  with a linked worktree under `.cide/worktrees/`:
+  - With the rules in `<worktree>/.codex/rules/cide.rules` and the project trusted, a
+    unix-socket probe ran **unsandboxed**.
+  - The same turn with the file removed got EPERM.
+  - Under `--approve-for-me` the rule still let it out.
+  - A project layer's rules load only for a trusted project, and for a linked worktree codex
+    keys that trust on the **main** repository's root.
+  - codex persisted that trust into `~/.codex/config.toml` by itself. The spike's entry was
+    removed by hand afterwards.
+
+What changed:
+- **A run's end takes its whole tree down.**
+  - `cide_core::process_tree` is new: a one-pass `/proc` table and `descendants`. Signalling
+    checks each pid's start time, so a reused pid is never hit.
+  - `agents::end_tree` reads the child's descendants **before** the signal (afterwards the
+    parent chain is gone), sends the usual SIGHUP, and SIGKILLs the survivors after 3 s.
+  - Every place a run or run server was `pty.kill()`ed now goes through it: stop, park, retire,
+    reclaim, resume-restart, respawn, and the servers.
+  - The quit ladder captures the **runs'** trees before its first rung and kills what survives
+    its last one. A shell pane's `nohup`ed job is the user's, and is left alone.
+  - Sweeps cover what no snapshot saw, such as a codex that crashed, or a command codex
+    abandoned at its own tool timeout. `process_tree::orphans_in` takes processes adopted by
+    init or a `systemd` subreaper whose cwd is in the directory (` (deleted)` included), or a
+    `codex-linux-sandbox --sandbox-policy-cwd <dir…>`, together with their subtrees.
+  - The sweep runs in `retire_worktree` (no run holds the checkout by then), and at launch over
+    every open project's `.cide/worktrees/`. It never runs over a project root.
+- **Three new role keys** in cide's dialect, which Claude Code subagents do not take. They are
+  editable in the file, in Settings → Agents (a new "Sandbox" group on the role form), and over
+  `cide_agent_create`/`cide_agent_update` (`allowCommands`, `needs`, `writableDirs`).
+  - `allow-commands: [blender -b, tools/ci/runners/e2e.sh]`:
+    - codex: a rules file of `prefix_rule`s in the worktree's `.codex/rules/cide.rules`. It is
+      rewritten or removed at every spawn, kept out of commits through the common dir's
+      `info/exclude`, and paired with `-c projects."<root>".trust_level="trusted"`. Worktree
+      runs only.
+    - claude: `Bash(<prefix>:*)` in `--allowedTools`.
+    - Refused, and the role greyed: shells, launchers (`env`, `timeout`, `sudo`, …) and shell
+      metacharacters, because allowing any of them allows everything.
+  - `needs: [display, audio, network]`: codex's network switch, plus the Mesa GL variables for
+    `display`. Only under a sandbox that writes.
+  - `writable-dirs: [~/.cache/godot]`: one more `--add-dir` each. Relative paths, `/`, `~` and
+    `..` are refused.
+  - The rules live in `cide_agents::sandbox`, shared by the loader and `defs::validate`, so a
+    value the form saves is a value that runs.
+- **The run is told.**
+  - `RunPlan::sandbox_brief`, from `harness::codex::sandbox_brief`, is appended to the codex
+    brief outside the tracker gate.
+  - It says either "no X display and no audio here — do not start Xvfb, Blender…; leave captures
+    to the reviewer" or "the network is on, start your own Xvfb", and lists the allowed
+    commands with the rule that they must be run directly.
+  - `sandbox_caveat` (run row, roster) now names `needs:`/`allow-commands:` as the way out
+    instead of `bypassPermissions`.
+- **`CIDE_PARK_GRACE_SECS`** overrides the five-minute park grace, for a live test of the park.
+  It is logged as a warning when set.
+
+Not done, on purpose:
+- opencode, mimo and qwen do not act on `allow-commands`. They have no sandbox to leave, and an
+  allow-only `permission.bash` table could change what unlisted commands default to, which was
+  not measured.
+- The Settings form's hint describes each harness in words. It does not compute the caveat
+  live.
+
+Checked:
+- The full CI list: fmt, contract-check, build, `cargo test` on every touched crate, workspace
+  clippy, `codegen --check`, tsc, every `check:*`, and the UI build.
+- The free real-codex tests (`--skip a_real_turn`).
+- New tests:
+  - `process_tree`: a real `setsid` grandchild killed after its parent is gone; a reused pid
+    left alone; cycles; ` (deleted)`; `--sandbox-policy-cwd`.
+  - `sandbox`: the command, need and directory rules, and the rules file written, excluded and
+    withdrawn.
+  - `a_sandbox_grant_is_read_refused_and_round_tripped`.
+  - `a_grant_reaches_codex_only_where_its_sandbox_is_on`.
+  - `the_run_is_told_what_its_sandbox_denies_and_what_it_may_run`.
+  - The caveat and roster tests, updated to name the grant.
+
+**Not seen on a display, and not run end to end:**
+- a real codex task run in cide with a grant: a Blender render, an Xvfb capture, an allowed e2e
+  runner;
+- a stopped run whose sandbox processes are gone afterwards (the tree kill was tested only on a
+  plain `setsid` tree);
+- the launch sweep;
+- the Settings form's new group;
+- M118's park, ended with `CIDE_PARK_GRACE_SECS`, and the "no new commit" stop — both still
+  unseen live.
+
+**Follow-up (same day): no GPU inside codex's sandbox.** selfcraft's ui-dev (redirected to codex
+by a local override) still rendered e2e captures on opengl3 with `needs: [display, audio]`.
+Measured on 0.157.1:
+- Inside the sandbox `vulkaninfo` sees only llvmpipe, because bwrap's `--dev /dev` has no
+  `/dev/dri` or `/dev/nvidia*`. Godot's Forward+ on it falls back to opengl3.
+- codex has no setting that binds devices.
+- `writable_roots` under `/dev` (the node list, or `/dev` itself) makes bwrap fail **every**
+  command with `Can't mkdir /dev/dri/.git`.
+
+Outside the sandbox the same e2e runner gets the RTX 5090 under Xvfb (the root checkout's
+`reports/e2e/*/godot.log`), so GPU work goes through `allow-commands`. What changed:
+- `writable-dirs` now refuses `/dev`, `/proc` and `/sys`, and the refusal points at
+  `allow-commands`.
+- A relative-path command is ruled in both spellings (`tools/…` and `./tools/…`), because codex
+  matches tokens literally.
+- The brief of a run with `needs:` says there is no GPU and names the allowed commands as the
+  route to one.
+
+Not yet seen: an allowed e2e run from a codex task actually getting the GPU.
+
+**Follow-up: a role's model does not follow it onto another harness.** terrastrike's 3d-artist
+says `harness: claude` and `model: opus`. A local override (`all: {harness: codex}`) moved it to
+codex, and `overrides::resolve` still folded the file's model in. So every dispatch ran
+`codex -m opus` and failed: "The 'opus' model is not supported when using Codex with a ChatGPT
+account".
+
+Now, when an override changes a role's harness, the role's own `model` and `effort` stay behind
+(both are that CLI's vocabulary), and the run takes the new CLI's default. A model or effort the
+**override** names still applies, since it was written for the harness it chose. The case is
+logged at info. Tests: `a_roles_model_does_not_follow_it_onto_another_harness`, and
+`an_override_wins_field_by_field_over_the_committed_role`, whose last assertion pinned the old
+behaviour and was changed.
+
+## The tracker's `rev` stays in memory, and a reverted counter sticks (M120)
+
+`.cide/tasks.json` conflicted on every merge where both branches had touched the board, even when
+the tasks merged cleanly. The cause was `"rev"`, which changed on every accepted mutation, next to
+`"nextId"`. `rev` only orders `cide://tasks-changed` snapshots inside one process, so it now
+lives in memory only. The file always says `"rev": 0` (`cide_tasks::REV_ON_DISK`).
+
+Frozen rather than omitted: before M120 `rev` is a required field, and an older build that opens a
+tracker without it quarantines the file (renames it aside). Dropping the line needs a schema bump,
+and that should wait until no older builds are left. A file's `rev` is still read, for
+`settle_next_id` on pre-M61 files. An older build writing a live value back is harmless: the
+store compares indexes without it (`same_index`).
+
+The second fix is from the same complaint. Create a task and delete it, and the file shows as
+modified in git, with only `nextId` changed. Reverting it never stuck: the watcher's merge took the
+higher counter and the flush wrote it back. Now, when an outside change leaves every row identical
+and only the counter differs, the store adopts the file's counter, in either direction, and writes
+nothing. The reverted number gets minted again, which is what the revert asked for.
+
+`nextId` still conflicts when two branches both created tasks, and that conflict is a real
+collision (both minted the same `t-N`). A merge driver or collision-free ids were discussed as
+follow-ups and not built.
+
+Tests: `the_file_says_rev_zero_whatever_memory_has_counted`,
+`a_reverted_counter_is_adopted_and_not_written_back`. Two older tests that asserted a live `rev`
+on disk now assert it in memory. Not yet seen on a display: the revert round trip in the running
+app. The installed AppImage predates this, and if it has the project open it still writes the
+higher counter back.
+
+## A gate need not run after every merge: `gateRuns` (M121)
+
+The gate for the active milestone reran after every agent merge. On the projects milestones were
+built for, that is a long run. `gates.json` recorded selfcraft's `slice` at 16 minutes and `items`
+at 7, and terrastrike's four gates at 7–15, with `timeoutSecs` of one to two hours. When a batch
+of subagents finished minutes apart, each merge started a fresh gate. By the time it finished,
+another merge had landed, so the result described a commit that was already out of date.
+
+`milestones.gateRuns` in `.cide/config.json` sets this for the whole plan:
+
+- `merge` (the default, omitted from the file): as before.
+- `idle`: no gate after a merge. The spinner's wake, which already reran a stale gate before
+  planning, is now the only automatic run. The spinner wakes a project only once it is quiet, so
+  a batch costs one gate run.
+- `manual`: nothing automatic. The wake plans on the last verdict, as the Plan button already did.
+
+In every mode the gate still runs from the Run gate button, from the remote, on `define` and when
+a proposal is accepted. The tools accept `gateRuns` in `define` and in a proposal. `action: get`
+says which mode is set, so a planner under `idle` or `manual` knows a PASSED may be several merges
+older than HEAD. The Milestones tab's Checks row shows the mode, and its modal sets it with the
+kit's `RadioGroup`.
+
+The config file is read leniently: an unknown value reads as `manual`, not `merge`. A typo in a
+key someone set to slow the gate down should not quietly bring back the 15-minute run after every
+merge. The tools are strict and refuse an unknown value with a sentence.
+
+Tests: `gate_runs_defaults_to_merge_and_says_when_each_mode_runs`,
+`an_unknown_gate_runs_value_costs_only_that_key` (cide-ipc),
+`gate_runs_is_a_plan_change_and_a_bad_one_is_refused` (cide-agents). The two call sites in
+`agent_rpc.rs` and `spinner.rs` are one-line conditions on those helpers and have no test of their
+own. Not yet seen on a display: the modal, and an `idle` project going through a batch.
+
+## Copy and Cut between projects, in any window (M122)
+
+The file tree's Copy/Cut/Paste stopped at the project boundary on purpose. `pasteRefusal` greyed
+Paste with "paste them where they came from", and `fs_paste` checked the sources *and* the
+destination against the one project it was given, so a file from another project was
+`OutsideProject`. The clip also lived in a zustand store in each webview, so a Copy in one window
+was invisible to every other window.
+
+Containment is split rather than relaxed. `cide_fs::copy::paste_between` and `plan_between`
+check the sources against the project the clip came from, and the destination against the
+project it lands in. `paste_with` and `plan` are those functions with one list on both sides.
+The union of the two lists was the option that lost: it accepts the same pastes, but it would let
+a cut move a root of the *destination* project, which is exactly what `check_not_root` exists to
+refuse. `fs_paste` and `fs_paste_plan` take an optional `sourceProject`. When it names another
+project, `paste_into` also folds a cut's sources into that project's index, so the row the file
+left disappears from its tree in the same call. Open tabs follow a cut through the existing
+workspace-wide `follow_moves`. A cut across mounts already fell back from EXDEV to copy-then-trash.
+
+The clip is now Rust's: `cmd::fs::FileClipState`, with `fs_clip_get`, `fs_clip_set`,
+`fs_clip_clear` and `cide://fs-clip-changed` to every window. It is in memory only; a Cut that
+survived a restart would arm a move nobody remembers making. `fileClipboard.ts` is a mirror,
+started once per window by `followFileClip` from the tree's effect. `take` writes locally first,
+so the strip appears on the keystroke. Rust clears a cut when its paste consumes it, but only
+when the pasted sources *are* the clip: a drag's cut goes through the same command and must
+leave the clipboard alone, as `check-tree-drag` requires. Closing the clip's project clears it
+in `fs_close`, because Paste would otherwise stay enabled and then fail with `NoIndex`. Every
+project's panel now draws the pending-cut strip. Outside the source project it reads "cut in
+another project, will move here" and does not mention Escape, which only the source panel honours.
+
+Tests:
+- `a_paste_between_projects_checks_each_side_against_its_own_roots` (cide-fs);
+- `a_paste_between_projects_updates_both_trees` and
+  `only_the_cut_on_the_clipboard_is_consumed_by_its_paste` (cide-app);
+- `check:fs-clipboard`, which now pins the opposite of its old cross-project refusal, plus the
+  other-panel strip.
+
+Out of scope: dragging a row from one project's tree into another's. Not yet seen on a display:
+any of it, including the detached-window paste.
+
+## cide offers its own updates, from GitHub releases (M123)
+
+Each start, a few seconds after the windows are restored, an installed cide reads
+`releases/latest/download/latest.json` on `lantian/cide` (`cide-app`'s `updater`, on
+`tauri-plugin-updater` 2.12.0). 2.13 needs tauri 2.12 and the workspace pins 2.11.5. GitHub's
+`latest` never serves a draft or a prerelease, so "stable only" needs no filtering of its own.
+A newer release that is not the skipped one becomes an app-wide notice in every shell window
+(`chrome/updates.ts`), with three answers:
+
+- **Update** downloads, verifies the minisign signature and replaces the file. It then asks
+  whether to restart. *Restart now* goes through `app_quit_requested` and the quit dialog, so
+  unsaved edits and busy sessions are asked about exactly as on quit. The restart itself is
+  `AppHandle::restart`, whose teardown `lifecycle::exit_requested` already runs inline.
+- **Skip this version** is `settings.update.skippedVersion`, through `settings_set`. Only that
+  version is silenced, and a skip made in one window clears the offer in the others.
+- **Dismiss** stores nothing, so the next start asks again.
+
+`help.checkForUpdates` and a button on the About card ask on demand and ignore a skip.
+Settings › Projects & windows has *Check for updates on start* (on by default) and *Offer it
+again* for a skipped version. The window also pulls `update_status` on mount, which covers the
+start-up event arriving before its listener is up.
+
+Only an AppImage in a writable folder, or a `.app` not running from the `.dmg` or App
+Translocation, installs in place. Everything else gets *Open release page*, and
+`updater::install` refuses it in Rust. The plugin writes an AppImage over `current_exe` for any
+Linux build it cannot classify, and over a tarball's `cide` that would leave an unlaunchable
+file. `-dev` versions, debug builds and an empty `plugins.updater.pubkey` never check.
+
+Release side: `xtask package` adds `createUpdaterArtifacts` as a `--config` argument only when
+`TAURI_SIGNING_PRIVATE_KEY` is set. In `tauri.conf.json` it would break every unsigned local
+build. The preflight refuses an unsigned build under `CIDE_RELEASE`, which `release.yml` sets.
+The macos job renames `cide.app.tar.gz` to `cide_<ver>_<arch>.app.tar.gz`, and the publish job
+writes `latest.json` with `scripts/updater-manifest.py`. That is Python rather than an xtask
+subcommand because the job has no Rust toolchain. Setup and an end-to-end recipe are in
+`docs/packaging.md` › Self-update; ADR 0007 has an addendum.
+
+**Not done, and it blocks releases:** the signing key does not exist yet. `pubkey` is checked in
+empty, so no build checks for updates, and `release.yml` will refuse to build until the key's
+secrets are set and its public half is committed.
+
+Tests:
+- `cargo test -p cide-app updater`: skip matching, never-checks, release URL, AppImage and
+  `.app` installability.
+- `cargo test -p xtask`: `update_signatures_are_asked_for_only_with_a_key_to_make_them` and
+  `an_unsigned_release_is_refused_and_an_unsigned_local_build_is_not`.
+- `python3 scripts/updater-manifest.py --self-test`, plus a manual run over fake assets.
+
+Not yet seen on a display or on a real release: any of it. Not seen: the notices, the download,
+an AppImage replacing itself, the restart, the macOS `.app.tar.gz` (including whether `--dmg`
+alone makes the bundler write it) and the macOS admin-password install. The first signed release
+is the first real test; `docs/packaging.md` has the local rehearsal with a throwaway key.
+
+## Override profiles: switch every role off a provider in one step (M123)
+
+Asked for as: "in project A every role is overridden onto codex, role X onto codex with its own
+model and effort; codex is out of limit, and I want to switch the whole set to another harness,
+models and efforts". Before this, that meant re-picking harness, model and effort on every
+override row, twice — once away and once back.
+
+A **profile** is a whole `ProjectOverrides` table (the every-role row and every role row) saved
+under a name, per project, in the same `agent-overrides.json`. Decisions the user made:
+profiles are **per project** (role rows name that project's roles), and **the active profile is
+the live table** — every edit is mirrored into it, so there is no unsaved state and a switch
+never loses work.
+
+The shape keeps every reader where it was. `AgentOverrides::projects[root]` is still the only
+table resolution reads (the fork, the queue caps, the roster, `ChildSettings`); profiles live in
+a new `AgentOverrides::profiles[root]` and a switch *copies* one into the live table. So
+`cide_agents::overrides` did not change at all, and the run-side consequences are the ones that
+already existed: queued runs take the new table at their fork, a paused run whose child settings
+moved is restarted on Resume, a running child keeps what it was forked with.
+
+- `cide_ipc::overrides`: `ProjectProfiles`, `OverrideProfileOp` (list / switch / save / rename /
+  delete), `OverrideProfilesState`; `AgentOverrides::set_project` (the mirror) and
+  `apply_profile_op`, which works on a copy so a refused op writes nothing. No schema bump —
+  `profiles` is `#[serde(default)]` and absent when empty; a pre-M123 build drops it on save.
+- `agent_override_profiles(project, op)` Tauri command; emits the roster on any change, since a
+  switch moves rows nothing on screen drew. `agent_overrides_set` now goes through `set_project`.
+- `cide_agent_override_profile` MCP tool for the product owner's pane — the vocabulary is
+  twenty-four. Its answer lists each role's resolution after the change.
+- Settings → Agents → Local overrides: a profile bar (select, Save as…, Rename…, Delete) above
+  the rows, built from the kit's `Select`, `Button` and `TextInput`.
+
+Tests: `cargo test -p cide-ipc overrides` (old file loads; save/switch round trip; edits mirror
+into the active profile; unknown name refused and nothing written; delete keeps the live rows),
+`cargo test -p cide-agents tools` (`an_override_profile_switches_the_whole_table_and_edits_land_in_it`),
+`cargo test -p cide-app -- agent_rpc agents settings`, `check:settings-agents`, `check:pools`,
+`check:selectors`, `check:kit`, `tsc`.
+
+Not yet seen on a display: the profile bar itself, and the Agents panel following a switch made
+through the MCP tool.

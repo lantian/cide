@@ -14,4 +14,13 @@ running: boolean, last?: CheckResult,
 /**
  * The full output, as [`GateState::log`].
  */
-log?: string, };
+log?: string, 
+/**
+ * Red verifies in a row on this task since the last green one. (M114)
+ */
+failures: number, 
+/**
+ * `agents.verifyRetries` as it stood when this was drawn: while `failures` is at most this,
+ * a red verify went back to the run itself; past it, to the reviewer.
+ */
+retries: number, };

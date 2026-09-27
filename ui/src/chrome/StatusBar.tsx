@@ -145,6 +145,20 @@ const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.
 /** Shown until a real readout exists, and the value the pending title keys off. */
 const CLAUDE_PLACEHOLDER = 'claude · —'
 
+/**
+ * The same two for a codex console (M93): no statusline, so the readout is read off the
+ * session's rollout once a turn has been taken — until then there is nothing to read.
+ */
+export const CODEX_PLACEHOLDER = 'codex · —'
+const CODEX_PENDING = 'Session readout arrives from the codex rollout after the first turn.'
+
+/** The slot's tooltip: which CLI the readout is about, or why it is still empty. */
+function sessionTitle(readout: string): string {
+  if (readout === CLAUDE_PLACEHOLDER) return CLAUDE_PENDING
+  if (readout === CODEX_PLACEHOLDER) return CODEX_PENDING
+  return readout.startsWith('codex') ? 'Codex session' : 'Claude session'
+}
+
 /** The crumb half of the readout, which is the half that goes through React state. */
 type Crumbs = Pick<ReadoutLine, 'trail' | 'pathCount' | 'file'>
 
@@ -393,7 +407,7 @@ export function StatusBar({
         <span className={styles.readout} ref={readoutRef} data-audit="editorReadout" />
         <span
           className={`${styles.claude} ${styles.stat}`}
-          title={claude === CLAUDE_PLACEHOLDER ? CLAUDE_PENDING : 'Claude session'}
+          title={sessionTitle(claude)}
         >
           <Icon name="message-square" size={1} />
           {claude}

@@ -512,7 +512,7 @@ try {
     'a drop is a CUT into the destination, sent through the one transfer path',
   )
   ok(
-    /void planEntries\(project, transfer\.sources, transfer\.destDir, transfer\.mode\)[\s\S]{0,400}?setPendingPaste\(\{ transfer, ask: startAsk\(collisions\) \}\)/.test(
+    /void planEntries\(project, transfer\.sources, transfer\.destDir, transfer\.mode(, transfer\.from)?\)[\s\S]{0,400}?setPendingPaste\(\{ transfer, ask: startAsk\(collisions\) \}\)/.test(
       tree,
     ),
     'and it is PLANNED first, so a collision raises `PasteConfirm` instead of overwriting — the '

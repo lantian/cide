@@ -47,6 +47,16 @@ pub struct Settings {
     /// [`clamp_ui_font_size`].
     pub ui_font_size: f32,
 
+    /// The brand colour every accent token is drawn in — primary buttons, focus rings, the
+    /// active tab, the awaiting counter. `None` is the shipped red, and it is `None` rather than
+    /// `Some(red)` on purpose: the default is `tokens.css`'s hand-picked literals, which a
+    /// derived palette only approximates, so "never touched" must stay distinguishable from
+    /// "picked red" or every existing install would repaint on upgrade.
+    ///
+    /// Written only by `cmd::settings` through `cide_core::accent::fit`, never from the patch
+    /// verbatim — see [`Accent`].
+    pub accent: Option<Accent>,
+
     /// "Each project keeps its own Claude tab — pinned, cannot be closed, only its panes
     /// can." Off would mean a project with no console tab, which the rest of the model
     /// does not currently allow; the toggle exists in the mock and is honoured as
@@ -126,6 +136,10 @@ pub struct Settings {
 
     /// How a phone reaches this cide, and whether one may. (M72)
     pub remote: RemoteSettings,
+
+    /// Whether cide asks GitHub for a newer release on start, and which one the user said to
+    /// stop mentioning. (`cide-app`'s `updater` module)
+    pub update: UpdateSettings,
 }
 
 impl Default for Settings {
@@ -134,6 +148,7 @@ impl Default for Settings {
             window_mode: WindowMode::default(),
             theme: Theme::default(),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
+            accent: None,
             each_project_keeps_claude_tab: true,
             reopen_last_project: true,
             keep_sessions_on_window_close: true,
@@ -152,8 +167,30 @@ impl Default for Settings {
             git: GitSettings::default(),
             llm: crate::llm::LlmSettings::default(),
             remote: RemoteSettings::default(),
+            update: UpdateSettings::default(),
         }
     }
+}
+
+/// A user-chosen accent, as `cide_core::accent::fit` left it: the colour picked and the two
+/// variants the themes actually draw. All three are `#rrggbb`.
+///
+/// The variants are stored rather than recomputed on read because the first frame needs them:
+/// `windows.rs` bakes `light` and `dark` into each window's URL and `public/theme-boot.js` writes
+/// them before anything paints, with no arithmetic of its own. Recomputing on load would also let
+/// a later change to the fit silently repaint a colour somebody chose — `scheme.rs`'s rule for
+/// imported schemes, for the same reason. Re-picking is how a user opts into a better fit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Accent {
+    /// What the user picked. Shown in the picker; drawn nowhere.
+    pub base: String,
+    /// Legible on the light theme's panel, and under a white label — so it is also the *ink*
+    /// fill (`--grad-accent-ink`) in both themes, as the shipped red's is.
+    pub light: String,
+    /// Legible on the dark theme's panel.
+    pub dark: String,
 }
 
 /// What the file tree walks, and therefore what it draws. (M18)
@@ -1419,6 +1456,41 @@ pub struct RemoteSettings {
     /// "everyone" are different decisions, and a single toggle that quietly meant the second
     /// would be the kind of default nobody chose.
     pub allow_non_private: bool,
+}
+
+/// The self-update check.
+///
+/// **On by default**, which is why this has a hand-written `Default` rather than a derived one:
+/// a derived `bool` is `false`, and an update check nobody knew to turn on is one nobody gets.
+/// An existing `workspace.json` has no `update` key at all, and `serde(default)` fills it from
+/// this impl — so an upgraded install checks too, which is the point of shipping the feature.
+///
+/// What it costs is one HTTPS request per start to GitHub's release download host, from the
+/// backend only (the webview's CSP never allows it). A build that cannot update — a `-dev`
+/// version, a debug build — never makes the request whatever this says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct UpdateSettings {
+    /// Ask once, a few seconds after the windows are up.
+    pub check_on_start: bool,
+    /// The version the user answered *Skip this version* for. Only that exact version is
+    /// silenced: the next release is newer than it and is announced as usual, so a skip can
+    /// never turn into "never update" without anyone deciding that. A manual *Check for
+    /// updates* ignores it — asking is the user overriding their own skip.
+    ///
+    /// A string rather than a parsed version: it is compared against what the release manifest
+    /// said, verbatim, and a value this build cannot parse must still round-trip untouched.
+    pub skipped_version: Option<String>,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_on_start: true,
+            skipped_version: None,
+        }
+    }
 }
 
 /// Which addresses the remote listener answers on.

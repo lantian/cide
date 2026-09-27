@@ -96,6 +96,7 @@ try {
     isStruck,
     joinModelId,
     modelsFor,
+    entryModelChoices,
     CODEX_PLUGIN,
     CODEX_PROVIDER_ID,
     apiKeyOf,
@@ -212,14 +213,24 @@ try {
 
   // ---------------------------------------------------------------- one joiner, one splitter
   eq(
-    entryFlags({ provider: 'openrouter', model: 'deepseek/deepseek-chat', variant: '' }),
+    entryFlags({ provider: 'openrouter', model: 'deepseek/deepseek-chat', variant: '' }, false),
     ['--model', 'openrouter/deepseek/deepseek-chat'],
     'entryFlags joins the two halves and omits a blank variant',
   )
   eq(
-    entryFlags({ provider: 'openai', model: 'gpt-5.1-codex-max', variant: 'xhigh' }),
+    entryFlags({ provider: 'openai', model: 'gpt-5.1-codex-max', variant: 'xhigh' }, false),
     ['--model', 'openai/gpt-5.1-codex-max', '--variant', 'xhigh'],
-    'and spells the variant as its own flag',
+    'and spells the variant as its own flag on opencode 1',
+  )
+  eq(
+    entryFlags({ provider: 'o3', model: 'Qwen-Coder', variant: 'xhigh' }, true),
+    ['--model', 'o3/Qwen-Coder#xhigh'],
+    'and inside the id on opencode 2, which has no --variant (t-1090)',
+  )
+  eq(
+    entryFlags({ provider: 'o3', model: 'Qwen-Coder#low', variant: 'xhigh' }, true),
+    ['--model', 'o3/Qwen-Coder#low'],
+    'an id that already names a variant keeps it, as model_args does',
   )
   for (const flag of ['"--model"', '"--variant"']) {
     ok(emitted.includes(flag), `${flag} is the spelling the harness uses`)
@@ -508,10 +519,65 @@ try {
     'modelsFor returns the right halves under one provider, slashes and all',
   )
   eq(modelsFor('nobody', lines), [], 'and nothing for a provider the probe never saw')
+  // A pool entry's model is chosen from what its provider declares, not typed.
+  const declaring = [
+    {
+      kind: 'custom',
+      id: 'o3',
+      label: '',
+      enabled: true,
+      npm: '',
+      baseUrl: '',
+      apiKey: '',
+      models: [
+        { id: 'AgentLLM-big', label: '', context: 0, output: 0 },
+        { id: 'Qwen-Coder', label: '', context: 0, output: 0 },
+        { id: '', label: '', context: 0, output: 0 },
+      ],
+    },
+    { kind: 'catalog', id: 'openrouter', label: '', enabled: true, apiKey: '' },
+  ]
+  const choices = (provider, model) =>
+    entryModelChoices({ provider, model, variant: '' }, declaring, lines)
+  eq(
+    choices('o3', 'Qwen-Coder'),
+    [
+      { model: 'AgentLLM-big', listed: true },
+      { model: 'Qwen-Coder', listed: true },
+    ],
+    'a custom provider offers the models its card declares, skipping a blank row',
+  )
+  eq(
+    entryModelChoices(
+      { provider: 'o3', model: '', variant: '' },
+      declaring,
+      [...lines, 'o3/Qwen-Coder', 'o3/from-opencode-json'],
+    ).map((c) => c.model),
+    ['AgentLLM-big', 'Qwen-Coder'],
+    'and only those: a model the user\'s own opencode.json declares is not an input (t-1090)',
+  )
+  eq(
+    choices('o3', 'gone'),
+    [
+      { model: 'AgentLLM-big', listed: true },
+      { model: 'Qwen-Coder', listed: true },
+      { model: 'gone', listed: false },
+    ],
+    'and still shows the entry\'s own model, marked, when the provider no longer declares it',
+  )
+  eq(
+    choices('openrouter', '').map((c) => c.model),
+    ['deepseek/deepseek-chat', 'anthropic/claude-sonnet-4-5'],
+    'a catalog provider declares nothing in cide, so the probe\'s list stands in',
+  )
+  eq(choices('nobody', ''), [], 'and an unknown provider offers nothing')
+  const pickerSource = shipping(section)
   ok(
-    /aria-label="Pick a model"/.test(section),
-    'a pool entry offers a picker beside the box — the ids the probe reported, with the box still ' +
-      'typable for one it has not',
+    /aria-label="Entry model"/.test(pickerSource) &&
+      /entryModelChoices\(/.test(pickerSource) &&
+      !/aria-label="Pick a model"/.test(pickerSource),
+    'a pool entry\'s model is one dropdown over entryModelChoices — no free-text box, no empty ' +
+      'chevron beside it',
   )
   ok(
     /aria-label="Display name"/.test(section) || /Display name/.test(section),

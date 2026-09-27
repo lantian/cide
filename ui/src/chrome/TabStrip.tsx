@@ -59,6 +59,8 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
+import { useRunningInTab } from '@/panes/running'
+import { runningBadge, runningHint } from '@/panes/runningRule'
 import { cancelResizeSettle, whenResizeSettles } from '@/layout/resizeGesture'
 import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { overflowEntries, tabMenuEntries } from './menuModel'
@@ -73,6 +75,12 @@ export interface TabStripProps {
   // `readonly`: the shell hands in a filtered view (`windows/windowTabs.ts`), and the strip
   // has no business mutating the list either way.
   tabs: readonly Tab[]
+  /**
+   * The project these tabs belong to, so a console tab can ask Rust how many of its consoles are
+   * mid-turn (M115). Optional because the chrome audit's handler-free strip has no project, and
+   * a strip with none draws no spinner rather than guessing.
+   */
+  project?: string | undefined
   activeTab: TabId
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
@@ -149,6 +157,7 @@ export interface TabStripProps {
 
 export function TabStrip({
   tabs,
+  project,
   activeTab,
   onActivate,
   onClose,
@@ -373,6 +382,7 @@ export function TabStrip({
           <TabItem
             key={tab.id}
             tab={tab}
+            project={project}
             active={tab.id === activeTab}
             onActivate={onActivate}
             onClose={onClose}
@@ -438,6 +448,7 @@ export function TabStrip({
 
 interface TabItemProps {
   tab: Tab
+  project: string | undefined
   active: boolean
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
@@ -449,7 +460,16 @@ interface TabItemProps {
   inFlight: boolean
 }
 
-function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }: TabItemProps) {
+function TabItem({
+  tab,
+  project,
+  active,
+  onActivate,
+  onClose,
+  onPick,
+  dragged,
+  inFlight,
+}: TabItemProps) {
   const view = viewFor(tab.kind, consoleName(tab))
   const shell = active ? `${styles.tab} ${styles.tabActive}` : styles.tab
   const label = view.closable ? styles.label : `${styles.label} ${styles.labelPinned}`
@@ -460,6 +480,21 @@ function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }
   const waiting = useAwaitingInTab(tab)
   const badge = awaitingBadge(waiting)
   const hint = awaitingHint(waiting, 'tab')
+
+  // The other half of a console tab's three states: turning while a turn runs, the awaiting chip
+  // once it ends unseen, plain once looked at. Rust's per-tab count (`ProjectRunning::tabs`), which
+  // counts only `Busy` sessions so the two chips never describe one session. Asked of console
+  // tabs alone: no other kind hosts a Claude-kind pane, so any other tab reads 0 from an empty key.
+  const isConsole = tab.kind.kind === 'claudeHome' || tab.kind.kind === 'claudeFull'
+  const turning = useRunningInTab(isConsole ? (project ?? '') : '', tab.id)
+  // The pinned grid always spells its figure, like the header's chip: "how many are working in
+  // there" is its question. A closable console tab is usually one console, where a `1` beside a
+  // turning mark says nothing the mark does not; it shows the figure only once a split has put
+  // two to work.
+  const figure = tab.kind.kind === 'claudeHome' || turning > 1 ? runningBadge(turning) : ''
+  const runningState = turning <= 0 ? 'false' : figure === '' ? 'bare' : figure
+  const busyHint = runningHint(0, turning, 'tab')
+  const tooltip = [view.hint, busyHint, hint].filter(Boolean).join(' — ')
 
   return (
     // `presentation` so the row does not sit between the tablist and its tabs: an
@@ -473,6 +508,7 @@ function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }
       data-tab-id={tab.id}
       data-active={active ? 'true' : 'false'}
       data-awaiting={waiting > 0 ? String(waiting) : 'false'}
+      data-running={runningState}
       // The press that may become a reorder. On the row rather than on the label button, so a
       // grab anywhere in the tab's box starts it — the same "one box the pointer can hit
       // anywhere" contract the label's negative margins exist to preserve.
@@ -487,7 +523,7 @@ function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }
         // The marker cannot carry its own tooltip — it is `pointer-events: none` so the tab
         // stays one box the pointer can hit anywhere — so the tab's own tooltip carries the
         // sentence, and the exact count that `9+` stops spelling out.
-        title={hint ? `${view.hint} — ${hint}` : view.hint}
+        title={tooltip}
         // Guarded by the drag, because `click` fires after `pointerup` and a drop would
         // otherwise *also* activate the tab it just moved. Harmless-looking and not: dropping a
         // background tab into a new position would yank the user out of whatever they were
@@ -499,6 +535,17 @@ function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }
       >
         {view.body}
       </button>
+      {/*
+       * Rendered only while lit, unlike the awaiting marker below: it carries no live region, so
+       * there is nothing that must exist before its content does, and a dark strip then animates
+       * nothing. The tooltip sentence is on the label, as the awaiting chip's is.
+       */}
+      {turning > 0 && (
+        <span className={styles.running} aria-hidden="true">
+          <Icon name="loader-circle" size={0} className={styles.runningSpin} />
+          {figure}
+        </span>
+      )}
       {/*
        * Always rendered, filled only when it means something. Rendered always because the
        * live region below has to exist before its content arrives to be announced; *sized*

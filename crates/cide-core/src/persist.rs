@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cide_ipc::{Project, RecentProject, ViewPosition, Workspace};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1310,7 +1310,13 @@ fn temp_path(path: &Path) -> PathBuf {
 }
 
 /// `fsync` a directory, the Unix way of making a rename within it durable.
-fn sync_dir(dir: &Path) -> Result<()> {
+///
+/// `pub` since M117, for the atomic writers elsewhere that stopped at the rename — the editor's
+/// save, `cide-git`'s sidecars (the shelf among them), GitLab's drafts. Without it the file's
+/// *bytes* are durable and its *name* may not be: after a power cut the directory can still
+/// point at the old file, and a shelved patch whose rename was lost exists nowhere once the
+/// working tree has been rolled back.
+pub fn sync_dir(dir: &Path) -> Result<()> {
     Ok(File::open(dir)?.sync_all()?)
 }
 
@@ -1344,6 +1350,38 @@ pub fn quarantine(path: &Path) {
             %error,
             "could not move the unusable file aside"
         ),
+    }
+}
+
+/// Read a small JSON state file that is rewritten whole on every change, moving an unparseable
+/// one aside first. (M117)
+///
+/// For the stores that used to read with `.ok().and_then(from_slice).unwrap_or_default()` — the
+/// milestone gates, the proposal queue. That spelling reads a corrupt file as empty, and the
+/// next save then replaces it: the one copy of whatever it held, gone, with nothing but a
+/// missing list in the UI to say so. Now the bytes survive as `<stem>.corrupt-<n>.<ext>` beside
+/// it, where [`quarantine`] puts a broken `workspace.json`.
+///
+/// Absent is the ordinary first run and answers the default silently. A read that fails for
+/// another reason (EACCES, EIO) is logged and **not** quarantined — `load_report`'s policy: the
+/// bytes may be fine, and moving a file this process merely could not read is not ours to do.
+/// The caller's next save still replaces it, as before; that half is unchanged.
+pub fn read_or_quarantine<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return T::default(),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not read a state file");
+            return T::default();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "a state file did not parse");
+            quarantine(path);
+            T::default()
+        }
     }
 }
 
@@ -1388,32 +1426,85 @@ fn file_name_or(path: &Path, fallback: &str) -> String {
 /// It owns no thread and no timer; the caller polls it from whatever loop it already has.
 /// A timer here would mean an async runtime in the domain crate, which `cide-headless`
 /// links without one.
+///
+/// # Two kinds of change
+///
+/// [`Self::note_change`] is the debounced kind: a write is owed `delay` after the burst began.
+/// It is right for what changes often and costs nothing to lose — which pane has focus, where
+/// a splitter sits, a scroll position.
+///
+/// [`Self::note_urgent`] is for what the next launch cannot do without — a task comment, a new
+/// tab, a pane's conversation, a setting. It makes the write due **now** and wakes a flusher
+/// parked in [`Self::wait`]. The write still happens on that flusher's thread and not on the
+/// caller's, which matters twice over: the callers include sync Tauri commands, which run on
+/// the GTK main thread, where two fsyncs would stall the UI; and a single writer per store is
+/// what keeps two concurrent saves from landing in the wrong order. Changes that arrive while
+/// the write is in flight start a fresh burst and are written straight after, so a burst of
+/// urgent changes still coalesces into as many writes as the disk can take, not one per change.
+///
+/// Before this existed everything waited out the debounce, and a power cut in that window lost
+/// the comment a subagent had just been told was written.
 #[derive(Debug)]
 pub struct Debouncer {
     delay: Duration,
+    burst: Mutex<Burst>,
+    /// Signalled by [`Self::note_urgent`]; waited on by [`Self::wait`].
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Burst {
     /// When the current burst started, or `None` when nothing is pending.
     ///
     /// Measured from the *first* change of the burst rather than the most recent, so a user
     /// who keeps typing still gets a write every `delay` instead of none until they stop.
-    started: Mutex<Option<Instant>>,
+    started: Option<Instant>,
+    /// Whether anything in the burst was urgent — then the write is due whatever `started` says.
+    /// A flag rather than a back-dated `started`, because `Instant::now() - delay` is a panic in
+    /// the first `delay` of a machine's uptime on some platforms.
+    urgent: bool,
+}
+
+impl Burst {
+    fn due(&self, delay: Duration) -> bool {
+        match self.started {
+            Some(started) => self.urgent || started.elapsed() >= delay,
+            None => false,
+        }
+    }
 }
 
 impl Debouncer {
-    pub fn new(delay: Duration) -> Self {
+    /// `const` so a crate with several stores and one flusher can keep a shared one in a
+    /// `static` — see `cide_tasks::wait_for_urgent`.
+    pub const fn new(delay: Duration) -> Self {
         Self {
             delay,
-            started: Mutex::new(None),
+            burst: Mutex::new(Burst {
+                started: None,
+                urgent: false,
+            }),
+            wake: Condvar::new(),
         }
     }
 
-    /// Record that the workspace changed and a write is owed.
+    /// Record that the state changed and a write is owed after the debounce.
     pub fn note_change(&self) {
-        self.started.lock().get_or_insert_with(Instant::now);
+        self.burst.lock().started.get_or_insert_with(Instant::now);
+    }
+
+    /// Record a change the next launch needs, and make the write due now. See the type's doc.
+    pub fn note_urgent(&self) {
+        let mut burst = self.burst.lock();
+        burst.started.get_or_insert_with(Instant::now);
+        burst.urgent = true;
+        drop(burst);
+        self.wake.notify_all();
     }
 
     /// Whether a write is owed and its delay has elapsed. Does not clear.
     pub fn due(&self) -> bool {
-        matches!(*self.started.lock(), Some(started) if started.elapsed() >= self.delay)
+        self.burst.lock().due(self.delay)
     }
 
     /// [`Self::due`], clearing the pending flag when it answers true.
@@ -1424,13 +1515,22 @@ impl Debouncer {
     /// fails owns the retry — call [`Self::note_change`] again, or the change waits on disk
     /// for the next unrelated mutation.
     pub fn take(&self) -> bool {
-        let mut started = self.started.lock();
-        match *started {
-            Some(at) if at.elapsed() >= self.delay => {
-                *started = None;
-                true
-            }
-            _ => false,
+        let mut burst = self.burst.lock();
+        if burst.due(self.delay) {
+            *burst = Burst::default();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Park the calling flusher until a write may be due: at once when one already is, as soon
+    /// as [`Self::note_urgent`] is called, and otherwise after `poll` — the debounced kind is
+    /// still found by polling, which is what bounds its latency to `delay + poll`.
+    pub fn wait(&self, poll: Duration) {
+        let mut burst = self.burst.lock();
+        if !burst.due(self.delay) {
+            self.wake.wait_for(&mut burst, poll);
         }
     }
 }
@@ -4092,6 +4192,86 @@ mod tests {
         }
 
         assert!(debouncer.take());
+    }
+
+    /// What the next launch needs is due at once, not after the debounce — and taking it clears
+    /// the urgency with the burst, so the next ordinary change waits as it always did.
+    #[test]
+    fn an_urgent_change_is_due_at_once_and_only_once() {
+        let debouncer = Debouncer::new(Duration::from_secs(30));
+        debouncer.note_change();
+        assert!(!debouncer.due());
+        debouncer.note_urgent();
+        assert!(debouncer.due(), "an urgent change inside a debounced burst");
+        assert!(debouncer.take());
+
+        debouncer.note_change();
+        assert!(
+            !debouncer.due(),
+            "the urgency went with the burst it belonged to"
+        );
+    }
+
+    /// A parked flusher is woken by an urgent change rather than finding it at its next poll —
+    /// the whole difference between "a few milliseconds" and "up to a poll" of exposure.
+    #[test]
+    fn an_urgent_change_wakes_a_parked_flusher() {
+        let debouncer = std::sync::Arc::new(Debouncer::new(Duration::from_secs(30)));
+        let flusher = {
+            let debouncer = std::sync::Arc::clone(&debouncer);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                debouncer.wait(Duration::from_secs(20));
+                (started.elapsed(), debouncer.take())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        debouncer.note_urgent();
+        let (waited, took) = flusher.join().expect("the flusher");
+        assert!(took, "woken with a write due");
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited out the poll: {waited:?}"
+        );
+    }
+
+    /// And one that is already due does not wait at all.
+    #[test]
+    fn waiting_with_a_write_due_returns_at_once() {
+        let debouncer = Debouncer::new(Duration::from_secs(30));
+        debouncer.note_urgent();
+        let started = Instant::now();
+        debouncer.wait(Duration::from_secs(20));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A corrupt whole-file store is moved aside, not read as empty and saved over; an absent
+    /// one is the default, silently. (M117)
+    #[test]
+    fn an_unparseable_state_file_is_quarantined_and_an_absent_one_is_default() {
+        let dir = std::env::temp_dir().join(format!("cide-roq-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("gates.json");
+
+        let absent: std::collections::BTreeMap<String, u32> = read_or_quarantine(&path);
+        assert!(absent.is_empty());
+        assert!(!dir.join("gates.corrupt-1.json").exists());
+
+        fs::write(&path, b"{\"half\": ").expect("plant");
+        let read: std::collections::BTreeMap<String, u32> = read_or_quarantine(&path);
+        assert!(read.is_empty());
+        assert!(!path.exists(), "left in place for the next save to replace");
+        assert_eq!(
+            fs::read(dir.join("gates.corrupt-1.json")).expect("moved aside"),
+            b"{\"half\": "
+        );
+
+        fs::write(&path, br#"{"a": 1}"#).expect("plant");
+        let read: std::collections::BTreeMap<String, u32> = read_or_quarantine(&path);
+        assert_eq!(read.get("a"), Some(&1));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

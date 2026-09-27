@@ -36,9 +36,15 @@
 }
 
 /* Selected wins over hover, so the accent does not drop back to --text on pointer-over. */
-/* The current panel: the kit's icon toggle "on", the accent on a 12% accent wash. */
-.itemActive,
-.itemActive:hover {
+/* The current panel: the kit's icon toggle "on", the accent on a 12% accent wash.
+ *
+ * `.item.itemActive`, not `.itemActive`, and the doubled class is the fix for a lost highlight:
+ * `composes` from another file makes Vite emit a second copy of `Chrome.module.css`, and that copy
+ * lands *after* this sheet. At equal specificity its `.railButton { background: transparent;
+ * color: inherit }` (and its `:hover`) then won, and no rail button looked current after the
+ * redesign. Two classes outrank one whatever order the sheets load in. */
+.item.itemActive,
+.item.itemActive:hover {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
 }

@@ -201,6 +201,16 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
+    // And the rename itself, or a power cut can leave the directory naming the *old* file
+    // under a save the editor already reported done. Logged rather than returned: the new
+    // file is in place, and failing a save whose bytes are published would have the user
+    // retry a write that succeeded. The target's parent, not the link's — the rename
+    // happened in the canonical directory. (M117)
+    if let Some(dir) = target.parent()
+        && let Err(error) = crate::persist::sync_dir(dir)
+    {
+        tracing::warn!(path = %target.display(), %error, "saved, but could not fsync its directory");
+    }
     Ok(())
 }
 

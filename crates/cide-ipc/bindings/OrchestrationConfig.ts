@@ -97,4 +97,14 @@ isolateEnvShare: Array<string>,
 /**
  * `agents.verifyExclusive`: whether the project's verifies run one at a time.
  */
-verifyExclusive: boolean, };
+verifyExclusive: boolean, 
+/**
+ * `agents.verifyRetries`: how many red verifies in a row go straight back to the run before
+ * the reviewer takes over. The stored number. (M114)
+ */
+verifyRetries: number, 
+/**
+ * `agents.resumeAfterRestart`: whether runs a cide restart interrupted continue by
+ * themselves at the next launch. (M118)
+ */
+resumeAfterRestart: boolean, };

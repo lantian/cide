@@ -617,6 +617,74 @@
 
 }
 
+/*
+ * The user's accent (Settings → Appearance → Accent colour), re-deriving every accent-family
+ * token above from two colours.
+ *
+ * `--accent-l` and `--accent-d` are written inline on <html> — by `public/theme-boot.js` before
+ * the first frame, then by `useSettings.ts`'s `paintAccent` — together with
+ * `data-accent="custom"`. They are `cide_core::accent::fit`'s output, not the colour picked:
+ * `-l` clears 4.5:1 on the light panel *and* under a white label, `-d` clears 4.5:1 on the dark
+ * panel. So everything here is arithmetic on colours already known to be legible, and this file
+ * does no contrast work of its own.
+ *
+ * **Why the defaults above are not rewritten in terms of these.** The shipped red's tokens are
+ * hand-picked (`--accent-dim`, `--sel`, the gradient stops are not exact mixes of `--accent`),
+ * and deriving them would repaint every existing install slightly on upgrade. With no custom
+ * accent, this block does not match and the cascade is exactly what it was.
+ *
+ * **What is deliberately absent.** `--red` and `--grad-red` are *failure*, a status, and stay red
+ * whatever the brand is; `--grad-danger` is black, which is why the fit refuses black. The editor's
+ * `--tk-*` belong to the colour scheme, which has its own picker. `check:accent` fails if one of
+ * those appears here, or if an accent token above has no line here — a new accent token that
+ * forgot this block would stay red under a blue accent, silently.
+ *
+ * `in srgb` for every mix, as in the 54 component washes: `color-mix()` itself was probed on this
+ * app's WebKitGTK (`check-css-prefix.mjs`), the interpolation spaces were not.
+ *
+ * Specificity: the light block is (0,2,0) so it beats the plain `[data-theme]` blocks; the dark
+ * one is (0,3,0) so it beats the light one.
+ */
+:root[data-accent='custom'] {
+  --accent: var(--accent-l);
+  --accent-hi: color-mix(in srgb, var(--accent-l) 78%, black);
+  --accent-dim: color-mix(in srgb, var(--accent-l) 25%, var(--panel));
+  --sel: color-mix(in srgb, var(--accent-l) 12%, var(--panel));
+  --grad-from: color-mix(in srgb, var(--accent-l) 85%, white);
+  --grad-to: color-mix(in srgb, var(--accent-l) 85%, black);
+  --grad-accent-ink: linear-gradient(
+    135deg,
+    var(--accent-l) 0%,
+    color-mix(in srgb, var(--accent-l) 85%, black) 100%
+  );
+  --grad-accent-soft: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent-l) 10%, transparent) 0%,
+    color-mix(in srgb, var(--accent-l) 5%, transparent) 100%
+  );
+}
+
+:root[data-accent='custom'][data-theme='dark'] {
+  --accent: var(--accent-d);
+  --accent-hi: color-mix(in srgb, var(--accent-d) 70%, white);
+  --accent-dim: color-mix(in srgb, var(--accent-d) 35%, var(--panel));
+  --sel: color-mix(in srgb, var(--accent-d) 18%, var(--panel));
+  --grad-from: var(--accent-d);
+  --grad-to: var(--accent-l);
+  /* From `-l`, not `-d`, in the dark theme too: this fill carries a white label, and `-l` is the
+     variant measured against white. The shipped red's ink is likewise one gradient in both. */
+  --grad-accent-ink: linear-gradient(
+    135deg,
+    var(--accent-l) 0%,
+    color-mix(in srgb, var(--accent-l) 85%, black) 100%
+  );
+  --grad-accent-soft: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent-d) 16%, transparent) 0%,
+    color-mix(in srgb, var(--accent-d) 8%, transparent) 100%
+  );
+}
+
 :root {
   /*
    * Fonts are bundled locally in M3. The CSP has no external host in `font-src`, so a

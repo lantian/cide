@@ -4,6 +4,7 @@ import { Icon } from '@/icons/Icon'
 import {
   Checkbox,
   ChoiceCards,
+  ColorSwatches,
   RadioGroup,
   Segmented,
   Switch,
@@ -20,6 +21,8 @@ export function Choices(): ReactElement {
   const [view, setView] = useState<'unified' | 'split'>('unified')
   const [kind, setKind] = useState<'empty' | 'clone' | 'template'>('clone')
   const [git, setGit] = useState(true)
+  const [colour, setColour] = useState<string | null>(null)
+  const [tone, setTone] = useState<string | null>('#7c3aed')
   return (
     <Chapter
       id="choices"
@@ -191,6 +194,54 @@ export function Choices(): ReactElement {
           />
         </Stack>
       </Specimen>
+
+      <Specimen
+        name="Colour swatches"
+        source="Choice.tsx › ColorSwatches"
+        use={
+          <>
+            One colour: hand-picked presets, a Custom swatch that opens the system colour dialog,
+            and a hex field — the accent picker in Settings → Appearance. Commits when the dialog
+            closes or the field is left, never per drag. A refusal from the caller is shown under
+            the row in <code>--red</code>.
+          </>
+        }
+        ground="panel"
+        spec={[
+          ['swatch', '22px, --r-full, 1px --border, --fill-sheen'],
+          ['chosen', '2px --text-hi ring, 2px out; a white check'],
+          ['custom', 'dashed --border, plus in --dim; the picked colour once chosen'],
+          ['error', '--fs-ui-11, --red'],
+        ]}
+      >
+        <Cell label="a default among presets" grow>
+          <ColorSwatches
+            label="Accent colour"
+            value={colour}
+            onChange={setColour}
+            defaultColor="#dc1f2b"
+            presets={SPECIMEN_PRESETS}
+          />
+        </Cell>
+        <Cell label="refused" grow>
+          <ColorSwatches
+            label="Accent colour, refused"
+            value={tone}
+            onChange={setTone}
+            defaultColor="#dc1f2b"
+            presets={SPECIMEN_PRESETS}
+            error="Too close to black — black is reserved for destructive actions."
+          />
+        </Cell>
+      </Specimen>
     </Chapter>
   )
 }
+
+const SPECIMEN_PRESETS = [
+  { value: null, label: 'Red (default)' },
+  { value: '#2563eb', label: 'Blue' },
+  { value: '#7c3aed', label: 'Violet' },
+  { value: '#0d9488', label: 'Teal' },
+  { value: '#16a34a', label: 'Green' },
+]

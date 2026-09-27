@@ -170,7 +170,9 @@ impl TasksStores {
                     tracing::info!(swept, "removed stale staged attachments");
                 }
                 loop {
-                    thread::sleep(POLL);
+                    // Parked rather than asleep: a task edit wakes this at once (M117), so a
+                    // comment is on disk a write after it was made, not a debounce after.
+                    cide_tasks::wait_for_urgent(POLL);
                     stores.tick(&app);
                 }
             })

@@ -584,6 +584,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             extras: Vec::new(),
+            sandbox: Default::default(),
         }
     }
 
@@ -616,6 +617,9 @@ mod tests {
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
             server: None,
+            git_dirs: Vec::new(),
+            sandbox_brief: None,
+            codex_trust_root: None,
         }
     }
 

@@ -967,12 +967,12 @@ try {
   const cancelButton = before('data-audit="confirmDestructiveCancel"', 260)
   ok(runButton !== '', 'the destructive button is still identifiable')
   ok(
-    runButton.includes("variant={confirmDefault ? 'primary' : danger ? 'danger' : 'secondary'}"),
-    'the accent reaches the confirm button ONLY behind `confirmDefault`. This one variant is ' +
-      'rule 3 in the DOM: for every destructive caller the prominent button has to be Cancel, ' +
-      'or a reflexive Enter performs the destruction — and where a caller did declare the act ' +
-      'reversible, the accent displaces the red, because an act safe enough to confirm by ' +
-      'reflex has no claim on the colour that means "this destroys work"',
+    runButton.includes("variant={danger ? 'danger' : confirmDefault ? 'primary' : 'secondary'}"),
+    'the confirm button wears the danger fill whenever the act removes something — including ' +
+      "the file tree's trash move, which is the default there but must still look like a " +
+      'removal — and the accent reaches it ONLY behind `confirmDefault` for a choice that ' +
+      'risks nothing. For every other destructive caller Cancel stays the default, so a ' +
+      'reflexive Enter backs out',
   )
   ok(
     cancelButton.includes("variant={confirmDefault ? 'secondary' : 'primary'}"),

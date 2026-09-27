@@ -78,6 +78,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(sidecar_err(path, e));
     }
+    // The rename made durable too, which is what the shelf's "the patch is on disk before the
+    // working tree is rolled back" actually needs: `sync_all` above covers the bytes, and
+    // without this a power cut could still leave the directory without the name — a shelved
+    // change that exists nowhere. An error here is returned, unlike the editor's save: every
+    // caller of this is about to act on the write having landed. (M117)
+    cide_core::persist::sync_dir(dir).map_err(|e| sidecar_err(dir, e))?;
     Ok(())
 }
 

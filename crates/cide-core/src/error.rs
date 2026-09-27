@@ -108,6 +108,11 @@ pub enum CoreError {
     #[error("{path} changed on disk since it was opened")]
     FileChanged { path: String },
 
+    /// A picked accent colour `crate::accent::fit` would not take — black (reserved for the
+    /// danger fill), a grey, a near-white, or not a colour at all. The detail is the sentence
+    /// Settings shows under the picker, so the frontend has nothing to phrase.
+    #[error("{0}")]
+    AccentRefused(String),
     #[error("{0}")]
     Io(String),
 

@@ -476,7 +476,18 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // And the rename, or a power cut can leave the directory naming the old file — a device
+    // paired a moment before it would be forgotten. Inline for the reason the doc above gives:
+    // `persist::sync_dir` is in the crate this one keeps out of its graph. Best-effort: the
+    // new file is in place either way. (M117)
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all())
+    {
+        tracing::warn!(%error, "saved, but could not fsync the directory");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

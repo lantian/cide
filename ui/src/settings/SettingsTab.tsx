@@ -154,7 +154,6 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
    */
   const configuredProviders = JSON.stringify(settings?.llm.providers ?? null)
   const [opencodeModels, setOpencodeModels] = useState<AgentModels | null>(null)
-  const [modelsNonce, setModelsNonce] = useState(0)
   useEffect(() => {
     if (settings === undefined) return
     let live = true
@@ -182,8 +181,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     return () => {
       live = false
     }
-  }, [project, configuredProviders, modelsNonce, settings === undefined])
-  const recheckModels = useCallback(() => setModelsNonce((n) => n + 1), [])
+  }, [project, configuredProviders, settings === undefined])
   /**
    * One real turn against one model, for the Models screen's Test buttons.
    *
@@ -191,7 +189,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
    * else, so a provider edit must not give the buttons a new identity mid-test.
    */
   const testModel = useCallback(
-    (model: string) => agentDefs.testModel(project, model),
+    (model: string, variant?: string) => agentDefs.testModel(project, model, variant),
     [project],
   )
   /** A custom model's limits from its server, for the Models screen's auto-fill. (M88) */
@@ -287,7 +285,6 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               openLogDir: revealLogDir,
               logDir,
               opencodeModels,
-              recheckModels,
               testModel,
               probeLimits,
             })

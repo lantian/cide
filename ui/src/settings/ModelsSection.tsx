@@ -31,7 +31,7 @@
 import { Select } from '@/kit/components/Select'
 import { IconButton } from '@/kit/components/Button'
 import { Badge } from '@/kit/components/Status'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 
 import { Icon } from '@/icons'
 import type {
@@ -42,7 +42,7 @@ import type {
   SettingsPatch,
 } from '@/ipc/generated'
 
-import { ActionButton, Group, Note, Row, TextField, ToggleRow } from './controls'
+import { ActionButton, Group, Note, TextField, ToggleRow } from './controls'
 import controls from './controls.module.css'
 import {
   CODEX_PLUGIN_SETUP,
@@ -51,17 +51,16 @@ import {
   VARIANT_SUGGESTIONS,
   blankProvider,
   entryFlags,
+  entryModelChoices,
   isEnabled,
   isStruck,
   joinModelId,
   judgeEntry,
   localProblems,
-  modelsFor,
   moveDown,
   moveUp,
   poolCapacity,
   removeAt,
-  splitModelId,
   withMaxRunning,
   type Entry,
   type Model,
@@ -81,12 +80,11 @@ export interface ModelsSectionProps {
   /** What `opencode models` reported, with cide's own document injected. `null` before it lands. */
   models: AgentModels | null
   /** Run the probe again, after a key or an endpoint changed. */
-  recheckModels: () => void
   /**
    * Try one `provider/model` for real. Spends a very small amount of quota, so it is only ever
    * wired to a button — never to a keystroke or a mount.
    */
-  testModel: (model: string) => Promise<LlmModelTest | null>
+  testModel: (model: string, variant?: string) => Promise<LlmModelTest | null>
   /** A custom model's limits from its server. Free; see `ModelRows`. (M88) */
   probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>
 }
@@ -95,7 +93,6 @@ export function ModelsSection({
   settings,
   patch,
   models,
-  recheckModels,
   testModel,
   probeLimits,
 }: ModelsSectionProps) {
@@ -119,19 +116,6 @@ export function ModelsSection({
       return next
     })
   }, [])
-
-  /** The provider ids the probe actually saw, so a row can say whether it works. */
-  const seen = useMemo(() => {
-    const byProvider = new Map<string, string[]>()
-    for (const line of models?.models ?? []) {
-      const split = splitModelId(line)
-      if (split === null) continue
-      const list = byProvider.get(split.provider) ?? []
-      list.push(split.model)
-      byProvider.set(split.provider, list)
-    }
-    return byProvider
-  }, [models])
 
   const setProvider = (index: number, next: Provider) =>
     write({ ...settings, providers: providers.map((p, i) => (i === index ? next : p)) })
@@ -168,8 +152,6 @@ export function ModelsSection({
           <ProviderCard
             key={`${provider.kind}-${index}`}
             provider={provider}
-            offered={seen.get(provider.id) ?? null}
-            probed={models !== null}
             open={openProviders.has(index)}
             onToggle={() => toggleProvider(index)}
             onChange={(next) => setProvider(index, next)}
@@ -217,6 +199,8 @@ export function ModelsSection({
             pool={pool}
             providers={providers}
             offered={models?.models ?? []}
+            variantInModel={models?.variantInModel ?? false}
+            testModel={testModel}
             onChange={(next) => setPool(index, next)}
             onRemove={() => write({ ...settings, pools: removeAt(pools, index) })}
           />
@@ -234,38 +218,6 @@ export function ModelsSection({
         </div>
       </Group>
 
-      <Group title="What opencode sees">
-        <Row
-          label="Check the providers"
-          hint={
-            'Runs `opencode models` with the configuration cide would give a run, so this list is ' +
-            'exactly what a pool entry can reach. A provider missing from it is one opencode ' +
-            'could not load — a wrong key, an endpoint that is not running, or a plugin that is ' +
-            'not installed.'
-          }
-          control={<ActionButton label="Re-check" onClick={recheckModels} />}
-        />
-        {models?.problem != null && (
-          <Note title="That check did not answer" tone="warn">
-            {models.problem}
-          </Note>
-        )}
-        {models !== null && models.problem == null && (
-          <div className={styles.readout}>
-            {models.models.length === 0 ? (
-              <span className={styles.readoutLine}>
-                opencode listed no models at all on this machine.
-              </span>
-            ) : (
-              models.models.map((line) => (
-                <span key={line} className={styles.readoutLine}>
-                  {line}
-                </span>
-              ))
-            )}
-          </div>
-        )}
-      </Group>
     </>
   )
 }
@@ -295,8 +247,6 @@ function addLabel(kind: ProviderKind): string {
  */
 function ProviderCard({
   provider,
-  offered,
-  probed,
   open,
   onToggle,
   onChange,
@@ -305,13 +255,11 @@ function ProviderCard({
   probeLimits,
 }: {
   provider: Provider
-  offered: readonly string[] | null
-  probed: boolean
   open: boolean
   onToggle: () => void
   onChange: (next: Provider) => void
   onRemove: () => void
-  testModel: (model: string) => Promise<LlmModelTest | null>
+  testModel: (model: string, variant?: string) => Promise<LlmModelTest | null>
   probeLimits: (provider: string, model: string) => Promise<LlmLimitsProbe | null>
 }) {
   const problems = localProblems(provider)
@@ -333,13 +281,6 @@ function ProviderCard({
             {provider.label === '' ? provider.id || 'New provider' : provider.label}
           </span>
         </button>
-        {/* Drawn collapsed as well as open: whether a provider works is the one thing worth
-            seeing without unfolding anything. */}
-        {probed && provider.id !== '' && (
-          <Badge tone={offered === null ? 'red' : 'green'} soft>
-            {offered === null ? 'not answering' : `${offered.length}`}
-          </Badge>
-        )}
         <Badge tone="neutral" soft squared>
           {provider.kind}
         </Badge>
@@ -383,23 +324,18 @@ function ProviderCard({
           {problem}
         </p>
       ))}
-      {probed && provider.id !== '' && (
-        <p className={offered === null ? styles.verdictBad : styles.verdictOk}>
-          {offered === null
-            ? verdictMiss(provider)
-            : `opencode offers ${offered.length} model${offered.length === 1 ? '' : 's'} under this id.`}
-        </p>
-      )}
       {/*
-       * A per-model test, for every kind — including the ones cide does not configure. Listing an
-       * id proves opencode *resolved* it; it does not prove a key is right, that an endpoint will
-       * answer a completion, that a model has not been retired, or that a plugin's OAuth is still
-       * good. Each of those lists perfectly and fails on the first token.
+       * A per-model test over the models **this card declares** — cide's providers are the whole
+       * configuration a run gets, so what opencode would list from the user's own opencode.json
+       * is not this screen's business (t-1090: the user asked for "opencode offers N models" and
+       * "What opencode sees" to go, for exactly that reason). A declared id proves nothing on its
+       * own: a wrong key, an endpoint that will not answer a completion and a retired model each
+       * fail on the first token, which is what the button finds out.
        */}
-      {(offered ?? []).length > 0 && (
+      {declaredModels(provider).length > 0 && (
         <TestableModels
           provider={provider.id}
-          models={offered ?? []}
+          models={declaredModels(provider)}
           testModel={testModel}
         />
       )}
@@ -423,7 +359,7 @@ function TestableModels({
 }: {
   provider: string
   models: readonly string[]
-  testModel: (model: string) => Promise<LlmModelTest | null>
+  testModel: (model: string, variant?: string) => Promise<LlmModelTest | null>
 }) {
   const [results, setResults] = useState<Record<string, LlmModelTest | 'running'>>({})
   const run = (model: string) => {
@@ -568,19 +504,15 @@ function providerBody(
 }
 
 /** The sentence for a provider the probe did not see, which differs by what cide could do about it. */
-function verdictMiss(provider: Provider): string {
-  switch (provider.kind) {
-    case 'catalog':
-      return 'opencode listed no models under this id. Either the key is wrong, or it is not in your environment and the box above is empty.'
-    case 'custom':
-      return 'opencode listed no models under this id. Check the base URL is reachable and the npm package is right.'
-    case 'external':
-      return 'Not visible yet. Follow the steps above, then re-check.'
-    default: {
-      const unreachable: never = provider
-      return unreachable
-    }
+/** The model ids a provider's card declares — none for a kind that stores no model list. */
+function declaredModels(provider: Provider): string[] {
+  if (provider.kind !== 'custom') return []
+  const ids: string[] = []
+  for (const model of provider.models) {
+    const id = model.id.trim()
+    if (id !== '' && !ids.includes(id)) ids.push(id)
   }
+  return ids
 }
 
 /**
@@ -741,6 +673,8 @@ function PoolCard({
   pool,
   providers,
   offered,
+  variantInModel,
+  testModel,
   onChange,
   onRemove,
 }: {
@@ -748,12 +682,43 @@ function PoolCard({
   providers: readonly Provider[]
   /** Every `provider/model` the probe reported, so an entry can be picked rather than typed. */
   offered: readonly string[]
+  /** How the installed CLI spells an effort variant — see `entryFlags`. */
+  variantInModel: boolean
+  testModel: (model: string, variant?: string) => Promise<LlmModelTest | null>
   onChange: (next: Pool) => void
   onRemove: () => void
 }) {
   const entries = pool.entries as Entry[]
   const set = (index: number, next: Entry) =>
     onChange({ ...pool, entries: entries.map((e, i) => (i === index ? next : e)) })
+
+  /**
+   * "Check entries": one real turn per entry, **with the entry's variant**, so a check passes
+   * exactly when a run falling to that entry would start. The per-model Test on a provider card
+   * cannot say that: it tries the bare model, and t-1090 died on `o3/Qwen-Coder#xhigh` — a model
+   * that answered perfectly on its own and was refused the moment the pool's variant was added.
+   *
+   * Keyed by what was checked (`checkKey`), not by row index: an entry edited, moved or removed
+   * while a check is in flight must not have the old answer drawn against it. One at a time, as
+   * `TestableModels` does — each check is a `--standalone` opencode, and six at once would be six
+   * servers booting for a button press.
+   */
+  const [checks, setChecks] = useState<Record<string, LlmModelTest | 'running'>>({})
+  const [checking, setChecking] = useState(false)
+  const checkAll = async () => {
+    setChecking(true)
+    const due = entries.filter((entry) => !isStruck(judgeEntry(entry, providers)))
+    setChecks(Object.fromEntries(due.map((entry) => [checkKey(entry), 'running' as const])))
+    for (const entry of due) {
+      const id = joinModelId(entry.provider, entry.model)
+      const answer = await testModel(id, entry.variant)
+      setChecks((prev) => ({
+        ...prev,
+        [checkKey(entry)]: answer ?? { model: id, ok: false, detail: 'This build has no model test.' },
+      }))
+    }
+    setChecking(false)
+  }
   return (
     <div className={styles.card}>
       <div className={styles.cardHead}>
@@ -778,109 +743,144 @@ function PoolCard({
         onCommit={(description) => onChange({ ...pool, description })}
       />
 
-      {entries.map((entry, index) => {
-        const verdict = judgeEntry(entry, providers)
-        return (
-          <div
-            key={index}
-            className={isStruck(verdict) ? `${styles.entry} ${styles.entryDead}` : styles.entry}
+      {/*
+       * One grid for the heading and every entry, rather than a flex row per entry: with each
+       * field `flex: 1` the provider, the model and the variant split the row in thirds, and the
+       * model box — the one field whose value is long — lost its third to the picker beside it
+       * and was drawn one character wide. Nothing said what the columns were, either; a
+       * "(default)" box and a bare number read as noise without the heading.
+       */}
+      {entries.length > 0 && (
+        <div className={styles.entries}>
+          <span />
+          <span className={styles.entryHead}>Provider</span>
+          <span className={styles.entryHead}>Model</span>
+          <span
+            className={styles.entryHead}
+            title="Reasoning effort, e.g. high or xhigh. Blank is the model's default."
           >
-            <span className={styles.entryOrdinal}>{index + 1}</span>
-            <span className={styles.entrySelect}>
-              <Select
-                size="sm"
-                aria-label="Entry provider"
-                value={entry.provider === '' ? null : entry.provider}
-                placeholder="(pick a provider)"
-                onChange={(provider) => set(index, { ...entry, provider })}
-                options={[
-                  // A provider the entry names but that no longer exists still has to be
-                  // displayable, or the row reads as empty over a value that is really there.
-                  ...(providers.every((p) => p.id !== entry.provider) && entry.provider !== ''
-                    ? [{ value: entry.provider, label: entry.provider }]
-                    : []),
-                  ...providers.map((p) => ({
-                    value: p.id,
-                    label: p.id,
-                    detail: isEnabled(p) ? undefined : 'off',
-                  })),
-                ]}
-              />
-            </span>
-            {/*
-             * A picker *and* a box, the shape `AgentsSection`'s ModelField already uses: the menu
-             * is what this machine actually reports, and the box stays typable because a model
-             * opencode has not listed — one behind a plugin whose OAuth has lapsed, one added
-             * since the last probe — is still a model a run can be pointed at.
-             */}
-            <div className={styles.combo}>
-              <input
-                className={styles.entryField}
-                aria-label="Entry model"
-                placeholder="deepseek/deepseek-chat"
-                value={entry.model}
-                onChange={(e) => set(index, { ...entry, model: e.target.value })}
-              />
-              <span className={styles.comboPick}>
-                <Select
-                  size="sm"
-                  aria-label="Pick a model"
-                  value={null}
-                  placeholder="Pick…"
-                  onChange={(model) => set(index, { ...entry, model })}
-                  options={modelsFor(entry.provider, offered).map((model) => ({
-                    value: model,
-                    label: model,
-                  }))}
+            Effort
+          </span>
+          <span
+            className={styles.entryHead}
+            title="How many runs may use this model at once, across every project. Blank is no limit."
+          >
+            At once
+          </span>
+          <span className={styles.entryHeadRest} />
+          {entries.map((entry, index) => {
+            const verdict = judgeEntry(entry, providers)
+            return (
+              <div
+                key={index}
+                className={isStruck(verdict) ? `${styles.entry} ${styles.entryDead}` : styles.entry}
+              >
+                <span className={styles.entryOrdinal}>{index + 1}</span>
+                <span className={styles.entrySelect}>
+                  <Select
+                    size="sm"
+                    aria-label="Entry provider"
+                    value={entry.provider === '' ? null : entry.provider}
+                    placeholder="(pick a provider)"
+                    onChange={(provider) => {
+                      // A model belongs to its provider: carried across, it would name something
+                      // the new provider does not declare and dispatch to nothing.
+                      const next = { ...entry, provider }
+                      const keep = entryModelChoices(next, providers, offered).some(
+                        (c) => c.listed && c.model === entry.model,
+                      )
+                      set(index, keep ? next : { ...next, model: '' })
+                    }}
+                    options={[
+                      // A provider the entry names but that no longer exists still has to be
+                      // displayable, or the row reads as empty over a value that is really there.
+                      ...(providers.every((p) => p.id !== entry.provider) && entry.provider !== ''
+                        ? [{ value: entry.provider, label: entry.provider }]
+                        : []),
+                      ...providers.map((p) => ({
+                        value: p.id,
+                        label: p.id,
+                        detail: isEnabled(p) ? undefined : 'off',
+                      })),
+                    ]}
+                  />
+                </span>
+                {/*
+                 * A dropdown alone, over the models the provider declares (`entryModelChoices`).
+                 * This was a free-text box with a chevron beside it fed only by the opencode probe:
+                 * the chevron was usually empty, and the box took any string, so a typo became a
+                 * pool entry that dispatched to nothing. A model the provider does not have yet is
+                 * added on the provider's card first, which is also what opencode needs to reach it.
+                 */}
+                <span className={styles.entrySelect}>
+                  <Select
+                    size="sm"
+                    aria-label="Entry model"
+                    value={entry.model === '' ? null : entry.model}
+                    disabled={entry.provider === ''}
+                    placeholder={
+                      entry.provider === ''
+                        ? '(pick a provider first)'
+                        : entryModelChoices(entry, providers, offered).length === 0
+                          ? '(this provider declares no models)'
+                          : '(pick a model)'
+                    }
+                    onChange={(model) => set(index, { ...entry, model })}
+                    options={entryModelChoices(entry, providers, offered).map((c) => ({
+                      value: c.model,
+                      label: c.model,
+                      detail: c.listed ? undefined : 'not declared',
+                    }))}
+                  />
+                </span>
+                <input
+                  className={styles.entryField}
+                  aria-label="Entry effort"
+                  list={VARIANT_LIST}
+                  placeholder="(default)"
+                  value={entry.variant}
+                  onChange={(e) => set(index, { ...entry, variant: e.target.value })}
                 />
-              </span>
-            </div>
-            <input
-              className={styles.entryField}
-              aria-label="Entry variant"
-              list={VARIANT_LIST}
-              placeholder="(default)"
-              value={entry.variant}
-              onChange={(e) => set(index, { ...entry, variant: e.target.value })}
-            />
-            {/*
-             * The entry's running limit. Blank is no limit. A run starts on the first entry
-             * with room, and waits in the queue when every one is full — so this is how a
-             * subscription that allows four sessions is kept from being asked for a fifth.
-             */}
-            <input
-              className={`${styles.entryField} ${styles.entryLimit}`}
-              aria-label="Entry max running"
-              title="How many runs may use this model at once, across every project. Blank is no limit."
-              type="number"
-              min={1}
-              step={1}
-              placeholder="no limit"
-              value={entry.maxRunning ?? ''}
-              onChange={(e) => set(index, withMaxRunning(entry, e.target.value))}
-            />
-            {/* Buttons rather than drag: keyboard-reachable, and the move logic is a pure
-                function `check:pools` drives. `check:ui-icons` forbids a Unicode arrow. */}
-            <IconButton
-              icon="arrow-up"
-              label="Move entry up"
-              disabled={index === 0}
-              onClick={() => onChange({ ...pool, entries: moveUp(entries, index) })}
-            />
-            <IconButton
-              icon="arrow-down"
-              label="Move entry down"
-              disabled={index === entries.length - 1}
-              onClick={() => onChange({ ...pool, entries: moveDown(entries, index) })}
-            />
-            <IconButton
-              icon="x"
-              label="Remove entry"
-              onClick={() => onChange({ ...pool, entries: removeAt(entries, index) })}
-            />
-          </div>
-        )
-      })}
+                {/*
+                 * The entry's running limit. Blank is no limit. A run starts on the first entry
+                 * with room, and waits in the queue when every one is full — so this is how a
+                 * subscription that allows four sessions is kept from being asked for a fifth.
+                 */}
+                <input
+                  className={`${styles.entryField} ${styles.entryLimit}`}
+                  aria-label="Entry max running"
+                  title="How many runs may use this model at once, across every project. Blank is no limit."
+                  type="number"
+                  min={1}
+                  step={1}
+                  placeholder="no limit"
+                  value={entry.maxRunning ?? ''}
+                  onChange={(e) => set(index, withMaxRunning(entry, e.target.value))}
+                />
+                {/* Buttons rather than drag: keyboard-reachable, and the move logic is a pure
+                    function `check:pools` drives. `check:ui-icons` forbids a Unicode arrow. */}
+                <IconButton
+                  icon="arrow-up"
+                  label="Move entry up"
+                  disabled={index === 0}
+                  onClick={() => onChange({ ...pool, entries: moveUp(entries, index) })}
+                />
+                <IconButton
+                  icon="arrow-down"
+                  label="Move entry down"
+                  disabled={index === entries.length - 1}
+                  onClick={() => onChange({ ...pool, entries: moveDown(entries, index) })}
+                />
+                <IconButton
+                  icon="x"
+                  label="Remove entry"
+                  onClick={() => onChange({ ...pool, entries: removeAt(entries, index) })}
+                />
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       <div className={styles.actions}>
         <ActionButton
@@ -889,7 +889,18 @@ function PoolCard({
             onChange({ ...pool, entries: [...entries, { provider: '', model: '', variant: '' }] })
           }
         />
+        <ActionButton
+          label={checking ? 'Checking…' : 'Check entries'}
+          disabled={checking || entries.every((entry) => isStruck(judgeEntry(entry, providers)))}
+          onClick={() => void checkAll()}
+        />
       </div>
+      {entries.length > 0 && (
+        <p className={styles.modelHead}>
+          Check entries sends one very small prompt to each entry, at its effort, which spends a
+          little of each provider&rsquo;s quota.
+        </p>
+      )}
 
       {entries.length > 0 && (
         <div className={styles.readout}>
@@ -907,12 +918,13 @@ function PoolCard({
                 {index + 1}{'  '}
                 {verdict === 'incomplete'
                   ? '(pick a provider and a model)'
-                  : entryFlags(entry).join(' ')}
+                  : entryFlags(entry, variantInModel).join(' ')}
                 {verdict === 'unknownProvider' && '   ← no such provider'}
                 {verdict === 'disabledProvider' && '   ← provider switched off'}
                 {verdict !== 'incomplete' &&
                   entry.maxRunning !== undefined &&
                   `   (up to ${entry.maxRunning} at once)`}
+                <CheckVerdict check={checks[checkKey(entry)]} />
               </span>
             )
           })}
@@ -924,5 +936,21 @@ function PoolCard({
         </div>
       )}
     </div>
+  )
+}
+
+/** What a pool entry's check is keyed by: everything the checked argv was made of. */
+function checkKey(entry: Entry): string {
+  return `${entry.provider}\u0000${entry.model}\u0000${entry.variant.trim()}`
+}
+
+/** One entry's "Check entries" answer, on its readout line. */
+function CheckVerdict({ check }: { check: LlmModelTest | 'running' | undefined }) {
+  if (check === undefined) return null
+  if (check === 'running') return <span className={styles.checkRunning}>   checking…</span>
+  return (
+    <span className={check.ok ? styles.checkOk : styles.checkBad}>
+      {check.ok ? '   answers' : `   fails: ${check.detail}`}
+    </span>
   )
 }

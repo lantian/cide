@@ -77,6 +77,9 @@ export type AgentFieldKey =
   | 'tools'
   | 'permissionMode'
   | 'maxConcurrent'
+  | 'allowCommands'
+  | 'needs'
+  | 'writableDirs'
   | 'systemPrompt'
   | 'extras'
 
@@ -113,6 +116,14 @@ export interface Draft {
   tools: string[]
   permissionMode: string | null
   maxConcurrent: number | null
+  /**
+   * The role's sandbox grant (M119) — `allow-commands:`, `needs:`, `writable-dirs:`. Carried
+   * whole on every save, drawn or not: `defs::render` writes only what the draft holds, so a key
+   * this form dropped would be deleted from the file by the next Save.
+   */
+  allowCommands: string[]
+  needs: SandboxNeedName[]
+  writableDirs: string[]
   systemPrompt: string
   /**
    * Every front-matter key cide does not model, in the order the file had them.
@@ -155,8 +166,37 @@ export const SCOPES: readonly Scope[] = [
   'claudeGlobal',
 ]
 
+/** `cide_ipc::SandboxNeed`. */
+export type SandboxNeedName = 'display' | 'audio' | 'network'
+
+/**
+ * `cide_ipc::SandboxNeed::ALL`, in its order, each with the words the form draws beside its box.
+ * On codex any of them turns the sandbox's network on — its filter refuses unix sockets exactly
+ * when the network is off — which the hint says rather than lets a user find out.
+ */
+export const SANDBOX_NEEDS: readonly { need: SandboxNeedName; label: string; hint: string }[] = [
+  { need: 'display', label: 'Display', hint: 'An Xvfb of its own, GL on llvmpipe — e2e captures.' },
+  { need: 'audio', label: 'Audio', hint: 'PulseAudio — Blender and Godot open it even headless.' },
+  { need: 'network', label: 'Network', hint: 'The network itself.' },
+]
+
 /** `cide_ipc::Harness`, as a set. Pinned to the Rust enum by the check script. */
 export const HARNESSES: readonly HarnessName[] = ['claude', 'opencode', 'qwen', 'codex', 'mimo']
+
+/**
+ * Whether a run on this harness takes a model pool — the twin of Rust's
+ * `Harness::reads_provider_document`, which answers `true` for opencode and its fork mimo only.
+ *
+ * On any other harness `cide_agents::overrides::resolve` leaves a named pool *inert*: not
+ * refused, just never applied, so a pool picked in the override table for a claude row would
+ * look configured and change nothing. One producer here for the same reason there is one in
+ * Rust: a second opencode-shaped CLI is added in one place rather than missed in several.
+ * `null`/absent ("leave as committed") is `false` — the override cannot promise what harness
+ * the committed file names, and the project-wide row has no single committed harness at all.
+ */
+export function takesPool(harness: HarnessName | null | undefined): boolean {
+  return harness === 'opencode' || harness === 'mimo'
+}
 
 /**
  * `cide_agents::defs::PERMISSION_MODES`, in that module's order.
@@ -357,6 +397,9 @@ export const AGENT_FIELDS: readonly AgentFieldKey[] = [
   'tools',
   'permissionMode',
   'maxConcurrent',
+  'allowCommands',
+  'needs',
+  'writableDirs',
   'systemPrompt',
   'extras',
 ]
@@ -387,6 +430,9 @@ export function blankDraft(scope: Scope): Draft {
     tools: [],
     permissionMode: null,
     maxConcurrent: null,
+    allowCommands: [],
+    needs: [],
+    writableDirs: [],
     systemPrompt: '',
     extras: [],
   }
@@ -470,6 +516,9 @@ function signature(draft: Draft): string {
     draft.tools,
     draft.permissionMode,
     draft.maxConcurrent,
+    draft.allowCommands,
+    draft.needs,
+    draft.writableDirs,
     draft.systemPrompt,
     // Included, or editing a `hooks:` block and clicking away would cost no confirm and the edit
     // would be gone. `JSON.stringify` over an array of objects compares order as well as
@@ -1037,6 +1086,9 @@ export interface WireDraft {
   tools: string[]
   permissionMode?: string
   maxConcurrent?: number
+  allowCommands: string[]
+  needs: SandboxNeedName[]
+  writableDirs: string[]
   systemPrompt: string
   extras: Extra[]
 }
@@ -1062,6 +1114,11 @@ export function toWire(draft: Draft): WireDraft {
     name: draft.name.trim(),
     description: draft.description.trim(),
     tools: draft.tools.map((tool) => tool.trim()).filter((tool) => tool !== ''),
+    // Sent whole and always, for `extras`' reason below: `Vec` on the Rust side, and a save
+    // without them would be a save that deleted them. (M119)
+    allowCommands: draft.allowCommands.map((line) => line.trim()).filter((line) => line !== ''),
+    needs: [...draft.needs],
+    writableDirs: draft.writableDirs.map((line) => line.trim()).filter((line) => line !== ''),
     systemPrompt: draft.systemPrompt,
     // Sent whole and always, empty list included: `extras` is `Vec` and not `Option`, and a save
     // that omitted it would deserialise as "this file has no unmodelled keys" — which is how a
@@ -1103,6 +1160,10 @@ export function fromWire(wire: WireDraft): Draft {
     tools: [...wire.tools],
     permissionMode: wire.permissionMode ?? null,
     maxConcurrent: wire.maxConcurrent ?? null,
+    // `?? []`: a cached draft from before M119 has none of the three.
+    allowCommands: [...(wire.allowCommands ?? [])],
+    needs: [...(wire.needs ?? [])],
+    writableDirs: [...(wire.writableDirs ?? [])],
     systemPrompt: wire.systemPrompt,
     extras: wire.extras.map((extra) => ({ ...extra })),
   }

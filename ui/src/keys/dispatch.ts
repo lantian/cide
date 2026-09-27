@@ -77,6 +77,7 @@ import { openFileProperties } from '@/chrome/filePropertiesOpen'
 import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { notify, notifyFailure } from '@/chrome/notices'
+import { checkForUpdates } from '@/chrome/updates'
 import { beginGitOp } from '@/chrome/gitOpStore'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
 import { openTerminalFind } from '@/terminal/findStore'
@@ -2135,6 +2136,16 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           return unmet(command, 'no shell window with a project open')
         }
         useOverlays.getState().toggle('about')
+        return
+      }
+      case 'help.checkForUpdates': {
+        // Mirrors the `shellWindow` clause for the reason `help.about` mirrors its own: the
+        // clause gates the palette and the keyboard, never a direct call, and only a shell window
+        // draws the update notices this answers with.
+        if (boot()?.role.kind !== 'shell') {
+          return unmet(command, 'no shell window')
+        }
+        checkForUpdates().catch((reason: unknown) => notifyFailure(reason, { project: null }))
         return
       }
 

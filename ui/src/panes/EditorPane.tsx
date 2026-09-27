@@ -90,6 +90,7 @@ import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { useWorkspace } from '@/store/workspace'
 import { visible, type DiagnosticFilters } from '@/sidebar/ProblemsPanel/model'
 import { AUTOSAVE_CEILING_MS, AUTOSAVE_IDLE_MS, shouldAutosave } from '@/editor/autosave'
+import { backupDelays, restoreDecision } from '@/editor/hotExit'
 import { describe, notify } from '@/chrome/notices'
 import { contextMenuOpen } from '@/menus/menuState'
 import { overlayOpen } from '@/overlays/store'
@@ -149,7 +150,14 @@ function levelOf(
 /** What the pane is currently showing instead of, or as well as, a buffer. */
 type Load =
   | { kind: 'loading' }
-  | { kind: 'ready'; text: string; writable: boolean; at: FileView | null }
+  | {
+      kind: 'ready'
+      text: string
+      writable: boolean
+      at: FileView | null
+      /** An unsaved buffer an earlier run kept, put over `text` as the view is built. (M117) */
+      recovered?: string | undefined
+    }
   | { kind: 'failed'; why: string }
 
 /**
@@ -348,6 +356,91 @@ export function EditorPane({
   const openedPath = useRef(path)
   /** Whether the load in flight is a retarget whose buffer must not be replaced. See below. */
   const carriedRef = useRef(false)
+
+  /*
+   * Hot exit: the dirty buffer, kept in the state directory so a crash does not take it. (M117)
+   *
+   * `editor/hotExit.ts` decides *when* — a moment after the typing pauses, never per keystroke —
+   * and `cide_core::buffers` says why at all. The pane is where it lives because this is where
+   * the three facts meet: the reader (`readTextRef`), the dirty flag, and the stamp the kept text
+   * was typed against.
+   *
+   * Every write and clear goes through one promise chain, and that is correctness rather than
+   * tidiness: a snapshot still in flight when a save's clear is sent would otherwise land *after*
+   * it and leave the pre-save text behind, which the next launch would offer back over the file
+   * the user saved.
+   */
+  const backupChain = useRef<Promise<unknown>>(Promise.resolve())
+  /** The path a snapshot currently exists for, or `null`. */
+  const backedUpRef = useRef<string | null>(null)
+  const backupQuiet = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const backupCeiling = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** Characters in the last text this pane read whole — the load, then each snapshot. */
+  const backupSize = useRef(0)
+  const queueBackup = useCallback((op: () => Promise<unknown>) => {
+    backupChain.current = backupChain.current.then(op).catch((error: unknown) => {
+      void diag.log(`hot exit: ${String(error)}`)
+    })
+  }, [])
+  const cancelBackup = useCallback(() => {
+    if (backupQuiet.current !== null) clearTimeout(backupQuiet.current)
+    if (backupCeiling.current !== null) clearTimeout(backupCeiling.current)
+    backupQuiet.current = null
+    backupCeiling.current = null
+  }, [])
+  const forgetBackup = useCallback(() => {
+    cancelBackup()
+    const kept = backedUpRef.current
+    if (kept === null) return
+    backedUpRef.current = null
+    queueBackup(() => fileApi.backupClear(kept))
+  }, [cancelBackup, queueBackup])
+  const snapshotNow = useCallback(() => {
+    cancelBackup()
+    // Only a dirty buffer: a clean one is the file, and the file is already on disk.
+    if (!dirtyRef.current) return
+    const text = readTextRef.current?.()
+    if (text === undefined) return
+    backupSize.current = text.length
+    const stale = backedUpRef.current
+    backedUpRef.current = path
+    const base = stampRef.current
+    queueBackup(async () => {
+      // A rename moved the buffer to a new name; the old name's snapshot must not outlive it.
+      if (stale !== null && stale !== path) await fileApi.backupClear(stale)
+      await fileApi.backupWrite(path, text, base)
+    })
+  }, [cancelBackup, path, queueBackup])
+  const scheduleBackup = useCallback(
+    (chars: number) => {
+      const { quiet, ceiling } = backupDelays(chars)
+      if (backupQuiet.current !== null) clearTimeout(backupQuiet.current)
+      backupQuiet.current = quiet === null ? null : setTimeout(snapshotNow, quiet)
+      if (backupCeiling.current === null) backupCeiling.current = setTimeout(snapshotNow, ceiling)
+    },
+    [snapshotNow],
+  )
+  /*
+   * Leaving: stop the timers, and forget the snapshot only if the *tab* is gone. A pane unmounts
+   * for other reasons too — a tab torn out into a window, re-docked — and the buffer lives on in
+   * the new mount; only a closed tab (saved, or closed with Discard) has nothing left to keep. A
+   * quit never reaches here at all, which is the case this feature is for.
+   */
+  useEffect(
+    () => () => {
+      cancelBackup()
+      const kept = backedUpRef.current
+      if (kept === null || project === undefined || tab === undefined) return
+      const open = (useWorkspace.getState().boot?.workspace.projects[project]?.tabs ?? []).some(
+        (t) => t.id === tab,
+      )
+      if (!open) {
+        backedUpRef.current = null
+        queueBackup(() => fileApi.backupClear(kept))
+      }
+    },
+    [cancelBackup, project, queueBackup, tab],
+  )
 
   /*
    * The markdown preview's three wires, and none of them is a prop that changes per keystroke.
@@ -748,6 +841,8 @@ export function EditorPane({
     (dirty: boolean) => {
       if (dirtyRef.current === dirty) return
       dirtyRef.current = dirty
+      // Clean again — saved, undone back to the file, reloaded: nothing left to keep. (M117)
+      if (!dirty) forgetBackup()
       /*
        * Offer — or withdraw — this buffer's text for the next blame. (M18)
        *
@@ -771,7 +866,7 @@ export function EditorPane({
       // is why nothing here waits for the round trip.
       void fileApi.setDirty(project, tab, dirty).catch(() => {})
     },
-    [path, project, tab],
+    [forgetBackup, path, project, tab],
   )
 
   /*
@@ -916,9 +1011,17 @@ export function EditorPane({
        * use it: `EditorSurface` prefers its own live observation over this prop, which is the
        * only value that is current after the user has been scrolling. See `observedRef` there.
        */
-      void Promise.all([fileApi.read(path), fileApi.position(path).catch(() => null)])
-        .then(([doc, at]) => {
+      /*
+       * The kept buffer, on a first load only (M117). A reload from disk (`bump`) is the user
+       * asking for the file, and a carried rename already has its buffer on screen.
+       */
+      const keptRead =
+        bump || carried ? Promise.resolve(null) : fileApi.backupRead(path).catch(() => null)
+      void Promise.all([fileApi.read(path), fileApi.position(path).catch(() => null), keptRead])
+        .then(([doc, at, kept]) => {
           if (cancelled) return
+          const recovery = restoreDecision(kept?.text ?? null, doc.text)
+          if (recovery === 'drop') void fileApi.backupClear(path).catch(() => {})
           /*
            * A carried buffer takes the refs and nothing else.
            *
@@ -936,6 +1039,7 @@ export function EditorPane({
               kind: 'ready',
               text: doc.text,
               writable: doc.writable,
+              ...(recovery === 'restore' && kept !== null ? { recovered: kept.text } : {}),
               at:
                 at === null
                   ? null
@@ -955,7 +1059,15 @@ export function EditorPane({
             setMdView(at?.markdownView ?? 'text')
           }
           diskTextRef.current = doc.text
-          stampRef.current = doc.stamp
+          backupSize.current = doc.text.length
+          /*
+           * A recovered buffer autosaves against the stamp it was *typed* against, not the one
+           * just read: if the file moved while cide was down, the write is refused and the
+           * conflict bar asks, rather than the kept text silently replacing whatever landed.
+           */
+          stampRef.current =
+            recovery === 'restore' && kept !== null ? kept.baseStamp : doc.stamp
+          if (recovery === 'restore') backedUpRef.current = path
           writableRef.current = doc.writable
           setConflict(false)
           if (!carried) reportDirty(false)
@@ -1371,6 +1483,7 @@ export function EditorPane({
           project={project}
           onScreen={onScreen}
           doc={load.text}
+          recovered={load.recovered}
           reloadKey={reloadKey}
           readOnly={!load.writable}
           indent={indent}
@@ -1397,6 +1510,11 @@ export function EditorPane({
             // a closure over this ref rather than over `read` itself, so a blame started ten
             // minutes into an editing session gets the buffer as it is then. (M18)
             readTextRef.current = read
+            // Hot exit (M117): arm the snapshot timers. Sized by the last text actually read —
+            // the load, or the last snapshot — because measuring *this* one would be a
+            // `toString` per keystroke, the cost the timers exist to avoid. A buffer does not
+            // cross the large-buffer line in one keystroke.
+            scheduleBackup(backupSize.current)
             // The markdown preview, if there is one. A `Set` and not a single callback: a
             // detached pane and its original are two components over one path.
             for (const listener of docListeners.current) listener()

@@ -537,6 +537,14 @@ pub trait Harness: Send + Sync + 'static {
         None
     }
 
+    /// The provider's own sentence for a line [`Self::diagnose`] classified — what the pool entry
+    /// notification quotes, so the person fixing the entry reads opencode's words and not cide's
+    /// paraphrase of them. `None` for a harness that has none, like `diagnose`.
+    fn failure_detail(&self, line: &str) -> Option<String> {
+        let _ = line;
+        None
+    }
+
     /// What one output line says about this run's **token spend**. (M80)
     ///
     /// A third reading of the same stream, beside [`Self::observe`] and [`Self::diagnose`], and
@@ -564,6 +572,41 @@ pub trait Harness: Send + Sync + 'static {
         let _ = line;
         None
     }
+
+    /// When one output line says a model request **began or ended**, and on which of the CLI's
+    /// sessions. (pool stats)
+    ///
+    /// The pool card's token speed is a step's generated tokens over the step's own duration, so
+    /// the app needs both edges of a step, not just the [`Self::usage`] line that closes it. Keyed
+    /// by the CLI's session rather than the run because opencode interleaves the steps of nested
+    /// subagents into the parent's stream: pairing a finish with "the last start this run saw"
+    /// would time one subagent's step from another's start.
+    ///
+    /// Defaulted to `None` for [`Self::usage`]'s reason — a TUI cide never parses has no steps to
+    /// time — and under the same thread rule: substring test first, parse nothing on the
+    /// ordinary line.
+    fn step_clock(&self, line: &str) -> Option<StepClock> {
+        let _ = line;
+        None
+    }
+}
+
+/// One edge of one model request, as [`Harness::step_clock`] reads it off a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepClock {
+    /// The CLI's own session the step belongs to — a nested subagent's, where it is one.
+    pub session: String,
+    /// The CLI's clock on the line, where it states one. `None` makes the app time the step by
+    /// when the line arrived instead, which is late by whatever the pipe held it for.
+    pub at_unix_ms: Option<u64>,
+    pub edge: StepEdge,
+}
+
+/// Which end of a step a [`StepClock`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepEdge {
+    Start,
+    Finish,
 }
 
 /// Everything needed to describe one run's child, composed by the dispatch site.
@@ -733,6 +776,33 @@ pub struct RunPlan<'a> {
     /// `None` is every other harness, and an opencode run whose server would not come up: it
     /// runs standalone exactly as before, which is the fallback rather than a failure.
     pub server: Option<RunServer>,
+    /// The git metadata a run in a worktree writes when it commits — the checkout's own admin
+    /// directory and the common `.git` (`cide_git::worktree::GitDirs`). Empty for a run in the
+    /// project root, and for a worktree whose repository could not be opened. (M118)
+    ///
+    /// Taken as paths for [`Self::cwd`]'s reason: nothing in this crate links git. Read by the
+    /// codex harness only, whose `workspace-write` sandbox has one writable root — the checkout
+    /// — and re-binds `.git` read-only on top, so without these a sandboxed codex run cannot
+    /// `git commit`, `merge` or `rebase`. claude and opencode have no filesystem sandbox of
+    /// their own and ignore it.
+    pub git_dirs: Vec<PathBuf>,
+    /// What this run's sandbox denies it and which commands it may run past it, in words for
+    /// the run itself — appended to its brief. (M119)
+    ///
+    /// The run row and the roster said the same to a person since M118, and the runs never
+    /// heard it: t-586 planned a Blender render, t-588 and t-592 planned Xvfb captures, and each
+    /// found out by failing — t-588 twice. Decided by the caller, which is the one place that
+    /// knows the run's policy, its worktree and the role's grant together
+    /// (`cide_agents::harness::codex::sandbox_brief` for codex). `None` says nothing.
+    pub sandbox_brief: Option<String>,
+    /// The project root codex must be told is trusted, because cide wrote this run's
+    /// `allow-commands` as `<cwd>/.codex/rules/cide.rules`. (M119)
+    ///
+    /// Measured on codex 0.157.1 in a linked worktree under `.cide/worktrees/`: a project
+    /// layer's rules load only for a trusted project, and the trust codex looks up for a linked
+    /// worktree is the **main** repository's root. `None` when no rules file was written — a
+    /// role with no `allow-commands`, a run in the project root, a harness other than codex.
+    pub codex_trust_root: Option<PathBuf>,
 }
 
 /// Where a run's server listens, and the password that guards it. See [`RunPlan::server`].
@@ -952,7 +1022,7 @@ pub enum Delivery {
 
 /// Why a turn died in a way another provider might survive. (M45)
 ///
-/// Deliberately three named cases and not "an error happened". A pool exists to route *around*
+/// Deliberately five named cases and not "an error happened". A pool exists to route *around*
 /// something, and each of these is a different something a different candidate plausibly fixes;
 /// anything not on this list is a failure another candidate would repeat, and repeating it once
 /// per candidate is how a typo'd model id burns a whole pool and reports the last one's error as
@@ -967,6 +1037,20 @@ pub enum FailoverReason {
     /// The provider refused the credentials — 401, 403, or the CLI's own auth error. An expired
     /// subscription OAuth lands here, which is exactly a case another candidate survives.
     Auth,
+    /// The model does not offer the effort variant this entry asked for — opencode 2's
+    /// `Variant unavailable for o3/Qwen-Coder: xhigh`, which killed t-1090's runs a second in.
+    /// Unlike a misspelt model id, this *is* repaired by the next candidate: it is a different
+    /// model with its own variant (or none), so the typo argument above does not apply.
+    Variant,
+    /// The provider rejected the request itself: a model it does not have, a provider opencode
+    /// does not know, a request body it would not take, an operation it does not support, output
+    /// it could not parse, a content filter. This is a *configuration* problem with the entry,
+    /// and it used to end the run on the argument that a misspelt model id would otherwise burn
+    /// every candidate in the pool. The user overruled that (t-1090): a pool is a list of fallbacks,
+    /// and a broken entry is exactly what the next one is for — so the run moves on, the entry is
+    /// benched like a refused credential, and cide raises a notification naming the entry and
+    /// opencode's own sentence, which is how the typo gets fixed rather than silently skipped.
+    Rejected,
 }
 
 impl FailoverReason {
@@ -977,7 +1061,17 @@ impl FailoverReason {
             Self::RateLimited => "rate limited",
             Self::Unreachable => "unreachable",
             Self::Auth => "refused the credential",
+            Self::Variant => "refused the variant",
+            Self::Rejected => "rejected the request",
         }
+    }
+
+    /// Whether this is something wrong with the **entry** rather than with the moment — a key, an
+    /// effort, a model id — which a person has to fix and so is told about by a notification.
+    /// A rate limit or a server that is down fixes itself, and only shows on the run's row.
+    #[must_use]
+    pub fn is_configuration(self) -> bool {
+        matches!(self, Self::Auth | Self::Variant | Self::Rejected)
     }
 
     /// The wire twin, for the pool-state card. (M90)
@@ -987,6 +1081,8 @@ impl FailoverReason {
             Self::RateLimited => cide_ipc::PoolRefusal::RateLimited,
             Self::Unreachable => cide_ipc::PoolRefusal::Unreachable,
             Self::Auth => cide_ipc::PoolRefusal::Auth,
+            Self::Variant => cide_ipc::PoolRefusal::Variant,
+            Self::Rejected => cide_ipc::PoolRefusal::Rejected,
         }
     }
 
@@ -996,14 +1092,15 @@ impl FailoverReason {
     /// nobody has started yet — once it is up, a long bench would keep steering work away from
     /// the model the user put first. Longer for a rate limit, whose window is minutes by design,
     /// and longest for a refused credential, which does not fix itself: somebody has to go and
-    /// renew it. The pool-state card's Reset ends any of them the moment the user knows better,
+    /// renew it. A refused variant is a configuration fact that no amount of waiting changes, so it
+    /// is benched as long as a credential. The pool-state card's Reset ends any of them the moment the user knows better,
     /// so these only have to be right when nobody is looking.
     #[must_use]
     pub fn bench_ms(self) -> u64 {
         match self {
             Self::Unreachable => 3 * 60 * 1000,
             Self::RateLimited => 10 * 60 * 1000,
-            Self::Auth => 30 * 60 * 1000,
+            Self::Auth | Self::Variant | Self::Rejected => 30 * 60 * 1000,
         }
     }
 }
@@ -1211,6 +1308,7 @@ mod tests {
                 permission_mode: None,
                 effort: None,
                 extras: Vec::new(),
+                sandbox: Default::default(),
             };
             let spawn = |env: Vec<(String, Option<String>)>| {
                 let run = RunId::new();
@@ -1242,6 +1340,9 @@ mod tests {
                     unattended: crate::config::Unattended::Ask,
                     tracker_paragraphs: true,
                     server: None,
+                    git_dirs: Vec::new(),
+                    sandbox_brief: None,
+                    codex_trust_root: None,
                 };
                 let spec = harness
                     .spawn_spec(&plan)
@@ -1597,6 +1698,7 @@ mod tests {
                 permission_mode: None,
                 effort: None,
                 extras: Vec::new(),
+                sandbox: Default::default(),
             }
         }
 
@@ -1633,6 +1735,9 @@ mod tests {
                 unattended: crate::config::Unattended::Ask,
                 tracker_paragraphs: true,
                 server: None,
+                git_dirs: Vec::new(),
+                sandbox_brief: None,
+                codex_trust_root: None,
             }
         }
 
@@ -1663,7 +1768,16 @@ mod tests {
             .map(|(_, value)| value.clone())
             .expect("an opencode run carries one");
         let document: serde_json::Value = serde_json::from_str(&document).expect("it is json");
-        let told_by_opencode = document["agent"]["developer"]["prompt"]
+        // `agent` on opencode 1, `agents` on opencode 2 — whichever this machine's probe says the
+        // installed binary reads. Read as "either spelling" rather than pinned to one, because the
+        // claim this test makes is about the **prompt**, and it must hold on both command lines:
+        // `opencode.rs`'s own `the_v2_document_renames_the_keys_and_not_the_prompt` is the other
+        // half of that, asserting the two documents carry byte-identical briefs. (M110)
+        let role_block = match document.get("agents") {
+            Some(agents) => &agents["developer"],
+            None => &document["agent"]["developer"],
+        };
+        let told_by_opencode = role_block["prompt"]
             .as_str()
             .expect("the inline role has a prompt")
             .to_string();

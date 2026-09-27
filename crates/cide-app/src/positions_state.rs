@@ -166,6 +166,9 @@ impl PositionsState {
         let list = self.inner.lock().clone();
         if let Err(error) = persist::save_positions(&self.path, &list) {
             tracing::error!(path = %self.path.display(), %error, "failed to save view positions");
+            // Owed again: `Debouncer::take` cleared the burst before this write, so without the
+            // re-arm a failed save waited for the next scroll to be retried.
+            self.debounce.note_change();
         }
     }
 }

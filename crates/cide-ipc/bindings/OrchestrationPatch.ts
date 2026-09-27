@@ -45,4 +45,12 @@ isolateEnvShare?: Array<string>,
 /**
  * `agents.verifyExclusive`.
  */
-verifyExclusive?: boolean, };
+verifyExclusive?: boolean, 
+/**
+ * `agents.verifyRetries`, clamped by `AgentsConfig::apply`. (M114)
+ */
+verifyRetries?: number, 
+/**
+ * `agents.resumeAfterRestart`. (M118)
+ */
+resumeAfterRestart?: boolean, };

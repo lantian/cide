@@ -86,13 +86,29 @@ pub fn write(path: &Path, contents: &str) -> Result<()> {
         std::process::id()
     ));
 
-    std::fs::write(&tmp, contents).map_err(|e| FsError::io(&tmp, e))?;
+    // `sync_all` before the rename, or a crash can publish the name over bytes that never
+    // reached the disk — an empty file, which is worse than the old one the rename replaced.
+    // It was a bare `fs::write` until M117.
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(FsError::io(&tmp, err));
+    }
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(FsError::io(path, err));
+    }
+    // And the rename, for the same reason one level up. Best-effort: the file is in place.
+    if let Err(error) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(%error, "saved, but could not fsync the directory");
     }
     Ok(())
 }

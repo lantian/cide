@@ -31,6 +31,9 @@ It needs **`cargo-tauri` 2.x**. The version already installed on the reference m
 version". The preflight's old check only asked whether `cargo-tauri` existed, so it printed
 `ok` for that build; it now runs `cargo-tauri --version` and fails on a major other than 2.
 
+*(Superseded in part by M123: the updater is configured — see the addendum at the end and
+`docs/packaging.md`'s "Self-update". The paragraph below is the state at M11.)*
+
 `plugins.updater` is **not yet configured** in `crates/cide-app/tauri.conf.json`: it needs a
 signing key pair and a release endpoint, neither of which exists at M11. `cargo xtask package`
 reports this as a warning rather than a failure — an AppImage without an update endpoint is
@@ -434,3 +437,21 @@ text, which is the one thing wrong with it — see README.
   regenerates the flatpak files from the result. Nothing outside that workflow enforces the
   agreement, which is the remaining gap: `package --check` re-derives from `tauri.conf.json` and
   so cannot see the Cargo.toml half.
+
+## Addendum (M123): the updater is on
+
+`plugins.updater` now names `releases/latest/download/latest.json` on `lantian/cide`, and the
+running app checks it at start (`crates/cide-app/src/updater.rs`). Three decisions this ADR did not
+make:
+
+- **The signing flag is an argument, not config.** `bundle.createUpdaterArtifacts` in
+  `tauri.conf.json` makes `cargo tauri build` refuse on any machine without the private key, so
+  `xtask package` passes it as a `--config` only when `TAURI_SIGNING_PRIVATE_KEY` is set. Local
+  builds stay unsigned and still build.
+- **A release must be signed.** `release.yml` sets `CIDE_RELEASE`, and the preflight fails an
+  unsigned release instead of warning, for the reason the old warning could not express: an
+  unsigned release publishes no manifest, and installed copies go quiet with no error anywhere.
+- **The macOS channel is the `.app.tar.gz`**, which the bundler writes beside the `.app` when the
+  flag is on. The `.dmg` stays the first install only. The tarball, `.deb` and Flatpak still cannot
+  self-update; the app offers them the release page.
+

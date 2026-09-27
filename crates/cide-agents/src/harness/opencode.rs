@@ -1,6 +1,19 @@
-//! Running a role on the opencode CLI. (M18)
+//! Running a role on the opencode CLI. (M18, M110)
 //!
-//! Measured against opencode **1.18** on a Linux machine, not remembered. Where a paragraph below
+//! # Two command lines, one file
+//!
+//! **opencode 2.0 is a different command line wearing the same name**, and this file serves both
+//! — chosen by what is installed, never by anything a user types. [`Generation`] is that choice
+//! and carries the whole argument; [`as_v2`] is the document's half of it. The short version:
+//! `run` lost `--dir`, `--variant`, `--attach` and `--password`, gained `--standalone` and
+//! `--server`, and stopped reading `OPENCODE_CONFIG_CONTENT` unless the child owns its own
+//! server — so on 2.0 `--standalone` is the condition under which everything below this line is
+//! true at all, rather than a flag worth arguing about. MiMo Code is a fork of opencode **1** and
+//! is untouched by any of it.
+//!
+//! Everything else in this header holds on both unless it says otherwise.
+//!
+//! Measured against opencode **1.18** and **2.0.16** on a Linux machine, not remembered. Where a paragraph below
 //! says *measured*, it means a command was run or the shipped binary was read; the two facts that
 //! decided the whole shape of this file — that a whole configuration can be handed over in one
 //! environment variable, and that the inline agent's `prompt` actually reaches the model — were
@@ -73,8 +86,13 @@
 //!
 //! # The argv, and the wager this file does not have to take
 //!
+//! opencode 1:
 //! `opencode run --agent <role> [--model <provider/model>] [--variant <effort>] --format json
-//! --dir <cwd> [--session <id> | --title <label>] <message>`
+//! --dir <cwd> [--attach <url>] [--session <id> | --title <label>] <message>`
+//!
+//! opencode 2:
+//! `opencode run (--server <url> | --standalone) --agent <role> [--model <provider/model#variant>]
+//! --format json --thinking [--session <id> | --title <label>] <message>`
 //!
 //! `ClaudeHarness`'s argv order is load-bearing because a *user's* variadic flag can swallow the
 //! tokens cide adds. **There is no user argument list on this side**: `ClaudeSettings::cli` is the
@@ -90,10 +108,13 @@
 //!   argv token may contain anything. It is still written as one line by the dispatch site, and
 //!   that is worth keeping, because the *parser* has its own hazard: the message goes last, and a
 //!   message beginning with `-` would be read as a flag by the CLI's option parser.
-//! * **`--dir` and the spawn's cwd are both set, to the same directory.** The cwd is what the
-//!   child and everything it starts inherit; `--dir` is what opencode resolves the project and
-//!   the session store from. Setting only one of them gives a run whose tools and whose conversation
-//!   disagree about where the work is.
+//! * **`--dir` and the spawn's cwd are both set, to the same directory** — on opencode 1. The cwd
+//!   is what the child and everything it starts inherit; `--dir` is what opencode resolves the
+//!   project and the session store from. Setting only one of them gives a run whose tools and
+//!   whose conversation disagree about where the work is. opencode 2 removed the flag, and the
+//!   cwd is what a standalone server resolves both from — measured, `run --dir` there answers
+//!   `Unrecognized flag` and prints no JSON at all, which would leave the run mute on the only
+//!   channel it has.
 //!
 //! # The environment, and the variable that is deliberately absent
 //!
@@ -244,6 +265,14 @@ pub struct Flavor {
     /// and only for the flavour that prints it, so opencode's filter goes on refusing every
     /// line with whitespace in it — see [`is_model_id`].
     annotated_models: bool,
+    /// Which [`Generation`] this CLI is assumed to be when the probe could not run. (M110)
+    ///
+    /// The *current* release of this particular CLI — which is what [`CliFlags`]' rule
+    /// "unknown reads as the current CLI's answer" always meant. It only stopped being one
+    /// answer when opencode shipped 2.0 and MiMo did not, so it became a field here rather
+    /// than a constant there, for this struct's own stated reason: a difference that is not a
+    /// field is a difference nobody can find.
+    default_generation: Generation,
 }
 
 /// opencode itself.
@@ -255,6 +284,7 @@ pub static OPENCODE_CLI: Flavor = Flavor {
     continue_args: &[],
     failure_exits_zero: false,
     annotated_models: false,
+    default_generation: Generation::V2,
 };
 
 /// MiMo Code, the opencode fork. (M81)
@@ -266,6 +296,8 @@ pub static MIMO_CLI: Flavor = Flavor {
     continue_args: &["--trust"],
     failure_exits_zero: true,
     annotated_models: true,
+    // MiMo forked opencode 1 and has shipped nothing since; see [`Generation`].
+    default_generation: Generation::V1,
 };
 
 impl Flavor {
@@ -291,6 +323,14 @@ impl Flavor {
             .into_iter()
             .find(|flavor| cide_core::toolchain::which(flavor.program()).is_some())
             .unwrap_or(&OPENCODE_CLI)
+    }
+
+    /// Whether the installed binary takes the effort variant inside the model id
+    /// (`provider/model#variant`, opencode 2) rather than as `--variant` — for the pool
+    /// screen's readout, which must spell the argv [`model_args`] will build. **Forks** on the
+    /// first call per binary, as [`Self::probe_cli_flags`] does.
+    pub fn variant_in_model(&self) -> bool {
+        matches!(self.probe_cli_flags().generation, Generation::V2)
     }
 
     /// The binary's bare name, which is also what every sentence below calls it.
@@ -323,6 +363,48 @@ impl Flavor {
     }
 }
 
+/// Which generation of the opencode command line a binary speaks. (M110)
+///
+/// # Not a version number, and not a wire variant
+///
+/// opencode 2.0 is a different command line wearing the same name. `run` lost `--dir`,
+/// `--variant`, `--attach` and `--password`, gained `--standalone` and `--server`, and — the
+/// fact everything else follows from — **stopped reading `OPENCODE_CONFIG_CONTENT` unless the
+/// child owns its own server**. Measured on 2.0.16: `opencode run --dir /tmp` answers
+/// `Unrecognized flag: --dir in command opencode run` and prints no JSON at all, and a `run`
+/// that is neither `--standalone` nor `--server` answers
+/// `{"type":"error",…,"message":"Agent not found: \"<role>\""}` — cide's whole configuration,
+/// the inline role and its system prompt, the providers and the `cide-hook mcp` bridge, is
+/// invisible to it because it is a thin client of the machine-wide background service, which
+/// was started in another directory with another environment.
+///
+/// So each generation's argv is a hard error under the other, and this is the one thing in this
+/// file a spec must branch on.
+///
+/// **Why it rides [`CliFlags`] and not [`Flavor`] or `cide_ipc::Harness`.** It is a property of
+/// the *installed binary*, so it belongs to the probe that already asks a binary what it can do.
+/// [`Flavor`] describes a CLI *family* — MiMo is an opencode **1** fork and always will be until
+/// it rebases — and `cide_ipc::Harness` is a wire enum a role file *chooses*. Nobody chooses a
+/// generation; they choose `opencode` and get whichever one they installed, and a role that
+/// greyed out or had to be re-pointed after `opencode upgrade` would be cide making the user
+/// carry a fact the binary tells us for free.
+///
+/// **Why not `--version`.** It is a proxy for the argv shape, and the fork disproves the proxy:
+/// `mimo --version` prints `0.1.15` while `opencode --version` prints `opencode v2.0.16`, so a
+/// parser needs per-flavour knowledge *and* a per-flavour threshold — and the day MiMo rebases
+/// onto opencode 2 and calls it 0.2, the threshold is wrong for a reason no number can express.
+/// A version is a claim about a release; a usage is a statement about the command line, and the
+/// command line is the only thing [`child`] cares about. It would also be a third fork for a
+/// fact both usages already carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    /// opencode 1.x, and the forks that track it — MiMo Code 0.1.15 among them.
+    V1,
+    /// opencode 2.x: the background service, `--standalone`, `provider/model#variant`, the
+    /// `agents`/`providers`/`mcp.servers` document and the `{type, message, status}` error.
+    V2,
+}
+
 /// Which of cide's optional flags this installed CLI actually has. (M108)
 ///
 /// # Why this is asked of the binary rather than assumed
@@ -347,19 +429,32 @@ impl Flavor {
 /// switch a working machine's runs to prompting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CliFlags {
+    /// Which command line this binary speaks. Everything else here is a detail of it. (M110)
+    pub generation: Generation,
     /// `run` takes this flavour's skip-permissions flag.
     pub run_skip_permissions: bool,
-    /// `run` takes `--password`, so a turn can attach to a guarded server.
+    /// `run` takes `--password`, so a turn can attach to a guarded server. v1 only: opencode 2
+    /// has no such flag and authenticates a `--server` client out of
+    /// [`Flavor::password_env`] instead. Ask [`Self::can_attach`], not this. (M110)
     pub run_password: bool,
+    /// `run` takes `--server <url>` — opencode 2's `--attach`, and the second half of the
+    /// question `run_password` used to answer on its own. (M110)
+    pub run_server: bool,
     /// The TUI (`<cli> [project]`) takes the skip-permissions flag — M104's session tab.
     pub tui_skip_permissions: bool,
 }
 
 impl Default for CliFlags {
+    /// Every optional flag, on the **v1** command line. Not the answer a flavour falls back to
+    /// — that is [`Flavor::default_flags`], because opencode's current release is v2 and MiMo's
+    /// is v1 — but the honest zero value for a fixture test, and the shape every measurement in
+    /// this file was originally taken against.
     fn default() -> Self {
         Self {
+            generation: Generation::V1,
             run_skip_permissions: true,
             run_password: true,
+            run_server: false,
             tui_skip_permissions: true,
         }
     }
@@ -374,10 +469,37 @@ impl CliFlags {
                 .any(|word| word == flag)
         };
         Self {
+            // **Two-sided on purpose, and the negative is what makes it not luck.** opencode 2's
+            // own `--print-logs` description reads `Print logs to stderr (server logs require
+            // --standalone)`, and that line is in *both* usages — so the positive alone would
+            // read every v2 help *and* would have read a v1 help that merely mentioned the flag.
+            // It survives today only because `has` splits on whitespace and commas, leaving the
+            // token as `--standalone)` with the paren attached: **do not widen that splitter to
+            // include parentheses.** `--dir`, which v1's `run` has and v2's does not, is the
+            // half that states the real difference, and a test pins the description-only case.
+            generation: match has(run_help, "--standalone") && !has(run_help, "--dir") {
+                true => Generation::V2,
+                false => Generation::V1,
+            },
             run_skip_permissions: has(run_help, skip_permissions),
             run_password: has(run_help, "--password"),
+            run_server: has(run_help, "--server"),
             tui_skip_permissions: has(tui_help, skip_permissions),
         }
+    }
+
+    /// Whether a turn of this CLI can be a client of the run's own **guarded** server — which
+    /// is the question M105 actually asks, and which `run_password` answered alone until
+    /// opencode 2 removed that flag without removing the ability. (M110)
+    ///
+    /// v1 sends the password with `run --password`; v2 sends it in the environment beside
+    /// `run --server <url>`. Measured on 2.0.16: a `--server` turn against a server that 401s
+    /// an unauthenticated request ran, with the password only in `OPENCODE_SERVER_PASSWORD`.
+    /// Keyed on `run_password` alone, every v2 run would silently go standalone and lose the
+    /// live TUI a pane attaches to.
+    #[must_use]
+    pub fn can_attach(&self) -> bool {
+        self.run_password || self.run_server
     }
 }
 
@@ -433,7 +555,7 @@ impl Flavor {
                 CliFlags::from_help(self.skip_permissions, &run, &tui)
             }
             // A probe that could not read a usage says nothing; see `CliFlags`' last paragraph.
-            _ => CliFlags::default(),
+            _ => self.default_flags(),
         };
         let mut cache = CLI_FLAGS
             .lock()
@@ -450,7 +572,22 @@ impl Flavor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|(kind, _, _, _)| *kind == self.kind)
-            .map_or_else(CliFlags::default, |(_, _, _, flags)| *flags)
+            .map_or_else(|| self.default_flags(), |(_, _, _, flags)| *flags)
+    }
+
+    /// What this flavour is assumed to be when the probe could not run: every optional flag, on
+    /// the command line [`Flavor::default_generation`] names. (M110)
+    ///
+    /// Both wrong guesses are **loud** — a v1 argv on v2 is `Unrecognized flag: --dir` and a v2
+    /// argv on v1 is a yargs usage page — so no default here can quietly corrupt a run the way
+    /// a missing `--auto` once did. This only makes the common case right.
+    fn default_flags(&self) -> CliFlags {
+        CliFlags {
+            generation: self.default_generation,
+            run_password: matches!(self.default_generation, Generation::V1),
+            run_server: matches!(self.default_generation, Generation::V2),
+            ..CliFlags::default()
+        }
     }
 }
 
@@ -490,13 +627,48 @@ impl Flavor {
         llm: &cide_ipc::LlmSettings,
         hook_bin: Option<&std::path::Path>,
     ) -> Result<TabLaunch, String> {
+        self.tab_launch_with(
+            prompt,
+            model,
+            unattended,
+            llm,
+            hook_bin,
+            self.probe_cli_flags(),
+        )
+    }
+
+    /// The half of [`Self::tab_launch`] a test can drive. See [`child_with`].
+    pub fn tab_launch_with(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        unattended: bool,
+        llm: &cide_ipc::LlmSettings,
+        hook_bin: Option<&std::path::Path>,
+        flags: CliFlags,
+    ) -> Result<TabLaunch, String> {
         let binary = self.binary()?;
         let mut args: Vec<String> = Vec::new();
-        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        // The tab is a child cide started, so it owns its server for `child`'s reason: the
+        // document below carries cide's MCP bridge and the machine's providers, and a client of
+        // the background service would have neither — which is the whole point of this tab.
+        if matches!(flags.generation, Generation::V2) {
+            args.push("--standalone".into());
+        }
+        // **`--model` is 1.x's alone.** Measured on 2.0.16: `opencode --model x` answers
+        // `Unrecognized flag: --model in command opencode`. Only `opencode mini` kept `--model`
+        // in 2.0, and `mini` has no `--auto` — so `mini` is the option that lost, and it is named
+        // here so the next reader does not rediscover it as a fix. `--auto` cannot be recovered
+        // any other way, and `claude_tab::TabMode::unattended` argues that a tab cide opened by
+        // itself may have nobody watching when the first permission prompt arrives; a wedged tab
+        // is worse than a tab that opened on the wrong model, which is one keystroke inside the
+        // TUI and whose providers this document already carries.
+        let model = model.map(str::trim).filter(|m| !m.is_empty());
+        if let (Generation::V1, Some(model)) = (flags.generation, model) {
             args.push("--model".into());
             args.push(model.to_string());
         }
-        if unattended && self.probe_cli_flags().tui_skip_permissions {
+        if unattended && flags.tui_skip_permissions {
             args.push(self.skip_permissions.to_string());
         }
         // Last and as one token: a value, so nothing after it can be mistaken for its tail.
@@ -505,7 +677,7 @@ impl Flavor {
             args.push(prompt.to_string());
         }
         let mut env = Vec::new();
-        if let Some(document) = self.tab_config(llm, hook_bin) {
+        if let Some(document) = self.tab_config(llm, hook_bin, flags.generation) {
             env.push((self.config_env(), document));
         }
         Ok(TabLaunch {
@@ -522,10 +694,11 @@ impl Flavor {
         &self,
         llm: &cide_ipc::LlmSettings,
         hook_bin: Option<&std::path::Path>,
+        generation: Generation,
     ) -> Option<String> {
         let mut config = serde_json::Map::new();
         config.insert("$schema".into(), json!(self.schema));
-        config.extend(provider_members(llm));
+        config.extend(provider_members(llm, &pool_efforts(llm, generation, None)));
         if let Some(hook) = hook_bin {
             let mut servers = serde_json::Map::new();
             servers.insert(
@@ -541,7 +714,7 @@ impl Flavor {
         if config.len() == 1 {
             return None;
         }
-        serde_json::to_string(&Value::Object(config)).ok()
+        serde_json::to_string(&as_generation(generation, Value::Object(config))).ok()
     }
 }
 
@@ -594,12 +767,20 @@ impl Harness for MimoHarness {
         failover(line)
     }
 
+    fn failure_detail(&self, line: &str) -> Option<String> {
+        failure_message(line)
+    }
+
     fn failure_exits_zero(&self) -> bool {
         MIMO_CLI.failure_exits_zero
     }
 
     fn usage(&self, line: &str) -> Option<cide_ipc::TokenUsage> {
         usage(line)
+    }
+
+    fn step_clock(&self, line: &str) -> Option<super::StepClock> {
+        step_clock(line)
     }
 
     fn models(
@@ -754,8 +935,16 @@ impl Harness for OpencodeHarness {
         failover(line)
     }
 
+    fn failure_detail(&self, line: &str) -> Option<String> {
+        failure_message(line)
+    }
+
     fn usage(&self, line: &str) -> Option<cide_ipc::TokenUsage> {
         usage(line)
+    }
+
+    fn step_clock(&self, line: &str) -> Option<super::StepClock> {
+        step_clock(line)
     }
 
     /// `opencode models`, run for real — see [`Flavor::models`].
@@ -773,6 +962,15 @@ impl Flavor {
         &self,
         conversation: &HarnessSession,
     ) -> Result<ContinueSpec, HarnessError> {
+        self.continue_spec_with(conversation, self.cli_flags())
+    }
+
+    /// The half of [`Self::continue_spec`] a test can drive. See [`child_with`].
+    pub fn continue_spec_with(
+        &self,
+        conversation: &HarnessSession,
+        flags: CliFlags,
+    ) -> Result<ContinueSpec, HarnessError> {
         if conversation.harness != self.kind {
             return Err(HarnessError::WrongHarness {
                 plan: conversation.harness,
@@ -786,11 +984,18 @@ impl Flavor {
                 id: conversation.id.clone(),
             });
         }
+        // The pane this opens is on a conversation that lives in a cide worktree, so it needs the
+        // private server the run had rather than the machine-wide background service, which is in
+        // another directory entirely. `--session` survived 2.0 on the root TUI unchanged.
+        let standalone: &[&str] = match flags.generation {
+            Generation::V1 => &[],
+            Generation::V2 => &["--standalone"],
+        };
         Ok(ContinueSpec {
             program: self.program().to_string(),
-            args: self
-                .continue_args
+            args: standalone
                 .iter()
+                .chain(self.continue_args.iter())
                 .map(|arg| (*arg).to_string())
                 .chain(["--session".to_string(), id.to_string()])
                 .collect(),
@@ -826,7 +1031,18 @@ impl Flavor {
         // The same document a run gets, so the menu describes the runs that can happen. Without
         // it the probe sees only what the user configured by hand, and cide's own providers are
         // invisible in the very dialog where they are chosen.
-        if let Some(document) = provider_config_content(self, llm) {
+        //
+        // **A measured limitation on opencode 2, recorded rather than papered over.** `models`
+        // there answers out of the machine-wide background service, which was started with
+        // another environment, so this variable is ignored however it is spelled — probed with
+        // both the 1.x and the 2.0 document shapes, and the same eighteen ids came back either
+        // way. `--standalone` is not the fix: measured, `opencode models --standalone` boots a
+        // private server and then prints **nothing at all**, exit 0, which would empty the menu
+        // rather than complete it. So a 2.x machine's Models dialog lists what that machine's own
+        // configuration declares and not cide's providers, and the field is free text, so a
+        // provider cide knows about can still be typed. The way out is the run's own private
+        // server plus `opencode api`, once its routes have been measured; it is not this call.
+        if let Some(document) = provider_config_content(self, llm, self.cli_flags().generation) {
             command.env(self.config_env(), document);
         }
         if let Some(cwd) = cwd {
@@ -865,6 +1081,132 @@ impl Flavor {
     }
 }
 
+/// A provider's `models` map in 2.0's spelling: every key carried as it is, except `variants`.
+///
+/// 1.x takes `variants` as a **map** of name to options (`{"xhigh": {"reasoningEffort": "xhigh"}}`);
+/// 2.0's `Config.Model` takes a **list** of `{id, settings}` — read out of the 2.0.16 binary,
+/// whose own 1.x importer does exactly this conversion (`Object.entries(variants).map(([id, o]) =>
+/// ({id, settings: o}))`). Copying the map verbatim, as this translation did for `models` until
+/// t-1090, is not a variant opencode ignores: it invalidates the **whole provider**, so every model
+/// under it answered `Model unavailable: o3/AgentLLM-big` — including the ones with no variant.
+/// Measured on that document: the map, every o3 model unavailable; the list, `o3/AgentLLM-big`,
+/// `o3/Qwen-Coder#xhigh` and `vllm/qwen3.8-27b-long#xhigh` all answer.
+fn models_as_v2(models: &Value) -> Value {
+    let Value::Object(models) = models else {
+        return models.clone();
+    };
+    Value::Object(
+        models
+            .iter()
+            .map(|(id, model)| {
+                let mut model = model.clone();
+                if let Some(Value::Object(variants)) = model.get("variants").cloned() {
+                    model["variants"] = Value::Array(
+                        variants
+                            .into_iter()
+                            .map(|(name, settings)| json!({ "id": name, "settings": settings }))
+                            .collect(),
+                    );
+                }
+                (id.clone(), model)
+            })
+            .collect(),
+    )
+}
+
+/// One model's `variants` object: each name as the `reasoningEffort` it means. See [`ModelEfforts`].
+fn effort_block(names: &std::collections::BTreeSet<String>) -> Value {
+    Value::Object(
+        names
+            .iter()
+            .map(|name| (name.clone(), json!({ "reasoningEffort": name })))
+            .collect(),
+    )
+}
+
+/// Every model cide will point opencode at on a **custom** provider, keyed by `(provider id, model
+/// id)`, with the reasoning efforts it will ask of each — the pool screen's Effort column, which
+/// opencode calls a *variant* and cide stores as `PoolEntry::variant`.
+///
+/// # cide's document must be enough on its own
+///
+/// A pool is cide's: the user defines providers and pools in cide, and a run is started on one of
+/// those entries. So every model a pool entry names is declared in the document cide gives
+/// opencode, whether or not the provider's card lists it and whatever the user's own
+/// `opencode.json` says. Before this, `vllm/qwen3.8-27b-long` worked only because the user's
+/// `opencode.jsonc` happened to declare it — the `vllm` card lists no models — and a pool that
+/// depends on a file cide never wrote is a pool that breaks on another machine, or the day that
+/// file is tidied.
+///
+/// # The variant rides in the id on opencode 2, and must be declared there
+///
+/// opencode 2 takes a variant only inside the model id (`--model o3/Qwen-Coder#xhigh`; the
+/// `--variant` flag is gone — measured, `Unrecognized flag`), and it accepts `#name` only when the
+/// model declares `name` under `provider.<id>.models.<model>.variants`. A catalog model gets its
+/// set from opencode's own database; a custom one has none unless a document writes it — and
+/// `"reasoning": true` does not supply one (measured: `vllm/qwen3.8-27b-long#high` refused). Without
+/// the declaration t-1090's runs died a second after starting, twice, on
+/// `Variant unavailable for o3/Qwen-Coder: xhigh`.
+///
+/// Each name is declared as `{ "reasoningEffort": name }`: the `@ai-sdk/openai-compatible`
+/// provider sends that as `reasoning_effort`, which is what a pool's `xhigh` means. Measured on
+/// 2.0.16 against both local endpoints: undeclared, the turn is refused; declared, it answers.
+///
+/// **Only what cide will actually ask for** — every pool entry, plus the one model and variant a
+/// particular run or test resolves to (a role's `model`/`effort` rather than a pool's) — rather
+/// than a fixed low/medium/high/xhigh set per model, which would be settings nobody wrote.
+///
+/// **No variants on opencode 1** ([`pool_efforts`]): there the variant rides `--variant`, and a
+/// `variants` key is unmeasured against 1.x's schema. A key its schema refused would invalidate
+/// the whole document, and the module header records what that costs — the run silently becomes
+/// opencode's default agent. The *models* are still declared there: a model entry is a key every
+/// generation's schema has.
+type ModelEfforts =
+    std::collections::BTreeMap<(String, String), std::collections::BTreeSet<String>>;
+
+/// [`ModelEfforts`] for this document: every pool entry, plus `extra` — the `provider/model` and
+/// variant (blank for none) one run or one test is about to ask for.
+fn pool_efforts(
+    llm: &cide_ipc::LlmSettings,
+    generation: Generation,
+    extra: Option<(&str, &str)>,
+) -> ModelEfforts {
+    let mut efforts = ModelEfforts::new();
+    let pooled = llm
+        .pools
+        .iter()
+        .flat_map(|pool| &pool.entries)
+        .map(|entry| {
+            (
+                entry.provider.as_str(),
+                entry.model.as_str(),
+                entry.variant.as_str(),
+            )
+        });
+    // `extra` is one `provider/model` string, split at the **first** `/` — `is_model_id`'s rule,
+    // because a model id may itself contain slashes.
+    let extra = extra.and_then(|(model, variant)| {
+        model
+            .split_once('/')
+            .map(|(provider, model)| (provider, model, variant))
+    });
+    for (provider, model, variant) in pooled.chain(extra) {
+        let (provider, model, variant) = (provider.trim(), model.trim(), variant.trim());
+        // A model id that already carries a `#` names its own variant, which `model_args` keeps;
+        // what it names in the document is not this id, so nothing is declared for it.
+        if provider.is_empty() || model.is_empty() || model.contains('#') {
+            continue;
+        }
+        let names = efforts
+            .entry((provider.to_string(), model.to_string()))
+            .or_default();
+        if !variant.is_empty() && matches!(generation, Generation::V2) {
+            names.insert(variant.to_string());
+        }
+    }
+    efforts
+}
+
 /// The `provider` member cide contributes to an opencode configuration. (M45)
 ///
 /// # One producer, two callers, and that is the entire point of this function existing
@@ -901,7 +1243,10 @@ impl Flavor {
 /// becomes opencode's default agent. Hence a hand-transcribed map rather than a
 /// `serde_json::to_value` of cide's own type, whose field names would follow a Rust rename
 /// straight into an invalid document.
-fn provider_members(llm: &cide_ipc::LlmSettings) -> serde_json::Map<String, Value> {
+fn provider_members(
+    llm: &cide_ipc::LlmSettings,
+    efforts: &ModelEfforts,
+) -> serde_json::Map<String, Value> {
     let mut providers = serde_json::Map::new();
 
     for provider in &llm.providers {
@@ -975,7 +1320,29 @@ fn provider_members(llm: &cide_ipc::LlmSettings) -> serde_json::Map<String, Valu
                             json!({ "context": model.context, "output": model.output }),
                         );
                     }
+                    // The variants cide will ask this model for — see `ModelEfforts`. Without the
+                    // declaration opencode 2 refuses `#xhigh` on a custom model outright.
+                    if let Some(names) = efforts
+                        .get(&(provider.id().to_string(), model.id.clone()))
+                        .filter(|names| !names.is_empty())
+                    {
+                        described.insert("variants".into(), effort_block(names));
+                    }
                     declared.insert(model.id.clone(), Value::Object(described));
+                }
+                // And every model a pool names on this provider that the card does **not** list —
+                // declared here rather than left to the user's own `opencode.json`, because the
+                // pool is cide's and so is this document (`ModelEfforts`). Measured on 2.0.16 under a
+                // provider id no user file knows: a bare `{}` entry is a model opencode runs, and
+                // one carrying `variants` takes `#xhigh`.
+                for ((owner, model), names) in efforts {
+                    if owner == provider.id() && !declared.contains_key(model) {
+                        let mut described = serde_json::Map::new();
+                        if !names.is_empty() {
+                            described.insert("variants".into(), effort_block(names));
+                        }
+                        declared.insert(model.clone(), Value::Object(described));
+                    }
                 }
                 if !declared.is_empty() {
                     entry.insert("models".into(), Value::Object(declared));
@@ -1000,30 +1367,54 @@ fn provider_members(llm: &cide_ipc::LlmSettings) -> serde_json::Map<String, Valu
 
 /// Those members as a whole document, for a caller with no [`RunPlan`] — the model probe.
 ///
+/// **Public so the real-CLI tests can build their document with it** rather than beside it: a
+/// hand-written provider block in `tests/real_opencode.rs` would be the second producer
+/// [`provider_members`]' header forbids, and the drift it would hide is the one those tests exist
+/// to catch — a release renaming a key, with the fixture still spelling it the old way.
+///
 /// `None` when cide has nothing to say, which is the ordinary state of an installation that has
 /// never opened the Models screen: the probe then runs exactly as it did before this existed.
-fn provider_config_content(flavor: &Flavor, llm: &cide_ipc::LlmSettings) -> Option<String> {
-    let members = provider_members(llm);
+pub fn provider_config_content(
+    flavor: &Flavor,
+    llm: &cide_ipc::LlmSettings,
+    generation: Generation,
+) -> Option<String> {
+    let members = provider_members(llm, &pool_efforts(llm, generation, None));
     if members.is_empty() {
         return None;
     }
     let mut doc = serde_json::Map::new();
     doc.insert("$schema".into(), json!(flavor.schema));
     doc.extend(members);
-    serde_json::to_string(&Value::Object(doc)).ok()
+    serde_json::to_string(&as_generation(generation, Value::Object(doc))).ok()
 }
 
 /// [`provider_config_content`] plus [`pool_retry`], for [`test_model`]. The provider members are
 /// the same producer's, so the test still describes the document a run gets.
-fn test_config_content(flavor: &Flavor, llm: &cide_ipc::LlmSettings) -> Option<String> {
-    let Some(retry) = pool_retry(flavor) else {
-        return provider_config_content(flavor, llm);
-    };
+///
+/// `extra` is the `provider/model` and variant being tested, declared beside the pool's own — so a
+/// check of a role's effort on a custom model is judged against the document the run would get.
+fn test_config_content(
+    flavor: &Flavor,
+    llm: &cide_ipc::LlmSettings,
+    generation: Generation,
+    extra: Option<(&str, &str)>,
+) -> Option<String> {
+    let members = provider_members(llm, &pool_efforts(llm, generation, extra));
+    let retry = pool_retry(flavor);
+    // Nothing to say is no variable at all, exactly as `provider_config_content` answers.
+    if members.is_empty() && retry.is_none() {
+        return None;
+    }
     let mut doc = serde_json::Map::new();
     doc.insert("$schema".into(), json!(flavor.schema));
-    doc.extend(provider_members(llm));
-    doc.insert("retry".into(), retry);
-    serde_json::to_string(&Value::Object(doc)).ok()
+    doc.extend(members);
+    if let Some(retry) = retry {
+        doc.insert("retry".into(), retry);
+    }
+    // `retry` reaching `as_v2` would be dropped, and correctly so — but this arm is only ever
+    // taken by MiMo, which is a fork of opencode 1, so the translation is the identity here.
+    serde_json::to_string(&as_generation(generation, Value::Object(doc))).ok()
 }
 
 /// Whether this line is opencode reporting a **provider** failure, and which kind. (M45)
@@ -1078,17 +1469,57 @@ pub fn failover(line: &str) -> Option<FailoverReason> {
         return None;
     }
     let error = event.get("error")?;
+    // **Both spellings, and deliberately not a `Generation` branch.** opencode 1 names the class
+    // in `name` and hangs the detail under `data`; opencode 2 names it in `type` and puts the
+    // detail flat on the error, so `name`, `data.statusCode` and `data.isRetryable` are *all
+    // three* absent on a v2 line. This function runs on the coalescer thread through
+    // `Harness::diagnose`, which is handed a `&str` and nothing else — no flavour, no probe —
+    // and threading one in to pick a spelling would cost a lookup per line to save a `get`.
+    // A v2 line reaching `None` because it was unrecognised is indistinguishable from one
+    // refused on purpose, which is exactly why the refusals below are by name.
     let name = error
         .get("name")
+        .or_else(|| error.get("type"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     let null = Value::Null;
     let data = error.get("data").unwrap_or(&null);
+    let status = data
+        .get("statusCode")
+        .or_else(|| error.get("status"))
+        .and_then(Value::as_u64);
 
     match name {
         // opencode's own, and unambiguous: the provider rejected the credentials.
-        "ProviderAuthError" => Some(FailoverReason::Auth),
-        "APIError" => match data.get("statusCode").and_then(Value::as_u64) {
+        // `provider.auth` is 2.0's spelling of it — read out of the binary, which translates its
+        // own `ProviderAuthError` to exactly that name, and measured live as
+        // `{"type":"provider.auth","message":"Incorrect API key provided: …","status":401}`.
+        "ProviderAuthError" | "provider.auth" => Some(FailoverReason::Auth),
+        // 2.0's classifier, read out of the shipped binary rather than guessed at from the
+        // release notes: one `switch` maps its internal reasons onto these names —
+        // `RateLimit` → `provider.rate-limit`, `QuotaExceeded` → `provider.quota`,
+        // `Transport` → `provider.transport`, `Timeout` → `provider.timeout`,
+        // `ProviderInternal` → `provider.internal`, `NoRoute` → `provider.no-route`,
+        // `UnknownProvider` → `provider.unknown`, `InvalidRequest` → `provider.invalid-request`,
+        // `ContentPolicy` → `provider.content-filter`,
+        // `UnsupportedOperation` → `provider.unsupported-operation`, and a second function
+        // translates the 1.x names above into the same set.
+        //
+        // Both of these are a candidate that has nothing left to give, which is what a pool
+        // exists to move on from.
+        "provider.rate-limit" | "provider.quota" => Some(FailoverReason::RateLimited),
+        // The connection never carried a request, or the provider broke on its own side — the
+        // three the next candidate genuinely repairs. `provider.transport` is the one measured:
+        // a provider on a closed port answers
+        // `{"type":"provider.transport","message":"ConnectionRefused: Unable to connect. …"}`,
+        // which is the same case 1.x reported as `APIError { isRetryable: true }` with no status.
+        "provider.transport" | "provider.timeout" | "provider.internal" => {
+            Some(FailoverReason::Unreachable)
+        }
+        // 2.0's `APIError`. The ladder below is the one fact this rename did not change, so it is
+        // shared rather than copied — only where the number lives moved, from `data.statusCode`
+        // to `status`.
+        "APIError" | "provider.error" => match status {
             Some(429) => Some(FailoverReason::RateLimited),
             // 402 is a guess and is here on purpose: a provider answering "payment required" is
             // out of quota in every sense a pool cares about. If no provider turns out to use it,
@@ -1096,23 +1527,60 @@ pub fn failover(line: &str) -> Option<FailoverReason> {
             Some(402) => Some(FailoverReason::RateLimited),
             Some(401 | 403) => Some(FailoverReason::Auth),
             // Every other explicit 4xx is a statement about the *request* — a model id that does
-            // not exist, a body the endpoint would not take — and no other candidate repairs it.
-            // Refused ahead of `isRetryable`, deliberately: the status code is the more specific
-            // fact and must win.
-            Some(400..=499) => None,
+            // not exist, a body the endpoint would not take. That is the entry's configuration,
+            // and the next entry is a different request: fail over, and say so (`Rejected`).
+            // Ahead of `isRetryable`, deliberately: the status code is the more specific fact.
+            Some(400..=499) => Some(FailoverReason::Rejected),
             // A 5xx, or no code at all. `isRetryable` is opencode's own verdict and is the primary
-            // signal here — the probed connect-refused case carries it with no code.
+            // signal here — the probed connect-refused case carries it with no code. 2.0 has no
+            // such field; it reaches this classifier as `provider.transport` above instead, so
+            // this tail is 1.x's alone and an absent `isRetryable` correctly answers `false`.
             _ => data
                 .get("isRetryable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
                 .then_some(FailoverReason::Unreachable),
         },
-        // Named rather than defaulted — see the header. A typo, a context overflow and an abort
-        // are each refused because they are each unfixable by another candidate.
-        "UnknownError" | "MessageOutputLengthError" | "MessageAbortedError" => None,
-        // A name this build has never met. `None` is the safe direction: the run ends as it always
-        // did, and its error is in the pane and in `run-logs/<run>.log`.
+        // Carved out of `provider.no-route` below, by its message, because it is the one no-route
+        // the next candidate repairs: the model exists, it just does not offer this entry's
+        // effort — and the next entry is another model with its own. Measured on 2.0.16:
+        // `{"type":"error",…,"error":{"type":"provider.no-route","message":"Variant unavailable
+        // for o3/Qwen-Coder: xhigh"}}`. Before this arm t-1090's runs exited 1 on entry 2 of six.
+        "provider.no-route"
+            if error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.starts_with("Variant unavailable")) =>
+        {
+            Some(FailoverReason::Variant)
+        }
+        // 1.x's `UnknownError` is how it reports a model id that does not exist — probed
+        // verbatim, "Unexpected server error. Check server logs for details." with no status —
+        // so it is the entry's configuration, and fails over like 2.0's `no-route` below.
+        "UnknownError" => Some(FailoverReason::Rejected),
+        // A context overflow is this *conversation's* size and an abort is cide's wind-down, so
+        // every candidate would repeat them.
+        "MessageOutputLengthError" | "MessageAbortedError" => None,
+        // cide's own wind-down arriving as an event (`{"type":"aborted","message":"Session
+        // interrupted: …"}`), and the bare `unknown` — 2.0's catch-all, the shape
+        // `Agent not found: "<role>"` arrives in, which is cide's configuration failing to reach
+        // the child. Neither is the entry's fault, and every entry would hit it again.
+        "aborted" | "unknown" => None,
+        // Every other provider failure — a model the provider does not have (`no-route`), one
+        // opencode cannot place (`unknown`), a request it would not take, an operation it does
+        // not support, output it could not parse, a content filter — is something wrong with
+        // *this entry*, and the next entry is a different model on a different request.
+        //
+        // These used to end the run, so that one misspelt model id could not burn every
+        // candidate in the pool. The user overruled that (t-1090): a pool is a list of fallbacks
+        // and a broken entry is what the next one is for. The run moves on, the entry is benched,
+        // and cide raises a notification quoting opencode's sentence — see
+        // `FailoverReason::Rejected`. A `provider.*` name this build has never met is taken the
+        // same way: it is still the provider speaking.
+        name if name.starts_with("provider.") => Some(FailoverReason::Rejected),
+        // A name this build has never met and that is not the provider's. `None` is the safe
+        // direction: the run ends as it always did, and its error is in the pane and in
+        // `run-logs/<run>.log`.
         _ => None,
     }
 }
@@ -1155,6 +1623,38 @@ pub fn usage(line: &str) -> Option<cide_ipc::TokenUsage> {
     })
 }
 
+/// Which edge of a step a `step_start` or `step_finish` line is, on which session, at what time.
+/// (pool stats)
+///
+/// Both carry the envelope's `timestamp` (the CLI's clock, ms) and `sessionID` — a nested
+/// subagent's own, which is what lets the app pair a finish with *its* start. Everything else on
+/// the line, `usage` has already read.
+pub fn step_clock(line: &str) -> Option<super::StepClock> {
+    let line = line.trim();
+    // `usage`'s gate, for its reason: the coalescer thread parses nothing on an ordinary line.
+    if !line.starts_with('{')
+        || !(line.contains("\"type\":\"step_start\"") || line.contains("\"type\":\"step_finish\""))
+    {
+        return None;
+    }
+    let event: Value = serde_json::from_str(line).ok()?;
+    let edge = match event.get("type").and_then(Value::as_str)? {
+        "step_start" => super::StepEdge::Start,
+        "step_finish" => super::StepEdge::Finish,
+        _ => return None,
+    };
+    let session = event
+        .get("sessionID")
+        .or_else(|| event.pointer("/part/sessionID"))
+        .and_then(Value::as_str)?
+        .to_owned();
+    Some(super::StepClock {
+        session,
+        at_unix_ms: event.get("timestamp").and_then(Value::as_u64),
+        edge,
+    })
+}
+
 /// How long a [`test_model`] turn is given before it is killed.
 ///
 /// Generously longer than [`MODELS_DEADLINE`], because this one waits on a *model*: a cold local
@@ -1181,11 +1681,18 @@ const TEST_PROMPT: &str = "Reply with the single word: ok";
 /// [`provider_members`] — so a model that passes here is a model a run can use, and a failure here
 /// is a failure a run would have had. Testing against an independently built document would be a
 /// button that reports on a configuration nothing else uses.
+///
+/// `variant` is a pool entry's effort, joined by the same [`model_args`] a run's argv goes through.
+/// Without it the pool screen's "Check entries" would pass `o3/Qwen-Coder` while the run it vouches
+/// for was refused as `o3/Qwen-Coder#xhigh` (`VariantUnavailableError`) — a green check over the
+/// exact failure it exists to catch. `None` tests the model on its default effort, as the per-model
+/// button on a provider card does.
 pub fn test_model(
     flavor: &Flavor,
     cwd: Option<&std::path::Path>,
     llm: &cide_ipc::LlmSettings,
     model: &str,
+    variant: Option<&str>,
 ) -> Result<String, String> {
     let model = model.trim();
     if model.is_empty() {
@@ -1196,8 +1703,25 @@ pub fn test_model(
 
     let mut command = std::process::Command::new(&binary);
     command.arg("run");
+    // The same condition `child` states at length: without it, opencode 2 tests the machine's
+    // background service instead of the document `provider_members` just produced — which is
+    // exactly the drift this function exists to prevent, a Test button reporting on a
+    // configuration nothing else uses. (M110)
+    // Probed, not the cached answer: the Settings screen can press this before any run has asked
+    // the binary, and the default generation guessed wrong is a check that fails for its own argv.
+    let generation = flavor.probe_cli_flags().generation;
+    if matches!(generation, Generation::V2) {
+        command.arg("--standalone");
+    }
+    let extra = Some((model, variant.unwrap_or_default()));
+    let document = test_config_content(flavor, llm, generation, extra);
+    let (model, variant) = model_args(generation, model, variant);
     command.arg("--model");
     command.arg(model);
+    if let Some(variant) = variant {
+        command.arg("--variant");
+        command.arg(variant);
+    }
     command.arg("--format");
     command.arg("json");
     // Last, and after every flag, for `child`'s stated reason: the message is positional and a
@@ -1206,7 +1730,7 @@ pub fn test_model(
     command.env("NO_COLOR", "1");
     // Bounded retries on a flavour that would otherwise retry a dead endpoint for fifteen minutes
     // in silence: a test asks whether the model answers *now*. See `pool_retry`.
-    if let Some(document) = test_config_content(flavor, llm) {
+    if let Some(document) = document {
         command.env(flavor.config_env(), document);
     }
     if let Some(cwd) = cwd {
@@ -1276,6 +1800,21 @@ fn verdict(flavor: &Flavor, stdout: &str, ok: bool, stderr: &str) -> Result<Stri
     })
 }
 
+/// The provider's own words on one `{"type":"error",…}` line, for the pool entry notification —
+/// [`error_sentence`]'s message half, without the class name a person fixing a pool does not need.
+pub fn failure_message(line: &str) -> Option<String> {
+    let event: Value = serde_json::from_str(line.trim()).ok()?;
+    let error = event.get("error")?;
+    error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .or_else(|| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
 /// The sentence inside one `{"type":"error",…}` line.
 ///
 /// Parsed defensively through `Value` and never into a closed struct: the live object carries
@@ -1289,10 +1828,18 @@ fn error_sentence(flavor: &Flavor, line: &str) -> String {
         );
     };
     let error = event.get("error").unwrap_or(&Value::Null);
-    let name = error.get("name").and_then(Value::as_str).unwrap_or("error");
+    // Both generations' spellings, for [`failover`]'s reason: 1.x names the class in `name` with
+    // its detail under `data`, 2.0 names it in `type` with the detail flat on the error. Read in
+    // that order so a CLI that grows both keeps the more specific 1.x reading.
+    let name = error
+        .get("name")
+        .or_else(|| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("error");
     let message = error
         .get("data")
         .and_then(|data| data.get("message"))
+        .or_else(|| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("");
     match message.is_empty() {
@@ -1463,23 +2010,84 @@ pub fn parse_user_config(printed: &str) -> Result<UserConfig, String> {
     let document: Value = serde_json::from_str(printed.trim()).map_err(|error| {
         format!("`opencode debug config` printed something that is not JSON: {error}")
     })?;
+    // **Two documents, told apart by their own shape rather than by a probe.** 1.x prints the
+    // merge as one object; 2.0 prints the *sources* it merged, as an ordered array of
+    // `{type, path, info}` — and that array is perfectly good JSON, so without this the parse
+    // below succeeds, `Value::get("model")` on an array answers `None`, and every field comes
+    // back empty from a document that read fine. That is the 1.18.31 failure this function's own
+    // header exists to record — a continued session keeps the model it last used, for ever —
+    // arriving again with nothing failing anywhere.
+    //
+    // Read off the value and not off [`CliFlags`] deliberately: this is the pure half of
+    // [`user_config`], its whole test is a captured document, and threading a generation in
+    // would make a fixture test need a probe.
+    let merged = match &document {
+        Value::Array(sources) => merge_v2_sources(sources),
+        _ => document,
+    };
     let string = |key: &str| {
-        document
+        merged
             .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+            // 2.0 spells a model `{providerID, model}` where 1.x spelled it `"provider/model"`.
+            // Composed here rather than at the call sites, because `UserConfig`'s contract is
+            // "as `provider/model`" and every reader of it — `with_default_model`, the `--model`
+            // this run is given — takes the flag's spelling.
+            .and_then(|value| match value {
+                Value::String(text) => Some(text.trim().to_string()),
+                Value::Object(_) => {
+                    let provider = value.get("providerID").and_then(Value::as_str)?;
+                    let model = value.get("model").and_then(Value::as_str)?;
+                    Some(format!("{}/{}", provider.trim(), model.trim()))
+                }
+                _ => None,
+            })
+            .filter(|value| !value.is_empty() && value != "/")
     };
     Ok(UserConfig {
         model: string("model"),
+        // 2.0's own spelling is unmeasured — the probed machine's configuration names none, and
+        // the binary still carries the 1.x string. A key that is absent is `None`, which is this
+        // function's rule for every key, so a rename degrades to "opencode picks" rather than to
+        // a wrong answer.
         small_model: string("small_model"),
-        provider: document
+        provider: merged
+            // `provider` in 1.x, `providers` in 2.0. Kept as the JSON it was printed as, for
+            // equality only — `plan_restarts` compares it so that editing a key restarts a
+            // paused run — so no field of it is read and the rename costs one `or_else`.
             .get("provider")
+            .or_else(|| merged.get("providers"))
             .filter(|provider| provider.is_object())
             .map(Value::to_string)
             .unwrap_or_default(),
     })
+}
+
+/// 2.0's `debug config` array of sources, flattened to the one object the rest of this file
+/// expects. (M110)
+///
+/// Measured on 2.0.16: the array is `[{type:"document",path,info:{…}}, {type:"directory",path,
+/// info:{}}, …]`, **in merge order**, so later sources win. Only a `document` source carries a
+/// file; a `directory` source is a search path whose `info` is empty, and folding it in would let
+/// an empty object erase a key an earlier document set.
+///
+/// A shallow merge and not a deep one: the three keys `UserConfig` keeps are all top-level, and a
+/// deep merge here would be this file re-implementing opencode's own merge — which is precisely
+/// what `user_config`'s header refuses to do ("a copy of that merge in Rust would be right until
+/// the next release moved it").
+fn merge_v2_sources(sources: &[Value]) -> Value {
+    let mut merged = serde_json::Map::new();
+    for source in sources {
+        if source.get("type").and_then(Value::as_str) != Some("document") {
+            continue;
+        }
+        let Some(Value::Object(info)) = source.get("info") else {
+            continue;
+        };
+        for (key, value) in info {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
 }
 
 /// `opencode debug config` reads files and prints; half a second measured. Generous, because a
@@ -1697,9 +2305,19 @@ pub fn render_event(state: &mut RenderState, line: &str, handle: Option<u64>) ->
         // of `part` here rendered every one of them as `✗ null`.
         "error" => {
             let error = event.get("error").unwrap_or(part);
-            let error = match error {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
+            // The sentence in preference to the whole object. 2.0 always carries one
+            // (`{"type":"provider.transport","message":"ConnectionRefused: …"}`) and 1.x carries
+            // one under `data`, so a person reads the failure rather than its JSON — and the
+            // fallback below is still there for a shape neither generation has printed yet,
+            // because an unrendered error is the one row that must never go missing.
+            let sentence = error
+                .get("message")
+                .or_else(|| error.get("data").and_then(|data| data.get("message")))
+                .and_then(Value::as_str);
+            let error = match (sentence, error) {
+                (Some(sentence), _) => sentence.to_string(),
+                (None, Value::String(text)) => text.clone(),
+                (None, other) => other.to_string(),
             };
             Some(format!("{RED}✗ {}{RESET}", one_line_of(&error)))
         }
@@ -1808,6 +2426,21 @@ fn child(
     plan: &RunPlan<'_>,
     resume: Option<&str>,
 ) -> Result<HarnessSpawn, HarnessError> {
+    child_with(flavor, plan, resume, flavor.cli_flags())
+}
+
+/// The half of [`child`] a test can drive: the whole spec, for a stated [`CliFlags`].
+///
+/// Split for `verdict`'s reason — the interesting half is the pure one — and for a reason M110
+/// added: both generations' argv must be assertable **side by side in one process**, and the
+/// probe's answer is a process-wide cache keyed by binary, so a test that had to prime it could
+/// only ever assert one of them and would race every other test that did.
+fn child_with(
+    flavor: &Flavor,
+    plan: &RunPlan<'_>,
+    resume: Option<&str>,
+    flags: CliFlags,
+) -> Result<HarnessSpawn, HarnessError> {
     // `plan.harness`, the *resolved* one, not the definition's: a role a local override moved onto
     // this CLI must not be refused by it. See `RunPlan::harness`. Against the *flavour's* kind, so
     // an opencode plan handed to mimo is refused as surely as a claude one. (M81)
@@ -1826,52 +2459,65 @@ fn child(
     // document there is no role — `--agent <id>` would name an agent that does not exist, the CLI
     // would warn once and fall back to its own default agent, and the run would look like it
     // worked while carrying somebody else's system prompt.
-    let config = config_json(flavor, plan).ok_or(HarnessError::NoConfig)?;
+    let config = config_json(flavor, plan, flags.generation).ok_or(HarnessError::NoConfig)?;
 
     // A bare name, resolved by the OS at this spawn rather than pinned at load: opencode updates
     // itself underneath a running app. `defs::harness_binary` is the one place that name lives,
     // and it is the same one `defs::installed` probed for the roster.
     let program = flavor.program();
 
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "--agent".into(),
-        plan.agent.def.id.to_string(),
-    ];
+    let mut args: Vec<String> = vec!["run".into()];
 
-    // Each of these only when the definition carried it. The CLI's defaults are the safe end of
-    // both ranges, and a value invented here is a behaviour the role's author never wrote and
-    // cannot find in their file.
-    // The pool's candidate outranks the definition's `model:` — for this run only, and only while
-    // the run is on that candidate. The role's file is untouched and goes on saying what its
-    // author wrote, which is what keeps "why is my agent doing that" answerable from a file.
-    let model = plan
-        .choice
-        .as_ref()
-        .map(|choice| choice.entry.model_flag())
-        .or_else(|| plan.agent.def.model.clone());
+    // The run's own server (M104 follow-up): this turn is a client of it, so the conversation
+    // lives where a pane can attach the full TUI to it. See `RunPlan::server`.
+    // Guarded by `can_attach` too: the app starts no server for a CLI that cannot authenticate to
+    // one, and a plan that names one anyway must not produce a client that cannot prove itself.
+    let server = plan.server.as_ref().filter(|_| flags.can_attach());
+
+    // **First, immediately after `run`, and before `--agent`.** Not tidiness: on opencode 2 this
+    // token decides *which process owns the configuration* that `--agent` then names, so a reader
+    // of a `# cide forked:` line in a post-mortem log sees the answer to "was this cide's run at
+    // all" without scanning to the end.
+    //
+    // `--standalone` is the condition under which cide's configuration exists, not an
+    // optimisation. Measured on 2.0.16: without it, and without `--server`, the child is a thin
+    // client of the machine-wide background service — which was started in another directory with
+    // another environment — and the whole `OPENCODE_CONFIG_CONTENT` document is invisible to it.
+    // The turn then answers `{"type":"error",…,"message":"Agent not found: \"<role>\""}`, which
+    // is at least loud; what is *not* loud is that such a child would also have run in the wrong
+    // directory, with the user's own providers and without the `cide-hook mcp` bridge, breaking
+    // every promise `docs/worktree-isolation.md` makes. `run --standalone` reading the document
+    // is measured the only way that can be proved: an `--agent` **only** this document defines
+    // resolves, while an unknown one is refused by name.
+    //
+    // The two are mutually exclusive — `--server and --standalone cannot be combined`, measured —
+    // and a served run is already a client of a server cide started with this same document, so
+    // it needs no private one.
+    if matches!(flags.generation, Generation::V2) {
+        match server {
+            Some(server) => {
+                args.push("--server".into());
+                args.push(server.url.clone());
+            }
+            None => args.push("--standalone".into()),
+        }
+    }
+
+    args.push("--agent".into());
+    args.push(plan.agent.def.id.to_string());
+
+    // Each only when something carried it — see `run_target`, which `config_json` shares so the
+    // document declares the very variant this argv asks for.
+    let (model, variant) = run_target(plan);
+    // Joined for this generation and nowhere else — see `model_args`.
     if let Some(model) = model {
+        let (model, variant) = model_args(flags.generation, &model, variant.as_deref());
         args.push("--model".into());
         args.push(model);
-    }
-    // Same precedence one flag down, and it is load-bearing rather than tidy: each model declares
-    // its own variant set (`gpt-5.2` offers none/low/medium/high/xhigh, `gpt-5.1-codex-mini` only
-    // medium/high), so a role-level `effort` carried onto the candidate a rate limit fell over to
-    // would be refused outright by the CLI — turning a recoverable failure into a hard one at the
-    // worst possible moment. An entry that names a variant is naming *this* candidate's; the
-    // role's `effort` stands for every entry that names none.
-    //
-    // Carried verbatim and unvalidated either way, for `LoadedAgent::effort`'s stated reason: the
-    // set is per-harness and per-release, and a bad value is the CLI's refusal to make, loudly.
-    let variant = plan
-        .choice
-        .as_ref()
-        .map(|choice| choice.entry.variant.clone())
-        .filter(|variant| !variant.is_empty())
-        .or_else(|| plan.agent.effort.clone());
-    if let Some(variant) = variant {
-        args.push("--variant".into());
-        args.push(variant);
+        if let Some(variant) = variant {
+            args.push("--variant".into());
+            args.push(variant);
+        }
     }
 
     // The project's default for unattended children (`agents.permissionMode`). For this harness
@@ -1884,7 +2530,6 @@ fn child(
     // before M82 and is left alone: opencode has no counterpart to map a mode onto.
     // Only where this CLI has the flag (M108): an older opencode rejects it and prints its usage
     // instead of running — see `CliFlags`. It also predates the prompts the flag answers.
-    let flags = flavor.cli_flags();
     if plan.unattended != Unattended::Ask && flags.run_skip_permissions {
         args.push(flavor.skip_permissions.into());
     }
@@ -1901,15 +2546,23 @@ fn child(
     // reason: without a flag the CLI prints its own `Thinking: …` block only when it is talking
     // to a person, and cide is not a person.
     args.push("--thinking".into());
-    args.push("--dir".into());
-    args.push(plan.cwd.to_string_lossy().to_string());
+    // **`--dir` is 1.x's alone.** opencode 2 removed it — measured, `run --dir /tmp` answers
+    // `Unrecognized flag: --dir in command opencode run` and prints *no JSON at all*, so a run
+    // that kept passing it would not merely be wrong, it would be mute on the only channel this
+    // harness has. Nothing is lost: the spawn's cwd below is `plan.cwd` either way, and on 2.0
+    // the cwd is exactly what a standalone server resolves the project and the session store
+    // from. On 1.x both are still set, to the same directory, for the reason the module header
+    // gives — setting only one gives a run whose tools and whose conversation disagree about
+    // where the work is.
+    if matches!(flags.generation, Generation::V1) {
+        args.push("--dir".into());
+        args.push(plan.cwd.to_string_lossy().to_string());
+    }
 
-    // The run's own server (M104 follow-up): this turn is a client of it, so the conversation
-    // lives where a pane can attach the full TUI to it. See `RunPlan::server`.
-    // Guarded by `run_password` too: the app starts no server for a CLI without it, and a plan
-    // that names one anyway must not produce a client that cannot authenticate.
-    let server = plan.server.as_ref().filter(|_| flags.run_password);
-    if let Some(server) = server {
+    // 1.x's spelling of the same thing the `--server` token above is on 2.0: this turn is a
+    // client of the run's own server, so the conversation lives where a pane can attach the full
+    // TUI to it. See `RunPlan::server`.
+    if let Some(server) = server.filter(|_| matches!(flags.generation, Generation::V1)) {
         args.push("--attach".into());
         args.push(server.url.clone());
     }
@@ -1967,6 +2620,93 @@ fn child(
         // The stream *is* this harness's stdout; nothing is written beside it.
         events: None,
     })
+}
+
+/// The `provider/model` and effort variant this run asks for, each only when something carried it.
+///
+/// The CLI's defaults are the safe end of both ranges, and a value invented here is a behaviour the
+/// role's author never wrote and cannot find in their file.
+///
+/// The pool's candidate outranks the definition's `model:` — for this run only, and only while the
+/// run is on that candidate. The role's file is untouched and goes on saying what its author wrote,
+/// which is what keeps "why is my agent doing that" answerable from a file.
+///
+/// Same precedence one field down, and it is load-bearing rather than tidy: each model declares
+/// its own variant set (`gpt-5.2` offers none/low/medium/high/xhigh, `gpt-5.1-codex-mini` only
+/// medium/high), so a role-level `effort` carried onto the candidate a rate limit fell over to
+/// would be refused outright by the CLI — turning a recoverable failure into a hard one at the
+/// worst possible moment. An entry that names a variant is naming *this* candidate's; the role's
+/// `effort` stands for every entry that names none.
+///
+/// Carried verbatim and unvalidated either way, for `LoadedAgent::effort`'s stated reason: the set
+/// is per-harness and per-release, and a bad value is the CLI's refusal to make, loudly.
+///
+/// One function for [`child`]'s argv and [`config_json`]'s `variants` declaration ([`ModelEfforts`]):
+/// two copies of this precedence are an argv asking for `#xhigh` over a document declaring `high`.
+fn run_target(plan: &RunPlan<'_>) -> (Option<String>, Option<String>) {
+    let model = plan
+        .choice
+        .as_ref()
+        .map(|choice| choice.entry.model_flag())
+        .or_else(|| plan.agent.def.model.clone());
+    let variant = plan
+        .choice
+        .as_ref()
+        .map(|choice| choice.entry.variant.clone())
+        .filter(|variant| !variant.is_empty())
+        .or_else(|| plan.agent.effort.clone());
+    (model, variant)
+}
+
+/// The `--model` value, and the `--variant` flag this generation still takes, from the pair
+/// [`child`] has already resolved. (M110)
+///
+/// # Where the two halves are joined, and why it is here
+///
+/// opencode 1 carries them apart. opencode 2 removed `--variant` — measured,
+/// `run --variant high` answers `Unrecognized flag` — and folded it into the id, which its own
+/// usage documents: `--model, -m string    Model to use in the format provider/model#variant`.
+///
+/// The join is **here and nowhere else**, and in particular not in `PoolEntry::model_flag`,
+/// whose doc calls itself "the only place the two halves are ever joined". That promise is about
+/// an *entry*, and an entry's target string is also printed to people — the `cide_llm_pool`
+/// listing, and the failover and capacity sentences a run writes to its task. A pool row must go
+/// on reading `openrouter/a`, never `openrouter/a#high`, and `PoolEntry::same_target` compares
+/// `variant` as its own field on purpose, so folding there would make one entry's *identity*
+/// depend on how it happens to be spelled for one generation of one CLI. It could not live on
+/// `PoolEntry` in any case: the precedence is [`child`]'s, not the entry's — the entry's variant
+/// wins when it names one, and the role's `effort` stands for every entry that names none — and
+/// a `PoolEntry` cannot see the role.
+///
+/// # A model id that already carries a `#` is left alone
+///
+/// [`is_model_id`] permits anything but whitespace after the first `/`, because real ids are
+/// hostile (`unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` is one of this machine's). A second `#` would be
+/// cide corrupting an id the user typed, and the CLI's complaint would name the *model*, which
+/// sends the next reader looking in the wrong file. So the suffix already there wins and the
+/// variant is dropped — a turn on the model's default effort, which is the CLI's own safe end of
+/// that range, rather than a turn that cannot start.
+fn model_args(
+    generation: Generation,
+    model: &str,
+    variant: Option<&str>,
+) -> (String, Option<String>) {
+    let variant = variant.map(str::trim).filter(|variant| !variant.is_empty());
+    let Some(variant) = variant else {
+        return (model.to_string(), None);
+    };
+    match generation {
+        Generation::V1 => (model.to_string(), Some(variant.to_string())),
+        Generation::V2 if model.contains('#') => {
+            tracing::warn!(
+                model,
+                variant,
+                "this model id already names a variant; the role's effort is not applied"
+            );
+            (model.to_string(), None)
+        }
+        Generation::V2 => (format!("{model}#{variant}"), None),
+    }
 }
 
 /// The `--title`: the role, then the task it was dispatched for. `claude.rs`'s `-n`, verbatim.
@@ -2036,13 +2776,25 @@ impl Flavor {
         port: u16,
         password: &str,
     ) -> Result<SpawnSpec, HarnessError> {
+        self.serve_spec_with(plan, port, password, self.cli_flags().generation)
+    }
+
+    /// The half of [`Self::serve_spec`] a test can drive. See [`child_with`]. The argv is the
+    /// same on both command lines; the **document** it carries is not.
+    pub fn serve_spec_with(
+        &self,
+        plan: &RunPlan<'_>,
+        port: u16,
+        password: &str,
+        generation: Generation,
+    ) -> Result<SpawnSpec, HarnessError> {
         if plan.harness != self.kind {
             return Err(HarnessError::WrongHarness {
                 plan: plan.harness,
                 harness: self.kind,
             });
         }
-        let config = config_json(self, plan).ok_or(HarnessError::NoConfig)?;
+        let config = config_json(self, plan, generation).ok_or(HarnessError::NoConfig)?;
         let mut spec = SpawnSpec::new(self.program(), plan.cwd.clone())
             .geometry(PtyGeometry::new(
                 RUN_COLS,
@@ -2051,6 +2803,13 @@ impl Flavor {
                 plan.geometry.cell_height,
             ))
             .fixed_size();
+        // Unchanged across both generations — measured on 2.0.16, which still takes `--port` and
+        // `--hostname` and still guards its routes with `<PREFIX>_SERVER_PASSWORD`.
+        //
+        // Two flags 2.0 added are deliberately **not** here. `--service` would register this
+        // per-run server as *the* machine-wide background service, which is the exact inversion of
+        // what it is for — every other run on the machine would then be a client of this one run's
+        // worktree. `--stdio` would take the port away, and the port is how a pane finds it.
         for arg in [
             "serve".to_string(),
             "--port".to_string(),
@@ -2069,9 +2828,23 @@ impl Flavor {
     /// The password is not here — it travels in the environment ([`Self::password_env`]), which
     /// the caller sets, because an argv is readable by every process on the machine.
     pub fn attach_spec(&self, conversation: &HarnessSession, url: &str) -> ContinueSpec {
-        ContinueSpec {
-            program: self.program().to_string(),
-            args: vec![
+        self.attach_spec_with(conversation, url, self.cli_flags())
+    }
+
+    /// The half of [`Self::attach_spec`] a test can drive. See [`child_with`].
+    pub fn attach_spec_with(
+        &self,
+        conversation: &HarnessSession,
+        url: &str,
+        flags: CliFlags,
+    ) -> ContinueSpec {
+        // 2.0 deleted the `attach` subcommand and put the same capability on the root TUI's
+        // `--server`, which is also what a `run` turn of that generation uses. There is no `--dir`
+        // to replace either: the root command takes a directory as a positional and the caller
+        // (`cmd::session`) already starts this child in `conversation.cwd`, so the directory is
+        // carried the way 2.0 carries it everywhere else.
+        let args = match flags.generation {
+            Generation::V1 => vec![
                 "attach".into(),
                 url.to_string(),
                 "--dir".into(),
@@ -2079,6 +2852,16 @@ impl Flavor {
                 "--session".into(),
                 conversation.id.trim().to_string(),
             ],
+            Generation::V2 => vec![
+                "--server".into(),
+                url.to_string(),
+                "--session".into(),
+                conversation.id.trim().to_string(),
+            ],
+        };
+        ContinueSpec {
+            program: self.program().to_string(),
+            args,
             resume: None,
         }
     }
@@ -2127,6 +2910,127 @@ fn pool_retry(flavor: &Flavor) -> Option<Value> {
     }))
 }
 
+/// One document, in the spelling this generation of the CLI reads. See [`as_v2`].
+fn as_generation(generation: Generation, document: Value) -> Value {
+    match generation {
+        Generation::V1 => document,
+        Generation::V2 => as_v2(document),
+    }
+}
+
+/// The document opencode **1** wants, rewritten as the one opencode **2** wants. (M110)
+///
+/// # A translation, and emphatically not a second builder
+///
+/// [`provider_members`]' header states the rule this file is held to — one producer for the
+/// provider block, so the model probe and a run cannot disagree — and two independently written
+/// documents drift in exactly the shape that header names: a Models menu listing ids no run can
+/// use. Everything upstream goes on building the 1.x document it always built, and both
+/// generations leave through here, which is what keeps
+/// `a_probe_and_a_run_carry_the_same_provider_block` a true statement about both.
+///
+/// # Total, and refusing rather than passing through
+///
+/// A 1.x key with no 2.0 mapping is **dropped**, never forwarded. 1.18.29 refuses a whole
+/// document over one key it does not declare — measured, and the module header records what a
+/// refused document costs — and 2.0 refuses in a way that is loud for `run --agent` (the role is
+/// simply not there, and it says so) but silent for the paths that name no agent. So the map
+/// below is the whole contract and anything outside it is discarded.
+///
+/// # The renames, read off a real 2.0 configuration
+///
+/// Taken from a working 2.0.16 installation's own file as `opencode debug config` echoes it
+/// back, not from release notes:
+///
+/// | 1.x | 2.0 |
+/// | --- | --- |
+/// | `agent` | `agents` |
+/// | `provider` | `providers` |
+/// | `provider.<id>.npm` | `providers.<id>.package`, prefixed `aisdk:` |
+/// | `provider.<id>.options` | `providers.<id>.settings` |
+/// | `mcp.<name>` | `mcp.servers.<name>` |
+/// | `mcp.<name>.enabled: true` | `mcp.servers.<name>.disabled: false` |
+///
+/// `$schema` is unchanged — the 2.0 file on the probed machine still names
+/// `https://opencode.ai/config.json` — so [`Flavor::schema`] is not a generation-shaped field.
+/// `provider.<id>.models.<id>.limit` survives verbatim, `{context, output}` and all, which is
+/// why [`provider_members`]' all-or-nothing rule needs no second statement here.
+fn as_v2(document: Value) -> Value {
+    let Value::Object(v1) = document else {
+        return document;
+    };
+    let mut out = serde_json::Map::new();
+
+    if let Some(schema) = v1.get("$schema") {
+        out.insert("$schema".into(), schema.clone());
+    }
+    if let Some(agents) = v1.get("agent") {
+        out.insert("agents".into(), agents.clone());
+    }
+    if let Some(Value::Object(providers)) = v1.get("provider") {
+        let mut translated = serde_json::Map::new();
+        for (id, entry) in providers {
+            let Value::Object(entry) = entry else {
+                continue;
+            };
+            let mut described = serde_json::Map::new();
+            if let Some(name) = entry.get("name") {
+                described.insert("name".into(), name.clone());
+            }
+            // `aisdk:` is 2.0's registry prefix, and the bare package name it prefixes is exactly
+            // what 1.x's `npm` held — measured on a real file, whose every custom provider reads
+            // `"package": "aisdk:@ai-sdk/openai-compatible"` against cide's own `npm` default of
+            // `@ai-sdk/openai-compatible`. An entry with no `npm` writes no `package`, which is
+            // also what that file's catalog-backed provider does.
+            if let Some(npm) = entry
+                .get("npm")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+            {
+                described.insert("package".into(), json!(format!("aisdk:{npm}")));
+            }
+            if let Some(options) = entry.get("options") {
+                described.insert("settings".into(), options.clone());
+            }
+            if let Some(models) = entry.get("models") {
+                described.insert("models".into(), models_as_v2(models));
+            }
+            translated.insert(id.clone(), Value::Object(described));
+        }
+        if !translated.is_empty() {
+            out.insert("providers".into(), Value::Object(translated));
+        }
+    }
+    if let Some(Value::Object(servers)) = v1.get("mcp") {
+        let mut translated = serde_json::Map::new();
+        for (name, server) in servers {
+            let Value::Object(server) = server else {
+                continue;
+            };
+            let mut described = serde_json::Map::new();
+            for key in ["type", "command", "environment"] {
+                if let Some(value) = server.get(key) {
+                    described.insert(key.into(), value.clone());
+                }
+            }
+            // The sense is inverted, so an untranslated `enabled` would not merely be ignored —
+            // it would leave the server at 2.0's own default with cide believing it said so.
+            if let Some(enabled) = server.get("enabled").and_then(Value::as_bool) {
+                described.insert("disabled".into(), json!(!enabled));
+            }
+            translated.insert(name.clone(), Value::Object(described));
+        }
+        out.insert(
+            "mcp".into(),
+            json!({ "servers": Value::Object(translated) }),
+        );
+    }
+    // `retry` is deliberately absent: it is [`pool_retry`]'s, which is MiMo's alone, and MiMo is
+    // a fork of opencode **1** — so this arm is unreachable today and is stated rather than left
+    // to a reader to infer from a key that quietly vanished.
+    Value::Object(out)
+}
+
 /// The whole `OPENCODE_CONFIG_CONTENT` document: this role, and cide's MCP server.
 ///
 /// # Built with serde, never `format!`
@@ -2154,7 +3058,7 @@ fn pool_retry(flavor: &Flavor) -> Option<Value> {
 /// `None` is unreachable — `serde_json::to_string` of a `Value` whose keys are all strings cannot
 /// fail — and is still an `Option` rather than an `unwrap`, because the caller turns it into a
 /// refusal and a refused run is always better than a panicking one.
-fn config_json(flavor: &Flavor, plan: &RunPlan<'_>) -> Option<String> {
+fn config_json(flavor: &Flavor, plan: &RunPlan<'_>, generation: Generation) -> Option<String> {
     let def = &plan.agent.def;
 
     let mut role = serde_json::Map::new();
@@ -2228,7 +3132,16 @@ fn config_json(flavor: &Flavor, plan: &RunPlan<'_>) -> Option<String> {
     config.insert("agent".into(), Value::Object(agents));
     // The user's providers, from global settings. Merged into this document rather than built
     // beside it, so a run and the model probe cannot disagree — see `provider_members`.
-    config.extend(provider_members(&plan.llm));
+    // With the variant this run resolves to declared on its model — `run_target`, the same pair
+    // `child` puts on the command line, so the argv never names a variant the document lacks.
+    let (model, variant) = run_target(plan);
+    let extra = model
+        .as_deref()
+        .map(|model| (model, variant.as_deref().unwrap_or_default()));
+    config.extend(provider_members(
+        &plan.llm,
+        &pool_efforts(&plan.llm, generation, extra),
+    ));
     // Only on a pool: see `pool_retry`.
     if plan.choice.is_some()
         && let Some(retry) = pool_retry(flavor)
@@ -2251,12 +3164,66 @@ fn config_json(flavor: &Flavor, plan: &RunPlan<'_>) -> Option<String> {
         config.insert("mcp".into(), Value::Object(servers));
     }
 
-    serde_json::to_string(&Value::Object(config)).ok()
+    // Built as the 1.x document throughout, and rewritten once, here, for the CLI that wants the
+    // other spelling. See `as_v2` for why this is a translation and not a second builder.
+    //
+    // The generation is a **parameter** and not a `flavor.cli_flags()` read, for the reason
+    // `verdict` and `plan_respawn` are split the way they are: this is the half a test can drive,
+    // and a test that had to prime a process-wide probe cache to see the document it asserts on
+    // is a test nobody can read.
+    let document = match generation {
+        Generation::V1 => Value::Object(config),
+        Generation::V2 => as_v2(Value::Object(config)),
+    };
+    serde_json::to_string(&document).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two command lines, as [`CliFlags`] a test states outright. (M110)
+    ///
+    /// Stated and not probed: the probe's answer is a process-wide cache keyed by the installed
+    /// binary, so a test that primed it could assert only one generation and would race every
+    /// other test in this binary. These drive the `_with` seams instead, which is what lets both
+    /// argvs be asserted side by side — and means a machine with no opencode on it at all still
+    /// runs every one of these.
+    fn v1() -> CliFlags {
+        CliFlags::default()
+    }
+    fn v2() -> CliFlags {
+        CliFlags {
+            generation: Generation::V2,
+            run_password: false,
+            run_server: true,
+            ..CliFlags::default()
+        }
+    }
+    /// `spawn_spec`/`respawn_spec`/`continue_spec`/`attach_spec` pinned to opencode **1**, which
+    /// is what every assertion written before M110 is about. Their v2 twins state `v2()`.
+    fn child_v1(plan: &RunPlan<'_>) -> Result<HarnessSpawn, HarnessError> {
+        child_with(&OPENCODE_CLI, plan, None, v1())
+    }
+    /// A turn's spec on a stated command line.
+    fn turn_on(flags: CliFlags, plan: &RunPlan<'_>) -> HarnessSpawn {
+        child_with(&OPENCODE_CLI, plan, None, flags).expect("a turn")
+    }
+    fn respawn_v1(plan: &RunPlan<'_>, session: &str) -> Result<HarnessSpawn, HarnessError> {
+        child_with(&OPENCODE_CLI, plan, Some(session), v1())
+    }
+    impl Flavor {
+        fn continue_spec_v1(
+            &self,
+            conversation: &HarnessSession,
+        ) -> Result<ContinueSpec, HarnessError> {
+            self.continue_spec_with(conversation, v1())
+        }
+        fn attach_spec_v1(&self, conversation: &HarnessSession, url: &str) -> ContinueSpec {
+            self.attach_spec_with(conversation, url, v1())
+        }
+    }
+
     use crate::harness::render::{ERASE_MARKER, MARKER};
 
     /// The tracker paragraph as *this* harness renders it — `cide_cide_task_get`, not
@@ -2277,7 +3244,7 @@ mod tests {
         });
 
         let server = OPENCODE_CLI
-            .serve_spec(&plan, 47000, "pw")
+            .serve_spec_with(&plan, 47000, "pw", Generation::V1)
             .expect("a server");
         assert_eq!(
             server.args,
@@ -2295,7 +3262,7 @@ mod tests {
         assert!(config["agent"]["developer"].is_object(), "{config}");
         assert!(config["mcp"][SERVER].is_object(), "{config}");
 
-        let turn = OpencodeHarness.spawn_spec(&plan).expect("a turn").spec;
+        let turn = child_v1(&plan).expect("a turn").spec;
         let at = turn
             .args
             .iter()
@@ -2308,11 +3275,11 @@ mod tests {
 
         // Standalone, as every run was before: no flag, no password.
         plan.server = None;
-        let turn = OpencodeHarness.spawn_spec(&plan).expect("a turn").spec;
+        let turn = child_v1(&plan).expect("a turn").spec;
         assert!(!turn.args.iter().any(|a| a == "--attach"));
         assert_eq!(env_value(&turn, "OPENCODE_SERVER_PASSWORD"), None);
 
-        let attach = MIMO_CLI.attach_spec(
+        let attach = MIMO_CLI.attach_spec_v1(
             &HarnessSession {
                 harness: cide_ipc::Harness::Mimo,
                 id: SESSION.into(),
@@ -2348,17 +3315,79 @@ mod tests {
         assert_eq!(
             old,
             CliFlags {
+                generation: Generation::V1,
                 run_skip_permissions: false,
                 run_password: false,
+                run_server: false,
                 tui_skip_permissions: false,
             }
         );
         const NEW_RUN: &str = "      --attach  attach\n  -p, --password  basic auth password\n      \
-            --auto  auto-approve permissions";
+            --dir  dir\n      --auto  auto-approve permissions";
         let new = CliFlags::from_help("--auto", NEW_RUN, "      --auto  auto-approve");
         assert_eq!(new, CliFlags::default());
         // A word that merely contains the flag is not the flag.
         assert!(!CliFlags::from_help("--auto", "--autocomplete", "").run_skip_permissions);
+    }
+
+    /// The real usage opencode **2.0.16** prints, trimmed to its flag blocks, beside the 1.x one:
+    /// the generation is read off the command line itself, and the description-only mention of
+    /// `--standalone` that rides in *both* usages does not move it. (M110)
+    #[test]
+    fn the_generation_is_read_off_the_usage() {
+        // `opencode run --help`, 2.0.16, verbatim but for the leading blocks.
+        const V2_RUN: &str = "FLAGS\n  \
+            --standalone            Run with a private server instead of the background service\n  \
+            --server string         Connect to a server URL instead of the background service\n  \
+            --session, -s string    Session ID to continue\n  \
+            --model, -m string      Model to use in the format provider/model#variant\n  \
+            --agent string          Agent to use\n  \
+            --format choice         Output format (choices: default, json)\n  \
+            --title string          Session title\n  \
+            --thinking              Show thinking blocks\n  \
+            --auto                  Auto-approve permissions that are not explicitly denied\n\n\
+            GLOBAL FLAGS\n  \
+            --print-logs            Print logs to stderr (server logs require --standalone)";
+        // `opencode --help`, 2.0.16: the root TUI, which has no `--model` any more.
+        const V2_TUI: &str = "FLAGS\n  \
+            --standalone            Run with a private server instead of the background service\n  \
+            --server string         Connect to a server URL instead of the background service\n  \
+            --auto                  Auto-approve permissions that are not explicitly denied\n  \
+            --prompt string         Prompt to use\n\n\
+            GLOBAL FLAGS\n  \
+            --print-logs            Print logs to stderr (server logs require --standalone)";
+        assert_eq!(
+            CliFlags::from_help("--auto", V2_RUN, V2_TUI),
+            CliFlags {
+                generation: Generation::V2,
+                run_skip_permissions: true,
+                // Gone in 2.0, and `can_attach` is why that is not the end of M105.
+                run_password: false,
+                run_server: true,
+                tui_skip_permissions: true,
+            }
+        );
+        assert!(CliFlags::from_help("--auto", V2_RUN, V2_TUI).can_attach());
+
+        // **The trap.** `--print-logs`' description names the flag, and that line is in every
+        // 1.x usage cide has ever read as well. Only the paren-attached token saves the positive
+        // half, so the `--dir` half is what actually decides it: a usage that has `--dir` is v1
+        // however often the word `--standalone` appears in its prose.
+        const V1_WITH_THE_WORD: &str = "  --dir  dir\n  --variant  variant\n  \
+            --print-logs  Print logs to stderr (server logs require --standalone)";
+        assert_eq!(
+            CliFlags::from_help("--auto", V1_WITH_THE_WORD, "").generation,
+            Generation::V1
+        );
+
+        // A probe that never ran reads as the *current* release of that particular CLI, which is
+        // two different answers since 2.0 — see `Flavor::default_flags`.
+        assert_eq!(OPENCODE_CLI.default_flags().generation, Generation::V2);
+        assert!(!OPENCODE_CLI.default_flags().run_password);
+        assert!(OPENCODE_CLI.default_flags().can_attach());
+        assert_eq!(MIMO_CLI.default_flags().generation, Generation::V1);
+        assert!(MIMO_CLI.default_flags().run_password);
+        assert!(!MIMO_CLI.default_flags().run_server);
     }
 
     /// M104's tab: the TUI, `--prompt` last, and a document with cide's server and no role.
@@ -2366,7 +3395,11 @@ mod tests {
     fn a_tab_is_the_tui_with_the_task_tools_and_no_role() {
         let hook = PathBuf::from("/opt/cide/cide-hook");
         let document = OPENCODE_CLI
-            .tab_config(&cide_ipc::LlmSettings::default(), Some(&hook))
+            .tab_config(
+                &cide_ipc::LlmSettings::default(),
+                Some(&hook),
+                Generation::V1,
+            )
             .expect("a document");
         let value: Value = serde_json::from_str(&document).expect("json");
         assert_eq!(
@@ -2376,7 +3409,7 @@ mod tests {
         assert!(value.get("agent").is_none(), "{document}");
         // Nothing to say, nothing set: the user's own configuration is all the CLI reads.
         assert_eq!(
-            OPENCODE_CLI.tab_config(&cide_ipc::LlmSettings::default(), None),
+            OPENCODE_CLI.tab_config(&cide_ipc::LlmSettings::default(), None, Generation::V1),
             None
         );
     }
@@ -2423,6 +3456,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             extras: Vec::new(),
+            sandbox: Default::default(),
         }
     }
 
@@ -2459,11 +3493,14 @@ mod tests {
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
             server: None,
+            git_dirs: Vec::new(),
+            sandbox_brief: None,
+            codex_trust_root: None,
         }
     }
 
     fn spawn(plan: &RunPlan<'_>) -> HarnessSpawn {
-        OpencodeHarness.spawn_spec(plan).expect("a spawnable plan")
+        child_v1(plan).expect("a spawnable plan")
     }
 
     fn at(args: &[String], token: &str) -> usize {
@@ -2852,6 +3889,283 @@ mod tests {
         );
     }
 
+    /// The same invocation on opencode **2**, measured against 2.0.16's own usage: the ownership
+    /// token first, the variant folded into the model, and the three flags 2.0 deleted nowhere in
+    /// sight. (M110)
+    #[test]
+    fn the_v2_argv_is_the_measured_invocation() {
+        let mut agent = role();
+        agent.def.model = Some("anthropic/claude-sonnet-4-5".into());
+        agent.effort = Some("high".into());
+        let plan = plan_for(&agent);
+        let spawned = turn_on(v2(), &plan);
+        let args = &spawned.spec.args;
+
+        assert_eq!(args[0], "run", "{args:?}");
+        // **Immediately after `run`, before `--agent`**: it decides which process owns the
+        // configuration that `--agent` then names. Without it the child is a client of the
+        // machine-wide background service and answers `Agent not found: "developer"`.
+        assert_eq!(args[1], "--standalone", "{args:?}");
+        assert_eq!(value_of(args, "--agent"), "developer");
+        // `--variant` is gone; the CLI's own usage documents the fold as `provider/model#variant`.
+        assert_eq!(
+            value_of(args, "--model"),
+            "anthropic/claude-sonnet-4-5#high"
+        );
+        assert_eq!(value_of(args, "--format"), "json");
+        assert!(args.iter().any(|arg| arg == "--thinking"), "{args:?}");
+        assert_eq!(
+            value_of(args, "--title"),
+            "Developer · Teach the parser about tabs"
+        );
+        // The message stays positional and last on both command lines.
+        assert_eq!(args.last().map(String::as_str), Some(&*plan.prompt));
+        assert_eq!(spawned.opening, None);
+        // No `--dir`: 2.0 answers `Unrecognized flag: --dir` and then prints *no JSON at all*,
+        // which would leave the run mute on the only channel this harness has. The cwd carries it.
+        assert_eq!(
+            spawned.spec.cwd,
+            PathBuf::from("/repo/.cide/worktrees/developer")
+        );
+    }
+
+    /// Neither command line's flags leak into the other. The failure this pins is not subtle —
+    /// an unknown flag is a usage page on 1.x and a refusal on 2.0 — but it is the one a later
+    /// edit to `child_with` would cause, and it is cheaper to assert than to read. (M110)
+    #[test]
+    fn nothing_from_one_generation_reaches_the_other() {
+        let mut agent = role();
+        agent.def.model = Some("anthropic/claude-sonnet-4-5".into());
+        agent.effort = Some("high".into());
+        let plan = plan_for(&agent);
+
+        let v2_args = turn_on(v2(), &plan).spec.args;
+        for gone in ["--dir", "--variant", "--attach", "--password"] {
+            assert!(!v2_args.iter().any(|a| a == gone), "{gone}: {v2_args:?}");
+        }
+        let v1_args = turn_on(v1(), &plan).spec.args;
+        for unknown in ["--standalone", "--server"] {
+            assert!(
+                !v1_args.iter().any(|a| a == unknown),
+                "{unknown}: {v1_args:?}"
+            );
+        }
+        // And the one thing that must be identical on both: the message, last.
+        assert_eq!(v1_args.last(), v2_args.last());
+    }
+
+    /// A served run on opencode 2: `--server` is 1.x's `--attach`, the password never reaches an
+    /// argv, and `--standalone` is **absent** beside it — measured, the two cannot be combined,
+    /// and a served turn is already a client of a server cide started with this document. (M110)
+    #[test]
+    fn a_served_v2_run_is_a_client_and_not_a_private_server() {
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.server = Some(crate::RunServer {
+            url: "http://127.0.0.1:47000".into(),
+            password: "pw".into(),
+        });
+
+        let turn = turn_on(v2(), &plan).spec;
+        assert_eq!(turn.args[1], "--server", "{:?}", turn.args);
+        assert_eq!(turn.args[2], "http://127.0.0.1:47000");
+        assert!(
+            !turn.args.iter().any(|a| a == "--standalone"),
+            "{:?}",
+            turn.args
+        );
+        assert!(!turn.args.iter().any(|a| a == "pw"), "{:?}", turn.args);
+        assert_eq!(env_value(&turn, "OPENCODE_SERVER_PASSWORD"), Some("pw"));
+
+        // The same run with no server falls back to owning one, never to the background service.
+        plan.server = None;
+        let alone = turn_on(v2(), &plan).spec;
+        assert_eq!(alone.args[1], "--standalone", "{:?}", alone.args);
+        assert_eq!(env_value(&alone, "OPENCODE_SERVER_PASSWORD"), None);
+
+        // `serve` itself is one argv on both, and must never register itself machine-wide.
+        let server = OPENCODE_CLI
+            .serve_spec_with(&plan, 47000, "pw", Generation::V2)
+            .expect("a server");
+        assert_eq!(
+            server.args,
+            ["serve", "--port", "47000", "--hostname", "127.0.0.1"]
+        );
+        assert!(!server.args.iter().any(|a| a == "--service"), "{server:?}");
+
+        // And the pane that attaches to it: `attach` is gone, `--server` replaces it, and the
+        // directory travels as the child's cwd because the root command has no `--dir`.
+        let conversation = HarnessSession {
+            harness: cide_ipc::Harness::Opencode,
+            id: SESSION.into(),
+            cwd: PathBuf::from("/repo/.cide/worktrees/developer-t-14"),
+        };
+        let attach = OPENCODE_CLI.attach_spec_with(&conversation, "http://127.0.0.1:47001", v2());
+        assert_eq!(
+            attach.args,
+            ["--server", "http://127.0.0.1:47001", "--session", SESSION]
+        );
+        // A finished run re-opened in a pane owns its server for the same worktree reason.
+        let resumed = OPENCODE_CLI
+            .continue_spec_with(&conversation, v2())
+            .expect("a pane");
+        assert_eq!(resumed.args, ["--standalone", "--session", SESSION]);
+    }
+
+    /// The document in 2.0's spelling, and the one thing that may **not** change with it: the
+    /// role reads the same paragraphs, byte for byte, on either command line. (M110)
+    #[test]
+    fn the_v2_document_renames_the_keys_and_not_the_prompt() {
+        let agent = role();
+        let plan = plan_for(&agent);
+        let v1_doc = config_of(&turn_on(v1(), &plan).spec);
+        let v2_doc = config_of(&turn_on(v2(), &plan).spec);
+
+        assert!(v2_doc["agent"].is_null(), "{v2_doc}");
+        assert!(v2_doc["agents"]["developer"].is_object(), "{v2_doc}");
+        assert_eq!(v2_doc["agents"]["developer"]["mode"], "primary");
+        assert_eq!(v2_doc["$schema"], v1_doc["$schema"]);
+        // `mcp.<name>` became `mcp.servers.<name>`, and `enabled` inverted into `disabled` —
+        // an untranslated `enabled` would not be ignored, it would leave the bridge at 2.0's own
+        // default while cide believed it had said so.
+        assert!(v2_doc["mcp"][SERVER].is_null(), "{v2_doc}");
+        assert_eq!(
+            v2_doc["mcp"]["servers"][SERVER]["command"],
+            v1_doc["mcp"][SERVER]["command"]
+        );
+        assert_eq!(v2_doc["mcp"]["servers"][SERVER]["disabled"], json!(false));
+        // **The parity that must hold.** `harness.rs` pins that one role pointed at either CLI
+        // reads the same brief; this pins that the same is true of either *generation* of one CLI.
+        assert_eq!(
+            v2_doc["agents"]["developer"]["prompt"],
+            v1_doc["agent"]["developer"]["prompt"]
+        );
+    }
+
+    /// The provider block, renamed the way a real 2.0 configuration spells it. (M110)
+    #[test]
+    fn the_v2_provider_block_is_the_shape_a_real_two_point_oh_file_uses() {
+        let llm = providers();
+        let v1_doc: Value = serde_json::from_str(
+            &provider_config_content(&OPENCODE_CLI, &llm, Generation::V1).expect("a document"),
+        )
+        .expect("json");
+        let v2_doc: Value = serde_json::from_str(
+            &provider_config_content(&OPENCODE_CLI, &llm, Generation::V2).expect("a document"),
+        )
+        .expect("json");
+
+        assert!(v2_doc["provider"].is_null(), "{v2_doc}");
+        let (id, v1_entry) = v1_doc["provider"]
+            .as_object()
+            .expect("providers")
+            .iter()
+            .find(|(_, entry)| entry.get("npm").is_some())
+            .expect("a custom provider");
+        let v2_entry = &v2_doc["providers"][id];
+        // `npm` → `package`, under 2.0's registry prefix.
+        assert_eq!(
+            v2_entry["package"],
+            json!(format!("aisdk:{}", v1_entry["npm"].as_str().expect("npm")))
+        );
+        assert!(v2_entry["npm"].is_null(), "{v2_entry}");
+        // `options` → `settings`, with opencode's own `baseURL` capitalisation carried through.
+        assert_eq!(v2_entry["settings"], v1_entry["options"]);
+        assert!(v2_entry["options"].is_null(), "{v2_entry}");
+        // `models`, and its all-or-nothing `limit`, survive verbatim.
+        assert_eq!(v2_entry["models"], v1_entry["models"]);
+        // The rule that outlives both spellings: never a `plugin` key.
+        assert!(!v2_doc.to_string().contains("\"plugin\""), "{v2_doc}");
+    }
+
+    /// The tab on opencode 2: it owns its server, and it names no model because the root TUI
+    /// has none to name. (M110)
+    #[test]
+    fn a_v2_tab_owns_its_server_and_names_no_model() {
+        let hook = PathBuf::from("/opt/cide/cide-hook");
+        let launch = OPENCODE_CLI
+            .tab_launch_with(
+                "review the diff",
+                Some("anthropic/claude-sonnet-4-5"),
+                true,
+                &cide_ipc::LlmSettings::default(),
+                Some(&hook),
+                v2(),
+            )
+            .expect("a launch");
+        assert_eq!(launch.args[0], "--standalone", "{:?}", launch.args);
+        // Measured: `opencode --model x` answers `Unrecognized flag: --model in command opencode`.
+        // Only `mini` kept it, and `mini` has no `--auto` — which is the flag that cannot be
+        // recovered any other way, so `mini` is the option that lost.
+        assert!(
+            !launch.args.iter().any(|a| a == "--model"),
+            "{:?}",
+            launch.args
+        );
+        assert!(
+            launch.args.iter().any(|a| a == "--auto"),
+            "{:?}",
+            launch.args
+        );
+        assert_eq!(
+            launch.args.last().map(String::as_str),
+            Some("review the diff")
+        );
+        // The document is the tab's whole reason, and it travels in 2.0's spelling.
+        let document: Value = serde_json::from_str(
+            &launch
+                .env
+                .iter()
+                .find(|(name, _)| name == "OPENCODE_CONFIG_CONTENT")
+                .expect("a document")
+                .1,
+        )
+        .expect("json");
+        assert!(document["mcp"]["servers"][SERVER].is_object(), "{document}");
+        // A session is not a role: still no inline agent, under either spelling.
+        assert!(
+            document["agent"].is_null() && document["agents"].is_null(),
+            "{document}"
+        );
+    }
+
+    /// Where the variant is joined, and the id it refuses to touch. (M110)
+    #[test]
+    fn the_variant_is_folded_only_for_the_cli_that_lost_the_flag() {
+        assert_eq!(
+            model_args(Generation::V1, "openrouter/a", Some("high")),
+            ("openrouter/a".into(), Some("high".into()))
+        );
+        assert_eq!(
+            model_args(Generation::V2, "openrouter/a", Some("high")),
+            ("openrouter/a#high".into(), None)
+        );
+        // No variant is no suffix, on either — an empty one is no variant at all.
+        assert_eq!(
+            model_args(Generation::V2, "openrouter/a", None),
+            ("openrouter/a".into(), None)
+        );
+        assert_eq!(
+            model_args(Generation::V2, "openrouter/a", Some("  ")),
+            ("openrouter/a".into(), None)
+        );
+        // An id that already names a variant is the user's, and a second `#` would corrupt it —
+        // `is_model_id` permits anything but whitespace after the first `/`, and real ids are
+        // hostile (`unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` is one).
+        assert_eq!(
+            model_args(Generation::V2, "openrouter/a#low", Some("high")),
+            ("openrouter/a#low".into(), None)
+        );
+        assert_eq!(
+            model_args(
+                Generation::V2,
+                "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M",
+                Some("high")
+            ),
+            ("unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M#high".into(), None)
+        );
+    }
+
     /// The invocation shape, in the order it is written, with the message last.
     #[test]
     fn the_argv_is_the_measured_invocation() {
@@ -2951,9 +4265,7 @@ mod tests {
 
         assert_eq!(OpencodeHarness.deliver("carry on"), Delivery::Respawn);
 
-        let spawned = OpencodeHarness
-            .respawn_spec(&plan, SESSION)
-            .expect("a continuable plan");
+        let spawned = respawn_v1(&plan, SESSION).expect("a continuable plan");
         let args = &spawned.spec.args;
         assert_eq!(value_of(args, "--session"), SESSION);
         // The conversation already has a title; renaming it mid-flight is not this call's to do.
@@ -3008,7 +4320,7 @@ mod tests {
         let mut agent = role();
         agent.def.harness = cide_ipc::Harness::Claude;
         assert_eq!(
-            OpencodeHarness.spawn_spec(&plan_for(&agent)).unwrap_err(),
+            child_v1(&plan_for(&agent)).unwrap_err(),
             HarnessError::WrongHarness {
                 plan: cide_ipc::Harness::Claude,
                 harness: cide_ipc::Harness::Opencode,
@@ -3018,10 +4330,7 @@ mod tests {
         let agent = role();
         let mut plan = plan_for(&agent);
         plan.prompt = "   ".into();
-        assert_eq!(
-            OpencodeHarness.spawn_spec(&plan).unwrap_err(),
-            HarnessError::NoPrompt
-        );
+        assert_eq!(child_v1(&plan).unwrap_err(), HarnessError::NoPrompt);
     }
 
     /// A step's figures, and the arithmetic that says they were read the right way round. (M80)
@@ -3071,6 +4380,28 @@ mod tests {
         // words is still parsed and still refused.
         assert_eq!(
             usage(r#"{"type":"text","part":{"text":"\"type\":\"step_finish\""}}"#),
+            None
+        );
+    }
+
+    /// Both edges of a step are read with the CLI's clock and session, and nothing else is.
+    #[test]
+    fn a_step_is_timed_by_its_own_two_lines() {
+        let start = step_clock(STEP_START).expect("a step_start is an edge");
+        assert_eq!(start.edge, super::super::StepEdge::Start);
+        assert_eq!(start.session, SESSION);
+        assert_eq!(start.at_unix_ms, Some(1_755_402_000_000));
+        let finish = step_clock(STEP_FINISH).expect("a step_finish is an edge");
+        assert_eq!(finish.edge, super::super::StepEdge::Finish);
+        assert_eq!(finish.at_unix_ms, Some(1_755_402_002_000));
+        // A line with no clock still names its edge; the app times it by arrival instead.
+        let bare = step_clock(r#"{"type":"step_start","sessionID":"ses_x"}"#).expect("an edge");
+        assert_eq!(bare.at_unix_ms, None);
+        for quiet in [TEXT, "not json at all", "{}"] {
+            assert_eq!(step_clock(quiet), None, "{quiet}");
+        }
+        assert_eq!(
+            step_clock(r#"{"type":"text","part":{"text":"\"type\":\"step_start\""}}"#),
             None
         );
     }
@@ -3355,6 +4686,66 @@ notamodel
         assert!(refused.contains("not JSON"), "{refused}");
     }
 
+    /// opencode 2 answers `debug config` with the **sources** it merged, not the merge — and that
+    /// array is perfectly good JSON, so before M110 the parse succeeded, every field came back
+    /// empty, and nothing failed anywhere. The consequence is the one `UserConfig`'s header exists
+    /// to record: with no default model to fold in, a continued session keeps the model it was
+    /// last on, for ever.
+    ///
+    /// The fixture is this machine's own 2.0.16 output, trimmed.
+    #[test]
+    fn the_two_point_oh_configuration_is_the_last_document_in_its_source_list() {
+        const SOURCES: &str = r#"[
+  {
+    "type": "document",
+    "path": "/home/u/.config/opencode/opencode.jsonc",
+    "info": {
+      "$schema": "https://opencode.ai/config.json",
+      "model": { "providerID": "deepseek", "model": "deepseek-flash" },
+      "compaction": { "auto": true, "buffer": 16384 },
+      "providers": {
+        "deepseek": { "settings": { "apiKey": "sk" } },
+        "vllm": { "package": "aisdk:@ai-sdk/openai-compatible", "settings": { "baseURL": "http://127.0.0.1:8000/v1" } }
+      }
+    }
+  },
+  { "type": "directory", "path": "/home/u/.config/opencode", "info": {} },
+  { "type": "directory", "path": "/home/u/.opencode", "info": {} }
+]"#;
+        let config = parse_user_config(SOURCES).expect("json");
+        // `{providerID, model}` composed into the spelling `--model` takes, which is what
+        // `UserConfig::model` promises and what `with_default_model` hands a child.
+        assert_eq!(config.model.as_deref(), Some("deepseek/deepseek-flash"));
+        // `provider` became `providers`; it is kept for equality only, so the rename costs one
+        // `or_else` and nothing reads a field of it.
+        assert!(config.provider.contains("vllm"), "{}", config.provider);
+        // This machine's file names no small model, and an absent key is `None` on both
+        // generations rather than a refusal.
+        assert_eq!(config.small_model, None);
+
+        // A `directory` source carries an empty `info`, and folding it in would let it erase a key
+        // the document before it set. Later documents win; that is the merge order opencode
+        // printed them in.
+        let second = SOURCES.replace(
+            r#"{ "type": "directory", "path": "/home/u/.opencode", "info": {} }"#,
+            r#"{ "type": "document", "path": "/repo/opencode.json", "info": { "model": { "providerID": "vllm", "model": "qwen" } } }"#,
+        );
+        assert_eq!(
+            parse_user_config(&second).expect("json").model.as_deref(),
+            Some("vllm/qwen")
+        );
+
+        // An empty source list is a configuration that names nothing, not a failure.
+        assert_eq!(
+            parse_user_config("[]").expect("json"),
+            UserConfig {
+                model: None,
+                small_model: None,
+                provider: String::new()
+            }
+        );
+    }
+
     /// The installed binary answers `debug config` with a document the parser reads. Free: it
     /// reads files and prints, and never reaches a model.
     #[test]
@@ -3377,8 +4768,8 @@ notamodel
     fn continuing_a_conversation_opens_the_tui_on_its_session() {
         use cide_ipc::{Harness, HarnessSession};
 
-        let spec = OpencodeHarness
-            .continue_spec(&HarnessSession {
+        let spec = OPENCODE_CLI
+            .continue_spec_v1(&HarnessSession {
                 harness: Harness::Opencode,
                 id: "ses_0a1b2c".into(),
                 cwd: std::path::PathBuf::from("/p/.cide/worktrees/qa-t-2"),
@@ -3399,8 +4790,8 @@ notamodel
             "an opencode id is not a cide session"
         );
 
-        let refused = OpencodeHarness
-            .continue_spec(&HarnessSession {
+        let refused = OPENCODE_CLI
+            .continue_spec_v1(&HarnessSession {
                 harness: Harness::Opencode,
                 id: "   ".into(),
                 cwd: std::path::PathBuf::from("/p"),
@@ -3411,8 +4802,8 @@ notamodel
             "{refused}"
         );
 
-        let wrong = OpencodeHarness
-            .continue_spec(&HarnessSession {
+        let wrong = OPENCODE_CLI
+            .continue_spec_v1(&HarnessSession {
                 harness: Harness::Claude,
                 id: cide_ipc::SessionId::new().to_string(),
                 cwd: std::path::PathBuf::from("/p"),
@@ -3496,7 +4887,8 @@ notamodel
 
         let run = config_of(&spawn(&plan).spec);
         let probe: Value = serde_json::from_str(
-            &provider_config_content(&OPENCODE_CLI, &llm).expect("something to say"),
+            &provider_config_content(&OPENCODE_CLI, &llm, Generation::V1)
+                .expect("something to say"),
         )
         .expect("valid JSON");
 
@@ -3504,12 +4896,118 @@ notamodel
         assert!(run["provider"].is_object(), "{run}");
     }
 
+    fn entry(provider: &str, model: &str, variant: &str) -> cide_ipc::PoolEntry {
+        cide_ipc::PoolEntry {
+            provider: provider.into(),
+            model: model.into(),
+            variant: variant.into(),
+            ..Default::default()
+        }
+    }
+
+    /// t-1090: opencode 2 refused `o3/Qwen-Coder#xhigh` because the custom model declared no
+    /// `xhigh`. Every variant a pool asks of a custom model is declared on it, as the effort it
+    /// names; a model no entry gives a variant gets no `variants` key at all.
+    #[test]
+    fn a_pool_variant_is_declared_on_its_custom_model() {
+        let mut llm = providers();
+        llm.pools = vec![cide_ipc::ModelPool {
+            name: "default".into(),
+            entries: vec![
+                entry("ollama", "qwen3:8b", "xhigh"),
+                entry("ollama", "qwen3:8b", " high "),
+                entry("ollama", "qwen3:32b", ""),
+                // Off the card — declared nowhere but the pool (vllm, t-1090).
+                entry("ollama", "user-only", "xhigh"),
+                entry("ollama", "bare", ""),
+                entry("openrouter", "a/b", "high"),
+            ],
+            ..Default::default()
+        }];
+        let members = provider_members(&llm, &pool_efforts(&llm, Generation::V2, None));
+        let models = &members["provider"]["ollama"]["models"];
+        assert_eq!(
+            models["qwen3:8b"]["variants"],
+            json!({
+                "high": { "reasoningEffort": "high" },
+                "xhigh": { "reasoningEffort": "xhigh" },
+            })
+        );
+        assert!(models["qwen3:32b"].get("variants").is_none(), "{models}");
+        // A model the card does not list is declared anyway: the pool is cide's, and the run must
+        // not depend on the user's own opencode.json knowing it.
+        assert_eq!(
+            models["user-only"],
+            json!({ "variants": { "xhigh": { "reasoningEffort": "xhigh" } } })
+        );
+        assert_eq!(models["bare"], json!({}));
+
+        // And it survives the translation to 2.0's document shape.
+        let document: Value = serde_json::from_str(
+            &provider_config_content(&OPENCODE_CLI, &llm, Generation::V2).expect("a document"),
+        )
+        .expect("valid JSON");
+        // In 2.0's spelling: a list of `{id, settings}`. The 1.x map here invalidated the whole
+        // provider — every o3 model answered `Model unavailable` (t-1090).
+        assert_eq!(
+            document["providers"]["ollama"]["models"]["qwen3:8b"]["variants"],
+            json!([
+                { "id": "high", "settings": { "reasoningEffort": "high" } },
+                { "id": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
+            ]),
+            "{document}"
+        );
+    }
+
+    /// opencode 1 takes `--variant` and its schema is unmeasured for a `variants` key; a key it
+    /// refused would sink the whole document. The models are declared there, the efforts are not.
+    #[test]
+    fn opencode_1_declares_no_efforts() {
+        let mut llm = providers();
+        llm.pools = vec![cide_ipc::ModelPool {
+            entries: vec![entry("ollama", "qwen3:8b", "xhigh")],
+            ..Default::default()
+        }];
+        let efforts = pool_efforts(&llm, Generation::V1, Some(("ollama/qwen3:8b", "high")));
+        assert_eq!(efforts.len(), 1, "{efforts:?}");
+        assert!(efforts.values().all(std::collections::BTreeSet::is_empty));
+        let document =
+            provider_config_content(&OPENCODE_CLI, &llm, Generation::V1).expect("a document");
+        assert!(!document.contains("variants"), "{document}");
+    }
+
+    /// The one model and effort a run or a test asks for is declared too — a role's `model` and
+    /// `effort` rather than a pool's — split at the first `/`, a blank effort declaring the model
+    /// alone, and nothing for an id that already carries its own `#suffix`, which `model_args`
+    /// leaves alone.
+    #[test]
+    fn the_effort_being_asked_for_is_declared_beside_the_pool() {
+        let llm = providers();
+        let key = |p: &str, m: &str| (p.to_string(), m.to_string());
+        let asked = pool_efforts(&llm, Generation::V2, Some(("ollama/org/qwen3:8b", "high")));
+        assert_eq!(
+            asked.get(&key("ollama", "org/qwen3:8b")).map(|v| v.len()),
+            Some(1),
+            "{asked:?}"
+        );
+        assert!(
+            pool_efforts(&llm, Generation::V2, Some(("ollama/qwen3:8b#low", "high"))).is_empty()
+        );
+        let bare = pool_efforts(&llm, Generation::V2, Some(("ollama/qwen3:8b", "  ")));
+        assert_eq!(
+            bare.get(&key("ollama", "qwen3:8b"))
+                .map(std::collections::BTreeSet::len),
+            Some(0),
+            "{bare:?}"
+        );
+    }
+
     /// Blank is a key cide omits, never a value cide writes. The document is deep-merged *over*
     /// the user's own configuration with cide's last, so an `apiKey: ""` would blank a working key
     /// in a file cide never touched.
     #[test]
     fn a_catalog_provider_with_no_key_writes_no_block_at_all() {
-        let members = provider_members(&providers());
+        let members = provider_members(&providers(), &ModelEfforts::new());
         let block = &members["provider"];
         assert_eq!(
             block["openrouter"]["options"]["apiKey"],
@@ -3525,7 +5023,7 @@ notamodel
     /// block, no plugin line, no credential.
     #[test]
     fn a_disabled_or_external_provider_writes_nothing() {
-        let members = provider_members(&providers());
+        let members = provider_members(&providers(), &ModelEfforts::new());
         let block = &members["provider"];
         assert!(block.get("groq").is_none(), "disabled: {block}");
         assert!(block.get("openai").is_none(), "external: {block}");
@@ -3540,12 +5038,12 @@ notamodel
         llm.providers
             .retain(|p| matches!(p, cide_ipc::LlmProvider::External { .. }));
         assert!(
-            provider_members(&llm).is_empty(),
+            provider_members(&llm, &ModelEfforts::new()).is_empty(),
             "an external-only settings says nothing"
         );
 
-        let document =
-            provider_config_content(&OPENCODE_CLI, &providers()).expect("something to say");
+        let document = provider_config_content(&OPENCODE_CLI, &providers(), Generation::V1)
+            .expect("something to say");
         assert!(!document.contains("plugin"), "{document}");
     }
 
@@ -3553,7 +5051,7 @@ notamodel
     /// is a claim about a context window rather than a number to write.
     #[test]
     fn a_custom_endpoint_declares_its_models_and_pairs_its_limits() {
-        let members = provider_members(&providers());
+        let members = provider_members(&providers(), &ModelEfforts::new());
         let ollama = &members["provider"]["ollama"];
         assert_eq!(ollama["npm"], json!("@ai-sdk/openai-compatible"));
         // opencode's own capitalisation, which its schema declares under
@@ -3599,7 +5097,7 @@ notamodel
             "options",
             "models",
         ];
-        let members = provider_members(&providers());
+        let members = provider_members(&providers(), &ModelEfforts::new());
         for (id, entry) in members["provider"].as_object().expect("a map") {
             for key in entry.as_object().expect("a provider object").keys() {
                 assert!(
@@ -3622,9 +5120,7 @@ notamodel
         agent.def.harness = cide_ipc::Harness::Claude;
         let mut plan = plan_for(&agent);
         plan.harness = cide_ipc::Harness::Opencode;
-        let spawn = OpencodeHarness
-            .spawn_spec(&plan)
-            .expect("a role redirected onto opencode spawns on opencode");
+        let spawn = child_v1(&plan).expect("a role redirected onto opencode spawns on opencode");
         assert_eq!(spawn.spec.program, "opencode");
     }
 
@@ -3636,10 +5132,7 @@ notamodel
         let mut plan = plan_for(&agent);
         plan.harness = cide_ipc::Harness::Claude;
         assert!(
-            matches!(
-                OpencodeHarness.spawn_spec(&plan),
-                Err(HarnessError::WrongHarness { .. })
-            ),
+            matches!(child_v1(&plan), Err(HarnessError::WrongHarness { .. })),
             "the resolved harness is what decides, in both directions"
         );
     }
@@ -3740,7 +5233,7 @@ notamodel
             ],
             pools: Vec::new(),
         };
-        let members = provider_members(&llm);
+        let members = provider_members(&llm, &ModelEfforts::new());
         let block = &members["provider"];
         assert_eq!(
             block.as_object().expect("a map").len(),
@@ -3793,21 +5286,26 @@ notamodel
         assert_eq!(failover(line), Some(FailoverReason::Auth));
     }
 
-    /// **The specification.** A typo must fail loudly once, not burn every candidate in the pool
-    /// one turn at a time and report the last one's error as the cause of death.
+    /// **The specification, reversed at the user's word (t-1090).** A typo'd model id is the
+    /// entry's configuration: the run moves on to the next entry and cide says which entry is
+    /// broken, rather than ending a run the pool had fallbacks for.
     #[test]
-    fn a_typod_model_id_never_fails_over() {
-        assert_eq!(failover(BOGUS_MODEL), None);
+    fn a_typod_model_id_fails_over_as_rejected() {
+        assert_eq!(failover(BOGUS_MODEL), Some(FailoverReason::Rejected));
+        assert_eq!(
+            failure_message(BOGUS_MODEL).as_deref(),
+            Some("Unexpected server error. Check server logs for details.")
+        );
     }
 
-    /// The status code is the more specific fact and must beat `isRetryable`. A 404 is a statement
-    /// about the request; no other candidate repairs it.
+    /// The status code is the more specific fact and must beat `isRetryable`: a 404 is a statement
+    /// about the request — the entry's configuration — not an endpoint that is down.
     #[test]
     fn an_explicit_four_hundred_beats_a_retryable_flag() {
         let line = r#"{"type":"error","error":{"name":"APIError","data":{"message":"m","statusCode":404,"isRetryable":true}}}"#;
         assert_eq!(
             failover(line),
-            None,
+            Some(FailoverReason::Rejected),
             "a 404 is about the request, however retryable the CLI calls it"
         );
     }
@@ -3815,11 +5313,9 @@ notamodel
     /// Refused by name, so the refusal is a decision a reader can find rather than a fall-through.
     #[test]
     fn a_turns_own_failures_are_not_the_providers_fault() {
-        for name in [
-            "MessageOutputLengthError",
-            "MessageAbortedError",
-            "UnknownError",
-        ] {
+        // `UnknownError` left this list at t-1090: on 1.x it is how a missing model arrives, and
+        // that is the entry's to fail over — `a_typod_model_id_fails_over_as_rejected`.
+        for name in ["MessageOutputLengthError", "MessageAbortedError"] {
             let line = format!(
                 r#"{{"type":"error","error":{{"name":"{name}","data":{{"message":"m"}}}}}}"#
             );
@@ -3850,6 +5346,93 @@ notamodel
         ] {
             assert_eq!(failover(line), None, "{line:?}");
         }
+    }
+
+    /// opencode 2's error vocabulary, which shares not one field with 1.x's: the class moved from
+    /// `name` to `type`, the detail from `data` to the error itself, and `statusCode`/`isRetryable`
+    /// are simply gone. Unwidened, `failover` answered `None` to every line below — a pool that
+    /// never advances, a run that dies on its first candidate, and **not one failing test**, which
+    /// is why these are here. (M110)
+    ///
+    /// The names are not invented: 2.0.16's own classifier maps its internal reasons onto them in
+    /// one `switch`, and a second function translates the 1.x names above into the same set. The
+    /// two error objects below are verbatim from real runs.
+    #[test]
+    fn the_two_point_oh_error_vocabulary_is_classified_too() {
+        // Measured: a provider on a closed port.
+        let transport = r#"{"type":"error","timestamp":1,"sessionID":"ses_a","error":{"type":"provider.transport","message":"ConnectionRefused: Unable to connect. Is the computer able to access the url?"}}"#;
+        assert_eq!(failover(transport), Some(FailoverReason::Unreachable));
+        // Measured: a wrong credential. The status is flat on the error now, not under `data`.
+        let auth = r#"{"type":"error","timestamp":1,"sessionID":"ses_a","error":{"type":"provider.auth","message":"Incorrect API key provided: sk-xxx","status":401}}"#;
+        assert_eq!(failover(auth), Some(FailoverReason::Auth));
+        // The flat status drives the shared ladder, exactly as `data.statusCode` does on 1.x.
+        let flat = |status: u64| {
+            format!(
+                r#"{{"type":"error","error":{{"type":"provider.error","message":"m","status":{status}}}}}"#
+            )
+        };
+        assert_eq!(failover(&flat(429)), Some(FailoverReason::RateLimited));
+        assert_eq!(failover(&flat(403)), Some(FailoverReason::Auth));
+        // A 4xx about the request is the entry's configuration, on either generation.
+        assert_eq!(failover(&flat(400)), Some(FailoverReason::Rejected));
+        for spent in ["provider.rate-limit", "provider.quota"] {
+            let line = format!(r#"{{"type":"error","error":{{"type":"{spent}","message":"m"}}}}"#);
+            assert_eq!(
+                failover(&line),
+                Some(FailoverReason::RateLimited),
+                "{spent}"
+            );
+        }
+        for broken in ["provider.timeout", "provider.internal"] {
+            let line = format!(r#"{{"type":"error","error":{{"type":"{broken}","message":"m"}}}}"#);
+            assert_eq!(
+                failover(&line),
+                Some(FailoverReason::Unreachable),
+                "{broken}"
+            );
+        }
+        // Every other provider failure is the entry's configuration, and moves the run on.
+        for rejected in [
+            "provider.no-route",
+            "provider.unknown",
+            "provider.invalid-request",
+            "provider.invalid-output",
+            "provider.content-filter",
+            "provider.unsupported-operation",
+            "provider.something-new",
+        ] {
+            let line =
+                format!(r#"{{"type":"error","error":{{"type":"{rejected}","message":"m"}}}}"#);
+            assert_eq!(
+                failover(&line),
+                Some(FailoverReason::Rejected),
+                "{rejected}"
+            );
+        }
+        // **Refused by name, each for its own reason.** An abort is cide's own wind-down
+        // arriving as an event, and `unknown` is how 2.0 reports cide's configuration failing to
+        // reach the child, measured as `Agent not found: "<role>"` — no entry's fault, and every
+        // entry would hit it again.
+        for refused in [
+            r#"{"type":"error","error":{"type":"aborted","message":"Session interrupted: stop"}}"#,
+            r#"{"type":"error","timestamp":1,"sessionID":"ses_a","error":{"type":"unknown","message":"Agent not found: \"developer\""}}"#,
+        ] {
+            assert_eq!(failover(refused), None, "{refused}");
+        }
+        // The one no-route the next candidate repairs, measured verbatim on 2.0.16 (t-1090): the
+        // model exists but does not offer this entry's variant.
+        assert_eq!(
+            failover(
+                r#"{"type":"error","timestamp":1790356920917,"sessionID":"ses_f2669674fffemtIa9SDkN4WEyG","error":{"type":"provider.no-route","message":"Variant unavailable for o3/Qwen-Coder: xhigh"}}"#
+            ),
+            Some(FailoverReason::Variant)
+        );
+        // And the sentence a person reads is the message, not the object it arrived in.
+        assert_eq!(
+            error_sentence(&OPENCODE_CLI, transport),
+            "provider.transport: ConnectionRefused: Unable to connect. Is the computer able to \
+             access the url?"
+        );
     }
 
     /// A release that adds a field must widen nothing here; one that adds a *name* falls through
@@ -3954,8 +5537,8 @@ notamodel
     #[test]
     fn an_empty_settings_says_nothing_at_all() {
         let llm = cide_ipc::LlmSettings::default();
-        assert!(provider_members(&llm).is_empty());
-        assert!(provider_config_content(&OPENCODE_CLI, &llm).is_none());
+        assert!(provider_members(&llm, &ModelEfforts::new()).is_empty());
+        assert!(provider_config_content(&OPENCODE_CLI, &llm, Generation::V1).is_none());
     }
 
     // ==========================================================================================
@@ -4032,9 +5615,7 @@ notamodel
     #[test]
     fn each_flavour_refuses_the_others_plan() {
         let mimo = mimo_role();
-        let refused = OpencodeHarness
-            .spawn_spec(&plan_for(&mimo))
-            .expect_err("a mimo plan");
+        let refused = child_v1(&plan_for(&mimo)).expect_err("a mimo plan");
         assert!(
             matches!(refused, HarnessError::WrongHarness { .. }),
             "{refused}"
@@ -4075,7 +5656,7 @@ notamodel
             Err(HarnessError::WrongHarness { .. })
         ));
         assert!(matches!(
-            OpencodeHarness.continue_spec(&conversation(Harness::Mimo)),
+            OPENCODE_CLI.continue_spec_v1(&conversation(Harness::Mimo)),
             Err(HarnessError::WrongHarness { .. })
         ));
     }

@@ -30,6 +30,17 @@ export interface StatusPayload {
     used_percentage?: number | null
   }
   cost?: { total_cost_usd?: number }
+  /**
+   * Which CLI the readout is for (M93). Absent in a real statusline frame — that is Claude
+   * Code's — and `"codex"` in the one cide builds from a codex rollout
+   * (`cide_core::codex_cli::status_of`), which has no statusline of its own.
+   */
+  harness?: string
+  /**
+   * The share of the plan's rate-limit window used (M93, codex only). Codex has no per-session
+   * cost, and this is the figure that plays its part: what is left before the CLI stops.
+   */
+  rate_limit?: { used_percent?: number | null; window_minutes?: number | null }
 }
 
 /** Tokens counted against the context window, or `undefined` when the CLI reports none. */
@@ -74,7 +85,7 @@ export function compact(n: number): string {
 export function formatClaude(p: StatusPayload | undefined): string | undefined {
   if (!p) return undefined
 
-  const parts = ['claude']
+  const parts = [p.harness ?? 'claude']
 
   const model = p.model?.display_name ?? p.model?.id
   if (model) parts.push(model)
@@ -91,6 +102,9 @@ export function formatClaude(p: StatusPayload | undefined): string | undefined {
   // not reported yet reads as "this is free", which is the wrong impression to give.
   const cost = p.cost?.total_cost_usd
   if (typeof cost === 'number' && cost > 0) parts.push(`$${cost.toFixed(2)}`)
+
+  const limit = p.rate_limit?.used_percent
+  if (typeof limit === 'number') parts.push(`limit ${Math.round(limit)}%`)
 
   return parts.length > 1 ? parts.join(' · ') : undefined
 }

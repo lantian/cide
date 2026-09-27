@@ -166,9 +166,36 @@ pub fn paste_with(
     mode: PasteMode,
     decisions: &[PasteDecision],
 ) -> Result<Vec<PastedEntry>> {
-    check_dest(roots, dest_dir)?;
+    paste_between(roots, roots, sources, dest_dir, mode, decisions)
+}
+
+/// [`paste_with`] where the sources belong to one project and the destination to another.
+///
+/// Copy and Cut between projects: the clip is taken in project A and pasted into project B,
+/// possibly in another window. The containment rule is not relaxed. It is **split**:
+///
+/// * every source must lie inside `source_roots`, the writable paths of the project it was
+///   copied in, and a cut may not take away one of *those* roots;
+/// * the destination must lie inside `dest_roots`, the project it is pasted into.
+///
+/// The option that lost was checking both against the union of the two lists. It accepts the
+/// same pastes, but it also lets a cut take a root of the *destination* project into itself
+/// ("move B's root into B/sub"), which is the kind of move `check_not_root` exists to refuse,
+/// and it stops saying which project a refused path was supposed to be in.
+///
+/// With one list on both sides this is exactly [`paste_with`], which is how every single-project
+/// caller and test still reaches it.
+pub fn paste_between(
+    source_roots: &[PathBuf],
+    dest_roots: &[PathBuf],
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mode: PasteMode,
+    decisions: &[PasteDecision],
+) -> Result<Vec<PastedEntry>> {
+    check_dest(dest_roots, dest_dir)?;
     for source in sources {
-        check_source(roots, source, dest_dir, mode)?;
+        check_source(source_roots, source, dest_dir, mode)?;
         if matches!(choice_for(decisions, source), PasteChoice::Replace) {
             check_replaceable(source, dest_dir)?;
         }
@@ -218,9 +245,20 @@ pub fn plan(
     dest_dir: &Path,
     mode: PasteMode,
 ) -> Result<Vec<PasteCollision>> {
-    check_dest(roots, dest_dir)?;
+    plan_between(roots, roots, sources, dest_dir, mode)
+}
+
+/// [`plan`] for a paste from one project into another; the checks are [`paste_between`]'s.
+pub fn plan_between(
+    source_roots: &[PathBuf],
+    dest_roots: &[PathBuf],
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mode: PasteMode,
+) -> Result<Vec<PasteCollision>> {
+    check_dest(dest_roots, dest_dir)?;
     for source in sources {
-        check_source(roots, source, dest_dir, mode)?;
+        check_source(source_roots, source, dest_dir, mode)?;
     }
     let mut out = Vec::new();
     for source in sources {
@@ -2013,6 +2051,98 @@ mod tests {
                 &roots,
                 &[dir.path().to_path_buf()],
                 &dir.join("src"),
+                PasteMode::Cut
+            ),
+            Err(FsError::IsRoot(_))
+        ));
+    }
+
+    /// Copy and Cut between projects: the sources are checked against the project they came
+    /// from, the destination against the one they go to, and neither list stands in for the
+    /// other.
+    #[test]
+    fn a_paste_between_projects_checks_each_side_against_its_own_roots() {
+        let a = scratch("copy-between-a");
+        let b = scratch("copy-between-b");
+        let elsewhere = scratch("copy-between-elsewhere");
+        let (roots_a, roots_b) = (roots_of(a.path()), roots_of(b.path()));
+        std::fs::write(a.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(a.join("moved.rs"), "m").unwrap();
+        std::fs::write(elsewhere.join("secret"), "s").unwrap();
+
+        // A copy lands in B and leaves A alone.
+        let out = paste_between(
+            &roots_a,
+            &roots_b,
+            &[a.join("main.rs")],
+            b.path(),
+            PasteMode::Copy,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out[0].dest, b.join("main.rs"));
+        assert_eq!(read(&b.join("main.rs")), "fn main() {}");
+        assert!(a.join("main.rs").exists());
+
+        // A cut moves it out of A.
+        paste_between(
+            &roots_a,
+            &roots_b,
+            &[a.join("moved.rs")],
+            b.path(),
+            PasteMode::Cut,
+            &[],
+        )
+        .unwrap();
+        assert!(!a.join("moved.rs").exists());
+        assert_eq!(read(&b.join("moved.rs")), "m");
+
+        // The plan agrees, and a source in neither project is still refused.
+        assert!(
+            plan_between(
+                &roots_a,
+                &roots_b,
+                &[a.join("main.rs")],
+                b.path(),
+                PasteMode::Copy
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            paste_between(
+                &roots_a,
+                &roots_b,
+                &[elsewhere.join("secret")],
+                b.path(),
+                PasteMode::Copy,
+                &[]
+            ),
+            Err(FsError::OutsideProject(_))
+        ));
+        // A *destination* in the source project is not a destination in B.
+        assert!(matches!(
+            paste_between(
+                &roots_b,
+                &roots_b,
+                &[b.join("main.rs")],
+                a.path(),
+                PasteMode::Copy,
+                &[]
+            ),
+            Err(FsError::OutsideProject(_))
+        ));
+        // The single-project form would have refused A's file outright: the split is the change.
+        assert!(matches!(
+            paste(&roots_b, &[a.join("main.rs")], b.path(), PasteMode::Copy),
+            Err(FsError::OutsideProject(_))
+        ));
+        // And A's root may be copied into B but never cut out of A.
+        assert!(matches!(
+            plan_between(
+                &roots_a,
+                &roots_b,
+                &[a.path().to_path_buf()],
+                b.path(),
                 PasteMode::Cut
             ),
             Err(FsError::IsRoot(_))

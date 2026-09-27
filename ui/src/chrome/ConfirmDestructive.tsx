@@ -217,9 +217,8 @@ export interface ConfirmState {
    * only because the gesture is easy to trigger by accident — the file tree's *Move to Trash*,
    * where a bare Delete key opens this and every desktop file manager answers the Enter that
    * follows with the trash move, not with a cancel the user then has to notice happened.
-   * Setting it also costs the caller the red: the accent replaces `buttonDanger` on the
-   * confirm button, because an act safe enough to confirm by reflex has no claim on the
-   * colour that means "this destroys work".
+   * The confirm button keeps the kit's `danger` fill either way — see the comment above
+   * `runButton` for why the accent no longer replaces it.
    */
   defaultButton?: 'confirm' | 'cancel'
   choices?: readonly ConfirmChoice[]
@@ -317,15 +316,18 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
    * Cancel — the kit's primary, focused — so the Enter already in flight when the dialog
    * appeared backs out, and the act itself is the kit's `danger` (a black fill, not the
    * accent: with a red accent, a red destroy button read as the primary). Where a caller
-   * declared the act reversible, the primary moves *with* the focus, never without it, and
-   * displaces the danger fill: an act safe enough to confirm by reflex has no claim on the
-   * look that means "this destroys work". A choice that risks nothing (a `--soft` reset) is
-   * a plain secondary.
+   * declared the act reversible, the focus moves to the act and the act **keeps** the danger
+   * fill — a filled button, so the prominence still travels with the focus, and Cancel drops to
+   * secondary. This used to hand the act the accent instead, on the argument that a reversible
+   * act has no claim on the destroy look; it read as "Move to Trash is the ordinary, safe
+   * button", which is not what a dialog raised by a bare Delete key should say. Only a choice
+   * that risks nothing (a `--soft` reset) gives the danger fill up — to the accent if it is the
+   * default, otherwise to a plain secondary.
    */
   const runButton = (
     <Button
       ref={confirmBtn}
-      variant={confirmDefault ? 'primary' : danger ? 'danger' : 'secondary'}
+      variant={danger ? 'danger' : confirmDefault ? 'primary' : 'secondary'}
       data-audit="confirmDestructiveRun"
       onClick={onConfirm}
     >

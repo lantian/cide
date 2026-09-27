@@ -86,6 +86,34 @@ pub fn root_of_checkout(checkout: &Path) -> Option<PathBuf> {
         .flatten()
 }
 
+/// The git metadata a checkout writes when it commits, outside the checkout itself. (M118)
+///
+/// A linked worktree's `.git` is a *file* pointing at `<repo>/.git/worktrees/<name>`, where its
+/// index, `HEAD` and per-worktree refs live; branches, objects and `packed-refs` live in the
+/// common `<repo>/.git`. A sandbox whose writable root is the checkout sees neither as writable,
+/// and codex's `workspace-write` sandbox re-binds any `.git` it finds read-only on top — so a
+/// codex run that is not told about these two directories cannot `git commit`, `merge` or
+/// `rebase` (`index.lock: Read-only file system`, selfcraft t-572). The codex harness passes
+/// them as `--add-dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirs {
+    /// `git rev-parse --git-dir`: the checkout's own admin directory.
+    pub git_dir: PathBuf,
+    /// `git rev-parse --git-common-dir`: refs, objects and config shared by every checkout.
+    pub common_dir: PathBuf,
+}
+
+/// [`GitDirs`] of the repository `checkout` is a working tree of. Canonicalised, so a sandbox
+/// given these paths binds what git will actually open. For a plain (non-linked) checkout the
+/// two are the same `.git`.
+pub fn git_dirs(checkout: &Path) -> Result<GitDirs> {
+    let repo = Repository::open(checkout).wrap()?;
+    Ok(GitDirs {
+        git_dir: repo_mod::canonical(repo.path()),
+        common_dir: repo_mod::canonical(repo.commondir()),
+    })
+}
+
 /// The ref namespace agent branches live in. `cide/` rather than a bare name so `git branch`
 /// groups them, and so a user's own `developer` branch is never the one an agent commits to.
 const BRANCH_PREFIX: &str = "cide";
@@ -706,6 +734,27 @@ mod tests {
 
     fn head_of(dir: &Path) -> String {
         git(dir, &["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    #[test]
+    fn a_linked_checkout_names_its_own_admin_dir_and_the_common_one() {
+        let root = project("gitdirs");
+        let wt = ensure(&root, "developer-t-1").expect("ensure");
+        let dirs = git_dirs(&wt.path).expect("git dirs");
+        let expect = |args: &[&str]| {
+            let out = git(&wt.path, args);
+            repo_mod::canonical(&wt.path.join(out.trim()))
+        };
+        assert_eq!(dirs.git_dir, expect(&["rev-parse", "--git-dir"]));
+        assert_eq!(dirs.common_dir, expect(&["rev-parse", "--git-common-dir"]));
+        assert_eq!(dirs.common_dir, repo_mod::canonical(&root.join(".git")));
+        assert_ne!(
+            dirs.git_dir, dirs.common_dir,
+            "a linked worktree has its own"
+        );
+
+        let plain = git_dirs(&root).expect("the root");
+        assert_eq!(plain.git_dir, plain.common_dir);
     }
 
     #[test]

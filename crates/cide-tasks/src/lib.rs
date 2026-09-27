@@ -88,6 +88,33 @@ pub const TASKS_DIR: &str = ".cide/tasks";
 /// One task's content, inside its own directory: `task.json`.
 pub const CONTENT_FILE: &str = "task.json";
 
+/// What `rev` is written as, always: [`TaskFile::rev`] lives in memory only. (M120)
+///
+/// `rev` orders snapshots *inside one process*: it rides `cide://tasks-changed` and the panel drops
+/// anything not strictly newer. Nothing needs it on disk: a second process orders its own
+/// broadcasts from its own counter, and a merge lands past whatever this one holds. Written as a
+/// live value, it was the line that changed on every accepted mutation, so two branches that had
+/// both touched the board always conflicted on `.cide/tasks.json`, even when their tasks merged
+/// cleanly.
+///
+/// **Frozen, not removed**, and the reason is older builds. Up to M119 `rev` is a required field,
+/// so a tracker without it does not parse there, and an unparseable tracker is quarantined:
+/// renamed aside when the project is opened. A constant line never conflicts and keeps every
+/// older build reading the file. Omitting it needs a schema bump so those builds refuse cleanly,
+/// and that is worth doing only once they are gone.
+///
+/// A file's `rev` is still *read*. `settle_next_id` needs a pre-M61 file's value, and an older
+/// build may write a live one back. The store then treats it as noise: [`same_index`] compares
+/// without it, and the next write of this build freezes it again.
+pub const REV_ON_DISK: u64 = 0;
+
+/// Do two trackers say the same thing on disk? Everything but [`TaskFile::rev`] — see
+/// [`REV_ON_DISK`]. `schema_version` is left out for a neighbouring reason: `read` lifts every
+/// file to `CURRENT_SCHEMA` in memory, so the field never differs between two parsed copies.
+fn same_index(a: &TaskFile, b: &TaskFile) -> bool {
+    a.next_id == b.next_id && a.tasks == b.tasks
+}
+
 /// `<root>/.cide/tasks.json`.
 pub fn tasks_path(project_root: &Path) -> PathBuf {
     project_root.join(TASKS_RELATIVE)
@@ -2228,6 +2255,25 @@ impl ContentCache {
 
 // --- layer 1: the single owning actor --------------------------------------------------------
 
+/// Any store's urgent write, as one thing a single flusher can park on.
+///
+/// Each [`TaskStore`] has its own [`Debouncer`], but the app drains every open project's store
+/// from one thread, and a thread can wait on one condition variable, not N. So [`TaskStore::update`]
+/// notes each urgent change twice: on the store's own debouncer, which decides *what* is written,
+/// and here, which decides *when* the flusher looks. The delay is irrelevant — only
+/// `note_urgent`/`wait`/`take` are ever used on it.
+static URGENT: Debouncer = Debouncer::new(persist::SAVE_DEBOUNCE);
+
+/// Park the calling flusher until some store has an urgent write, or `poll` passes. Then every
+/// store's `flush_if_due` finds its own write due. See [`URGENT`].
+pub fn wait_for_urgent(poll: std::time::Duration) {
+    URGENT.wait(poll);
+    // Taken *before* the caller's pass over the stores, so an urgent change that lands during
+    // that pass is due again at the next `wait` and returns it at once, rather than being
+    // swallowed by a take that came after it.
+    URGENT.take();
+}
+
 /// The one thing in the process allowed to write `.cide/tasks.json`.
 ///
 /// Shaped after `cide_app::WorkspaceState` down to the field names, because the two do the same
@@ -2659,7 +2705,14 @@ impl TaskStore {
         guard.rev += 1;
         drop(cache);
         drop(guard);
-        self.debounce.note_change();
+        // Urgent, not debounced (M117). Every edit that reaches here is a task, a status, an
+        // assignment or a comment — most often a comment a subagent has just been told over MCP
+        // was written — and a power cut inside the old 500 ms debounce lost it after that answer
+        // had gone out. The write still happens on the flusher's thread, not this caller's: the
+        // callers include every agent's MCP connection, and serialising their tool calls behind
+        // each other's fsyncs is the cost this does not pay.
+        self.debounce.note_urgent();
+        URGENT.note_urgent();
         outcome
     }
 
@@ -3135,9 +3188,14 @@ impl TaskStore {
         // with nothing in the inbox stays readable by a build that predates it. The field is put
         // back straight after, under the same lock, because `validate` and every reader in this
         // process hold the in-memory file to `CURRENT_SCHEMA`.
+        //
+        // `rev` goes out frozen at [`REV_ON_DISK`] by the same swap, and is put back for the same
+        // reason: in memory it is the live ordering counter every broadcast carries.
         guard.schema_version = guard.schema_on_disk();
+        let rev = std::mem::replace(&mut guard.rev, REV_ON_DISK);
         let encoded = serde_json::to_vec_pretty(&*guard);
         guard.schema_version = TaskFile::CURRENT_SCHEMA;
+        guard.rev = rev;
         let mut bytes = match encoded {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -3391,9 +3449,41 @@ impl TaskStore {
                 }
                 *self.stamp.lock() = stamp;
                 *state = DiskState::Ready;
-                if disk == *file {
+                if same_index(&disk, file) {
                     // The stamp moved but the content did not: someone rewrote the file with the
-                    // same bytes, or `git checkout` restored what was already there.
+                    // same bytes, or `git checkout` restored what was already there. Compared
+                    // without `rev`, which is frozen on disk (`REV_ON_DISK`) and live in memory, so
+                    // plain equality would call every one of our own files a change.
+                    return None;
+                }
+
+                /*
+                 * **Only the counter moved: take theirs, whichever way it went.** (M120)
+                 *
+                 * The case is a user undoing a mistake. Create a task, delete it, and
+                 * `.cide/tasks.json` shows as modified in git for no reason but `nextId`. The user
+                 * reverts it, and `merge` would take the higher counter back and the flush would
+                 * write the file straight back over the revert, so a `git checkout` of the tracker
+                 * could never stick. Identical rows mean nothing but the counter is in dispute, and
+                 * the side that changed it on disk did so on purpose.
+                 *
+                 * The cost is the one `TaskFile::next_id` exists to prevent, accepted knowingly:
+                 * the reverted number is minted again, so anything that still names the deleted
+                 * task (a comment elsewhere, a branch `cide/<role>-t-<n>`) now points at the new
+                 * one. That is the user's call, made by reverting. It cannot lower the counter
+                 * past a live id: `read` settled `disk` past every id it holds, and those are ours.
+                 *
+                 * No write and no broadcast: memory now matches the file, and the counter is not
+                 * on the board.
+                 */
+                if disk.tasks == file.tasks {
+                    tracing::info!(
+                        path = %self.path.display(),
+                        was = file.next_id,
+                        now = disk.next_id,
+                        "only the id counter changed outside this process; adopted it"
+                    );
+                    file.next_id = disk.next_id;
                     return None;
                 }
 
@@ -5900,10 +5990,11 @@ mod tests {
             "neither side's comment was lost"
         );
         assert!(
-            on_disk.index.rev > 40,
+            store.snapshot().rev > 40,
             "rev landed past both sides: {}",
-            on_disk.index.rev
+            store.snapshot().rev
         );
+        assert_eq!(on_disk.index.rev, REV_ON_DISK, "and is not written (M120)");
     }
 
     /// The watcher's half of layer 3: `.cide/tasks.json` moved under us with no local write in
@@ -5949,10 +6040,13 @@ mod tests {
         std::thread::sleep(persist::SAVE_DEBOUNCE);
         store.flush_if_due();
         let on_disk = read_tracker(dir.root());
-        assert_eq!(
-            on_disk.index,
-            store.snapshot(),
+        assert!(
+            same_index(&on_disk.index, &store.snapshot()),
             "the flusher converged the index to the merged board"
+        );
+        assert_eq!(
+            on_disk.index.rev, REV_ON_DISK,
+            "`rev` stays in memory (M120)"
         );
     }
 
@@ -5972,6 +6066,74 @@ mod tests {
             store.refresh_from_disk().is_none(),
             "the store's own bytes read as an external change"
         );
+    }
+
+    /// `rev` counts in memory and is frozen on disk (M120). Two branches that both touched the
+    /// board used to conflict on this one line even when their tasks merged cleanly.
+    #[test]
+    fn the_file_says_rev_zero_whatever_memory_has_counted() {
+        let dir = TempDir::new("rev-frozen");
+        let store = TaskStore::open(dir.root());
+        store
+            .create(&new_task("ours"), TaskAuthor::User)
+            .expect("create");
+        store
+            .edit(
+                &TaskId("t-1".into()),
+                TaskEdit::Comment {
+                    text: "another mutation".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("comment");
+        store.write_now();
+
+        assert!(store.snapshot().rev >= 2, "memory still orders snapshots");
+        let raw = fs::read_to_string(dir.tasks()).expect("read");
+        assert!(raw.contains("\"rev\": 0,"), "{raw}");
+        assert!(
+            store.refresh_from_disk().is_none(),
+            "a file differing from memory only in `rev` read as an external change, and every \
+             flush would come back through the watcher as a merge"
+        );
+    }
+
+    /// Create a task, delete it, and `git checkout .cide/tasks.json`: the revert sticks. (M120)
+    /// `merge` takes the higher `nextId`, so before this the store wrote the counter straight
+    /// back over the revert and the file could never be put back clean.
+    #[test]
+    fn a_reverted_counter_is_adopted_and_not_written_back() {
+        let dir = TempDir::new("counter-revert");
+        let store = TaskStore::open(dir.root());
+        store
+            .create(&new_task("keep"), TaskAuthor::User)
+            .expect("create");
+        store.write_now();
+        let committed = fs::read_to_string(dir.tasks()).expect("read");
+
+        store
+            .create(&new_task("oops"), TaskAuthor::User)
+            .expect("create");
+        store.delete(&TaskId("t-2".into())).expect("delete");
+        store.write_now();
+        assert_ne!(
+            fs::read_to_string(dir.tasks()).expect("read"),
+            committed,
+            "the test only tests while the counter has moved"
+        );
+
+        dir.plant(&committed);
+        assert!(
+            store.refresh_from_disk().is_none(),
+            "a counter-only change is not a board change"
+        );
+        store.write_now();
+        assert_eq!(
+            fs::read_to_string(dir.tasks()).expect("read"),
+            committed,
+            "the store wrote the higher counter back over the revert"
+        );
+        assert_eq!(store.snapshot().next_id, 2);
     }
 
     /// An external change landing while a local edit is still inside the debounce window merges
@@ -6204,6 +6366,40 @@ mod tests {
             !dir.tasks().exists(),
             "an idle store created a file in the user's repository"
         );
+    }
+
+    /// **An edit is written at the flusher's next look, not after the debounce.** (M117) A comment
+    /// an agent was told is written must survive a power cut a moment later — so the very next
+    /// `flush_if_due`, with no sleep in between, writes it.
+    #[test]
+    fn an_edit_is_due_at_once() {
+        let dir = TempDir::new("urgent");
+        let store = TaskStore::open(dir.root());
+        store
+            .create(&new_task("durable"), TaskAuthor::User)
+            .expect("create");
+        store.flush_if_due();
+        assert!(dir.tasks().exists(), "the create waited out the debounce");
+
+        store
+            .edit(
+                &TaskId("t-1".into()),
+                TaskEdit::Comment {
+                    text: "written".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("comment");
+        store.flush_if_due();
+        let on_disk = TaskStore::open(dir.root());
+        let texts: Vec<String> = on_disk
+            .get(&TaskId("t-1".into()))
+            .expect("the task")
+            .comments
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(texts, ["written"]);
     }
 
     /// The same claim for the **unconditional** write, which is the one that was creating the

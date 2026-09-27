@@ -459,9 +459,9 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
         {badge}
       </span>
       {/*
-       * The running chip, **after** the amber one rather than before it. Both lay out left to
-       * right, so a chip placed first would shove the amber one sideways every time an agent
-       * started working — and the amber one's whole job is to be findable in the same place
+       * The running chip, **after** the awaiting one rather than before it. Both lay out left to
+       * right, so a chip placed first would shove the awaiting one sideways every time an agent
+       * started working — and the awaiting one's whole job is to be findable in the same place
        * twice. This one moves; that one does not.
        *
        * A turning mark *and* a number. The mark is `loader-circle`, which is exactly what the

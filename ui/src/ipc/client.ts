@@ -42,6 +42,8 @@ import type {
   LogLineDetail,
   ResolvedBinding,
   DirSummary,
+  BufferBackup,
+  BufferBackupWrite,
   FileBytesHead,
   FileBytesWrite,
   FileDoc,
@@ -1969,6 +1971,27 @@ export const file = {
     const head: FileBytesWrite = { path, ifUnchanged }
     return invoke<FileStamp | null>('file_write_bytes', packFrame(JSON.stringify(head), bytes))
   },
+
+  /**
+   * Keep an unsaved buffer's text across a crash or a power cut. (M117)
+   *
+   * Framed like `writeBytes`, so a multi-megabyte buffer is not JSON-escaped on the way: the head
+   * is a `BufferBackupWrite`, the payload the text as UTF-8. `baseStamp` is what the file was when
+   * the buffer last agreed with it — a restored buffer autosaves against it, so a file that moved
+   * while cide was down raises the conflict bar rather than being overwritten. When to call this
+   * is `editor/hotExit.ts`'s decision, never per keystroke.
+   */
+  backupWrite: (path: string, text: string, baseStamp: FileStamp | null) => {
+    const head: BufferBackupWrite = { path, baseStamp }
+    return invoke<null>(
+      'file_backup_write',
+      packFrame(JSON.stringify(head), new TextEncoder().encode(text)),
+    )
+  },
+  /** The unsaved text an earlier run kept for `path`, if any. (M117) */
+  backupRead: (path: string) => invoke<BufferBackup | null>('file_backup_read', { path }),
+  /** Forget `path`'s kept text: saved, reverted or discarded. (M117) */
+  backupClear: (path: string) => invoke<null>('file_backup_clear', { path }),
 }
 
 /**
@@ -2879,9 +2902,17 @@ export const fsClipboard = {
    * Rejects with the same refusals `paste` does — a folder pasted into itself is refused here
    * *instead of* being asked about, which is the point of running the same checks twice.
    */
-  plan: (projectId: ProjectId, sources: readonly string[], destDir: string, mode: PasteMode) =>
+  plan: (
+    projectId: ProjectId,
+    sources: readonly string[],
+    destDir: string,
+    mode: PasteMode,
+    sourceProject: ProjectId | null = null,
+  ) =>
     invoke<PasteCollision[]>('fs_paste_plan', {
       project: projectId,
+      // The project the sources were copied in, when it is not `projectId` — see `paste`.
+      sourceProject,
       sources: [...sources],
       destDir,
       mode,
@@ -2896,6 +2927,10 @@ export const fsClipboard = {
    *
    * `decisions` is the dialog's answers and the only way anything here overwrites a file. An
    * empty list is the safe call and is what a paste with no collisions sends.
+   *
+   * `sourceProject` is the project the clip was taken in, when that is not `projectId`: Rust
+   * then checks the sources against its roots and the destination against `projectId`'s. `null`
+   * — a drag, or a paste in the project it was copied in — checks both ends against `projectId`.
    */
   paste: (
     projectId: ProjectId,
@@ -2903,9 +2938,11 @@ export const fsClipboard = {
     destDir: string,
     mode: PasteMode,
     decisions: readonly PasteDecision[],
+    sourceProject: ProjectId | null = null,
   ) =>
     invoke<PastedEntry[]>('fs_paste', {
       project: projectId,
+      sourceProject,
       // A fresh array: `invoke` serialises what it is handed, and a `readonly string[]` from a
       // zustand store is the store's own array.
       sources: [...sources],
@@ -4209,6 +4246,8 @@ import type {
   Harness,
   LlmLimitsProbe,
   LlmModelTest,
+  OverrideProfileOp,
+  OverrideProfilesState,
   ProjectOverrides,
 } from './generated'
 
@@ -4290,11 +4329,19 @@ export const agentDefs = {
       null,
     ),
 
-  /** One real turn against one model. `project` of `null` for `models`' reason above. */
-  testModel: (project: ProjectId | null, model: string) =>
+  /**
+   * One real turn against one model. `project` of `null` for `models`' reason above. `variant` is
+   * a pool entry's effort, joined the way a run's argv joins it; absent tests the model's default.
+   */
+  testModel: (project: ProjectId | null, model: string, variant?: string) =>
     pendingCommand<LlmModelTest | null>(
       'llm_test_model',
-      () => invoke<LlmModelTest>('llm_test_model', { project, model }),
+      () =>
+        invoke<LlmModelTest>('llm_test_model', {
+          project,
+          model,
+          variant: variant === undefined || variant.trim() === '' ? null : variant,
+        }),
       null,
     ),
 
@@ -4321,6 +4368,31 @@ export const agentDefs = {
    */
   setOverrides: (project: ProjectId, overrides: ProjectOverrides) =>
     invoke<ProjectOverrides>('agent_overrides_set', { project, overrides }),
+
+  /**
+   * This project's named override profiles and which is active. (M123)
+   *
+   * `null` on a build with no such handler, for [`overrides`]' reason: the screen then simply
+   * draws no profile bar.
+   */
+  overrideProfiles: (project: ProjectId) =>
+    pendingCommand<OverrideProfilesState | null>(
+      'agent_override_profiles',
+      () =>
+        invoke<OverrideProfilesState>('agent_override_profiles', {
+          project,
+          op: { op: 'list' } satisfies OverrideProfileOp,
+        }),
+      null,
+    ),
+
+  /**
+   * Switch, save, rename or delete one override profile, and answer the live table and the
+   * profiles as they now stand — a switch rewrites every row, so the screen redraws from this
+   * rather than from what it sent. Rejects with a sentence for a blank or unknown name.
+   */
+  overrideProfileOp: (project: ProjectId, op: OverrideProfileOp) =>
+    invoke<OverrideProfilesState>('agent_override_profiles', { project, op }),
 
   /**
    * Write one role's definition file. Creates, edits, renames and moves between scopes — all
@@ -5190,8 +5262,12 @@ export const milestones = {
   /** Whole-value: the list is ordered and a removed item must go. Awaited, for `setConfig`'s reason. */
   set: (project: ProjectId, plan: import('./generated').MilestonePlan) =>
     invoke<import('./generated').MilestonesView | null>('milestones_set', { project, plan }),
-  /** Starts the active gate in the background; the result arrives as `onChanged`. */
-  runGate: (project: ProjectId) => invoke<void>('milestones_gate_run', { project }),
+  /**
+   * Starts a gate in the background — the active milestone's, or `milestone`'s when named (the
+   * modal re-checks an accepted milestone that went red); the result arrives as `onChanged`.
+   */
+  runGate: (project: ProjectId, milestone?: string) =>
+    invoke<void>('milestones_gate_run', { project, milestone: milestone ?? null }),
   accept: (project: ProjectId) =>
     invoke<import('./generated').MilestonesView | null>('milestones_accept', { project }),
   /** Apply a proposal exactly (a plan, or files written and committed) and dequeue it. */
@@ -5230,6 +5306,14 @@ export const pools = {
   /** Clear one target's bench, or every bench with `null`, and rewind the runs waiting past it. */
   reset: (entry: import('./generated').PoolEntry | null) =>
     invoke<void>('llm_pool_reset', { entry }),
+  /**
+   * A pool entry's configuration is wrong and a run has just moved past it — the sentence names
+   * the pool, the entry and the provider's own words. See `emit::POOL_NOTICE`. (t-1090)
+   */
+  onNotice: (handler: (project: ProjectId, text: string) => void) =>
+    listen<{ project: ProjectId; text: string }>('cide://pool-notice', (e) =>
+      handler(e.payload.project, e.payload.text),
+    ),
 }
 
 /* -----------------------------------------------------------------------------------------
@@ -5346,4 +5430,63 @@ export const newProjectApi = {
   /** A step started, finished or failed. Sent to every window; only a wizard listens. */
   onProgress: (handler: (progress: NewProjectProgress) => void) =>
     listen<NewProjectProgress>('cide://project-new-progress', (e) => handler(e.payload)),
+}
+
+// --- the tree's clipboard, shared by every window -------------------------------------------
+//
+// Appended rather than folded into `fsClipboard` above, per this file's append-only rule.
+import type { FileClip } from './generated'
+
+/**
+ * The file tree's Copy/Cut clipboard, held in Rust so every window reads the same one.
+ *
+ * A Copy in one window used to be invisible to the next — each webview kept its own store —
+ * which made pasting into a project drawn by another window impossible. `sidebar/fileClipboard.ts`
+ * is now a mirror of this: it seeds from `get` once and follows `onChanged` after that.
+ */
+export const fileClip = {
+  /** What is held right now, or `null`. Asked once per window, then the event takes over. */
+  get: () => invoke<FileClip | null>('fs_clip_get'),
+  /** Hold these paths. Writes nothing on disk. */
+  set: (clip: FileClip) => invoke<void>('fs_clip_set', { clip }),
+  /** Drop the clip — Escape on a pending cut. A cut's paste clears it in Rust by itself. */
+  clear: () => invoke<void>('fs_clip_clear'),
+  /**
+   * `cide://fs-clip-changed`: taken, cleared, consumed by a cut's paste, or dropped because the
+   * project it came from closed. To every window.
+   */
+  onChanged: (handler: (clip: FileClip | null) => void) =>
+    listen<{ clip: FileClip | null }>('cide://fs-clip-changed', (e) => handler(e.payload.clip)),
+}
+
+// --- self-update ----------------------------------------------------------------------------
+//
+// Appended, per this file's append-only rule. The check runs in Rust (`cide-app`'s `updater`
+// module): the webview's CSP allows no request to GitHub, and the install replaces files on disk.
+import type { UpdateCheck, UpdateInfo, UpdateProgress } from './generated'
+
+/**
+ * A newer cide release: the start-up check's finding, the manual check, install and restart.
+ *
+ * *Skip this version* is not here — it is `settings.set({ update })`, so the skip is stored and
+ * broadcast like any other setting and the Settings screen can clear it.
+ */
+export const update = {
+  /** What the start-up check found, for a window that mounted after the event went out. */
+  status: () => invoke<UpdateInfo | null>('update_status'),
+  /** *Check for updates*: ignores the skipped version, and never rejects — a failure is `unavailable`. */
+  check: () => invoke<UpdateCheck>('update_check'),
+  /** Download, verify, replace. Resolves with the installed version; does not restart. */
+  install: () => invoke<string>('update_install'),
+  /** Restart into the installed version. Ask `app.quitRequested` first; this does not. */
+  restart: () => invoke<void>('update_restart'),
+  /** `cide://update-available`: the start-up check found a release the user has not skipped. */
+  onAvailable: (handler: (info: UpdateInfo) => void) =>
+    listen<UpdateInfo>('cide://update-available', (e) => handler(e.payload)),
+  /** `cide://update-progress`: at most one per percent of the download. */
+  onProgress: (handler: (progress: UpdateProgress) => void) =>
+    listen<UpdateProgress>('cide://update-progress', (e) => handler(e.payload)),
+  /** `cide://update-ready`: the new version is on disk; a restart runs it. */
+  onReady: (handler: (version: string) => void) =>
+    listen<{ version: string }>('cide://update-ready', (e) => handler(e.payload.version)),
 }

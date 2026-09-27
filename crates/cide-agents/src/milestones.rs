@@ -474,7 +474,7 @@ pub fn proposal_draft(
          this fixes it",
     )?;
     let task = text("task").map(TaskId);
-    let has_plan = ["milestones", "verify", "guardPaths", "maxOpen"]
+    let has_plan = ["milestones", "verify", "guardPaths", "maxOpen", "gateRuns"]
         .iter()
         .any(|k| args.get(*k).is_some_and(|v| !v.is_null()));
     let files = args.get("files").filter(|v| !v.is_null());
@@ -535,6 +535,7 @@ fn proposed_plan(
         Some(n) => plan.max_open = Some(u32::try_from(n).unwrap_or(u32::MAX)),
         None => plan.max_open = current.max_open,
     }
+    plan.gate_runs = crate::tools::gate_runs_from(args)?.unwrap_or(current.gate_runs);
     if plan == *current {
         return Err("that plan is the one the project already has".into());
     }
@@ -948,6 +949,46 @@ mod tests {
             proposal_draft(&serde_json::json!({ "title": "x" }), &current).is_err(),
             "needs a rationale"
         );
+    }
+
+    #[test]
+    fn gate_runs_is_a_plan_change_and_a_bad_one_is_refused() {
+        let mut current = plan(12);
+        current.gate_runs = cide_ipc::GateRuns::Idle;
+        let draft = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({ "title": "t", "rationale": "the gate takes 16 min" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            proposal_draft(&v, &current)
+        };
+        let DraftChange::Plan(p) = draft(serde_json::json!({ "gateRuns": "manual" }))
+            .expect("a plan")
+            .change
+        else {
+            panic!("`gateRuns` alone is a plan change, not a note")
+        };
+        assert_eq!(p.gate_runs, cide_ipc::GateRuns::Manual);
+        let DraftChange::Plan(p) = draft(serde_json::json!({ "maxOpen": 5 }))
+            .expect("a plan")
+            .change
+        else {
+            panic!("a plan")
+        };
+        assert_eq!(
+            p.gate_runs,
+            cide_ipc::GateRuns::Idle,
+            "a proposal that does not name the mode keeps it"
+        );
+        let why = draft(serde_json::json!({ "gateRuns": "never" })).expect_err("not a mode");
+        assert!(why.contains("never") && why.contains("idle"), "{why}");
+
+        let defined = crate::tools::milestone_plan_from(&serde_json::json!({
+            "milestones": [{ "id": "slice", "title": "s", "gate": "true" }],
+            "gateRuns": "idle",
+        }))
+        .expect("defines");
+        assert_eq!(defined.gate_runs, cide_ipc::GateRuns::Idle);
     }
 
     /// Titles from a real board (`~/work/selfcraft`): the pairs that are one defect match, the

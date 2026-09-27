@@ -48,11 +48,13 @@ export interface FileClip {
   /**
    * The project the paths came from.
    *
-   * Carried because a paste into a *different* project would send Rust paths that are outside
-   * that project's roots, and `ops::check_within` refuses those — correctly, since containment
-   * is the only thing standing between a webview-supplied path and `/etc`. So the refusal is
-   * made here, where it can be a sentence in a greyed menu item instead of a rejected command
-   * the user has to interpret.
+   * Sent as `sourceProject` when the paste lands in a different project, so Rust checks the
+   * sources against *that* project's roots and the destination against the one being pasted
+   * into (`cide_fs::copy::paste_between`). Containment is not relaxed by a cross-project paste,
+   * only split: it is still the only thing standing between a webview-supplied path and `/etc`.
+   *
+   * Until then this field was the reason to *refuse* such a paste — "paste them where they came
+   * from" — because the command took one project and checked both ends against it.
    */
   readonly project: string
   /**
@@ -123,9 +125,8 @@ export function pasteRefusal(
   if (clip === null || clip.paths.length === 0) {
     return 'Nothing has been copied yet — use Copy or Cut first.'
   }
-  if (clip.project !== project) {
-    return 'Those paths were copied in another project; paste them where they came from.'
-  }
+  // No "copied in another project" refusal: a clip from project A pastes into project B, in
+  // this window or any other. The clip carries A, and the paste sends it as `sourceProject`.
   if (target === null) return 'This project has no folder to paste into.'
   const inside = clip.paths.find((path) => isInside(target.parent, path))
   if (inside !== undefined) {
@@ -159,10 +160,19 @@ export function copyLabel(mode: ClipMode, count: number): string {
  * ordinary and is about to move. The cut rows are dimmed as well; the strip is what says why,
  * and says how to call it off.
  */
-export function pendingNote(clip: FileClip | null): string | null {
+export function pendingNote(
+  clip: FileClip | null,
+  project?: string | null,
+): string | null {
   if (clip === null || clip.mode !== 'cut' || clip.paths.length === 0) return null
   const what =
     clip.paths.length === 1 ? `“${basenameOf(clip.paths[0] ?? '')}”` : `${clip.paths.length} items`
+  // Drawn in *another* project's panel too, now that a cut can be pasted there — and there it
+  // must not promise Escape, which only cancels a cut from the panel it was made in
+  // (`escapeCancels`). Saying "Esc cancels" in a panel where Esc does nothing is a dead control.
+  if (project !== undefined && project !== clip.project) {
+    return `${what}, cut in another project, will move here when you paste.`
+  }
   return `${what} will move when you paste. Esc cancels.`
 }
 

@@ -52,6 +52,7 @@ fn role(prompt: &str) -> LoadedAgent {
         permission_mode: None,
         effort: None,
         extras: Vec::new(),
+        sandbox: Default::default(),
     }
 }
 
@@ -84,6 +85,9 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: true,
         server: None,
+        git_dirs: Vec::new(),
+        sandbox_brief: None,
+        codex_trust_root: None,
     }
 }
 
@@ -205,6 +209,24 @@ fn a_dead_pool_candidate_is_classified_within_seconds() {
         },
     });
     let spawned = MimoHarness.spawn_spec(&plan).expect("spawnable");
+    // MiMo forked opencode **1**, so nothing from opencode 2's command line may reach it: its
+    // parser is yargs, which answers an unknown flag with its whole usage page and no reason line
+    // — the failure M108 was written for. The generation is a property of the binary and this one
+    // has never shipped a 2.x, so the assertion is flat rather than probed. (M110)
+    for never in ["--standalone", "--server"] {
+        assert!(
+            !spawned.spec.args.iter().any(|a| a == never),
+            "{never} is opencode 2's, and mimo is a fork of opencode 1.\n{:?}",
+            spawned.spec.args
+        );
+    }
+    // And the two 1.x flags it must still be given, since this is what proves the flavour did not
+    // quietly follow opencode across the rename.
+    assert!(
+        spawned.spec.args.iter().any(|a| a == "--dir"),
+        "{:?}",
+        spawned.spec.args
+    );
 
     let started = std::time::Instant::now();
     let (ok, stdout, stderr) = run(&spawned.spec, Duration::from_secs(120));
@@ -248,6 +270,7 @@ fn the_model_test_refuses_a_dead_endpoint_quickly() {
         Some(&dir),
         &dead_llm(),
         "cide-test-dead/nothing-here",
+        None,
     );
     let sentence = answer.expect_err("nothing is listening");
     assert!(sentence.contains("APIError"), "{sentence}");

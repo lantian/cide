@@ -673,10 +673,166 @@ pub fn thread_names(home: &std::path::Path) -> std::collections::HashMap<String,
     names
 }
 
+/// How much of a rollout's end [`status_of`] reads. The facts it wants are the *last* ones, and
+/// a long thread's rollout runs to megabytes; a token count is written after every model
+/// response, so the newest is always well inside this.
+const STATUS_TAIL: u64 = 512 * 1024;
+
+/// Whether a hook payload's `transcript_path` is a codex rollout (M93) — `rollout-<ts>-<id>.jsonl`,
+/// where Claude Code's is `<uuid>.jsonl`. The socket is shared, so this is how a frame says which
+/// CLI sent it without the applier having to ask anybody.
+pub fn is_rollout(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+}
+
+/// The status bar's readout for a codex session, read off its rollout. (M93)
+///
+/// Codex has no statusline command — the channel Claude Code's live figures arrive on — but it
+/// records the same facts in the rollout as it works: a `turn_context` per turn naming the
+/// model and effort, and a `token_count` after every model response carrying
+/// `last_token_usage` (the prompt the model was just sent, i.e. how full the context is),
+/// `model_context_window`, and the account's `rate_limits` (measured on 0.156.1). This builds
+/// **the statusline's own shape** from them — `model`, `context_window.{context_window_size,
+/// current_usage, total_input_tokens, total_output_tokens}` — so the webview formats a codex
+/// session with the code that formats a claude one, plus two fields the claude payload does not
+/// have: `harness` (the readout's first word) and `rate_limit` (codex has no per-session cost,
+/// and the share of the plan's window used is the figure that plays that part).
+///
+/// `model` is the hook payload's own, used when the rollout has no `turn_context` yet — the
+/// `SessionStart` frame arrives before the first one is written.
+pub fn status_of(rollout: &std::path::Path, model: Option<&str>) -> Option<serde_json::Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(rollout).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(STATUS_TAIL);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    // A tail that starts mid-line has a torn first line; skip it unless this is the whole file.
+    let lines = text.lines().skip(usize::from(start > 0));
+
+    let mut tokens: Option<serde_json::Value> = None;
+    let mut limits: Option<serde_json::Value> = None;
+    let mut turn: Option<(String, Option<String>)> = None;
+    for line in lines {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let payload = event.get("payload");
+        let kind = payload.and_then(|p| p.get("type")).and_then(|t| t.as_str());
+        match (event.get("type").and_then(|t| t.as_str()), kind) {
+            (Some("event_msg"), Some("token_count")) => {
+                let payload = payload.expect("matched on it");
+                if let Some(info) = payload.get("info").filter(|i| !i.is_null()) {
+                    tokens = Some(info.clone());
+                }
+                if let Some(rate) = payload.get("rate_limits").filter(|r| !r.is_null()) {
+                    limits = Some(rate.clone());
+                }
+            }
+            (Some("turn_context"), _) => {
+                if let Some(model) = payload
+                    .and_then(|p| p.get("model"))
+                    .and_then(|m| m.as_str())
+                {
+                    let effort = payload
+                        .and_then(|p| p.get("effort"))
+                        .and_then(|e| e.as_str())
+                        .map(str::to_string);
+                    turn = Some((model.to_string(), effort));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (model, effort) = match turn {
+        Some((model, effort)) => (Some(model), effort),
+        None => (model.map(str::to_string), None),
+    };
+    if model.is_none() && tokens.is_none() {
+        return None;
+    }
+    let mut status = serde_json::json!({ "harness": "codex" });
+    if let Some(model) = model {
+        let shown = match effort {
+            Some(effort) => format!("{model} {effort}"),
+            None => model.clone(),
+        };
+        status["model"] = serde_json::json!({ "id": model, "display_name": shown });
+    }
+    if let Some(info) = tokens {
+        let at = |usage: &str, key: &str| info.get(usage).and_then(|u| u.get(key)).cloned();
+        status["context_window"] = serde_json::json!({
+            "context_window_size": info.get("model_context_window"),
+            // The last request's whole prompt plus its answer: what is in the window now.
+            "current_usage": at("last_token_usage", "total_tokens"),
+            "total_input_tokens": at("total_token_usage", "input_tokens"),
+            "total_output_tokens": at("total_token_usage", "output_tokens"),
+        });
+    }
+    if let Some(used) = limits
+        .as_ref()
+        .and_then(|l| l.get("primary"))
+        .filter(|p| !p.is_null())
+    {
+        status["rate_limit"] = serde_json::json!({
+            "used_percent": used.get("used_percent"),
+            "window_minutes": used.get("window_minutes"),
+        });
+    }
+    Some(status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cide_ipc::{ClaudeEnvVar, CodexInjections};
+
+    /// (M93) The status bar's figures come off the rollout's newest `turn_context` and
+    /// `token_count`, in the statusline's own shape; the fields are the measured ones.
+    #[test]
+    fn a_rollout_reads_as_a_statusline() {
+        let dir = std::env::temp_dir().join(format!("cide-codex-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file =
+            dir.join("rollout-2026-09-24T10-21-07-01a0d24a-1dfe-72d2-8b25-185cd0f80ec7.jsonl");
+        assert!(is_rollout(&file));
+        assert!(!is_rollout(
+            &dir.join("01a0d24a-1dfe-72d2-8b25-185cd0f80ec7.jsonl")
+        ));
+        std::fs::write(
+            &file,
+            [
+                r#"{"type":"session_meta","payload":{"id":"x"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-old","effort":"low"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"output_tokens":50,"total_tokens":20050},"last_token_usage":{"input_tokens":14390,"output_tokens":5,"total_tokens":14395},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":90.0,"window_minutes":10080}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+        let status = status_of(&file, Some("ignored")).expect("a readout");
+        assert_eq!(status["harness"], "codex");
+        assert_eq!(status["model"]["display_name"], "gpt-6-astra high");
+        assert_eq!(status["context_window"]["current_usage"], 14395);
+        assert_eq!(status["context_window"]["context_window_size"], 258400);
+        assert_eq!(status["context_window"]["total_input_tokens"], 20000);
+        assert_eq!(status["rate_limit"]["used_percent"], 90.0);
+
+        // Before any turn: the hook's model alone.
+        let empty = dir.join("rollout-2026-09-24T10-21-08-x.jsonl");
+        std::fs::write(&empty, r#"{"type":"session_meta","payload":{}}"#).expect("write");
+        let status = status_of(&empty, Some("gpt-6-astra")).expect("the model is enough");
+        assert_eq!(status["model"]["id"], "gpt-6-astra");
+        assert!(status.get("context_window").is_none());
+        assert!(status_of(&empty, None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn cli(args: &[&str]) -> CodexCli {
         CodexCli {

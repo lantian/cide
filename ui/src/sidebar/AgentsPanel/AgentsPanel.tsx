@@ -120,6 +120,7 @@ import {
   metaFigure,
   scopeBadge,
   sections,
+  type GateView,
   type RoleRow,
   type Roster,
   type Section,
@@ -169,14 +170,17 @@ const PAUSE_ALL_TITLE =
   "Pause every subagent, and this project's own Claude session, until you resume"
 
 /**
- * What the header's Resume says. Two clauses, because a pause did two things.
+ * What the header's Resume says. Three clauses, because a project-scope Resume does three things.
  *
- * `AgentRoster::Ready::dispatching` is on the wire precisely so this control can tell them
- * apart: a project with the queue shut and nothing running is indistinguishable from an idle
- * one, and the thawing of frozen children and the reopening of the queue are separate facts.
+ * `AgentRoster::Ready::dispatching` is on the wire precisely so this control can tell the first
+ * and last apart: a project with the queue shut and nothing running is indistinguishable from an
+ * idle one, and the thawing of frozen children and the reopening of the queue are separate facts.
+ * The middle clause is `requeue_interrupted`: the runs a cide restart brought back `interrupted`,
+ * whose children died with the old process, go back through the queue continuing their
+ * conversations — which is what the user pressing Resume after a restart is asking for.
  */
 const RESUME_ALL_TITLE =
-  'Resume: continue every frozen agent on the current model settings, and reopen the dispatch queue'
+  'Resume: continue every frozen agent on the current model settings, restart the ones a cide restart interrupted, and reopen the dispatch queue'
 
 export interface AgentsPanelViewProps {
   /**
@@ -202,6 +206,11 @@ export interface AgentsPanelViewProps {
    * `titleOf` already decided.
    */
   taskTitles?: Readonly<Record<string, string>> | undefined
+  /**
+   * Task id → the verify gate on its branch (M114), for the line that says why an idle run is
+   * idle. A plain map, `taskTitles`' reason; a missing key draws no line.
+   */
+  taskGates?: Readonly<Record<string, GateView>> | undefined
   /** The clock, as a prop. See the header. */
   nowMs: number
   /**
@@ -216,6 +225,8 @@ export interface AgentsPanelViewProps {
   onResume?: ((run: string) => void) | undefined
   onStop?: ((run: string) => void) | undefined
   onRevealTask?: ((task: string) => void) | undefined
+  /** Reveal the review tab that owns a run's task (M114) — `session`, for `task`. */
+  onOpenReviewer?: ((session: string, task: string) => void) | undefined
   onRetryTurn?: ((run: string) => void) | undefined
   onAckStaleTurn?: ((run: string) => void) | undefined
   /**
@@ -312,6 +323,7 @@ export function AgentsPanelView({
   project,
   roster = ROSTER_UNKNOWN,
   taskTitles = {},
+  taskGates = {},
   nowMs,
   tab = 'agents',
   onTab,
@@ -320,6 +332,7 @@ export function AgentsPanelView({
   onResume,
   onStop,
   onRevealTask,
+  onOpenReviewer,
   onRetryTurn,
   onAckStaleTurn,
   onEnable,
@@ -339,7 +352,7 @@ export function AgentsPanelView({
    * be recomputing on nearly every render anyway while adding a hook to a component whose
    * whole value is that it is a function of its props.
    */
-  const body = sections(roster, taskTitles)
+  const body = sections(roster, taskTitles, taskGates)
   const meta = metaFigure(roster)
   const roles = body.find((section) => section.kind === 'agents')
   const history = body.find((section) => section.kind === 'recent')
@@ -554,6 +567,7 @@ export function AgentsPanelView({
                     onResume={onResume}
                     onStop={onStop}
                     onRevealTask={onRevealTask}
+                    onOpenReviewer={onOpenReviewer}
                     onRetryTurn={onRetryTurn}
                     onAckStaleTurn={onAckStaleTurn}
                   />
@@ -584,6 +598,7 @@ export function AgentsPanelView({
                     onOpen={onOpen}
                     onStop={onStop}
                     onRevealTask={onRevealTask}
+                    onOpenReviewer={onOpenReviewer}
                     armed={integrateArmed === row.run.run}
                     onIntegrateArm={onIntegrateArm}
                     onIntegrate={onIntegrate}
@@ -616,15 +631,22 @@ function historyCount(section: Section | undefined): string {
 }
 
 /**
- * Is anything in this project frozen right now — **by any route, including the one that leaves
- * no row behind?**
+ * Is there anything in this project a project-scope Resume would act on — **by any route,
+ * including the one that leaves no row behind?**
  *
- * Two facts, and the second is the one a reader deletes by mistake:
+ * Three facts, and the second is the one a reader deletes by mistake:
  *
  *  * a run reading `paused` — the ordinary case, and the only one visible in the list;
  *  * `dispatching === false` — the project's queue is shut, which only a project-scope pause
  *    does. `AgentRegistry::dispatching` reads exactly one thing, `paused_projects`, and a
- *    per-run pause never touches it, so this flag *is* "a project-scope pause is in effect".
+ *    per-run pause never touches it, so this flag *is* "a project-scope pause is in effect";
+ *  * a run reading `interrupted` — every run a cide restart restored, whatever it was doing
+ *    before, since its child died with the old process. `AgentRegistry::resume` with no run
+ *    requeues them all (`requeue_interrupted`), so Resume has real work to do. This clause was
+ *    missing, and the user who paused their agents row by row, closed cide and opened it again
+ *    found rows drawn in the paused tone under a header offering **Pause** — a control with
+ *    nothing to freeze (an interrupted run has no child) in the slot of the one that restarts
+ *    them.
  *
  * The wire carries `dispatching` beside the run states for this and for nothing else: a project
  * whose queue is shut with every run finished is byte-identical to an idle one in the `runs`
@@ -639,9 +661,12 @@ function historyCount(section: Section | undefined): string {
  * registry and not by the frozen console, so a paused project keeps answering `Ready` — and if
  * a later arm ever carries a project-level pause flag, it belongs here.
  */
-function anythingFrozen(roster: Roster): boolean {
+function anythingToResume(roster: Roster): boolean {
   if (roster.kind !== 'ready') return false
-  return !roster.dispatching || roster.runs.some((run) => run.phase === 'paused')
+  return (
+    !roster.dispatching ||
+    roster.runs.some((run) => run.phase === 'paused' || run.phase === 'interrupted')
+  )
 }
 
 /**
@@ -658,6 +683,13 @@ function anythingFrozen(roster: Roster): boolean {
  * for the same reason and is the clearest case: there is no process to `SIGSTOP`, and holding
  * it in the queue is the entire point.
  *
+ * `interrupted` is out, though it is not done: its child died with a cide restart, so there is
+ * nothing to `SIGSTOP` and nothing the queue will start by itself — only Resume moves it. A
+ * roster of interrupted rows alone would leave Pause freezing nothing but the user's console,
+ * which is the control the next paragraph refuses to draw. ([`anythingToResume`] offers Resume
+ * over the same rows, and Resume wins the slot anyway; this keeps the two answers from
+ * contradicting each other.)
+ *
  * The condition deliberately does **not** reduce to "a project is open". With no run at all and
  * the queue open, the only thing a pause would do is freeze the user's own console — the
  * documented side effect standing alone as the whole effect, on a screen with no agents on it.
@@ -666,7 +698,10 @@ function anythingFrozen(roster: Roster): boolean {
  */
 function anythingToFreeze(roster: Roster): boolean {
   if (roster.kind !== 'ready') return false
-  return roster.dispatching && roster.runs.some((run) => !isDonePhase(run.phase))
+  return (
+    roster.dispatching &&
+    roster.runs.some((run) => !isDonePhase(run.phase) && run.phase !== 'interrupted')
+  )
 }
 
 /**
@@ -676,7 +711,7 @@ function anythingToFreeze(roster: Roster): boolean {
  *
  * A project-scope pause freezes every run *and the project's own console session* — the pane
  * the user types into. So the resume half has to be reachable from a window where nothing else
- * is: it is offered whenever [`anythingFrozen`] says something is frozen, and on **no** other
+ * is: it is offered whenever [`anythingToResume`] says there is something, and on **no** other
  * condition. Not gated on the roster being busy, not on there being a live run, not on
  * `dispatching`, not on a row being visible. Every one of those can be false while something is
  * frozen, and a Resume that is absent while the console is frozen is a window with no way out
@@ -705,7 +740,7 @@ function ScopeControl({
   onPauseAll?: (() => void) | undefined
   onResumeAll?: (() => void) | undefined
 }) {
-  if (onResumeAll !== undefined && anythingFrozen(roster)) {
+  if (onResumeAll !== undefined && anythingToResume(roster)) {
     return (
       <button
         type="button"
@@ -794,6 +829,7 @@ function RoleLine({
   onResume,
   onStop,
   onRevealTask,
+  onOpenReviewer,
   onRetryTurn,
   onAckStaleTurn,
 }: {
@@ -805,6 +841,7 @@ function RoleLine({
   onResume?: ((run: string) => void) | undefined
   onStop?: ((run: string) => void) | undefined
   onRevealTask?: ((task: string) => void) | undefined
+  onOpenReviewer?: ((session: string, task: string) => void) | undefined
   onRetryTurn?: ((run: string) => void) | undefined
   onAckStaleTurn?: ((run: string) => void) | undefined
 }) {
@@ -940,6 +977,7 @@ function RoleLine({
           onResume={onResume}
           onStop={onStop}
           onRevealTask={onRevealTask}
+          onOpenReviewer={onOpenReviewer}
           onRetryTurn={onRetryTurn}
           onAckStaleTurn={onAckStaleTurn}
         />

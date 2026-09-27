@@ -190,6 +190,14 @@ impl GitLab {
         if result.is_err() {
             let _ = fs::remove_file(tmp);
         }
+        // The rename made durable, not only the bytes: without the directory's fsync a power
+        // cut can leave it naming the previous file. Logged, not returned — the new file is
+        // already in place. (M117)
+        if result.is_ok()
+            && let Err(error) = cide_core::persist::sync_dir(parent)
+        {
+            tracing::warn!(%error, "saved, but could not fsync the directory");
+        }
         Ok(result?)
     }
     pub fn board(&self) -> GitLabBoard {

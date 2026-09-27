@@ -560,6 +560,14 @@ pub struct AgentRun {
     /// A run with no task stood in the project root and never had one.
     #[serde(default)]
     pub worktree: bool,
+    /// The Claude session of the review tab that owns this run's task right now, while that tab
+    /// is open. (M114) The row draws it as "In review by orchestrator", a link that reveals the
+    /// tab: a run parked `Idle` because its task went to review otherwise looked stuck, with
+    /// nothing saying that somebody else holds the task. Filled, like [`Self::worktree`], only
+    /// where a roster is built — the review-tab table lives in the app.
+    #[ts(optional)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<SessionId>,
 }
 
 /// What pressing **Open** on a run should do, as `agents_run_open` answers it. (M42)
@@ -721,6 +729,12 @@ pub struct OrchestrationConfig {
     pub isolate_env_share: Vec<String>,
     /// `agents.verifyExclusive`: whether the project's verifies run one at a time.
     pub verify_exclusive: bool,
+    /// `agents.verifyRetries`: how many red verifies in a row go straight back to the run before
+    /// the reviewer takes over. The stored number. (M114)
+    pub verify_retries: u8,
+    /// `agents.resumeAfterRestart`: whether runs a cide restart interrupted continue by
+    /// themselves at the next launch. (M118)
+    pub resume_after_restart: bool,
 }
 
 impl Default for OrchestrationConfig {
@@ -740,6 +754,8 @@ impl Default for OrchestrationConfig {
             isolate_env: Vec::new(),
             isolate_env_share: Vec::new(),
             verify_exclusive: false,
+            verify_retries: 3,
+            resume_after_restart: true,
         }
     }
 }
@@ -791,6 +807,12 @@ pub struct OrchestrationPatch {
     /// `agents.verifyExclusive`.
     #[ts(optional)]
     pub verify_exclusive: Option<bool>,
+    /// `agents.verifyRetries`, clamped by `AgentsConfig::apply`. (M114)
+    #[ts(optional)]
+    pub verify_retries: Option<u8>,
+    /// `agents.resumeAfterRestart`. (M118)
+    #[ts(optional)]
+    pub resume_after_restart: Option<bool>,
 }
 
 /// Dispatch one run. Inbound.
@@ -853,6 +875,13 @@ pub struct DispatchRequest {
     #[serde(default)]
     #[ts(optional)]
     pub model: Option<String>,
+    /// Start a new context rather than continue the role's own conversation on this task.
+    /// (M116) Without it a dispatch onto a (role, task) that has been worked before continues it:
+    /// its instructions go into the run still holding the pair, or a new run resumes the last
+    /// ended one's conversation. `false`, and absent from older clients, is the default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub fresh: bool,
 }
 
 /// A piece of work that is not a task in this project's tracker. (M104)
@@ -1139,6 +1168,24 @@ pub struct AgentDraft {
     /// silently *deleted* from a hand-written definition by the next panel save.
     #[ts(optional)]
     pub worktree: Option<bool>,
+    /// `allow-commands:` — command prefixes this role runs without being asked, written the way
+    /// they are typed (`blender -b`, `tools/ci/runners/e2e.sh`). (M119)
+    ///
+    /// On codex these become execpolicy `prefix_rule`s, and a command every part of which one
+    /// matches runs **outside** codex's sandbox; on claude they are `Bash(<prefix>:*)` entries in
+    /// `--allowedTools`. Empty means none. `#[serde(default)]` because a draft from before M119 —
+    /// and every form that does not show the field — must still deserialize, and `render` writes
+    /// only what the draft carries, so the form carries all three of these keys even where it
+    /// does not draw them (see [`Self::worktree`]'s doc for the deletion hazard).
+    #[serde(default)]
+    pub allow_commands: Vec<String>,
+    /// `needs:` — what the role's work needs from a sandbox. See [`SandboxNeed`]. (M119)
+    #[serde(default)]
+    pub needs: Vec<SandboxNeed>,
+    /// `writable-dirs:` — directories outside the worktree this role may write, absolute or
+    /// `~/…`. Added to codex's sandbox as writable roots. (M119)
+    #[serde(default)]
+    pub writable_dirs: Vec<String>,
     /// The body of the file: the role's system prompt, verbatim.
     ///
     /// The one field here that is a document rather than a switch, and the reason the format is
@@ -1158,6 +1205,47 @@ pub struct AgentDraft {
     /// first.
     #[serde(default)]
     pub extras: Vec<AgentExtra>,
+}
+
+/// A resource a role's work needs that a sandboxed harness denies by default. (M119)
+///
+/// Measured on codex 0.157.1 (selfcraft, 2026-09-26): its workspace-write sandbox with the
+/// network off refuses **every `AF_UNIX` socket** through seccomp, not only network ones. So an
+/// Xvfb cannot listen on `/tmp/.X11-unix` although that directory is writable, and a Blender run
+/// finishes its script and then hangs at exit on PulseAudio's wake-up write. The one switch that
+/// lifts it is the sandbox's network access, which is why all three of these mean "network on"
+/// to codex and differ only in what else a harness does for them (`Display` also points glvnd at
+/// Mesa, because the sandbox's `/dev` has no GPU nodes and NVIDIA's EGL crashes Xvfb's GLX).
+/// The three are kept apart anyway: they are what the *role* needs, and the next harness's
+/// sandbox may not tie them together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SandboxNeed {
+    /// An X server of its own — Xvfb for an e2e capture — with GL on llvmpipe.
+    Display,
+    /// Audio — Blender, Godot and anything else that opens PulseAudio even headless.
+    Audio,
+    /// The network itself.
+    Network,
+}
+
+impl SandboxNeed {
+    /// The word a role file writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxNeed::Display => "display",
+            SandboxNeed::Audio => "audio",
+            SandboxNeed::Network => "network",
+        }
+    }
+
+    /// Every need, in the order a file lists them.
+    pub const ALL: [SandboxNeed; 3] = [
+        SandboxNeed::Display,
+        SandboxNeed::Audio,
+        SandboxNeed::Network,
+    ];
 }
 
 /// Which box on the form a refusal belongs to.
@@ -1184,6 +1272,10 @@ pub enum AgentField {
     Tools,
     PermissionMode,
     MaxConcurrent,
+    /// `allow-commands:`, `needs:`, `writable-dirs:` — the role's sandbox grant. (M119)
+    AllowCommands,
+    Needs,
+    WritableDirs,
     SystemPrompt,
     /// The unmodelled front-matter keys, as a whole. (M30)
     ///
@@ -1324,7 +1416,7 @@ pub struct LlmModelTest {
 /// Why a provider refused a run, as the pool-state card draws it. (M90)
 ///
 /// The wire twin of `cide_agents::FailoverReason`, which is not serialisable and lives in a crate
-/// this one must not depend on. Three cases for the same reason that enum gives: each is a
+/// this one must not depend on. Five cases for the same reason that enum gives: each is a
 /// different something a different candidate plausibly routes around.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1333,6 +1425,10 @@ pub enum PoolRefusal {
     RateLimited,
     Unreachable,
     Auth,
+    /// The model does not offer the entry's effort variant. (t-1090)
+    Variant,
+    /// The provider rejected the request: no such model, a bad request, an unsupported operation.
+    Rejected,
 }
 
 /// A pool target every run's admission is currently steering around. (M90)
@@ -1479,6 +1575,114 @@ pub struct PoolEntryState {
     pub runs: Vec<PoolRunRef>,
     /// `None` when admission is not steering around it.
     pub bench: Option<PoolBench>,
+    /// What this target has done since cide started. Kept in memory only, like the bench.
+    pub stats: PoolEntryStats,
+}
+
+/// One model request's generated tokens against its duration. (pool stats)
+///
+/// Two integers rather than a rate so the report keeps `Eq` and the card does the one division.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolStepRate {
+    #[ts(type = "number")]
+    pub tokens: u64,
+    #[ts(type = "number")]
+    pub ms: u64,
+}
+
+impl PoolStepRate {
+    /// Whether `self` is a faster request than `other`, by cross-multiplication — no float.
+    #[must_use]
+    pub fn faster_than(self, other: Self) -> bool {
+        u128::from(self.tokens) * u128::from(other.ms)
+            > u128::from(other.tokens) * u128::from(self.ms)
+    }
+}
+
+/// How much one pool target has been used since cide started. (pool stats)
+///
+/// Asked for as a card that shows, per entry, how many runs went to it, how many requests it
+/// served, the tokens in and out and how fast it wrote them. Keyed by **target**
+/// (`PoolEntry::same_target`), like the bench and the running limit: two pools naming one server
+/// are one server's figures, drawn under both. In memory only — a restart starts from nothing,
+/// which is what "since cide started" on the card says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PoolEntryStats {
+    /// Runs admitted onto this target, by admission or by a failover moving onto it.
+    pub started: u32,
+    /// Model requests — one per `step_finish` a run on this target printed.
+    #[ts(type = "number")]
+    pub requests: u64,
+    /// Uncached prompt tokens, summed — [`TokenUsage::input`]'s meaning.
+    #[ts(type = "number")]
+    pub input: u64,
+    #[ts(type = "number")]
+    pub cache_read: u64,
+    #[ts(type = "number")]
+    pub output: u64,
+    #[ts(type = "number")]
+    pub reasoning: u64,
+    /// Generated tokens (output + reasoning) and milliseconds over the requests that could be
+    /// timed — the average speed is their quotient, weighted by tokens, so a two-token step that
+    /// took a second does not drag it the way a mean of rates would.
+    #[ts(type = "number")]
+    pub rated_tokens: u64,
+    #[ts(type = "number")]
+    pub rated_ms: u64,
+    pub slowest: Option<PoolStepRate>,
+    pub fastest: Option<PoolStepRate>,
+    /// Response time: over **every** request whose start was seen, how many, their total and
+    /// their extremes, in ms — step start to step finish. Kept apart from the speed figures
+    /// because a request that generated nothing (a bare tool call) still took time to answer and
+    /// belongs here, while it would be a meaningless zero in a speed.
+    #[ts(type = "number")]
+    pub timed: u64,
+    #[ts(type = "number")]
+    pub timed_ms: u64,
+    #[ts(type = "number | null")]
+    pub quickest_ms: Option<u64>,
+    #[ts(type = "number | null")]
+    pub longest_ms: Option<u64>,
+}
+
+impl PoolEntryStats {
+    /// Add one finished request: what it spent and, where both edges were seen, how long it took.
+    pub fn record(&mut self, spent: &TokenUsage, took_ms: Option<u64>) {
+        self.requests += 1;
+        self.input += spent.input;
+        self.cache_read += spent.cache_read;
+        self.output += spent.output;
+        self.reasoning += spent.reasoning;
+        let generated = spent.output + spent.reasoning;
+        let Some(ms) = took_ms else {
+            return;
+        };
+        self.timed += 1;
+        self.timed_ms += ms;
+        self.quickest_ms = Some(self.quickest_ms.map_or(ms, |q| q.min(ms)));
+        self.longest_ms = Some(self.longest_ms.map_or(ms, |l| l.max(ms)));
+        // A step that wrote nothing, or was timed at zero, says nothing about speed — it would
+        // be the minimum forever, or a division by zero.
+        if ms == 0 || generated == 0 {
+            return;
+        }
+        let rate = PoolStepRate {
+            tokens: generated,
+            ms,
+        };
+        self.rated_tokens += generated;
+        self.rated_ms += ms;
+        if self.fastest.is_none_or(|f| rate.faster_than(f)) {
+            self.fastest = Some(rate);
+        }
+        if self.slowest.is_none_or(|s| s.faster_than(rate)) {
+            self.slowest = Some(rate);
+        }
+    }
 }
 
 /// One configured pool. (M90)
@@ -1537,6 +1741,12 @@ pub struct AgentModels {
     /// [`AgentDraftProblem`], because nothing the user typed caused it and nothing they can type
     /// in this form fixes it. The box stays editable either way.
     pub problem: Option<String>,
+    /// Whether this harness's CLI takes a pool entry's effort variant inside the model id
+    /// (`--model o3/Qwen-Coder#xhigh`, opencode 2) rather than as `--variant xhigh` (opencode 1,
+    /// MiMo). The pool screen's argv readout spells it this way; it said `--variant` for a CLI
+    /// that answers that flag with `Unrecognized flag`, over the exact argv t-1090 died on.
+    /// `false` for a harness with no variant at all.
+    pub variant_in_model: bool,
 }
 
 /// What a harness reported it spent, as of its last completed step. (M80)
@@ -1715,6 +1925,7 @@ mod tests {
             model: None,
             pool_position: None,
             worktree: false,
+            reviewer: None,
         };
         let json = serde_json::to_string(&run).expect("serialize");
         // snake_case on both sides would round-trip happily and read `undefined` in the webview.

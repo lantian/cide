@@ -52,3 +52,58 @@ about to release** — that file then differs by no lines and the workflow's `1 
 refuses the run. A final `bump` job puts master on `<next patch>-dev` after publishing, because the
 release branch is never merged back and the trunk otherwise keeps a version two releases old;
 `scripts/bump-version.sh` is the same edit by hand, and release.yml now calls it.
+
+## Self-update
+
+Installed copies check `https://github.com/lantian/cide/releases/latest/download/latest.json` a
+few seconds after start (`crates/cide-app/src/updater.rs`). GitHub's `latest` skips drafts and
+prereleases, so only stable releases are ever offered. The user can **Update** (download, verify,
+replace, then asked whether to restart), **Skip this version** (`settings.update.skippedVersion`),
+or dismiss the notice until the next start. *Check for updates* in the palette and the About card
+asks on demand and ignores a skip. Settings › Projects & windows turns the start-up check off.
+
+Only the AppImage and a `.app` in a writable, non-translocated location replace themselves. The
+tarball, a `.deb`, the Flatpak and a copy running from the `.dmg` get *Open release page*.
+Development builds (`-dev` versions, debug builds) never check.
+
+### One-time setup (the maintainer)
+
+1. `pnpm --dir ui exec tauri signer generate -w ~/.tauri/cide.key` — keep the private key and its
+   password safe; losing it means installed copies can never be updated again.
+2. Repository secrets `TAURI_SIGNING_PRIVATE_KEY` (the key file's contents) and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+3. Paste the public key (`~/.tauri/cide.key.pub`'s contents) into `plugins.updater.pubkey` in
+   `crates/cide-app/tauri.conf.json` and commit it.
+
+Until step 3 the running app never checks, and **`release.yml` refuses to build**: it sets
+`CIDE_RELEASE=1`, under which `xtask package`'s preflight fails an unsigned release instead of
+warning, because an unsigned release publishes no manifest and installed copies go quiet with no
+error anywhere.
+
+### What a release publishes for it
+
+- `xtask package` passes `{"bundle":{"createUpdaterArtifacts":true}}` as an extra `--config` when
+  `TAURI_SIGNING_PRIVATE_KEY` is set (never in `tauri.conf.json`, where it would break every
+  unsigned local build). The bundler then writes `<AppImage>.sig`, and on macOS
+  `bundle/macos/cide.app.tar.gz` and its `.sig`; the macos job renames those to
+  `cide_<version>_<arch>.app.tar.gz[.sig]`.
+- `scripts/updater-manifest.py` writes `latest.json` in the publish job from those `.sig` files:
+  `version`, `pub_date`, and `platforms.{linux-x86_64,darwin-aarch64}.{signature,url}`.
+
+### Testing an update end to end
+
+Needs two builds stamped with release versions (not `-dev`) and signed with one throwaway key:
+
+```sh
+pnpm --dir ui exec tauri signer generate -w /tmp/test.key    # paste its .pub into tauri.conf.json, uncommitted
+export TAURI_SIGNING_PRIVATE_KEY="$(cat /tmp/test.key)" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=…
+# version 0.10.1 in tauri.conf.json → cargo xtask package --appimage --run → keep the AppImage
+# version 0.10.3 → build again → copy its AppImage and .sig into ./srv
+python3 scripts/updater-manifest.py --dir srv --version 0.10.3 --repo lantian/cide
+# edit srv/latest.json's url to http://127.0.0.1:8000/<AppImage>, serve srv with python3 -m http.server
+CIDE_PROFILE=test CIDE_UPDATE_ENDPOINT=http://127.0.0.1:8000/latest.json ./cide_0.10.1_amd64.AppImage
+```
+
+The plugin refuses plain `http` endpoints unless `plugins.updater.dangerousInsecureTransportProtocol`
+is `true`; set it in the throwaway build's config only.
+

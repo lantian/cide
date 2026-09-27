@@ -2208,6 +2208,7 @@ mod tests {
             tools: Vec::new(),
             permission_mode: None,
             effort: None,
+            sandbox: Default::default(),
         }
     }
 

@@ -262,6 +262,17 @@ platform-specific here; what it knows is that under `workspace-write` codex re-b
 read-only on Linux, which is why a task run's default is the bypass. Whether the macOS sandbox
 does the same to a worktree's `.git` file is unmeasured, and nothing here has been run on a Mac.
 
+What a role's sandbox grant does (M119) is Linux-measured only:
+- With the network off, codex's seccomp filter refuses every `AF_UNIX` socket, which is why
+  `needs:` turns the network on.
+- The Mesa glvnd variables for `display` are set only when `/usr/share/glvnd/egl_vendor.d/50_mesa.json`
+  (or `/etc/…`) exists.
+- An `allow-commands` rule lets a command out of the sandbox entirely.
+
+Seatbelt's equivalents are unknown. `cide_core::process_tree` (ending a run's whole tree, and the
+worktree sweeps) reads `/proc`, so it is a no-op off Linux. There a stopped codex run can still
+leave its commands running, as every platform did before M119.
+
 ## What needs a Mac at the keyboard
 
 Everything here is a decision, not a port, and each one has a consequence somebody has to look

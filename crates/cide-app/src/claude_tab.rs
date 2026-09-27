@@ -36,7 +36,9 @@
 //!
 //! `TabKind::ClaudeFull::ephemeral`'s doc carries it: closing a tab normally parks its sessions
 //! for Ctrl+Shift+T, which at one tab per finished run is a `claude` leaked per run. Every tab
-//! this module opens is marked, and `cmd::project::tab_close` ends a marked tab's children.
+//! this module opens is marked, and `cmd::project::tab_close` ends a marked tab's children. The
+//! tab is still remembered, and Ctrl+Shift+T brings it back live by resuming the transcript:
+//! [`resume_closed`].
 
 use cide_core::CoreError;
 use cide_ipc::{Geometry, Pane, PaneId, PaneKind, PaneRole, ProjectId, SessionId, TabId, TabKind};
@@ -219,35 +221,11 @@ pub(crate) fn open(
     };
     let model = model.map(str::trim).filter(|m| !m.is_empty());
 
-    // One flag, spelled once. `Ask` passes nothing, which is the CLI's own default.
-    let mut args: Vec<String> = Vec::new();
-    if codex {
-        // Codex's vocabulary for the same three answers: the sandbox-and-approval pair a run of
-        // that mode gets (`harness::codex::permission_policy`), and nothing for `Ask`, where the
-        // user's own `config.toml` decides and codex asks in the pane. No `--name`: codex has
-        // none, and names a thread by itself.
-        //
-        // And nothing when Settings says a wrapper decides (M108, `CodexInjections::permissions`).
-        let policy = match mode.unattended {
-            _ if !codex_policy => None,
-            cide_agents::Unattended::Ask => None,
-            unattended => cide_agents::harness::codex::permission_policy(None, unattended).ok(),
-        };
-        args.extend(policy.into_iter().flatten().map(|t| t.to_string()));
-    } else {
-        let permission = match mode.unattended {
-            cide_agents::Unattended::Auto => Some("auto"),
-            cide_agents::Unattended::Bypass => Some(cide_agents::defs::BYPASS_PERMISSIONS),
-            cide_agents::Unattended::Ask => None,
-        };
-        if let Some(permission) = permission {
-            args.push("--permission-mode".into());
-            args.push(permission.into());
-        }
-        if let Some(name) = session_name {
-            args.push("--name".into());
-            args.push(name.into());
-        }
+    let mut args = stance_args(codex, mode.unattended, codex_policy);
+    // Codex has no `--name`, and names a thread by itself.
+    if !codex && let Some(name) = session_name {
+        args.push("--name".into());
+        args.push(name.into());
     }
     // Both consoles spell it the same. Opencode's goes through `tab_launch` below.
     if !opencode && let Some(model) = model {
@@ -456,13 +434,7 @@ pub(crate) fn open(
     // `openDiff` or an `@`-mention belongs to. `ide::resolve_unbound_connections` would recover
     // it by walking ancestry — `pane_pids` reads the tree, which now names this session — but
     // both facts are in hand here, so the answer is given rather than reconstructed.
-    if let (Some(servers), Some(pty)) = (
-        app.try_state::<crate::ide::IdeServers>(),
-        registry.get(session),
-    ) && let Some(pid) = pty.child_pid()
-    {
-        servers.bind_pane(project, pid, pane);
-    }
+    bind_ide_pane(app, &registry, project, session, pane);
 
     if codex || opencode {
         // Already submitted, as the argv's last token (codex) or its `--prompt` (opencode).
@@ -476,4 +448,199 @@ pub(crate) fn open(
     }
 
     Ok((session, tab))
+}
+
+/// The permission stance a tab cide opens is started under, as argv: one flag, spelled once.
+/// `Ask` passes nothing, which is the CLI's own default.
+///
+/// Shared by [`open`] and [`resume_closed`], because a reopened reviewer that came back asking
+/// for permission where the one the user closed did not would be the same tab behaving
+/// differently for no reason the user can see — and it is still unattended by construction.
+fn stance_args(
+    codex: bool,
+    unattended: cide_agents::Unattended,
+    codex_policy: bool,
+) -> Vec<String> {
+    if codex {
+        // Codex's vocabulary for the same three answers: the sandbox-and-approval pair a run of
+        // that mode gets (`harness::codex::permission_policy`), and nothing for `Ask`, where the
+        // user's own `config.toml` decides and codex asks in the pane. No `--name`: codex has
+        // none, and names a thread by itself.
+        //
+        // And nothing when Settings says a wrapper decides (M108, `CodexInjections::permissions`).
+        let policy = match unattended {
+            _ if !codex_policy => None,
+            cide_agents::Unattended::Ask => None,
+            unattended => cide_agents::harness::codex::permission_policy(None, unattended).ok(),
+        };
+        policy
+            .into_iter()
+            .flatten()
+            .map(|t| t.to_string())
+            .collect()
+    } else {
+        let permission = match unattended {
+            cide_agents::Unattended::Auto => Some("auto"),
+            cide_agents::Unattended::Bypass => Some(cide_agents::defs::BYPASS_PERMISSIONS),
+            cide_agents::Unattended::Ask => None,
+        };
+        permission
+            .map(|permission| vec!["--permission-mode".to_string(), permission.to_string()])
+            .unwrap_or_default()
+    }
+}
+
+/// The pid→pane join for `cide-ide-mcp`, which `cmd::pane::pane_bind_session` would normally do
+/// and which a pane whose `session` is written in Rust skips. `claude` announces itself over the
+/// IDE socket with its pid, and that pid is what decides which pane an `openDiff` or an
+/// `@`-mention belongs to. `ide::resolve_unbound_connections` would recover it by walking
+/// ancestry, but both facts are in hand wherever this is called, so the answer is given rather
+/// than reconstructed.
+fn bind_ide_pane(
+    app: &tauri::AppHandle,
+    registry: &crate::state::SessionRegistry,
+    project: ProjectId,
+    session: SessionId,
+    pane: PaneId,
+) {
+    if let (Some(servers), Some(pty)) = (
+        app.try_state::<crate::ide::IdeServers>(),
+        registry.get(session),
+    ) && let Some(pid) = pty.child_pid()
+    {
+        servers.bind_pane(project, pid, pane);
+    }
+}
+
+/// Bring a closed tab's conversations back to life before Ctrl+Shift+T reinserts the tab.
+///
+/// # Why a tab cide opened is now remembered at all
+///
+/// Until this, closing a Review or Plan tab ended its `claude` (M79) **and** wrote no
+/// `ClosedTabs` record, on the argument that a record would name a session the registry had
+/// forgotten. The consequence was reported plainly: Ctrl+Shift+T could not bring back a Review
+/// or Plan tab, and closing one by mistake lost the conversation from view. The kill is still
+/// right — parking a child per finished run is the leak M79 was about — but the *transcript*
+/// survives the kill on disk, and `claude --resume` is exactly the road back. So the close
+/// kills and remembers, and the reopen resumes.
+///
+/// The option that lost was restoring the tab with its dead screen and the pane's own
+/// **Resume this conversation** button: smaller, but a reopen whose result is a corpse the user
+/// then has to click on is not what the key promises for any other tab.
+///
+/// # Session first, tab second
+///
+/// [`open`]'s rule, for [`open`]'s reason: the child is spawned **before** the tab is back in
+/// the tree, under the pane's own session id (a plain `--resume` keeps it, and
+/// `spawn_session`'s guard replaces an *exited* registry entry and refuses only a live one). So
+/// when the broadcast mounts the pane, `TerminalPane`'s adoption branch finds a running session
+/// and attaches to it; there is no spawn plan to lose between a mutation and a mount.
+///
+/// # What is resumed, and what is not
+///
+/// The decision is `lifecycle::restore_for`'s — the same one the launch plan and the Resume
+/// splash make — so a `/clear`ed pane resumes the conversation it moved on to, a codex pane
+/// resumes by its thread, and a pane whose transcript is gone or whose `--resume` injection is
+/// switched off is **not** respawned. That pane comes back holding its exited session and shows
+/// the ordinary restart bar, which is honest; so does an opencode pane (a `Shell`, with no id
+/// cide could continue — M104's stated gap). A spawn that fails is logged and left the same
+/// way: the tab still comes back, so the key never silently does nothing.
+///
+/// Answers the sessions it started, which the caller kills if the reinsert then fails — a live
+/// `claude` with no pane is a leak and a billed process.
+pub(crate) async fn resume_closed(
+    app: &tauri::AppHandle,
+    record: &mut crate::closed_tabs::ClosedTab,
+) -> Vec<SessionId> {
+    let project = record.project;
+    let (Some(state), Some(registry)) = (
+        app.try_state::<WorkspaceState>(),
+        app.try_state::<crate::state::SessionRegistry>(),
+    ) else {
+        return Vec::new();
+    };
+    let Ok((root, codex_policy)) = state.with(|ws| {
+        let p = cide_core::workspace::project(ws, project)?;
+        let root = p
+            .roots
+            .first()
+            .map(|root| root.path.clone())
+            .ok_or(CoreError::NoRoots)?;
+        Ok::<_, CoreError>((root, ws.settings.codex.cli.inject.permissions))
+    }) else {
+        return Vec::new();
+    };
+    // Read fresh, like every caller of `open`: `.cide/config.json` is committed and changes
+    // under a running app.
+    let unattended = cide_agents::config::load(&root).agents.unattended();
+
+    let mut started = Vec::new();
+    let panes: Vec<Pane> = record.tree.panes.values().cloned().collect();
+    for pane in &panes {
+        let Some(session) = pane.session else {
+            continue;
+        };
+        // Still running somewhere — nothing to resume, and spawning would be refused anyway.
+        if registry.get(session).is_some_and(|pty| !pty.has_exited()) {
+            continue;
+        }
+        let cide_ipc::SessionRestore::Resumable { session: resume } =
+            state.with(|ws| crate::lifecycle::resumable_on_reopen(ws, pane, &root))
+        else {
+            continue;
+        };
+        let codex = cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Codex;
+        let console = if codex {
+            cide_ipc::ConsoleHarness::Codex
+        } else {
+            cide_ipc::ConsoleHarness::Claude
+        };
+        let cwd = pane
+            .continues
+            .as_ref()
+            .map_or(root.clone(), |conversation| conversation.cwd.clone());
+        let request = crate::cmd::session::SpawnRequest {
+            program: console.program().to_string(),
+            // A `continues` pane's argv is its harness's `continue_spec`, which replaces these;
+            // for every other pane they are the stance the tab was opened under.
+            args: stance_args(codex, unattended, codex_policy),
+            cwd: cwd.to_string_lossy().into_owned(),
+            geometry: Geometry::default(),
+            project: Some(project),
+            resume: Some(resume),
+            fork: None,
+            continues: pane.continues.clone(),
+            // Told explicitly: `spawn_session` infers a worker from the tree, and the tab is not
+            // back in the tree yet — session first, tab second.
+            voice: Some(if pane.origin == Some(cide_ipc::PaneOrigin::Worker) {
+                crate::cmd::session::Voice::Worker
+            } else {
+                crate::cmd::session::Voice::Acting
+            }),
+            env: Vec::new(),
+            // Nothing is typed: the conversation already holds its brief, and a reopened tab
+            // waits for the user rather than starting another turn.
+            prompt: None,
+            task_tools: false,
+        };
+        match crate::cmd::session::spawn_session(app, &registry, request).await {
+            Ok(id) => {
+                tracing::info!(%project, %session, "resumed a reopened tab cide opened by itself");
+                bind_ide_pane(app, &registry, project, id, pane.id);
+                // The pane is rebound to what the spawn answered, which is not always the id it
+                // held: a `/clear`ed conversation resumes under the id the CLI moved on to, and a
+                // codex console is filed under a freshly minted routing id. The webview does this
+                // with `pane_bind_session` after its own spawns; here the tree is still the
+                // record's, so it is written before the reinsert makes it anybody's.
+                if let Some(held) = record.tree.panes.get_mut(&pane.id) {
+                    held.session = Some(id);
+                }
+                started.push(id);
+            }
+            Err(error) => {
+                tracing::warn!(%project, %session, %error, "could not resume a reopened tab; it comes back exited");
+            }
+        }
+    }
+    started
 }

@@ -17,6 +17,8 @@ pub mod project;
 pub mod remote;
 pub mod session;
 pub mod settings;
+/// Self-update: the manual check, *Skip this version*, install, restart.
+pub mod update;
 pub mod window;
 
 // --- M8 ---

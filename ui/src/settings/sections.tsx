@@ -62,6 +62,7 @@ import { badge, handshakeNote, sentence } from './cliHandshake'
 import { ClaudeCliSection } from './ClaudeCliSection'
 import { CodexCliSection } from './CodexCliSection'
 import { ModelsSection } from './ModelsSection'
+import { AccentRow } from './AccentRow'
 import { ColorSchemeRow } from './ColorSchemeRow'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
@@ -178,15 +179,13 @@ export interface SectionProps {
    * and on a build with no such handler.
    */
   opencodeModels: AgentModels | null
-  /** Run that probe again, after a key or an endpoint changed. */
-  recheckModels: () => void
   /**
    * Try one `provider/model` for real, for the Models screen's Test buttons. (M45)
    *
    * Spends a very small amount of quota, so it is only ever wired to a button. `null` on a build
    * with no such handler, exactly as `opencodeModels` above.
    */
-  testModel: (model: string) => Promise<LlmModelTest | null>
+  testModel: (model: string, variant?: string) => Promise<LlmModelTest | null>
   /**
    * A custom model's limits, read off its provider's server. (M88) Free, so the screen calls it
    * when a model id is entered as well as from its button.
@@ -225,6 +224,8 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
           being visible at all.
         */}
         <ColorSchemeRow theme={settings.theme} editor={settings.editor} patch={patch} />
+        {/* After the scheme rather than between it and Theme, which are a pair (above). */}
+        <AccentRow accent={settings.accent} />
         <Row
           label="UI font size"
           // Named for what it excludes, because the screen already carries two other font
@@ -299,6 +300,26 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
         checked={settings.reopenLastProject}
         onChange={(v) => patch({ reopenLastProject: v })}
       />
+      {/* Here beside *Reopen the last project*: both are about what a launch does. The patch
+          sends the whole `update` group, `SettingsPatch`'s per-group rule. */}
+      <ToggleRow
+        label="Check for updates on start"
+        hint="Asks GitHub for a newer release a few seconds after launch, and offers to install it. Development builds never check."
+        checked={settings.update.checkOnStart}
+        onChange={(v) => patch({ update: { ...settings.update, checkOnStart: v } })}
+      />
+      {settings.update.skippedVersion !== null && (
+        <Row
+          label={`Skipping cide ${settings.update.skippedVersion}`}
+          hint="You chose Skip this version. Newer releases are still offered."
+          control={
+            <ActionButton
+              label="Offer it again"
+              onClick={() => patch({ update: { ...settings.update, skippedVersion: null } })}
+            />
+          }
+        />
+      )}
       <ToggleRow
         // The mock says "Keep a project running when its window is closed — live Claude
         // sessions survive in the background". That is a promise cide does not keep: there is
@@ -864,7 +885,6 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
           settings={props.settings.llm}
           patch={props.patch}
           models={props.opencodeModels}
-          recheckModels={props.recheckModels}
           testModel={props.testModel}
           probeLimits={props.probeLimits}
         />

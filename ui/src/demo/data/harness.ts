@@ -52,6 +52,9 @@ export function draftOf(agent: string, scope: AgentScope): AgentDraft {
     tools: [],
     maxConcurrent: def.maxConcurrent,
     worktree: def.worktree,
+    allowCommands: [],
+    needs: [],
+    writableDirs: [],
     systemPrompt: PROMPTS[def.id] ?? def.systemPrompt,
     extras: def.color ? [{ key: 'color', value: def.color }] : [],
     ...EXTRA[def.id],
@@ -68,7 +71,7 @@ const MODELS: Record<Harness, string[]> = {
   qwen: ['qwen3-coder-plus', 'qwen3-coder-flash'],
 }
 
-export const modelsOf = (harness: Harness): AgentModels => ({ harness, models: MODELS[harness], problem: null })
+export const modelsOf = (harness: Harness): AgentModels => ({ harness, models: MODELS[harness], problem: null, variantInModel: harness === 'opencode' })
 
 export const OVERRIDES: ProjectOverrides = {
   all: {},

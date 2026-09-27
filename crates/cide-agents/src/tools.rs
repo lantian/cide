@@ -243,6 +243,9 @@ pub mod tool {
     /// Point one role — or every role that names nothing of its own — at a different harness,
     /// model, pool or effort, on this machine only. (M71)
     pub const AGENT_OVERRIDE: &str = "cide_agent_override";
+    /// Switch this project's whole override table between named profiles, or save, rename and
+    /// delete them. (M123) The gesture for "this provider is out of quota; move everything".
+    pub const AGENT_OVERRIDE_PROFILE: &str = "cide_agent_override_profile";
     /// Add, change or remove one LLM provider: an id, an endpoint, a credential. (M71)
     pub const LLM_PROVIDER: &str = "cide_llm_provider";
     /// Add, change or remove one model pool — the ordered list a run falls down. (M71)
@@ -306,6 +309,7 @@ pub mod tool {
         AGENT_UPDATE,
         AGENTS_CONFIG,
         AGENT_OVERRIDE,
+        AGENT_OVERRIDE_PROFILE,
         LLM_PROVIDER,
         LLM_POOL,
         AGENT_DISPATCH,
@@ -339,6 +343,7 @@ pub mod tool {
         AGENT_UPDATE,
         AGENTS_CONFIG,
         AGENT_OVERRIDE,
+        AGENT_OVERRIDE_PROFILE,
         LLM_PROVIDER,
         LLM_POOL,
         AGENT_DISPATCH,
@@ -521,6 +526,30 @@ pub struct DispatchArgs<'a> {
     pub notify: Notify,
     pub harness: Option<Harness>,
     pub model: Option<&'a str>,
+    /// A new context rather than the role's own conversation on this task. (M116)
+    pub fresh: bool,
+}
+
+/// What a dispatch did. (M116) Since dispatching again continues, "a run id" alone no longer
+/// says whether the caller got a new context, the old one back, or no new run at all — and a
+/// model told "Dispatched" after its instructions went into a live run would go looking for a
+/// second run that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatched {
+    pub run: RunId,
+    pub how: DispatchHow,
+}
+
+/// See [`Dispatched`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchHow {
+    /// A new run with a new context; `why` says why, when a conversation existed that was not
+    /// continued.
+    Started { why: Option<String> },
+    /// A new run resuming run `from`'s conversation.
+    Continued { from: RunId },
+    /// The instructions went into the run already holding the pair. No new run.
+    Told,
 }
 
 /// The four scopes a definition can live in, as a slice, for [`STATUSES`]' reason. (M33)
@@ -882,11 +911,15 @@ pub trait AgentSink: Send + Sync {
     /// Defaulted to refuse anything `dispatch` cannot carry, so a sink that predates them — every
     /// test double — keeps answering the ordinary case unchanged; the app's `RegistrySink`
     /// implements it whole.
-    fn dispatch_with(&self, args: &DispatchArgs<'_>) -> Result<RunId, String> {
+    fn dispatch_with(&self, args: &DispatchArgs<'_>) -> Result<Dispatched, String> {
         if args.external.is_some() || args.harness.is_some() || args.model.is_some() {
             return Err("this cide cannot dispatch external work or choose a harness".into());
         }
-        self.dispatch(args.agent, args.task, args.instructions, args.notify)
+        let run = self.dispatch(args.agent, args.task, args.instructions, args.notify)?;
+        Ok(Dispatched {
+            run,
+            how: DispatchHow::Started { why: None },
+        })
     }
 
     /// Open a tab on one piece of work, in a worktree of its own, and type the work into it.
@@ -1001,6 +1034,17 @@ pub trait AgentSink: Send + Sync {
     /// verb, an ordering and a story about two windows. What must not be whole-table is the
     /// **tool**, which is the module header's rule.
     fn set_overrides(&self, overrides: ProjectOverrides) -> Result<(), String>;
+
+    /// Apply one override-profile operation and answer the live table and the profiles. (M123)
+    ///
+    /// A default body so the test doubles that never switch a profile need not grow one; the
+    /// app's `RegistrySink` implements it over the same function the Settings screen calls.
+    fn override_profiles(
+        &self,
+        _op: cide_ipc::OverrideProfileOp,
+    ) -> Result<cide_ipc::OverrideProfilesState, String> {
+        Err("this cide cannot switch override profiles".into())
+    }
 
     /// The machine's providers and pools.
     ///
@@ -1281,7 +1325,20 @@ pub fn description(name: &str) -> &'static str {
              model), and both only mean anything when the role's effective harness is opencode \
              \u{2014} cide_agents_list says so against the role when it is not. A role defined in \
              `.claude/agents/` cannot be overridden at all: a Claude Code subagent runs under \
-             Claude Code, and there is no second answer."
+             Claude Code, and there is no second answer. While an override profile is active \
+             (cide_agent_override_profile), the change is saved into that profile too."
+        }
+        tool::AGENT_OVERRIDE_PROFILE => {
+            "Switch this project's **whole** local override table \u{2014} the every-role row and \
+             each role's own row \u{2014} between named profiles, on this machine only. The \
+             gesture for \"codex is out of quota: move every role onto something else, and back \
+             later\". `action`: `list` (the profiles and which is active), `save` (store the \
+             current table as `name` and make it active), `switch` (make `name` the live table; \
+             leave `name` out to detach from any profile and keep the rows), `rename` (`name` \
+             to `to`), `delete` (`name`; the live rows stay). While a profile is active, every \
+             cide_agent_override edit is saved into it, so switching never loses a change. \
+             Queued runs take the new table when they start; a running run keeps what it was \
+             forked with. Build a profile with cide_agent_override, then `save` it."
         }
         tool::LLM_PROVIDER => {
             "Add, change or remove one LLM provider \u{2014} where an opencode run's models come from. \
@@ -1325,11 +1382,16 @@ pub fn description(name: &str) -> &'static str {
              create it first with cide_task_create and put the statement of the work in its \
              body — the run is pointed at the task, reads it itself, works in its own worktree \
              and reports back through the task's comments. Not needed after an assignment \
-             (assigning a task already starts the role), so with a task this is for re-running \
-             a role **once its previous run has ended**, or adding a one-line extra \
-             `instructions`. A role gets **one run per task at a time**: a dispatch onto a task \
-             the role is already on is refused, naming the run you already started, so stop that \
-             one with cide_agent_stop or wait for it rather than asking twice. **The exception \
+             (assigning a task already starts the role), so with a task this is for **handing \
+             work back** to a role, with a one-line `instructions` saying what is still wrong. \
+             A role gets **one run per task at a time**, and dispatching it again onto that task \
+             **continues its own context**: while its run is alive (idle or mid-turn) the \
+             `instructions` go into that run — now if its turn is over, else at its next \
+             hand-back — and no new run starts; once it has ended, a new run resumes its \
+             conversation. The answer says which. Pass `fresh: true` for a clean context instead \
+             (a stuck or poisoned conversation); a run still alive must be stopped with \
+             cide_agent_stop first. A dispatch with no `instructions` onto a live run is refused, \
+             naming it — there is nothing to tell it. **The exception \
              is a run with no \
              task**: leave `task` out and put the whole brief in `instructions`, for a quick \
              check, a test run, or a small piece of work not worth a task. Such a run stands in \
@@ -1453,6 +1515,11 @@ pub fn input_schema(name: &str) -> Value {
                 "verify": { "type": "string" },
                 "guardPaths": { "type": "array", "items": { "type": "string" } },
                 "maxOpen": { "type": "integer", "minimum": 1 },
+                "gateRuns": {
+                    "type": "string",
+                    "enum": ["merge", "idle", "manual"],
+                    "description": "When cide runs the active gate by itself: after every merge (`merge`, the default), only once the project goes quiet (`idle`), or only when asked (`manual`). For a gate that takes minutes, `idle`.",
+                },
                 "files": {
                     "type": "array",
                     "items": {
@@ -1498,6 +1565,11 @@ pub fn input_schema(name: &str) -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "For `define`: paths a gate reads (a directory ends in `/`); a branch that changes one is not merged.",
+                },
+                "gateRuns": {
+                    "type": "string",
+                    "enum": ["merge", "idle", "manual"],
+                    "description": "For `define`: when cide runs the active gate by itself: after every merge (`merge`, the default), only once the project goes quiet (`idle`), or only when asked (`manual`). For a gate that takes minutes, `idle`.",
                 },
                 "text": {
                     "type": "string",
@@ -1859,6 +1931,28 @@ pub fn input_schema(name: &str) -> Value {
                 },
             },
         }),
+        tool::AGENT_OVERRIDE_PROFILE => json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "switch", "save", "rename", "delete"],
+                    "description": "What to do. `list` changes nothing.",
+                },
+                "name": {
+                    "type": "string",
+                    "description":
+                        "The profile to switch to, save as, rename or delete. Left out of \
+                         `switch`, the live rows are kept and belong to no profile.",
+                },
+                "to": {
+                    "type": "string",
+                    "description": "The new name, for `rename` only.",
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": false,
+        }),
         tool::AGENT_OVERRIDE => json!({
             "type": "object",
             "properties": {
@@ -2163,6 +2257,12 @@ pub fn input_schema(name: &str) -> Value {
                          anywhere — check with cide_agent_runs (includeFinished: true) and read \
                          the task's comments yourself.",
                 },
+                "fresh": {
+                    "type": "boolean",
+                    "description":
+                        "Start a new context instead of continuing this role's own conversation \
+                         on the task. Default false: dispatching again continues.",
+                },
             },
             "required": ["agent"],
         }),
@@ -2373,6 +2473,36 @@ fn definition_properties(nullable: bool) -> Value {
                  puts its edits straight onto the branch you have checked out with nothing to \
                  integrate — right for a role that only reads, wrong for anything that \
                  writes.{clearable}"
+            ),
+        },
+        "allowCommands": {
+            "type": kind("array"),
+            "items": { "type": "string" },
+            "description": format!(
+                "Command prefixes this role runs without being asked, as typed: `blender -b`, \
+                 `tools/ci/runners/e2e.sh`. On codex a command that is wholly one of these runs \
+                 outside its sandbox (so the run must invoke it directly, not under `timeout`, \
+                 a pipe or `sh -c`); on claude they are `Bash(<prefix>:*)` in --allowedTools. \
+                 No shells, launchers (`env`, `timeout`, `sudo`) or shell metacharacters — \
+                 those would allow everything.{clearable}"
+            ),
+        },
+        "needs": {
+            "type": kind("array"),
+            "items": { "type": "string", "enum": ["display", "audio", "network"] },
+            "description": format!(
+                "What the role's work needs from a sandbox. `display` (an Xvfb of its own, GL on \
+                 llvmpipe), `audio` (PulseAudio — Blender and Godot open it even headless), \
+                 `network`. On codex any of them turns the sandbox's network on, because its \
+                 filter refuses unix sockets exactly when the network is off.{clearable}"
+            ),
+        },
+        "writableDirs": {
+            "type": kind("array"),
+            "items": { "type": "string" },
+            "description": format!(
+                "Directories outside the worktree this role may write, absolute or `~/…` — a \
+                 cache, an asset store. Added to codex's sandbox as writable roots.{clearable}"
             ),
         },
     })
@@ -3109,6 +3239,7 @@ pub fn dispatch_orchestration(
         tool::AGENT_UPDATE => Some(agent_update(arguments, sink)),
         tool::AGENTS_CONFIG => Some(agents_config(arguments, sink)),
         tool::AGENT_OVERRIDE => Some(agent_override(arguments, sink)),
+        tool::AGENT_OVERRIDE_PROFILE => Some(agent_override_profile(arguments, sink)),
         tool::LLM_PROVIDER => Some(llm_provider(arguments, sink)),
         tool::LLM_POOL => Some(llm_pool(arguments, sink)),
         tool::AGENT_DISPATCH => Some(agent_dispatch(arguments, sink)),
@@ -3342,7 +3473,22 @@ pub(crate) fn milestone_plan_from(arguments: &Value) -> Result<cide_ipc::Milesto
         verify,
         max_open: None,
         guard_paths,
+        gate_runs: gate_runs_from(arguments)?.unwrap_or_default(),
     })
+}
+
+/// `gateRuns` from a tool's arguments: `None` when absent, a sentence when it is not a mode.
+/// Strict here, unlike the config file's lenient read: a model that sent `"never"` should be
+/// told, not have its plan saved with a mode it did not ask for.
+pub(crate) fn gate_runs_from(arguments: &Value) -> Result<Option<cide_ipc::GateRuns>, String> {
+    match arguments.get("gateRuns") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .and_then(|s| cide_ipc::GateRuns::parse(s.trim()))
+            .map(Some)
+            .ok_or_else(|| format!("`gateRuns` is {v}; it is one of `merge`, `idle`, `manual`")),
+    }
 }
 
 /// The plan as a model reads it.
@@ -3458,6 +3604,19 @@ fn render_milestones(view: &cide_ipc::MilestonesView) -> String {
             plan.guard_paths.join(", ")
         ));
     }
+    // Said because it changes what "last gate" means: under `idle` or `manual` a verdict can be
+    // several merges older than HEAD, and a planner reading PASSED as "HEAD passes" would stop.
+    out.push_str(match plan.gate_runs {
+        cide_ipc::GateRuns::Merge => "The gate runs after every merge.\n",
+        cide_ipc::GateRuns::Idle => {
+            "The gate runs once the project goes quiet, not after each merge, so its last result \
+             may predate the latest merges.\n"
+        }
+        cide_ipc::GateRuns::Manual => {
+            "The gate runs only when the user starts it, so its last result may predate the \
+             latest merges.\n"
+        }
+    });
     out.push_str(&format!(
         "Open-task limit for the active milestone: {}.",
         plan.max_open()
@@ -3639,9 +3798,30 @@ fn agents_list(sink: &dyn AgentSink) -> ToolResult {
             (None, Some(why)) => format!("cannot run: {}", one_line(why)),
             (None, None) => "ready".to_string(),
         };
+        // What codex's sandbox will deny a task run of this role, said here because the run
+        // itself only finds out at its first `git commit` or its first Xvfb (M118, selfcraft's
+        // codex batch). Only where the role — or its override — names a mode itself: with none,
+        // the project default decides, and its `auto`/`bypass` are codex's bypass, while its
+        // `manual` puts a person in the pane to answer. The roster cannot see a wrapper deciding
+        // the sandbox or a repository that will not open; the run's own note says those.
+        let caveat = resolved
+            .filter(|r| r.harness == cide_ipc::Harness::Codex && isolated && def.worktree)
+            .and_then(|r| Some((r.permission_mode.as_deref()?, &r.sandbox)))
+            .and_then(|(mode, grant)| {
+                crate::harness::codex::sandbox_caveat(
+                    Some(mode),
+                    crate::config::Unattended::default(),
+                    true,
+                    true,
+                    true,
+                    grant,
+                )
+            })
+            .map(|why| format!(" | {why}"))
+            .unwrap_or_default();
         body.push_str(&format!(
             "{} ({}) | {runs_as}{overridden} | {standing} | {mine} live run(s), runs up to \
-             {at_once}{ground}{source}\n",
+             {at_once}{ground}{source}{caveat}\n",
             one_line(def.id.as_str()),
             one_line(&def.label),
         ));
@@ -3797,6 +3977,9 @@ fn agent_create(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         permission_mode: fields.permission_mode.onto(None),
         max_concurrent: fields.max_concurrent.onto(None),
         worktree: fields.worktree.onto(None),
+        allow_commands: fields.allow_commands.onto(None).unwrap_or_default(),
+        needs: fields.needs.onto(None).unwrap_or_default(),
+        writable_dirs: fields.writable_dirs.onto(None).unwrap_or_default(),
         system_prompt,
         // A file cide is authoring in cide's own format has no key cide does not model.
         extras: Vec::new(),
@@ -3891,6 +4074,18 @@ fn agent_update(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         permission_mode: fields.permission_mode.onto(before.permission_mode.clone()),
         max_concurrent: fields.max_concurrent.onto(before.max_concurrent),
         worktree: fields.worktree.onto(before.worktree),
+        allow_commands: fields
+            .allow_commands
+            .onto(Some(before.allow_commands.clone()))
+            .unwrap_or_default(),
+        needs: fields
+            .needs
+            .onto(Some(before.needs.clone()))
+            .unwrap_or_default(),
+        writable_dirs: fields
+            .writable_dirs
+            .onto(Some(before.writable_dirs.clone()))
+            .unwrap_or_default(),
         // Everything else — the scope, the name, `original`, and above all the extras and the
         // system prompt — comes through from the file untouched unless the two arms below say
         // otherwise. That is the patch.
@@ -4033,6 +4228,16 @@ fn render_definition(draft: &AgentDraft) -> String {
     }
     if let Some(worktree) = draft.worktree {
         line("worktree", if worktree { "true" } else { "false" });
+    }
+    if !draft.allow_commands.is_empty() {
+        line("allow-commands", &draft.allow_commands.join(", "));
+    }
+    if !draft.needs.is_empty() {
+        let needs: Vec<&str> = draft.needs.iter().map(|need| need.as_str()).collect();
+        line("needs", &needs.join(", "));
+    }
+    if !draft.writable_dirs.is_empty() {
+        line("writable-dirs", &draft.writable_dirs.join(", "));
     }
     if !draft.extras.is_empty() {
         line(
@@ -4413,6 +4618,106 @@ fn agent_override(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         " This is local and uncommitted; a run already going keeps what it was forked with until \
          it is resumed.",
     );
+    ToolResult::text(said)
+}
+
+/// Switch, save, rename or delete this project's override profiles. (M123)
+fn agent_override_profile(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    use cide_ipc::OverrideProfileOp;
+    let fail = |why: String| ToolResult::error(format!("{}: {why}", tool::AGENT_OVERRIDE_PROFILE));
+    let action = match required_string(arguments, "action") {
+        Ok(action) => action,
+        Err(why) => return fail(why),
+    };
+    let name = match optional_string(arguments, "name") {
+        Ok(name) => name.map(|name| name.trim().to_string()),
+        Err(why) => return fail(why),
+    };
+    let needs_name = |name: Option<String>| {
+        name.filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("`{action}` needs a `name`. Nothing was written."))
+    };
+    let op = match action.as_str() {
+        "list" => OverrideProfileOp::List,
+        "switch" => OverrideProfileOp::Switch {
+            name: name.filter(|name| !name.is_empty()),
+        },
+        "save" => match needs_name(name) {
+            Ok(name) => OverrideProfileOp::Save { name },
+            Err(why) => return fail(why),
+        },
+        "delete" => match needs_name(name) {
+            Ok(name) => OverrideProfileOp::Delete { name },
+            Err(why) => return fail(why),
+        },
+        "rename" => {
+            let from = match needs_name(name) {
+                Ok(name) => name,
+                Err(why) => return fail(why),
+            };
+            match optional_string(arguments, "to") {
+                Ok(Some(to)) if !to.trim().is_empty() => OverrideProfileOp::Rename {
+                    from,
+                    to: to.trim().to_string(),
+                },
+                Ok(_) => {
+                    return fail("`rename` needs `to`, the new name. Nothing was written.".into());
+                }
+                Err(why) => return fail(why),
+            }
+        }
+        other => {
+            return fail(format!(
+                "`{}` is not an action; use list, switch, save, rename or delete.",
+                one_line(other)
+            ));
+        }
+    };
+    let changed = !matches!(op, OverrideProfileOp::List);
+    let state = match sink.override_profiles(op) {
+        Ok(state) => state,
+        Err(why) => return fail(why),
+    };
+
+    let mut said = match &state.active {
+        Some(active) => format!("Active override profile: `{}`.", one_line(active)),
+        None => "No override profile is active; the live rows belong to none.".to_string(),
+    };
+    match state.names.is_empty() {
+        true => said.push_str(" This project has no saved profiles."),
+        false => said.push_str(&format!(
+            " Profiles: {}.",
+            state
+                .names
+                .iter()
+                .map(|name| format!("`{}`", one_line(name)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+    // What each role now runs as, from the dispatch's own resolution rather than a re-reading of
+    // the rows: the question after a switch is "where do my roles go now", not "what did I type".
+    if let Ok(resolved) = sink.resolutions()
+        && !resolved.is_empty()
+    {
+        said.push_str("\nEach role now runs as:");
+        for (id, resolved) in &resolved {
+            said.push_str(&format!(
+                "\n- `{}`: {}",
+                one_line(id.as_str()),
+                resolved_sentence(resolved)
+            ));
+            if let Some(refusal) = &resolved.refusal {
+                said.push_str(&format!(" \u{2014} refused: {}", one_line(refusal)));
+            }
+        }
+    }
+    if changed {
+        said.push_str(
+            "\nThis is local and uncommitted; queued runs take it when they start, and a run \
+             already going keeps what it was forked with until it is resumed.",
+        );
+    }
     ToolResult::text(said)
 }
 
@@ -5031,6 +5336,10 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
             tool::TASK_CREATE
         ));
     }
+    let fresh = match optional_bool(arguments, "fresh") {
+        Ok(value) => value.unwrap_or(false),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::AGENT_DISPATCH)),
+    };
     let notify = match optional_string(arguments, "notify") {
         Ok(None) => Notify::default(),
         Ok(Some(text)) => match notify_from_wire(&text) {
@@ -5085,10 +5394,11 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         notify,
         harness,
         model: model.as_deref(),
+        fresh,
     };
     let dispatched = sink.dispatch_with(&args);
     // An external piece of work reads like a task in the answer: it has a worktree and a branch.
-    if let (Ok(run), Some(work)) = (&dispatched, &external) {
+    if let (Ok(Dispatched { run, .. }), Some(work)) = (&dispatched, &external) {
         return ToolResult::text(format!(
             "Dispatched `{agent}` on \"{}\"{}. Run {run}.\nIt works in a worktree of its own, \
              named after {}. Nothing waits on it; call {} to see how it is getting on — there is \
@@ -5111,12 +5421,31 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         // Deliberately does not claim the run has started. It has been *enqueued* — behind the
         // role's concurrency, or behind another run in the same checkout — and a sentence saying
         // "started" would have a model watching for output that is minutes away.
-        Ok(run) => match task {
+        // Told: no new run, and the answer must not read like one. (M116)
+        Ok(Dispatched {
+            run,
+            how: DispatchHow::Told,
+        }) => ToolResult::text(format!(
+            "Told run {run} (`{agent}`){}: your instructions go into its own conversation — now \
+             if its turn is over, else at its next hand-back. No new run, same worktree; read \
+             what it does in the task's comments. {announced}{paused}",
+            task.as_ref()
+                .map(|t| format!(" on {t}"))
+                .unwrap_or_default(),
+        )),
+        Ok(Dispatched { run, how }) => match task {
             Some(task) => ToolResult::text(format!(
-                "Dispatched `{agent}` on {task}. Run {run}.\nNothing waits on it: it may be \
+                "Dispatched `{agent}` on {task}{}. Run {run}.\nNothing waits on it: it may be \
                  queued behind the role's other runs, the project's cap or its pool's running \
                  limits. Call {} to see how it is getting on, and \
                  read what it did in the task's comments. {announced}{paused}",
+                match &how {
+                    DispatchHow::Continued { from } => {
+                        format!(", continuing run {from}'s conversation")
+                    }
+                    DispatchHow::Started { why: Some(why) } => format!(" ({})", one_line(why)),
+                    DispatchHow::Started { why: None } | DispatchHow::Told => String::new(),
+                },
                 tool::AGENT_RUNS
             )),
             // The task-less road says where the run stands and what it will *not* do, because
@@ -5439,7 +5768,7 @@ fn stopped_text(run: RunId, outcome: &Stopped) -> String {
         ),
         Stopped::Discarded => format!(
             "Discarded run {run} without resuming it. Its conversation is still on disk, so \
-             its task can be dispatched again."
+             dispatching its task again continues it."
         ),
         Stopped::Killed { why, task } => {
             let unasked = match why {
@@ -5648,8 +5977,9 @@ pub fn run_state_detail(state: &RunState) -> Option<String> {
         // stop it had no reason to believe in. One sentence, so it can be followed.
         RunState::Idle => Some(format!(
             "its turn ended and its child is parked at its prompt, so it will not end on its \
-             own; read the task's comments for what it did, and to give it more work stop it \
-             with {} and dispatch again",
+             own; read the task's comments for what it did, and to give it more work dispatch \
+             again with `instructions` — they go into this run's own conversation. Stop it with \
+             {} only for a fresh context",
             tool::AGENT_STOP,
         )),
         RunState::Interrupted => Some(
@@ -5851,6 +6181,9 @@ struct Fields {
     permission_mode: Field<String>,
     max_concurrent: Field<u16>,
     worktree: Field<bool>,
+    allow_commands: Field<Vec<String>>,
+    needs: Field<Vec<crate::sandbox::SandboxNeed>>,
+    writable_dirs: Field<Vec<String>>,
 }
 
 impl Fields {
@@ -5864,6 +6197,19 @@ impl Fields {
             permission_mode: nullable_string(arguments, "permissionMode")?,
             max_concurrent: nullable_u16(arguments, "maxConcurrent")?,
             worktree: nullable_bool(arguments, "worktree")?,
+            allow_commands: nullable_strings(arguments, "allowCommands", "commands")?,
+            needs: match nullable_strings(arguments, "needs", "needs")? {
+                Field::Absent => Field::Absent,
+                Field::Null => Field::Null,
+                Field::Value(words) => Field::Value(
+                    words
+                        .iter()
+                        .map(|word| crate::sandbox::parse_need(word))
+                        .collect::<Result<_, _>>()
+                        .map_err(|why| format!("`needs`: {why}"))?,
+                ),
+            },
+            writable_dirs: nullable_strings(arguments, "writableDirs", "directories")?,
         })
     }
 }
@@ -5947,6 +6293,41 @@ fn nullable_harness(arguments: &Value, key: &str) -> Result<Field<Harness>, Stri
             )
         }),
     }
+}
+
+/// A list of strings under `key`, `what` naming its items in a refusal. An empty array is
+/// [`Field::Null`], as for [`nullable_tools`]: on disk they are one answer. (M119)
+fn nullable_strings(
+    arguments: &Value,
+    key: &str,
+    what: &str,
+) -> Result<Field<Vec<String>>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(Field::Absent);
+    };
+    if value.is_null() {
+        return Ok(Field::Null);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`{key}` must be an array of {what}, not {}",
+            kind_of(value)
+        ));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(format!(
+                "`{key}` must contain {what} as strings, not {}",
+                kind_of(item)
+            ));
+        };
+        out.push(text.to_string());
+    }
+    if out.is_empty() {
+        return Ok(Field::Null);
+    }
+    Ok(Field::Value(out))
 }
 
 /// The `tools` list. An empty array is [`Field::Null`], because on disk they are one answer.
@@ -7242,6 +7623,7 @@ mod tests {
             max_concurrent: 1,
             permission_mode: None,
             refusal: None,
+            sandbox: Default::default(),
         }
     }
 
@@ -7473,6 +7855,63 @@ mod tests {
         assert!(text.contains("claudeProject"), "{text}");
         assert!(text.contains(tool::AGENT_UPDATE), "{text}");
         assert!(sink.overrides.lock().roles.is_empty());
+    }
+
+    /// The gesture profiles exist for: codex is out, move every role elsewhere, and back. (M123)
+    #[test]
+    fn an_override_profile_switches_the_whole_table_and_edits_land_in_it() {
+        let sink = roster();
+        let _ = ask(tool::AGENT_OVERRIDE, json!({ "harness": "codex" }), &sink);
+        let answer = ask(
+            tool::AGENT_OVERRIDE_PROFILE,
+            json!({ "action": "save", "name": "codex" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(text_of(&answer).contains("Active override profile: `codex`"));
+
+        // Save the current rows under a second name, then change them: the edit goes to it.
+        let _ = ask(
+            tool::AGENT_OVERRIDE_PROFILE,
+            json!({ "action": "save", "name": "cheap" }),
+            &sink,
+        );
+        let _ = ask(
+            tool::AGENT_OVERRIDE,
+            json!({ "harness": "opencode", "pool": "cheap" }),
+            &sink,
+        );
+
+        let answer = ask(
+            tool::AGENT_OVERRIDE_PROFILE,
+            json!({ "action": "switch", "name": "codex" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert_eq!(sink.overrides.lock().all.harness, Some(Harness::Codex));
+        assert!(sink.overrides.lock().all.pool.is_none());
+
+        let _ = ask(
+            tool::AGENT_OVERRIDE_PROFILE,
+            json!({ "action": "switch", "name": "cheap" }),
+            &sink,
+        );
+        assert_eq!(sink.overrides.lock().all.harness, Some(Harness::Opencode));
+        assert_eq!(sink.overrides.lock().all.pool.as_deref(), Some("cheap"));
+
+        let refused = ask(
+            tool::AGENT_OVERRIDE_PROFILE,
+            json!({ "action": "switch", "name": "nope" }),
+            &sink,
+        );
+        assert!(refused.is_error);
+        assert!(text_of(&refused).contains("no override profile called “nope”"));
+        let refused = ask(
+            tool::AGENT_OVERRIDE_PROFILE,
+            json!({ "action": "save" }),
+            &sink,
+        );
+        assert!(refused.is_error, "save needs a name");
     }
 
     /// The project-wide row, a clear, and the emptied row leaving no trace behind it.
@@ -7914,6 +8353,39 @@ mod tests {
         );
     }
 
+    /// A role that names its own mode and runs on codex is told, in the roster, what codex's
+    /// sandbox denies it — before its run finds out at the first Xvfb. None when the project
+    /// default decides, and none for bypass. (M118)
+    #[test]
+    fn the_roster_says_what_codexs_sandbox_denies_a_role() {
+        let with = |mode: Option<&str>| FakeAgents {
+            resolutions: vec![(
+                AgentId("developer".into()),
+                crate::overrides::Resolved {
+                    permission_mode: mode.map(str::to_string),
+                    ..resolved(Harness::Codex, None, None)
+                },
+            )],
+            ..roster()
+        };
+        let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &with(Some("auto"))));
+        assert!(
+            text.contains("it can edit and commit in its worktree"),
+            "{text}"
+        );
+        // The way out is the narrow grant, not dropping the sandbox (M119): one seccomp switch
+        // is what denies X and audio, and `bypassPermissions` took the whole sandbox for it.
+        assert!(
+            text.contains("needs: [display, audio]") && text.contains("allow-commands:"),
+            "the way out names the grant: {text}"
+        );
+        assert!(!text.contains("bypassPermissions"), "{text}");
+        for quiet in [None, Some("bypassPermissions")] {
+            let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &with(quiet)));
+            assert!(!text.contains("X display"), "{quiet:?}: {text}");
+        }
+    }
+
     /// A pool with nothing in it refuses every dispatch overridden onto it, and a tool call has no
     /// next gesture to fill it — so creating one would be creating a trap.
     #[test]
@@ -8300,6 +8772,8 @@ mod tests {
                 // integrate: what a role runs on is part of defining it. (M71)
                 "cide_agents_config",
                 "cide_agent_override",
+                // Beside the override it switches wholesale. (M123)
+                "cide_agent_override_profile",
                 "cide_llm_provider",
                 "cide_llm_pool",
                 "cide_agent_dispatch",
@@ -9253,6 +9727,8 @@ mod tests {
         /// handler writes one and the assertion is what is in it afterwards. (M71)
         config: Mutex<OrchestrationConfig>,
         overrides: Mutex<ProjectOverrides>,
+        /// The saved override profiles, as the file would hold them for this one project. (M123)
+        profiles: Mutex<cide_ipc::AgentOverrides>,
         llm: Mutex<LlmSettings>,
         /// What each role resolves to, **stated by the fixture** rather than computed.
         ///
@@ -9267,6 +9743,10 @@ mod tests {
         /// Every session `cide_session_open` asked for, and whether the next one is a reuse.
         /// (M104)
         sessions: Mutex<Vec<SessionRequest>>,
+        /// What a dispatch reports it did (M116) — a new run unless a test says otherwise — and
+        /// every `fresh` the handler passed.
+        how: Mutex<Option<DispatchHow>>,
+        fresh: Mutex<Vec<bool>>,
     }
 
     const NOW: u64 = 1_700_000_000_000;
@@ -9354,6 +9834,22 @@ mod tests {
                 notify,
             ));
             Ok(RunId::new())
+        }
+
+        fn dispatch_with(&self, args: &DispatchArgs<'_>) -> Result<super::Dispatched, String> {
+            // The trait default's refusal, kept: this fake stands in for a sink that cannot
+            // carry external work or a harness, and a test pins that it says so.
+            if args.external.is_some() || args.harness.is_some() || args.model.is_some() {
+                return Err("this cide cannot dispatch external work or choose a harness".into());
+            }
+            self.fresh.lock().push(args.fresh);
+            let run = self.dispatch(args.agent, args.task, args.instructions, args.notify)?;
+            let how = self
+                .how
+                .lock()
+                .clone()
+                .unwrap_or(DispatchHow::Started { why: None });
+            Ok(super::Dispatched { run, how })
         }
 
         fn open_session(&self, request: &SessionRequest) -> Result<OpenedSession, String> {
@@ -9461,8 +9957,21 @@ mod tests {
             if let Some(why) = &self.refuse_settings {
                 return Err(why.clone());
             }
+            // Through the file's own rule, so an edit lands in the active profile as it does
+            // on disk.
+            self.profiles.lock().set_project("/p", overrides.clone());
             *self.overrides.lock() = overrides;
             Ok(())
+        }
+
+        fn override_profiles(
+            &self,
+            op: cide_ipc::OverrideProfileOp,
+        ) -> Result<cide_ipc::OverrideProfilesState, String> {
+            let mut file = self.profiles.lock();
+            file.apply_profile_op("/p", &op)?;
+            *self.overrides.lock() = file.project("/p");
+            Ok(file.profiles_state("/p"))
         }
 
         fn llm(&self) -> Result<LlmSettings, String> {
@@ -9529,6 +10038,9 @@ mod tests {
                 key: "hooks".to_string(),
                 value: "\n  PreToolUse: []".to_string(),
             }],
+            allow_commands: Vec::new(),
+            needs: Vec::new(),
+            writable_dirs: Vec::new(),
         }
     }
 
@@ -9573,6 +10085,7 @@ mod tests {
             model: None,
             pool_position: None,
             worktree: false,
+            reviewer: None,
         }
     }
 
@@ -9626,10 +10139,13 @@ mod tests {
                 ..Default::default()
             }),
             overrides: Mutex::new(ProjectOverrides::default()),
+            profiles: Mutex::default(),
             llm: Mutex::new(LlmSettings::default()),
             resolutions: Vec::new(),
             refuse_settings: None,
             sessions: Mutex::new(Vec::new()),
+            how: Mutex::new(None),
+            fresh: Mutex::new(Vec::new()),
         }
     }
 
@@ -9789,6 +10305,56 @@ mod tests {
             "{}",
             text_of(&answer)
         );
+    }
+
+    /// Dispatching again continues (M116), and the answer says how: into the live run, from the
+    /// last conversation, or fresh with the reason — never "Dispatched" for a run that was only
+    /// told something.
+    #[test]
+    fn a_repeated_dispatch_says_whether_it_continued() {
+        let sink = roster();
+        let from = RunId::new();
+        *sink.how.lock() = Some(DispatchHow::Told);
+        let told = text_of(&ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7", "instructions": "fix the legend" }),
+            &sink,
+        ));
+        assert!(told.starts_with("Told run "), "{told}");
+        assert!(
+            told.contains("on t-7") && told.contains("No new run"),
+            "{told}"
+        );
+        assert!(!told.contains("Dispatched"), "{told}");
+
+        *sink.how.lock() = Some(DispatchHow::Continued { from });
+        let continued = text_of(&ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7", "instructions": "fix the legend" }),
+            &sink,
+        ));
+        assert!(
+            continued.contains(&format!("on t-7, continuing run {from}'s conversation")),
+            "{continued}"
+        );
+
+        *sink.how.lock() = Some(DispatchHow::Started {
+            why: Some("fresh, as asked".into()),
+        });
+        let fresh = text_of(&ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7", "fresh": true }),
+            &sink,
+        ));
+        assert!(fresh.contains("on t-7 (fresh, as asked)"), "{fresh}");
+        assert_eq!(*sink.fresh.lock(), vec![false, false, true]);
+
+        let bad = ask(
+            tool::AGENT_DISPATCH,
+            json!({ "agent": "developer", "task": "t-7", "fresh": "yes" }),
+            &sink,
+        );
+        assert!(bad.is_error, "{}", text_of(&bad));
     }
 
     #[test]

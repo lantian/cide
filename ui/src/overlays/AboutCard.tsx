@@ -20,6 +20,8 @@ import { Button } from '@/kit/components/Button'
 import { Dialog } from '@/kit/components/Overlay'
 import { Summary } from '@/kit/components/Surface'
 import { useWorkspace } from '@/store/workspace'
+import { checkForUpdates } from '@/chrome/updates'
+import { notifyFailure } from '@/chrome/notices'
 import styles from './AboutCard.module.css'
 
 export function AboutCard({ onDismiss }: { onDismiss: () => void }) {
@@ -46,9 +48,22 @@ export function AboutCard({ onDismiss }: { onDismiss: () => void }) {
         onKeyDown={onKeyDown}
         data-audit="about"
         actions={
-          <Button ref={close} variant="primary" onClick={onDismiss} data-audit="aboutClose">
-            Close
-          </Button>
+          <>
+            {/* Closes the card first: the answer is a toast (`chrome/updates.ts`), and a toast
+                offering *Update* under a modal scrim is a button nobody can press. */}
+            <Button
+              onClick={() => {
+                onDismiss()
+                checkForUpdates().catch((reason: unknown) => notifyFailure(reason, { project: null }))
+              }}
+              data-audit="aboutCheckUpdates"
+            >
+              Check for updates
+            </Button>
+            <Button ref={close} variant="primary" onClick={onDismiss} data-audit="aboutClose">
+              Close
+            </Button>
+          </>
         }
       >
         <Summary

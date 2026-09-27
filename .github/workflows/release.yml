@@ -349,6 +349,13 @@ jobs:
       # the only line that reaches the log is `failed to run linuxdeploy`. Extracting instead
       # of mounting is the supported way out and costs a few seconds of disk.
       APPIMAGE_EXTRACT_AND_RUN: 1
+      # The update signing key (docs/packaging.md). With it, `xtask package` asks the bundler for
+      # `createUpdaterArtifacts` and a `.sig` lands beside the AppImage; `CIDE_RELEASE` makes the
+      # preflight refuse a release built without it, because an unsigned release publishes no
+      # `latest.json` and every installed copy would stop hearing about new versions, silently.
+      CIDE_RELEASE: 1
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -459,6 +466,7 @@ jobs:
           name: linux-artefacts
           path: |
             target/release/bundle/appimage/*.AppImage
+            target/release/bundle/appimage/*.AppImage.sig
             target/release/bundle/tarball/*.tar.gz
             target/release/bundle/src/*.tar.gz
           if-no-files-found: error
@@ -471,6 +479,12 @@ jobs:
     name: macos artefacts
     runs-on: macos-15
     needs: prepare
+    # The linux job's signing block, for the same reasons: the `.app.tar.gz` and its `.sig` are
+    # the macOS update, and the `.dmg` is only the first install.
+    env:
+      CIDE_RELEASE: 1
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -552,10 +566,29 @@ jobs:
       - name: cargo xtask package --dmg --run
         run: cargo --locked xtask package --dmg --run
 
+      # The bundler names the update archive `cide.app.tar.gz` — no version, no architecture —
+      # which would collide with the next architecture's in the flattened `dist/` and tells
+      # `scripts/updater-manifest.py` nothing about which platform key it is. Renamed to the
+      # `.dmg`'s own shape, and the `.sig` with it: the signature covers the bytes, not the name.
+      - name: Name the update archive like the other artefacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd target/release/bundle/macos
+          arch=$(uname -m)
+          [ "$arch" = arm64 ] && arch=aarch64 || true
+          mv cide.app.tar.gz "cide_${VERSION}_${arch}.app.tar.gz"
+          mv cide.app.tar.gz.sig "cide_${VERSION}_${arch}.app.tar.gz.sig"
+          ls -la
+
       - uses: actions/upload-artifact@v4
         with:
           name: macos-artefacts
-          path: target/release/bundle/dmg/*.dmg
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app.tar.gz
+            target/release/bundle/macos/*.app.tar.gz.sig
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------------
@@ -611,6 +644,28 @@ jobs:
           find . -mindepth 1 -type d -empty -delete
           ls -la
 
+      # The one file this job needs from the repository. Sparse, so it stays a job that moves
+      # files rather than one that clones the tree.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          path: src
+          sparse-checkout: scripts/updater-manifest.py
+          sparse-checkout-cone-mode: false
+
+      # `latest.json`: what every installed cide reads at start (the endpoint in tauri.conf.json is
+      # `releases/latest/download/latest.json`). Before the checksums, so SHA256SUMS lists it too.
+      # A draft or a prerelease carries one as well and is still never offered: GitHub's `latest`
+      # resolves only to a published, non-prerelease release.
+      - name: Update manifest
+        run: |
+          set -euo pipefail
+          python3 src/scripts/updater-manifest.py \
+            --dir dist \
+            --version '${{ needs.prepare.outputs.version }}' \
+            --repo "$GITHUB_REPOSITORY"
+          cat dist/latest.json
+
       - name: Checksums
         working-directory: dist
         run: |
@@ -649,6 +704,12 @@ jobs:
                   what="Linux, extract and run. Needs WebKitGTK 4.1 already installed; put \`bin/\` on your \`PATH\` so the desktop entry can find \`cide\`." ;;
                 *.dmg)
                   what="macOS 11+. **Ad-hoc signed, not notarised** — see below." ;;
+                *.app.tar.gz)
+                  what="macOS, the self-update archive. Installed copies fetch this themselves; download the \`.dmg\` instead." ;;
+                *.sig)
+                  what="Update signature, checked by the running app before it installs anything." ;;
+                latest.json)
+                  what="The update manifest installed copies read at start." ;;
                 *-src.tar.gz)
                   what="The source at this tag. \`git archive\`, so its sha256 is reproducible from the tag; the binaries' are not." ;;
                 SHA256SUMS)
@@ -663,7 +724,9 @@ jobs:
             echo "says *Apple could not verify \"cide\" is free of malware*. Click Done, open **System Settings"
             echo "› Privacy & Security**, scroll to the *Security* section and click **Open Anyway** next to"
             echo "cide (right-click › Open no longer offers this on macOS 15 and later). Once is enough."
-            echo "Nothing here self-updates yet — no updater endpoint is configured."
+            echo
+            echo "Installed copies (the AppImage, and the macOS app in Applications) offer this update"
+            echo "themselves at their next start."
             echo
             cat notes/changelog.md
           } > notes/notes.md

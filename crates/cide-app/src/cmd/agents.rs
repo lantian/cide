@@ -103,7 +103,7 @@ where
 /// A private copy rather than a shared helper, matching `cmd::settings`' own: the four callers of
 /// this idea across `cmd/` each want a different error type, and a common one would have to
 /// invent a lowest common denominator that none of them wants.
-fn project_root(state: &WorkspaceState, project: ProjectId) -> Result<PathBuf> {
+pub(crate) fn project_root(state: &WorkspaceState, project: ProjectId) -> Result<PathBuf> {
     state.with(|ws| {
         workspace::project(ws, project)?
             .roots
@@ -123,12 +123,13 @@ fn project_root(state: &WorkspaceState, project: ProjectId) -> Result<PathBuf> {
 /// those are three different screens.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn agents_roster(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     agents: State<'_, Arc<AgentRegistry>>,
     project: ProjectId,
 ) -> Result<AgentRoster> {
     let root = project_root(&state, project)?;
-    let runs = agents.runs_for(project);
+    let runs = with_reviewers(&app, project, agents.runs_for(project));
     let dispatching = agents.dispatching(project);
     blocking(move || {
         Ok(roster(
@@ -374,23 +375,61 @@ pub async fn agent_overrides_set(
         let path = cide_core::persist::agent_overrides_path();
         let mut all = cide_core::persist::load_agent_overrides(&path);
         let key = root.to_string_lossy().to_string();
-        // A project whose whole table is empty is removed rather than stored as an empty object,
-        // so the file does not accumulate a row per project ever opened. That is safe where
-        // dropping a *row* is not: nothing is being edited here, the user has cleared it.
-        match overrides.all.is_empty() && overrides.roles.is_empty() {
-            true => {
-                all.projects.remove(&key);
-            }
-            false => {
-                all.projects.insert(key.clone(), overrides.clone());
-            }
-        }
+        // `set_project` removes a project whose whole table is empty rather than storing an
+        // empty object, so the file does not accumulate a row per project ever opened — safe
+        // where dropping a *row* is not, because the user has cleared it. It also mirrors the
+        // table into the active override profile (M123), so an edit is never lost to a switch.
+        all.set_project(&key, overrides);
         cide_core::persist::save_agent_overrides(&path, &all).map_err(|error| {
             CoreError::Io(format!("the overrides could not be written: {error}"))
         })?;
         Ok(all.project(&key))
     })
     .await
+}
+
+/// List, switch, save, rename or delete this project's override profiles. (M123)
+///
+/// A profile is a whole named override table; switching copies it into the live table every
+/// reader resolves against (`cide_ipc::overrides::AgentOverrides::projects`), so nothing
+/// downstream learned about profiles. Queued runs take the new table at their fork, a paused run
+/// whose child settings moved is restarted on Resume, and a running child keeps what it was
+/// forked with.
+///
+/// **Emits the roster** on anything but a list, unlike `agent_overrides_set`: a switch moves
+/// rows the screen did not draw — every role's resolved harness in the Agents panel — and the
+/// override file is watched by nothing.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn agent_override_profiles(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    op: cide_ipc::OverrideProfileOp,
+) -> Result<cide_ipc::OverrideProfilesState> {
+    let root = project_root(&state, project)?;
+    let changes = !matches!(op, cide_ipc::OverrideProfileOp::List);
+    let answer = blocking(move || override_profiles_apply(&root, &op)).await?;
+    if changes && let Some(roster) = project_roster(&app, project) {
+        crate::emit::agents_changed(&app, project, &roster);
+    }
+    Ok(answer)
+}
+
+/// The file half of [`agent_override_profiles`], shared with the MCP road (`agent_rpc`).
+pub(crate) fn override_profiles_apply(
+    root: &Path,
+    op: &cide_ipc::OverrideProfileOp,
+) -> Result<cide_ipc::OverrideProfilesState> {
+    let path = cide_core::persist::agent_overrides_path();
+    let mut all = cide_core::persist::load_agent_overrides(&path);
+    let key = root.to_string_lossy().to_string();
+    all.apply_profile_op(&key, op).map_err(CoreError::Io)?;
+    if !matches!(op, cide_ipc::OverrideProfileOp::List) {
+        cide_core::persist::save_agent_overrides(&path, &all).map_err(|error| {
+            CoreError::Io(format!("the overrides could not be written: {error}"))
+        })?;
+    }
+    Ok(all.profiles_state(&key))
 }
 
 /// Does this provider/model actually answer? One very small real turn. (M45)
@@ -407,6 +446,9 @@ pub async fn llm_test_model(
     state: State<'_, WorkspaceState>,
     project: Option<ProjectId>,
     model: String,
+    // A pool entry's effort, so a checked entry is tested with the argv a run would get. Absent
+    // from the provider card's per-model button, which tests the model on its default.
+    variant: Option<String>,
 ) -> Result<cide_ipc::LlmModelTest> {
     // `None` since M74: the Settings screen opens with no project open, and the root was already
     // an `Option` here because a project that has gone away answers the same way. The probe runs
@@ -420,12 +462,16 @@ pub async fn llm_test_model(
         // Whichever opencode-shaped CLI is installed: the provider document is the same for
         // both, and this tests the provider. (M81)
         let flavor = cide_agents::harness::opencode::Flavor::first_installed();
-        let (ok, detail) =
-            match cide_agents::harness::opencode::test_model(flavor, root.as_deref(), &llm, &model)
-            {
-                Ok(detail) => (true, detail),
-                Err(detail) => (false, detail),
-            };
+        let (ok, detail) = match cide_agents::harness::opencode::test_model(
+            flavor,
+            root.as_deref(),
+            &llm,
+            &model,
+            variant.as_deref(),
+        ) {
+            Ok(detail) => (true, detail),
+            Err(detail) => (false, detail),
+        };
         Ok(cide_ipc::LlmModelTest { model, ok, detail })
     })
     .await
@@ -565,9 +611,12 @@ pub async fn agents_models(
         // The registry is the same lookup the dispatch makes, so this cannot answer for a
         // harness the fork would refuse — `defs::implemented` makes the identical argument
         // against matching on the enum in a second place.
+        let variant_in_model = cide_agents::harness::opencode::Flavor::of(harness)
+            .is_some_and(cide_agents::harness::opencode::Flavor::variant_in_model);
         let Some(implementation) = cide_agents::harness::for_kind(harness) else {
             return Ok(cide_ipc::agents::AgentModels {
                 harness,
+                variant_in_model,
                 models: Vec::new(),
                 // `defs::implemented` answers the same question the `for_kind` miss just
                 // answered, and it owns the sentence. Asking it rather than writing a second one
@@ -578,11 +627,13 @@ pub async fn agents_models(
         Ok(match implementation.models(root.as_deref(), &llm) {
             Ok(models) => cide_ipc::agents::AgentModels {
                 harness,
+                variant_in_model,
                 models,
                 problem: None,
             },
             Err(problem) => cide_ipc::agents::AgentModels {
                 harness,
+                variant_in_model,
                 models: Vec::new(),
                 problem: Some(problem),
             },
@@ -734,7 +785,9 @@ pub async fn agents_dispatch(
     request: DispatchRequest,
 ) -> Result<RunId> {
     match dispatch_or_duplicate(app, state, agents, tasks, request).await? {
-        DispatchOutcome::Started(run) => Ok(run),
+        DispatchOutcome::Started { run, .. }
+        | DispatchOutcome::Continued { run, .. }
+        | DispatchOutcome::Told(run) => Ok(run),
         // Flattened to the sentence, because both callers of *this* function asked for the
         // dispatch out loud: the panel's button and `cide_agent_dispatch`. The one caller that
         // did not ask — auto-dispatch, where a repeated assignment is an ordinary gesture rather
@@ -757,9 +810,107 @@ pub async fn agents_dispatch(
 /// shown the panel the literal word `duplicateRun`, which is the `[object Object]` failure that
 /// file's header was written about. The sentence rides `Io` like every other refusal
 /// [`plan_dispatch`] composes, and the discriminator stays inside Rust where only Rust needs it.
+///
+/// # Dispatching again continues (M116)
+///
+/// A dispatch onto a (role, task) that role has worked before goes back into that role's own
+/// context rather than starting an empty one — [`Self::Told`] into the run still holding the
+/// pair, [`Self::Continued`] from the last ended run's conversation — unless the request says
+/// `fresh`. Keyed on the pair, never on a run id: one role has at most one run per task, so the
+/// pair names the conversation exactly, and a model has no id to get wrong or keep stale.
 pub(crate) enum DispatchOutcome {
-    Started(RunId),
-    Duplicate { held: HeldPair, why: String },
+    /// A new run with a new context. `why` says why it is fresh when a conversation existed that
+    /// could have been continued — the model asked, or the harness changed under it.
+    Started {
+        run: RunId,
+        why: Option<String>,
+    },
+    /// A new run that resumes run `from`'s conversation.
+    Continued {
+        run: RunId,
+        from: RunId,
+    },
+    /// The instructions went into the run already holding the pair: now if its turn is over,
+    /// else at its next hand-back. No new run.
+    Told(RunId),
+    Duplicate {
+        held: HeldPair,
+        why: String,
+    },
+}
+
+/// What the worker decided before anything is enqueued. (M116)
+enum Planned {
+    Tell(RunId),
+    // Boxed for clippy's size rule: a `DispatchSpec` is hundreds of bytes beside a run id.
+    Spec(
+        Box<DispatchSpec>,
+        std::result::Result<(RunId, String), Option<String>>,
+    ),
+}
+
+/// Whether a dispatch onto a held pair is said to that run instead of refused. (M116)
+///
+/// Only with something to say — an assignment repeated while its run lives carries no
+/// instructions and stays the harmless duplicate `task_triggers` logs — and never under `fresh`,
+/// which wants a new context and gets the refusal naming the run to stop first. `reachable` is
+/// `AgentRegistry::follow_up_reachable`: alive, not paused, not being stopped.
+fn tell_route(
+    held: Option<&HeldPair>,
+    reachable: bool,
+    fresh: bool,
+    has_instructions: bool,
+) -> Option<RunId> {
+    let held = held?;
+    (reachable && !fresh && has_instructions).then_some(held.run)
+}
+
+/// Whether a dispatch onto a free pair continues the last ended run's conversation. (M116)
+///
+/// `Ok((from, conversation))` to continue; `Err(Some(why))` to start fresh although there was a
+/// conversation, with the sentence the answer carries; `Err(None)` when there was nothing to
+/// continue. **The harness guard is the silent failure here**: a conversation id means something
+/// only to the CLI that minted it, and handing it to another is terrastrike's `fb668bf6`, dead of
+/// "not a conversation the codex harness can re-open". **qwen never continues**: its respawn
+/// resumes the new run's own id and ignores the one it is given, so it would open an empty
+/// conversation and look like a continuation.
+fn continue_route(
+    previous: Option<(RunId, cide_ipc::Harness, String)>,
+    harness: cide_ipc::Harness,
+    fresh: bool,
+) -> std::result::Result<(RunId, String), Option<String>> {
+    let Some((from, was, conversation)) = previous else {
+        return Err(None);
+    };
+    if fresh {
+        return Err(Some(format!(
+            "fresh, as asked: run {from}'s conversation on this task was not continued"
+        )));
+    }
+    if harness == cide_ipc::Harness::Qwen {
+        return Err(Some(format!(
+            "fresh: qwen cannot resume run {from}'s conversation in a new run"
+        )));
+    }
+    if was != harness {
+        return Err(Some(format!(
+            "fresh: run {from} was on {} and this run is on {} — a conversation belongs to the \
+             CLI that started it",
+            harness_word(was),
+            harness_word(harness)
+        )));
+    }
+    Ok((from, conversation))
+}
+
+fn harness_word(harness: cide_ipc::Harness) -> &'static str {
+    match harness {
+        cide_ipc::Harness::Claude => "claude",
+        cide_ipc::Harness::Opencode => "opencode",
+        cide_ipc::Harness::Codex => "codex",
+        cide_ipc::Harness::Qwen => "qwen",
+        cide_ipc::Harness::Mimo => "mimo",
+    }
 }
 
 /// The whole of [`agents_dispatch`] except the flattening. See [`DispatchOutcome`].
@@ -783,8 +934,15 @@ pub(crate) async fn dispatch_or_duplicate(
     // The pools, for the entry limits admission places this run by. Global settings, so read
     // off the workspace here rather than off the project's disk on the worker.
     let llm = state.with(|ws| ws.settings.llm.clone());
+    // Kept for after the worker: the continue and tell roads say the instructions themselves.
+    let instructions = request
+        .prompt
+        .as_deref()
+        .map(crate::agent_rpc::one_line)
+        .filter(|line| !line.is_empty());
+    let notify = request.notify.clone();
 
-    let spec = blocking(move || {
+    let planned = blocking(move || {
         // Read on the worker rather than here, for this module's standing reason: the registry's
         // lock is also taken by the hook applier thread, and this command is the one an
         // orchestrating session holds its turn behind.
@@ -792,6 +950,17 @@ pub(crate) async fn dispatch_or_duplicate(
             .task
             .as_ref()
             .and_then(|task| lookup.run_holding(project, &request.agent, task));
+        // Held, with something to say: say it to that run instead of refusing. (M116)
+        let reachable = held
+            .as_ref()
+            .is_some_and(|held| lookup.follow_up_reachable(project, held.run));
+        let has_instructions = request
+            .prompt
+            .as_deref()
+            .is_some_and(|line| !line.trim().is_empty());
+        if let Some(run) = tell_route(held.as_ref(), reachable, request.fresh, has_instructions) {
+            return Ok(Planned::Tell(run));
+        }
         // This project's local redirections, read on the worker with the rest of the disk. The
         // same file `crate::agents::facts` reads at the fork, so the concurrency the queue
         // enforces and the pool the child is forked with come from one answer — and read *per
@@ -801,13 +970,56 @@ pub(crate) async fn dispatch_or_duplicate(
         let overrides =
             cide_core::persist::load_agent_overrides(&cide_core::persist::agent_overrides_path())
                 .project(&root.to_string_lossy());
-        plan_dispatch(&root, &store, held.as_ref(), &overrides, &llm, &request)
+        let spec = plan_dispatch(&root, &store, held.as_ref(), &overrides, &llm, &request)?;
+        // Free pair: the last ended run's conversation, if the harness can take it back. The
+        // role id from the spec, which is the resolved one; external work has no pair.
+        let previous = spec
+            .task
+            .as_ref()
+            .filter(|_| request.external.is_none())
+            .and_then(|task| lookup.last_conversation(project, &spec.agent, task));
+        let route = continue_route(previous, spec.harness, request.fresh);
+        Ok(Planned::Spec(Box::new(spec), route))
     })
     .await?;
 
+    let (mut spec, route) = match planned {
+        Planned::Tell(run) => {
+            // Re-pointed first, so the hand-back these instructions produce is announced to the
+            // pane that gave them.
+            if let Some(notify) = notify {
+                registry.renotify(run, notify);
+            }
+            let line = instructions.unwrap_or_default();
+            registry
+                .follow_up(&app, project, run, &line)
+                .map_err(|error| CoreError::Io(format!("run {run} could not be told: {error}")))?;
+            return Ok(DispatchOutcome::Told(run));
+        }
+        Planned::Spec(spec, route) => (*spec, route),
+    };
+
     // Named before the move: on the duplicate arm the spec is gone and the sentence wants them.
     let (agent, task) = (spec.agent.clone(), spec.task.clone());
-    let run = match registry.enqueue_unique(spec) {
+    let (enqueued, continued, why) = match route {
+        Ok((from, conversation)) => {
+            if let Some(task) = spec.task.as_ref() {
+                spec.prompt = crate::agents::handed_back_prompt(
+                    task,
+                    spec.task_title.as_deref(),
+                    spec.harness,
+                    instructions.as_deref(),
+                );
+            }
+            (
+                registry.enqueue_continuing(spec, conversation),
+                Some(from),
+                None,
+            )
+        }
+        Err(why) => (registry.enqueue_unique(spec), None, why),
+    };
+    let run = match enqueued {
         Ok(run) => run,
         // The window the answer above could not cover — see `AgentRegistry::enqueue_unique`.
         // Composed through the same function, so a user cannot tell which gate fired.
@@ -819,7 +1031,10 @@ pub(crate) async fn dispatch_or_duplicate(
     registry.mark_changed(&app, project);
     // Returns at once; each admitted run starts on its own task.
     registry.pump(&app);
-    Ok(DispatchOutcome::Started(run))
+    Ok(match continued {
+        Some(from) => DispatchOutcome::Continued { run, from },
+        None => DispatchOutcome::Started { run, why },
+    })
 }
 
 /// Stop a run, from the **Agents panel**: cancel it if it is queued, kill its child if it has
@@ -1288,9 +1503,9 @@ fn duplicate_refusal(agent: &AgentId, task: Option<&TaskId>, held: &HeldPair) ->
     let task = task.map_or_else(|| "this task".to_string(), TaskId::to_string);
     format!(
         "`{agent}` is already on {task}: run {} [{}]{detail}. A role gets one run per task, \
-         because a second wants the same worktree — it would queue behind the first and replay \
-         the same prompt into it. Stop that run if it is going the wrong way, or wait for it to \
-         end and read the task's comments; the Agents panel shows it, and so does `{}`.",
+         because a second wants the same worktree. To give that run more work, dispatch again \
+         with `instructions` and they go into it; for a fresh context, stop it first. The Agents \
+         panel shows it, and so does `{}`.",
         held.run,
         cide_agents::tools::run_state_wire(&held.state),
         cide_agents::tools::tool::AGENT_RUNS,
@@ -1818,6 +2033,24 @@ fn roster(
     }
 }
 
+/// Each run's review tab, when one owns its task (M114) — filled here, beside the roster, because
+/// the table is the app's and `roster` stays a function of a directory for its tests.
+fn with_reviewers(
+    app: &AppHandle,
+    project: ProjectId,
+    runs: Vec<cide_ipc::AgentRun>,
+) -> Vec<cide_ipc::AgentRun> {
+    runs.into_iter()
+        .map(|mut run| {
+            run.reviewer = run
+                .task
+                .as_ref()
+                .and_then(|task| crate::agent_rpc::reviewer_of(app, project, task));
+            run
+        })
+        .collect()
+}
+
 /// This project's roster, runs included — for a caller that has an `AppHandle` and nothing else.
 ///
 /// The one place the two halves meet: the files on disk, read fresh, and the run registry. It is
@@ -1828,9 +2061,10 @@ pub(crate) fn project_roster(app: &AppHandle, project: ProjectId) -> Option<Agen
     let state = app.try_state::<WorkspaceState>()?;
     let root = project_root(&state, project).ok()?;
     let registry = app.try_state::<Arc<AgentRegistry>>()?;
+    let runs = with_reviewers(app, project, registry.runs_for(project));
     Some(roster(
         &root,
-        registry.runs_for(project),
+        runs,
         registry.dispatching(project),
         crate::agents::cide_hook_binary().as_deref(),
     ))
@@ -2212,6 +2446,7 @@ mod tests {
             model: None,
             pool_position: None,
             worktree: false,
+            reviewer: None,
         };
         let AgentRoster::Ready { runs, .. } = roster(
             &root,
@@ -2264,6 +2499,7 @@ mod tests {
             external: None,
             harness: None,
             model: None,
+            fresh: false,
         }
     }
 
@@ -2374,6 +2610,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Held and reachable, with something to say: said to that run. Anything else falls through
+    /// to the refusal — no instructions, `fresh`, or a run that cannot be spoken to. (M116)
+    #[test]
+    fn a_dispatch_onto_a_live_run_with_instructions_is_said_to_it() {
+        let live = held(RunState::Idle);
+        assert_eq!(tell_route(Some(&live), true, false, true), Some(live.run));
+        assert_eq!(
+            tell_route(Some(&live), true, false, false),
+            None,
+            "nothing to say"
+        );
+        assert_eq!(
+            tell_route(Some(&live), true, true, true),
+            None,
+            "fresh wants a new context"
+        );
+        assert_eq!(
+            tell_route(Some(&live), false, false, true),
+            None,
+            "paused or stopping"
+        );
+        assert_eq!(
+            tell_route(None, true, false, true),
+            None,
+            "nothing holds the pair"
+        );
+    }
+
+    /// A free pair continues the last conversation only on the harness that minted it, never on
+    /// qwen, never under `fresh` — and says why when it could have and did not. (M116)
+    #[test]
+    fn a_dispatch_continues_only_a_conversation_its_harness_can_take_back() {
+        use cide_ipc::Harness::{Claude, Codex, Opencode, Qwen};
+        let from = RunId::new();
+        let previous = |harness| Some((from, harness, "thread".to_string()));
+        assert_eq!(continue_route(None, Codex, false), Err(None));
+        for harness in [Claude, Codex, Opencode] {
+            assert_eq!(
+                continue_route(previous(harness), harness, false),
+                Ok((from, "thread".to_string())),
+                "{harness:?}"
+            );
+        }
+        let why = continue_route(previous(Opencode), Codex, false).expect_err("another CLI");
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("opencode") && w.contains("codex")),
+            "{why:?}"
+        );
+        let why = continue_route(previous(Qwen), Qwen, false).expect_err("qwen");
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("qwen")),
+            "{why:?}"
+        );
+        let why = continue_route(previous(Codex), Codex, true).expect_err("fresh");
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("as asked")),
+            "{why:?}"
+        );
+    }
+
     /// The sentence has to teach a rule, not report a fault.
     ///
     /// Its reader is usually a language model that has just asked for one thing twice, and the
@@ -2393,7 +2690,10 @@ mod tests {
         .expect_err("refused")
         .to_string();
 
-        assert!(why.contains("Stop that run"), "{why}");
+        // Since M116 the road out is to *say more* to the run, not to stop it: that is what a
+        // repeated dispatch with instructions does, and stopping is only for a fresh context.
+        assert!(why.contains("dispatch again with `instructions`"), "{why}");
+        assert!(why.contains("stop it first"), "{why}");
         assert!(why.contains("cide_agent_runs"), "{why}");
         assert!(why.contains("Agents panel"), "{why}");
         let lower = why.to_lowercase();
@@ -2487,6 +2787,7 @@ mod tests {
                 external: None,
                 harness: None,
                 model: None,
+                fresh: false,
             },
         )
         .expect_err("this project was never enabled")
@@ -2528,6 +2829,7 @@ mod tests {
                 external: None,
                 harness: None,
                 model: None,
+                fresh: false,
             },
         )
         .expect_err("a project that never enabled this refuses everything");
@@ -2848,11 +3150,19 @@ pub async fn milestones_set(
     .await
 }
 
-/// Run the active milestone's gate now, in the background. The answer arrives as
-/// `cide://milestones-changed`, twice: once when it starts and once when it ends.
+/// Run a milestone's gate now, in the background — the active one's, or `milestone`'s when it
+/// is named (the modal's Run gate, which also re-checks an accepted milestone that went red). The
+/// answer arrives as `cide://milestones-changed`, twice: once when it starts and once when it ends.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn milestones_gate_run(app: tauri::AppHandle, project: ProjectId) -> Result<()> {
-    crate::milestones::run_gate(&app, project);
+pub async fn milestones_gate_run(
+    app: tauri::AppHandle,
+    project: ProjectId,
+    milestone: Option<String>,
+) -> Result<()> {
+    match milestone {
+        None => crate::milestones::run_gate(&app, project),
+        Some(id) => crate::milestones::run_gate_for(&app, project, id).map_err(CoreError::Io)?,
+    }
     Ok(())
 }
 

@@ -163,6 +163,9 @@ try {
       // writes the user's files on a timer must have its refusals somewhere a check can drive
       // them rather than inside a `useEffect`.
       'src/editor/autosave.ts',
+      // M117: hot exit — when an unsaved buffer is kept on disk, and whether a kept one comes
+      // back. Import-free for autosave's reason: it decides what happens to the user's work.
+      'src/editor/hotExit.ts',
       // M12, section 13: the two position features. `position.ts` is the type both of them
       // speak; `navHistory.ts` is the whole of what Back and Forward decide.
       'src/editor/position.ts',
@@ -7596,6 +7599,52 @@ try {
       /checked=\{editor\.detectIndentation\}/.test(sections22) && /detectIndentation: v/.test(sections22),
       'the detection toggle is offered in Settings ▸ Editor, in both directions',
     )
+  }
+
+  /*
+   * Hot exit (M117). An unsaved buffer is snapshotted to the state directory a moment after the
+   * typing pauses, and a file opened with a snapshot behind it comes back dirty. The policy is
+   * pure and driven here; the wiring — the recovered text going in *over* the disk's baseline,
+   * one write chain, a clean transition forgetting the snapshot — is pinned over stripped source.
+   */
+  {
+    const hot = load('hotExit.js')
+    const bare = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+    eq(hot.backupDelays(10).quiet, hot.BACKUP_QUIET_MS, 'an ordinary buffer is kept a moment after the typing pauses')
+    eq(hot.backupDelays(10).ceiling, hot.BACKUP_CEILING_MS, 'and never later than the ceiling')
+    eq(hot.backupDelays(hot.BACKUP_LARGE_CHARS + 1).quiet, null,
+      'a buffer past the large line is kept on the ceiling alone — several megabytes stringified and '
+      + 'framed every second and a half of typing is the cost this refuses')
+    ok(hot.BACKUP_QUIET_MS < hot.BACKUP_CEILING_MS, 'the quiet delay is the shorter one')
+
+    eq(hot.restoreDecision(null, 'x'), 'none', 'nothing kept, nothing offered')
+    eq(hot.restoreDecision('a\nb', 'a\nb'), 'drop', 'a snapshot the disk already agrees with is forgotten')
+    eq(hot.restoreDecision('a\nb', 'a\r\nb'), 'drop',
+      'line endings ignored — the kept text is the editor\'s `\\n`, the disk\'s is verbatim, and a CRLF '
+      + 'file must still recognise its own snapshot')
+    eq(hot.restoreDecision('a\nb\nc', 'a\nb'), 'restore', 'work the disk does not have comes back')
+
+    const hotSrc = bare(readFileSync('src/editor/hotExit.ts', 'utf8'))
+    const surface = bare(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    const pane = bare(readFileSync('src/panes/EditorPane.tsx', 'utf8'))
+    ok(!/^\s*import /m.test(hotSrc), '`hotExit.ts` imports nothing, so this script can drive it')
+    ok(/baseline = view\.state\.doc\s*viewRef\.current = view[\s\S]{0,400}?minimalChange\(view\.state\.doc\.toString\(\), kept\)[\s\S]{0,120}?view\.dispatch\(\{ changes: recovery \}\)/.test(surface),
+      'the recovered text goes in AFTER the baseline is taken from the disk, as a change — built '
+      + 'from it instead, the tab would come up clean and the close guard would let the work go')
+    ok(/recovered=\{load\.recovered\}/.test(pane), 'the pane hands the kept text to the surface')
+    ok(/bump \|\| carried \? Promise\.resolve\(null\) : fileApi\.backupRead\(path\)/.test(pane),
+      'a snapshot is consulted on a first load only — a reload from disk is the user asking for the file')
+    ok(/recovery === 'restore' && kept !== null \? kept\.baseStamp : doc\.stamp/.test(pane),
+      'a recovered buffer autosaves against the stamp it was typed against, so a file that moved '
+      + 'while cide was down raises the conflict bar rather than being overwritten')
+    ok(/if \(!dirty\) forgetBackup\(\)/.test(pane), 'a clean buffer forgets its snapshot')
+    ok(/backupChain\.current = backupChain\.current\.then\(op\)/.test(pane),
+      'every write and clear goes through one chain — a snapshot landing after a save\'s clear would '
+      + 'be offered back over the file the user saved')
+    ok(/scheduleBackup\(backupSize\.current\)/.test(pane) && !/scheduleBackup\(read\(\)/.test(pane),
+      'the timers are armed per change without reading the text — a `toString` per keystroke is the '
+      + 'cost the timers exist to avoid')
   }
 
   if (failed > 0) {

@@ -98,6 +98,19 @@
   --pane-top-strip: var(--h-findbar);
 }
 
+/*
+ * A pane that draws no cluster — a file tab's, see `bare` in `PaneTitleBar.tsx` — reserves no
+ * width for one. `--pane-corner-clear` then resolves to the minimap inset alone, so what the
+ * pane keeps in its own top-right (the conflict bar's buttons, the markdown view switch) moves
+ * into the corner the cluster used to hold rather than stopping 125px short of empty space.
+ *
+ * After `.frame` in specificity (0,2,0 against 0,1,0), so the base declaration below stays the
+ * single measured number `check:rows` derives.
+ */
+.frame[data-bare='true'] {
+  --pane-corner: 0px;
+}
+
 .frame {
   display: flex;
   flex-direction: column;

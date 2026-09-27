@@ -215,6 +215,11 @@ struct LiveRun {
     /// `Some` in exactly the states [`RunState::counts_as_work`] admits. Not persisted: a
     /// restored run is `Interrupted`, which is not working.
     working_since_unix_ms: Option<u64>,
+    /// When this run entered `AwaitingPermission`, or `None` when it is not waiting on an
+    /// approval prompt. The identity of one park: [`park_due`] ends the run only if the park it
+    /// was armed for is still the one in progress. Not persisted, for `working_since_unix_ms`'
+    /// reason. (M118)
+    parked_since_unix_ms: Option<u64>,
     /// The last prompt delivered — the opening one today, a follow-up once the queue can send
     /// them. Kept because the retry a frozen turn offers has to re-send *this* text: a retry
     /// that recomposed the prompt from the task would silently drop whatever extra instruction
@@ -277,6 +282,9 @@ struct LiveRun {
     /// observations milliseconds apart. Taken rather than read so a stale verdict cannot fail the
     /// *next* candidate over on its own clean exit.
     provider_failure: Option<cide_agents::FailoverReason>,
+    /// The provider's own sentence for [`Self::provider_failure`], latched and taken with it —
+    /// what the pool entry notification quotes (t-1090).
+    provider_detail: Option<String>,
     /// Every candidate this run has spent, and why, oldest first.
     ///
     /// What makes the exhaustion sentence able to say more than "they all failed" — by the second
@@ -551,6 +559,10 @@ pub enum StopHow {
     /// `note_run_over` types no line, where either would be one comment and one knock per
     /// finished task, saying only that the work that was done is done.
     Retired,
+    /// Ended by cide because it sat on an approval prompt for `waited_secs` with nobody to answer
+    /// it (M118, [`park_due`]). Nobody's hand, like the two above. Never *asked* to wind down:
+    /// a typed line and its Enter would answer the prompt — `stop_route`'s first rule.
+    Parked { waited_secs: u64 },
 }
 
 impl StopHow {
@@ -663,6 +675,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             // interval open and nothing accumulated. Every later change goes through `move_to`.
             worked_ms: 0,
             working_since_unix_ms: None,
+            parked_since_unix_ms: None,
             prompt: spec.prompt,
             note: (ahead > 0).then(|| {
                 format!("{ahead} ahead of it in this role's queue; runs start as slots free")
@@ -673,6 +686,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             pool: spec.pool,
             pool_index: 0,
             provider_failure: None,
+            provider_detail: None,
             spent: Vec::new(),
             pool_note: None,
             pool_name: None,
@@ -761,6 +775,35 @@ fn holder_in(
             run: run.run,
             state: run.state.clone(),
         })
+}
+
+/// [`AgentRegistry::last_conversation`]'s rule over the table, so a test can drive it. (M116)
+fn last_conversation_in(
+    inner: &Inner,
+    project: ProjectId,
+    agent: &AgentId,
+    task: &TaskId,
+) -> Option<(RunId, Harness, String)> {
+    inner
+        .runs
+        .values()
+        .filter(|run| {
+            run.project == project
+                && &run.agent == agent
+                && run.task.as_ref() == Some(task)
+                && matches!(run.purpose, RunPurpose::Work(_))
+                && !holds_a_pair(&run.state)
+                && run.reopenable
+        })
+        .filter_map(|run| {
+            let id = match run.harness {
+                Harness::Claude | Harness::Qwen => run.session.map(|s| s.to_string()),
+                Harness::Opencode | Harness::Codex | Harness::Mimo => run.harness_session.clone(),
+            }?;
+            Some((run.started_unix_ms, run.run, run.harness, id))
+        })
+        .max_by_key(|(started, run, ..)| (*started, *run))
+        .map(|(_, run, harness, id)| (run, harness, id))
 }
 
 /// Whether a run in this state holds its (role, task) pair against a new dispatch. (M66)
@@ -855,6 +898,43 @@ impl LiveRun {
         (model, position)
     }
 
+    /// The pool target this run's requests are charged to on the pool card. (pool stats)
+    ///
+    /// Its pool's current entry where it has one. Otherwise, for a harness that reads the
+    /// provider document, the model it was forked with, read as a target: `provider/model` and
+    /// the effort it was given as the variant, which is what `--variant` carried. So a role that
+    /// was never pointed at a pool but names `k3s/qwen-36-27b-fp8` still shows up on that entry's
+    /// figures. The first report of the stats had exactly that: one run working on entry 5 while
+    /// every entry of the pool read as idle, because only pooled runs were counted.
+    ///
+    /// Only the stats follow this. `maxRunning` and the load beside it still count pooled runs
+    /// alone (`entry_load`), because admission never placed an off-pool run and cannot hold it
+    /// back.
+    fn stats_target(&self) -> Option<cide_ipc::PoolEntry> {
+        if let Some(entry) = self.pool.get(self.pool_index) {
+            return Some(entry.clone());
+        }
+        if !self.harness.reads_provider_document() {
+            return None;
+        }
+        let flag = self.using().0?;
+        // `provider/model#variant` is opencode 2's spelling of the same three fields.
+        let (flag, folded) = match flag.split_once('#') {
+            Some((flag, variant)) => (flag.to_owned(), Some(variant.to_owned())),
+            None => (flag, None),
+        };
+        let (provider, model) = flag.split_once('/')?;
+        let variant = folded
+            .or_else(|| self.forked_with.as_ref().and_then(|s| s.effort.clone()))
+            .unwrap_or_default();
+        Some(cide_ipc::PoolEntry {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            variant,
+            ..cide_ipc::PoolEntry::default()
+        })
+    }
+
     fn wire(&self) -> AgentRun {
         let (model, pool_position) = self.using();
         AgentRun {
@@ -887,6 +967,7 @@ impl LiveRun {
             pool_position,
             // Filled by the roster builder, which has the root; see `AgentRun::worktree`.
             worktree: false,
+            reviewer: None,
         }
     }
 }
@@ -1183,6 +1264,22 @@ struct Inner {
     /// decisions", which is the only place an admission that passed over an entry is written
     /// down. (M90)
     pool_events: VecDeque<cide_ipc::PoolEvent>,
+    /// Notifications a failover owes the user and has not delivered yet — a pool entry whose
+    /// *configuration* is wrong (`FailoverReason::is_configuration`), with the provider's own
+    /// sentence. Queued under the lock by `plan_failover_or_wait`, which has no `AppHandle`, and
+    /// drained by `watch_exit`'s closures, which do. (t-1090)
+    pool_notices: Vec<(ProjectId, String)>,
+    /// Per pool target, what it has done since cide started — the card's runs, requests, tokens
+    /// and speeds. Keyed by `PoolEntry::same_target` like [`Self::benched`], and a list for the
+    /// same reason: a handful of targets, compared by three fields, never worth a hash. In memory
+    /// only; see [`cide_ipc::PoolEntryStats`].
+    pool_stats: Vec<(cide_ipc::PoolEntry, cide_ipc::PoolEntryStats)>,
+    /// When the step each (run, CLI session) has open began, for timing it when its
+    /// `step_finish` arrives. Keyed by the CLI's session and not just the run because opencode
+    /// interleaves nested subagents' steps into the parent's stream. An entry whose finish never
+    /// comes (a killed child) is overwritten by that session's next start and otherwise costs a
+    /// few bytes until the process ends.
+    step_started: HashMap<(RunId, String), u64>,
 }
 
 /// How many pool events [`Inner::pool_events`] keeps. Enough for an afternoon's dispatches to be
@@ -1221,6 +1318,18 @@ pub struct AgentRegistry {
     /// those kills recorded as outcomes. Two paused runs restored as *history*, and Resume had
     /// nothing to resume.
     snapshot_sealed: std::sync::atomic::AtomicBool,
+    /// Set the moment cide learns it is going down — the first line of the signal thread, of
+    /// [`crate::lifecycle::exit_requested`] and of logind's `PrepareForShutdown` — and read by
+    /// [`Self::external_stop`] and [`Self::pump`]. **Not** the seal, and the two must stay apart:
+    /// the seal also refuses every snapshot write, so setting *it* this early would make the
+    /// teardown's own [`Self::final_snapshot`] a no-op.
+    ///
+    /// It exists because the seal comes too late for an OS shutdown. systemd stops cide's unit
+    /// with `KillMode=control-group`: every `claude`, `opencode` and `codex` child gets SIGTERM
+    /// **at the same instant cide does**, not from cide's ladder after the seal. Children that
+    /// died before the teardown reached the seal were recorded `Finished { 143 }`, restored as
+    /// history, and a reboot left nothing to Resume — the one outcome a quit is built to avoid.
+    going_down: std::sync::atomic::AtomicBool,
 }
 
 impl AgentRegistry {
@@ -1343,6 +1452,12 @@ impl AgentRegistry {
                                 run: bench.run,
                                 agent_label: bench.agent_label.clone(),
                             }),
+                            stats: inner
+                                .pool_stats
+                                .iter()
+                                .find(|(on, _)| on.same_target(entry))
+                                .map(|(_, stats)| *stats)
+                                .unwrap_or_default(),
                         }
                     })
                     .collect(),
@@ -1454,6 +1569,12 @@ impl AgentRegistry {
     /// something new — a pool that is full — so [`Self::pump`] can redraw it. Without that the
     /// sentence would be written under the lock and shown at the next unrelated change.
     fn take_admissions_noting(&self) -> (Vec<Admission>, Vec<ProjectId>) {
+        // Nothing starts on the way out. An interrupted run gives its slot back (see
+        // `external_stop`), and without this the next queued run would be forked straight into
+        // the teardown — the shape `plan_failover`'s own going-down refusal already rules out.
+        if self.going_down() {
+            return (Vec::new(), Vec::new());
+        }
         let mut inner = self.inner.lock();
         let mut admitted = Vec::new();
         let mut noted = Vec::new();
@@ -1613,6 +1734,8 @@ fn refusal_phrase(reason: cide_ipc::PoolRefusal) -> &'static str {
         cide_ipc::PoolRefusal::RateLimited => "rate limited",
         cide_ipc::PoolRefusal::Unreachable => "unreachable",
         cide_ipc::PoolRefusal::Auth => "refused the credential",
+        cide_ipc::PoolRefusal::Variant => "refused the variant",
+        cide_ipc::PoolRefusal::Rejected => "rejected the request",
     }
 }
 
@@ -1622,8 +1745,36 @@ fn minutes_left(until: u64, now: u64) -> String {
     format!("{}m", ms.div_ceil(60_000).max(1))
 }
 
+/// The running figures for `entry`'s target, created at zero on first use.
+fn pool_stats_for<'a>(
+    inner: &'a mut Inner,
+    entry: &cide_ipc::PoolEntry,
+) -> &'a mut cide_ipc::PoolEntryStats {
+    let at = match inner
+        .pool_stats
+        .iter()
+        .position(|(on, _)| on.same_target(entry))
+    {
+        Some(at) => at,
+        None => {
+            inner
+                .pool_stats
+                .push((entry.clone(), cide_ipc::PoolEntryStats::default()));
+            inner.pool_stats.len() - 1
+        }
+    };
+    &mut inner.pool_stats[at].1
+}
+
 /// Append to the pool log, dropping the oldest past [`POOL_EVENTS`].
+///
+/// Also where an entry's run count is kept: both places a run lands on an entry — admission and
+/// a failover's fork — write their `Started` here and nowhere else, so counting here counts each
+/// landing exactly once.
 fn log_pool_event(inner: &mut Inner, event: cide_ipc::PoolEvent) {
+    if let cide_ipc::PoolEventKind::Started { entry, .. } = &event.kind {
+        pool_stats_for(inner, entry).started += 1;
+    }
     if inner.pool_events.len() >= POOL_EVENTS {
         inner.pool_events.pop_front();
     }
@@ -1999,6 +2150,27 @@ const SETTINGS_KEPT_FOR_A_PANE: &str = "settings changed, but this run's convers
 pub(crate) const PAUSED_QUEUE_NOTE: &str =
     "this project's agents are paused; nothing starts until Resume";
 
+/// What a run continuing an ended run's conversation on a handed-back task reads first. (M116)
+///
+/// [`continuation_prompt`]'s re-read-and-continue sentence with [`Restarted::HandedBack`] as its
+/// opening, then whatever the dispatch said — one line, since it is typed at a TUI.
+pub(crate) fn handed_back_prompt(
+    task: &TaskId,
+    title: Option<&str>,
+    harness: Harness,
+    instructions: Option<&str>,
+) -> String {
+    let tools = cide_agents::harness::for_kind(harness);
+    let base = continuation_prompt(Some(task), title, tools, Restarted::HandedBack);
+    let said = instructions
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty());
+    match said {
+        Some(line) => format!("{base} What to do now: {line}"),
+        None => base,
+    }
+}
+
 /// The first line a resumed run is told. One line, for the same `\r` rule as every prompt.
 ///
 /// It does not restate the task body — the conversation being continued already holds it — but
@@ -2109,6 +2281,74 @@ fn holds_its_checkout(live: &LiveRun) -> bool {
             | RunState::AwaitingPermission
             | RunState::Paused { .. }
     )
+}
+
+/// Whether a project's interrupted runs continue by themselves at launch: subagents on, and
+/// `agents.resumeAfterRestart` not turned off. (M118)
+pub(crate) fn resumes_at_launch(config: &cide_agents::config::AgentsConfig) -> bool {
+    config.enabled && config.resume_after_restart
+}
+
+/// How long a task run may sit on an approval prompt before cide ends it. (M118)
+///
+/// A task run is unattended by construction: nobody is watching its pane, and a prompt there
+/// parks it until somebody happens to look — selfcraft's codex runs sat on `--approve-for-me`
+/// escalations its reviewer had rejected (t-552, t-574) until the orchestrator noticed and
+/// killed them with no reason on the board. Long enough for a person who *is* around to open the
+/// run and answer; a run open in a pane is never ended, however long it waits.
+pub(crate) const PERMISSION_PARK_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// [`PERMISSION_PARK_GRACE`], or `CIDE_PARK_GRACE_SECS` when it is set — for a live test of the
+/// park, which otherwise costs five idle minutes a try (M119: the park had never fired on
+/// selfcraft, so M118 shipped it unseen). Read once; said in the log when it is in force, so a
+/// profile that forgot the variable is not a mystery.
+pub(crate) fn park_grace() -> Duration {
+    static GRACE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        match std::env::var("CIDE_PARK_GRACE_SECS")
+            .ok()
+            .and_then(|secs| secs.trim().parse::<u64>().ok())
+        {
+            Some(secs) => {
+                tracing::warn!(secs, "CIDE_PARK_GRACE_SECS is set: runs parked on a prompt are ended after this, not five minutes");
+                Duration::from_secs(secs)
+            }
+            None => PERMISSION_PARK_GRACE,
+        }
+    })
+}
+
+/// Whether a park armed at `armed` is due to be ended: still waiting on **that** prompt, no
+/// stop already under way, and no person with the run open in a pane. Pure. (M118)
+///
+/// Nothing is typed into the prompt — `stop_route`'s first rule, since a line and its Enter
+/// would approve the very call. The run is ended, its epitaph says why, and the conversation
+/// stays on disk for a dispatch to continue once somebody has decided about the command.
+pub(crate) fn park_due(
+    state: &RunState,
+    parked_since: Option<u64>,
+    armed: u64,
+    stopping: bool,
+    viewed: bool,
+) -> bool {
+    matches!(state, RunState::AwaitingPermission)
+        && parked_since == Some(armed)
+        && !stopping
+        && !viewed
+}
+
+/// Wait out [`PERMISSION_PARK_GRACE`] for one park, then ask [`AgentRegistry::end_parked`]. One
+/// short-lived thread per park; a park that ends first makes the check a no-op.
+fn watch_park(registry: Arc<AgentRegistry>, app: AppHandle, run: RunId, since: u64) {
+    let spawned = std::thread::Builder::new()
+        .name("cide-park-watch".into())
+        .spawn(move || {
+            std::thread::sleep(park_grace());
+            registry.end_parked(&app, run, since, now_unix_ms());
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%run, %error, "no thread to watch an approval prompt; a parked run stays parked");
+    }
 }
 
 /// What a state change means for a wind-down in flight. See [`wind_down_step`]. (M67)
@@ -2359,6 +2599,9 @@ enum Restarted {
     Cide,
     /// A person changed the model settings under a pause and resumed; cide restarted the run.
     Settings,
+    /// Its task was handed back to it after the run had ended — a reviewer's send-back, a red
+    /// verify, a re-assignment. (M116) The process is new; the conversation is the earlier run's.
+    HandedBack,
 }
 
 impl Restarted {
@@ -2368,6 +2611,11 @@ impl Restarted {
             Self::Settings => {
                 "cide restarted you on new model settings while you were paused; the \
                  conversation so far is yours, the process is new."
+            }
+            Self::HandedBack => {
+                "Your task has been handed back to you: the conversation above is your earlier \
+                 work on it, and the process is new. Read its newest comments first — they say \
+                 what is still wrong."
             }
         }
     }
@@ -2386,9 +2634,16 @@ impl AgentRegistry {
     }
 
     /// Note which directory a run is working in: for the row, and for the agent socket. (M39)
-    fn note_cwd(&self, run: RunId, cwd: &std::path::Path) {
+    ///
+    /// `caveat` is what codex's sandbox will deny the run (M118, `sandbox_caveat`), said beside
+    /// the checkout so a run that cannot commit or has no X display says so on its row before it
+    /// fails at it.
+    fn note_cwd(&self, run: RunId, cwd: &std::path::Path, caveat: Option<&str>) {
         if let Some(live) = self.inner.lock().runs.get_mut(&run) {
-            live.note = Some(cwd.display().to_string());
+            live.note = Some(match caveat {
+                Some(caveat) => format!("{} — {caveat}", cwd.display()),
+                None => cwd.display().to_string(),
+            });
             live.cwd = Some(cwd.to_path_buf());
             // A `claude` child files its transcript under this directory the moment it starts,
             // so from here the conversation can be re-opened there. An opencode run's answer
@@ -2418,6 +2673,33 @@ impl AgentRegistry {
         match live.harness {
             Harness::Claude | Harness::Qwen => live.session.map(|session| session.to_string()),
             Harness::Opencode | Harness::Codex | Harness::Mimo => live.harness_session.clone(),
+        }
+    }
+
+    /// The conversation a dispatch onto (`agent`, `task`) would continue: the newest run of that
+    /// pair that no longer holds it, whose conversation is still on disk. (M116)
+    ///
+    /// `(run, harness, id)` — the harness because an id is only meaningful to the CLI that minted
+    /// it: handing a codex thread to opencode, or an opencode `ses_…` to codex, is the respawn
+    /// that killed terrastrike's `fb668bf6`, and the caller compares it against the harness the
+    /// new run will actually fork. `None` when no ended run of the pair left one — a first
+    /// failure clears `harness_session`, and a restored claude run whose transcript is gone is not
+    /// `reopenable`. Review runs are never continued this way; they are not a role on a task.
+    pub fn last_conversation(
+        &self,
+        project: ProjectId,
+        agent: &AgentId,
+        task: &TaskId,
+    ) -> Option<(RunId, Harness, String)> {
+        let inner = self.inner.lock();
+        last_conversation_in(&inner, project, agent, task)
+    }
+
+    /// Re-point where `run` reports its next hand-back: the pane that just said something to it
+    /// is the one waiting for the answer, not whoever dispatched it an hour ago. (M116)
+    pub fn renotify(&self, run: RunId, notify: RunNotify) {
+        if let Some(live) = self.inner.lock().runs.get_mut(&run) {
+            live.notify = notify;
         }
     }
 
@@ -2614,8 +2896,25 @@ impl AgentRegistry {
                 RunState::Idle
             )
         );
-        let over = matches!(next, RunState::Finished { .. } | RunState::Failed { .. });
-        move_to(live, next, now_unix_ms());
+        // `Interrupted` ends the child as surely as the terminal states do — it is what an
+        // [`Self::external_stop`] records — so it gives back the slot and the freeze the same way.
+        // It is *not* terminal: the row keeps its session and a Resume continues it.
+        let over = matches!(
+            next,
+            RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+        );
+        // A task run that has just stopped at an approval prompt. Armed here, where the edge is
+        // seen once, and watched after the lock is dropped. (M118)
+        let parked_now = !matches!(live.state, RunState::AwaitingPermission)
+            && matches!(next, RunState::AwaitingPermission);
+        let now = now_unix_ms();
+        live.parked_since_unix_ms = match (parked_now, &next) {
+            (true, _) => Some(now),
+            (false, RunState::AwaitingPermission) => live.parked_since_unix_ms,
+            (false, _) => None,
+        };
+        let park = (parked_now && live.task.is_some()).then_some(now);
+        move_to(live, next, now);
         if over {
             // A frozen child that died under the freeze is not frozen any more, and leaving the
             // record behind would put a dead session on `thaw_for_shutdown`'s list and leave the
@@ -2709,9 +3008,53 @@ impl AgentRegistry {
             tracing::info!(%run, "a run wound down as asked; ending it");
             self.kill_child(app, Some(session));
         }
+        if let (Some(app), Some(since)) = (app, park)
+            && let Some(registry) = app.try_state::<Arc<AgentRegistry>>()
+        {
+            watch_park(Arc::clone(&registry), app.clone(), run, since);
+        }
         if let (Some(app), Some(project)) = (app, nudge) {
             crate::agent_rpc::note_run_over(app, project, run);
         }
+        true
+    }
+
+    /// End a task run still parked on the approval prompt it was parked on at `since`, when
+    /// [`park_due`] says so. Answers whether it did. (M118)
+    fn end_parked(&self, app: &AppHandle, run: RunId, since: u64, now: u64) -> bool {
+        let session = {
+            let sessions = app.try_state::<SessionRegistry>();
+            let mut inner = self.inner.lock();
+            let viewed = match (&sessions, inner.runs.get(&run)) {
+                (Some(sessions), Some(live)) => viewed_by(&inner, sessions, live).is_some(),
+                _ => false,
+            };
+            let Some(live) = inner.runs.get_mut(&run) else {
+                return false;
+            };
+            if !park_due(
+                &live.state,
+                live.parked_since_unix_ms,
+                since,
+                live.stop.is_some() || live.stopping,
+                viewed,
+            ) {
+                return false;
+            }
+            live.stopping = true;
+            live.stop = Some(StopRecord {
+                // Nobody's hand, as with `Retired`; read by nothing for this arm.
+                by: StopBy::User,
+                reason: None,
+                how: StopHow::Parked {
+                    waited_secs: now.saturating_sub(since) / 1000,
+                },
+                grace_secs: 0,
+            });
+            live.session
+        };
+        tracing::info!(%run, "a task run sat on an approval prompt nobody can answer; ending it");
+        self.kill_child(app, session);
         true
     }
 
@@ -2749,7 +3092,15 @@ impl AgentRegistry {
         if let Observation::Hook(frame) = ob
             && let Some(conversation) = harness.capture_hook(frame)
         {
-            self.note_harness_session(run, conversation);
+            // Marked for the snapshot for the reason the line path gives beside its own capture:
+            // a frame that captures and moves nothing would otherwise leave the id in memory.
+            if self.note_harness_session(run, conversation)
+                && let Some(app) = app
+                && let Some(registry) = app.try_state::<Arc<AgentRegistry>>()
+                && let Some(project) = self.project_of(run)
+            {
+                registry.mark_changed(app, project);
+            }
         }
         let next = harness.observe(current, ob)?;
         self.set_state(app, run, next.clone())
@@ -3576,7 +3927,7 @@ impl AgentRegistry {
             for old in &restarts {
                 if let Some(pty) = sessions.get(*old) {
                     tracing::info!(session = %old, "winding down a paused run's child to restart it on the current settings");
-                    pty.kill();
+                    end_tree(&pty, "a paused run restarted");
                 }
             }
         }
@@ -3606,6 +3957,54 @@ impl AgentRegistry {
         }
         self.mark_changed(app, project);
         Ok(())
+    }
+
+    /// At launch: put the runs the last cide's restart interrupted back through the queue, as
+    /// pressing Resume on each would, in every project whose `agents.resumeAfterRestart` is on.
+    /// (M118)
+    ///
+    /// Through [`Self::requeue_interrupted`], so its two skips are this road's too: a run whose
+    /// conversation is open in a pane, and a run whose (role, task) a newer run already holds.
+    /// Admission decides the rest — caps, pools, a paused project — exactly as for a dispatch,
+    /// and [`continuation_prompt`] tells each run that cide restarted under it. The quit itself
+    /// still winds nothing down (`stop_route`'s `SEALED`): the turn in flight is lost, the
+    /// conversation is not, and this is what picks it back up.
+    pub fn resume_after_restart(self: &Arc<Self>, app: &AppHandle) {
+        let projects: Vec<ProjectId> = {
+            let inner = self.inner.lock();
+            let mut projects: Vec<ProjectId> = inner
+                .runs
+                .values()
+                .filter(|live| live.state == RunState::Interrupted)
+                .map(|live| live.project)
+                .collect();
+            projects.sort_unstable_by_key(|project| project.to_string());
+            projects.dedup();
+            projects
+        };
+        let Some(workspace) = app.try_state::<crate::WorkspaceState>() else {
+            return;
+        };
+        let sessions = app.try_state::<SessionRegistry>();
+        for project in projects {
+            let Ok(root) = crate::tasks_state::project_root(&workspace, project) else {
+                continue;
+            };
+            // Read off the disk, now: `.cide/config.json` is committed, and the switch as it
+            // stands at this launch is the one that counts.
+            let config = cide_agents::config::load(&root).agents;
+            if !resumes_at_launch(&config) {
+                continue;
+            }
+            let settings_now = settings_now(app, project);
+            if let Err(error) =
+                self.requeue_interrupted(project, None, sessions.as_deref(), settings_now.as_ref())
+            {
+                tracing::warn!(%project, %error, "could not resume the runs a restart interrupted");
+            }
+            self.mark_changed(app, project);
+        }
+        self.pump(app);
     }
 
     /// Which sessions a resume would thaw. **Reads only** — see [`Self::resume`] for why.
@@ -3877,7 +4276,8 @@ impl AgentRegistry {
             );
             return None;
         }
-        if self.snapshot_sealed.load(Ordering::SeqCst) {
+        // `going_down`, not only the seal: see `AgentRegistry::going_down`.
+        if self.going_down() {
             return None;
         }
         Some(failover)
@@ -4299,7 +4699,7 @@ impl AgentRegistry {
             && let Some(pty) = sessions.get(previous)
         {
             tracing::info!(%run, session = %previous, "winding down a run's previous child before continuing it");
-            pty.kill();
+            end_tree(&pty, "a run continued");
         }
 
         let registry = Arc::clone(self);
@@ -4438,6 +4838,7 @@ impl AgentRegistry {
 
         // **Taken, never read.** A candidate's verdict belongs to the child that reported it; a
         // latch left behind would fail the *next* candidate over on its own clean exit.
+        let detail = live.provider_detail.take();
         let reason = live.provider_failure.take()?;
 
         // Four refusals before the pool is consulted, each about a death that is not a provider's
@@ -4460,7 +4861,7 @@ impl AgentRegistry {
         let clean_is_final =
             cide_agents::for_kind(live.harness).is_some_and(|harness| harness.failure_exits_zero());
         if live.stopping
-            || self.snapshot_sealed.load(Ordering::SeqCst)
+            || self.going_down()
             || !matches!(live.state, RunState::Starting | RunState::Running)
             || (code == 0 && !clean_is_final)
         {
@@ -4497,6 +4898,28 @@ impl AgentRegistry {
                     },
                 },
             );
+            // A broken entry is the user's to fix, so it is *said*, not only drawn on the run's
+            // row: which pool, which entry, and the provider's own sentence. The run itself moves
+            // on below either way. (t-1090)
+            if reason.is_configuration() {
+                let detail = detail
+                    .as_deref()
+                    .map_or_else(String::new, |detail| format!(": {detail}"));
+                let pool = pool_name
+                    .as_deref()
+                    .map_or_else(|| "Pool".to_string(), |name| format!("Pool \"{name}\""));
+                inner.pool_notices.push((
+                    project,
+                    format!(
+                        "{pool}, entry {from} ({}) {}{detail}. {agent_label}'s run \
+                         moved on; the entry is skipped for {} min — fix it in Settings → Models → \
+                         Pools.",
+                        entry.flag(),
+                        reason.phrase(),
+                        reason.bench_ms() / 60_000,
+                    ),
+                ));
+            }
         }
         // Where this run could go next: the count needs every other run, and leaves this one out
         // because it is leaving its current entry.
@@ -4692,17 +5115,28 @@ impl AgentRegistry {
     ) -> Option<cide_ipc::PoolChoice> {
         let mut inner = self.inner.lock();
         let live = inner.runs.get_mut(&run)?;
+        let first_fork = live.forked_with.is_none();
         live.last_model.clone_from(&settings.model);
         live.forked_with = Some(settings);
         if live.pool.is_empty() && live.pool_index == 0 {
             live.pool.clone_from(&resolved.pool);
         }
+        // A run with no pool never passes `log_pool_event`, so its one landing on a target is
+        // counted here, on its first fork — a respawn is the same run on the same model.
+        // (pool stats)
+        let landed = (first_fork && live.pool.is_empty())
+            .then(|| live.stats_target())
+            .flatten();
         // The pool's name and position are fields on the wire row now (`LiveRun::using`), not a
         // sentence in `pool_note` — which is kept for the events a pool has (a failover, an
         // exhaustion) rather than for the standing fact of which candidate a run is on. (M89)
         if live.pool_name.is_none() && !live.pool.is_empty() {
             live.pool_name.clone_from(&resolved.pool_name);
         }
+        if let Some(target) = landed {
+            pool_stats_for(&mut inner, &target).started += 1;
+        }
+        let live = inner.runs.get(&run)?;
         let entry = live.pool.get(live.pool_index)?.clone();
         Some(cide_ipc::PoolChoice {
             pool: resolved.pool_name.clone().unwrap_or_default(),
@@ -4728,9 +5162,38 @@ impl AgentRegistry {
     /// a turn cost). No event is emitted either: the figure is read on demand by a card somebody
     /// opened, and broadcasting a roster to every window per step would be a redraw per model
     /// call for a number nothing on screen is showing.
-    fn note_usage(&self, run: RunId, usage: cide_ipc::TokenUsage) {
-        if let Some(live) = self.inner.lock().runs.get_mut(&run) {
-            live.usage = Some(usage);
+    ///
+    /// `finish` is the step's own edge, where the harness reads one — the CLI's session and the
+    /// time it ended — and is what adds the step to its pool target's figures (pool stats): one
+    /// request, its tokens, and its speed when the matching start was seen.
+    fn note_usage(&self, run: RunId, usage: cide_ipc::TokenUsage, finish: Option<(String, u64)>) {
+        let mut inner = self.inner.lock();
+        let Some(live) = inner.runs.get_mut(&run) else {
+            return;
+        };
+        live.usage = Some(usage);
+        // A run on no target (a claude run, an opencode run on its CLI's unnamed default model)
+        // has no entry to charge — the card has no row for it.
+        let Some(entry) = live.stats_target() else {
+            return;
+        };
+        let took = finish.and_then(|(session, at)| {
+            let began = inner.step_started.remove(&(run, session))?;
+            Some(at.saturating_sub(began))
+        });
+        pool_stats_for(&mut inner, &entry).record(&usage, took);
+    }
+
+    /// A step began on `session` at `at`, for [`Self::note_usage`] to time it by. (pool stats)
+    fn note_step_start(&self, run: RunId, session: String, at: u64) {
+        let mut inner = self.inner.lock();
+        // Only a run with a target is ever charged anywhere, so only its steps are remembered.
+        if inner
+            .runs
+            .get(&run)
+            .is_some_and(|live| live.stats_target().is_some())
+        {
+            inner.step_started.insert((run, session), at);
         }
     }
 
@@ -4780,11 +5243,29 @@ impl AgentRegistry {
         })
     }
 
+    #[cfg(test)]
     fn note_provider_failure(&self, run: RunId, reason: cide_agents::FailoverReason) {
+        self.note_provider_failure_with(run, reason, None);
+    }
+
+    /// The latch, with the provider's own sentence when the harness has one — what a
+    /// configuration refusal's notification quotes.
+    fn note_provider_failure_with(
+        &self,
+        run: RunId,
+        reason: cide_agents::FailoverReason,
+        detail: Option<String>,
+    ) {
         if let Some(live) = self.inner.lock().runs.get_mut(&run) {
-            tracing::warn!(%run, ?reason, "this run's provider refused");
+            tracing::warn!(%run, ?reason, ?detail, "this run's provider refused");
             live.provider_failure = Some(reason);
+            live.provider_detail = detail;
         }
+    }
+
+    /// The pool notifications queued since the last call. See `Inner::pool_notices`.
+    fn take_pool_notices(&self) -> Vec<(ProjectId, String)> {
+        std::mem::take(&mut self.inner.lock().pool_notices)
     }
 
     /// `SIGCONT` every session this registry froze, so the shutdown ladder's rungs can land.
@@ -4824,6 +5305,19 @@ impl AgentRegistry {
             }
         }
     }
+
+    /// Every live run's session — the children whose trees the shutdown ends with them. (M119)
+    ///
+    /// Runs only, not every session: a shell pane's `nohup`ed job is the user's, and a quit
+    /// that took it down would be a new way for cide to lose somebody's work.
+    pub fn run_sessions(&self) -> Vec<SessionId> {
+        self.inner
+            .lock()
+            .runs
+            .values()
+            .filter_map(|live| live.session)
+            .collect()
+    }
 }
 
 /// The project's primary console session — the orchestrator. See [`AgentRegistry::pause`].
@@ -4842,6 +5336,30 @@ fn primary_session(app: &AppHandle, project: ProjectId) -> Option<SessionId> {
             .find(|pane| pane.role == PaneRole::Primary)
             .and_then(|pane| pane.session)
     })
+}
+
+/// How long a run's child has to take its tree down with it before cide ends what is left.
+/// See [`cide_core::process_tree::Tree::finish`].
+const TREE_GRACE: Duration = Duration::from_secs(3);
+
+/// End a run's child **and everything it started**. (M119)
+///
+/// Every road that ends a run's (or a run server's) child comes here instead of calling
+/// `pty.kill()` itself. `pty.kill()` is portable-pty's one `SIGHUP` to the pid cide forked, and
+/// a codex run's commands live in sessions of their own under `codex-linux-sandbox`, which that
+/// signal never reaches: selfcraft had Godot probes and Blender workers from runs that ended
+/// seven hours earlier, adopted by `systemd --user`. The tree is read **before** the signal,
+/// because after the child exits its orphans no longer say whose they were; see
+/// `cide_core::process_tree` for why ending them is enough to take a whole sandbox down.
+///
+/// The polite signal still goes first and alone. What survives [`TREE_GRACE`] is `SIGKILL`ed.
+fn end_tree(pty: &cide_pty::PtySession, what: &str) {
+    let tree = pty
+        .child_pid()
+        .map(cide_core::process_tree::capture)
+        .unwrap_or_default();
+    pty.kill();
+    tree.finish(TREE_GRACE, what.to_string());
 }
 
 /// Signal one session's child, by id.
@@ -5388,6 +5906,83 @@ impl AgentRegistry {
         self.save_screens_for_snapshot(sessions);
     }
 
+    /// cide is going down: from here on a child's death is an interruption, and nothing is
+    /// admitted or forked. See [`Self::going_down`]. Idempotent, and cheap enough to call first
+    /// on every road out.
+    pub fn begin_going_down(&self) {
+        self.going_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a new child may still be started: not once the process is on its way out. A
+    /// child forked into a teardown is killed by the ladder it was born into — or, on the logind
+    /// and SIGTERM roads, is simply one more process in a cgroup systemd is about to SIGKILL.
+    fn going_down(&self) -> bool {
+        self.going_down.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .snapshot_sealed
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record a child that somebody other than cide stopped as **interrupted**, not finished.
+    /// Answers the run's project when it did, for the caller's redraw and pump.
+    ///
+    /// Two ways to know it was not cide, and neither applies to a run cide is stopping itself
+    /// (`LiveRun::stopping` — every Stop route, the idle-done retirement and the reclaim latch
+    /// it first):
+    ///
+    /// * **cide is going down** ([`Self::begin_going_down`]). Whatever the exit says, the child's
+    ///   conversation is exactly what the teardown exists to leave resumable;
+    /// * **the exit is what a SIGTERM makes of this CLI.** That is how an OS shutdown or a
+    ///   logout reaches a child *before* cide's own signal thread has woken: systemd signals
+    ///   the whole cgroup at once. cide never sends SIGTERM to a run outside the shutdown
+    ///   ladder — `pty.kill()` is a SIGHUP — so this cannot swallow one of its own kills.
+    ///   Measured (M117, SIGTERM to each CLI idle in a pty): `claude` 2.1.283 catches it and
+    ///   exits **143**; `codex` 0.157 dies of the signal, which `cide_pty::Exit` reports as
+    ///   `128 + 15`, also 143; `opencode` 2.0.16 catches it and exits **130**, SIGINT's number.
+    ///   So both codes. The second can also be a person's Ctrl+C in the run's pane — an
+    ///   interruption too, by any reading, and a Resume is the honest offer for it;
+    ///
+    /// SIGHUP is deliberately not the second test's: it is what cide's own kills send, and a
+    /// run's pty has no other terminal to hang up. SIGKILL is not either: the OOM killer and a
+    /// person's `kill -9` are real endings, and a transcript cut mid-write is not something
+    /// to promise a Resume from.
+    ///
+    /// Not a *delay* on other exits, which was considered for a CLI that catches SIGTERM and
+    /// exits 0: an opencode run exits at the end of every turn, so a grace on every exit would
+    /// be a grace on every turn. The going-down test covers that CLI once cide has woken.
+    fn external_stop(&self, session: SessionId, code: i32) -> Option<ProjectId> {
+        /// `claude` and `codex` (143), `opencode` (130) — see above.
+        const OUTSIDE_STOP_EXITS: [i32; 2] = [128 + 15, 128 + 2];
+        let run = {
+            let inner = self.inner.lock();
+            let live = inner.runs.values().find(|r| r.session == Some(session))?;
+            if live.stopping || !(self.going_down() || OUTSIDE_STOP_EXITS.contains(&code)) {
+                return None;
+            }
+            // Only a run with a child to lose. A terminal row has nothing to interrupt, and a
+            // queued one no child at all.
+            if matches!(
+                live.state,
+                RunState::Queued
+                    | RunState::Interrupted
+                    | RunState::Finished { .. }
+                    | RunState::Failed { .. }
+            ) {
+                return None;
+            }
+            live.run
+        };
+        tracing::info!(%run, code, "a run's child was stopped from outside cide; interrupted");
+        self.set_state(None, run, RunState::Interrupted);
+        let mut inner = self.inner.lock();
+        let live = inner.runs.get_mut(&run)?;
+        live.note = Some(
+            "its child was stopped from outside cide; Resume continues the conversation".into(),
+        );
+        Some(live.project)
+    }
+
     /// The write, with the path as an argument so a test never touches the real state dir.
     ///
     /// Refuses after the seal — see [`Self::snapshot_sealed`] for the shutdown race this is
@@ -5525,6 +6120,11 @@ impl AgentRegistry {
             Ok(file) => file,
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "the run snapshot did not parse; starting without it");
+                // Moved aside, not left to the next flush: the coalescer writes this file on
+                // the first change of the session, and it used to replace an unreadable
+                // snapshot with an empty run list — every resumable run gone, silently. The
+                // bytes survive as `agent-runs.corrupt-<n>.json`. (M117)
+                cide_core::persist::quarantine(path);
                 return;
             }
         };
@@ -5603,6 +6203,7 @@ impl AgentRegistry {
                     // latch about a dead process's last words would be a claim about nothing —
                     // the argument `death_noted` and `stale_turn` already make for themselves.
                     provider_failure: None,
+                    provider_detail: None,
                     spent: Vec::new(),
                     pool_note: None,
                     pool_name: saved.pool_name,
@@ -5624,6 +6225,7 @@ impl AgentRegistry {
                     // A restored run is `Interrupted` — not work — so no interval is open and
                     // the gap between the snapshot and this launch is excluded by construction.
                     working_since_unix_ms: None,
+                    parked_since_unix_ms: None,
                     prompt: saved.prompt,
                     note,
                     slot: false,
@@ -5991,6 +6593,8 @@ struct Started {
     /// The JSON event file the child writes, when its harness reports that way. See
     /// [`event_tap`].
     events: Option<PathBuf>,
+    /// What the harness's sandbox will deny this run, for the row beside its checkout. (M118)
+    caveat: Option<&'static str>,
 }
 
 impl AgentRegistry {
@@ -6123,7 +6727,7 @@ impl AgentRegistry {
             );
         }
 
-        self.note_cwd(run, &started.cwd);
+        self.note_cwd(run, &started.cwd, started.caveat);
         // The board reflects that somebody is on it now: `Todo → Doing`, and only that hop —
         // `note_run_started`'s own doc has the reviewer-on-a-review-task case and the respawn
         // idempotence argument. After the child is live rather than at enqueue, so a run the
@@ -6185,7 +6789,7 @@ impl AgentRegistry {
             }
         };
         if let Some(stale) = stale {
-            stale.pty.kill();
+            end_tree(&stale.pty, "a stale run server");
         }
 
         let port = free_port()?;
@@ -6211,10 +6815,26 @@ impl AgentRegistry {
         while !server_healthy(port, &user, &password) {
             if pty.has_exited() || std::time::Instant::now() > deadline {
                 tracing::warn!(%run, port, "the run's server never answered; it runs standalone");
-                pty.kill();
+                end_tree(&pty, "a run server that never answered");
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        // Up is not the same as *ours* on opencode 2, whose health route is public. A port freshly
+        // reported free can still be held by a stranger's opencode — the machine-wide background
+        // service among them — and a run whose turns went into somebody else's conversation is the
+        // one failure here that would look like success. See `server_owned`. (M110)
+        if matches!(
+            flavor.cli_flags().generation,
+            cide_agents::harness::opencode::Generation::V2
+        ) && !server_owned(port, &user, &password)
+        {
+            tracing::warn!(
+                %run, port,
+                "the server on this port is not the one cide started; the run goes standalone"
+            );
+            end_tree(&pty, "a run server on a taken port");
+            return None;
         }
         let url = format!("http://127.0.0.1:{port}");
         tracing::info!(%run, %url, "a run's server is up");
@@ -6255,7 +6875,7 @@ impl AgentRegistry {
         };
         if let Some(server) = server {
             tracing::info!(%run, url = %server.url, "a run is over; stopping its server");
-            server.pty.kill();
+            end_tree(&server.pty, "a finished run's server");
         }
     }
 
@@ -6263,7 +6883,7 @@ impl AgentRegistry {
     pub fn stop_servers(&self) {
         let servers: Vec<LiveServer> = self.inner.lock().servers.drain().map(|(_, s)| s).collect();
         for server in servers {
-            server.pty.kill();
+            end_tree(&server.pty, "a run server at quit");
         }
     }
 
@@ -6329,6 +6949,13 @@ impl AgentRegistry {
     /// hop inside it: `PtySession::on_exit` keeps a list, the pane path has no business knowing
     /// what a run is, and this way a run's exit is wired where runs are — one file, one reader.
     fn watch_exit(self: &Arc<Self>, app: &AppHandle, session: SessionId, pty: &Arc<PtySession>) {
+        // Whatever the exit decided, a configuration refusal owes the user a notification —
+        // queued under the lock by `plan_failover_or_wait`, delivered here where the app is.
+        fn deliver_notices(app: &AppHandle, registry: &AgentRegistry) {
+            for (project, text) in registry.take_pool_notices() {
+                crate::emit::pool_notice(app, project, text);
+            }
+        }
         let app = app.clone();
         let for_failover = app.clone();
         let for_failover_app = app.clone();
@@ -6337,6 +6964,7 @@ impl AgentRegistry {
             session,
             pty,
             move |registry, run| {
+                deliver_notices(&app, registry);
                 after_transition(&app, registry, run);
                 // The exit's nudge, delivered by the wrapper that holds the app — the observation
                 // itself travels app-free so a test can drive it (see `set_state`'s `None` arm).
@@ -6357,6 +6985,7 @@ impl AgentRegistry {
                 // `after_transition` to run here: no slot came free, nothing can be admitted, and the
                 // run is `Starting` with its checkout still its own. All that is owed is the row's new
                 // sentence and the fork.
+                deliver_notices(&for_failover, registry);
                 registry.mark_changed(&for_failover, failover.project);
                 let registry = Arc::clone(registry);
                 tauri::async_runtime::spawn(async move {
@@ -6364,6 +6993,7 @@ impl AgentRegistry {
                 });
             },
             move |registry, project| {
+                deliver_notices(&for_wait, registry);
                 registry.mark_changed(&for_wait, project);
                 registry.pump(&for_wait);
             },
@@ -6401,6 +7031,15 @@ impl AgentRegistry {
             // the run is no longer bound to this session and `plan_failover` could not find it.
             if let Some(restart) = registry.plan_restart(session) {
                 over_to(&registry, restart);
+                return;
+            }
+            // Before the failover, because a child somebody else stopped is neither a provider's
+            // failure nor an outcome: it is an interruption, and the conversation is intact. See
+            // `external_stop`. `wait` is the right tail for it — redraw and pump, with no death
+            // comment and no orchestrator nudge: nothing ended, and during a shutdown there is
+            // nobody left to read either.
+            if let Some(project) = registry.external_stop(session, exit.code) {
+                wait(&registry, project);
                 return;
             }
             match registry.plan_failover_or_wait(session, exit.code) {
@@ -6512,7 +7151,16 @@ impl AgentRegistry {
             if !captured.load(Ordering::Acquire)
                 && let Some(harness_session) = capture(line)
             {
-                registry.note_harness_session(run, harness_session);
+                // A new id has to reach the snapshot, and only a `mark_changed` puts it there.
+                // The `observe` below usually transitions and marks anyway, but a capture on a
+                // line that moved nothing left the id in memory only — and a power cut then
+                // restored the run with nothing for Resume to continue.
+                if registry.note_harness_session(run, harness_session)
+                    && let Some(app) = app.as_ref()
+                    && let Some(project) = registry.project_of(run)
+                {
+                    registry.mark_changed(app, project);
+                }
                 captured.store(true, Ordering::Release);
             }
             // Runs on the coalescer thread — the thread every byte of every session flows
@@ -6532,23 +7180,40 @@ impl AgentRegistry {
             //
             // `diagnose`'s own first act is a substring test, so the ordinary line costs no parse
             // on this thread. (M45)
-            if let Some(reason) = diagnoser.and_then(|harness| harness.diagnose(line)) {
-                registry.note_provider_failure(run, reason);
+            if let Some((harness, reason)) =
+                diagnoser.and_then(|harness| harness.diagnose(line).map(|reason| (harness, reason)))
+            {
+                registry.note_provider_failure_with(run, reason, harness.failure_detail(line));
             }
             // And what the step spent, latched the same way and for the same reason: it moves
             // nothing, and the card that reads it is opened by a person long after this line
             // scrolled past. (M80) `usage`'s own first act is a substring test, so the ordinary
             // line costs no parse on this thread — `diagnose`'s rule one statement up.
-            if let Some(spent) = diagnoser.and_then(|harness| harness.usage(line)) {
-                registry.note_usage(run, spent);
-            }
             // The wall clock, read once, on the coalescer thread, at the only moment this line
             // is in hand — `logring`'s module header makes the whole argument, and M62 gave the
             // renderer the same need: codex states no clock on any item, so a thinking block's
             // duration is the silence it ended and cide is the only thing that can time it. One
-            // read for both, because two reads of `SystemTime::now()` for one line are two
+            // read for every use, because two reads of `SystemTime::now()` for one line are two
             // different answers to when it arrived.
             let now = crate::logring::now_unix_ms();
+            // Which edge of a model request this line is, for the pool card's speeds. (pool
+            // stats) The CLI's own clock where the line states one, this arrival otherwise.
+            let edge = diagnoser.and_then(|harness| harness.step_clock(line));
+            if let Some(clock) = &edge
+                && clock.edge == cide_agents::StepEdge::Start
+            {
+                registry.note_step_start(
+                    run,
+                    clock.session.clone(),
+                    clock.at_unix_ms.unwrap_or(now),
+                );
+            }
+            if let Some(spent) = diagnoser.and_then(|harness| harness.usage(line)) {
+                let finish = edge
+                    .filter(|clock| clock.edge == cide_agents::StepEdge::Finish)
+                    .map(|clock| (clock.session, clock.at_unix_ms.unwrap_or(now)));
+                registry.note_usage(run, spent, finish);
+            }
             // Kept before it is rendered and only when the harness says a person may want it
             // whole — `json_log_render`'s rule, one hook over. The raw line is what the card
             // shows; the rendering is what the pane shows.
@@ -6891,6 +7556,11 @@ impl AgentRegistry {
                 how: StopHow::Reclaimed,
                 grace_secs: 0,
             });
+            // cide's own hand, and the exit must say so: without the latch a reclaim kill could
+            // pass `plan_failover`'s gate on a run with a latched provider failure and fork a
+            // successor into the checkout it is being killed to give away. `external_stop`
+            // reads it too.
+            live.stopping = true;
         }
     }
 
@@ -6904,8 +7574,9 @@ impl AgentRegistry {
     /// does once worktrees went per-task) and cide quitting. So on a project run through the
     /// claude harness every finished task left a gray `Idle` row and a live process behind it,
     /// under its role, for the rest of the session: selfcraft had fourteen at once, their tasks
-    /// integrated and closed. opencode, mimo and codex never showed it, because each of their
-    /// turns is a child that exits.
+    /// integrated and closed. opencode and mimo never showed it, because each of their turns is
+    /// a child that exits; codex did once it became a console harness, whose child stays at its
+    /// prompt as claude's does (terrastrike's t-1249, M114).
     ///
     /// `done` and not `review`, deliberately: a task in review may be sent back, and the idle
     /// child is exactly what a send-back is typed into, with its whole context still loaded.
@@ -6956,7 +7627,7 @@ impl AgentRegistry {
         for session in self.plan_retire(project, |task| done.contains(task), &shown) {
             if let Some(pty) = sessions.get(session) {
                 tracing::info!(%session, "ending an idle run whose task is done");
-                pty.kill();
+                end_tree(&pty, "a retired run");
             }
         }
     }
@@ -7120,7 +7791,7 @@ impl AgentRegistry {
         if let (Some(session), Some(sessions)) = (session, app.try_state::<SessionRegistry>())
             && let Some(pty) = sessions.get(session)
         {
-            pty.kill();
+            end_tree(&pty, "a stopped run");
         }
     }
 
@@ -7293,7 +7964,7 @@ fn start_child(
                         // *already* ended. That was merely odd while the sentence meant nothing
                         // in particular; it is a lie now that it means **nobody asked**.
                         registry.mark_reclaimed(idle);
-                        pty.kill();
+                        end_tree(&pty, "a run whose worktree was reclaimed");
                     }
                 }
             }
@@ -7325,6 +7996,28 @@ fn start_child(
     // function on the same path, so the verify of this branch sees these very directories.
     let isolated = if in_worktree {
         project.config.agents.isolated_env(&cwd)
+    } else {
+        Vec::new()
+    };
+
+    // The git metadata a commit in this checkout writes, outside the checkout (M118). Only for a
+    // run in a checkout of its own — the root's `.git` is the user's, and a run standing there is
+    // told not to commit. A repository that will not open leaves the list empty: the run still
+    // starts, and the codex harness's sandbox caveat says it will not be able to commit.
+    let git_dirs = if in_worktree {
+        match cide_git::worktree::git_dirs(&cwd) {
+            Ok(dirs) => {
+                let mut paths = vec![dirs.git_dir];
+                if !paths.contains(&dirs.common_dir) {
+                    paths.push(dirs.common_dir);
+                }
+                paths
+            }
+            Err(error) => {
+                tracing::warn!(checkout = %cwd.display(), %error, "could not resolve a worktree's git directories; a sandboxed run will not be able to commit");
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -7419,24 +8112,94 @@ fn start_child(
         // what it is told. See `RunPlan::tracker_paragraphs`.
         tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work(_)),
         server: None,
+        git_dirs,
+        // Both decided just below, once the plan's policy can be read. (M119)
+        sandbox_brief: None,
+        codex_trust_root: None,
     };
     // An opencode-shaped run works behind a server of its own, so a pane can attach the full TUI
     // to the conversation while it runs (M104 follow-up). Started — or found alive from an earlier
     // turn — before the turn's child, which is a client of it.
+    // What codex's sandbox will deny this run, from the plan it is about to be given (M118). The
+    // roster says the same for a role that names a mode; this is the only place that also sees a
+    // wrapper deciding the sandbox and a repository whose git directories would not resolve.
+    let caveat = (resolved.harness == Harness::Codex)
+        .then(|| {
+            cide_agents::harness::codex::sandbox_caveat(
+                plan.agent.permission_mode.as_deref(),
+                plan.unattended,
+                in_worktree,
+                !plan.git_dirs.is_empty(),
+                plan.codex.cli.inject.permissions,
+                &plan.agent.sandbox,
+            )
+        })
+        .flatten();
+    if let Some(caveat) = caveat {
+        tracing::info!(run = %admission.run, "codex sandbox: {caveat}");
+    }
     let mut plan = plan;
+    // The role's `allow-commands`, where codex reads them: the worktree's own project layer,
+    // written (or withdrawn) at every spawn so the file is always the role as it stands now, and
+    // the main repository's root marked trusted for this run, which is where codex looks for a
+    // linked worktree's trust (M119, measured on 0.157.1: an allowed command ran unsandboxed and
+    // the same one without the file got EPERM). A worktree run only — in the project root the
+    // file would be the user's own codex's rules too. The common directory is the last git dir,
+    // and its parent is the root.
+    let rules_written = resolved.harness == Harness::Codex
+        && in_worktree
+        && {
+            let common = plan.git_dirs.last().cloned();
+            match cide_agents::sandbox::write_codex_rules(
+                &plan.cwd,
+                common.as_deref(),
+                &plan.agent.sandbox.allow_commands,
+            ) {
+                Ok(written) => {
+                    if written {
+                        plan.codex_trust_root = common
+                            .as_deref()
+                            .and_then(std::path::Path::parent)
+                            .map(std::path::Path::to_path_buf);
+                    }
+                    written
+                }
+                Err(error) => {
+                    tracing::warn!(run = %admission.run, %error, "could not write the role's allowed commands for codex; they will prompt or stay sandboxed");
+                    false
+                }
+            }
+        };
+    if resolved.harness == Harness::Codex {
+        plan.sandbox_brief = cide_agents::harness::codex::sandbox_brief(
+            plan.agent.permission_mode.as_deref(),
+            plan.unattended,
+            in_worktree,
+            !plan.git_dirs.is_empty(),
+            plan.codex.cli.inject.permissions,
+            &plan.agent.sandbox,
+            rules_written,
+        );
+    }
     if let Some(flavor) = cide_agents::harness::opencode::Flavor::of(resolved.harness) {
         // Asked of the installed binary before the first spec is built (M108): which of cide's
         // flags it has. Forks once per binary version, here on the blocking pool, so the spec
         // below reads the answer without forking. See `CliFlags`.
         let flags = flavor.probe_cli_flags();
-        plan.server = if flags.run_password {
+        // `can_attach`, not `run_password`: the question is whether a turn of this CLI can be a
+        // client of a **guarded** server, and opencode 2 answers yes by a different route — the
+        // password in the environment beside `run --server <url>` — having removed the flag.
+        // Keyed on the flag alone, every 2.x machine would silently lose the live TUI a pane
+        // attaches to, and would log a sentence that is true about `--password` and wrong about
+        // the CLI. (M110)
+        plan.server = if flags.can_attach() {
             registry.ensure_server(admission.run, flavor, &plan)
         } else {
-            // A CLI whose `run` cannot send a password could only use an unguarded server. It
-            // runs standalone, as before M105 — the full TUI on a live run is what it gives up.
+            // A CLI whose `run` can send no password at all could only use an unguarded server.
+            // It runs standalone, as before M105 — the full TUI on a live run is what it gives up.
             tracing::info!(
                 run = %admission.run,
-                "this {} predates --password; the run goes without a server",
+                "this {} cannot authenticate to a run server; the run goes without one",
                 flavor.program()
             );
             None
@@ -7562,8 +8325,18 @@ fn start_child(
         RUN_LOG_CAP,
     )
     .append(&format!(
-        "# cide forked: {}",
-        argv_line(&spec.program, &spec.args)
+        "# cide forked: {}{}",
+        argv_line(&spec.program, &spec.args),
+        // Which binary a bare name resolves to, with cide's own PATH — the question a machine
+        // with two installs of one CLI turns on, and one a desktop launcher's PATH answers
+        // differently from a terminal's. (M108)
+        match std::path::Path::new(&spec.program).components().count() {
+            1 => cide_core::toolchain::which(&spec.program).map_or_else(
+                || format!("\n# {} is not on cide's PATH", spec.program),
+                |path| format!("\n# {} resolves to {}", spec.program, path.display()),
+            ),
+            _ => String::new(),
+        }
     ));
     let pty = PtySession::spawn(spec).map_err(|error| CoreError::Io(error.to_string()))?;
 
@@ -7572,6 +8345,7 @@ fn start_child(
         opening,
         cwd,
         events,
+        caveat,
     })
 }
 
@@ -7605,29 +8379,61 @@ struct LiveServer {
 /// less than its first model call does.
 const SERVER_READY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Whether a server at `port` answers its health route with this password. One blocking HTTP/1.1
-/// request by hand: the route is a fixed string and a whole client crate is not worth one probe.
+/// Whether a server at `port` is **up**: one blocking HTTP/1.1 request by hand, because the route
+/// is a fixed string and a whole client crate is not worth one probe.
+///
+/// On opencode 1 this proves the server is cide's as well, because `/global/health` is guarded
+/// there. **On opencode 2 it does not** — measured on 2.0.16, a fresh `serve` answers that route
+/// `200` with no credential at all, and so does the machine-wide background service. So this is
+/// readiness only from M110 on, and [`server_owned`] is what proves the server on a recycled port
+/// is the one cide just started rather than a stranger's opencode that happens to be listening.
 fn server_healthy(port: u16, user: &str, password: &str) -> bool {
+    http_status(port, Some((user, password)), "/global/health") == Some(200)
+}
+
+/// Whether the server at `port` is guarded by **this** password. (M110)
+///
+/// Measured on 2.0.16 against a real `serve`: `/openapi.json` answers `401` unauthenticated,
+/// `401` with the wrong password and `200` with the right one, while `/global/health` answers
+/// `200` to all three. Both halves are asserted, so a build that stops guarding this route too is
+/// a refusal here rather than a server cide wrongly believes is its own.
+fn server_owned(port: u16, user: &str, password: &str) -> bool {
+    http_status(port, Some((user, password)), "/openapi.json") == Some(200)
+        && http_status(port, None, "/openapi.json") == Some(401)
+}
+
+/// One hand-rolled HTTP/1.1 `GET`, and the status it answered.
+fn http_status(port: u16, auth: Option<(&str, &str)>, path: &str) -> Option<u16> {
     use std::io::{Read as _, Write as _};
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         std::time::Duration::from_millis(300),
     ) else {
-        return false;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(800)));
-    let auth = basic_auth(user, password);
+    let credential = match auth {
+        Some((user, password)) => {
+            format!("Authorization: Basic {}\r\n", basic_auth(user, password))
+        }
+        None => String::new(),
+    };
     let request = format!(
-        "GET /global/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Basic {auth}\r\n\
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{credential}\
          Connection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+        return None;
     }
     let mut head = [0u8; 16];
     let read = stream.read(&mut head).unwrap_or(0);
     // `HTTP/1.1 200 OK`: the status is the second word.
-    std::str::from_utf8(&head[..read]).is_ok_and(|line| line.split(' ').nth(1) == Some("200"))
+    std::str::from_utf8(&head[..read])
+        .ok()?
+        .split(' ')
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// RFC 7617's credential, `base64(user:password)`, without a crate for eleven lines.
@@ -7810,6 +8616,13 @@ pub(crate) fn retire_worktree(
         .name("cide-retire-worktree".into())
         .spawn(move || {
             let dir = cide_git::worktree::path_of(&root, &name);
+            // No run holds this checkout any more, so anything adopted by init or the user
+            // manager that still stands in it is what a run left behind — a command codex
+            // abandoned at its own tool timeout, or a whole sandbox whose codex crashed, which
+            // `end_tree`'s snapshot never saw. Before the pane check, which asks about live
+            // panes only and would not count them, and before the removal, which would leave
+            // them running in a deleted directory (selfcraft's Blender workers). (M119)
+            end_leftovers_in(&dir);
             if a_pane_stands_in(&app, &dir) {
                 tracing::info!(checkout = %name, "a pane is standing in this worktree; keeping it");
                 return;
@@ -7832,6 +8645,20 @@ pub(crate) fn retire_worktree(
         });
     if let Err(error) = spawned {
         tracing::warn!(%error, "could not start the worktree retirement thread");
+    }
+}
+
+/// End what runs left running in one worktree: `cide_core::process_tree::end_orphans_in`, asked
+/// about the directory as `/proc` spells it. (M119)
+///
+/// Only ever a worktree. A project root is where the user's own processes stand, and one of
+/// theirs that was adopted — a `nohup`ed build — is not a run's leftover. In a worktree it is,
+/// or near enough: the directory is about to be removed under it either way.
+pub(crate) fn end_leftovers_in(dir: &std::path::Path) {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let ended = cide_core::process_tree::end_orphans_in(&dir);
+    if ended > 0 {
+        tracing::info!(ended, dir = %dir.display(), "ended processes a run left in its worktree");
     }
 }
 
@@ -8303,6 +9130,47 @@ impl Coalescer {
 mod tests {
     use super::*;
 
+    /// A park is ended only while it is the same park, with no stop under way and nobody
+    /// looking — a person with the run open answers the prompt themselves. (M118)
+    #[test]
+    fn interrupted_runs_resume_at_launch_only_where_subagents_are_on() {
+        let mut config = cide_agents::config::AgentsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(resumes_at_launch(&config));
+        config.resume_after_restart = false;
+        assert!(!resumes_at_launch(&config));
+        config.resume_after_restart = true;
+        config.enabled = false;
+        assert!(
+            !resumes_at_launch(&config),
+            "a project with subagents off starts nothing"
+        );
+    }
+
+    #[test]
+    fn a_task_run_parked_on_a_prompt_nobody_can_answer_is_due_to_end() {
+        let parked = RunState::AwaitingPermission;
+        assert!(park_due(&parked, Some(10), 10, false, false));
+        assert!(
+            !park_due(&parked, Some(20), 10, false, false),
+            "a later park"
+        );
+        assert!(
+            !park_due(&RunState::Running, None, 10, false, false),
+            "answered"
+        );
+        assert!(
+            !park_due(&parked, Some(10), 10, true, false),
+            "already stopping"
+        );
+        assert!(
+            !park_due(&parked, Some(10), 10, false, true),
+            "open in a pane"
+        );
+    }
+
     use cide_pty::SpawnSpec;
 
     /// One dispatch's choices (M104): external work names its checkout like a task does, and a
@@ -8723,6 +9591,10 @@ mod tests {
         assert!(entries[1].bench.is_none());
         assert_eq!(entries[1].running, 2, "both runs stand on entry 1");
         assert_eq!(entries[0].provider, cide_ipc::PoolProviderState::Missing);
+        // Each landing counted once: the first run's admission onto entry 0, then its failover
+        // and the second run's admission onto entry 1.
+        assert_eq!(entries[0].stats.started, 1);
+        assert_eq!(entries[1].stats.started, 2);
         // Newest first: the second run's start, the first run's failover start, its refusal, and
         // the first run's own start.
         assert!(matches!(
@@ -8804,6 +9676,52 @@ mod tests {
         });
         registry.take_admissions();
         assert_eq!(index_of(&registry, second), 0);
+    }
+
+    /// t-1090: an entry whose configuration is wrong — here a model the provider does not have —
+    /// moves the run on to the next entry **and** queues a notification naming the entry and the
+    /// provider's own sentence. A transient refusal moves the run on silently.
+    #[test]
+    fn a_configuration_refusal_moves_on_and_says_which_entry() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let pool = limited_pool(&[None, None]);
+        let run = registry.enqueue(pooled_spec(project, &pool));
+        registry.take_admissions();
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry.inner.lock().runs.get_mut(&run).unwrap().state = RunState::Running;
+        registry.note_provider_failure_with(
+            run,
+            cide_agents::FailoverReason::Rejected,
+            Some("Model not found: o3/no-such".into()),
+        );
+        assert!(matches!(
+            registry.plan_failover_or_wait(session, 1),
+            Some(FailoverPlan::Fork(_))
+        ));
+        let notices = registry.take_pool_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let (to, text) = &notices[0];
+        assert_eq!(*to, project);
+        assert!(text.contains("entry 1"), "{text}");
+        assert!(text.contains(&pool[0].model_flag()), "{text}");
+        assert!(
+            text.contains("rejected the request: Model not found: o3/no-such"),
+            "{text}"
+        );
+        assert!(registry.take_pool_notices().is_empty(), "delivered once");
+
+        // A server that is down fixes itself: the run still moves on, and nobody is notified.
+        let registry = AgentRegistry::default();
+        let (_, plan) = refuse_a_pooled_run(
+            &registry,
+            project,
+            &pool,
+            cide_agents::FailoverReason::Unreachable,
+        );
+        assert!(matches!(plan, Some(FailoverPlan::Fork(_))));
+        assert!(registry.take_pool_notices().is_empty());
     }
 
     /// A bench is on the *target*, so a second pool naming the same server steers around it too.
@@ -8970,6 +9888,7 @@ mod tests {
                 cache_read: 1_000,
                 cache_write: 64,
             },
+            None,
         );
 
         let info = registry
@@ -9004,6 +9923,130 @@ mod tests {
 
         // A session no run stands on is the ordinary case — every shell pane in the application.
         assert!(registry.log_run_info(SessionId::new()).is_none());
+    }
+
+    /// A pooled run's steps are charged to the target it is on: one request each, their tokens
+    /// summed, and a speed only for a step whose start was seen on the same CLI session — a nested
+    /// subagent's step interleaved with the parent's is timed from its own start. (pool stats)
+    #[test]
+    fn a_pooled_step_is_charged_to_its_target_with_its_speed() {
+        let registry = AgentRegistry::default();
+        let (_project, run, _session) = run_on_a_pool(&registry, 2);
+        let spent = |output, reasoning| cide_ipc::TokenUsage {
+            input: 1_000,
+            output,
+            reasoning,
+            cache_read: 500,
+            cache_write: 0,
+        };
+        // Parent starts at 0, a subagent at 1 000; the subagent finishes first.
+        registry.note_step_start(run, "ses_parent".into(), 0);
+        registry.note_step_start(run, "ses_child".into(), 1_000);
+        registry.note_usage(run, spent(100, 0), Some(("ses_child".into(), 2_000)));
+        registry.note_usage(run, spent(300, 100), Some(("ses_parent".into(), 4_000)));
+        // A finish whose start was never seen still counts as a request, untimed.
+        registry.note_usage(run, spent(50, 0), Some(("ses_unseen".into(), 9_000)));
+
+        let pool: Vec<cide_ipc::PoolEntry> = (0..2)
+            .map(|i| pool_entry("openrouter", &format!("model-{i}")))
+            .collect();
+        let report = registry.pool_state(&cide_ipc::LlmSettings {
+            providers: Vec::new(),
+            pools: vec![cide_ipc::ModelPool {
+                name: "default".into(),
+                description: String::new(),
+                entries: pool,
+            }],
+        });
+        let stats = report.pools[0].entries[0].stats;
+        assert_eq!(stats.requests, 3);
+        assert_eq!(stats.input, 3_000);
+        assert_eq!(stats.cache_read, 1_500);
+        assert_eq!(stats.output, 450);
+        assert_eq!(stats.reasoning, 100);
+        // 100 tokens in 1 s and 400 in 4 s: both 100/s, so the weighted average is too.
+        assert_eq!((stats.rated_tokens, stats.rated_ms), (500, 5_000));
+        assert_eq!(
+            stats.fastest,
+            Some(cide_ipc::PoolStepRate {
+                tokens: 100,
+                ms: 1_000
+            }),
+            "a tie keeps the first"
+        );
+        assert_eq!(
+            stats.slowest,
+            Some(cide_ipc::PoolStepRate {
+                tokens: 100,
+                ms: 1_000
+            })
+        );
+        // Response time over the two timed requests: 1 s and 4 s; the unseen one is untimed.
+        assert_eq!((stats.timed, stats.timed_ms), (2, 5_000));
+        assert_eq!(
+            (stats.quickest_ms, stats.longest_ms),
+            (Some(1_000), Some(4_000))
+        );
+        assert_eq!(
+            report.pools[0].entries[1].stats.requests, 0,
+            "entry 2 did nothing"
+        );
+    }
+
+    /// A run whose role names a pool's model without naming the pool is still that model's
+    /// work: its requests land on the entry with the same target, and a claude run's never do.
+    /// The first report of the stats was a pool reading idle on every entry while an off-pool
+    /// run worked on entry 5. (pool stats)
+    #[test]
+    fn an_off_pool_run_is_charged_to_the_entry_naming_its_model() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let off = registry.enqueue(pooled_spec(project, &[]));
+        let claude = registry.enqueue(spec(project, "claude-role", 8, 8));
+        registry.take_admissions();
+        {
+            let mut inner = registry.inner.lock();
+            inner.runs.get_mut(&off).expect("the run").forked_with =
+                Some(forked_on(Harness::Opencode, "k3s/qwen-36-27b-fp8"));
+            inner.runs.get_mut(&claude).expect("the run").forked_with =
+                Some(forked_on(Harness::Claude, "k3s/qwen-36-27b-fp8"));
+        }
+        let spent = cide_ipc::TokenUsage {
+            input: 2_000,
+            output: 200,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        for run in [off, claude] {
+            registry.note_step_start(run, "ses".into(), 0);
+            registry.note_usage(run, spent, Some(("ses".into(), 2_000)));
+        }
+        let report = registry.pool_state(&cide_ipc::LlmSettings {
+            providers: Vec::new(),
+            pools: vec![cide_ipc::ModelPool {
+                name: "default".into(),
+                description: String::new(),
+                entries: vec![
+                    pool_entry("openrouter", "model-0"),
+                    pool_entry("k3s", "qwen-36-27b-fp8"),
+                ],
+            }],
+        });
+        let entries = &report.pools[0].entries;
+        assert_eq!(entries[0].stats.requests, 0);
+        let stats = entries[1].stats;
+        assert_eq!(
+            stats.requests, 1,
+            "the opencode run's step, and not the claude run's"
+        );
+        assert_eq!((stats.input, stats.output), (2_000, 200));
+        assert_eq!((stats.timed, stats.timed_ms), (1, 2_000));
+        assert_eq!(
+            entries[1].running, 0,
+            "the load still counts pooled runs only"
+        );
+        assert_eq!(report.off_pool.len(), 1);
     }
 
     /// With no pool, the model is what the child was forked with, and a custom provider's own
@@ -11943,6 +12986,166 @@ mod tests {
     }
 
     // ======================================================================================
+    // A child somebody else stopped: an OS shutdown, a logout, a `kill -TERM`.
+    // ======================================================================================
+
+    /// **An OS shutdown's SIGTERM, through the real reaper.** systemd signals the whole cgroup,
+    /// so the child dies before cide's own teardown has sealed anything; it used to be recorded
+    /// `Finished { 143 }` and restored as history. It is an interruption: the slot comes back,
+    /// the row keeps its session, and nothing is reported as an ending.
+    #[test]
+    fn a_child_sigtermed_from_outside_is_interrupted_not_finished() {
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        let queued = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry.set_state(None, run, RunState::Running);
+
+        let pty = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("kill -TERM $$"),
+        )
+        .expect("spawn sh");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ended = tx.clone();
+        registry.watch_exit_with(
+            session,
+            &pty,
+            move |_, _| {
+                let _ = ended.send("ended");
+            },
+            |_, _| {},
+            move |_, _| {
+                let _ = tx.send("interrupted");
+            },
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok("interrupted"),
+            "a SIGTERM from outside went down the ending road"
+        );
+        assert_eq!(state_of(&registry, run), RunState::Interrupted);
+        let (session_kept, note) = {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            (live.session, live.note.clone())
+        };
+        assert_eq!(session_kept, Some(session), "Resume needs the conversation");
+        assert!(note.is_some_and(|n| n.contains("outside cide")));
+        // The slot came back — this is not a shutdown, so the queue moves on.
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, queued);
+    }
+
+    /// The decision itself, over every case that must *not* be read as an outside stop, and the
+    /// two that must.
+    #[test]
+    fn only_a_stop_cide_did_not_make_is_an_interruption() {
+        // SIGTERM's code on a working run: interrupted.
+        let registry = AgentRegistry::default();
+        let (project, run, session) = run_on_a_pool(&registry, 1);
+        assert_eq!(registry.external_stop(session, 143), Some(project));
+        assert_eq!(state_of(&registry, run), RunState::Interrupted);
+        // And opencode's answer to the same SIGTERM.
+        let registry = AgentRegistry::default();
+        let (project, run, session) = run_on_a_pool(&registry, 1);
+        assert_eq!(registry.external_stop(session, 130), Some(project));
+        assert_eq!(state_of(&registry, run), RunState::Interrupted);
+
+        // cide's own kill is a SIGHUP, and an ordinary failure is an ending.
+        for code in [129, 1, 0, 137] {
+            let registry = AgentRegistry::default();
+            let (_, _, session) = run_on_a_pool(&registry, 1);
+            assert_eq!(registry.external_stop(session, code), None, "exit {code}");
+        }
+
+        // A stop cide is making itself, whatever the code.
+        let registry = AgentRegistry::default();
+        let (_, run, session) = run_on_a_pool(&registry, 1);
+        registry.inner.lock().runs.get_mut(&run).unwrap().stopping = true;
+        assert_eq!(registry.external_stop(session, 143), None);
+
+        // A reclaim is cide's own hand too, and now says so.
+        let registry = AgentRegistry::default();
+        let (_, run, session) = run_on_a_pool(&registry, 1);
+        registry.mark_reclaimed(session);
+        assert!(registry.inner.lock().runs[&run].stopping);
+        assert_eq!(registry.external_stop(session, 143), None);
+
+        // Going down: any exit at all is an interruption — a CLI that catches SIGTERM and
+        // exits 0 included — and nothing is admitted behind it.
+        let registry = AgentRegistry::default();
+        let (project, run, session) = run_on_a_pool(&registry, 1);
+        registry.enqueue(spec(project, "developer", 4, 4));
+        registry.begin_going_down();
+        assert_eq!(registry.external_stop(session, 0), Some(project));
+        assert_eq!(state_of(&registry, run), RunState::Interrupted);
+        assert!(
+            registry.take_admissions().is_empty(),
+            "a run was forked into the teardown"
+        );
+    }
+
+    /// Going down also refuses the failover a latched provider failure would otherwise fork —
+    /// the seal used to be the only refusal, and it comes too late for an OS shutdown.
+    #[test]
+    fn going_down_spends_no_candidate() {
+        let registry = AgentRegistry::default();
+        let (_, run, session) = run_on_a_pool(&registry, 3);
+        registry.begin_going_down();
+        registry.note_provider_failure(run, cide_agents::FailoverReason::Auth);
+        assert!(registry.plan_failover(session, 143).is_none());
+        assert_eq!(registry.inner.lock().runs[&run].pool_index, 0);
+    }
+
+    /// A snapshot that does not parse is moved aside rather than overwritten by the session's
+    /// first flush with an empty run list. (M117)
+    #[test]
+    fn an_unreadable_snapshot_is_quarantined() {
+        let dir = std::env::temp_dir().join(format!("cide-run-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+        std::fs::write(&path, b"{\"runs\": [").expect("plant");
+
+        let registry = Arc::new(AgentRegistry::default());
+        registry.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(dir.join("agent-runs.corrupt-1.json")).expect("moved aside"),
+            b"{\"runs\": ["
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the snapshot written after an outside stop brings the run back resumable.
+    #[test]
+    fn an_interrupted_run_is_restored_interrupted() {
+        let dir = std::env::temp_dir().join(format!("cide-run-external-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let registry = Arc::new(AgentRegistry::default());
+        let (_, run, session) = run_on_a_pool(&registry, 1);
+        registry.external_stop(session, 143).expect("interrupted");
+        registry.write_snapshot_to(&path);
+
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        assert_eq!(state_of(&after, run), RunState::Interrupted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ======================================================================================
     // The second harness: a run whose only channel is its own output.
     // ======================================================================================
 
@@ -12201,6 +13404,136 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Dispatching again continues. (M116)
+    // ------------------------------------------------------------------------------------------
+
+    /// One ended run of `developer` on `t-1`, in `state`, with `conversation` recorded the way
+    /// its harness records it and `reopenable` as given.
+    fn ended_on_task(
+        registry: &AgentRegistry,
+        project: ProjectId,
+        harness: Harness,
+        state: RunState,
+        started: u64,
+        reopenable: bool,
+    ) -> RunId {
+        let run = registry.enqueue(DispatchSpec {
+            harness,
+            task: Some(TaskId("t-1".into())),
+            ..spec(project, "developer", 4, 4)
+        });
+        let mut inner = registry.inner.lock();
+        let live = inner.runs.get_mut(&run).expect("the run");
+        live.state = state;
+        live.started_unix_ms = started;
+        live.reopenable = reopenable;
+        match harness {
+            Harness::Claude | Harness::Qwen => live.session = Some(SessionId::new()),
+            _ => live.harness_session = Some(format!("thread-{started}")),
+        }
+        run
+    }
+
+    /// The newest ended run whose conversation is on disk — not a live one, not one whose
+    /// transcript is gone, not another task's, not one whose first failure cleared its id.
+    #[test]
+    fn a_dispatch_continues_the_newest_ended_conversation_of_the_pair() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let task = TaskId("t-1".into());
+        let developer = AgentId("developer".into());
+        assert_eq!(registry.last_conversation(project, &developer, &task), None);
+
+        let old = ended_on_task(
+            &registry,
+            project,
+            Harness::Codex,
+            RunState::Finished { code: 0 },
+            10,
+            true,
+        );
+        let newer = ended_on_task(
+            &registry,
+            project,
+            Harness::Codex,
+            RunState::Failed { reason: "x".into() },
+            20,
+            true,
+        );
+        let _gone = ended_on_task(
+            &registry,
+            project,
+            Harness::Codex,
+            RunState::Finished { code: 0 },
+            30,
+            false,
+        );
+        let _live = ended_on_task(&registry, project, Harness::Codex, RunState::Idle, 40, true);
+        let found = registry.last_conversation(project, &developer, &task);
+        assert_eq!(
+            found,
+            Some((newer, Harness::Codex, "thread-20".into())),
+            "old was {old}"
+        );
+
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&newer)
+            .expect("the run")
+            .harness_session = None;
+        assert_eq!(
+            registry
+                .last_conversation(project, &developer, &task)
+                .map(|(run, ..)| run),
+            Some(old),
+            "a run whose id was cleared has nothing to continue"
+        );
+        assert_eq!(
+            registry.last_conversation(project, &developer, &TaskId("t-2".into())),
+            None
+        );
+    }
+
+    /// The pane that hands work back is the one told when it comes back.
+    #[test]
+    fn a_run_told_something_reports_to_whoever_told_it() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 4, 4));
+        let pane = SessionId::new();
+        registry.renotify(run, RunNotify::Session { session: pane });
+        assert_eq!(
+            registry.inner.lock().runs[&run].notify,
+            RunNotify::Session { session: pane }
+        );
+    }
+
+    /// One line, the task named, the tool spelled the harness's way, the instructions last.
+    #[test]
+    fn a_handed_back_run_is_told_it_is_continuing_and_what_is_wrong() {
+        let task = TaskId("t-7".into());
+        let line = handed_back_prompt(
+            &task,
+            Some("Lakes\npart 1"),
+            Harness::Opencode,
+            Some("fix\nthe legend"),
+        );
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("handed back to you"), "{line}");
+        assert!(line.contains("t-7 (Lakes part 1)"), "{line}");
+        assert!(
+            line.contains("cide_cide_task_get"),
+            "opencode's spelling: {line}"
+        );
+        assert!(line.ends_with("What to do now: fix the legend"), "{line}");
+        let claude = handed_back_prompt(&task, None, Harness::Claude, None);
+        assert!(claude.contains("mcp__cide__cide_task_get"), "{claude}");
+        assert!(!claude.contains("What to do now"), "{claude}");
+    }
+
     /// **A run with no hooks moves on its own output, and the queue moves on its exit.**
     ///
     /// The whole liveness story for the second harness, against a real child and the real state
@@ -12337,6 +13670,47 @@ mod tests {
         // And nothing listening is simply not healthy, quickly.
         let dead = free_port().expect("a port");
         assert!(!server_healthy(dead, "opencode", "right"));
+    }
+
+    /// opencode 2 made `/global/health` **public**, so being up stopped meaning "and it is mine".
+    /// `server_owned` is what still means it, on the route 2.0 does guard. (M110)
+    ///
+    /// The failure this pins is the quiet one: a port cide was just told is free can be taken by a
+    /// stranger's opencode — the machine-wide background service among them — between the check
+    /// and the bind, and a run that accepted it would put its turns into somebody else's
+    /// conversation while reporting success.
+    #[test]
+    fn a_two_point_oh_server_is_ours_only_when_the_guarded_route_says_so() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let expected = format!("Authorization: Basic {}", basic_auth("opencode", "right"));
+        // A server that behaves as 2.0.16 does, measured: health open to all, openapi guarded.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                // The health route is open to anyone; every other route wants the credential.
+                let open = request.starts_with("GET /global/health ");
+                let status = match open || request.contains(&expected) {
+                    true => "200 OK",
+                    false => "401 Unauthorized",
+                };
+                let _ = stream.write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes());
+            }
+        });
+        // Up — and on 2.0 that is all this says, for anybody with or without a password.
+        assert!(server_healthy(port, "opencode", "right"));
+        assert!(server_healthy(port, "opencode", "wrong"));
+        // Ours: the guarded route answers us and refuses an anonymous caller. Both halves, so a
+        // build that stops guarding it is a refusal here rather than a false yes.
+        assert!(server_owned(port, "opencode", "right"));
+        assert!(!server_owned(port, "opencode", "wrong"));
+        assert!(!server_owned(port, "mimocode", "right"));
+        let dead = free_port().expect("a port");
+        assert!(!server_owned(dead, "opencode", "right"));
     }
 
     /// A run's server outlives the run's turn while a pane is attached, and goes when the last
@@ -12493,7 +13867,7 @@ mod tests {
         let session = SessionId::new();
         registry.bind_session(run, session);
         let cwd = cide_git::worktree::path_of(&root, "developer-t-1");
-        registry.note_cwd(run, &cwd);
+        registry.note_cwd(run, &cwd, None);
 
         let pty = PtySession::spawn(
             SpawnSpec::new("/bin/sh", std::env::temp_dir())

@@ -64,4 +64,11 @@ harness?: Harness,
 /**
  * And this model, for this run only. Passed through as the harness's `--model`. (M104)
  */
-model?: string, };
+model?: string, 
+/**
+ * Start a new context rather than continue the role's own conversation on this task.
+ * (M116) Without it a dispatch onto a (role, task) that has been worked before continues it:
+ * its instructions go into the run still holding the pair, or a new run resumes the last
+ * ended one's conversation. `false`, and absent from older clients, is the default.
+ */
+fresh?: boolean, };

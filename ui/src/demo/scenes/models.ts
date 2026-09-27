@@ -14,7 +14,7 @@ export const models: Scene = {
     const host = pane('editor', 'settings')
     world.open(tab({ kind: 'settings', section: 'models' }, leaf(host.id), [host]))
     handlers.set('agents_models', (a: Args): AgentModels =>
-      a['harness'] === 'opencode' ? OPENCODE_MODELS : { harness: 'claude', models: ['opus', 'sonnet', 'haiku'], problem: null })
+      a['harness'] === 'opencode' ? OPENCODE_MODELS : { harness: 'claude', models: ['opus', 'sonnet', 'haiku'], problem: null, variantInModel: false })
     handlers.set('llm_probe_limits', (a: Args): LlmLimitsProbe =>
       ({ provider: String(a['provider']), model: String(a['model']), context: 262144, output: 32768, outputEstimated: false, detail: 'read from /v1/models' }))
     handlers.set('llm_test_model', (a: Args): LlmModelTest =>

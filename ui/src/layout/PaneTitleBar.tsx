@@ -195,6 +195,21 @@ export interface PaneFrameProps {
    * keyboard's four `pane.move.*` rows carry the same gesture into the palette.
    */
   onMove?: ((outcome: MoveOutcome) => void) | undefined
+  /**
+   * Draw no pane controls in the corner — a **file** tab's pane.
+   *
+   * Asked for by name: on an open file the cluster only repeated the header's split and detach
+   * and the tab strip's ×, and it floated over the top line of the code the user was reading.
+   * A file tab is one pane in a tab of its own, so the header's buttons (which `App.tsx` routes
+   * through the same `clusterPlan` rule) aim at exactly this pane anyway.
+   *
+   * Only the hover cluster goes. The right-click menu keeps every row, so the gestures stay
+   * reachable on the pane itself, and the awaiting marker stays — though an editor never
+   * awaits. **Ignored in a detached-pane window**: there the cluster carries the window's own
+   * minimize/zoom/close, and a window with no decorations (ADR 0006) and no close button is a
+   * window the user cannot close.
+   */
+  bare?: boolean | undefined
 }
 
 export function PaneFrame({
@@ -212,6 +227,7 @@ export function PaneFrame({
   onClose,
   tabScoped,
   onMove,
+  bare,
 }: PaneFrameProps): ReactNode {
   // Withheld once this pane is already the focused one. `onFocus` is an IPC round trip
   // that re-reads the tree and re-renders every pane in the tab, and a click inside a
@@ -225,6 +241,8 @@ export function PaneFrame({
 
   const awaiting = useAwaiting(session)
   const detachedWindow = useMemo(inDetachedPaneWindow, [])
+  // See `bare` on the props: never in a detached window, whose cluster is its window controls.
+  const noControls = bare === true && !detachedWindow
   const clusterRef = useRef<HTMLDivElement>(null)
   const addTileRef = useRef<HTMLButtonElement>(null)
 
@@ -606,6 +624,9 @@ export function PaneFrame({
       // edge — an editor's 96px minimap, today the only one. A CSS hook rather than a prop:
       // the inset belongs to the frame, and a pane body cannot reach its own frame.
       data-kind={pane.kind}
+      // No cluster drawn, so the stylesheet stops reserving its width (`--pane-corner: 0`) for
+      // whatever else sits in this corner — the conflict bar, the markdown view switch.
+      data-bare={noControls ? 'true' : undefined}
       data-pane-id={pane.id}
       data-focused={focused ? 'true' : 'false'}
       /*
@@ -683,6 +704,10 @@ export function PaneFrame({
           if (event.button === 0) event.preventDefault()
         }}
       >
+        {/* A file tab's pane draws none of it — `bare` on the props says why. Not rendered
+            rather than hidden: an invisible button still takes Tab and still answers
+            `:focus-within`, which would light the whole cluster back up from the keyboard. */}
+        {!noControls && (
         <span className={revealed}>
           {/*
              * No index and no title here any more.
@@ -894,6 +919,7 @@ export function PaneFrame({
             )}
           </span>
         </span>
+        )}
 
         {/*
          * Outside the reveal, and last in the row, so it keeps the corner and never hides:

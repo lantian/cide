@@ -124,12 +124,17 @@ impl WorkspaceState {
             .name("cide-workspace".into())
             .spawn(move || {
                 loop {
-                    thread::sleep(POLL);
                     // `try_state` rather than `state`: the handle outlives nothing here, but a
                     // panic on a teardown race would be a panic in a thread nobody joins, for
                     // a write the shutdown is about to make anyway.
-                    if let Some(state) = app.try_state::<Self>() {
-                        state.flush_if_due();
+                    match app.try_state::<Self>() {
+                        // Parked on the debouncer rather than asleep, so an urgent change is
+                        // written the moment it lands rather than at the next poll.
+                        Some(state) => {
+                            state.debounce.wait(POLL);
+                            state.flush_if_due();
+                        }
+                        None => thread::sleep(POLL),
                     }
                 }
             })
@@ -185,8 +190,39 @@ impl WorkspaceState {
     /// `rev` has the bump applied here, which is what makes the module doc's "cannot be
     /// forgotten at a call site" true rather than aspirational: every broadcast carries a
     /// strictly newer `rev`, so the frontend can drop non-newer snapshots as duplicates.
+    ///
+    /// # Written now, or after the debounce
+    ///
+    /// This is the **urgent** kind: the flusher is woken and the change is on disk within one
+    /// write, milliseconds. It is the default because almost everything in this tree is
+    /// something the next launch needs — a tab, a split, a pane's conversation, a setting, a
+    /// project — and a power cut inside the old 500 ms debounce lost exactly the change the
+    /// user had just made. [`Self::update_cosmetic`] is the exception, and it has to be asked
+    /// for by name.
     pub fn update<T>(
         &self,
+        f: impl FnOnce(&mut Workspace) -> cide_core::Result<T>,
+    ) -> cide_core::Result<T> {
+        self.apply(true, f)
+    }
+
+    /// [`Self::update`] for a change that happens often and that the next launch can do
+    /// without: which pane or tab has focus, where a splitter sits, which tool window is
+    /// showing, a tab's dirty dot (cleared on every load anyway). Written after the debounce,
+    /// as everything used to be — a click-by-click fsync buys nothing a restart would show.
+    ///
+    /// A mutation that is *sometimes* structural stays on [`Self::update`]: the cost of an
+    /// unneeded write is a millisecond, and the cost of the other mistake is the change.
+    pub fn update_cosmetic<T>(
+        &self,
+        f: impl FnOnce(&mut Workspace) -> cide_core::Result<T>,
+    ) -> cide_core::Result<T> {
+        self.apply(false, f)
+    }
+
+    fn apply<T>(
+        &self,
+        urgent: bool,
         f: impl FnOnce(&mut Workspace) -> cide_core::Result<T>,
     ) -> cide_core::Result<T> {
         let mut guard = self.inner.lock();
@@ -240,7 +276,11 @@ impl WorkspaceState {
             guard.rev += 1;
         }
 
-        self.debounce.note_change();
+        if urgent {
+            self.debounce.note_urgent();
+        } else {
+            self.debounce.note_change();
+        }
 
         // Broadcast while still holding the lock, so two concurrent mutations cannot emit
         // their snapshots in the opposite order to the one they were applied in. The clone
@@ -305,8 +345,13 @@ impl WorkspaceState {
                     // Refusing the write is the point: the file is the only copy of whatever
                     // this build could not read, and a layout change the user made this session
                     // is the smaller loss — it is still in memory, and the next flush retries.
+                    // Re-armed, or "the next flush" would be the next unrelated mutation —
+                    // `Debouncer::take` cleared the burst before this write began. Debounced
+                    // rather than urgent, so a copy that keeps failing is retried at the
+                    // debounce's pace and not in a loop.
                     Err(error) => {
                         tracing::error!(path = %self.path.display(), %error, "could not back up the workspace; not overwriting it");
+                        self.debounce.note_change();
                         return;
                     }
                 }
@@ -315,6 +360,9 @@ impl WorkspaceState {
         let workspace = self.inner.lock().clone();
         if let Err(error) = persist::save_atomic(&self.path, &workspace) {
             tracing::error!(path = %self.path.display(), %error, "failed to save the workspace");
+            // Owed again — see the backup arm above. Without it a save that failed (a full
+            // disk, a transient EIO) stayed unwritten until some unrelated change came along.
+            self.debounce.note_change();
         }
     }
 }
@@ -348,19 +396,20 @@ mod tests {
 
     /// **The debounce is only a debounce if something drains it.** (M73)
     ///
-    /// The behavioural half of `start_flusher`'s argument: a mutation is not on the disk
-    /// immediately, is on it once the debounce has elapsed and a flush is asked for, and a
-    /// second flush with nothing new does not rewrite the file. Until M73 the middle step had
-    /// no caller in the whole binary, so every line of this was true and none of it ever ran.
+    /// The behavioural half of `start_flusher`'s argument, for the cosmetic kind (M117): a
+    /// mutation is not on the disk immediately, is on it once the debounce has elapsed and a
+    /// flush is asked for, and a second flush with nothing new does not rewrite the file. Until
+    /// M73 the middle step had no caller in the whole binary, so every line of this was true and
+    /// none of it ever ran.
     #[test]
-    fn a_mutation_reaches_the_disk_on_the_debounce_and_not_before() {
+    fn a_cosmetic_mutation_reaches_the_disk_on_the_debounce_and_not_before() {
         let mut s = state();
         // Its own file: every other test here shares one path and writes to none of it, and a
         // test that asserts on mtimes must not be readable by another test's `remove_file`.
         s.path = std::env::temp_dir().join("cide-workspace-flush-test.json");
         let _ = std::fs::remove_file(&s.path);
 
-        s.update(|ws| {
+        s.update_cosmetic(|ws| {
             // `Dark`, because `Theme::default()` is `Light` and `update` suppresses a mutation
             // that changed nothing — a no-op notes no change, owes no write, and would make
             // every assertion below pass against a file that was never written.
@@ -400,6 +449,54 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&s.path);
+    }
+
+    /// **What the next launch needs is written now.** (M117) An ordinary `update` — a setting, a
+    /// tab, a pane's conversation — is due the moment it lands, so a power cut inside the old
+    /// 500 ms debounce no longer loses it; the flusher is woken rather than left to its poll.
+    #[test]
+    fn an_ordinary_mutation_is_due_at_once() {
+        let mut s = state();
+        s.path = std::env::temp_dir().join("cide-workspace-urgent-test.json");
+        let _ = std::fs::remove_file(&s.path);
+
+        s.update(|ws| {
+            ws.settings.theme = Theme::Dark;
+            Ok(())
+        })
+        .expect("a theme change is a change");
+        s.flush_if_due();
+        assert_eq!(
+            persist::load(&s.path).settings.theme,
+            Theme::Dark,
+            "written without waiting out the debounce"
+        );
+
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    /// A save that fails owes the write again. `Debouncer::take` clears the burst before the
+    /// write begins, so without the re-arm a failed save waited for an unrelated change.
+    #[test]
+    fn a_failed_save_is_retried() {
+        let mut s = state();
+        // A path whose parent is a *file*: `save_atomic` cannot create the directory.
+        let blocker = std::env::temp_dir().join("cide-workspace-retry-blocker");
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        s.path = blocker.join("workspace.json");
+
+        s.update(|ws| {
+            ws.settings.theme = Theme::Dark;
+            Ok(())
+        })
+        .expect("a theme change is a change");
+        s.flush_if_due();
+        assert!(!s.path.exists());
+        std::thread::sleep(persist::SAVE_DEBOUNCE);
+        assert!(s.debounce.due(), "the failed write is owed again");
+
+        let _ = std::fs::remove_file(&blocker);
     }
 
     /// **And something does drain it.** (M73)

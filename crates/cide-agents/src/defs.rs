@@ -178,9 +178,9 @@ pub const KNOWN_TOOLS: &[&str] = &[
 
 /// The keys **cide's own** front matter may carry.
 ///
-/// Exactly the ten the panel, the parser and the spawn between them consume. (It said "nine"
-/// through two milestones after `worktree` was added, which is the sort of drift a list a reader
-/// trusts cannot afford.)
+/// Exactly the thirteen the panel, the parser and the spawn between them consume. (It said
+/// "nine" through two milestones after `worktree` was added, which is the sort of drift a list a
+/// reader trusts cannot afford; M119 added the last three, the sandbox grant.)
 ///
 /// Not the vocabulary of a `.claude/agents/` file, which is Claude Code's and is not enumerable
 /// here — see [`canonical_key`] for the handful of keys the two formats share and
@@ -198,6 +198,9 @@ pub const KNOWN_KEYS: &[&str] = &[
     "permission-mode",
     "max-concurrent",
     "worktree",
+    "allow-commands",
+    "needs",
+    "writable-dirs",
 ];
 
 // ==========================================================================================
@@ -591,6 +594,9 @@ pub struct LoadedAgent {
     /// differs per harness and per release, exactly like [`KNOWN_TOOLS`], and cide has no list to
     /// check it against that would not be wrong within a month.
     pub effort: Option<String>,
+    /// `allow-commands:`, `needs:`, `writable-dirs:` — what the role may do past a harness's
+    /// sandbox. Empty for every role that does not say, and always for a subagent. (M119)
+    pub sandbox: crate::sandbox::SandboxGrant,
     /// Every front-matter key cide does not model, in file order. See `cide_ipc::AgentExtra`.
     ///
     /// Ordinarily empty for a `.cide/agents/` definition and ordinarily *not* for a subagent,
@@ -656,6 +662,7 @@ impl LoadedAgent {
             },
             permission_mode: None,
             effort: None,
+            sandbox: crate::sandbox::SandboxGrant::default(),
             extras: Vec::new(),
         }
     }
@@ -782,6 +789,8 @@ struct Parsed {
     permission_mode: Option<String>,
     max_concurrent: Option<u16>,
     worktree: Option<bool>,
+    /// `allow-commands:`, `needs:`, `writable-dirs:`. (M119)
+    sandbox: crate::sandbox::SandboxGrant,
     /// The role's colour, read out of a key cide keeps in `extras` rather than models. (M75)
     color: Option<String>,
     /// Every key this file carried that cide does not model, in the order it carried them.
@@ -836,6 +845,11 @@ fn canonical_key(key: &str, scope: AgentScope) -> Option<&'static str> {
         "permission-mode" if !claude => Some("permission-mode"),
         "permissionMode" if claude => Some("permission-mode"),
         "harness" if !claude => Some("harness"),
+        // cide's sandbox grant (M119), in cide's dialect only: a subagent runs under Claude
+        // Code, whose own settings are where a Claude sandbox is configured.
+        "allow-commands" if !claude => Some("allow-commands"),
+        "needs" if !claude => Some("needs"),
+        "writable-dirs" if !claude => Some("writable-dirs"),
         _ => None,
     }
 }
@@ -1135,6 +1149,46 @@ fn read_definition(
                     );
                 }
             },
+            // The sandbox grant (M119). A value cide cannot honour greys the role, for
+            // `worktree`'s reason: these decide what an unattended child may do outside its
+            // sandbox, and running with a grant the author did not write — or without one they
+            // did — is the posture mismatch both of those refusals exist to prevent.
+            "allow-commands" => {
+                for command in crate::sandbox::split_commands(value) {
+                    match crate::sandbox::check_command(&command) {
+                        Ok(()) => parsed.sandbox.allow_commands.push(command),
+                        Err(why) => {
+                            problems.push(AgentProblem::error(path, line, why.clone()));
+                            note_first(&mut unavailable, why);
+                        }
+                    }
+                }
+            }
+            "needs" => {
+                for word in crate::sandbox::split_words(value) {
+                    match crate::sandbox::parse_need(&word) {
+                        Ok(need) if !parsed.sandbox.needs.contains(&need) => {
+                            parsed.sandbox.needs.push(need);
+                        }
+                        Ok(_) => {}
+                        Err(why) => {
+                            problems.push(AgentProblem::error(path, line, why.clone()));
+                            note_first(&mut unavailable, why);
+                        }
+                    }
+                }
+            }
+            "writable-dirs" => {
+                for dir in crate::sandbox::split_words(value) {
+                    match crate::sandbox::check_writable_dir(&dir) {
+                        Ok(()) => parsed.sandbox.writable_dirs.push(dir),
+                        Err(why) => {
+                            problems.push(AgentProblem::error(path, line, why.clone()));
+                            note_first(&mut unavailable, why);
+                        }
+                    }
+                }
+            }
             // `canonical_key` returns only the names spelled above, and the compiler cannot
             // know that. A `debug_assert` rather than a silent `{}` so a key added to that table
             // and forgotten here fails a test run instead of being read as absent.
@@ -1279,6 +1333,7 @@ fn read_definition(
             tools: parsed.tools,
             permission_mode: parsed.permission_mode,
             effort: parsed.effort,
+            sandbox: parsed.sandbox,
             extras: parsed.extras,
         },
     })
@@ -2005,6 +2060,32 @@ pub fn normalize(draft: &AgentDraft) -> AgentDraft {
         permission_mode: optional(&draft.permission_mode),
         max_concurrent: draft.max_concurrent,
         worktree: draft.worktree,
+        allow_commands: draft
+            .allow_commands
+            .iter()
+            .map(|command| {
+                scalar(command)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|command| !command.is_empty())
+            .collect(),
+        needs: {
+            let mut needs = Vec::new();
+            for need in &draft.needs {
+                if !needs.contains(need) {
+                    needs.push(*need);
+                }
+            }
+            needs
+        },
+        writable_dirs: draft
+            .writable_dirs
+            .iter()
+            .map(|dir| scalar(dir))
+            .filter(|dir| !dir.is_empty())
+            .collect(),
         system_prompt: body(&draft.system_prompt),
         extras: draft
             .extras
@@ -2111,6 +2192,17 @@ pub fn render(draft: &AgentDraft) -> String {
             "worktree",
             if worktree { "true" } else { "false" },
         );
+    }
+    // The sandbox grant (M119). `allow-commands` joins with `, ` alone — its entries have spaces.
+    if !draft.allow_commands.is_empty() {
+        field(&mut out, "allow-commands", &draft.allow_commands.join(", "));
+    }
+    if !draft.needs.is_empty() {
+        let needs: Vec<&str> = draft.needs.iter().map(|need| need.as_str()).collect();
+        field(&mut out, "needs", &needs.join(", "));
+    }
+    if !draft.writable_dirs.is_empty() {
+        field(&mut out, "writable-dirs", &draft.writable_dirs.join(", "));
     }
     // Last, and verbatim. Everything above is a key cide models and can therefore re-spell —
     // quoting it, joining a list with `, `, normalising `True` to `true`. These are keys cide does
@@ -2278,6 +2370,21 @@ pub fn parse_draft(
         permission_mode: optional("permission-mode"),
         max_concurrent: value("max-concurrent").and_then(|value| value.parse::<u16>().ok()),
         worktree: value("worktree").and_then(|value| value.parse::<bool>().ok()),
+        allow_commands: value("allow-commands")
+            .map(crate::sandbox::split_commands)
+            .unwrap_or_default(),
+        // A word that is not a need is dropped here, as an unparsable `worktree` is: the roster
+        // has already greyed the role over it against its line, and a draft carries only what
+        // cide could read.
+        needs: value("needs")
+            .map(crate::sandbox::split_words)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|word| crate::sandbox::parse_need(word).ok())
+            .collect(),
+        writable_dirs: value("writable-dirs")
+            .map(crate::sandbox::split_words)
+            .unwrap_or_default(),
         system_prompt: doc.body,
         extras: doc
             .fields
@@ -2476,6 +2583,52 @@ pub fn validate(draft: &AgentDraft) -> Vec<AgentDraftProblem> {
                 PERMISSION_MODES.join(", ")
             ),
         ));
+    }
+
+    // The sandbox grant (M119), by the rules `read_definition` greys a file with.
+    let dialect_only = |field: AgentField, key: &str, problems: &mut Vec<AgentDraftProblem>| {
+        problems.push(problem(
+            field,
+            format!(
+                "`{key}` is cide's key and a Claude Code subagent runs under Claude Code, whose \
+                 own settings decide its sandbox. Write this role as a cide role instead."
+            ),
+        ));
+    };
+    if claude && !draft.allow_commands.is_empty() {
+        dialect_only(AgentField::AllowCommands, "allow-commands", &mut problems);
+    }
+    if claude && !draft.needs.is_empty() {
+        dialect_only(AgentField::Needs, "needs", &mut problems);
+    }
+    if claude && !draft.writable_dirs.is_empty() {
+        dialect_only(AgentField::WritableDirs, "writable-dirs", &mut problems);
+    }
+    for command in &draft.allow_commands {
+        if let Err(why) = crate::sandbox::check_command(command) {
+            problems.push(problem(AgentField::AllowCommands, why));
+        } else if command.contains(',') {
+            problems.push(problem(
+                AgentField::AllowCommands,
+                format!(
+                    "`{command}` contains a comma, and the list is written on one line \
+                     separated by commas, so it would be read back as two commands."
+                ),
+            ));
+        }
+    }
+    for dir in &draft.writable_dirs {
+        if let Err(why) = crate::sandbox::check_writable_dir(dir) {
+            problems.push(problem(AgentField::WritableDirs, why));
+        } else if dir.contains([' ', '\t', ',']) {
+            problems.push(problem(
+                AgentField::WritableDirs,
+                format!(
+                    "`{dir}` contains a space or a comma, which separate the list's entries; \
+                     a directory whose name has one cannot be written here."
+                ),
+            ));
+        }
     }
 
     if draft.max_concurrent == Some(0) {
@@ -2985,6 +3138,9 @@ Work one task at a time.
                 key: "color".into(),
                 value: "cyan".into(),
             }],
+            allow_commands: Vec::new(),
+            needs: Vec::new(),
+            writable_dirs: Vec::new(),
         };
 
         let text = render(&draft);
@@ -3844,6 +4000,83 @@ Work one task at a time.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The sandbox grant (M119): read into `LoadedAgent::sandbox`, a value cide cannot honour
+    /// greys the role with the key's problem named, and a draft carrying the three keys renders
+    /// and parses back to itself — commands keep their spaces, since only commas split them.
+    #[test]
+    fn a_sandbox_grant_is_read_refused_and_round_tripped() {
+        use crate::sandbox::SandboxNeed;
+        let dir = temp("sandbox-grant");
+        let project = dir.join("project");
+        write(
+            &project,
+            "a.md",
+            "---\nname: a\ndescription: d\nharness: codex\nallow-commands: [blender -b, \
+             tools/ci/runners/e2e.sh]\nneeds: display, audio\nwritable-dirs: ~/.cache/godot\n---\nP.\n",
+        );
+        write(
+            &project,
+            "b.md",
+            "---\nname: b\ndescription: d\nallow-commands: bash -c make\n---\nP.\n",
+        );
+        write(
+            &project,
+            "c.md",
+            "---\nname: c\ndescription: d\nneeds: gpu\n---\nP.\n",
+        );
+        let catalog = load_from(
+            &two(&dir.join("global"), &project),
+            Harness::Claude,
+            present,
+        );
+        let a = agent(&catalog, "a");
+        assert!(a.is_available(), "{:?}", a.def.unavailable);
+        assert_eq!(
+            a.sandbox.allow_commands,
+            vec!["blender -b", "tools/ci/runners/e2e.sh"]
+        );
+        assert_eq!(
+            a.sandbox.needs,
+            vec![SandboxNeed::Display, SandboxNeed::Audio]
+        );
+        assert_eq!(a.sandbox.writable_dirs, vec!["~/.cache/godot"]);
+        for (name, word) in [("b", "bash"), ("c", "gpu")] {
+            let greyed = agent(&catalog, name);
+            assert!(
+                greyed
+                    .def
+                    .unavailable
+                    .as_deref()
+                    .is_some_and(|why| why.contains(word)),
+                "{name}: {:?}",
+                greyed.def.unavailable
+            );
+        }
+
+        let text = std::fs::read_to_string(project.join("a.md")).expect("read a.md");
+        let parsed = parse_draft(&text, AgentScope::Project).expect("parse a.md");
+        assert_eq!(parsed.allow_commands, a.sandbox.allow_commands);
+        assert_eq!(parsed.needs, a.sandbox.needs);
+        let rendered = render(&parsed);
+        assert!(
+            rendered.contains("allow-commands: blender -b, tools/ci/runners/e2e.sh\n"),
+            "{rendered}"
+        );
+        assert_eq!(
+            normalize(&parse_draft(&rendered, AgentScope::Project).expect("reparse")),
+            normalize(&parsed)
+        );
+
+        let mut bad = draft("x", "P.");
+        bad.allow_commands = vec!["timeout 55s blender".into()];
+        bad.writable_dirs = vec!["/".into()];
+        let fields: Vec<AgentField> = validate(&bad).into_iter().map(|p| p.field).collect();
+        assert!(fields.contains(&AgentField::AllowCommands), "{fields:?}");
+        assert!(fields.contains(&AgentField::WritableDirs), "{fields:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The harness spellings are the wire's, in both directions, so a file and a DTO agree.
     #[test]
     fn harness_names_round_trip() {
@@ -3878,6 +4111,9 @@ Work one task at a time.
             max_concurrent: None,
             worktree: None,
             system_prompt: prompt.to_string(),
+            allow_commands: Vec::new(),
+            needs: Vec::new(),
+            writable_dirs: Vec::new(),
         }
     }
 

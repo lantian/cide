@@ -51,8 +51,14 @@
   color: var(--text);
 }
 
+/* `aria-selected` as well as `aria-pressed`: the app's rail panels are `role="tab"` and say
+   "current" with `aria-selected`, only the tool-window toggle is a pressed button. Lighting only
+   `aria-pressed` here is how the redesign lost the current-panel highlight — see `.itemActive`
+   in `chrome/ActivityRail.module.css`. */
 .railButton[aria-pressed='true'],
-.railButton[aria-pressed='true']:hover {
+.railButton[aria-pressed='true']:hover,
+.railButton[aria-selected='true'],
+.railButton[aria-selected='true']:hover {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
 }

@@ -424,16 +424,27 @@ export function MarkdownFrame({
 /**
  * The floating three-way switch.
  *
- * Revealed on hover like the ⊞ ⛶ ⧉ × cluster it sits beside, and **always** visible while the
- * layout is not `text` — a control that hides itself is a control the user cannot use to undo
- * what it just did.
+ * Drawn like the pane's ⊞ ⛶ ⧉ × cluster and in that cluster's place: a file tab draws no cluster
+ * any more (`bare` in `layout/PaneTitleBar.tsx`), so the frame publishes `--pane-corner: 0` and
+ * the reserve below resolves to the corner itself. It used to be a chrome-coloured pill with a
+ * ring, revealed on hover of the whole pane — a second style of floating control beside the
+ * first, which is what the user reported.
+ *
+ * Always drawn, and **faint at rest** rather than hidden: it sits on the first line of the
+ * document, so it has to let that line be read through it, and it comes up to full strength only
+ * under the pointer or with focus inside it. The old reveal-on-pane-hover put it at full strength
+ * whenever the mouse was anywhere in the file, i.e. over the text for the whole time anyone read.
+ * Being always drawn also covers what the old `data-pinned` did — a switch that vanishes is one
+ * the user cannot use to undo what it just did.
  *
  * `corner` is not cosmetic. The pane's top-right is spoken for: `layout/PaneTitleBar.module.css`
  * floats the pane controls there and an editor pane reserves `--pane-corner-clear` — 221px, the
  * minimap's 96px plus the cluster's 125px — for them. `panes/EditorPane.module.css` carries the
  * write-up of the once a strip reserved 125 instead and put both its buttons inside the ×'s live
  * hit box. Rather than squeeze three squares into what is left of a narrow pane, the switch drops
- * to the bottom-right, where nothing floats.
+ * to the bottom-right, where nothing floats. On a file tab's own pane the cluster is gone and the
+ * reserve is the minimap alone; the full 221px still applies where the frame keeps its cluster —
+ * a markdown pane detached into a window of its own, whose cluster is the window's controls.
  */
 function ViewSwitch({
   view,
@@ -450,7 +461,6 @@ function ViewSwitch({
     <div
       className={styles.switch}
       data-corner={corner}
-      data-pinned={view === 'text' ? undefined : 'true'}
       role="group"
       aria-label="Markdown layout"
     >

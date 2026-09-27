@@ -17,6 +17,8 @@
 //! Nothing here depends on `tauri`. `cide-headless` links this crate and must never be
 //! able to link a webview — that is the standing check that the rule is being kept.
 
+pub mod accent;
+pub mod buffers;
 pub mod check;
 pub mod child_env;
 pub mod claude_cli;
@@ -43,6 +45,9 @@ pub mod persist;
 /// Process ancestry: whose child a pid is. The join key when a `claude` is not the process
 /// cide forked — a wrapper, a shell, a re-exec through a proxy.
 pub mod proc;
+/// Everything a run started, and ending all of it — the descendants a codex sandbox puts in a
+/// session of their own, and what is left standing in a worktree after its run. (M119)
+pub mod process_tree;
 pub mod profile;
 /// What a path *is* — OS stat, and what one pass over a text file's bytes says. (M70)
 pub mod properties;

@@ -198,12 +198,15 @@ export function apiKeyOf(provider: Provider): string {
  * the readout on screen describes the run that happens. A second joiner is how a preview starts
  * describing a different run from the one it previews — `cide_git::push::preview`'s rule.
  */
-export function entryFlags(entry: Entry): string[] {
-  const flags = ['--model', joinModelId(entry.provider, entry.model)]
-  if (entry.variant !== '') {
-    flags.push('--variant', entry.variant)
-  }
-  return flags
+export function entryFlags(entry: Entry, variantInModel: boolean): string[] {
+  const model = joinModelId(entry.provider, entry.model)
+  const variant = entry.variant.trim()
+  if (variant === '') return ['--model', model]
+  // opencode 2 has no `--variant` (it answers `Unrecognized flag`); the effort rides the id, and
+  // `AgentModels.variantInModel` says which CLI is installed. An id that already carries a `#`
+  // keeps its own, as `model_args` on the Rust side does.
+  if (variantInModel) return ['--model', model.includes('#') ? model : `${model}#${variant}`]
+  return ['--model', model, '--variant', variant]
 }
 
 /**
@@ -419,6 +422,55 @@ export function modelsFor(provider: string, lines: readonly string[]): string[] 
     }
   }
   return found
+}
+
+/** One row of a pool entry's model dropdown. */
+export interface ModelChoice {
+  model: string
+  /** False for the entry's own value when its provider no longer lists it. */
+  listed: boolean
+}
+
+/**
+ * What a pool entry's model dropdown offers: the models its provider declares **in cide**.
+ *
+ * The entry used to be a free-text box with a picker beside it fed only by the `opencode models`
+ * probe. On a machine where the probe had not landed, or had not listed a custom endpoint, the
+ * picker was an empty chevron next to a box, and a typo in the box was a pool entry that
+ * resolved to nothing at dispatch.
+ *
+ * A custom provider's card is the whole of what it offers. cide's providers are the configuration
+ * a run gets, and the user ruled that the user's own `opencode.json` is not an input to this
+ * screen (t-1090) — a model it happens to declare is a model this machine has and the next one
+ * may not. A model the card lacks is added on the card, which is also where its limits live.
+ *
+ * A catalog or external provider stores no model list in cide: opencode's own catalogue is the
+ * only one there is, so the probe's list stands in for those kinds alone.
+ *
+ * The entry's current model is always offered, last and marked unlisted, when the list does not
+ * have it. Without it a pool naming a model that was since removed from its provider would draw
+ * as an empty dropdown over a value that is still there and still dispatched.
+ */
+export function entryModelChoices(
+  entry: Entry,
+  providers: readonly Provider[],
+  lines: readonly string[],
+): ModelChoice[] {
+  const provider = providers.find((p) => p.id === entry.provider)
+  const listed: string[] = []
+  if (provider?.kind === 'custom') {
+    for (const model of provider.models) {
+      const id = model.id.trim()
+      if (id !== '' && !listed.includes(id)) listed.push(id)
+    }
+  } else if (provider !== undefined) {
+    listed.push(...modelsFor(provider.id, lines))
+  }
+  const choices = listed.map((model) => ({ model, listed: true }))
+  if (entry.model !== '' && !listed.includes(entry.model)) {
+    choices.push({ model: entry.model, listed: false })
+  }
+  return choices
 }
 
 /** Every `provider/model` line, deduplicated, for a picker that spans providers. */

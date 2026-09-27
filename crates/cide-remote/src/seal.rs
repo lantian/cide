@@ -20,15 +20,17 @@
 //! # The shape
 //!
 //! ```text
-//! server → client   "cide-hail" 02 | S_pub[32]                               (once, in the clear)
 //! client → server   "cide-seal" 02 | mode | e_pub[32] | len | device-id      (once, in the clear)
+//! server → client   "cide-hail" 02 | S_pub[32]                               (once, in the clear)
 //! both ways         counter[8] | XChaCha20-Poly1305(key, prefix ‖ counter, json)
 //! ```
 //!
 //! Both opening messages are in the clear because everything in them is public: two public keys
-//! and a device id. What they establish is not. Neither waits for the other — the handshake does
-//! not depend on `S` and the greeting does not depend on `e` — so the pair costs no round trip
-//! over sending the handshake alone.
+//! and a device id. What they establish is not. The client does not wait for the greeting — the
+//! handshake does not depend on `S` — so it sends at once and the pair costs no round trip over
+//! sending the handshake alone. The server **does** wait: it greets only a peer
+//! whose first message starts with `cide-seal`, so a scanner that merely completes a WebSocket
+//! upgrade is not handed the name of the service and this instance's long-lived key.
 //!
 //! **The greeting is a convenience and never evidence.** A device that paired by QR already has
 //! `S` and compares the greeting against it, refusing by name on a mismatch; a device pairing by

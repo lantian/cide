@@ -36,13 +36,15 @@ export const settingsScheme: Scene = {
     // "not newer" than itself and the store would drop it.
     handlers.set('settings_set', (a: Args): Settings => {
       const ws = world.boot.workspace
-      const next = { ...ws, rev: wire(Number(ws.rev) + 1), settings: { ...ws.settings, ...(a['patch'] as SettingsPatch) } }
+      // `accent` is not a stored value in a patch (Rust fits it), and this scene never sends one.
+      const { accent: _accent, ...patch } = a['patch'] as SettingsPatch
+      const next = { ...ws, rev: wire(Number(ws.rev) + 1), settings: { ...ws.settings, ...patch } }
       world.boot.workspace = next
       emitEvent('cide://workspace-changed', { rev: Number(next.rev), workspace: structuredClone(next) })
       return next.settings
     })
     handlers.set('graphics_status', (): GraphicsStatus => GRAPHICS)
-    handlers.set('agents_models', (): AgentModels => ({ harness: 'opencode', models: [], problem: null }))
+    handlers.set('agents_models', (): AgentModels => ({ harness: 'opencode', models: [], problem: null, variantInModel: true }))
     // The seed is `cide-headless`'s, and says so; the About line should name the app.
     world.boot.capabilities.version = '0.9.1'
   },

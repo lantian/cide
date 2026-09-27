@@ -43,6 +43,8 @@ pub mod settings_ops;
 /// Editor colour schemes — the `--tk-*` palette, as data. A different axis from [`Theme`],
 /// which stays the app's light/dark polarity; the module header argues the split.
 pub mod theme;
+/// Self-update: a newer release, a manual check's answer, download progress.
+pub mod update;
 pub mod workspace;
 
 pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
@@ -53,34 +55,38 @@ pub use llm::{
     LlmModel, LlmProvider, LlmSettings, ModelPool, PoolChoice, PoolEntry, pool_capacity,
 };
 pub use milestones::{
-    CheckResult, GateState, Milestone, MilestonePlan, MilestoneTask, MilestoneTasks,
+    CheckResult, GateRuns, GateState, Milestone, MilestonePlan, MilestoneTask, MilestoneTasks,
     MilestonesView, VerifyState,
 };
 pub use new_project::{
     NewProjectKind, NewProjectOutcome, NewProjectProbe, NewProjectProgress, NewProjectRequest,
     NewProjectStep, NewProjectStepState,
 };
-pub use overrides::{AgentOverride, AgentOverrides, ProjectOverrides};
+pub use overrides::{
+    AgentOverride, AgentOverrides, OverrideProfileOp, OverrideProfilesState, ProjectOverrides,
+    ProjectProfiles,
+};
 pub use positions::{MarkdownView, ViewPosition};
 pub use properties::{
     DirSummary, FileProperties, FilePropertiesGit, LineEnding, Owner, PathKind, TextFacts,
 };
 pub use proposals::{Proposal, ProposalChange, ProposedFile};
 pub use settings::{
-    ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings, CodexCli,
+    Accent, ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings, CodexCli,
     CodexInjections, CodexSettings, ConsoleHarness, DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE,
     EditorSettings, ExplorerSettings, GitSettings, GraphicsSettings, HighlightLevel,
     InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MAX_UI_FONT_SIZE,
     MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, OpenRunIn, ProxyMode, ProxyScope,
     ProxySettings, ProxyTarget, RemoteBind, RemoteSettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    Settings, SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size,
-    clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
+    Settings, SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, UpdateSettings,
+    clamp_font_size, clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
-    GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,
-    SettingsPatch,
+    AccentPatch, GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem,
+    KeymapReport, SettingsPatch,
 };
 pub use theme::{BUILTIN_SCHEME, ColorScheme, SCHEME_SURFACE, SCHEME_TOKENS, scheme_roles};
+pub use update::{UpdateCheck, UpdateInfo, UpdateProgress};
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, HistoryTab, LayoutNode,
     LogLineDetail, MAX_RATIO, MIN_RATIO, Pane, PaneOrigin, PaneTree, Project, ProjectRoot,
@@ -93,7 +99,7 @@ pub mod fs;
 pub mod search;
 
 pub use fs::{
-    FsChange, FsStatus, NO_ROOT, PasteChoice, PasteCollision, PasteDecision, PasteMode,
+    FileClip, FsChange, FsStatus, NO_ROOT, PasteChoice, PasteCollision, PasteDecision, PasteMode,
     PastedEntry, TreeMatch, TreeMatches, TreeRow, TreeRowKind, WatchBackend, WatchStatus,
 };
 pub use search::{PickerFrame, PickerItem, PickerRow};
@@ -135,8 +141,9 @@ pub mod tasks;
 pub use agents::{
     AgentDef, AgentRoster, AgentRun, DispatchRequest, ExternalWork, Harness, LlmLimitsProbe,
     LlmModelTest, LogRunInfo, OrchestrationConfig, OrchestrationPatch, PoolBench, PoolEntryState,
-    PoolEvent, PoolEventKind, PoolProviderState, PoolRefusal, PoolRunRef, PoolSkip, PoolSkipped,
-    PoolState, PoolStateReport, RunNotify, RunOpen, RunState, TokenUsage,
+    PoolEntryStats, PoolEvent, PoolEventKind, PoolProviderState, PoolRefusal, PoolRunRef, PoolSkip,
+    PoolSkipped, PoolState, PoolStateReport, PoolStepRate, RunNotify, RunOpen, RunState,
+    SandboxNeed, TokenUsage,
 };
 pub use tasks::{
     ATTACHMENTS_DIR, ATTACHMENTS_LEAF, AttachTarget, AttachmentKind, LinkType, StagedFile,
@@ -750,7 +757,7 @@ pub struct SessionSummary {
 /// neither is a session that has finished its turn and is waiting for the user: that is the
 /// *awaiting* marker's job (`cide://session-awaiting`), and the two chips sit side by side on one
 /// tab. They must never describe the same session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ProjectRunning {
@@ -762,6 +769,33 @@ pub struct ProjectRunning {
     /// **De-duplicated by session**: a mirrored pane is two panes showing one child, and a
     /// count that said `2` about it would be counting windows onto a thing rather than the
     /// thing — `ui/src/panes/awaitingRule.ts` argues the same point for the marker beside it.
+    pub panes: u32,
+    /// The in-project tab strip's spinner: consoles mid-turn, per tab. (M115)
+    ///
+    /// **Only tabs with a count above zero**, in tab order — the set's own "absence is zero" rule
+    /// one level down. A detached pane is in no tab and counts toward `panes` alone; a session
+    /// mirrored into two tabs counts once in each, because each tab is showing it.
+    ///
+    /// # Narrower than `panes`, on purpose
+    ///
+    /// A tab counts a session only while it is `Busy` — a permission prompt is **not** a
+    /// spinning tab. The strip gives each console tab three states: turning (working), the
+    /// awaiting badge (finished, or asking, and not yet looked at), and plain. A session at a
+    /// permission prompt is the badge's — it is waiting on a person — and counting it here too
+    /// would light both chips on a one-console tab, which is the "never describe the same
+    /// session" rule above broken exactly where there is only one session to describe. The
+    /// header keeps its wider reading: it has no badge for "asking" separate from its own chip's
+    /// tooltip, and the auto-spin timer shares its predicate.
+    pub tabs: Vec<TabRunning>,
+}
+
+/// One tab's working consoles, inside [`ProjectRunning::tabs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TabRunning {
+    pub tab: TabId,
+    /// Distinct sessions in this tab's tree that are mid-turn.
     pub panes: u32,
 }
 
@@ -920,6 +954,36 @@ pub struct FileBytesHead {
 pub struct FileBytesWrite {
     pub path: String,
     pub if_unchanged: Option<FileStamp>,
+}
+
+/// The head of a hot-exit snapshot's frame: which file an unsaved buffer belongs to, and what
+/// the file was when the buffer last agreed with it. (M117)
+///
+/// The text itself is the frame's payload, UTF-8 — `file_backup_write` is framed for
+/// `file_write_bytes`'s reason, so a multi-megabyte buffer is not JSON-escaped on its way over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BufferBackupWrite {
+    pub path: String,
+    pub base_stamp: Option<FileStamp>,
+}
+
+/// An editor buffer's unsaved text, kept in the state directory so a crash or a power cut does
+/// not take it. (M117)
+///
+/// `base_stamp` is the file as the buffer last agreed with it. A restored buffer carries it as
+/// its autosave precondition, so a file that changed on disk while cide was down raises the
+/// ordinary conflict bar instead of being overwritten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BufferBackup {
+    pub path: String,
+    pub text: String,
+    pub base_stamp: Option<FileStamp>,
+    #[ts(type = "number")]
+    pub saved_unix_ms: u64,
 }
 
 /// A text file as the editor loads it. (M9)

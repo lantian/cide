@@ -95,7 +95,48 @@ const appliedPalette = new WeakMap<Terminal, string>()
  * same element — `createTerminal` also wants `--font-mono` — pays for one lookup.
  */
 function readTheme(style: CSSStyleDeclaration): Record<string, string> {
-  return terminalPalette((name) => style.getPropertyValue(name).trim())
+  return terminalPalette((name) => concreteColor(style.getPropertyValue(name).trim()))
+}
+
+/**
+ * A token's value as a colour xterm can parse, or the value unchanged when it already is one.
+ *
+ * Needed since the user's accent (`tokens.css`'s `[data-accent='custom']` blocks): there `--sel`
+ * and `--accent-dim` are `color-mix(...)` expressions, and a custom property's computed value is
+ * its *tokens* with `var()` substituted — the mix is never evaluated, because a custom property
+ * has no type to evaluate it as. xterm's `parseColor` does not understand `color-mix()` and falls
+ * back to its own default without a word, so a blue accent would get xterm's stock selection.
+ *
+ * So anything with a function in it is evaluated the only way the engine offers: assigned to a
+ * real `color` on a probe element and read back computed. A mix computes to `color(srgb r g b)`
+ * (CSS Color 5 serialisation) or to `rgb(...)` depending on the engine, so both are handled.
+ * Hex, `rgb()` and names — every value the shipped palette uses — skip the probe entirely.
+ */
+export function concreteColor(value: string): string {
+  if (!value.includes('(') || /^rgba?\(/.test(value)) return value
+  if (typeof document === 'undefined') return value
+  colorProbe ??= document.createElement('span')
+  if (!colorProbe.isConnected) {
+    colorProbe.style.display = 'none'
+    document.documentElement.appendChild(colorProbe)
+  }
+  colorProbe.style.color = ''
+  colorProbe.style.color = value
+  const computed = getComputedStyle(colorProbe).color
+  return srgbToHex(computed) ?? (computed || value)
+}
+
+let colorProbe: HTMLSpanElement | null = null
+
+/** `color(srgb 0.1 0.2 0.3)` (alpha ignored) → `#1a334d`; `null` for anything else. */
+export function srgbToHex(value: string): string | null {
+  const m = /^color\(srgb\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)/.exec(value.trim())
+  if (!m) return null
+  const byte = (c: string) =>
+    Math.round(Math.min(1, Math.max(0, Number(c))) * 255)
+      .toString(16)
+      .padStart(2, '0')
+  return `#${byte(m[1]!)}${byte(m[2]!)}${byte(m[3]!)}`
 }
 
 /**
@@ -614,9 +655,16 @@ export function ensureSearch(handle: TerminalHandle): SearchAddon {
  * is for the edit that changes one, which would otherwise show up as a search that highlights
  * nothing and reports no count, with nothing anywhere saying why.
  */
+/** `rgb(1, 2, 3)` / `rgb(1 2 3)` → `#010203`; `null` for anything else. */
+function rgbToHex(value: string): string | null {
+  const m = /^rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/.exec(value)
+  if (!m) return null
+  return `#${[m[1], m[2], m[3]].map((c) => Number(c).toString(16).padStart(2, '0')).join('')}`
+}
+
 function hexToken(style: CSSStyleDeclaration, name: string, fallback: string): string {
-  const value = style.getPropertyValue(name).trim()
-  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback
+  const value = concreteColor(style.getPropertyValue(name).trim())
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : (rgbToHex(value) ?? fallback)
 }
 
 /**
@@ -669,8 +717,8 @@ function hexToken(style: CSSStyleDeclaration, name: string, fallback: string): s
  */
 export function searchOptions(): ISearchOptions {
   const style = getComputedStyle(document.documentElement)
-  const fill = hexToken(style, '--accent-dim', '#7a4432')
-  const ring = hexToken(style, '--accent', '#d97757')
+  const fill = hexToken(style, '--accent-dim', '#f7c9cc')
+  const ring = hexToken(style, '--accent', '#dc1f2b')
   return {
     decorations: {
       matchBackground: fill,

@@ -54,6 +54,7 @@ tauri-plugin-opener = { workspace = true }
 tauri-plugin-os = { workspace = true }
 tauri-plugin-process = { workspace = true }
 tauri-plugin-store = { workspace = true }
+tauri-plugin-updater = { workspace = true }
 tauri-plugin-window-state = { workspace = true }
 
 dashmap = { workspace = true }
@@ -72,6 +73,10 @@ uuid = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 signal-hook = { workspace = true }
+
+# logind's shutdown delay inhibitor (`crate::logind`). Linux-only: logind is systemd's.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true }
 
 # The folder picker's parent window. Linux-only because that is the only platform where the
 # dialog plugin declines to parent it for us — see `cmd::project::project_pick`.

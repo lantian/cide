@@ -125,11 +125,18 @@ pub(crate) async fn index_project(
 /// to walk rather than after.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_close(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     searches: State<'_, SearchRegistry>,
     logs: State<'_, LogRegistry>,
+    clips: State<'_, FileClipState>,
     project: ProjectId,
 ) -> Result<bool, FsError> {
+    // A clip taken in the closing project can no longer be pasted anywhere — see
+    // `FileClipState::forget_project`. Cleared before the teardown so no window offers it.
+    if clips.forget_project(project) {
+        crate::emit::fs_clip_changed(&app, None);
+    }
     // A log walk over a closing project is libgit2 reading a history nobody will see the rows
     // of — the same waste `searches.cancel` exists to stop, on the same disk the teardown below
     // is competing for. Nothing else sweeps them: without this they run to the end of the page's
@@ -1425,6 +1432,95 @@ fn relist_if_scratch(fs: &crate::files::ProjectFs, paths: &[PathBuf]) -> bool {
     true
 }
 
+/// The file tree's clipboard — what Copy or Cut took, for Paste in **any** window to read.
+///
+/// It used to be a zustand store inside each webview, which made two things impossible: a
+/// paste into another project from a *different* window (each window had its own clip, so the
+/// second one had nothing to paste), and a cut consumed in one window greying out Paste in the
+/// others. Rust holds it now and every window mirrors it through `cide://fs-clip-changed`.
+///
+/// In memory only. A clip is a gesture in progress; persisting a Cut across a restart would
+/// arm a move the user no longer remembers making.
+#[derive(Default)]
+pub struct FileClipState(std::sync::Mutex<Option<cide_ipc::FileClip>>);
+
+impl FileClipState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<cide_ipc::FileClip>> {
+        // A poisoned lock still holds a whole `Option`: nothing here panics half way through a
+        // write, so recovering the value is right and refusing every later Copy is not.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn get(&self) -> Option<cide_ipc::FileClip> {
+        self.lock().clone()
+    }
+
+    pub fn set(&self, clip: Option<cide_ipc::FileClip>) -> bool {
+        let mut held = self.lock();
+        let changed = *held != clip;
+        *held = clip;
+        changed
+    }
+
+    /// Clear the clip when it is a **cut** of exactly `sources` — the paste that consumed it.
+    ///
+    /// Exactly, rather than "any cut": a drag-and-drop move goes through `fs_paste` with its
+    /// own sources and must not throw away what the user put on the clipboard ten seconds
+    /// earlier. A Copy is never consumed; pasting twice is how anyone makes two copies.
+    pub fn take_if_cut_of(&self, sources: &[PathBuf]) -> bool {
+        let mut held = self.lock();
+        let consumed = held.as_ref().is_some_and(|clip| {
+            clip.mode == cide_ipc::PasteMode::Cut && clip.paths.as_slice() == sources
+        });
+        if consumed {
+            *held = None;
+        }
+        consumed
+    }
+
+    /// Clear the clip when it was taken in `project`, which is closing. Its paths are checked
+    /// against that project's roots, and once the project is gone there are none — a Paste left
+    /// enabled would only fail with `NoIndex`.
+    pub fn forget_project(&self, project: ProjectId) -> bool {
+        let mut held = self.lock();
+        if held.as_ref().is_some_and(|clip| clip.project == project) {
+            *held = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// What the tree's clipboard is holding. A window asks once when its tree starts, so a window
+/// opened *after* the Copy can still paste it; from then on it follows the event.
+#[tauri::command(rename_all = "camelCase")]
+pub fn fs_clip_get(clips: State<'_, FileClipState>) -> Option<cide_ipc::FileClip> {
+    clips.get()
+}
+
+/// Copy or Cut in the tree: hold these paths for a Paste in any window. Writes nothing on disk —
+/// a Cut that is never pasted must cost exactly nothing.
+#[tauri::command(rename_all = "camelCase")]
+pub fn fs_clip_set(
+    app: tauri::AppHandle,
+    clips: State<'_, FileClipState>,
+    clip: cide_ipc::FileClip,
+) {
+    if clips.set(Some(clip.clone())) {
+        crate::emit::fs_clip_changed(&app, Some(&clip));
+    }
+}
+
+/// Drop whatever the tree's clipboard holds — Escape on a pending cut.
+#[tauri::command(rename_all = "camelCase")]
+pub fn fs_clip_clear(app: tauri::AppHandle, clips: State<'_, FileClipState>) {
+    if clips.set(None) {
+        crate::emit::fs_clip_changed(&app, None);
+    }
+}
+
 /// Which names a paste would land on that are already taken — and nothing is written.
 ///
 /// The read half of Ctrl+V, asked first so the confirmation can be a decision rather than an
@@ -1440,15 +1536,37 @@ fn relist_if_scratch(fs: &crate::files::ProjectFs, paths: &[PathBuf]) -> bool {
 pub async fn fs_paste_plan(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    source_project: Option<ProjectId>,
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     mode: cide_ipc::PasteMode,
 ) -> Result<Vec<cide_ipc::PasteCollision>, FsError> {
     let fs = project_fs(&registry, project)?;
+    let source_fs = source_fs(&registry, project, source_project)?;
     blocking("fs_paste_plan", move || {
-        cide_fs::copy::plan(&fs.writable_paths(), &sources, &dest_dir, mode)
+        let dest_roots = fs.writable_paths();
+        let source_roots = source_fs.map_or_else(|| dest_roots.clone(), |s| s.writable_paths());
+        cide_fs::copy::plan_between(&source_roots, &dest_roots, &sources, &dest_dir, mode)
     })
     .await?
+}
+
+/// The project a paste's sources came from, when it is not the one being pasted into.
+///
+/// `None` for the ordinary paste — same project, or a caller (a drag, every test) that never
+/// sends one — and for a `source_project` that *is* the destination, so the two cases cannot
+/// take different paths through `paste_into`. A source project that has been closed since the
+/// Copy is `NoIndex`, the same refusal an unknown destination gets: its roots are no longer
+/// known, and without them there is nothing to check the sources against.
+fn source_fs(
+    registry: &FsRegistry,
+    project: ProjectId,
+    source_project: Option<ProjectId>,
+) -> Result<Option<std::sync::Arc<crate::files::ProjectFs>>, FsError> {
+    match source_project {
+        Some(source) if source != project => project_fs(registry, source).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// Copy or move paths into a folder — the file tree's Ctrl+C / Ctrl+X / Ctrl+V.
@@ -1478,27 +1596,46 @@ pub async fn fs_paste_plan(
 /// A **cut** is a move, so it takes the open tabs with it exactly as [`fs_rename`] does — same
 /// defect, same fix, and the paste half is the one that would have been left behind. A copy moves
 /// nothing and is asked nothing.
+///
+/// **`source_project`** is set when the clip was taken in another project — possibly in another
+/// window, which is why the clip itself lives in Rust ([`FileClipState`]). The sources are then
+/// checked against *that* project's writable paths and the destination against `project`'s; see
+/// `cide_fs::copy::paste_between` for why the two lists are not simply unioned. A cut between
+/// projects needs nothing more for the tabs: `follow_moves` retargets across the whole workspace.
+///
+/// A cut that consumed the shared clip clears it here rather than in the webview that pasted,
+/// so every other window's Paste greys out in the same event instead of offering to move a file
+/// that has already gone. Only when the sources *are* the clip: a drag sends a cut of its own
+/// through this command, and it must leave the clipboard alone (`check-tree-drag` pins that).
 #[tauri::command(rename_all = "camelCase")]
-// Three of the eight are Tauri's injected state, which the caller never spells: the wire
-// signature is the five below them, and splitting a command's arguments into a struct to satisfy
+// Four of the ten are Tauri's injected state or handle, which the caller never spells: the wire
+// signature is the six below them, and splitting a command's arguments into a struct to satisfy
 // this lint would change what the frontend sends for a reason no frontend has.
 #[allow(clippy::too_many_arguments)]
 pub async fn fs_paste(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     state: State<'_, WorkspaceState>,
     positions: State<'_, Arc<crate::positions_state::PositionsState>>,
     project: ProjectId,
+    source_project: Option<ProjectId>,
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     mode: cide_ipc::PasteMode,
     decisions: Vec<cide_ipc::PasteDecision>,
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
     let fs = project_fs(&registry, project)?;
+    let from = source_fs(&registry, project, source_project)?;
+    let consumed = sources.clone();
     let pasted = blocking("fs_paste", move || {
-        paste_into(&fs, &sources, &dest_dir, mode, &decisions)
+        paste_into(&fs, from.as_deref(), &sources, &dest_dir, mode, &decisions)
     })
     .await??;
     if mode == cide_ipc::PasteMode::Cut {
+        let clips = app.state::<FileClipState>();
+        if clips.take_if_cut_of(&consumed) {
+            crate::emit::fs_clip_changed(&app, None);
+        }
         // `entry.dest` and not the destination directory joined to the source's name: a
         // collision is renamed rather than refused, so the file the user cut may well have
         // landed as `main copy.rs` — and a tab retargeted onto the name it *wanted* would be a
@@ -1517,8 +1654,14 @@ pub async fn fs_paste(
 /// A named function for the same reason [`create_entry`] is one: the property worth testing is
 /// that the pasted rows are in the tree the instant the command returns, and a body inline in
 /// the `#[tauri::command]` item cannot be called from a test.
+///
+/// `source` is the project the sources came from when it is not `fs` — a paste between projects.
+/// Its roots check the sources, and on a cut its own index is folded too, so the row the file
+/// left disappears from *that* tree now rather than when its watcher next fires; `fs`'s index is
+/// given only the destinations, because a path outside its roots is not a row it could draw.
 pub(crate) fn paste_into(
     fs: &crate::files::ProjectFs,
+    source: Option<&crate::files::ProjectFs>,
     sources: &[PathBuf],
     dest_dir: &std::path::Path,
     mode: cide_ipc::PasteMode,
@@ -1528,11 +1671,38 @@ pub(crate) fn paste_into(
     // out-of direction is the one that matters: a scratch that turned out to be worth keeping
     // is copied into the project with the gesture the user already knows.
     let writable = fs.writable_paths();
-    let pasted = cide_fs::copy::paste_with(&writable, sources, dest_dir, mode, decisions)?;
+    let source_writable = source.map(crate::files::ProjectFs::writable_paths);
+    let pasted = cide_fs::copy::paste_between(
+        source_writable.as_deref().unwrap_or(&writable),
+        &writable,
+        sources,
+        dest_dir,
+        mode,
+        decisions,
+    )?;
+
+    // A cut out of another project: fold the sources into *its* index, the same way the
+    // same-project fold below does for its own sources. A copy left the source tree as it was.
+    if let Some(source) = source
+        && mode == cide_ipc::PasteMode::Cut
+    {
+        let left = cide_ipc::FsChange {
+            paths: sources.to_vec(),
+            truncated: false,
+            git: false,
+        };
+        let filter = source.filter();
+        source.with_index_mut(|index| index.apply(&left, &filter));
+        let _ = relist_if_scratch(source, &left.paths);
+    }
 
     // Sources first so a rename that lands on the *same* directory reads as one rescan, and
     // because a cut's old row has to go in the same write that adds the new one.
-    let mut touched: Vec<PathBuf> = sources.to_vec();
+    let mut touched: Vec<PathBuf> = if source.is_none() {
+        sources.to_vec()
+    } else {
+        Vec::new()
+    };
     touched.extend(pasted.iter().map(|entry| entry.dest.clone()));
     let change = cide_ipc::FsChange {
         paths: touched,
@@ -2434,6 +2604,7 @@ mod tests {
 
         let pasted = paste_into(
             &fs,
+            None,
             &[dir.path().join("src/main.rs")],
             &dir.path().join("dest"),
             cide_ipc::PasteMode::Cut,
@@ -2507,6 +2678,7 @@ mod tests {
         let source = dir.path().join("src/main.rs");
         let pasted = paste_into(
             &fs,
+            None,
             std::slice::from_ref(&source),
             &dir.path().join("dest"),
             cide_ipc::PasteMode::Copy,
@@ -2560,6 +2732,7 @@ mod tests {
         assert!(matches!(
             paste_into(
                 &fs,
+                None,
                 &[outside.path().join("secret")],
                 dir.path(),
                 cide_ipc::PasteMode::Copy,
@@ -2570,6 +2743,107 @@ mod tests {
         assert!(!dir.path().join("secret").exists());
 
         drop(registry.remove(project));
+    }
+
+    /// Copy and Cut between two projects, through the command layer.
+    ///
+    /// What is pinned here and not in `cide-fs`: the handler checks the sources against the
+    /// **source** project's roots (the file above, pasted with no source project, is refused),
+    /// and a cut's old row leaves the *source* project's tree in the same call — the index that
+    /// draws it is not the one the paste lands in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paste_between_projects_updates_both_trees() {
+        let a = scratch("cmd-paste-between-a");
+        let b = scratch("cmd-paste-between-b");
+        std::fs::write(a.path().join("copied.rs"), "c").expect("a file in A");
+        std::fs::write(a.path().join("moved.rs"), "m").expect("a file in A");
+        let registry = FsRegistry::default();
+        let (pa, pb) = (ProjectId::new(), ProjectId::new());
+        for (project, dir) in [(pa, a.path()), (pb, b.path())] {
+            let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+            index_project(
+                events,
+                &registry,
+                project,
+                vec![dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+            )
+            .await
+            .expect("the walk");
+        }
+        let (fa, fb) = (
+            registry.get(pa).expect("A indexed"),
+            registry.get(pb).expect("B indexed"),
+        );
+
+        // Without the source project it is still a path outside B, and refused.
+        assert!(matches!(
+            paste_into(
+                &fb,
+                None,
+                &[a.path().join("copied.rs")],
+                b.path(),
+                cide_ipc::PasteMode::Copy,
+                &[]
+            ),
+            Err(FsError::OutsideProject(_))
+        ));
+
+        let pasted = paste_into(
+            &fb,
+            Some(&fa),
+            &[a.path().join("copied.rs")],
+            b.path(),
+            cide_ipc::PasteMode::Copy,
+            &[],
+        )
+        .expect("a copy from A into B");
+        assert_eq!(pasted[0].dest, b.path().join("copied.rs"));
+        assert!(fb.with_index(|index| index.contains(&b.path().join("copied.rs"))));
+        assert!(fa.with_index(|index| index.contains(&a.path().join("copied.rs"))));
+
+        paste_into(
+            &fb,
+            Some(&fa),
+            &[a.path().join("moved.rs")],
+            b.path(),
+            cide_ipc::PasteMode::Cut,
+            &[],
+        )
+        .expect("a cut from A into B");
+        assert!(fb.with_index(|index| index.contains(&b.path().join("moved.rs"))));
+        assert!(
+            !fa.with_index(|index| index.contains(&a.path().join("moved.rs"))),
+            "the cut's old row stayed in A's tree until the watcher caught up"
+        );
+
+        drop(registry.remove(pa));
+        drop(registry.remove(pb));
+    }
+
+    /// Only the paste the clip was for consumes it: a drag's cut of other paths goes through
+    /// the same command and must leave the clipboard alone, and a Copy is never consumed.
+    #[test]
+    fn only_the_cut_on_the_clipboard_is_consumed_by_its_paste() {
+        let project = ProjectId::new();
+        let clip = |mode, path: &str| cide_ipc::FileClip {
+            mode,
+            project,
+            paths: vec![PathBuf::from(path)],
+        };
+        let clips = FileClipState::default();
+
+        assert!(clips.set(Some(clip(cide_ipc::PasteMode::Cut, "/p/a.rs"))));
+        assert!(!clips.take_if_cut_of(&[PathBuf::from("/p/dragged.rs")]));
+        assert!(clips.get().is_some(), "a drag threw the clipboard away");
+        assert!(clips.take_if_cut_of(&[PathBuf::from("/p/a.rs")]));
+        assert!(clips.get().is_none());
+
+        clips.set(Some(clip(cide_ipc::PasteMode::Copy, "/p/a.rs")));
+        assert!(!clips.take_if_cut_of(&[PathBuf::from("/p/a.rs")]));
+        assert!(!clips.forget_project(ProjectId::new()));
+        assert!(clips.forget_project(project));
+        assert!(clips.get().is_none());
     }
 
     /// The three refusals, driven through the command layer rather than through `ops`.

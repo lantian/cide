@@ -44,6 +44,7 @@ fn role() -> LoadedAgent {
         permission_mode: None,
         effort: None,
         extras: Vec::new(),
+        sandbox: Default::default(),
     }
 }
 
@@ -110,6 +111,9 @@ fn a_real_turn_is_interrupted_by_esc_and_the_next_line_is_taken_up() {
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: true,
         server: None,
+        git_dirs: Vec::new(),
+        sandbox_brief: None,
+        codex_trust_root: None,
     };
 
     let spawn = ClaudeHarness.spawn_spec(&plan).expect("spawnable");

@@ -37,7 +37,7 @@ import { refont, retheme } from '@/terminal/xterm'
 import { asThemeName, DEFAULT_THEME, otherTheme, themeToAdopt } from './theme'
 import { applyScheme, schemeIsPainted, schemeToApply } from '@/editor/scheme'
 import type { PaintedScheme } from '@/editor/scheme'
-import type { ColorScheme } from '@/ipc/generated'
+import type { Accent, ColorScheme } from '@/ipc/generated'
 
 /** The settings this window currently mirrors, or `null` before bootstrap resolves. */
 export function useSettings(): Settings | null {
@@ -209,6 +209,42 @@ function paintUiScale(size: number): void {
   root.style.setProperty('--ui-scale', value)
 }
 
+/**
+ * Write the user's accent onto `<html>`, or take it off. Settings → Appearance → Accent colour.
+ *
+ * Two properties and one attribute, and the names are `public/theme-boot.js`'s, which writes the
+ * same three from `?accent=` before the first frame (`check:accent` pins that the two agree).
+ * Everything else — `--accent`, its washes, the gradients, the focus ring — is derived by
+ * `tokens.css`'s `[data-accent='custom']` blocks, so this does no colour arithmetic; the fit is
+ * `cide_core::accent`, and what arrives here is already legible in both themes.
+ *
+ * Ends in `retheme` for `paintTheme`'s reason: a live xterm holds a *resolved* cursor and
+ * selection colour (`TERMINAL_SLOTS` reads `--accent` and `--sel`) and follows no cascade.
+ *
+ * Guarded on the written values — this listener sees every snapshot.
+ */
+function paintAccent(accent: Accent | null): void {
+  const root = document.documentElement
+  const light = accent?.light ?? ''
+  const dark = accent?.dark ?? ''
+  if (
+    root.style.getPropertyValue('--accent-l') === light &&
+    root.style.getPropertyValue('--accent-d') === dark &&
+    (root.dataset.accent === 'custom') === (accent !== null)
+  ) {
+    return
+  }
+  if (accent) {
+    root.style.setProperty('--accent-l', light)
+    root.style.setProperty('--accent-d', dark)
+    root.dataset.accent = 'custom'
+  } else {
+    root.style.removeProperty('--accent-l')
+    root.style.removeProperty('--accent-d')
+    delete root.dataset.accent
+  }
+  retheme([...liveHosts()].flatMap((h) => (h.terminal ? [h.terminal] : [])))
+}
 
 /**
  * Write the selected colour scheme's custom properties onto `<html>`. (M24)
@@ -293,6 +329,8 @@ export function installThemeSync(): () => void {
     // means it costs one string compare. It is not redundant — the audit entry points and any
     // window opened without the parameter reach here and nowhere else.
     paintUiScale(bootSettings.uiFontSize)
+    // Likewise usually a no-op after `theme-boot.js`'s `?accent=`.
+    paintAccent(bootSettings.accent)
     paintScheme(
       schemesOf(useWorkspace.getState()),
       schemeIdFor(bootSettings.editor, start),
@@ -317,6 +355,7 @@ export function installThemeSync(): () => void {
     if (settings) {
       paintFonts(settings.editor.fontSize, settings.terminal.fontSize)
       paintUiScale(settings.uiFontSize)
+      paintAccent(settings.accent)
       paintScheme(schemesOf(state), schemeIdFor(settings.editor, state.theme), state.theme)
     }
   })

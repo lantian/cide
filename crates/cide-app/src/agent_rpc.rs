@@ -466,8 +466,9 @@ impl ToolAccess for ProjectTools {
             .map_or(RunNotify::Primary, |session| RunNotify::Session { session });
         let mutations = sink.mutations.into_inner();
         // A run that just set its task to review has, by its own account, finished: verify its
-        // branch now, so the reviewer's merge finds the answer ready instead of waiting on it.
-        // (M83) Warming only — the merge is where the result is enforced.
+        // branch now. (M83) Since M114 this is also the gate the reviewer waits behind — a red
+        // answer goes back to the run itself (`milestones::prewarm` and `GATES` say how); the
+        // merge still re-checks, and is still where the result is enforced.
         for mutation in &mutations {
             if let TaskAuthor::Agent { agent, .. } = &mutation.author
                 && mutation.after.status == cide_ipc::TaskStatus::Review
@@ -890,6 +891,27 @@ impl AgentSink for RegistrySink {
         Ok(())
     }
 
+    fn override_profiles(
+        &self,
+        op: cide_ipc::OverrideProfileOp,
+    ) -> Result<cide_ipc::OverrideProfilesState, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        let root = crate::cmd::agents::project_root(&workspace, self.project)
+            .map_err(|error| error.to_string())?;
+        let changes = !matches!(op, cide_ipc::OverrideProfileOp::List);
+        let state = crate::cmd::agents::override_profiles_apply(&root, &op)
+            .map_err(|error| error.to_string())?;
+        // `set_overrides`' reason: nothing watches the override file, so the roster goes out.
+        if changes && let Some(roster) = crate::cmd::agents::project_roster(&self.app, self.project)
+        {
+            crate::emit::agents_changed(&self.app, self.project, &roster);
+        }
+        Ok(state)
+    }
+
     fn llm(&self) -> Result<LlmSettings, String> {
         let workspace = self
             .app
@@ -1078,10 +1100,17 @@ impl AgentSink for RegistrySink {
             notify,
             harness: None,
             model: None,
+            fresh: false,
         })
+        .map(|dispatched| dispatched.run)
     }
 
-    fn dispatch_with(&self, args: &cide_agents::tools::DispatchArgs<'_>) -> Result<RunId, String> {
+    fn dispatch_with(
+        &self,
+        args: &cide_agents::tools::DispatchArgs<'_>,
+    ) -> Result<cide_agents::tools::Dispatched, String> {
+        use crate::cmd::agents::DispatchOutcome;
+        use cide_agents::tools::{DispatchHow, Dispatched};
         let cide_agents::tools::DispatchArgs {
             agent,
             task,
@@ -1090,6 +1119,7 @@ impl AgentSink for RegistrySink {
             notify,
             harness,
             model,
+            fresh,
         } = *args;
         let (workspace, agents, tasks) = self.dispatch_state()?;
         let request = DispatchRequest {
@@ -1113,15 +1143,33 @@ impl AgentSink for RegistrySink {
             external: external.cloned(),
             harness,
             model: model.map(str::to_string),
+            fresh,
         };
-        tauri::async_runtime::block_on(crate::cmd::agents::agents_dispatch(
+        // The outcome rather than `agents_dispatch`'s bare run id (M116): the tool's answer has
+        // to say whether this was a new context, the old one resumed, or no new run at all.
+        let outcome = tauri::async_runtime::block_on(crate::cmd::agents::dispatch_or_duplicate(
             self.app.clone(),
             workspace,
             agents,
             tasks,
             request,
         ))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        match outcome {
+            DispatchOutcome::Started { run, why } => Ok(Dispatched {
+                run,
+                how: DispatchHow::Started { why },
+            }),
+            DispatchOutcome::Continued { run, from } => Ok(Dispatched {
+                run,
+                how: DispatchHow::Continued { from },
+            }),
+            DispatchOutcome::Told(run) => Ok(Dispatched {
+                run,
+                how: DispatchHow::Told,
+            }),
+            DispatchOutcome::Duplicate { why, .. } => Err(why),
+        }
     }
 
     /// One worktree, one tab, one piece of work. (M104)
@@ -1343,8 +1391,13 @@ impl AgentSink for RegistrySink {
                 })
                 .map_err(|error| error.to_string())?;
         // Something landed, so the active milestone's gate is asked again — in the background,
-        // because the answer is for whoever plans next, not for this call.
-        if matches!(outcome, Integrated::Merged { .. }) {
+        // because the answer is for whoever plans next, not for this call. Unless the plan's
+        // `gateRuns` says otherwise: a gate that runs for a quarter of an hour, rerun after each
+        // of a batch of merges minutes apart, never finishes about the commit that matters. Under
+        // `idle` the spinner's wake runs it once the batch is in; under `manual` the user does.
+        if matches!(outcome, Integrated::Merged { .. })
+            && cide_agents::config::load_milestones(&root).gate_after_merge()
+        {
             crate::milestones::run_gate(&self.app, self.project);
         }
         // And the task's checkout, whose work is now in, is removed — the same rule and the same
@@ -2051,11 +2104,272 @@ fn live_reviewer(
 }
 
 /// Record the tab just opened, so the next burst for the same task finds it.
-fn remember_reviewer(project: ProjectId, task: TaskId, session: SessionId) {
+///
+/// And tell the Agents panel: the run whose task this is draws "In review by orchestrator" from
+/// this table (M114), and a row that learned it only on the next unrelated broadcast would sit
+/// there looking idle and ownerless — the report that started M114.
+fn remember_reviewer(app: &AppHandle, project: ProjectId, task: TaskId, session: SessionId) {
     REVIEWERS.lock().push(Reviewer {
         project,
         task,
         session,
+    });
+    if let Some(registry) = app.try_state::<Arc<AgentRegistry>>() {
+        registry.mark_changed(app, project);
+    }
+}
+
+/// The open review tab that owns `task`, for the roster's "In review by orchestrator". (M114)
+pub(crate) fn reviewer_of(app: &AppHandle, project: ProjectId, task: &TaskId) -> Option<SessionId> {
+    reviewer_for(app, project, task)
+}
+
+/// Tasks whose branch is being verified before anybody reviews it, and the turns waiting on that
+/// answer. (M114)
+///
+/// # Why the reviewer waits for the gate
+///
+/// Verify starts the moment a run sets its task to review (`milestones::prewarm`, M83), and the
+/// reviewer used to open in the same second — so on terrastrike's t-1249 a fresh claude read the
+/// task, diffed the branch, wrote an approving verdict, and only *then* met a red verify at the
+/// merge. It filed a follow-up task for somebody else and left t-1249 in review, while the run
+/// that wrote the change sat `Idle` with its context loaded and nothing on its row saying why.
+/// The verdict was already on its way; the reviewer simply asked before it arrived.
+///
+/// So a turn whose task is being verified is **parked** here instead of announced, and the
+/// verdict decides where it goes ([`GateVerdict`]): green, on to the reviewer as before; red
+/// within `agents.verifyRetries`, nowhere — the output goes back into the run itself, which is
+/// the context that can fix it; red past that, on to the reviewer with the count.
+///
+/// # The two orders, both real
+///
+/// The run sets review with a tool call and then ends its turn, so the usual order is *gate
+/// opened → turn parked → verdict*. But a cached verify can answer before the turn ends, and a
+/// dirty checkout is answered synchronously inside the tool call — *gate opened → verdict →
+/// turn*. The entry therefore outlives an early verdict and remembers it, and the turn that
+/// arrives next is handled by that remembered verdict. Keyed on the task, the reviewer table's
+/// key; a fresh `gate_opened` for the same task replaces whatever was there, so an entry whose
+/// turn never came (a run dispatched `notify: none`) cannot outlive the next review.
+static GATES: Mutex<Vec<GateHold>> = Mutex::new(Vec::new());
+
+/// One task's gate: still running, or answered and waiting for the turn it applies to.
+struct GateHold {
+    project: ProjectId,
+    task: TaskId,
+    verdict: Option<GateVerdict>,
+    parked: Vec<Turn>,
+}
+
+/// What a verify on a run's branch decided about the turn that asked for it. (M114)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    /// Green: the reviewer opens, told the gate passed.
+    Passed,
+    /// Red, and the output went back to the run: nobody else is told.
+    HandedBack,
+    /// Red for the `times`-th time in a row, past `agents.verifyRetries` — or `stuck`: red with
+    /// nothing committed since the last red one (M118), which a hand-back would not change. The
+    /// reviewer's now.
+    Escalated { times: u8, stuck: bool },
+}
+
+/// A verify of `task`'s branch has started; hold its reviewer until [`gate_closed`].
+pub(crate) fn gate_opened(project: ProjectId, task: TaskId) {
+    open_gate(&mut GATES.lock(), project, task);
+}
+
+/// The verify answered. Whatever turns it was holding go where `verdict` says.
+pub(crate) fn gate_closed(
+    app: &AppHandle,
+    project: ProjectId,
+    task: &TaskId,
+    verdict: GateVerdict,
+) {
+    let released = close_gate(&mut GATES.lock(), project, task, verdict);
+    for turn in released {
+        announce(app, turn);
+    }
+}
+
+/// [`gate_opened`]'s rule, over the table — pure, [`live_reviewer`]'s shape.
+fn open_gate(gates: &mut Vec<GateHold>, project: ProjectId, task: TaskId) {
+    gates.retain(|gate| !(gate.project == project && gate.task == task));
+    gates.push(GateHold {
+        project,
+        task,
+        verdict: None,
+        parked: Vec::new(),
+    });
+}
+
+/// [`gate_closed`]'s rule: the turns to announce now. With nothing parked yet the verdict is
+/// remembered for the turn still to come — see [`GATES`] on the two orders.
+fn close_gate(
+    gates: &mut Vec<GateHold>,
+    project: ProjectId,
+    task: &TaskId,
+    verdict: GateVerdict,
+) -> Vec<Turn> {
+    let Some(at) = gates
+        .iter()
+        .position(|gate| gate.project == project && &gate.task == task)
+    else {
+        return Vec::new();
+    };
+    if gates[at].parked.is_empty() {
+        gates[at].verdict = Some(verdict);
+        return Vec::new();
+    }
+    let gate = gates.remove(at);
+    gate.parked
+        .into_iter()
+        .filter_map(|turn| with_verdict(turn, verdict))
+        .collect()
+}
+
+/// What a turn becomes under a verdict: `None` when it is not to be announced at all.
+fn with_verdict(mut turn: Turn, verdict: GateVerdict) -> Option<Turn> {
+    turn.gate = match verdict {
+        GateVerdict::Passed => Some(GateNote::Passed),
+        GateVerdict::HandedBack => return None,
+        GateVerdict::Escalated { times, stuck } => Some(GateNote::Failed { times, stuck }),
+    };
+    Some(turn)
+}
+
+/// A turn that just ended, checked against the gates: `Some` to announce now (with the verdict
+/// it was waiting on, if any), `None` when it is parked or swallowed.
+fn gate_turn(gates: &mut Vec<GateHold>, turn: Turn) -> Option<Turn> {
+    let Some(task) = turn.task.as_ref() else {
+        return Some(turn);
+    };
+    let Some(at) = gates
+        .iter()
+        .position(|gate| gate.project == turn.project && &gate.task == task)
+    else {
+        return Some(turn);
+    };
+    match gates[at].verdict {
+        None => {
+            gates[at].parked.push(turn);
+            None
+        }
+        Some(verdict) => {
+            gates.remove(at);
+            with_verdict(turn, verdict)
+        }
+    }
+}
+
+/// Queue one turn for the next burst and make sure a flusher is coming for it.
+fn announce(app: &AppHandle, turn: Turn) {
+    if !NUDGES.mark(turn) {
+        return;
+    }
+    let app = app.clone();
+    // One short-lived thread per burst, as `crate::agents::mark_changed` does it: a process with
+    // no subagents in it must not wake up ten times a second for ever.
+    if let Err(error) = thread::Builder::new()
+        .name("cide-agent-nudge".into())
+        .spawn(move || flush_nudges(&app))
+    {
+        tracing::warn!(%error, "no thread for the orchestrator nudge; this turn ending is not announced");
+        // Without this the coalescer stays latched on a flusher that does not exist, and *every
+        // later* nudge in the process is swallowed by the `false` return above — one failed
+        // thread spawn would silently end the product-owner loop for the life of the app.
+        NUDGES.give_up();
+    }
+}
+
+/// Put a red verify back in front of the run that made the branch. (M114)
+///
+/// The task goes back to `doing` — it is not ready for review, and a board that said otherwise
+/// would be asked to review it by the next planning pass — and `line` is said to the run through
+/// an ordinary dispatch onto the pair, which since M116 means: typed into the run still holding
+/// it (held for the hand-back if its turn is not over), else a new run resuming the last one's
+/// conversation, else — a changed harness, no conversation on disk — a fresh run. The full output is the comment the caller already wrote; `line` points at it,
+/// since a PTY write is one line.
+pub(crate) fn hand_back_to_run(
+    app: &AppHandle,
+    project: ProjectId,
+    agent: &AgentId,
+    task: &TaskId,
+    line: &str,
+) {
+    if let Some(stores) = app.try_state::<Arc<TasksStores>>()
+        && let Some(store) = stores.get(project)
+    {
+        let edit = TaskEdit::SetStatus {
+            status: cide_ipc::TaskStatus::Doing,
+        };
+        match store.edit(task, edit, TaskAuthor::Orchestrator) {
+            Ok(_) => crate::tasks_state::broadcast(app, project, &store),
+            Err(error) => tracing::debug!(%task, %error, "a red verify found no task to move"),
+        }
+    }
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return;
+    };
+    let registry = Arc::clone(&registry);
+    let line = one_line(line);
+    // One road since M116: a dispatch onto the pair tells the run still holding it, continues the
+    // last ended run's conversation, or — only when neither can be had — starts fresh. It
+    // reports wherever the last run on this task did, so the reviewer that eventually opens is
+    // announced to the same pane.
+    let notify = registry
+        .runs_for(project)
+        .into_iter()
+        .filter(|run| &run.agent == agent && run.task.as_ref() == Some(task))
+        .max_by_key(|run| run.started_unix_ms)
+        .map_or(RunNotify::Primary, |run| run.notify);
+    let app = app.clone();
+    let agent = agent.clone();
+    let task = task.clone();
+    tauri::async_runtime::spawn(async move {
+        let (Some(workspace), Some(agents), Some(tasks)) = (
+            app.try_state::<WorkspaceState>(),
+            app.try_state::<Arc<AgentRegistry>>(),
+            app.try_state::<Arc<TasksStores>>(),
+        ) else {
+            return;
+        };
+        let request = DispatchRequest {
+            project,
+            agent: agent.clone(),
+            task: Some(task.clone()),
+            prompt: Some(line),
+            notify: Some(notify),
+            external: None,
+            harness: None,
+            model: None,
+            fresh: false,
+        };
+        match crate::cmd::agents::dispatch_or_duplicate(
+            app.clone(),
+            workspace,
+            agents,
+            tasks,
+            request,
+        )
+        .await
+        {
+            Ok(crate::cmd::agents::DispatchOutcome::Told(run)) => {
+                tracing::info!(%run, %task, "a red verify went back to the run");
+            }
+            Ok(crate::cmd::agents::DispatchOutcome::Continued { run, from }) => {
+                tracing::info!(%run, %from, %task, "a red verify went back into the run's conversation");
+            }
+            Ok(crate::cmd::agents::DispatchOutcome::Started { run, why }) => {
+                tracing::info!(%run, agent = %agent, %task, ?why, "a red verify went back to a fresh run");
+            }
+            // Something already holds the task — it will read the comment when it looks.
+            Ok(crate::cmd::agents::DispatchOutcome::Duplicate { held, .. }) => {
+                tracing::debug!(run = %held.run, %task, "a red verify found the task already held");
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent, %task, %error, "a red verify could not go back to the role");
+            }
+        }
     });
 }
 
@@ -2115,22 +2429,11 @@ pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
     let Some(turn) = turn_of(app, project, run) else {
         return;
     };
-    if !NUDGES.mark(turn) {
+    // A turn whose branch is still being verified waits for the answer (M114) — see [`GATES`].
+    let Some(turn) = gate_turn(&mut GATES.lock(), turn) else {
         return;
-    }
-    let app = app.clone();
-    // One short-lived thread per burst, as `crate::agents::mark_changed` does it: a process with
-    // no subagents in it must not wake up ten times a second for ever.
-    if let Err(error) = thread::Builder::new()
-        .name("cide-agent-nudge".into())
-        .spawn(move || flush_nudges(&app))
-    {
-        tracing::warn!(%error, "no thread for the orchestrator nudge; this turn ending is not announced");
-        // Without this the coalescer stays latched on a flusher that does not exist, and *every
-        // later* nudge in the process is swallowed by the `false` return above — one failed
-        // thread spawn would silently end the product-owner loop for the life of the app.
-        NUDGES.give_up();
-    }
+    };
+    announce(app, turn);
 }
 
 /// A run that died with a task and no successor writes one comment onto that task.
@@ -2256,7 +2559,7 @@ fn epitaph(run: RunId, facts: &DeathFacts) -> String {
         ),
         StopHow::Discarded => format!(
             "run {run} ({who}) was discarded by {by} without being resumed; its conversation is \
-             still on disk, so this task can be dispatched again{because}"
+             still on disk, so dispatching this task again continues it{because}"
         ),
         // Not a stop anybody asked for — `bring_up` reclaiming a checkout — and until M67 it
         // produced the crash sentence above about a run whose turn had already ended.
@@ -2269,6 +2572,14 @@ fn epitaph(run: RunId, facts: &DeathFacts) -> String {
         StopHow::Retired => format!(
             "run {run} ({who}) was ended because its task is done{exit}; its turn had already \
              ended, so nothing was interrupted"
+        ),
+        // Nobody's hand: cide ended a task run parked on an approval prompt (M118).
+        StopHow::Parked { waited_secs } => format!(
+            "run {run} ({who}) sat on an approval prompt for {} min with nobody to answer it, so \
+             cide ended it{exit}; nothing was approved. Its conversation is still on disk, so \
+             dispatching this task again continues it — decide first whether what it asked for \
+             should be allowed (a role that needs it can say permission-mode: bypassPermissions)",
+            waited_secs.div_ceil(60)
         ),
     }
 }
@@ -2456,7 +2767,7 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
                 // After the tab exists and never before: a row naming a session that failed to
                 // spawn would suppress the *next* burst's tab for a reviewer that never opened.
                 if let Some(task) = task {
-                    remember_reviewer(project, task, session);
+                    remember_reviewer(app, project, task, session);
                 }
             }
             // Dropped rather than held, and never silently: holding would wait for a condition
@@ -2614,6 +2925,50 @@ struct Turn {
     agent_label: String,
     task: Option<TaskId>,
     outcome: TurnOutcome,
+    /// What the verify of this run's branch said, when the turn waited for it (M114) — `None`
+    /// for a turn nothing verified, which is every turn of a project with no verify command.
+    gate: Option<GateNote>,
+}
+
+/// The verify verdict a turn carries into its announcement. (M114)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateNote {
+    Passed,
+    /// Red this many times in a row, which is past what goes back to the run — or `stuck`, red
+    /// again with nothing committed since the last hand-back (M118).
+    Failed {
+        times: u8,
+        stuck: bool,
+    },
+}
+
+/// "handed its turn back", "finished (exit 0)", … — and what the gate said, when it said
+/// anything. One phrase for the console line and the review brief alike, since both fill it
+/// into the same slot of a sentence.
+fn ended_phrase(turn: Option<&Turn>) -> String {
+    let ended = match turn.map(|turn| &turn.outcome) {
+        None | Some(TurnOutcome::HandedBack) => "handed its turn back".to_string(),
+        Some(TurnOutcome::Finished { code }) => format!("finished (exit {code})"),
+        Some(TurnOutcome::Failed) => "failed".to_string(),
+    };
+    match turn.and_then(|turn| turn.gate) {
+        None => ended,
+        Some(GateNote::Passed) => format!("{ended}, and the verify gate passed on its branch"),
+        Some(GateNote::Failed { times, stuck: true }) => format!(
+            "{ended}, and the verify gate failed on its branch {times} times in a row, the last \
+             with nothing committed since the one before — so it was not handed back again, and \
+             it is yours. If the run said it cannot commit (a `Read-only file system` from git), \
+             that is why; the latest output is the newest comment on the task"
+        ),
+        Some(GateNote::Failed {
+            times,
+            stuck: false,
+        }) => format!(
+            "{ended}, and the verify gate failed on its branch {times} times in a row — past what \
+             goes back to the run, so it is yours; the latest output is the newest comment on the \
+             task"
+        ),
+    }
 }
 
 /// Where a turn's line is typed. (M40) [`RunNotify`] with the silent arm removed — a silent run
@@ -2676,6 +3031,7 @@ fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
             agent: live.agent,
             agent_label: live.agent_label,
             task: live.task,
+            gate: None,
             outcome: match live.state {
                 RunState::Finished { code } => TurnOutcome::Finished { code },
                 RunState::Failed { .. } => TurnOutcome::Failed,
@@ -2788,11 +3144,7 @@ fn nudge_line(turns: &[Turn], title: Option<&str>) -> String {
     // The outcome is the difference between "answer it" and "its child is gone": a claude run
     // hands every ordinary turn back and exits only when stopped, an opencode run *finishes* as
     // its normal end — the orchestrator's next move differs, so the line says which.
-    let ended = match last.map(|turn| &turn.outcome) {
-        None | Some(TurnOutcome::HandedBack) => "handed its turn back".to_string(),
-        Some(TurnOutcome::Finished { code }) => format!("finished (exit {code})"),
-        Some(TurnOutcome::Failed) => "failed".to_string(),
-    };
+    let ended = ended_phrase(last);
 
     let task = last.and_then(|turn| turn.task.as_ref());
     let on = match (task, title.map(one_line).filter(|title| !title.is_empty())) {
@@ -2904,11 +3256,7 @@ fn review_prompt(template: &str, turns: &[Turn], title: Option<&str>) -> String 
         .filter(|label| !label.is_empty())
         .map_or_else(|| "a subagent".to_string(), |label| format!("`{label}`"));
 
-    let ended = match last.map(|turn| &turn.outcome) {
-        None | Some(TurnOutcome::HandedBack) => "handed its turn back".to_string(),
-        Some(TurnOutcome::Finished { code }) => format!("finished (exit {code})"),
-        Some(TurnOutcome::Failed) => "failed".to_string(),
-    };
+    let ended = ended_phrase(last);
 
     let also = match turns.len() {
         0 | 1 => String::new(),
@@ -3826,7 +4174,7 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 23, "{names:?}");
+            assert_eq!(names.len(), 24, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
@@ -3889,6 +4237,7 @@ mod tests {
             for guessed in [
                 "cide_agents_config",
                 "cide_agent_override",
+                "cide_agent_override_profile",
                 "cide_llm_provider",
                 "cide_llm_pool",
             ] {
@@ -4128,6 +4477,107 @@ mod tests {
     }
 
     // --------------------------------------------------------------------------------------
+    // The gate before the reviewer. (M114)
+    // --------------------------------------------------------------------------------------
+
+    /// The usual order: the turn ends while verify is still running and waits; green lets it
+    /// through, told so, and the entry is gone.
+    #[test]
+    fn a_turn_waits_for_its_gate_and_a_green_one_lets_it_through() {
+        let project = ProjectId::new();
+        let mut gates = Vec::new();
+        open_gate(&mut gates, project, TaskId("t-1".into()));
+        assert_eq!(
+            gate_turn(&mut gates, turn(project, "Developer", Some("t-1"))),
+            None
+        );
+        let out = close_gate(
+            &mut gates,
+            project,
+            &TaskId("t-1".into()),
+            GateVerdict::Passed,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].gate, Some(GateNote::Passed));
+        assert!(gates.is_empty());
+        assert!(ended_phrase(out.first()).contains("verify gate passed"));
+    }
+
+    /// Red within the retries: the output went back to the run, and nobody else is told.
+    #[test]
+    fn a_red_gate_handed_back_announces_nothing() {
+        let project = ProjectId::new();
+        let mut gates = Vec::new();
+        open_gate(&mut gates, project, TaskId("t-1".into()));
+        gate_turn(&mut gates, turn(project, "Developer", Some("t-1")));
+        let out = close_gate(
+            &mut gates,
+            project,
+            &TaskId("t-1".into()),
+            GateVerdict::HandedBack,
+        );
+        assert!(out.is_empty());
+        assert!(gates.is_empty());
+    }
+
+    /// The other order: the verdict came first (a cached verify, a dirty checkout), so the turn
+    /// that arrives next is decided by it — swallowed once, and the one after is ordinary.
+    #[test]
+    fn an_early_verdict_waits_for_the_turn_it_is_about() {
+        let project = ProjectId::new();
+        let mut gates = Vec::new();
+        open_gate(&mut gates, project, TaskId("t-1".into()));
+        assert!(
+            close_gate(
+                &mut gates,
+                project,
+                &TaskId("t-1".into()),
+                GateVerdict::HandedBack
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            gate_turn(&mut gates, turn(project, "Developer", Some("t-1"))),
+            None
+        );
+        assert!(gates.is_empty());
+        let next = gate_turn(&mut gates, turn(project, "Developer", Some("t-1")));
+        assert_eq!(next.and_then(|t| t.gate), None);
+
+        open_gate(&mut gates, project, TaskId("t-1".into()));
+        close_gate(
+            &mut gates,
+            project,
+            &TaskId("t-1".into()),
+            GateVerdict::Escalated {
+                times: 4,
+                stuck: false,
+            },
+        );
+        let told = gate_turn(&mut gates, turn(project, "Developer", Some("t-1")));
+        assert_eq!(
+            told.as_ref().and_then(|t| t.gate),
+            Some(GateNote::Failed {
+                times: 4,
+                stuck: false
+            })
+        );
+        assert!(ended_phrase(told.as_ref()).contains("4 times in a row"));
+    }
+
+    /// Another task's turn, or a task-less one, is not held by somebody else's gate.
+    #[test]
+    fn a_gate_holds_only_its_own_task() {
+        let project = ProjectId::new();
+        let mut gates = Vec::new();
+        open_gate(&mut gates, project, TaskId("t-1".into()));
+        assert!(gate_turn(&mut gates, turn(project, "Developer", Some("t-2"))).is_some());
+        assert!(gate_turn(&mut gates, turn(project, "Developer", None)).is_some());
+        assert!(gate_turn(&mut gates, turn(ProjectId::new(), "Developer", Some("t-1"))).is_some());
+        assert_eq!(gates.len(), 1);
+    }
+
+    // --------------------------------------------------------------------------------------
     // One reviewer per task. (M79)
     // --------------------------------------------------------------------------------------
 
@@ -4232,6 +4682,7 @@ mod tests {
             agent_label: agent.to_string(),
             task: task.map(|id| TaskId(id.to_string())),
             outcome,
+            gate: None,
         }
     }
 
@@ -5022,6 +5473,15 @@ mod tests {
 
         // The reclaim: not a stop anybody asked for. Until M67 it borrowed the crash sentence
         // and reported a run whose turn had *already ended* as having died before finishing.
+        // A park cide ended (M118): nothing approved, and the conversation is continuable.
+        let parked = epitaph(
+            run,
+            &facts(Some(129), Some(StopHow::Parked { waited_secs: 301 }), None),
+        );
+        assert!(parked.contains("approval prompt for 6 min"), "{parked}");
+        assert!(parked.contains("nothing was approved"), "{parked}");
+        assert!(parked.contains("continues it"), "{parked}");
+
         let reclaimed = epitaph(run, &facts(Some(129), Some(StopHow::Reclaimed), None));
         assert!(
             reclaimed.contains("give its worktree to another task"),

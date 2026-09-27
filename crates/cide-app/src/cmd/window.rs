@@ -188,7 +188,7 @@ pub fn window_set_mode(
     app: AppHandle,
     mode: WindowMode,
 ) -> Result<Mutated, CoreError> {
-    state.update(|ws| workspace::set_window_mode(ws, mode))?;
+    state.update_cosmetic(|ws| workspace::set_window_mode(ws, mode))?;
     reconcile(&app, &state)?;
     Ok(Mutated { rev: state.rev() })
 }

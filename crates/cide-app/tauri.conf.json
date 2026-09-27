@@ -43,5 +43,10 @@
     "shortDescription": "A Claude-Code-native IDE",
     "longDescription": "An IDE built around a live Claude Code session: a pinned project console of tiling Claude and shell panes, alongside a file tree, tabbed editor and an IDEA-style git commit tool window."
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": ["https://github.com/lantian/cide/releases/latest/download/latest.json"]
+    }
+  }
 }

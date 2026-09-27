@@ -9,6 +9,12 @@
   gap: var(--sp-6);
 }
 
+/* The pool selector: sized to a pool name, not stretched across the wide dialog. */
+.picker {
+  width: calc(280px * var(--ui-scale));
+  max-width: 100%;
+}
+
 .entries,
 .list {
   margin: 0;
@@ -68,11 +74,17 @@
 }
 
 .runs,
+.stats,
 .testOk,
 .testBad {
   margin: var(--sp-1) 0 0 calc(28px * var(--ui-scale));
   font-size: var(--fs-ui-11);
   color: var(--dim);
+}
+
+.stats {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .testOk {
@@ -90,10 +102,28 @@
   line-height: 1.4;
 }
 
-.time {
-  margin-right: var(--sp-4);
+/*
+ * Recent decisions: the kit's table, with the cells' text styled here. Every column but Details
+ * keeps to one line, so the facts line up down the table; Details takes what is left and wraps.
+ * The wrapper scrolls sideways rather than squeezing, for a narrow window at a large UI scale.
+ */
+.events {
+  overflow-x: auto;
+}
+
+.mono,
+.nowrap {
+  white-space: nowrap;
+}
+
+.mono {
   font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+}
+
+.details {
   color: var(--dim);
+  font-size: var(--fs-ui-11);
 }
 
 .who {

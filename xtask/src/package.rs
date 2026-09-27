@@ -530,6 +530,10 @@ pub struct AppInfo {
     pub bundle_targets: Vec<String>,
     pub icons: Vec<String>,
     pub has_updater: bool,
+    /// `plugins.updater.pubkey` is present and not empty. The block itself must exist for the
+    /// plugin to start at all, so it is checked in with an empty key until the maintainer runs
+    /// `tauri signer generate` (docs/packaging.md); an empty key means "configured, not signed".
+    pub updater_pubkey: bool,
     /// `bundle.externalBin` from `TAURI_BUNDLE_CONF` — the sidecars the bundler copies beside
     /// the main binary.
     pub external_bin: Vec<String>,
@@ -1045,6 +1049,14 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
                 if let Some((_, files)) = webkit_helper_plan() {
                     args.push("--config".into());
                     args.push(appimage_files_config(&files));
+                }
+                // The update signatures, as a third `--config` and only when there is a key to
+                // make them with. See `updater_artifacts_config`.
+                if let Some(config) =
+                    updater_artifacts_config(info, std::env::var_os(SIGNING_KEY_VAR).is_some())
+                {
+                    args.push("--config".into());
+                    args.push(config);
                 }
                 args.extend(["--bundles".into(), bundles]);
                 args
@@ -2216,18 +2228,11 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
 
     if targets.appimage {
         out.push(webkit_helper_check());
-        out.push(if info.has_updater {
-            Verdict::Ok("the updater plugin is configured".into())
-        } else {
-            // A warning, not a failure: an AppImage without an updater endpoint is a
-            // perfectly good AppImage. It is just not the *self-updating* channel, which is
-            // the only reason this format was chosen over the others.
-            Verdict::Warn(
-                "no `plugins.updater` in the config: this AppImage will not self-update, \
-                 and AppImage is the only Linux format `tauri-plugin-updater` supports"
-                    .into(),
-            )
-        });
+        out.push(updater_verdict(
+            info,
+            std::env::var_os(SIGNING_KEY_VAR).is_some(),
+            std::env::var_os(RELEASE_VAR).is_some(),
+        ));
     }
 
     if targets.flatpak {
@@ -2345,18 +2350,71 @@ fn macos_checks(info: &AppInfo) -> Vec<Verdict> {
         info.macos_signing_identity.as_deref(),
     ));
 
-    // The updater's macOS channel is a different artefact from the `.dmg`. Worth one line
-    // because the Linux warning below names AppImage and would otherwise read as "sorted".
-    if !info.has_updater {
-        out.push(Verdict::Warn(
-            "no `plugins.updater` in the config. On macOS the updater's artefact is an \
-             `app.tar.gz`, which is a third bundle target rather than a property of the .dmg — \
-             so self-updating is not something the .dmg gains by being configured"
-                .into(),
-        ));
-    }
+    // The updater's macOS channel is a different artefact from the `.dmg`: an `app.tar.gz` and
+    // its `.sig`, written beside the `.app` when `createUpdaterArtifacts` is on. Same verdict as
+    // the AppImage's, because the same key signs both.
+    out.push(updater_verdict(
+        info,
+        std::env::var_os(SIGNING_KEY_VAR).is_some(),
+        std::env::var_os(RELEASE_VAR).is_some(),
+    ));
 
     out
+}
+
+/// The private half of the update signing key, as `cargo tauri build` reads it. Its password, if
+/// the key has one, is `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, which this task never reads.
+const SIGNING_KEY_VAR: &str = "TAURI_SIGNING_PRIVATE_KEY";
+
+/// Set by `release.yml`. Turns "no signing key" from a warning into a refusal, because a release
+/// built without one publishes no `.sig` files and so no `latest.json`, and every installed copy
+/// then silently stops hearing about new versions.
+const RELEASE_VAR: &str = "CIDE_RELEASE";
+
+/// `bundle.createUpdaterArtifacts: true`, as one `--config` JSON argument, when this build can
+/// sign; otherwise `None`.
+///
+/// Not in tauri.conf.json, and that is the point: with the flag in the checked-in config,
+/// `cargo tauri build` refuses outright on any machine without the private key — which is every
+/// machine but the release runner, `./build.sh` included. As an argument it is added exactly when
+/// the key is there, and a local AppImage simply comes out unsigned (and cannot be offered as an
+/// update, which a local build never is).
+fn updater_artifacts_config(info: &AppInfo, have_key: bool) -> Option<String> {
+    (info.has_updater && info.updater_pubkey && have_key)
+        .then(|| r#"{"bundle":{"createUpdaterArtifacts":true}}"#.to_string())
+}
+
+/// Whether this build will produce what self-update needs. Pure over its inputs, for
+/// [`signing_verdicts`]' reason.
+fn updater_verdict(info: &AppInfo, have_key: bool, release: bool) -> Verdict {
+    if !info.has_updater {
+        // A warning, not a failure: a bundle without an updater endpoint is a perfectly good
+        // bundle. It is just not the *self-updating* channel.
+        return Verdict::Warn(
+            "no `plugins.updater` in the config: this bundle will not self-update".into(),
+        );
+    }
+    if !info.updater_pubkey {
+        let text = "`plugins.updater.pubkey` is empty: the running app never checks for updates \
+                    and no signatures are made. `tauri signer generate` and docs/packaging.md";
+        return if release {
+            Verdict::Fail(format!("{text} — a release must be signed"))
+        } else {
+            Verdict::Warn(text.into())
+        };
+    }
+    if !have_key {
+        let text = format!(
+            "{SIGNING_KEY_VAR} is not set: the bundle is built without update signatures, so it \
+             cannot be published as an update"
+        );
+        return if release {
+            Verdict::Fail(format!("{text} — a release must be signed"))
+        } else {
+            Verdict::Warn(text)
+        };
+    }
+    Verdict::Ok("the updater is configured and this build signs its artefacts".into())
 }
 
 /// The signing and notarisation verdicts, over the environment rather than reading it.
@@ -3566,6 +3624,10 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         bundle_targets: list(conf.pointer("/bundle/targets")),
         icons: list(conf.pointer("/bundle/icon")),
         has_updater: conf.pointer("/plugins/updater").is_some(),
+        updater_pubkey: conf
+            .pointer("/plugins/updater/pubkey")
+            .and_then(|v| v.as_str())
+            .is_some_and(|key| !key.trim().is_empty()),
         external_bin: list(overlay.pointer("/bundle/externalBin")),
         base_external_bin: list(conf.pointer("/bundle/externalBin")),
         macos_bundle_targets: list(macos.pointer("/bundle/targets")),
@@ -3678,6 +3740,7 @@ mod tests {
             bundle_targets: vec!["appimage".into(), "deb".into()],
             icons: vec!["icons/32x32.png".into()],
             has_updater: false,
+            updater_pubkey: false,
             external_bin: vec!["../../target/release/cide-hook".into()],
             base_external_bin: Vec::new(),
             macos_bundle_targets: vec!["app".into(), "dmg".into()],
@@ -5893,5 +5956,53 @@ mod tests {
         assert_eq!(name_some(&["a".into()], 1), "a");
         assert_eq!(name_some(&["a".into(), "b".into()], 2), "a, b");
         assert_eq!(name_some(&["a".into(), "b".into()], 7), "a, b and 5 more");
+    }
+
+    #[test]
+    fn update_signatures_are_asked_for_only_with_a_key_to_make_them() {
+        let mut conf = info();
+        assert_eq!(
+            updater_artifacts_config(&conf, true),
+            None,
+            "no plugin block"
+        );
+        conf.has_updater = true;
+        assert_eq!(updater_artifacts_config(&conf, true), None, "empty pubkey");
+        conf.updater_pubkey = true;
+        assert_eq!(
+            updater_artifacts_config(&conf, false),
+            None,
+            "no private key"
+        );
+        let arg = updater_artifacts_config(&conf, true).expect("everything present");
+        let json: serde_json::Value = serde_json::from_str(&arg).unwrap();
+        assert_eq!(
+            json.pointer("/bundle/createUpdaterArtifacts"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn an_unsigned_release_is_refused_and_an_unsigned_local_build_is_not() {
+        let mut conf = info();
+        conf.has_updater = true;
+        assert!(matches!(
+            updater_verdict(&conf, false, false),
+            Verdict::Warn(_)
+        ));
+        assert!(
+            matches!(updater_verdict(&conf, true, true), Verdict::Fail(_)),
+            "empty pubkey"
+        );
+        conf.updater_pubkey = true;
+        assert!(matches!(
+            updater_verdict(&conf, false, false),
+            Verdict::Warn(_)
+        ));
+        assert!(matches!(
+            updater_verdict(&conf, false, true),
+            Verdict::Fail(_)
+        ));
+        assert!(matches!(updater_verdict(&conf, true, true), Verdict::Ok(_)));
     }
 }

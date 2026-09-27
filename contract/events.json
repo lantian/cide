@@ -6,6 +6,7 @@
   "cide://docker-changed",
   "cide://ext-changed",
   "cide://fs-changed",
+  "cide://fs-clip-changed",
   "cide://fs-status",
   "cide://git-status",
   "cide://gitlab-changed",
@@ -14,6 +15,7 @@
   "cide://keymap-changed",
   "cide://milestones-changed",
   "cide://mouse-nav",
+  "cide://pool-notice",
   "cide://project-new-progress",
   "cide://project-running",
   "cide://remote-changed",
@@ -25,5 +27,8 @@
   "cide://session-tool",
   "cide://spec-changed",
   "cide://tasks-changed",
+  "cide://update-available",
+  "cide://update-progress",
+  "cide://update-ready",
   "cide://workspace-changed"
 ]

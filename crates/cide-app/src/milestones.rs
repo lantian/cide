@@ -3,8 +3,9 @@
 //! `cide_ipc::milestones` says why milestones exist and `cide_agents::milestones` what they decide
 //! about a board. This module is the part that runs programs and remembers what they said:
 //!
-//! * **A gate** — the active milestone's command, run in the project root after every
-//!   integration and on request. When it passes, the milestone's task moves to *review* with the
+//! * **A gate** — the active milestone's command, run in the project root on request and, as the
+//!   plan's `gateRuns` says, after every agent integration (`merge`, the default), only when the
+//!   spinner wakes a quiet project (`idle`), or never by itself (`manual`). When it passes, the milestone's task moves to *review* with the
 //!   output as a comment and the spinner stops waking the project: the next step is the user's.
 //! * **Verify** — the project's own check, run in a run's worktree before
 //!   `cide_agent_integrate` merges its branch. Red refuses the merge with the output, which is the
@@ -68,6 +69,16 @@ struct RootChecks {
     /// is news. (M83)
     #[serde(skip)]
     task_verifies: HashMap<TaskId, (AgentId, bool, Option<CheckResult>)>,
+    /// Red verifies in a row per task, on the review road ([`prewarm`]), reset by a green one.
+    /// What `agents.verifyRetries` is counted against. (M114) Memory only, like its neighbour:
+    /// a restart forgets it and the run gets its retries again, which is the cheap side to err on.
+    #[serde(skip)]
+    verify_failures: HashMap<TaskId, u8>,
+    /// What the last red verify of each task was *about* — its head and its uncommitted paths —
+    /// so the next red one can tell "the run changed nothing" from "the run tried again and it is
+    /// still red". (M118) Memory only, for `verify_failures`' reason; cleared by green.
+    #[serde(skip)]
+    red_marks: HashMap<TaskId, RedMark>,
     /// The commit the gate last ran against, per milestone, so the spinner can tell whether
     /// anything landed since.
     #[serde(default)]
@@ -151,10 +162,9 @@ fn log_string(root: &Path, kind: LogKind, key: &str) -> Option<String> {
 impl Checks {
     fn with<T>(&self, root: &Path, f: impl FnOnce(&mut RootChecks) -> T) -> T {
         self.loaded.get_or_init(|| {
-            let loaded: HashMap<PathBuf, RootChecks> = std::fs::read(store_path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
+            // A corrupt file is moved aside rather than read as empty and then saved over.
+            let loaded: HashMap<PathBuf, RootChecks> =
+                cide_core::persist::read_or_quarantine(&store_path());
             if let Ok(mut inner) = self.inner.lock() {
                 *inner = loaded;
             }
@@ -246,6 +256,7 @@ pub fn view(app: &AppHandle, project: ProjectId) -> Option<MilestonesView> {
                 .unwrap_or_default(),
         })
         .collect();
+    let retries = cide_agents::config::load(&root).agents.verify_retries();
     let verifies = checks.with(&root, |c| {
         let mut all: Vec<cide_ipc::VerifyState> = c
             .task_verifies
@@ -256,6 +267,8 @@ pub fn view(app: &AppHandle, project: ProjectId) -> Option<MilestonesView> {
                 running: *running,
                 last: last.clone(),
                 log: log_string(&root, LogKind::Verify, task.as_str()),
+                failures: c.verify_failures.get(task).copied().unwrap_or(0),
+                retries,
             })
             .collect();
         all.sort_by_key(|v| {
@@ -301,9 +314,40 @@ pub fn run_gate(app: &AppHandle, project: ProjectId) {
 /// Run the active gate and wait for it — the spinner's road, which is already on its own thread
 /// and must plan from a fresh answer rather than from one started a moment ago.
 pub fn run_gate_now(app: &AppHandle, project: ProjectId) -> Option<CheckResult> {
+    run_gate_of(app, project, None)
+}
+
+/// Run one named milestone's gate in the background — the milestone modal's Run gate, which
+/// works on any milestone, not only the active one. An accepted milestone whose gate went red
+/// afterwards (something landed later and broke what it promised) had no way back to a fresh
+/// verdict: every other road runs `current()`, and making the old milestone active again just to
+/// re-check it would re-open planning for it. Refused for an id the plan does not have, so a
+/// stale modal says so instead of silently running the active gate.
+pub fn run_gate_for(app: &AppHandle, project: ProjectId, milestone: String) -> Result<(), String> {
+    let root = root_of(app, project).ok_or("that project is not open here")?;
+    let plan = cide_agents::config::load_milestones(&root);
+    if !plan.items.iter().any(|m| m.id == milestone) {
+        return Err(format!("there is no milestone `{milestone}`"));
+    }
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("cide-gate".into())
+        .spawn(move || {
+            run_gate_of(&app, project, Some(&milestone));
+        })
+        .map(|_| ())
+        .map_err(|error| format!("could not start a thread for the gate: {error}"))
+}
+
+/// The one body both roads share: `which` names a milestone, `None` means the current one.
+fn run_gate_of(app: &AppHandle, project: ProjectId, which: Option<&str>) -> Option<CheckResult> {
     let root = root_of(app, project)?;
     let plan = cide_agents::config::load_milestones(&root);
-    let milestone = plan.current()?.clone();
+    let current = plan.current()?.clone();
+    let milestone = match which {
+        Some(id) => plan.items.iter().find(|m| m.id == id)?.clone(),
+        None => current.clone(),
+    };
     if milestone.gate.trim().is_empty() {
         return None;
     }
@@ -338,7 +382,11 @@ pub fn run_gate_now(app: &AppHandle, project: ProjectId) -> Option<CheckResult> 
         c.gates.insert(milestone.id.clone(), result.clone());
     });
     checks.save();
-    if result.passed {
+    // Only the current milestone's green gate moves its task to review. An accepted one's task
+    // is done already (`announce_met` leaves it), and a later one that happens to pass early is
+    // not the goal being worked on: sending its task to review would put a milestone the plan
+    // has not reached in front of the user as if it were the next thing to accept.
+    if result.passed && milestone.id == current.id {
         announce_met(app, project, &milestone, &result);
     }
     crate::emit::milestones_changed(app, project);
@@ -867,7 +915,14 @@ fn verify(checks: &Checks, root: &Path, job: &VerifyJob<'_>) -> (CheckResult, Ve
     (result, run)
 }
 
-/// Start verify for a run's branch in the background, so it is ready when a reviewer merges.
+/// Start verify for a run's branch in the background, and hold its reviewer until it answers.
+///
+/// Warming only, until M114: the merge was where the result was enforced, and the reviewer opened
+/// beside it. Now this verify is **the gate the reviewer waits behind** (`agent_rpc::GATES` has
+/// the whole argument) and its answer is acted on here — [`settle_gate`]. A checkout with
+/// uncommitted changes is answered at once, as the red verdict `before_integrate` would give it
+/// at the merge: what is merged is the branch, and the run that forgot to commit is the one that
+/// can.
 pub fn prewarm(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId) {
     let Some(root) = root_of(app, project) else {
         return;
@@ -876,23 +931,63 @@ pub fn prewarm(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId
     if plan.verify.trim().is_empty() {
         return;
     }
-    let worktree =
-        cide_git::worktree::path_of(&root, &cide_agents::checkout_name(&agent, Some(&task)));
-    if !worktree.is_dir() || !dirty_paths(&worktree).is_empty() {
+    let name = cide_agents::checkout_name(&agent, Some(&task));
+    let worktree = cide_git::worktree::path_of(&root, &name);
+    if !worktree.is_dir() {
         return;
     }
     let Some(checks) = checks(app).map(|s| Arc::clone(&s)) else {
         return;
     };
+    crate::agent_rpc::gate_opened(project, task.clone());
+    let dirty = dirty_paths(&worktree);
+    if !dirty.is_empty() {
+        let why = format!(
+            "not merged: .cide/worktrees/{name} has changes that were never committed ({}). \
+             What is merged is the branch, so they would be lost, and verify would be checking \
+             something other than what lands. Commit them (or discard them) and set review again.",
+            dirty.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        );
+        let refused = CheckResult {
+            command: plan.verify.clone(),
+            passed: false,
+            exit_code: None,
+            timed_out: false,
+            tail: why.clone(),
+            started_unix_ms: now_ms(),
+            duration_ms: 0,
+            head: None,
+        };
+        note_verify(
+            app,
+            project,
+            &checks,
+            &root,
+            &agent,
+            &task,
+            false,
+            Some(refused),
+        );
+        let mark = RedMark {
+            head: cide_core::check::head_of(&worktree),
+            dirty,
+        };
+        settle_gate(
+            app, project, &checks, &root, &agent, &task, false, &why, mark,
+        );
+        return;
+    }
+    let (outer, gated) = (app.clone(), task.clone());
     let app = app.clone();
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("cide-verify".into())
         .spawn(move || {
             // The same environment and slot `before_integrate` would use, read on this thread
             // because `isolated_env` makes directories.
             let agents = cide_agents::config::load(&root).agents;
-            let branch = format!("cide/{}", cide_agents::checkout_name(&agent, Some(&task)));
-            let (result, _) = verify_task(
+            let branch = format!("cide/{name}");
+            let mut live = live_runs(&app, project, &root, &name);
+            let (result, ran) = verify_task(
                 &app,
                 project,
                 &checks,
@@ -910,7 +1005,192 @@ pub fn prewarm(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId
                 Some(&task),
             );
             tracing::info!(%agent, %task, passed = result.passed, "verify ran on review");
+            let report_text = if result.passed {
+                String::new()
+            } else {
+                for run in live_runs(&app, project, &root, &name) {
+                    if !live.contains(&run) {
+                        live.push(run);
+                    }
+                }
+                let log = log_string(&root, LogKind::Verify, task.as_str());
+                cide_agents::milestones::verify_refusal(&cide_agents::milestones::VerifyReport {
+                    branch: &branch,
+                    result: &result,
+                    reused: ran.reused,
+                    waited: ran
+                        .waited_behind
+                        .as_deref()
+                        .map(|behind| (ran.waited_ms, behind)),
+                    live: &live,
+                    isolating: !agents.isolate_env.is_empty(),
+                    log: log.as_deref(),
+                })
+            };
+            settle_gate(
+                &app,
+                project,
+                &checks,
+                &root,
+                &agent,
+                &task,
+                result.passed,
+                &report_text,
+                RedMark {
+                    head: result.head.clone(),
+                    dirty: Vec::new(),
+                },
+            );
         });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "no thread for verify on review; the reviewer is not held");
+        crate::agent_rpc::gate_closed(
+            &outer,
+            project,
+            &gated,
+            crate::agent_rpc::GateVerdict::Passed,
+        );
+    }
+}
+
+/// What a red verify was about: the branch's head and the paths left uncommitted. Two reds
+/// with the same mark mean nothing new was committed between them. (M118)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RedMark {
+    pub head: Option<String>,
+    pub dirty: Vec<String>,
+}
+
+/// Act on the review road's verify: count it, and send the turn it held where it belongs. (M114)
+///
+/// A red one that is **the same as the last** — same head, same uncommitted paths — is not
+/// handed back again (M118). selfcraft's codex runs could not commit (their sandbox kept the git
+/// metadata read-only), and the gate handed the same dirty checkout back three times, then kept
+/// failing up to six in a row: every round trip was a billed turn with no possible progress, and
+/// cide could not tell "did not commit" from "cannot commit". It still cannot tell *why*; it can
+/// tell that nothing moved, and a run given the same refusal twice with nothing moved in between
+/// is not going to move it a third time.
+///
+/// Green resets the count and lets the reviewer open. Red writes the refusal onto the task —
+/// the whole of it, since that is what either reader will need and a PTY line cannot carry it —
+/// and then goes back to the run while the count is within `agents.verifyRetries`, or on to
+/// the reviewer, with the count, once it is past.
+#[allow(clippy::too_many_arguments)]
+fn settle_gate(
+    app: &AppHandle,
+    project: ProjectId,
+    checks: &Checks,
+    root: &Path,
+    agent: &AgentId,
+    task: &TaskId,
+    passed: bool,
+    refusal: &str,
+    mark: RedMark,
+) {
+    use crate::agent_rpc::GateVerdict;
+    let retries = cide_agents::config::load(root).agents.verify_retries();
+    let (times, progressed) = checks.with(root, |c| {
+        if passed {
+            c.verify_failures.remove(task);
+            c.red_marks.remove(task);
+            (0, true)
+        } else {
+            let times = c.verify_failures.entry(task.clone()).or_insert(0);
+            *times = times.saturating_add(1);
+            let previous = c.red_marks.insert(task.clone(), mark.clone());
+            (*times, previous.as_ref() != Some(&mark))
+        }
+    });
+    crate::emit::milestones_changed(app, project);
+    let verdict = gate_verdict(passed, times, retries, progressed);
+    if !passed {
+        comment_refusal(
+            app,
+            project,
+            task,
+            &refusal_comment(refusal, verdict, times, retries),
+        );
+    }
+    if verdict == GateVerdict::HandedBack {
+        let branch = format!("cide/{}", cide_agents::checkout_name(agent, Some(task)));
+        let line = format!(
+            "The verify gate failed on your branch {branch} ({times} of {retries} red verifies \
+             that come back to you before the reviewer takes over). The output is the newest \
+             comment on {task}; read it with mcp__cide__cide_task_get. Fix what it names in this \
+             branch, commit, and set {task} to review again. If the failure is in something you \
+             may not change, say exactly that in a comment and set review anyway."
+        );
+        crate::agent_rpc::hand_back_to_run(app, project, agent, task, &line);
+    }
+    crate::agent_rpc::gate_closed(app, project, task, verdict);
+}
+
+/// The rule [`settle_gate`] applies, pure: green passes; red goes back to the run while
+/// `times` is within `retries` **and the run moved something since the last red one**
+/// (`progressed`, M118), and to the reviewer otherwise. `0` retries is the pre-M114 road.
+fn gate_verdict(
+    passed: bool,
+    times: u8,
+    retries: u8,
+    progressed: bool,
+) -> crate::agent_rpc::GateVerdict {
+    use crate::agent_rpc::GateVerdict;
+    if passed {
+        GateVerdict::Passed
+    } else if times <= retries && progressed {
+        GateVerdict::HandedBack
+    } else {
+        GateVerdict::Escalated {
+            times,
+            stuck: !progressed,
+        }
+    }
+}
+
+/// What a red verify writes on its task: who it goes to, then the refusal verbatim.
+fn refusal_comment(
+    refusal: &str,
+    verdict: crate::agent_rpc::GateVerdict,
+    times: u8,
+    retries: u8,
+) -> String {
+    use crate::agent_rpc::GateVerdict;
+    let to = match verdict {
+        GateVerdict::Escalated { stuck: true, .. } => "with the same result and no new commit \
+             since the last hand-back, so it is not handed back again — for the reviewer. If the \
+             run reported it cannot commit (a `Read-only file system` from git, say), that is the \
+             cause, and another hand-back would not change it"
+            .to_string(),
+        GateVerdict::Escalated { times, .. } => {
+            format!(
+                "{times} in a row, past the {retries} that go back to the run — for the reviewer"
+            )
+        }
+        // `Passed` never writes a refusal.
+        GateVerdict::HandedBack | GateVerdict::Passed => {
+            format!("handed back to the run ({times} of {retries})")
+        }
+    };
+    format!("**Verify failed on review**, {to}.\n\n{refusal}")
+}
+
+fn comment_refusal(app: &AppHandle, project: ProjectId, task: &TaskId, text: &str) {
+    let Some(stores) = app.try_state::<Arc<TasksStores>>() else {
+        return;
+    };
+    let Some(store) = stores.get(project) else {
+        return;
+    };
+    match store.edit(
+        task,
+        TaskEdit::Comment {
+            text: text.to_string(),
+        },
+        TaskAuthor::Orchestrator,
+    ) {
+        Ok(_) => crate::tasks_state::broadcast(app, project, &store),
+        Err(error) => tracing::debug!(%task, %error, "no verify comment; the task is gone"),
+    }
 }
 
 /// [`verify`], with the board told it is running and what it answered. (M83)
@@ -1025,6 +1305,81 @@ fn last_lines(text: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three red verifies go back to the run, the fourth is the reviewer's, and green is green
+    /// whatever came before. `0` retries sends every red one to the reviewer. (M114)
+    #[test]
+    fn a_red_gate_goes_back_to_the_run_until_the_retries_are_spent() {
+        use crate::agent_rpc::GateVerdict;
+        assert_eq!(gate_verdict(true, 0, 3, true), GateVerdict::Passed);
+        for times in 1..=3 {
+            assert_eq!(
+                gate_verdict(false, times, 3, true),
+                GateVerdict::HandedBack,
+                "{times}"
+            );
+        }
+        let past = GateVerdict::Escalated {
+            times: 4,
+            stuck: false,
+        };
+        assert_eq!(gate_verdict(false, 4, 3, true), past);
+        assert_eq!(
+            gate_verdict(false, 1, 0, true),
+            GateVerdict::Escalated {
+                times: 1,
+                stuck: false
+            }
+        );
+        assert!(
+            refusal_comment("x", GateVerdict::HandedBack, 2, 3)
+                .contains("handed back to the run (2 of 3)")
+        );
+        assert!(refusal_comment("x", past, 4, 3).contains("for the reviewer"));
+    }
+
+    /// The same red result on the same commit is not handed back twice: a run that could not
+    /// commit (selfcraft's codex runs, before M118) was otherwise sent the same refusal until
+    /// the retries ran out. A run that committed something gets its retries. (M118)
+    #[test]
+    fn a_red_gate_with_no_new_commit_is_not_handed_back_twice() {
+        use crate::agent_rpc::GateVerdict;
+        let stuck = gate_verdict(false, 2, 3, false);
+        assert_eq!(
+            stuck,
+            GateVerdict::Escalated {
+                times: 2,
+                stuck: true
+            }
+        );
+        assert_eq!(gate_verdict(false, 2, 3, true), GateVerdict::HandedBack);
+        let text = refusal_comment("x", stuck, 2, 3);
+        assert!(text.contains("no new commit"), "{text}");
+        assert!(text.contains("Read-only file system"), "{text}");
+        // Green is green, moved or not.
+        assert_eq!(gate_verdict(true, 0, 3, false), GateVerdict::Passed);
+    }
+
+    /// Two dirty-checkout refusals with the same head and the same paths are the same mark; a
+    /// commit or a changed path set is progress.
+    #[test]
+    fn a_dirty_checkout_is_a_red_mark() {
+        let mark = |head: &str, dirty: &[&str]| RedMark {
+            head: Some(head.to_string()),
+            dirty: dirty.iter().map(|p| p.to_string()).collect(),
+        };
+        assert_eq!(mark("abc", &["a.gd"]), mark("abc", &["a.gd"]));
+        assert_ne!(
+            mark("abc", &["a.gd"]),
+            mark("def", &["a.gd"]),
+            "a new commit"
+        );
+        assert_ne!(
+            mark("abc", &["a.gd"]),
+            mark("abc", &[]),
+            "committed the paths"
+        );
+    }
 
     /// A log key becomes a file name, so anything but a plain name is refused rather than
     /// joined — a task id is `t-12`, a milestone id `slice`, and neither has a `/` in it.
@@ -1240,6 +1595,7 @@ mod tests {
             model: None,
             pool_position: None,
             worktree,
+            reviewer: None,
         }
     }
 

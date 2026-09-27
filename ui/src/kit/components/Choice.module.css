@@ -388,3 +388,89 @@
   line-height: 1.45;
   color: var(--dim);
 }
+
+/* --- colour swatches ------------------------------------------------------------------------ */
+
+/*
+ * A colour choice: preset swatches, a Custom swatch over the native colour input, a hex field.
+ * The swatch *is* the colour, so it is painted inline by the component; everything else here is
+ * tokens. The check on the chosen swatch is white with a dark halo, because it sits on whatever
+ * colour the user picked and no single ink is legible on all of them.
+ */
+.swatchField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.swatchRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.swatch {
+  flex: none;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(22px * var(--ui-scale));
+  height: calc(22px * var(--ui-scale));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: var(--panel-2);
+  box-shadow: var(--fill-sheen);
+  color: var(--on-fill);
+  filter: drop-shadow(0 0 0.5px rgba(0, 0, 0, 0.6));
+  cursor: pointer;
+}
+
+.swatch[aria-checked='true'],
+.swatchCustom[data-on='true'] {
+  outline: 2px solid var(--text-hi);
+  outline-offset: 2px;
+}
+
+.swatch:focus-visible,
+.swatchCustom:focus-within {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* The empty Custom swatch: a dashed ring with a plus, in the ordinary ink. */
+.swatchCustom:not([data-on='true']) {
+  border-style: dashed;
+  background: transparent;
+  box-shadow: none;
+  filter: none;
+  color: var(--dim);
+}
+
+.swatchNative {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.swatchHex {
+  width: calc(96px * var(--ui-scale));
+}
+
+.swatchError {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--red);
+}

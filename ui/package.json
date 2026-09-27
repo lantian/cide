@@ -12,6 +12,7 @@
     "check:docker": "node scripts/check-docker.mjs",
     "check:docker-render": "node scripts/check-docker-render.mjs",
     "check:attach": "node scripts/check-attach.mjs",
+    "check:accent": "node scripts/check-accent.mjs",
     "check:awaiting": "node scripts/check-awaiting.mjs",
     "check:blame": "node scripts/check-blame.mjs",
     "check:boundary": "node scripts/check-boundary.mjs",

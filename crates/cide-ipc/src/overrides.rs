@@ -165,7 +165,25 @@ impl ProjectOverrides {
 pub struct AgentOverrides {
     pub version: u32,
     /// Absolute project root → that project's overrides.
+    ///
+    /// This is the **live** table, and the only one anything resolves against. Profiles
+    /// ([`Self::profiles`]) are stored beside it and *copied into* it on a switch, so the fork,
+    /// the queue's caps, the roster and `ChildSettings` read exactly what they read before
+    /// profiles existed — a second place a run could take its harness from would be the
+    /// "computed here, obeyed nowhere" split `cide_agents::overrides` keeps paying for.
     pub projects: std::collections::BTreeMap<String, ProjectOverrides>,
+    /// Absolute project root → that project's named override profiles.
+    ///
+    /// Added without a schema bump: `#[serde(default)]` loads an older file unchanged. A build
+    /// from before profiles *reading* a newer file drops this field on its next save — the live
+    /// table survives, the saved profiles do not — which is the accepted cost of not refusing
+    /// the file outright.
+    ///
+    /// `#[ts(skip)]`: the webview never reads the whole file — it is answered one project at a
+    /// time through `OverrideProfilesState`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[ts(skip)]
+    pub profiles: std::collections::BTreeMap<String, ProjectProfiles>,
 }
 
 impl Default for AgentOverrides {
@@ -173,8 +191,73 @@ impl Default for AgentOverrides {
         Self {
             version: SCHEMA_VERSION,
             projects: std::collections::BTreeMap::new(),
+            profiles: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// One project's named override tables, and which of them is live. (M123)
+///
+/// # Why whole tables, not per-row presets
+///
+/// The gesture this serves is "codex is out of quota; move this project onto something else,
+/// and back tomorrow". That touches the project-wide row *and* every role row that named codex
+/// with its own model and effort, so the unit that switches is the whole [`ProjectOverrides`].
+/// A per-row preset would leave the user re-picking a preset on every row, which is the chore.
+///
+/// # The active profile is the live table
+///
+/// While a profile is active, every edit to the live table is mirrored into it
+/// ([`AgentOverrides::set_project`]), so switching away never loses a change and there is no
+/// "unsaved" state for the screen to draw. The alternative — a snapshot saved on demand — was
+/// refused: a switch that silently discards the afternoon's edits is the failure a person only
+/// finds out about when they switch back.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ProjectProfiles {
+    /// The profile the live table belongs to, or `None` when it belongs to none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub active: Option<String>,
+    /// Name → table.
+    pub profiles: std::collections::BTreeMap<String, ProjectOverrides>,
+}
+
+/// What a caller does to a project's profiles. One command carries all of them, for
+/// `agent_overrides_set`'s reason: a single small file, rewritten whole, needs no verb per field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", tag = "op")]
+#[ts(export)]
+pub enum OverrideProfileOp {
+    /// Answer the state, change nothing.
+    List,
+    /// Make `name` live, or with `None` detach the live table from any profile (it keeps its rows).
+    Switch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        name: Option<String>,
+    },
+    /// Store the live table under `name` — replacing one of that name — and make it active.
+    Save { name: String },
+    /// Forget `name`. The live table is untouched, even when `name` was the active one.
+    Delete { name: String },
+    /// Rename `from` to `to`, keeping it active if it was.
+    Rename { from: String, to: String },
+}
+
+/// The answer to an [`OverrideProfileOp`]: the live table and the profiles, so a screen redraws
+/// both from one reply rather than guessing what a switch did to the rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct OverrideProfilesState {
+    pub overrides: ProjectOverrides,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub active: Option<String>,
+    /// Profile names, sorted.
+    pub names: Vec<String>,
 }
 
 impl AgentOverrides {
@@ -183,6 +266,128 @@ impl AgentOverrides {
     #[must_use]
     pub fn project(&self, root: &str) -> ProjectOverrides {
         self.projects.get(root).cloned().unwrap_or_default()
+    }
+
+    /// One project's profiles, or none.
+    #[must_use]
+    pub fn profiles_of(&self, root: &str) -> ProjectProfiles {
+        self.profiles.get(root).cloned().unwrap_or_default()
+    }
+
+    /// The live table and the profiles, as one answer.
+    #[must_use]
+    pub fn profiles_state(&self, root: &str) -> OverrideProfilesState {
+        let profiles = self.profiles_of(root);
+        OverrideProfilesState {
+            overrides: self.project(root),
+            active: profiles.active,
+            names: profiles.profiles.into_keys().collect(),
+        }
+    }
+
+    /// Replace a project's live table — and, while a profile is active, that profile too.
+    ///
+    /// A project whose whole table is empty is removed rather than stored as an empty object, so
+    /// the file does not accumulate a row per project ever opened. The active profile is mirrored
+    /// *including* when emptied: a profile whose rows were all cleared is a profile that says
+    /// "run what is committed", which is a perfectly good thing to switch to.
+    pub fn set_project(&mut self, root: &str, table: ProjectOverrides) {
+        if let Some(saved) = self.profiles.get_mut(root)
+            && let Some(active) = saved.active.clone()
+        {
+            saved.profiles.insert(active, table.clone());
+        }
+        match table.all.is_empty() && table.roles.is_empty() {
+            true => {
+                self.projects.remove(root);
+            }
+            false => {
+                self.projects.insert(root.to_string(), table);
+            }
+        }
+    }
+
+    /// Apply one profile operation to a project. `Err` is a sentence for a person.
+    ///
+    /// # Errors
+    /// A name that is blank, or names no profile where one must exist, or collides on rename.
+    pub fn apply_profile_op(&mut self, root: &str, op: &OverrideProfileOp) -> Result<(), String> {
+        let named = |name: &str| -> Result<String, String> {
+            let name = name.trim();
+            match name.is_empty() {
+                true => Err("A profile needs a name.".to_string()),
+                false => Ok(name.to_string()),
+            }
+        };
+        // Worked on a copy and written back only on success, so a refused op leaves the file
+        // exactly as it found it — not with an empty profile set for this project.
+        let live = self.project(root);
+        let mut saved = self.profiles_of(root);
+        let mut switched_to = None;
+        match op {
+            OverrideProfileOp::List => {}
+            OverrideProfileOp::Switch { name: None } => saved.active = None,
+            OverrideProfileOp::Switch { name: Some(name) } => {
+                let name = named(name)?;
+                let Some(table) = saved.profiles.get(&name).cloned() else {
+                    return Err(format!(
+                        "This project has no override profile called “{name}”."
+                    ));
+                };
+                // The live table already equals the active profile (every edit is mirrored), so
+                // this write is belt and braces for a file edited by hand or by an older build.
+                if let Some(active) = saved.active.clone() {
+                    saved.profiles.insert(active, live);
+                }
+                saved.active = Some(name);
+                switched_to = Some(table);
+            }
+            OverrideProfileOp::Save { name } => {
+                let name = named(name)?;
+                saved.profiles.insert(name.clone(), live);
+                saved.active = Some(name);
+            }
+            OverrideProfileOp::Delete { name } => {
+                let name = named(name)?;
+                if saved.profiles.remove(&name).is_none() {
+                    return Err(format!(
+                        "This project has no override profile called “{name}”."
+                    ));
+                }
+                if saved.active.as_deref() == Some(name.as_str()) {
+                    saved.active = None;
+                }
+            }
+            OverrideProfileOp::Rename { from, to } => {
+                let (from, to) = (named(from)?, named(to)?);
+                if from != to {
+                    if saved.profiles.contains_key(&to) {
+                        return Err(format!("There is already a profile called “{to}”."));
+                    }
+                    let Some(table) = saved.profiles.remove(&from) else {
+                        return Err(format!(
+                            "This project has no override profile called “{from}”."
+                        ));
+                    };
+                    saved.profiles.insert(to.clone(), table);
+                    if saved.active.as_deref() == Some(from.as_str()) {
+                        saved.active = Some(to);
+                    }
+                }
+            }
+        }
+        match saved.active.is_none() && saved.profiles.is_empty() {
+            true => {
+                self.profiles.remove(root);
+            }
+            false => {
+                self.profiles.insert(root.to_string(), saved);
+            }
+        }
+        if let Some(table) = switched_to {
+            self.set_project(root, table);
+        }
+        Ok(())
     }
 }
 
@@ -228,5 +433,170 @@ mod tests {
         let table = ProjectOverrides::default();
         let json = serde_json::to_string(&table).expect("serializes");
         assert!(!json.contains("null"), "{json}");
+    }
+
+    fn codex() -> ProjectOverrides {
+        ProjectOverrides {
+            all: AgentOverride {
+                harness: Some(crate::Harness::Codex),
+                ..Default::default()
+            },
+            roles: [(
+                "x".to_string(),
+                AgentOverride {
+                    harness: Some(crate::Harness::Codex),
+                    model: Some("astra".into()),
+                    effort: Some("high".into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        }
+    }
+
+    fn opencode() -> ProjectOverrides {
+        ProjectOverrides {
+            all: AgentOverride {
+                harness: Some(crate::Harness::Opencode),
+                pool: Some("cheap".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A file written before profiles existed loads, and one with none writes no `profiles` key,
+    /// so an older build reading it back sees the shape it always did.
+    #[test]
+    fn a_file_from_before_profiles_loads_and_round_trips() {
+        let old = r#"{"version":1,"projects":{"/p":{"all":{"harness":"codex"},"roles":{}}}}"#;
+        let loaded: AgentOverrides = serde_json::from_str(old).expect("parses");
+        assert!(loaded.profiles.is_empty());
+        assert_eq!(
+            loaded.project("/p").all.harness,
+            Some(crate::Harness::Codex)
+        );
+        let json = serde_json::to_string(&loaded).expect("serializes");
+        assert!(!json.contains("profiles"), "{json}");
+    }
+
+    /// The gesture the feature exists for: codex is out, move onto another set, and back.
+    #[test]
+    fn switching_swaps_the_live_table_and_keeps_both() {
+        let mut file = AgentOverrides::default();
+        file.set_project("/p", codex());
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Save {
+                name: "codex".into(),
+            },
+        )
+        .expect("saves");
+        file.set_project("/p", opencode());
+        // Editing while "codex" is active edits "codex": save the new rows under their own name
+        // *first* is the ordinary order, so undo that edit and do it properly.
+        assert_eq!(file.profiles_of("/p").profiles["codex"], opencode());
+        file.set_project("/p", codex());
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Save {
+                name: "opencode".into(),
+            },
+        )
+        .expect("saves");
+        file.set_project("/p", opencode());
+        assert_eq!(file.profiles_of("/p").profiles["codex"], codex());
+
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Switch {
+                name: Some("codex".into()),
+            },
+        )
+        .expect("switches");
+        assert_eq!(file.project("/p"), codex());
+        assert_eq!(file.profiles_of("/p").active.as_deref(), Some("codex"));
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Switch {
+                name: Some("opencode".into()),
+            },
+        )
+        .expect("switches");
+        assert_eq!(file.project("/p"), opencode());
+        let state = file.profiles_state("/p");
+        assert_eq!(
+            state.names,
+            vec!["codex".to_string(), "opencode".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_profile_is_refused_and_changes_nothing() {
+        let mut file = AgentOverrides::default();
+        file.set_project("/p", codex());
+        let before = file.clone();
+        let refused = file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Switch {
+                name: Some("nope".into()),
+            },
+        );
+        assert!(refused.is_err());
+        assert_eq!(file, before);
+        assert!(
+            file.apply_profile_op("/p", &OverrideProfileOp::Save { name: "  ".into() })
+                .is_err()
+        );
+    }
+
+    /// Deleting or detaching from the active profile leaves the rows running as they are.
+    #[test]
+    fn deleting_the_active_profile_keeps_the_live_table() {
+        let mut file = AgentOverrides::default();
+        file.set_project("/p", codex());
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Save {
+                name: "codex".into(),
+            },
+        )
+        .expect("saves");
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Rename {
+                from: "codex".into(),
+                to: "c".into(),
+            },
+        )
+        .expect("renames");
+        assert_eq!(file.profiles_of("/p").active.as_deref(), Some("c"));
+        file.apply_profile_op("/p", &OverrideProfileOp::Delete { name: "c".into() })
+            .expect("deletes");
+        assert_eq!(file.project("/p"), codex());
+        assert!(
+            !file.profiles.contains_key("/p"),
+            "an empty profile set is not stored"
+        );
+    }
+
+    /// An emptied active profile is kept: "run what is committed" is a profile worth switching to.
+    #[test]
+    fn clearing_the_live_table_empties_the_active_profile_without_losing_it() {
+        let mut file = AgentOverrides::default();
+        file.set_project("/p", codex());
+        file.apply_profile_op(
+            "/p",
+            &OverrideProfileOp::Save {
+                name: "codex".into(),
+            },
+        )
+        .expect("saves");
+        file.set_project("/p", ProjectOverrides::default());
+        assert!(!file.projects.contains_key("/p"));
+        assert_eq!(
+            file.profiles_of("/p").profiles["codex"],
+            ProjectOverrides::default()
+        );
     }
 }

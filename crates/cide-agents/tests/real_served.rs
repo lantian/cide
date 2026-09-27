@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use cide_agents::harness::opencode::{Flavor, MIMO_CLI, OPENCODE_CLI};
+use cide_agents::harness::opencode::{Flavor, Generation, MIMO_CLI, OPENCODE_CLI};
 use cide_agents::{LoadedAgent, MimoHarness, OpencodeHarness, RunPlan, RunServer};
 use cide_ipc::{AgentDef, AgentId, Geometry, ProjectId, RunId, SessionId, Theme};
 use cide_pty::SpawnSpec;
@@ -78,6 +78,7 @@ fn role(harness: cide_ipc::Harness) -> LoadedAgent {
         permission_mode: None,
         effort: None,
         extras: Vec::new(),
+        sandbox: Default::default(),
     }
 }
 
@@ -115,6 +116,9 @@ fn plan<'a>(
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: false,
         server: Some(server),
+        git_dirs: Vec::new(),
+        sandbox_brief: None,
+        codex_trust_root: None,
     }
 }
 
@@ -173,6 +177,13 @@ fn served(flavor: &'static Flavor, turn: &dyn cide_agents::Harness) {
         eprintln!("no `{}` on PATH; skipping", flavor.program());
         return;
     }
+    // Ask the installed binary which command line it speaks **before** any spec is built: every
+    // one of them below — the server's, the turn's, the pane's — is a different argv on opencode 2,
+    // and `spawn_spec` reads this probe's cached answer. Without it the specs would be built for
+    // whichever generation the flavour assumes, which on a 2.x machine is right only by luck and
+    // on a machine that later ships 3.x would be wrong in silence. (M110)
+    let generation = flavor.probe_cli_flags().generation;
+    eprintln!("{} speaks {generation:?}", flavor.program());
     if cide_core::toolchain::which("curl").is_none()
         || cide_core::toolchain::which("script").is_none()
     {
@@ -214,29 +225,73 @@ fn served(flavor: &'static Flavor, turn: &dyn cide_agents::Harness) {
         get(&format!("{url}/global/health"), credential)
     })
     .expect("the server answers its health route with the password");
-    assert_eq!(
-        get(&format!("{url}/global/health"), None),
-        None,
-        "and refuses it without"
+    // **What proves the server is cide's own moves with the generation.** On 1.x `/global/health`
+    // is guarded, so answering it *is* the proof. On 2.0 that route is public — measured on
+    // 2.0.16, a fresh `serve` and the machine-wide background service both answer it 200 with no
+    // credential — and `/openapi.json` is the guarded one. Asserting the old route's refusal on a
+    // 2.x machine would fail for a reason that is not a bug; asserting nothing would let a server
+    // on a recycled port pass for cide's. See `agents.rs`'s `server_owned`.
+    let guarded = match generation {
+        Generation::V1 => format!("{url}/global/health"),
+        Generation::V2 => format!("{url}/openapi.json"),
+    };
+    assert!(
+        get(&guarded, credential).is_some(),
+        "the guarded route answers with the password"
     );
+    assert_eq!(get(&guarded, None), None, "and refuses it without");
 
     // A turn, as a client of it: its session shows up there, busy.
     let spec = turn.spawn_spec(&plan).expect("a turn").spec;
-    assert!(spec.args.iter().any(|a| a == "--attach"), "{:?}", spec.args);
+    // 2.0 deleted `--attach` and put the same capability on `--server`; both mean "this turn is a
+    // client of the run's server, not the owner of a private one".
+    let client_flag = match generation {
+        Generation::V1 => "--attach",
+        Generation::V2 => "--server",
+    };
+    assert!(
+        spec.args.iter().any(|a| a == client_flag),
+        "{:?}",
+        spec.args
+    );
+    assert!(
+        !spec.args.iter().any(|a| a == "--standalone"),
+        "a served turn must not also own a private server; the two cannot be combined.\n{:?}",
+        spec.args
+    );
     children
         .0
         .push(command(&spec).spawn().expect("spawn the turn"));
     let dir = cwd.to_string_lossy();
-    let session = until(Duration::from_secs(20), || {
-        let status = get(&format!("{url}/session/status?directory={dir}"), credential)?;
-        let status: serde_json::Value = serde_json::from_str(&status).ok()?;
-        status
-            .as_object()?
-            .iter()
-            .find(|(_, state)| state["type"] == "busy")
-            .map(|(id, _)| id.clone())
+    // The fact being proved is one sentence — *the turn's conversation lives in this server* — and
+    // each generation answers it on its own route. 1.x has `/session/status`, which names the busy
+    // ones outright. 2.0 moved every route under `/api` and lists the live ones at
+    // `/api/session/active`; the id is read out of the body rather than off a field path, because
+    // the shape of that body is opencode's to change and the sentence above is not.
+    let session = until(Duration::from_secs(20), || match generation {
+        Generation::V1 => {
+            let status = get(&format!("{url}/session/status?directory={dir}"), credential)?;
+            let status: serde_json::Value = serde_json::from_str(&status).ok()?;
+            status
+                .as_object()?
+                .iter()
+                .find(|(_, state)| state["type"] == "busy")
+                .map(|(id, _)| id.clone())
+        }
+        Generation::V2 => {
+            let body = get(&format!("{url}/api/session/active"), credential)
+                .or_else(|| get(&format!("{url}/api/session"), credential))?;
+            // `ses_` followed by the id's own alphabet: the one token in that body this test is
+            // about, and the only thing it needs out of it.
+            let start = body.find("ses_")?;
+            let id: String = body[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (id.len() > 4).then_some(id)
+        }
     })
-    .expect("the attached turn's session is busy on the server");
+    .expect("the attached turn's session is live on the server");
     eprintln!("{} served {session} on {url}", flavor.program());
 
     // The pane's child: the full TUI, attached to that session, drawing its first message.

@@ -47,6 +47,10 @@ pub struct Resolved {
     /// names a pool which does not exist. Everything else degrades, because an override is a
     /// convenience and a convenience must not stop a dispatch.
     pub refusal: Option<String>,
+    /// The role's sandbox grant, carried for a reader that has only this — the roster's
+    /// caveat. Not overridable: what a role may do past a sandbox is the committed file's to
+    /// say, where a reviewer sees it. (M119)
+    pub sandbox: crate::sandbox::SandboxGrant,
 }
 
 impl Resolved {
@@ -286,7 +290,26 @@ pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSetti
     let over: &AgentOverride = row_for(agent, overrides).unwrap_or(&empty);
 
     let harness = effective_harness(agent, overrides);
-    let effort = over.effort.clone().or_else(|| agent.effort.clone());
+    // A role's own `model` and `effort` are words in **its** harness's vocabulary, so they do not
+    // follow the role onto another one. terrastrike's 3d-artist says `model: opus`, a local
+    // override put every role on codex, and `-m opus` failed every dispatch with codex's "The
+    // 'opus' model is not supported when using Codex with a ChatGPT account": the role could not
+    // run at all. Redirected, the run takes the new CLI's default unless the **override** names a
+    // model or effort, which it wrote for the harness it chose. (M119 follow-up)
+    let redirected = harness != agent.def.harness;
+    if redirected && (agent.def.model.is_some() || agent.effort.is_some()) {
+        tracing::info!(
+            role = %agent.def.id,
+            from = ?agent.def.harness,
+            to = ?harness,
+            model = ?agent.def.model,
+            effort = ?agent.effort,
+            "a local override moved this role to another harness; its own model and effort stay behind"
+        );
+    }
+    let own_model = agent.def.model.clone().filter(|_| !redirected);
+    let own_effort = agent.effort.clone().filter(|_| !redirected);
+    let effort = over.effort.clone().or(own_effort);
     // Through `effective_max_concurrent` and not off `over` directly, because the *queue* reads
     // that function and this struct is read by the fork: two foldings of one override is how
     // this field came to be computed here and obeyed nowhere — see `Resolved::max_concurrent`.
@@ -372,7 +395,7 @@ pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSetti
             .model
             .clone()
             .filter(|model| !model.is_empty())
-            .or_else(|| agent.def.model.clone()),
+            .or(own_model),
     };
 
     Resolved {
@@ -384,6 +407,7 @@ pub fn resolve(agent: &LoadedAgent, overrides: &ProjectOverrides, llm: &LlmSetti
         max_concurrent,
         permission_mode,
         refusal,
+        sandbox: agent.sandbox.clone(),
     }
 }
 
@@ -467,6 +491,7 @@ mod tests {
             permission_mode: None,
             effort: Some("committed-effort".into()),
             extras: Vec::new(),
+            sandbox: Default::default(),
         }
     }
 
@@ -581,8 +606,46 @@ mod tests {
         assert_eq!(out.harness, Harness::Opencode);
         assert_eq!(out.effort.as_deref(), Some("high"));
         assert_eq!(out.max_concurrent, 6);
-        // Untouched fields still come from the file.
-        assert_eq!(out.model.as_deref(), Some("committed-model"));
+        // The file's model is claude's word and the run is on opencode now: it stays behind
+        // (M119 follow-up — see the next test). Same harness, and it comes from the file.
+        assert_eq!(out.model, None);
+        let same = resolve(
+            &agent,
+            &with(AgentOverride {
+                max_concurrent: Some(6),
+                ..Default::default()
+            }),
+            &LlmSettings::default(),
+        );
+        assert_eq!(same.model.as_deref(), Some("committed-model"));
+        assert_eq!(same.effort.as_deref(), Some("committed-effort"));
+    }
+
+    /// terrastrike's 3d-artist: `model: opus` in the file, every role overridden onto codex, and
+    /// `-m opus` refused by codex on every dispatch. The role's own model and effort do not follow
+    /// it to another harness; the override's own still do, since it wrote them for the one it
+    /// chose. (M119 follow-up)
+    #[test]
+    fn a_roles_model_does_not_follow_it_onto_another_harness() {
+        let mut agent = role(AgentScope::Project, Harness::Claude);
+        agent.def.model = Some("opus".into());
+        let moved = |over: AgentOverride| {
+            resolve(&agent, &with(over), &LlmSettings::default()).apply(&agent)
+        };
+        let codex = moved(AgentOverride {
+            harness: Some(Harness::Codex),
+            ..Default::default()
+        });
+        assert_eq!(codex.def.model, None, "codex takes its own default");
+        assert_eq!(codex.effort, None);
+        let named = moved(AgentOverride {
+            harness: Some(Harness::Codex),
+            model: Some("gpt-5.5".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        });
+        assert_eq!(named.def.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(named.effort.as_deref(), Some("high"));
     }
 
     /// A role's own row **replaces** the project default rather than merging with it — a
@@ -1149,6 +1212,7 @@ mod tests {
             max_concurrent,
             permission_mode: None,
             refusal: None,
+            sandbox: Default::default(),
         }
     }
 

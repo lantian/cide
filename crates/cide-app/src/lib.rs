@@ -66,6 +66,8 @@ pub mod ide;
 pub mod instance;
 pub mod libraries;
 pub mod lifecycle;
+#[cfg(target_os = "linux")]
+pub mod logind;
 pub mod logring;
 pub mod lsp;
 pub mod milestones;
@@ -86,6 +88,7 @@ pub mod symbols;
 pub mod task_triggers;
 // M18: one `.cide/tasks.json` store per open project, and the thread that ticks them.
 pub mod tasks_state;
+pub mod updater;
 pub mod windows;
 pub mod workspace_state;
 
@@ -309,6 +312,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        // Self-update (`updater.rs`). Its config — the endpoint and the public key — is
+        // `plugins.updater` in tauri.conf.json, and the plugin refuses to start without that
+        // block, so the block stays even while its key is empty (which `updater::check` reads
+        // as "not set up yet" and never asks).
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(log_plugin());
 
     if restore_geometry {
@@ -353,6 +361,7 @@ pub fn run() {
     };
 
     builder = builder.manage(SessionRegistry::default());
+    builder = builder.manage(updater::UpdaterState::default());
     builder = builder.manage(cmd::gitlab::GitLabState::default());
     // The raw text behind rendered log lines, one bounded ring per session. See `logring`.
     builder = builder.manage(std::sync::Arc::new(logring::JsonLogRing::default()));
@@ -360,6 +369,7 @@ pub fn run() {
     // command arriving before any `fs.index` answers `NoIndex` rather than failing to
     // resolve its state.
     builder = builder.manage(files::FsRegistry::default());
+    builder = builder.manage(cmd::fs::FileClipState::default());
     // Likewise: empty until the search panel asks for something, and managed from the start
     // so that `search.query` resolves its state and answers `NoIndex` rather than failing to
     // resolve at all.
@@ -455,6 +465,10 @@ pub fn run() {
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
             cmd::app::app_open_url,
+            cmd::update::update_status,
+            cmd::update::update_check,
+            cmd::update::update_install,
+            cmd::update::update_restart,
             cmd::app::app_get_bootstrap,
             cmd::app::workspace_rev,
             cmd::app::window_set_viewport,
@@ -542,6 +556,9 @@ pub fn run() {
             cmd::file::file_properties_dir,
             cmd::file::file_read_bytes,
             cmd::file::file_write_bytes,
+            cmd::file::file_backup_write,
+            cmd::file::file_backup_read,
+            cmd::file::file_backup_clear,
             cmd::file::file_note_position,
             cmd::file::file_position,
             cmd::file::tab_open_file,
@@ -661,6 +678,9 @@ pub fn run() {
             cmd::fs::fs_delete,
             cmd::fs::fs_paste,
             cmd::fs::fs_paste_plan,
+            cmd::fs::fs_clip_get,
+            cmd::fs::fs_clip_set,
+            cmd::fs::fs_clip_clear,
             cmd::picker::picker_query,
             cmd::picker::picker_rank,
             cmd::picker::picker_index_libraries,
@@ -778,6 +798,7 @@ pub fn run() {
             cmd::agents::llm_probe_limits,
             cmd::agents::agent_overrides_get,
             cmd::agents::agent_overrides_set,
+            cmd::agents::agent_override_profiles,
             cmd::agents::agents_save,
             cmd::agents::agents_delete,
             // --- M22: extensions and their marketplaces ---
@@ -870,6 +891,10 @@ pub fn run() {
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());
+            // And the other half of an OS shutdown: logind announces it before systemd
+            // signals anything, so the quit can run as a quit. See `logind`'s header.
+            #[cfg(target_os = "linux")]
+            logind::watch(app.handle());
 
             // Before any pane can spawn a shell. The renderer's flag defaults to on, so
             // without this a profile that had turned it off would render the first lines of
@@ -912,6 +937,12 @@ pub fn run() {
             // panel and broadcasts the merged board. See `tasks_state`.
             app.state::<std::sync::Arc<tasks_state::TasksStores>>()
                 .start_flusher(app.handle().clone());
+
+            // Unsaved buffers a crash kept (M117) that no tab can ask for any more — closed with
+            // Discard, or a month old. Before any editor mounts, from the tree as it was loaded.
+            // A snapshot, not `with`: the sweep reads `closed.json`, and no disk read belongs
+            // under the workspace lock.
+            cmd::file::sweep_backups(&app.state::<WorkspaceState>().snapshot());
 
             // Before the listener binds, so a `SIGKILL`ed previous run's socket is gone
             // rather than accumulating one file per hard kill for the life of the account.
@@ -1080,9 +1111,56 @@ pub fn run() {
                     },
                     ws.settings.claude.cli.inject.resume.enabled,
                 );
+
+                // What the last cide's runs left running in their worktrees — every run from
+                // before M119, and any run whose cide crashed before `end_tree` could finish it.
+                // Nothing of this process's is running yet, and a run another profile's cide is
+                // hosting in the same project has a live parent, so only orphans are taken; see
+                // `agents::end_leftovers_in`. A thread, because it is a `/proc` walk per project
+                // and a launch waits for nothing it does not need. (M119)
+                let worktree_dirs: Vec<std::path::PathBuf> = ws
+                    .projects
+                    .values()
+                    .filter_map(|p| p.roots.first())
+                    .map(|root| cide_git::worktree::path_of(&root.path, ""))
+                    .collect();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("cide-leftovers".into())
+                    .spawn(move || {
+                        for dir in worktree_dirs.iter().filter(|d| d.is_dir()) {
+                            agents::end_leftovers_in(dir);
+                        }
+                    })
+                {
+                    tracing::warn!(%error, "no thread to end what the last runs left running");
+                }
             }
 
             restore_windows(app.handle())?;
+
+            // The runs the last cide's restart interrupted, continued (M118). After the windows,
+            // on a thread of its own and a moment later: each project's config is read off the
+            // disk, and a child forked before the hook and agent sockets answer would be a run
+            // cide cannot hear.
+            {
+                let app = app.handle().clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("cide-resume-runs".into())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let agents = app.state::<std::sync::Arc<agents::AgentRegistry>>();
+                        agents.resume_after_restart(&app);
+                    })
+                {
+                    tracing::warn!(%error, "no thread to resume interrupted runs; Resume still does it");
+                }
+            }
+
+            // Whether GitHub has a newer release. After the windows, so the check never
+            // competes with the restore, and on a thread of its own that sleeps first — see
+            // `updater::start`. The windows also pull `update_status` on mount, so one whose
+            // listener is not up yet when the event fires still hears about it.
+            updater::start(app.handle());
 
             // After the windows, because the dock menu is a *view* of the projects those
             // windows show and installing it first would put a menu on screen before there was

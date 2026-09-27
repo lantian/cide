@@ -46,6 +46,8 @@ pub mod milestones;
 pub mod overrides;
 /// The merge-request review vocabulary. (M85)
 pub mod review;
+/// What a role may do past a harness's sandbox. (M119)
+pub mod sandbox;
 // No `///` summary here, deliberately: `harness.rs`'s own `//!` header is the summary, and an
 // outer doc comment on the `mod` item merges with it into one fragment that rustdoc then resolves
 // in *this* module's scope — so every `[`RunState`]` and `[`SpawnSpec`]` link inside that header
@@ -70,7 +72,7 @@ pub use defs::{AgentProblem, Catalog, LoadedAgent, Severity};
 pub use harness::{
     ClaudeHarness, CodexHarness, ContinueSpec, Delivery, ERASE_MARKER, FailoverReason, Harness,
     HarnessError, HarnessSpawn, MimoHarness, Observation, OpencodeHarness, QwenHarness,
-    RenderState, RunPlan, RunServer, SessionBinding, for_kind, registry,
+    RenderState, RunPlan, RunServer, SessionBinding, StepClock, StepEdge, for_kind, registry,
 };
 pub use tools::{Content, TaskSink, ToolResult, descriptors, dispatch};
 
@@ -386,6 +388,7 @@ mod tests {
             permission_mode: permission_mode.map(str::to_string),
             effort: None,
             extras: Vec::new(),
+            sandbox: Default::default(),
         }
     }
 

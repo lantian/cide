@@ -23,10 +23,10 @@ use cide_core::keymap::{self, KeymapDiagnostic};
 use cide_core::{CoreError, persist, workspace};
 use cide_ipc::git::DiffSide;
 use cide_ipc::{
-    GraphicsRung, GraphicsSettings, GraphicsStatus, HeadlessError, HeadlessRequest, HeadlessResult,
-    KeymapConflict, KeymapEdit, KeymapEditResult, KeymapProblem, KeymapReport, Pane, PaneId,
-    PaneKind, PaneRole, ProjectId, RepoId, Settings, SettingsPatch, SettingsSection, TabId,
-    TabKind,
+    AccentPatch, GraphicsRung, GraphicsSettings, GraphicsStatus, HeadlessError, HeadlessRequest,
+    HeadlessResult, KeymapConflict, KeymapEdit, KeymapEditResult, KeymapProblem, KeymapReport,
+    Pane, PaneId, PaneKind, PaneRole, ProjectId, RepoId, Settings, SettingsPatch, SettingsSection,
+    TabId, TabKind,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -78,6 +78,12 @@ pub fn settings_set(
             ws.settings.remote.clone(),
         )
     });
+    // Refused before the update rather than inside it: `apply_patch` is infallible by design (it
+    // is the fold every test drives), and a refusal must leave *every* field of the patch
+    // unapplied — half a patch landing is a form that shows one thing and saves another.
+    if let Some(AccentPatch::Set { base }) = &patch.accent {
+        cide_core::accent::fit(base).map_err(|e| CoreError::AccentRefused(e.to_string()))?;
+    }
     state.update(|ws| {
         apply_patch(&mut ws.settings, patch);
         // Settings are not part of any structural invariant, but they are part of the tree,
@@ -252,6 +258,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     let SettingsPatch {
         theme,
         ui_font_size,
+        accent,
         each_project_keeps_claude_tab,
         reopen_last_project,
         keep_sessions_on_window_close,
@@ -270,6 +277,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         git,
         llm,
         remote,
+        update,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -284,6 +292,18 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // declaration. That is 405 rules with no `font-size` and a window of UA-default serif.
     if let Some(v) = ui_font_size {
         settings.ui_font_size = cide_ipc::clamp_ui_font_size(v);
+    }
+    // Only the picked colour crosses the wire; what is stored is the fit, so an illegible
+    // variant cannot be written by any caller. A refused colour never reaches here from
+    // `settings_set` (it answers first); from anywhere else it leaves the accent alone.
+    match accent {
+        Some(AccentPatch::Set { base }) => {
+            if let Ok(fitted) = cide_core::accent::fit(&base) {
+                settings.accent = Some(fitted);
+            }
+        }
+        Some(AccentPatch::Reset) => settings.accent = None,
+        None => {}
     }
     if let Some(v) = each_project_keeps_claude_tab {
         settings.each_project_keeps_claude_tab = v;
@@ -358,6 +378,11 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     }
     if let Some(v) = remote {
         settings.remote = v;
+    }
+    // No live reaction: the check runs once per start, so a toggle turned on takes effect on
+    // the next launch and one turned off simply finds nothing left to stop.
+    if let Some(v) = update {
+        settings.update = v;
     }
     // The one patched field that is clamped rather than taken at face value.
     //
@@ -1825,6 +1850,69 @@ mod tests {
             "an untouched group moved"
         );
         assert!(settings.reopen_last_project, "an untouched toggle moved");
+    }
+
+    /// What lands is the fit, not the patch: the stored variants are computed here, and a reset
+    /// goes back to `None` (the stylesheet's own red), not to a stored red.
+    #[test]
+    fn an_accent_patch_stores_the_fit_and_a_reset_clears_it() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.accent, None,
+            "the shipped red is no stored accent at all"
+        );
+
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                accent: Some(AccentPatch::Set {
+                    base: "#FDE047".into(),
+                }),
+                ..SettingsPatch::default()
+            },
+        );
+        let stored = settings.accent.clone().expect("a yellow is accepted");
+        assert_eq!(stored, cide_core::accent::fit("#fde047").unwrap());
+        assert_ne!(stored.light, stored.base, "fitted for the white panel");
+
+        // A refused colour leaves what was there; `settings_set` answers the refusal before it
+        // ever reaches this fold.
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                accent: Some(AccentPatch::Set {
+                    base: "#000000".into(),
+                }),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(settings.accent.as_ref(), Some(&stored));
+
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                accent: Some(AccentPatch::Reset),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(settings.accent, None);
+    }
+
+    /// The wire shape `AccentRow.tsx` sends, and an old `workspace.json` with no `accent` key.
+    #[test]
+    fn the_accent_patch_reads_the_shape_the_settings_row_sends() {
+        let set: SettingsPatch =
+            serde_json::from_str(r##"{"accent":{"set":{"base":"#2563eb"}}}"##).unwrap();
+        assert_eq!(
+            set.accent,
+            Some(AccentPatch::Set {
+                base: "#2563eb".into()
+            })
+        );
+        let reset: SettingsPatch = serde_json::from_str(r#"{"accent":"reset"}"#).unwrap();
+        assert_eq!(reset.accent, Some(AccentPatch::Reset));
+        let old: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(old.accent, None);
     }
 
     #[test]

@@ -222,6 +222,16 @@ export interface EditorSurfaceProps {
   /** The file exactly as it came off disk, line endings included. */
   doc: string
   /**
+   * An unsaved buffer an earlier run kept, to be put over `doc` as this view is built. (M117)
+   *
+   * `doc` stays the baseline — it is what the disk says, so the tab comes up **dirty**, arms
+   * autosave, and a save compares against the file. The recovered text goes in as one ordinary
+   * change, which is also what makes it undoable: Ctrl+Z once is "no, the file as it was". Read
+   * only at build, like `doc`: a later value is ignored until `reloadKey` asks for a new view,
+   * and a reload from disk passes none. `editor/hotExit.ts` has the policy.
+   */
+  recovered?: string | undefined
+  /**
    * Bumped by the caller to replace the buffer from disk.
    *
    * A changed `doc` alone is deliberately ignored. The prop is a string and a parent that
@@ -557,8 +567,12 @@ export function EditorSurface({
   onShowCommit,
   onAnnotateParent,
   onShowHistory,
+  recovered,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
+  /** Read once, by the build effect — see the prop. A ref so the effect's keys stay as they are. */
+  const recoveredRef = useRef(recovered)
+  recoveredRef.current = recovered
   const viewRef = useRef<EditorView | null>(null)
   /** The live view's lint compartment, so the push effect can reconfigure it. */
   const lintSlotRef = useRef<Compartment | null>(null)
@@ -1511,6 +1525,19 @@ export function EditorSurface({
     }
     baseline = view.state.doc
     viewRef.current = view
+    /*
+     * A kept buffer goes in *after* the baseline is taken from the disk's text, as one change
+     * through the ordinary road — so the update listener sees it and does everything a keystroke
+     * would: the dirty flag, the autosave timers, `onDocChanged`. Building the view from the
+     * recovered text instead would make it the baseline, and a tab holding unsaved work would
+     * come up clean — the close guard would let it go without a word. (M117)
+     */
+    const kept = recoveredRef.current
+    // Trimmed to the span that differs, as a format is (`check:reformat` holds every dispatch to
+    // it): a whole-document replacement would throw away the remembered caret and folds the
+    // view is about to restore, for text that is mostly the same.
+    const recovery = kept === undefined || readOnly ? null : minimalChange(view.state.doc.toString(), kept)
+    if (recovery !== null) view.dispatch({ changes: recovery })
     // A fresh view is a fresh document: the fingerprint from the last one describes ranges
     // in text this view has never held, and keeping it would skip the first publish.
     lintFingerprintRef.current = null

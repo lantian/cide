@@ -532,6 +532,7 @@ function asRun(chip: Chip): RunView {
     model: null,
     poolPosition: null,
     worktree: false,
+    reviewer: null,
   }
 }
 

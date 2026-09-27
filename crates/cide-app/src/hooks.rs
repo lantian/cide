@@ -418,6 +418,53 @@ enum Effect {
     },
 }
 
+/// The status bar's readout for a **codex** session, from its rollout file. (M93)
+///
+/// Claude Code's figures arrive as `statusline` frames; codex has no statusline, so on the frames
+/// that follow a model response (and the first one, which names the model) this reads the
+/// rollout the payload's own `transcript_path` names and emits the same `session-status` event
+/// in the statusline's shape (`cide_core::codex_cli::status_of`). The webview cannot tell the two
+/// apart except by the `harness` field, which is the point.
+///
+/// **Off this thread.** `apply` is the single ordered applier, and a rollout runs to megabytes;
+/// a read of its tail per frame here would put file I/O in front of every later frame, busy/idle
+/// included. A thread per qualifying frame is cheap next to a model response, and the order of
+/// two readouts does not matter — each is the rollout's newest state when it was read.
+fn codex_status(frame: &HookFrame, app: &AppHandle) {
+    let Some(kind) = frame.kind() else { return };
+    if !matches!(
+        kind,
+        HookEvent::SessionStart | HookEvent::Stop | HookEvent::PostToolUse
+    ) {
+        return;
+    }
+    let Some(path) = frame
+        .payload
+        .get("transcript_path")
+        .and_then(|p| p.as_str())
+        .map(std::path::PathBuf::from)
+        .filter(|p| cide_core::codex_cli::is_rollout(p))
+    else {
+        return;
+    };
+    let Some(session) = frame.owner().map(str::to_owned) else {
+        return;
+    };
+    let model = frame
+        .payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_owned);
+    let app = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("cide-codex-status".into())
+        .spawn(move || {
+            if let Some(status) = cide_core::codex_cli::status_of(&path, model.as_deref()) {
+                crate::emit::session_status(&app, &session, status);
+            }
+        });
+}
+
 /// Route one frame: update state, emit what the frontend needs.
 fn apply(
     frame: &HookFrame,
@@ -425,6 +472,7 @@ fn apply(
     states: &DashMap<SessionId, SessionState>,
     conversations: &DashMap<SessionId, SessionId>,
 ) {
+    codex_status(frame, app);
     for effect in decide(frame, states, conversations) {
         match effect {
             Effect::Status { session, payload } => {

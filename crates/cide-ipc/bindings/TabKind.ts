@@ -22,9 +22,14 @@ export type TabKind = { "kind": "claudeHome" } | { "kind": "claudeFull", title: 
  * M79 opens tabs **by itself**: one per finished subagent turn, and one per quiet
  * period. At that rate "parked, recoverable" is a `claude` leaked per run, alive and
  * billed-for until the app quits, in a tab the user closed precisely to say they were
- * done with it. So these are marked, and the mark decides both halves — the sessions
- * are killed *and* no `ClosedTabs` record is written, because a reopened tab naming a
- * session the registry has forgotten is the hole `closed_tabs.rs`' header describes.
+ * done with it. So these are marked, and closing one **kills** its sessions.
+ *
+ * It is still remembered for Ctrl+Shift+T, mark and all. Until the fix it was not — no
+ * `ClosedTabs` record was written, on the argument that a record would name a session
+ * already killed — and the result was reported as a Review or Plan tab that could not be
+ * brought back at all. The child is dead but its transcript is not:
+ * `cmd::project::tab_reopen_closed` resumes it (`claude_tab::resume_closed`) before
+ * reinserting the tab, and the kept mark makes the next close end it again.
  *
  * A **field and not a variant**, because a `TabKind` variant is four arms and two of
  * them get forgotten (`chrome/TabStrip.tsx`'s and `closed_tabs::remembered`'s), and

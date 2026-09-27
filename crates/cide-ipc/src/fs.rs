@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::ids::ProjectId;
+
 /// One row of the flattened, windowed file tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +256,31 @@ pub enum PasteMode {
     /// cost nothing, which is the whole reason the mode travels with the paste rather than
     /// being acted on when the user pressed Ctrl+X.
     Cut,
+}
+
+/// What the file tree's Copy or Cut is holding, ready to be pasted — in **any** window.
+///
+/// Held in Rust (`cide-app`'s `FileClipState`) and broadcast as `cide://fs-clip-changed`
+/// rather than kept in each webview, because a clip is something the user takes from one
+/// project and puts into another, and the other project may be drawn by another window —
+/// detached, or in per-project window mode. Each webview used to keep its own, so a Copy in
+/// one window left Paste in the next saying nothing had been copied.
+///
+/// Not persisted: a clip is a gesture in progress, and one that survived a restart would be a
+/// Cut the user had long since forgotten, waiting to move a file the next time Ctrl+V is
+/// pressed anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileClip {
+    pub mode: PasteMode,
+    /// The project the paths were copied in. A paste into another project sends it as
+    /// `sourceProject`, and the sources are checked against **its** roots — the destination
+    /// is checked against the project it lands in.
+    pub project: ProjectId,
+    /// Absolute paths, in the order they were picked.
+    #[ts(type = "string[]")]
+    pub paths: Vec<PathBuf>,
 }
 
 /// What one pasted path became.

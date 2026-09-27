@@ -310,6 +310,42 @@ try {
     eq(idle?.opens, 0, 'and the role beside it, which is doing nothing, still offers none')
   }
 
+  /*
+   * M114: why an idle run is idle. The gate's line and the review link are on the row, the role
+   * says so in its word, and neither is an Open — the per-role Open counts above stay exact.
+   */
+  {
+    const d = a('role-gate-running')
+    const dev = d.roles?.find((r) => r.id === 'developer')
+    eq(dev?.status, 'Verifying', 'a run parked behind its gate says so instead of Idle')
+    ok(d.text.includes('Verify gate running'), 'and the row says the gate is running')
+    eq(dev?.opens, 1, 'the gate line is not a second Open')
+  }
+  {
+    const d = a('role-gate-handed-back')
+    ok(
+      d.text.includes('Verify gate failed (2 of 3), handed back to the run'),
+      'a red verify that went back to the run shows the count',
+    )
+  }
+  {
+    const d = a('role-in-review')
+    const dev = d.roles?.find((r) => r.id === 'developer')
+    eq(dev?.status, 'In review', 'a run whose task a review tab owns says so')
+    ok(d.buttons.includes('In review by orchestrator'), 'as a link to that tab')
+    ok(d.text.includes('Verify gate passed'), 'beside the gate that let the reviewer in')
+    eq(dev?.opens, 1, 'and the link is not counted as an Open')
+  }
+  {
+    const d = a('role-in-review-no-link')
+    ok(d.text.includes('In review by orchestrator'), 'without a handler the words stay')
+    ok(!d.buttons.includes('In review by orchestrator'), 'and no dead link is drawn')
+  }
+  for (const name of ['role-idle', 'role-running', 'roles-resting']) {
+    const d = a(name)
+    ok(!d.text.includes('Verify gate') && !d.text.includes('In review'), `${name} draws no gate line`)
+  }
+
   {
     const d = a('role-idle')
     const dev = d.roles?.find((r) => r.id === 'developer')
@@ -865,6 +901,25 @@ try {
     ok(
       d.buttons?.includes(PAUSE_ALL),
       'the header offers Pause instead: a live run and an open queue is something to freeze',
+    )
+  }
+
+  /*
+   * After a restart. The snapshot brings every run back `interrupted`, drawn in the paused tone,
+   * with the queue open unless a project-scope pause was saved. The header used to offer Pause
+   * here — the user paused their agents, closed cide, opened it and read "Pause" over rows that
+   * looked paused. Pause has nothing to freeze (an interrupted run has no child); project-scope
+   * Resume requeues every interrupted run, so it is the control that belongs in the slot.
+   */
+  {
+    const d = a('role-interrupted')
+    ok(
+      d.buttons?.includes(RESUME_ALL),
+      'interrupted runs after a restart put Resume in the header — it is what restarts them',
+    )
+    ok(
+      !d.buttons?.includes(PAUSE_ALL),
+      'and not Pause: an interrupted run has no child to freeze',
     )
   }
 

@@ -1547,6 +1547,17 @@ fn build() -> Vec<Command> {
         Command::new("help.about", "About cide", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["version", "help", "claude"]),
+        /*
+         * Ask GitHub for a newer release now, whatever the start-up check or a skip said.
+         *
+         * `shellWindow` and not `projectOpen`: the answer is a toast, which a shell window
+         * draws with or without a project, and "is there a newer cide" is exactly what someone
+         * looking at an empty window might ask. Not in a detached pane's window, which draws
+         * none of the update notices (`ui/src/chrome/updates.ts`).
+         */
+        Command::new("help.checkForUpdates", "Check for updates", VIEW)
+            .when("shellWindow")
+            .keywords(&["update", "upgrade", "version", "release", "new"]),
         // The rail and its sidebar exist in the shell window only; a detached pane has none.
         Command::new("sidebar.files", "Show files sidebar", VIEW).when("shellWindow"),
         /*

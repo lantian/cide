@@ -63,6 +63,17 @@
 //! the workspace-write sandbox re-binds `.git` read-only and the brief asks every task run to
 //! commit.
 //!
+//! **A sandboxed run in a worktree can commit, since M118.** A role that names a mode itself —
+//! `auto` above all, which on claude and opencode means "run unattended" — used to land in the
+//! workspace-write sandbox with its git metadata read-only: the checkout's admin directory
+//! (`<repo>/.git/worktrees/<name>`) and the common `.git` are outside the one writable root, and
+//! codex re-binds `.git` read-only on top. Every such run in selfcraft stopped at its first
+//! commit (t-518, t-572, t-574, …), and M114's verify gate handed the dirty branch back to a run
+//! that could not act on it. [`RunPlan::git_dirs`] now rides as `--add-dir` under every policy
+//! [`sandboxes_writes`] names, which keeps the sandbox and makes the commit work (measured on
+//! 0.157.1, step 4 of [`assemble`]). What the sandbox still denies — an X display, audio — is
+//! [`sandbox_caveat`]'s to say.
+//!
 //! **Always an explicit pair**, never codex's own default: with neither flag, codex consults
 //! the directory's trust and may open a "trust this folder?" chooser first — in a fresh
 //! worktree, every time. (Unmeasured in a worktree; measured absent with explicit flags.)
@@ -74,7 +85,7 @@
 //! Settings → Harness → Codex → Binary ([`RunPlan::codex`]), a bare `codex` by default and
 //! resolved by the OS at the spawn — the console and every codex run start the same program.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cide_claude::{HookEvent, HookFrame};
 use cide_core::codex_cli;
@@ -317,6 +328,52 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     // is still computed above, so a role naming a mode codex cannot honour is still refused.
     if plan.codex.cli.inject.permissions {
         args.extend(policy.iter().map(|token| token.to_string()));
+        // The checkout's git metadata, writable beside it (M118). The sandbox's one writable
+        // root is `-C`, and codex re-binds any `.git` in it read-only on top; the linked
+        // worktree's admin directory and the common `.git` are outside it anyway. Without these
+        // a sandboxed task run cannot `git commit`, `merge` or `rebase` — selfcraft's t-572,
+        // `index.lock: Read-only file system`. Measured on 0.157.1: `--approve-for-me --add-dir
+        // <git-dir> --add-dir <common-dir>` commits from a linked worktree, and the same turn
+        // without them does not; `codex resume` takes `--add-dir` too.
+        if sandboxes_writes(policy) {
+            for dir in &plan.git_dirs {
+                args.push("--add-dir".into());
+                args.push(dir.to_string_lossy().to_string());
+            }
+            // The role's grant (M119). `needs` is the network switch, because codex's seccomp
+            // filter refuses **every** `AF_UNIX` socket while the network is off — Xvfb cannot
+            // listen and Blender hangs at exit on PulseAudio's wake-up write, measured on
+            // 0.157.1 with `codex sandbox`. `writable-dirs` are more of what `git_dirs` are.
+            let grant = &plan.agent.sandbox;
+            if grant.wants_network() {
+                codex_cli::push_config(
+                    &mut args,
+                    "sandbox_workspace_write.network_access",
+                    "true".into(),
+                );
+            }
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            for dir in grant.writable_paths(home.as_deref()) {
+                args.push("--add-dir".into());
+                args.push(dir.to_string_lossy().to_string());
+            }
+        }
+    }
+    // Trust for the project whose worktree carries this run's `.codex/rules/cide.rules`: codex
+    // reads a project layer's rules only for a trusted project, and for a linked worktree it
+    // asks about the main repository's root (measured on 0.157.1; `RunPlan::codex_trust_root`).
+    // Under any policy, not only a sandboxed one — the rules also take the approval prompt away
+    // from an allowed command under `default`. Only when cide wrote the file, so a role without
+    // `allow-commands` leaves the user's trust decisions exactly as they were.
+    if let Some(root) = &plan.codex_trust_root {
+        codex_cli::push_config(
+            &mut args,
+            &format!(
+                "projects.{}.trust_level",
+                codex_cli::toml_string(&root.to_string_lossy())
+            ),
+            codex_cli::toml_string("trusted"),
+        );
     }
 
     // ---- 5. what the definition asked for ----
@@ -389,6 +446,24 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
     spec = spec.apply(plan.env.clone());
+    // GL for a role that needs a display (M119): the sandbox's `/dev` has no GPU nodes, and
+    // glvnd's first choice on an NVIDIA machine crashes Xvfb's GLX setup inside it; pointed at
+    // Mesa, Xvfb runs GLX on llvmpipe (measured under `codex sandbox`, 0.157.1). Only where the
+    // sandbox is actually on, and only when this machine has Mesa's vendor file at all.
+    if plan.codex.cli.inject.permissions
+        && sandboxes_writes(policy)
+        && plan
+            .agent
+            .sandbox
+            .needs(crate::sandbox::SandboxNeed::Display)
+        && let Some(mesa) = mesa_egl_vendor()
+    {
+        spec = spec.env(
+            "__EGL_VENDOR_LIBRARY_FILENAMES",
+            mesa.to_string_lossy().to_string(),
+        );
+        spec = spec.env("__GLX_VENDOR_LIBRARY_NAME", "mesa".to_string());
+    }
     spec = spec.env("CIDE_SESSION", plan.session.to_string());
     spec = spec.env("CIDE_RUN", plan.run.to_string());
     if let Some(sock) = &plan.hook_sock {
@@ -406,6 +481,17 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
         // Hooks are this harness's channel now.
         events: None,
     })
+}
+
+/// Mesa's glvnd EGL vendor file, where distributions put it.
+fn mesa_egl_vendor() -> Option<PathBuf> {
+    [
+        "/usr/share/glvnd/egl_vendor.d/50_mesa.json",
+        "/etc/glvnd/egl_vendor.d/50_mesa.json",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
 }
 
 /// A follow-up as the TUI takes one: a bracketed paste, then Enter.
@@ -446,7 +532,31 @@ pub(crate) fn developer_brief(plan: &RunPlan<'_>) -> String {
             say(ADHOC_PREAMBLE.to_string());
         }
     }
+    // Outside the tracker gate: what the sandbox denies is true of a review too. (M119)
+    if let Some(note) = &plan.sandbox_brief {
+        say(note.clone());
+    }
     paragraphs.join("\n\n")
+}
+
+const BYPASS: &[&str] = &["--dangerously-bypass-approvals-and-sandbox"];
+/// Edits inside the checkout without asking; anything beyond it asks a person.
+const ASK_BEYOND_WORKSPACE: &[&str] = &["-s", "workspace-write", "-a", "on-request"];
+/// Edits inside the checkout without asking; anything beyond it is refused and returned to the
+/// model — claude's `dontAsk`, which never puts a prompt in front of anyone.
+const NEVER_ASK: &[&str] = &["-s", "workspace-write", "-a", "never"];
+const READ_ONLY: &[&str] = &["-s", "read-only", "-a", "on-request"];
+/// Claude's `auto` is a classifier approving on the user's behalf; codex's flag routes approvals
+/// through its own reviewer under the workspace-write sandbox. clap refuses it beside `-a`
+/// (measured on 0.157.1), so it cannot be told `never` as well.
+const AUTO_REVIEW: &[&str] = &["--approve-for-me"];
+
+/// Whether a [`permission_policy`] answer runs the child in codex's **`workspace-write`**
+/// sandbox — the one where [`RunPlan::git_dirs`] must be added as writable roots for a commit to
+/// work. Not bypass (no sandbox, nothing to add) and not `read-only` (nothing is writable, and
+/// adding the git metadata alone would be a sandbox that can commit but not edit). (M118)
+pub fn sandboxes_writes(policy: &[&str]) -> bool {
+    [ASK_BEYOND_WORKSPACE, NEVER_ASK, AUTO_REVIEW].contains(&policy)
 }
 
 /// Codex's sandbox and approval flags for a definition's claude-vocabulary permission mode, or
@@ -457,16 +567,6 @@ pub fn permission_policy(
     mode: Option<&str>,
     unattended: Unattended,
 ) -> Result<&'static [&'static str], HarnessError> {
-    const BYPASS: &[&str] = &["--dangerously-bypass-approvals-and-sandbox"];
-    // Edits inside the checkout without asking; anything beyond it asks a person.
-    const ASK_BEYOND_WORKSPACE: &[&str] = &["-s", "workspace-write", "-a", "on-request"];
-    // Edits inside the checkout without asking; anything beyond it is refused and returned to
-    // the model — claude's `dontAsk`, which never puts a prompt in front of anyone.
-    const NEVER_ASK: &[&str] = &["-s", "workspace-write", "-a", "never"];
-    const READ_ONLY: &[&str] = &["-s", "read-only", "-a", "on-request"];
-    // Claude's `auto` is a classifier approving on the user's behalf; codex's flag routes
-    // approvals through its own reviewer under the workspace-write sandbox.
-    const AUTO_REVIEW: &[&str] = &["--approve-for-me"];
     Ok(match mode {
         Some("bypassPermissions") => BYPASS,
         Some("default") | Some("acceptEdits") => ASK_BEYOND_WORKSPACE,
@@ -487,6 +587,158 @@ pub fn permission_policy(
             Unattended::Ask => ASK_BEYOND_WORKSPACE,
         },
     })
+}
+
+/// What codex's sandbox will stop a worktree run of this role from doing, said before it fails
+/// inside the run rather than after. (M118; the grant since M119)
+///
+/// The two failures selfcraft's codex runs hit and could not name: a commit refused because the
+/// git metadata was read-only, and an e2e runner that could not bind `/tmp/.X11-unix` or a
+/// Blender render that stalled on denied audio. The first is fixed when [`RunPlan::git_dirs`]
+/// is known (`git_dirs_known`), and said when it is not — a wrapper deciding the sandbox
+/// (`inject_permissions` off), a repository that would not open, `plan`'s read-only sandbox. The
+/// second is **one** denial, measured in M119: with the network off codex's seccomp filter
+/// refuses every `AF_UNIX` socket, and a role's `needs:` turns the network on. So the sentence
+/// says which of the two the role is in, and names the grant rather than `bypassPermissions`,
+/// which drops the whole sandbox for what one switch fixes.
+///
+/// `None` for bypass, and for a mode codex refuses (the dispatch refusal says that instead). A
+/// run in the project root is `None` too — it is told not to commit, and it stands where the
+/// user does — unless its role allows commands, which cide writes into a worktree only.
+pub fn sandbox_caveat(
+    mode: Option<&str>,
+    unattended: Unattended,
+    worktree: bool,
+    git_dirs_known: bool,
+    inject_permissions: bool,
+    grant: &crate::sandbox::SandboxGrant,
+) -> Option<&'static str> {
+    if !worktree {
+        return (!grant.allow_commands.is_empty()).then_some(
+            "its `allow-commands:` are written into a run's worktree, and this run stands in the \
+             project root, so they do not apply here",
+        );
+    }
+    if !inject_permissions {
+        return Some(
+            "a wrapper decides codex's sandbox here (Settings → Harness → Codex), so cide cannot \
+             make the worktree's git metadata writable or apply the role's `needs:`; if that \
+             sandbox is workspace-write, the run cannot commit",
+        );
+    }
+    let policy = permission_policy(mode, unattended).ok()?;
+    if policy == READ_ONLY {
+        return Some(
+            "codex runs it in a read-only sandbox (permission-mode: plan): it can neither edit nor commit",
+        );
+    }
+    if !sandboxes_writes(policy) {
+        return None;
+    }
+    Some(match (git_dirs_known, grant.wants_network()) {
+        (true, true) => {
+            "codex runs it in its workspace-write sandbox with the network on for the role's \
+             `needs:`, so an Xvfb of its own and audio work there; it can edit and commit in its \
+             worktree"
+        }
+        (true, false) => {
+            "codex runs it in its workspace-write sandbox: it can edit and commit in its worktree, \
+             but the sandbox refuses unix sockets while the network is off, so it has no X display \
+             and no audio and an Xvfb e2e run or a Blender render fails there; a role that needs \
+             them says `needs: [display, audio]`, or lets the one command out with \
+             `allow-commands:`"
+        }
+        (false, _) => {
+            "codex runs it in its workspace-write sandbox and the worktree's git directories could \
+             not be resolved, so it cannot commit"
+        }
+    })
+}
+
+/// What the run itself is told about its sandbox, appended to its brief. (M119)
+///
+/// [`sandbox_caveat`] is the same facts for a person; this is them for the model, as
+/// instructions, because a run that is not told plans the capture it cannot make and finds out
+/// by failing — t-586's Blender render, t-588's Xvfb run, retried. `rules_written` is whether
+/// cide put the role's `allow-commands` where codex reads them (a worktree run only); the list
+/// is repeated here with the one rule that decides whether codex lets a command out — every part
+/// of it must be allowed, so a `timeout` or a pipe around it keeps it in.
+pub fn sandbox_brief(
+    mode: Option<&str>,
+    unattended: Unattended,
+    worktree: bool,
+    git_dirs_known: bool,
+    inject_permissions: bool,
+    grant: &crate::sandbox::SandboxGrant,
+    rules_written: bool,
+) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let sandboxed = inject_permissions
+        && permission_policy(mode, unattended)
+            .ok()
+            .is_some_and(|policy| policy == READ_ONLY || sandboxes_writes(policy));
+    if sandboxed {
+        let policy = permission_policy(mode, unattended).ok();
+        if policy == Some(READ_ONLY) {
+            lines.push("Your sandbox is read-only: you cannot edit files or commit here.".into());
+        } else {
+            if worktree && !git_dirs_known {
+                lines.push(
+                    "Your sandbox cannot write this worktree's git metadata, so `git commit` will \
+                     fail: do not retry it — say in your comment that the work is uncommitted."
+                        .into(),
+                );
+            }
+            if grant.wants_network() {
+                lines.push(
+                    "Your sandbox has the network on for this role's needs, so unix sockets work: \
+                     you may start an X server of your own (`Xvfb :<n> -nolisten tcp`) and programs \
+                     that open audio will not hang."
+                        .into(),
+                );
+                // No GPU in here, whatever the role needs: codex binds a minimal `/dev` and has
+                // no setting that adds `/dev/dri` or `/dev/nvidia*` (0.157.1). Vulkan and GL
+                // fall to llvmpipe, which is what selfcraft's e2e runs got — Godot's Forward+
+                // then fell back to opengl3. Said, so a run does not debug a missing device.
+                lines.push(
+                    "There is no GPU in this sandbox: Vulkan and GL run on llvmpipe (software), and \
+                     no setting adds /dev/dri or /dev/nvidia*. Work that needs the GPU goes through \
+                     one of the role's allowed commands, which run outside the sandbox with the real \
+                     devices; if there is none for it, say so in your comment rather than debugging \
+                     the device."
+                        .into(),
+                );
+            } else {
+                lines.push(
+                    "Your sandbox refuses unix sockets (the network is off), so it has no X display \
+                     and no audio: do not start Xvfb, a windowed Godot, Blender or anything that \
+                     opens PulseAudio here — they fail, or hang and never exit. Leave captures and \
+                     renders to the reviewer, and say so in your comment."
+                        .into(),
+                );
+            }
+        }
+    }
+    if rules_written && !grant.allow_commands.is_empty() {
+        let list = grant
+            .allow_commands
+            .iter()
+            .map(|command| format!("`{command}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "These commands run without asking{}: {list}. Only when you invoke one directly, as \
+             a whole command — under `timeout`, after `cd … &&`, in a pipe or inside `sh -c` it is \
+             treated as any other command. Something started this way is not stopped by the \
+             sandbox if it hangs, so prefer a script that exits by itself.",
+            if sandboxed {
+                " and outside the sandbox"
+            } else {
+                ""
+            }
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join(" "))
 }
 
 /// One sentence for a [`cide_core::child_env::FilterError`], read in a settings dialog.
@@ -582,6 +834,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             extras: Vec::new(),
+            sandbox: Default::default(),
         }
     }
 
@@ -614,6 +867,9 @@ mod tests {
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
             server: None,
+            git_dirs: Vec::new(),
+            sandbox_brief: None,
+            codex_trust_root: None,
         }
     }
 
@@ -829,6 +1085,199 @@ mod tests {
         ] {
             assert!(!args.iter().any(|a| a == flag), "{flag} in {args:?}");
         }
+    }
+
+    /// A sandboxed run in a worktree is given its git metadata as writable roots, and only a
+    /// sandboxed one: bypass has no sandbox to widen, `plan` must stay read-only, and a wrapper
+    /// that decides the sandbox is given nothing of cide's. (M118, selfcraft t-572)
+    #[test]
+    fn a_worktree_run_can_write_its_git_metadata() {
+        let dirs = [
+            std::path::PathBuf::from("/work/game/.git/worktrees/qa-t-572"),
+            std::path::PathBuf::from("/work/game/.git"),
+        ];
+        let session = SessionId::new();
+        let args_for_under = |mode: Option<&str>, inject: bool, unattended: Unattended| {
+            let mut agent = role();
+            agent.permission_mode = mode.map(str::to_string);
+            let mut plan = plan_for(&agent, session);
+            plan.git_dirs = dirs.to_vec();
+            plan.unattended = unattended;
+            plan.codex.cli.inject.permissions = inject;
+            CodexHarness.spawn_spec(&plan).expect("spawnable").spec.args
+        };
+        let args_for = |mode, inject| args_for_under(mode, inject, Unattended::Auto);
+        let added = |args: &[String]| -> Vec<String> {
+            args.windows(2)
+                .filter(|w| w[0] == "--add-dir")
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        let wanted: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        for mode in ["auto", "default", "acceptEdits", "dontAsk"] {
+            assert_eq!(added(&args_for(Some(mode), true)), wanted, "{mode}");
+        }
+        for mode in [Some("plan"), Some("bypassPermissions"), None] {
+            assert!(added(&args_for(mode, true)).is_empty(), "{mode:?}");
+        }
+        assert!(
+            added(&args_for(Some("auto"), false)).is_empty(),
+            "a wrapper decides"
+        );
+        assert_eq!(
+            added(&args_for_under(None, true, Unattended::Ask)),
+            wanted,
+            "a project that asks is sandboxed, and its person should not have to approve a commit"
+        );
+
+        // A run in the root has no list, and nothing is added.
+        let mut agent = role();
+        agent.permission_mode = Some("auto".into());
+        let args = CodexHarness
+            .spawn_spec(&plan_for(&agent, session))
+            .expect("spawnable")
+            .spec
+            .args;
+        assert!(!args.iter().any(|a| a == "--add-dir"), "{args:?}");
+    }
+
+    #[test]
+    fn the_sandbox_caveat_is_said_only_where_the_sandbox_denies_something() {
+        let none = crate::sandbox::SandboxGrant::default();
+        let caveat = |mode, worktree, known, inject| {
+            sandbox_caveat(mode, Unattended::Auto, worktree, known, inject, &none)
+        };
+        assert!(caveat(Some("auto"), true, true, true).is_some_and(|s| s.contains("X display")));
+        assert!(
+            caveat(Some("auto"), true, false, true).is_some_and(|s| s.contains("cannot commit"))
+        );
+        assert!(caveat(Some("plan"), true, true, true).is_some_and(|s| s.contains("read-only")));
+        assert!(caveat(Some("auto"), true, true, false).is_some_and(|s| s.contains("wrapper")));
+        assert_eq!(caveat(Some("bypassPermissions"), true, true, true), None);
+        assert_eq!(
+            caveat(None, true, true, true),
+            None,
+            "the project default is bypass"
+        );
+        assert_eq!(
+            caveat(Some("auto"), false, true, true),
+            None,
+            "the root is not asked to commit"
+        );
+        assert_eq!(
+            caveat(Some("manual"), true, true, true),
+            None,
+            "refused at dispatch instead"
+        );
+        assert!(
+            sandbox_caveat(None, Unattended::Ask, true, true, true, &none).is_some(),
+            "a project that asks is sandboxed"
+        );
+        // The way out it names is the grant, not the bypass (M119).
+        assert!(caveat(Some("auto"), true, true, true).is_some_and(|s| s.contains("needs:")));
+        let display = crate::sandbox::SandboxGrant {
+            needs: vec![crate::sandbox::SandboxNeed::Display],
+            ..Default::default()
+        };
+        assert!(
+            sandbox_caveat(Some("auto"), Unattended::Auto, true, true, true, &display)
+                .is_some_and(|s| s.contains("network on") && !s.contains("no X display"))
+        );
+        let allowed = crate::sandbox::SandboxGrant {
+            allow_commands: vec!["blender -b".into()],
+            ..Default::default()
+        };
+        assert!(
+            sandbox_caveat(Some("auto"), Unattended::Auto, false, true, true, &allowed)
+                .is_some_and(|s| s.contains("project root")),
+            "a root run is told its allow-commands do not reach it"
+        );
+    }
+
+    /// The grant on the command line (M119): `needs` is codex's network switch plus Mesa for a
+    /// display, `writable-dirs` are `--add-dir`s, and all of it only under a writes sandbox;
+    /// the trust `-c` whenever cide wrote the rules file.
+    #[test]
+    fn a_grant_reaches_codex_only_where_its_sandbox_is_on() {
+        let session = SessionId::new();
+        let mut agent = role();
+        agent.permission_mode = Some("auto".into());
+        agent.sandbox = crate::sandbox::SandboxGrant {
+            needs: vec![crate::sandbox::SandboxNeed::Display],
+            writable_dirs: vec!["/srv/assets".into()],
+            allow_commands: vec!["blender -b".into()],
+        };
+        let mut plan = plan_for(&agent, session);
+        plan.codex_trust_root = Some(PathBuf::from("/p"));
+        plan.sandbox_brief = Some("BRIEF-LINE".into());
+        let spawn = CodexHarness.spawn_spec(&plan).expect("spawnable");
+        let args = &spawn.spec.args;
+        assert!(
+            args.iter()
+                .any(|a| a == "sandbox_workspace_write.network_access=true"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == "/srv/assets"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "projects.\"/p\".trust_level=\"trusted\""),
+            "{args:?}"
+        );
+        assert!(developer_brief(&plan).ends_with("BRIEF-LINE"));
+
+        agent.permission_mode = Some("bypassPermissions".into());
+        let plan = plan_for(&agent, session);
+        let args = CodexHarness.spawn_spec(&plan).expect("spawnable").spec.args;
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("sandbox_workspace_write")),
+            "no sandbox, nothing to widen: {args:?}"
+        );
+    }
+
+    #[test]
+    fn the_run_is_told_what_its_sandbox_denies_and_what_it_may_run() {
+        let none = crate::sandbox::SandboxGrant::default();
+        let brief = |grant: &crate::sandbox::SandboxGrant, rules| {
+            sandbox_brief(
+                Some("auto"),
+                Unattended::Auto,
+                true,
+                true,
+                true,
+                grant,
+                rules,
+            )
+        };
+        assert!(brief(&none, false).is_some_and(|b| b.contains("do not start Xvfb")));
+        let grant = crate::sandbox::SandboxGrant {
+            needs: vec![crate::sandbox::SandboxNeed::Audio],
+            allow_commands: vec!["blender -b".into()],
+            ..Default::default()
+        };
+        let told = brief(&grant, true).expect("said");
+        assert!(
+            told.contains("`blender -b`") && told.contains("outside the sandbox"),
+            "{told}"
+        );
+        assert!(!told.contains("do not start Xvfb"), "{told}");
+        assert_eq!(
+            sandbox_brief(
+                Some("bypassPermissions"),
+                Unattended::Auto,
+                true,
+                true,
+                true,
+                &none,
+                false
+            ),
+            None
+        );
     }
 
     #[test]

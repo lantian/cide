@@ -26,4 +26,12 @@ models: Array<string>,
  * [`AgentDraftProblem`], because nothing the user typed caused it and nothing they can type
  * in this form fixes it. The box stays editable either way.
  */
-problem: string | null, };
+problem: string | null, 
+/**
+ * Whether this harness's CLI takes a pool entry's effort variant inside the model id
+ * (`--model o3/Qwen-Coder#xhigh`, opencode 2) rather than as `--variant xhigh` (opencode 1,
+ * MiMo). The pool screen's argv readout spells it this way; it said `--variant` for a CLI
+ * that answers that flag with `Unrecognized flag`, over the exact argv t-1090 died on.
+ * `false` for a harness with no variant at all.
+ */
+variantInModel: boolean, };

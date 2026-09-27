@@ -34,6 +34,7 @@ import { useTasks } from '@/sidebar/tasksStore'
 import {
   milestones as milestonesApi,
   type CheckResult,
+  type GateRuns,
   type Milestone,
   type MilestonePlan,
   type MilestoneTask,
@@ -42,6 +43,7 @@ import {
 import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { Icon, asIcon } from '@/icons/Icon'
+import { RadioGroup } from '@/kit/components/Choice'
 import fieldStyles from '@/settings/controls.module.css'
 
 import { CheckLogModal, CheckLogView, type CheckLogTarget } from './CheckLogModal'
@@ -404,6 +406,10 @@ export function MilestonesPanel({
                 <span className={styles.k}>Open tasks</span>
                 <span className={styles.v}>{plan.maxOpen ?? 12} per milestone</span>
               </span>
+              <span className={styles.kv}>
+                <span className={styles.k}>Gate runs</span>
+                <span className={styles.v}>{GATE_RUNS_SUMMARY[plan.gateRuns ?? 'merge']}</span>
+              </span>
             </button>
             {error !== null && <p className={styles.error}>{error}</p>}
           </>
@@ -552,6 +558,19 @@ function MilestoneModal({
     initialTab === 'log' && index !== null ? 'log' : 'overview',
   )
 
+  // Run this milestone's gate, whichever it is. The header's Run gate only ever runs the active
+  // one, and an accepted milestone whose gate went red afterwards had no way to a fresh verdict
+  // short of making it active again — which re-opens planning for a goal already signed off.
+  // Opens the log, where the run is drawn; the answer lands through `milestones-changed`.
+  const runGate = () => {
+    if (project === null) return
+    setError(null)
+    setTab('log')
+    void milestonesApi.runGate(project, original.id).catch((e: unknown) => setError(errorText(e)))
+  }
+  // A gate edited here and not saved is not what would run — Rust reads the plan from disk.
+  const gateDirty = gateCmd.trim() !== original.gate
+
   return (
     <OverlayCard
       label={index === null ? 'New milestone' : `Milestone ${original.id}`}
@@ -698,6 +717,18 @@ function MilestoneModal({
             </>
           )}
           <span className={styles.spacer} />
+          {index !== null && tab !== 'tasks' && (
+            <button
+              type="button"
+              className={panelStyles.action}
+              data-audit="milestoneModalRunGate"
+              disabled={busy || gateRunning || gateDirty || original.gate.trim() === ''}
+              title={gateDirty ? 'Save the edited gate first — the saved one is what runs' : undefined}
+              onClick={runGate}
+            >
+              Run gate
+            </button>
+          )}
           {ready && (
             <button
               type="button"
@@ -773,6 +804,35 @@ function MilestoneTaskList({
   )
 }
 
+/**
+ * When cide runs the active gate by itself (`MilestonePlan::gate_runs`). A gate is a project's
+ * whole acceptance run — 7 to 16 minutes on the projects milestones were built for — and rerun
+ * after each of a batch of merges minutes apart it never finishes about the commit that matters.
+ */
+const GATE_RUNS_SUMMARY: Record<GateRuns, string> = {
+  merge: 'after every merge',
+  idle: 'when the project goes quiet',
+  manual: 'only when you run it',
+}
+
+const GATE_RUNS_OPTIONS: ReadonlyArray<{ value: GateRuns; label: string; hint: string }> = [
+  {
+    value: 'merge',
+    label: 'After every merge',
+    hint: 'Each agent branch cide merges reruns the gate. Right for a gate that takes seconds.',
+  },
+  {
+    value: 'idle',
+    label: 'When the project goes quiet',
+    hint: 'Not after each merge: once every run has finished, before the orchestrator plans again. One run per batch.',
+  },
+  {
+    value: 'manual',
+    label: 'Only when you run it',
+    hint: 'Run gate in a milestone’s card; the orchestrator plans on the last result.',
+  },
+]
+
 function ChecksModal({
   plan,
   onWrite,
@@ -785,6 +845,7 @@ function ChecksModal({
   const [verify, setVerify] = useState(plan.verify)
   const [guards, setGuards] = useState(plan.guardPaths.join('\n'))
   const [limit, setLimit] = useState(String(plan.maxOpen ?? 12))
+  const [gateRuns, setGateRuns] = useState<GateRuns>(plan.gateRuns ?? 'merge')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -797,6 +858,7 @@ function ChecksModal({
         .split('\n')
         .map((l) => l.trim())
         .filter((l) => l !== ''),
+      gateRuns,
     }
     if (Number.isFinite(n) && n > 0) next.maxOpen = n
     setBusy(true)
@@ -835,6 +897,13 @@ function ChecksModal({
           onChange={setLimit}
           mono
           hint="Past this many open tasks under the active milestone, new ones the orchestrator files go to the inbox."
+        />
+        <RadioGroup
+          legend="Run the gate"
+          name="milestone-gate-runs"
+          value={gateRuns}
+          onChange={setGateRuns}
+          options={GATE_RUNS_OPTIONS}
         />
         {error !== null && <p className={styles.error}>{error}</p>}
         <div className={styles.modalActions}>

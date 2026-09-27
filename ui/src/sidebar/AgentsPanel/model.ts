@@ -561,6 +561,61 @@ export interface RunView {
    * it is `true`: with no worktree there is nothing of this run's to take from the panel.
    */
   worktree: boolean
+  /**
+   * The Claude session of the review tab that owns this run's task, while it is open, or
+   * `null`. (M114) `AgentRun::reviewer`: the row draws "In review by orchestrator" as a link to
+   * that tab, because a run parked idle behind somebody else's review otherwise looks stuck.
+   */
+  reviewer: string | null
+}
+
+/**
+ * The verify gate on one task's branch, as the Agents panel reads it. (M114) Joined onto the run
+ * whose role did the work — `VerifyState` from the milestones view, which is the one producer.
+ */
+export interface GateView {
+  /** The role whose branch was verified; a row of any other role ignores it. */
+  agent: string
+  running: boolean
+  /** The last answer, or `null` when there is none yet (the first verify is still running). */
+  passed: boolean | null
+  /** Red verifies in a row since the last green one. */
+  failures: number
+  /** `agents.verifyRetries`: red verifies up to this many go back to the run itself. */
+  retries: number
+}
+
+/**
+ * **Why an idle run is idle**, when the gate is the reason: one line under the row. (M114)
+ *
+ * A run hands its turn back the moment it sets review, and until M114 its row said `Idle` and
+ * nothing else while verify ran, failed, went back or went to a reviewer — the report was a run
+ * "stuck idle" whose reviewer had in fact already been and gone. `null` when there is no gate on
+ * this run's task, or the gate is about another role's branch.
+ */
+export function gateLine(run: RunView, gate: GateView | undefined): string | null {
+  if (gate === undefined || run.task === null || gate.agent !== run.agent) return null
+  if (gate.running) return 'Verify gate running on its branch'
+  if (gate.passed === true) return 'Verify gate passed'
+  if (gate.passed === null) return null
+  if (gate.failures === 0) return 'Verify gate failed'
+  if (gate.failures <= gate.retries) {
+    return `Verify gate failed (${gate.failures} of ${gate.retries}), handed back to the run`
+  }
+  return `Verify gate failed ${gate.failures} times in a row, sent to the orchestrator`
+}
+
+/**
+ * The one word an idle run's row and its role's summary say, when the gate or a reviewer is why
+ * it is idle. (M114) `Idle` alone read as "stuck"; these say who has the task.
+ */
+function idleLabel(run: RunView, gate: GateView | undefined): string | null {
+  if (run.phase !== 'idle') return null
+  const mine = gate !== undefined && gate.agent === run.agent
+  if (mine && gate.running) return 'Verifying'
+  if (run.reviewer !== null) return 'In review'
+  if (mine && gate.passed === false) return 'Gate failed'
+  return null
 }
 
 /**
@@ -1042,6 +1097,10 @@ export interface RunRow {
    * back to the label itself.
    */
   hint: string | null
+  /** The verify gate's line for this run, or `null`. See [`gateLine`]. (M114) */
+  gate: string | null
+  /** The open review tab that owns this run's task — [`RunView.reviewer`], repeated. (M114) */
+  reviewer: string | null
 }
 
 /**
@@ -1236,17 +1295,24 @@ function titleOf(titles: Readonly<Record<string, string>>, id: string | null): s
   return title
 }
 
-function runRow(run: RunView, titles: Readonly<Record<string, string>>): RunRow {
+function runRow(
+  run: RunView,
+  titles: Readonly<Record<string, string>>,
+  gates: Readonly<Record<string, GateView>>,
+): RunRow {
+  const gate = run.task !== null && Object.hasOwn(gates, run.task) ? gates[run.task] : undefined
   return {
     run,
     glyph: phaseGlyph(run.phase),
-    label: phaseLabel(run.phase),
+    label: idleLabel(run, gate) ?? phaseLabel(run.phase),
     tone: phaseTone(run.phase),
     taskTitle: titleOf(titles, run.task),
     canOpen: canOpen(run),
     canPause: canPause(run),
     staleTurn: staleTurnLine(run),
     hint: phaseHint(run.phase),
+    gate: gateLine(run, gate),
+    reviewer: run.reviewer,
   }
 }
 
@@ -1329,11 +1395,12 @@ function roleRow(
   roster: Roster,
   runs: readonly RunView[],
   titles: Readonly<Record<string, string>>,
+  gates: Readonly<Record<string, GateView>>,
 ): RoleRow {
   const active = runs
     .filter((run) => run.agent === def.id && isActivePhase(run.phase))
     .sort(byUrgency)
-    .map((run) => runRow(run, titles))
+    .map((run) => runRow(run, titles, gates))
   const first = active[0]
   return {
     def,
@@ -1392,10 +1459,16 @@ function roleRow(
  * re-render when two runs share a millisecond, and a list that reshuffles under the pointer is
  * unusable.
  */
-export function sections(roster: Roster, taskTitles: Readonly<Record<string, string>>): Section[] {
+export function sections(
+  roster: Roster,
+  taskTitles: Readonly<Record<string, string>>,
+  gates: Readonly<Record<string, GateView>> = {},
+): Section[] {
   if (roster.kind !== 'ready') return []
 
-  const roles: RoleRow[] = roster.agents.map((def) => roleRow(def, roster, roster.runs, taskTitles))
+  const roles: RoleRow[] = roster.agents.map((def) =>
+    roleRow(def, roster, roster.runs, taskTitles, gates),
+  )
 
   /*
    * The orphans, found by asking the roster rather than by trusting the run: `defined` is built
@@ -1409,7 +1482,7 @@ export function sections(roster: Roster, taskTitles: Readonly<Record<string, str
     if (!isActivePhase(run.phase)) continue
     if (defined.has(run.agent) || orphans.includes(run.agent)) continue
     orphans.push(run.agent)
-    roles.push(roleRow(undefinedRole(run), roster, roster.runs, taskTitles))
+    roles.push(roleRow(undefinedRole(run), roster, roster.runs, taskTitles, gates))
   }
 
   const recent = roster.runs.filter((run) => isDonePhase(run.phase))
@@ -1431,7 +1504,7 @@ export function sections(roster: Roster, taskTitles: Readonly<Record<string, str
       // a per-process scratchpad. The *kind* stays 'recent' — it is an internal name in every
       // fixture and check, and renaming a wire-adjacent identifier to chase a label is churn.
       label: 'History',
-      rows: recent.slice(0, RECENT_CAP).map((run) => runRow(run, taskTitles)),
+      rows: recent.slice(0, RECENT_CAP).map((run) => runRow(run, taskTitles, gates)),
     })
   }
   return out

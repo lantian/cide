@@ -127,9 +127,12 @@ try {
   ok(m.pasteRefusal(null, 'p1', target).includes('Nothing has been copied'),
     'an empty clipboard is a REASON on a disabled item, not a hidden item — an item that '
       + 'appears only sometimes teaches the user nothing about why')
-  ok(m.pasteRefusal(clip('copy', ['/x/a.rs'], 'p2'), 'p1', target).includes('another project'),
-    'pasting into a different project is refused here, where it can be a sentence, rather '
-      + 'than by ops::check_within after the gesture')
+  eq(m.pasteRefusal(clip('copy', ['/x/a.rs'], 'p2'), 'p1', target), null,
+    'a clip from ANOTHER project pastes — the clip carries its project, the paste sends it as '
+      + '`sourceProject`, and Rust checks the sources against that project\'s roots. This line '
+      + 'pinned the opposite until cross-project paste existed')
+  eq(m.pasteRefusal(clip('cut', ['/x/a.rs'], 'p2'), 'p1', target), null,
+    'and so does a cut: a move between projects is the same containment split')
   ok(m.pasteRefusal(clip('copy', ['/home/u/work/cide/a.rs']), null, target).includes('No project'),
     'and with no project open there is nothing to paste into')
   ok(
@@ -177,6 +180,14 @@ try {
   ok(m.pendingNote(clip('cut', ['/a/x.rs'])).includes('Esc'),
     'and says how to call it off — a cut that cannot be cancelled is a trap')
   eq(m.pendingNote(null), null, 'an empty clipboard says nothing')
+  ok(m.pendingNote(clip('cut', ['/a/x.rs'], 'p2'), 'p1').includes('another project'),
+    'another project\'s panel ALSO announces a pending cut, now that it can paste one — and '
+      + 'says where it came from')
+  ok(!m.pendingNote(clip('cut', ['/a/x.rs'], 'p2'), 'p1').includes('Esc'),
+    'but does not promise Escape, which only the panel the cut was made in honours '
+      + '(escapeCancels below) — a hint for a key that does nothing is a dead control')
+  ok(m.pendingNote(clip('cut', ['/a/x.rs'], 'p1'), 'p1').includes('Esc'),
+    'while the source panel still does')
 
   ok(m.isCutPending(clip('cut', ['/a/x.rs']), '/a/x.rs'), 'a cut row is drawn faded')
   ok(!m.isCutPending(clip('copy', ['/a/x.rs']), '/a/x.rs'), 'a copied row is not')

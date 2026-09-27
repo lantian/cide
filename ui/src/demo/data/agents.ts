@@ -186,4 +186,6 @@ export const CONFIG: OrchestrationConfig = {
   isolateEnv: ['CARGO_TARGET_DIR', 'VITE_PORT'],
   isolateEnvShare: ['RUSTC_WRAPPER'],
   verifyExclusive: true,
+  verifyRetries: 3,
+  resumeAfterRestart: true,
 }
