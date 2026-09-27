@@ -627,17 +627,26 @@ impl Flavor {
         llm: &cide_ipc::LlmSettings,
         hook_bin: Option<&std::path::Path>,
     ) -> Result<TabLaunch, String> {
-        self.tab_launch_with(
+        let binary = self.binary()?;
+        let launch = self.tab_launch_with(
             prompt,
             model,
             unattended,
             llm,
             hook_bin,
             self.probe_cli_flags(),
-        )
+        );
+        Ok(TabLaunch {
+            program: binary.to_string_lossy().into_owned(),
+            ..launch
+        })
     }
 
     /// The half of [`Self::tab_launch`] a test can drive. See [`child_with`].
+    ///
+    /// `program` is the bare name; [`Self::tab_launch`] swaps in the resolved binary. The search
+    /// is `PATH`, and a test that reached it passed only on a machine with opencode installed —
+    /// it failed on CI, whose runner has none, while every developer machine had it.
     pub fn tab_launch_with(
         &self,
         prompt: &str,
@@ -646,8 +655,7 @@ impl Flavor {
         llm: &cide_ipc::LlmSettings,
         hook_bin: Option<&std::path::Path>,
         flags: CliFlags,
-    ) -> Result<TabLaunch, String> {
-        let binary = self.binary()?;
+    ) -> TabLaunch {
         let mut args: Vec<String> = Vec::new();
         // The tab is a child cide started, so it owns its server for `child`'s reason: the
         // document below carries cide's MCP bridge and the machine's providers, and a client of
@@ -680,11 +688,11 @@ impl Flavor {
         if let Some(document) = self.tab_config(llm, hook_bin, flags.generation) {
             env.push((self.config_env(), document));
         }
-        Ok(TabLaunch {
-            program: binary.to_string_lossy().into_owned(),
+        TabLaunch {
+            program: self.program().to_string(),
             args,
             env,
-        })
+        }
     }
 
     /// The tab's configuration document: providers and cide's MCP server. `None` when there is
@@ -4083,16 +4091,14 @@ mod tests {
     #[test]
     fn a_v2_tab_owns_its_server_and_names_no_model() {
         let hook = PathBuf::from("/opt/cide/cide-hook");
-        let launch = OPENCODE_CLI
-            .tab_launch_with(
-                "review the diff",
-                Some("anthropic/claude-sonnet-4-5"),
-                true,
-                &cide_ipc::LlmSettings::default(),
-                Some(&hook),
-                v2(),
-            )
-            .expect("a launch");
+        let launch = OPENCODE_CLI.tab_launch_with(
+            "review the diff",
+            Some("anthropic/claude-sonnet-4-5"),
+            true,
+            &cide_ipc::LlmSettings::default(),
+            Some(&hook),
+            v2(),
+        );
         assert_eq!(launch.args[0], "--standalone", "{:?}", launch.args);
         // Measured: `opencode --model x` answers `Unrecognized flag: --model in command opencode`.
         // Only `mini` kept it, and `mini` has no `--auto` — which is the flag that cannot be
