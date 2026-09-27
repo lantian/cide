@@ -51,4 +51,9 @@ fork: boolean,
  * role's `permission-mode` and the project's unattended default are no longer expressed,
  * so a run may stop on an approval prompt nobody is watching.
  */
-permissions: boolean, };
+permissions: boolean, 
+/**
+ * For MR reviews, allow tools and writes inside the review checkout without approval
+ * prompts, while keeping the workspace sandbox boundary.
+ */
+reviewPermissions: boolean, };
