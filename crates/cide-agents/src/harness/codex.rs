@@ -291,7 +291,12 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     let policy = if review_permissions {
         // The shorthand also selects a sandbox and conflicts with wrappers that pass -s.
         // Route requests to the automatic reviewer without overriding the wrapper's sandbox.
-        &["-a", "on-request", "-c", "approvals_reviewer=\"auto_review\""][..]
+        &[
+            "-a",
+            "on-request",
+            "-c",
+            "approvals_reviewer=\"auto_review\"",
+        ][..]
     } else {
         permission_policy(plan.agent.permission_mode.as_deref(), plan.unattended)?
     };
