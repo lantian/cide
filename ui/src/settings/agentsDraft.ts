@@ -167,7 +167,7 @@ export const SCOPES: readonly Scope[] = [
 ]
 
 /** `cide_ipc::SandboxNeed`. */
-export type SandboxNeedName = 'display' | 'audio' | 'network'
+export type SandboxNeedName = 'display' | 'audio' | 'network' | 'gpu'
 
 /**
  * `cide_ipc::SandboxNeed::ALL`, in its order, each with the words the form draws beside its box.
@@ -178,6 +178,7 @@ export const SANDBOX_NEEDS: readonly { need: SandboxNeedName; label: string; hin
   { need: 'display', label: 'Display', hint: 'An Xvfb of its own, GL on llvmpipe — e2e captures.' },
   { need: 'audio', label: 'Audio', hint: 'PulseAudio — Blender and Godot open it even headless.' },
   { need: 'network', label: 'Network', hint: 'The network itself.' },
+  { need: 'gpu', label: 'GPU', hint: 'The real GPU bound in — Vulkan off llvmpipe, e.g. Godot Forward+.' },
 ]
 
 /** `cide_ipc::Harness`, as a set. Pinned to the Rust enum by the check script. */

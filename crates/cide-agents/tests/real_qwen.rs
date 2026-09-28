@@ -92,6 +92,7 @@ fn a_real_turn_ends_in_a_result_event_and_the_child_stays_interactive() {
         git_dirs: Vec::new(),
         sandbox_brief: None,
         codex_trust_root: None,
+        codex_path_prepend: None,
     };
     let spawn = QwenHarness.spawn_spec(&plan).expect("spawnable");
     let pty = PtySession::spawn(spawn.spec).expect("spawn qwen");

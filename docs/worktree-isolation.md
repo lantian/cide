@@ -75,7 +75,7 @@ Three keys in a role's front matter, also on the Settings → Agents form and on
 
 ```yaml
 allow-commands: [blender -b, tools/ci/runners/e2e.sh]
-needs: [display, audio]
+needs: [display, audio, gpu]
 writable-dirs: [~/.cache/godot]
 ```
 
@@ -83,9 +83,12 @@ writable-dirs: [~/.cache/godot]
   one of these alone runs **outside** the sandbox. It stays sandboxed under `timeout`, after
   `cd … &&`, in a pipe or inside `sh -c`, and the run's brief says so. cide writes the rules into
   the run's worktree only. A run in the project root does not get them.
-- **`needs`** — `display`, `audio`, `network`. On codex any of them turns the sandbox's network
-  on, because its filter refuses unix sockets while the network is off. `display` also points
-  GL at Mesa.
+- **`needs`** — `display`, `audio`, `network`, `gpu`. On codex any of them turns the sandbox's
+  network on, because its filter refuses unix sockets while the network is off. `display` also
+  points GL at Mesa. `gpu` (M125) binds `/dev/dri` and `/dev/nvidia*` into the sandbox, so
+  Vulkan runs on the real GPU rather than llvmpipe. codex's own `/dev` has neither, and it has
+  no setting for them. cide puts a `bwrap` shim first on codex's `PATH` that adds them to the
+  sandbox it builds.
 - **`writable-dirs`** — extra writable roots, absolute or `~/…`.
 
 When a run ends, cide ends everything it started, including a codex sandbox's own sessions. When

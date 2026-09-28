@@ -12,5 +12,12 @@
  * Mesa, because the sandbox's `/dev` has no GPU nodes and NVIDIA's EGL crashes Xvfb's GLX).
  * The three are kept apart anyway: they are what the *role* needs, and the next harness's
  * sandbox may not tie them together.
+ *
+ * `Gpu` is the one that is not a socket. codex's bwrap is handed `--dev /dev`, a minimal `/dev`
+ * with no `/dev/dri` or `/dev/nvidia*`, so Vulkan inside sees only llvmpipe and Godot's Forward+
+ * aborts there (`LLVM ERROR X86ISD::MGATHER`, exit 134 — selfcraft, 0.157.1). codex has no
+ * setting for it and a writable root under `/dev` fails every command, so the harness puts a
+ * `bwrap` shim first on codex's `PATH` that binds the real nodes in
+ * (`cide_agents::sandbox::bwrap_gpu_shim`).
  */
-export type SandboxNeed = "display" | "audio" | "network";
+export type SandboxNeed = "display" | "audio" | "network" | "gpu";

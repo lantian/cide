@@ -2509,12 +2509,14 @@ fn definition_properties(nullable: bool) -> Value {
         },
         "needs": {
             "type": kind("array"),
-            "items": { "type": "string", "enum": ["display", "audio", "network"] },
+            "items": { "type": "string", "enum": ["display", "audio", "network", "gpu"] },
             "description": format!(
                 "What the role's work needs from a sandbox. `display` (an Xvfb of its own, GL on \
                  llvmpipe), `audio` (PulseAudio — Blender and Godot open it even headless), \
-                 `network`. On codex any of them turns the sandbox's network on, because its \
-                 filter refuses unix sockets exactly when the network is off.{clearable}"
+                 `network`, `gpu` (the machine's /dev/dri and /dev/nvidia* bound in, so Vulkan \
+                 runs on the real GPU rather than llvmpipe — Godot's Forward+ needs it). On codex \
+                 any of them turns the sandbox's network on, because its filter refuses unix \
+                 sockets exactly when the network is off.{clearable}"
             ),
         },
         "writableDirs": {
@@ -8534,7 +8536,7 @@ mod tests {
         // The way out is the narrow grant, not dropping the sandbox (M119): one seccomp switch
         // is what denies X and audio, and `bypassPermissions` took the whole sandbox for it.
         assert!(
-            text.contains("needs: [display, audio]") && text.contains("allow-commands:"),
+            text.contains("needs: [display, audio, gpu]") && text.contains("allow-commands:"),
             "the way out names the grant: {text}"
         );
         assert!(!text.contains("bypassPermissions"), "{text}");

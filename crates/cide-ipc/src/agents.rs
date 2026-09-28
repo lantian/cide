@@ -1218,6 +1218,13 @@ pub struct AgentDraft {
 /// Mesa, because the sandbox's `/dev` has no GPU nodes and NVIDIA's EGL crashes Xvfb's GLX).
 /// The three are kept apart anyway: they are what the *role* needs, and the next harness's
 /// sandbox may not tie them together.
+///
+/// `Gpu` is the one that is not a socket. codex's bwrap is handed `--dev /dev`, a minimal `/dev`
+/// with no `/dev/dri` or `/dev/nvidia*`, so Vulkan inside sees only llvmpipe and Godot's Forward+
+/// aborts there (`LLVM ERROR X86ISD::MGATHER`, exit 134 — selfcraft, 0.157.1). codex has no
+/// setting for it and a writable root under `/dev` fails every command, so the harness puts a
+/// `bwrap` shim first on codex's `PATH` that binds the real nodes in
+/// (`cide_agents::sandbox::bwrap_gpu_shim`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -1228,6 +1235,9 @@ pub enum SandboxNeed {
     Audio,
     /// The network itself.
     Network,
+    /// The machine's GPU — `/dev/dri` and `/dev/nvidia*` bound into the sandbox, so Vulkan runs
+    /// on the real device rather than llvmpipe.
+    Gpu,
 }
 
 impl SandboxNeed {
@@ -1237,14 +1247,16 @@ impl SandboxNeed {
             SandboxNeed::Display => "display",
             SandboxNeed::Audio => "audio",
             SandboxNeed::Network => "network",
+            SandboxNeed::Gpu => "gpu",
         }
     }
 
     /// Every need, in the order a file lists them.
-    pub const ALL: [SandboxNeed; 3] = [
+    pub const ALL: [SandboxNeed; 4] = [
         SandboxNeed::Display,
         SandboxNeed::Audio,
         SandboxNeed::Network,
+        SandboxNeed::Gpu,
     ];
 }
 

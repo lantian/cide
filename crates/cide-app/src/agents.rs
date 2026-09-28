@@ -8151,6 +8151,8 @@ fn start_child(
         // Both decided just below, once the plan's policy can be read. (M119)
         sandbox_brief: None,
         codex_trust_root: None,
+        // Written just below for a `needs: [gpu]` codex run. (M125)
+        codex_path_prepend: None,
     };
     // An opencode-shaped run works behind a server of its own, so a pane can attach the full TUI
     // to the conversation while it runs (M104 follow-up). Started — or found alive from an earlier
@@ -8205,6 +8207,38 @@ fn start_child(
                 }
             }
         };
+    // The GPU for a role that says `needs: [gpu]` (M125): a `bwrap` shim, which the harness puts
+    // first on codex's `PATH`, binding `/dev/dri` and `/dev/nvidia*` into the sandbox codex builds
+    // with it. Written only where the harness will use it — codex, cide deciding a sandbox that
+    // writes — and beside the run's event FIFO, in this cide's runtime directory, keyed by run.
+    // Rewritten at every spawn, so a respawn gets this build's shim. A failure is not a refused
+    // run: the run starts on llvmpipe, and its brief (below) says it has no GPU.
+    if resolved.harness == Harness::Codex
+        && plan.codex.cli.inject.permissions
+        && plan
+            .agent
+            .sandbox
+            .needs(cide_agents::sandbox::SandboxNeed::Gpu)
+        && cide_agents::harness::codex::permission_policy(
+            plan.agent.permission_mode.as_deref(),
+            plan.unattended,
+        )
+        .is_ok_and(cide_agents::harness::codex::sandboxes_writes)
+    {
+        // `cide-run-<run>.bin`, the FIFO's sibling — and **not** in the worktree, which would be
+        // tidier and would not work: codex passes over a `PATH` bwrap inside a writable root and
+        // uses its bundled one, with no error (`sandbox::bwrap_gpu_shim`, "Where it may live").
+        // Not removed when the run ends — nothing
+        // removes the FIFO generically either — because the runtime directory it sits in is
+        // this cide's and goes with it, and a respawn of the same run reuses it.
+        let dir = events_path.with_extension("bin");
+        match cide_agents::sandbox::write_bwrap_gpu_shim(&dir) {
+            Ok(_) => plan.codex_path_prepend = Some(dir),
+            Err(error) => {
+                tracing::warn!(run = %admission.run, %error, dir = %dir.display(), "could not write the bwrap shim for `needs: [gpu]`; the run's sandbox will have no GPU");
+            }
+        }
+    }
     if resolved.harness == Harness::Codex {
         plan.sandbox_brief = cide_agents::harness::codex::sandbox_brief(
             plan.agent.permission_mode.as_deref(),
@@ -8214,6 +8248,7 @@ fn start_child(
             plan.codex.cli.inject.permissions,
             &plan.agent.sandbox,
             rules_written,
+            plan.codex_path_prepend.is_some(),
         );
     }
     if let Some(flavor) = cide_agents::harness::opencode::Flavor::of(resolved.harness) {

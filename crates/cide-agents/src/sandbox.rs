@@ -15,8 +15,9 @@
 //!   with `decision="allow"`, which codex also runs *unsandboxed* when every segment of the
 //!   command matches one (`ExecPolicyManager`: `BypassSandboxFirstAttempt`). On claude,
 //!   `Bash(<prefix>:*)` in `--allowedTools`.
-//! * **`needs`** — [`SandboxNeed`]s; see its doc for the measurement that ties display and audio
-//!   to codex's network switch.
+//! * **`needs`** — [`SandboxNeed`]s (`display`, `audio`, `network`, `gpu`); see its doc for the
+//!   measurement that ties display and audio to codex's network switch. `gpu` is also a `bwrap`
+//!   shim on codex's `PATH`, [`bwrap_gpu_shim`].
 //! * **`writable-dirs`** — extra writable roots, codex's `--add-dir`.
 //!
 //! The rules for what may be written are here, in one place, because two readers apply them —
@@ -215,15 +216,17 @@ pub fn check_writable_dir(dir: &str) -> Result<(), String> {
     // given, and under `/dev` bwrap cannot create them: measured on 0.157.1, `writable_roots =
     // ["/dev/dri", "/dev/nvidia0", …]` or `["/dev"]` fails **every** command of the run with
     // `bwrap: Can't mkdir /dev/dri/.git: Permission denied` (a device node is not even a
-    // directory). selfcraft asked for exactly this to get Vulkan on the GPU; the way that works
-    // is `allow-commands`, whose commands run outside the sandbox with the real `/dev`.
+    // directory). selfcraft asked for exactly this to get Vulkan on the GPU; the ways that work
+    // are `needs: [gpu]`, which binds the nodes in through a bwrap shim ([`bwrap_gpu_shim`]),
+    // and `allow-commands`, whose commands run outside the sandbox with the real `/dev`.
     for kernel in ["/dev", "/proc", "/sys"] {
         if trimmed == kernel || trimmed.starts_with(&format!("{kernel}/")) {
             return Err(format!(
                 "`{dir}` is under `{kernel}`, which codex's sandbox cannot take as a writable root: \
                  it tries to hide `.git` inside it, fails, and every command of the run fails with \
-                 it. For the GPU (`/dev/dri`, `/dev/nvidia*`), allow the command that needs it with \
-                 `allow-commands:` instead — it then runs outside the sandbox, with the real devices."
+                 it. For the GPU (`/dev/dri`, `/dev/nvidia*`), write `needs: [gpu]` instead — the \
+                 devices are then bound into the sandbox — or allow the one command that needs it \
+                 with `allow-commands:`, which runs it outside the sandbox."
             ));
         }
     }
@@ -329,6 +332,148 @@ pub fn write_codex_rules(
     Ok(true)
 }
 
+/// The device nodes `needs: [gpu]` binds into codex's sandbox, each only where it exists on
+/// this machine when the sandbox is built: the DRM nodes (Mesa, and NVIDIA's own Vulkan ICD
+/// opens them too) and the nodes NVIDIA's driver needs for Vulkan and CUDA.
+pub const GPU_NODES: &[&str] = &[
+    "/dev/dri",
+    "/dev/nvidia0",
+    "/dev/nvidiactl",
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+];
+
+/// The file name the shim is written as: what codex looks up on its `PATH`.
+pub const BWRAP_SHIM: &str = "bwrap";
+
+/// The `bwrap` shim `needs: [gpu]` puts first on a codex run's `PATH`. (M125)
+///
+/// # Why a shim
+///
+/// codex 0.157.1 builds its Linux sandbox by running the **system** `bwrap`, looked up on its
+/// `PATH`, with `--dev /dev` — a fresh minimal `/dev` holding `null`, `zero`, `tty` and little
+/// else. No `/dev/dri`, no `/dev/nvidia*`, so Vulkan inside the sandbox enumerates llvmpipe
+/// alone, and Godot's Forward+ aborts on it (`LLVM ERROR X86ISD::MGATHER`, exit 134; selfcraft).
+/// codex has no setting that adds a device, and a writable root under `/dev` fails every command
+/// of the run ([`check_writable_dir`]). What does work, measured by hand on 0.157.1 with
+/// `codex sandbox` (network on): a `bwrap` earlier on the `PATH` that adds `--dev-bind <n> <n>`
+/// for each node right after the `--dev /dev` pair and execs the real one — `vulkaninfo
+/// --summary` inside then lists the RTX 5090 first. Order matters: bwrap applies its mount
+/// operations in sequence, so a bind before `--dev /dev` would be buried under the new tmpfs.
+///
+/// # Where it may live
+///
+/// **Never inside one of the sandbox's writable roots** — the worktree, its git directories, a
+/// `writable-dirs` entry. codex skips a `PATH` bwrap it finds there and quietly uses the one it
+/// bundles (`codex-resources/bwrap`), which a sandboxed command could not have rewritten
+/// (measured on 0.157.1: the same shim ran from `$XDG_RUNTIME_DIR` and was passed over under the
+/// `-C` directory). So nothing fails; the GPU is simply absent. cide writes it beside the run's
+/// event FIFO in its runtime directory.
+///
+/// # What it must not do
+///
+/// * **Find itself.** The real `bwrap` is the first one on `PATH` in a directory that is not the
+///   shim's own; an entry spelling the shim's directory differently (a symlink, a trailing `/`)
+///   is compared after `pwd -P`. Finding itself would be an exec loop that never builds a sandbox.
+/// * **Guess.** If codex ever stops passing `--dev /dev`, the arguments pass through unchanged
+///   and a warning goes to stderr: the run gets codex's ordinary sandbox rather than one the shim
+///   rearranged on a guess. The ignored `real_codex` test is what notices such an update.
+///
+/// POSIX `sh` and its builtins only — no `dirname`, no `which` — because the one thing the shim
+/// cannot rely on is what else the `PATH` holds. The argv is rebuilt with the
+/// `for arg do set -- "$@" "$arg"; done; shift $n` idiom — the only way plain `sh` edits a list
+/// of arguments without word-splitting them.
+pub fn bwrap_gpu_shim() -> String {
+    bwrap_gpu_shim_for(GPU_NODES)
+}
+
+/// [`bwrap_gpu_shim`] over a given node list — the tests' seam, so they can bind temp files
+/// rather than depend on this machine's GPU.
+pub fn bwrap_gpu_shim_for(nodes: &[&str]) -> String {
+    let nodes = nodes
+        .iter()
+        .map(|node| sh_quote(node))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        r#"#!/bin/sh
+# Written by cide for a codex run whose role says `needs: [gpu]` (M125). Regenerated at every
+# spawn. codex runs `bwrap … --dev /dev …`, which gives the sandbox a /dev with no GPU; this adds
+# the real device nodes right after that pair and runs the real bwrap.
+case $0 in
+    */*) self_dir=${{0%/*}} ;;
+    *) self_dir=. ;;
+esac
+self_dir=$(cd "$self_dir" && pwd -P)
+real=
+old_ifs=$IFS
+IFS=:
+for dir in $PATH; do
+    [ -n "$dir" ] || continue
+    resolved=$(cd "$dir" 2>/dev/null && pwd -P) || continue
+    [ "$resolved" = "$self_dir" ] && continue
+    if [ -f "$dir/bwrap" ] && [ -x "$dir/bwrap" ]; then
+        real=$dir/bwrap
+        break
+    fi
+done
+IFS=$old_ifs
+if [ -z "$real" ]; then
+    echo "cide gpu shim: no bwrap on PATH other than this shim" >&2
+    exit 127
+fi
+n=$#
+found=0
+prev=
+for arg do
+    set -- "$@" "$arg"
+    if [ "$found" = 0 ] && [ "$prev" = "--dev" ] && [ "$arg" = "/dev" ]; then
+        found=1
+        for node in {nodes}; do
+            if [ -e "$node" ]; then
+                set -- "$@" --dev-bind "$node" "$node"
+            fi
+        done
+    fi
+    prev=$arg
+done
+shift "$n"
+if [ "$found" = 0 ]; then
+    echo "cide gpu shim: no \`--dev /dev\` in bwrap's arguments; passing them through unchanged — the GPU is not bound" >&2
+fi
+exec "$real" "$@"
+"#
+    )
+}
+
+/// Write [`bwrap_gpu_shim`] as `dir/bwrap`, executable, and return the path. Rewritten at every
+/// spawn, as [`write_codex_rules`] is, so a run always gets the shim this build writes.
+pub fn write_bwrap_gpu_shim(dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    write_shim_at(dir, &bwrap_gpu_shim())
+}
+
+fn write_shim_at(dir: &std::path::Path, script: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(BWRAP_SHIM);
+    // Through a temporary name and a rename: a respawn rewriting the shim while a previous child
+    // of the same run is still exec'ing it must not hand that child half a script.
+    let partial = dir.join(format!(".{BWRAP_SHIM}.partial"));
+    std::fs::write(&partial, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&partial, &path)?;
+    Ok(path)
+}
+
+/// One `sh` word, single-quoted.
+fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
 fn starlark_string(token: &str) -> String {
     let mut out = String::from("\"");
     for ch in token.chars() {
@@ -388,13 +533,132 @@ mod tests {
     }
 
     #[test]
-    fn needs_are_the_three_words() {
+    fn needs_are_the_four_words() {
         assert_eq!(parse_need("display"), Ok(SandboxNeed::Display));
+        assert_eq!(parse_need("gpu"), Ok(SandboxNeed::Gpu));
         assert!(
-            parse_need("gpu")
+            parse_need("vulkan")
                 .unwrap_err()
-                .contains("display, audio, network")
+                .contains("display, audio, network, gpu")
         );
+    }
+
+    /// A scratch directory with the shim in `shim/` and a fake `bwrap` in `real/` that prints
+    /// one argument per line, and the `PATH` to run it with: the shim's own directory first
+    /// **and again** before the real one, spelled with a trailing `/`, so a shim that could find
+    /// itself would.
+    #[cfg(unix)]
+    fn shim_rig(name: &str, nodes: &[&str]) -> (PathBuf, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cide-gpu-shim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        let shim = write_shim_at(&shim_dir, &bwrap_gpu_shim_for(nodes)).expect("shim");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let fake = real.join("bwrap");
+        std::fs::write(&fake, "#!/bin/sh\nfor a do printf '%s\\n' \"$a\"; done\n").expect("fake");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}/:{}:/usr/bin:/bin",
+            shim_dir.display(),
+            shim_dir.display(),
+            real.display()
+        );
+        (dir, shim, path)
+    }
+
+    #[cfg(unix)]
+    fn run_shim(shim: &std::path::Path, path: &str, args: &[&str]) -> (Vec<String>, String) {
+        let out = std::process::Command::new(shim)
+            .args(args)
+            .env("PATH", path)
+            .output()
+            .expect("run the shim");
+        assert!(out.status.success(), "{out:?}");
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The nodes that exist go in right after `--dev /dev`, in order; one that does not is
+    /// skipped; an argument with a space survives; and the real `bwrap` is the fake one, not
+    /// the shim again under another spelling.
+    #[cfg(unix)]
+    #[test]
+    fn the_gpu_shim_binds_the_nodes_after_the_dev_pair() {
+        let base = std::env::temp_dir().join(format!("cide-gpu-nodes-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("dri")).expect("mkdir");
+        std::fs::write(base.join("nvidia0"), "").expect("node");
+        let dri = base.join("dri").display().to_string();
+        let nvidia = base.join("nvidia0").display().to_string();
+        let missing = base.join("nvidia-uvm").display().to_string();
+        let (dir, shim, path) = shim_rig("binds", &[&dri, &nvidia, &missing]);
+
+        let (argv, stderr) = run_shim(
+            &shim,
+            &path,
+            &[
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--",
+                "sh",
+                "-c",
+                "echo a b",
+            ],
+        );
+        let mut wanted: Vec<String> = ["--ro-bind", "/", "/", "--dev", "/dev"]
+            .map(str::to_string)
+            .to_vec();
+        for node in [&dri, &nvidia] {
+            wanted.extend(["--dev-bind".to_string(), node.clone(), node.clone()]);
+        }
+        wanted.extend(["--", "sh", "-c", "echo a b"].map(str::to_string));
+        assert_eq!(argv, wanted);
+        assert!(stderr.is_empty(), "{stderr}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// No `--dev /dev`: the arguments reach the real bwrap untouched and the shim says so.
+    #[cfg(unix)]
+    #[test]
+    fn the_gpu_shim_passes_an_unknown_invocation_through_and_warns() {
+        let (dir, shim, path) = shim_rig("through", &["/"]);
+        let args = ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "true"];
+        let (argv, stderr) = run_shim(&shim, &path, &args);
+        assert_eq!(argv, args.map(str::to_string).to_vec());
+        assert!(
+            stderr.contains("passing them through unchanged"),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With only itself on `PATH` the shim refuses rather than exec'ing itself for ever.
+    #[cfg(unix)]
+    #[test]
+    fn the_gpu_shim_never_runs_itself() {
+        let (dir, shim, _) = shim_rig("alone", &["/"]);
+        let shim_dir = shim.parent().expect("dir").display().to_string();
+        let out = std::process::Command::new(&shim)
+            .arg("--version")
+            .env(
+                "PATH",
+                format!("{shim_dir}:{shim_dir}/:/usr/bin/../bin/nowhere"),
+            )
+            .output()
+            .expect("run");
+        assert_eq!(out.status.code(), Some(127), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no bwrap on PATH"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
