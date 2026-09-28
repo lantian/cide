@@ -42,7 +42,7 @@
 //! [`crate::proc`] stays the parentage reader it says it is; this is the process *table* that
 //! module deliberately is not.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// One row of the process table: enough to find a subtree and to know a pid is still the
@@ -248,7 +248,8 @@ pub fn orphans_in(dir: &Path) -> Vec<ProcEntry> {
         if entry.pid == own || !adopted(entry.ppid) {
             continue;
         }
-        let cwd: Option<PathBuf> = std::fs::read_link(format!("/proc/{}/cwd", entry.pid)).ok();
+        let cwd: Option<std::path::PathBuf> =
+            std::fs::read_link(format!("/proc/{}/cwd", entry.pid)).ok();
         let cmdline: Vec<String> = std::fs::read(format!("/proc/{}/cmdline", entry.pid))
             .map(|bytes| {
                 bytes
