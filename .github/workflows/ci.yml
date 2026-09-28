@@ -254,12 +254,12 @@ jobs:
       # meaningful against the version that produced the lockfile. Adding
       # "packageManager": "pnpm@9.15.4" to ui/package.json would delete this pin and this
       # comment with it.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5
         with:
           version: 9.15.4
 
       # setup-node's built-in pnpm store cache; it must run *after* pnpm exists on PATH.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm

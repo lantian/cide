@@ -37,9 +37,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      # v4 stopped uploading dotfiles; `site/.nojekyll` is one. An Actions deployment never runs
+      # Jekyll, so it is inert here — kept so the published tree stays what is committed.
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
+          include-hidden-files: true
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

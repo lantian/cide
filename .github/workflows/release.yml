@@ -9,11 +9,14 @@ name: Release
 # What it does, in the order it does it:
 #
 #   prepare  cut release/v<version> from master, write the version into the four files that
-#            carry it, regenerate what is derived from them, commit, tag, push; and render the
-#            release notes from the commits since the previous release.
+#            carry it, regenerate what is derived from them, commit and tag — locally, handed on
+#            as a git bundle, pushed by nobody yet; and render the release notes from the commits
+#            since the previous release.
 #   linux    the AppImage, the binary tarball and the source tarball, from that tag.
-#   macos    the .dmg, from that tag.
-#   publish  one GitHub release with all of it and a SHA256SUMS beside it.
+#   macos    the .dmg and the update archive, from that tag.
+#   publish  push the branch and the tag, then one GitHub release with all of it and a SHA256SUMS
+#            beside it. Only here does anything reach the remote, so a failed build leaves
+#            nothing to clean up and the same version can simply be dispatched again.
 #
 # Everything is built by `cargo xtask package`, never by calling `cargo tauri build` directly.
 # That task is the packaging brain (docs/adr/0007): it preflights the configuration, refuses a
@@ -69,10 +72,15 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------------
-  # Everything that writes to the repository happens here, once, before anything is
-  # compiled. A build that fails then leaves a branch and a tag and no release, which is
-  # recoverable by hand; the reverse — artefacts built against a tree that was never
-  # tagged — is not.
+  # The release commit and its tag are made here, once, before anything is compiled — and
+  # pushed only by `publish`, after every build has succeeded. They travel between the jobs
+  # as a git bundle (.github/actions/release-commit), so the artefacts are still built from
+  # exactly the tagged tree, while a build that fails leaves nothing on the remote.
+  #
+  # This job used to push both straight away, reasoning that a stray branch and tag were
+  # "recoverable by hand". They were, every time, and every time by hand: the tag check
+  # below refused the retry of the same version until somebody deleted the branch and the
+  # tag on the remote.
   # ---------------------------------------------------------------------------------
   prepare:
     name: prepare ${{ inputs.version }}
@@ -81,6 +89,9 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       branch: ${{ steps.plan.outputs.branch }}
+      # The commit the release is cut from, pinned: the later jobs check it out and apply the
+      # bundle on top, and `inputs.base` may have moved by the time they start.
+      base_sha: ${{ steps.plan.outputs.base_sha }}
       previous: ${{ steps.notes.outputs.previous }}
     steps:
       # fetch-depth: 0 twice over. The changelog needs the history to walk, and
@@ -114,10 +125,18 @@ jobs:
             echo "::error::$tag already exists. A release is cut once." >&2
             exit 1
           fi
+          # The branch too: `publish` pushes it with --atomic beside the tag, and a leftover
+          # from before this workflow stopped pushing early would fail that push only after
+          # every artefact had been built.
+          if git ls-remote --exit-code --heads origin "release/$tag" >/dev/null; then
+            echo "::error::release/$tag already exists on the remote. Delete it, or release another version." >&2
+            exit 1
+          fi
           {
             echo "version=$version"
             echo "tag=$tag"
             echo "branch=release/$tag"
+            echo "base_sha=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
       # No apt packages. `xtask` depends on anyhow, serde_json and sha2, and `package --write`
@@ -259,11 +278,12 @@ jobs:
           cargo --locked xtask package --check
           cargo --locked metadata --format-version 1 > /dev/null
 
-      - name: Commit, tag and push
+      - name: Commit and tag, without pushing
         env:
           VERSION: ${{ steps.plan.outputs.version }}
           TAG: ${{ steps.plan.outputs.tag }}
           BRANCH: ${{ steps.plan.outputs.branch }}
+          BASE_SHA: ${{ steps.plan.outputs.base_sha }}
         run: |
           set -euo pipefail
           version="$VERSION"
@@ -277,8 +297,16 @@ jobs:
           # ignores it by default — which is the wrong shape for the one ref a release page
           # points at.
           git tag -a "$tag" -m "cide $version"
-          git push origin "$branch"
-          git push origin "$tag"
+          # Everything past the base, under both names. `publish` pushes exactly these objects,
+          # so the tag on the remote is the one the artefacts were built from.
+          git bundle create release.bundle "refs/heads/$branch" "refs/tags/$tag" "^$BASE_SHA"
+          git bundle verify release.bundle
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-commit
+          path: release.bundle
+          if-no-files-found: error
 
       # Only the changelog half. The "what's attached" table is built in `publish`, from the
       # files that were actually uploaded — writing it here would mean guessing artefact names
@@ -327,7 +355,7 @@ jobs:
 
           cat changelog.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-notes
           path: changelog.md
@@ -357,10 +385,16 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
+      # The base, then prepare's unpushed release commit on top of it: the tag is not on the
+      # remote until `publish`. See .github/actions/release-commit.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
+      - uses: ./.github/actions/release-commit
+        with:
+          tag: ${{ needs.prepare.outputs.tag }}
+          branch: ${{ needs.prepare.outputs.branch }}
 
       - name: Install system dependencies
         run: |
@@ -387,10 +421,10 @@ jobs:
         with:
           cache-key: release-linux
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5
         with:
           version: 9.15.4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -440,7 +474,7 @@ jobs:
       # checkout below, so setup-go installs a floor and GOTOOLCHAIN=auto (the default)
       # fetches whatever the pinned module actually demands.
       - name: Set up Go for the gopls sidecar
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: false
@@ -461,7 +495,7 @@ jobs:
       - name: cargo xtask package --appimage --tarball --src --run
         run: cargo --locked xtask package --appimage --tarball --src --run
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: linux-artefacts
           path: |
@@ -486,19 +520,25 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
+      # The base, then prepare's unpushed release commit on top of it: the tag is not on the
+      # remote until `publish`. See .github/actions/release-commit.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
+      - uses: ./.github/actions/release-commit
+        with:
+          tag: ${{ needs.prepare.outputs.tag }}
+          branch: ${{ needs.prepare.outputs.branch }}
 
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: release-macos
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5
         with:
           version: 9.15.4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -534,7 +574,7 @@ jobs:
       # checkout below, so setup-go installs a floor and GOTOOLCHAIN=auto (the default)
       # fetches whatever the pinned module actually demands.
       - name: Set up Go for the gopls sidecar
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: false
@@ -586,7 +626,7 @@ jobs:
           mv cide.app.tar.gz.sig "cide_${VERSION}_${arch}.app.tar.gz.sig"
           ls -la
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: macos-artefacts
           path: |
@@ -604,12 +644,12 @@ jobs:
       # Two downloads, and separately on purpose: `dist/` becomes the asset list verbatim
       # (`gh release create ... dist/*`), so the notes must not land in it — attaching the
       # release notes to the release as a downloadable file is not the same as using them.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: release-notes
           path: notes
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: "*-artefacts"
           path: dist
@@ -648,14 +688,18 @@ jobs:
           find . -mindepth 1 -type d -empty -delete
           ls -la
 
-      # The one file this job needs from the repository. Sparse, so it stays a job that moves
-      # files rather than one that clones the tree.
+      # A full checkout now, where it used to be a sparse one of the manifest script: this job
+      # is where the release branch and tag are pushed, so it needs the history under them.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.base_sha }}
           path: src
-          sparse-checkout: scripts/updater-manifest.py
-          sparse-checkout-cone-mode: false
+          fetch-depth: 0
+      - uses: ./src/.github/actions/release-commit
+        with:
+          tag: ${{ needs.prepare.outputs.tag }}
+          branch: ${{ needs.prepare.outputs.branch }}
+          path: src
 
       # `latest.json`: what every installed cide reads at start (the endpoint in tauri.conf.json is
       # `releases/latest/download/latest.json`). Before the checksums, so SHA256SUMS lists it too.
@@ -736,6 +780,18 @@ jobs:
           } > notes/notes.md
           cat notes/notes.md
 
+      # The first write to the remote in the whole run, and deliberately the last moment before
+      # the release itself: every artefact is built, checksummed and listed by now. --atomic, so
+      # a refused branch cannot leave the tag pushed alone (or the reverse).
+      - name: Push the release branch and tag
+        working-directory: src
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push --atomic origin "refs/heads/$BRANCH" "refs/tags/$TAG"
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -788,7 +844,8 @@ jobs:
   # After `publish` rather than inside `prepare`, and that ordering is the whole point of
   # it being a separate job: a trunk claiming to be past a release that was never
   # published is the one wrong state available here, and it is exactly what a failed
-  # `linux` or `macos` job would leave behind if the bump ran earlier.
+  # `linux` or `macos` job would leave behind if the bump ran earlier. (The release branch
+  # and tag follow the same rule now: `publish` pushes them.)
   #
   # The push carries `github.token`, so it does NOT start a CI run — GitHub refuses to
   # trigger workflows from pushes made with that token, which is what keeps this from

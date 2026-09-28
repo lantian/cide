@@ -39,7 +39,7 @@ runs:
   steps:
     - name: Cache the fork build
       if: inputs.cache-path != ''
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ${{ inputs.cache-path }}
         key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(inputs.lock) }}

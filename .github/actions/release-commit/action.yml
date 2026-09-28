@@ -1,0 +1,56 @@
+# The release commit and its tag, as `prepare` made them, in a checkout of the base it was cut
+# from — without either ever having been pushed.
+#
+# `prepare` used to push `release/v<version>` and its tag before anything was compiled, so a
+# build that failed left both behind, and the next attempt at the same version was refused by
+# prepare's own "a release is cut once" check until somebody deleted them by hand, twice over,
+# on the remote. Now prepare hands the commit and the annotated tag to the later jobs as a git
+# bundle, and only `publish` — after every build has succeeded — pushes them.
+#
+# A bundle rather than re-running the version bump in each job: the tag must be *one object*.
+# Recomputed per job, the commit would carry a different committer timestamp on every runner,
+# so the Linux and macOS artefacts would be built from two different commits and the pushed tag
+# would be a third.
+#
+# The caller checks out `prepare`'s `base-sha` with `fetch-depth: 0` first; a local action
+# cannot be used before the repository is on disk, and the bundle's prerequisite is that commit.
+name: release-commit
+description: Fetch prepare's unpushed release commit and tag from its bundle and check the tag out
+inputs:
+  tag:
+    description: The release tag, e.g. v0.11.0
+    required: true
+  branch:
+    description: The release branch, e.g. release/v0.11.0
+    required: true
+  path:
+    description: The checkout to fetch into, relative to the workspace
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v7
+      with:
+        name: release-commit
+        path: ${{ runner.temp }}/release-commit
+
+    - name: Check out the release tag from the bundle
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        TAG: ${{ inputs.tag }}
+        BRANCH: ${{ inputs.branch }}
+        BUNDLE: ${{ runner.temp }}/release-commit/release.bundle
+      run: |
+        set -euo pipefail
+        # `verify` names a missing prerequisite — the base commit — rather than letting the
+        # fetch fail on it with a message about packs.
+        git bundle verify "$BUNDLE"
+        git fetch --no-tags "$BUNDLE" \
+          "refs/tags/$TAG:refs/tags/$TAG" \
+          "refs/heads/$BRANCH:refs/heads/$BRANCH"
+        # Detached at the tag, exactly as `ref: <tag>` used to leave it: xtask's source-tarball
+        # preflight looks for a tag at HEAD matching the version.
+        git checkout --detach "refs/tags/$TAG"
+        git log -1 --format='%H %s'

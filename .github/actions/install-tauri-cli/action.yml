@@ -45,7 +45,7 @@ runs:
     # whole of it would restore every other tool a job installed as well.
     - name: Cache cargo-tauri
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cargo/bin/cargo-tauri
         key: cargo-tauri-${{ steps.pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}

@@ -47,6 +47,12 @@ after building.
 before it existed), tags, builds every artefact through `cargo xtask package`, and publishes one
 GitHub release with a SHA256SUMS.
 
+**Nothing reaches the remote until every build has passed.** The release commit and tag travel
+between the jobs as a git bundle (`.github/actions/release-commit`), and `publish` pushes the
+branch and the tag (`--atomic`) just before creating the release. A failed build therefore leaves
+no branch or tag behind — dispatch the same version again. (Until 2026-09-28 `prepare` pushed
+both first, and every failed build meant deleting them by hand on the remote.)
+
 **Never bump the version by hand for a release, and never bump master to the version you are
 about to release** — that file then differs by no lines and the workflow's `1 1` numstat guard
 refuses the run. A final `bump` job puts master on `<next patch>-dev` after publishing, because the
