@@ -147,7 +147,10 @@ async function restartNow(): Promise<void> {
   }
 }
 
-/** *Check for updates* — the command and the About card's button. Always answers. */
+/**
+ * *Check for updates* — the command, the About card's button, Settings' Version row and the
+ * macOS menu bar's item. Always answers.
+ */
 export async function checkForUpdates(): Promise<void> {
   const answer = await update.check()
   switch (answer.kind) {
@@ -179,6 +182,13 @@ export function useUpdateNotices(enabled: boolean): void {
     void update.onAvailable(offerUpdate).then(keep)
     void update.onProgress(showProgress).then(keep)
     void update.onReady(offerRestart).then(keep)
+    // The macOS menu bar's *Check for Updates…* (`cide-app`'s `app_menu`). Rust picked this
+    // window; the check and its answer are the same as the command's.
+    void update
+      .onCheckRequested(() => {
+        checkForUpdates().catch((reason: unknown) => notifyFailure(reason, { project: null }))
+      })
+      .then(keep)
     // The pull covers a window whose listener was not up when the start-up event went out. A
     // failure here is a build without the command, which has nothing to announce anyway.
     void update

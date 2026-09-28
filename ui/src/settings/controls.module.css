@@ -62,6 +62,14 @@
   user-select: text;
 }
 
+/* `InlineControls`: a readout and its action side by side in one row's control slot. */
+.inlineControls {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-4);
+}
+
 /* A stacked label + field + hint: the kit `Field`'s layout, for a field that commits on blur. */
 .field {
   display: flex;

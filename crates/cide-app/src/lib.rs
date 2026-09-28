@@ -6,6 +6,7 @@
 // M18: the `$CIDE_AGENT_SOCK` server — the task tools a dispatched agent and the project's own
 // orchestrator reach over a unix socket, scoped from the connection's header line.
 pub mod agent_rpc;
+pub mod app_menu;
 pub mod caps;
 // M18: the run registry — the queue, the slots and every dispatched subagent run. The spawn
 // itself is the ordinary session path (`SpawnSpec` -> `PtySession` -> `SessionRegistry`), which
@@ -1167,6 +1168,9 @@ pub fn run() {
             // anything for a pick to raise. A no-op off macOS; `dock`'s header says why there
             // is no Linux counterpart to write.
             dock::install(app.handle());
+            // *Check for Updates…* under *About cide*. A no-op off macOS, where cide has no
+            // menu bar; `app_menu`'s header says why the default menu is kept whole.
+            app_menu::install(app.handle());
             Ok(())
         })
         .build(context)

@@ -638,9 +638,9 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 
 ### The updater
 
-**Touches:** `cide-app`'s `updater` and `cmd::update`, `cide_ipc::update`, `Settings::update`, `plugins.updater` in `tauri.conf.json`, `ui/src/chrome/updates.ts`, `help.checkForUpdates`, the About card's button, `xtask package`'s `updater_artifacts_config`/`updater_verdict`, `scripts/updater-manifest.py`, `release.yml`'s signing env and *Update manifest* step
+**Touches:** `cide-app`'s `updater` and `cmd::update`, `cide_ipc::update`, `Settings::update`, `plugins.updater` in `tauri.conf.json`, `ui/src/chrome/updates.ts`, `help.checkForUpdates`, the About card's button, Settings' Version row button, `cide-app`'s `app_menu` (macOS *Check for Updates…*) and `cide://update-check-requested`, `xtask package`'s `updater_artifacts_config`/`updater_verdict`, `scripts/updater-manifest.py`, `release.yml`'s signing env and *Update manifest* step
 
-`cargo test -p cide-app updater`, `cargo test -p xtask`, `python3 scripts/updater-manifest.py --self-test`, `cargo --locked xtask contract-check`, `cargo --locked xtask codegen --check`, `check:commands`, `check:keys`, `check:switcher`, `check:selectors`. Five silent failures.
+`cargo test -p cide-app updater`, `cargo test -p cide-app app_menu`, `cargo test -p xtask`, `python3 scripts/updater-manifest.py --self-test`, `cargo --locked xtask contract-check`, `cargo --locked xtask codegen --check`, `check:commands`, `check:keys`, `check:switcher`, `check:selectors`. Five silent failures.
 
 - **Only an AppImage or an installed `.app` may install.** On Linux the plugin treats any build it cannot classify as an AppImage and writes the download over `current_exe` — over a tarball's `cide`, that leaves an unlaunchable file where the program was. `updater::install` refuses anything `installability` did not call `InPlace`, and the notice offers those builds the release page. Keep the refusal in Rust; a UI-only gate is one `invoke` away.
 - **The `plugins.updater` block must exist even with an empty key.** The plugin refuses to start without it, and cide with it. An empty `pubkey` is read as "not set up" (`never_checks`): no request is made, and nothing is signed.

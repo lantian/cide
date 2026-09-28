@@ -5,7 +5,8 @@
  * `--chrome-hi`; the section on the right at 34px/44px padding under a 20px/600 title and a
  * dim description.
  *
- * The selected section is local state seeded from the tab, and is *also* pushed back to Rust
+ * The selected section is local state seeded from the tab — and re-seeded whenever the tab is
+ * re-pointed from outside, which issue #1 was about — and is *also* pushed back to Rust
  * so it survives a relaunch. Local first because a nav click that waits an IPC round trip
  * before moving reads as a stuck button; pushed back because `TabKind::Settings { section }`
  * is persisted with the rest of the workspace and a tab that always reopens on Appearance
@@ -68,6 +69,29 @@ export interface SettingsTabProps {
 
 export function SettingsTab({ project, section }: SettingsTabProps) {
   const [active, setActive] = useState<SettingsSection>(section)
+  /*
+   * …and re-seeded whenever the tab is re-pointed. (Issue #1)
+   *
+   * Seeding only on mount was the bug: with the tab already open on Git, Agents → Configure
+   * called `openTab(project, 'agents')`, Rust re-pointed the tab, the prop arrived as `'agents'`
+   * — and the screen stayed on Git, because `useState` had read its argument once. Every "open
+   * Settings on X" gesture did the same (`settings.keymap` too); only closing the tab and
+   * letting the next one mount fresh made them work.
+   *
+   * Adjusted during render rather than in an effect, so there is no painted frame of the old
+   * section. Not `key={section}` in `App.tsx`, the way `SettingsFrame` does it: `select` below
+   * pushes every nav click through `openTab`, so the prop moves on each click and a key would
+   * remount the whole screen per click — re-running the `claude --version` probe and dropping
+   * the revealed log directory. Following the prop is safe for the same reason: it only moves
+   * by an explicit request, or as the echo of a `select` that has already set `active` to it.
+   * `tab_open_settings` keeps an open tab's section when none is named, so the rail's ⚙ does
+   * not arrive here as a jump to Appearance.
+   */
+  const [seeded, setSeeded] = useState<SettingsSection>(section)
+  if (seeded !== section) {
+    setSeeded(section)
+    setActive(section)
+  }
   const settings = useSettings()
   const version = useWorkspace((s) => s.boot?.capabilities.version ?? null)
   const claudeVersion = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)

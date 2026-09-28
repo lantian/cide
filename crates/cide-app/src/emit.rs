@@ -915,6 +915,28 @@ pub fn update_ready(app: &AppHandle, version: &str) {
     }
 }
 
+/// The macOS menu bar's *Check for Updates…* was clicked (`crate::app_menu`).
+///
+/// Only asks: the check and its toast are the window's `checkForUpdates`, the same one the
+/// command and the About card run. Addressed to one shell window by the payload's `window`,
+/// for `mouse_nav`'s reason — `emit_to` alone reaches every webview, and each one asked would
+/// check GitHub and draw the answer again.
+pub const UPDATE_CHECK_REQUESTED: &str = "cide://update-check-requested";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckRequested<'a> {
+    window: &'a str,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn update_check_requested(app: &AppHandle, window: &cide_ipc::WindowLabel) {
+    let payload = UpdateCheckRequested { window: &window.0 };
+    if let Err(error) = app.emit_to(window.0.as_str(), UPDATE_CHECK_REQUESTED, payload) {
+        tracing::debug!(%error, window = %window.0, "update-check-requested reached no window");
+    }
+}
+
 /// A paired device pressed PgUp/PgDn on a session showing the normal screen. (M91)
 ///
 /// The pane host holding `session` scrolls its xterm by `pages` — the desk's view and the

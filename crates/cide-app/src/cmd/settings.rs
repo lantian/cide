@@ -26,7 +26,7 @@ use cide_ipc::{
     AccentPatch, GraphicsRung, GraphicsSettings, GraphicsStatus, HeadlessError, HeadlessRequest,
     HeadlessResult, KeymapConflict, KeymapEdit, KeymapEditResult, KeymapProblem, KeymapReport,
     Pane, PaneId, PaneKind, PaneRole, ProjectId, RepoId, Settings, SettingsPatch, SettingsSection,
-    TabId, TabKind,
+    TabId, TabKind, Workspace,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -412,7 +412,8 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
 
 // --- the settings tab --------------------------------------------------------------------
 
-/// Open the project's Settings tab, or activate and re-point the one it already has.
+/// Open the project's Settings tab, or activate the one it already has — re-pointing it only
+/// when a section was asked for.
 ///
 /// Settings is a singleton per project. Opening a second one would give a project two tabs
 /// that disagree about which section is showing, and closing "the" settings tab would leave
@@ -423,51 +424,71 @@ pub fn tab_open_settings(
     project: ProjectId,
     section: Option<SettingsSection>,
 ) -> Result<TabId, CoreError> {
-    state.update(|ws| {
-        let section = section.unwrap_or_default();
-        let p = workspace::project(ws, project)?;
-        let existing = p
-            .tabs
-            .iter()
-            .find(|t| matches!(t.kind, TabKind::Settings { .. }))
-            .map(|t| t.id);
+    state.update(|ws| open_settings_tab(ws, project, section))
+}
 
-        if let Some(id) = existing {
+/// [`tab_open_settings`]'s mutation, apart from the `State` so it can be tested.
+///
+/// # `None` leaves an open tab where it is (issue #1)
+///
+/// `None` is the rail's ⚙ and `settings.open`, and what they mean is *show me Settings* —
+/// `App.tsx` and `chrome/panelRequests.ts` both document `null` as "wherever it was left". This
+/// used to `unwrap_or_default()` before the lookup, so a plain ⚙ quietly re-pointed an open tab
+/// at Appearance. Nobody saw it, because `SettingsTab` ignored its `section` prop after mount —
+/// which was the bug in the issue: Agents → Configure re-pointed the tab here correctly and the
+/// screen stayed on whatever section had last been clicked. The screen honours the prop now, so
+/// the default has to apply to a *new* tab only, or fixing the one would have surfaced the other.
+fn open_settings_tab(
+    ws: &mut Workspace,
+    project: ProjectId,
+    section: Option<SettingsSection>,
+) -> Result<TabId, CoreError> {
+    let p = workspace::project(ws, project)?;
+    let existing = p
+        .tabs
+        .iter()
+        .find(|t| matches!(t.kind, TabKind::Settings { .. }))
+        .map(|t| t.id);
+
+    if let Some(id) = existing {
+        if let Some(section) = section {
             let p = workspace::project_mut(ws, project)?;
             if let Some(tab) = p.tabs.iter_mut().find(|t| t.id == id) {
                 tab.kind = TabKind::Settings { section };
             }
-            workspace::activate_tab(ws, project, id)?;
-            // `activate_tab` only bumps when the active tab actually changed, and re-pointing
-            // the section of an already-active tab is a change the frontend has to be told
-            // about.
-            workspace::bump(ws);
-            return Ok(id);
         }
+        workspace::activate_tab(ws, project, id)?;
+        // `activate_tab` only bumps when the active tab actually changed, and re-pointing
+        // the section of an already-active tab is a change the frontend has to be told
+        // about.
+        workspace::bump(ws);
+        return Ok(id);
+    }
 
-        let id = workspace::open_tab(
-            ws,
-            project,
-            TabKind::Settings { section },
-            Pane {
-                id: PaneId::new(),
-                kind: PaneKind::Editor,
-                role: PaneRole::Auxiliary,
-                // No process. The tree exists because every tab has one — the invariant is
-                // what makes "promote pane to tab" and "split editor" one code path — and
-                // the settings screen simply renders over it.
-                session: None,
-                conversation: None,
-                conversation_since: None,
-                continues: None,
-                harness: None,
-                title: "settings".into(),
-                docker: None,
-                origin: None,
-            },
-        )?;
-        Ok(id)
-    })
+    let id = workspace::open_tab(
+        ws,
+        project,
+        TabKind::Settings {
+            section: section.unwrap_or_default(),
+        },
+        Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Editor,
+            role: PaneRole::Auxiliary,
+            // No process. The tree exists because every tab has one — the invariant is
+            // what makes "promote pane to tab" and "split editor" one code path — and
+            // the settings screen simply renders over it.
+            session: None,
+            conversation: None,
+            conversation_since: None,
+            continues: None,
+            harness: None,
+            title: "settings".into(),
+            docker: None,
+            origin: None,
+        },
+    )?;
+    Ok(id)
 }
 
 // --- keymap ------------------------------------------------------------------------------
@@ -1682,6 +1703,67 @@ pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
 mod tests {
     use super::*;
     use cide_ipc::{SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
+
+    /// The section a project's one Settings tab is showing, and how many Settings tabs it has.
+    fn settings_tabs(ws: &Workspace, project: ProjectId) -> Vec<SettingsSection> {
+        workspace::project(ws, project)
+            .expect("the project is open")
+            .tabs
+            .iter()
+            .filter_map(|t| match t.kind {
+                TabKind::Settings { section } => Some(section),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Issue #1: Agents → Configure while the tab was open on another section. The tab must be
+    /// re-pointed, and stay the one tab.
+    #[test]
+    fn a_named_section_re_points_the_open_settings_tab() {
+        let mut ws = Workspace::default();
+        let project = workspace::open_project(&mut ws, vec!["/home/dev/atlas".into()], None)
+            .expect("a rooted project opens");
+
+        let first = open_settings_tab(&mut ws, project, Some(SettingsSection::Git)).expect("opens");
+        let again =
+            open_settings_tab(&mut ws, project, Some(SettingsSection::Agents)).expect("re-opens");
+
+        assert_eq!(first, again);
+        assert_eq!(settings_tabs(&ws, project), vec![SettingsSection::Agents]);
+        assert_eq!(
+            workspace::project(&ws, project).expect("open").active_tab,
+            first
+        );
+    }
+
+    /// The other half of issue #1: the rail's ⚙ names no section and must not drag an open tab
+    /// back to Appearance — `None` is "wherever it was left".
+    #[test]
+    fn no_section_leaves_the_open_settings_tab_where_it_was() {
+        let mut ws = Workspace::default();
+        let project = workspace::open_project(&mut ws, vec!["/home/dev/atlas".into()], None)
+            .expect("a rooted project opens");
+
+        open_settings_tab(&mut ws, project, Some(SettingsSection::Git)).expect("opens");
+        open_settings_tab(&mut ws, project, None).expect("re-opens");
+
+        assert_eq!(settings_tabs(&ws, project), vec![SettingsSection::Git]);
+    }
+
+    #[test]
+    fn a_new_settings_tab_with_no_section_opens_on_the_default() {
+        let mut ws = Workspace::default();
+        let project = workspace::open_project(&mut ws, vec!["/home/dev/atlas".into()], None)
+            .expect("a rooted project opens");
+
+        open_settings_tab(&mut ws, project, None).expect("opens");
+
+        assert_eq!(
+            settings_tabs(&ws, project),
+            vec![SettingsSection::default()]
+        );
+    }
 
     #[test]
     fn only_an_effective_binary_choice_change_restarts_a_server() {

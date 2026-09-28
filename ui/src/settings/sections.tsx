@@ -17,6 +17,8 @@ import { GitLabSettings } from '@/gitlab/GitLabSettings'
  * `keepSessionsOnWindowClose` below.
  */
 import type { ReactNode } from 'react'
+import { checkForUpdates } from '@/chrome/updates'
+import { notifyFailure } from '@/chrome/notices'
 import type {
   ClaudeCliSupport,
   ClaudeSettings,
@@ -40,6 +42,7 @@ import type {
 import {
   ActionButton,
   Group,
+  InlineControls,
   NumberField,
   Note,
   Part,
@@ -262,10 +265,24 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
             log directory is the person about to file a report, and a report without a version
             is a report that gets asked for one. The string is spelled exactly as
             `cide --version` prints it, so the two never disagree in a bug thread. */}
+        {/* The check sits beside the version it compares against — the same `checkForUpdates`
+            as the command and the About card, answered by a toast. Enabled on a -dev build
+            too: the answer there is "development builds never check", which is true and says
+            why, where a disabled button would say nothing. */}
         <Row
           label="Version"
-          hint="This build of cide. A -dev suffix is a tree built by run.sh, not a release."
-          control={<Readout text={version === null ? '…' : `cide ${version}`} />}
+          hint="This build of cide. A -dev suffix is a tree built by run.sh, not a release, and never checks for updates."
+          control={
+            <InlineControls>
+              <Readout text={version === null ? '…' : `cide ${version}`} />
+              <ActionButton
+                label="Check for updates"
+                onClick={() => {
+                  checkForUpdates().catch((reason: unknown) => notifyFailure(reason, { project: null }))
+                }}
+              />
+            </InlineControls>
+          }
         />
         <Row
           label="Log directory"

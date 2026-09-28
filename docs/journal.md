@@ -16152,3 +16152,52 @@ will break.
 Not yet seen live: no Godot Forward+ run through a cide-dispatched codex role, and no
 `vulkaninfo` from inside a real run's sandbox (the manual measurement before this work was
 `codex sandbox`, as is the test).
+
+## Configure lands on Agents when Settings is already open: GitHub issue #1 (M126)
+
+Reported against 0.11.0: with a project's Settings tab open and a section picked in it, every
+Configure (⚙) on the Agents panel activated the tab on the section last clicked instead of
+Agents; closing the tab first made it work. Rust was already right — `tab_open_settings`
+re-pointed the open tab's `TabKind::Settings { section }` — but `SettingsTab` seeded `active`
+from its `section` prop with `useState` and never read the prop again, so a re-pointed tab kept
+its old screen. `settings.keymap` with the tab open had the same bug.
+
+`SettingsTab` now re-seeds `active` when the prop changes (adjusted during render, not a `key`:
+every nav click round-trips through `openTab`, so a key would remount the screen, and re-run the
+`claude --version` probe, per click). That exposed a second, latent half: `tab_open_settings`
+did `section.unwrap_or_default()` even for an open tab, so the rail's ⚙ (no section) re-pointed
+it at Appearance — invisible until the screen started honouring the prop. An open tab now keeps
+its section when none is named; a new tab still opens on the default. The mutation moved into
+`open_settings_tab` so it could be tested without `State`.
+
+Tests: `cargo test -p cide-app settings` (a named section re-points the one tab; no section
+leaves it where it was; a new tab with no section opens on the default), and
+`check:settings-agents` pins the re-seed in `SettingsTab` (checked to fail against the old file).
+
+Not yet seen live: the fix has not been driven on a display; the manual pass is open a project →
+⚙ → Git → Agents panel → Configure on a role (lands on Agents, that role focused) → rail ⚙
+(stays on Agents).
+
+## Check for updates from Settings and from the macOS menu bar (M127)
+
+The check itself existed (`help.checkForUpdates`, the About card's button); two doors to it did
+not. **Settings › Appearance › Diagnostics** now has a *Check for updates* button on the Version
+row, beside the version it compares (`InlineControls` in `settings/controls.tsx` puts the readout
+and the button on one line; the kit's `.rowControl` is a plain block and stacked them). It stays
+enabled on a `-dev` build, where the toast says development builds never check.
+
+On **macOS**, *Check for Updates…* sits under *About cide* in the application menu
+(`cide-app`'s `app_menu`). tauri's `Menu::default` is kept whole and the item inserted into it, so
+the Edit submenu, ⌘Q and `MACOS_MENU_CHORDS` are unchanged; the item has no accelerator. A click
+asks one shell window (the focused one, else the first) to run `checkForUpdates` via the new
+`cide://update-check-requested`, filtered by label in `client.ts` for `onMouseNav`'s reason, so
+`PerProject` mode does not check once per window.
+
+Tests: `cargo test -p cide-app app_menu` (the focused shell window answers; none focused → the
+first shell; a detached window never does). The macOS module was lifted into a scratch crate and
+passes `cargo clippy --target aarch64-apple-darwin --all-targets -D warnings` under the
+`docs/platforms.md` recipe, confirmed live by a planted type error that the check caught.
+
+Not yet seen live: the Settings button has not been clicked on a display, and the menu item has
+never been linked or run — a Mac has to confirm it draws after *About*, that the click reaches
+the focused window, and that exactly one toast appears with two project windows open.

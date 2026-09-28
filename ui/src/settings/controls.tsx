@@ -250,6 +250,17 @@ export function Readout({ text }: { text: string }) {
   return <span className={styles.readout}>{text}</span>
 }
 
+/**
+ * Several controls in one row's control slot, on one line — a readout and the action about it.
+ *
+ * The kit's `.rowControl` is a plain block, so two children in it stack; the Version row put a
+ * *Check for updates* button under the version it checks, which read as a second row with no
+ * label. A settings-local wrapper rather than a kit part: every other row has one control.
+ */
+export function InlineControls({ children }: { children: ReactNode }) {
+  return <span className={styles.inlineControls}>{children}</span>
+}
+
 export interface ActionButtonProps {
   label: string
   onClick: () => void

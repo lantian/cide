@@ -28,6 +28,7 @@
   "cide://spec-changed",
   "cide://tasks-changed",
   "cide://update-available",
+  "cide://update-check-requested",
   "cide://update-progress",
   "cide://update-ready",
   "cide://workspace-changed"

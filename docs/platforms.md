@@ -301,8 +301,11 @@ at before choosing:
   `MAC` layout becomes dead code and the header has to reserve ~78px of leading inset instead.
   That is a design decision. Until it is made, the header draws its own buttons on the left and
   the OS resizes the edges.
-* **The menu bar.** cide calls neither `.menu()` nor `.enable_macos_default_menu(false)`, so
-  tauri installs `Menu::default`, whose accelerators AppKit resolves ahead of the web view.
+* **The menu bar.** cide calls no `.enable_macos_default_menu(false)`, and the menu it sets
+  (`cide-app`'s `app_menu`, since M127) is tauri's `Menu::default` with one item added —
+  *Check for Updates…* after *About*, no accelerator — so its accelerators are still the
+  default's, which AppKit resolves ahead of the web view. The item is type-checked for Darwin,
+  never run.
   `keymap::MACOS_MENU_CHORDS` lists all twelve and `macos_menu_conflicts()` computes which
   bindings they kill; a test pins the answer in both directions, so a new dead chord fails the
   build rather than shipping, and `./target/debug/cide-headless keymap` prints the list under

@@ -5489,4 +5489,13 @@ export const update = {
   /** `cide://update-ready`: the new version is on disk; a restart runs it. */
   onReady: (handler: (version: string) => void) =>
     listen<{ version: string }>('cide://update-ready', (e) => handler(e.payload.version)),
+  /**
+   * `cide://update-check-requested`: the macOS menu bar's *Check for Updates…*, addressed to
+   * one shell window. Filtered here by label for `onMouseNav`'s reason — `emit_to` reaches
+   * every webview, and each would check and draw the answer again.
+   */
+  onCheckRequested: (handler: () => void) =>
+    listen<{ window: string }>('cide://update-check-requested', (e) => {
+      if (e.payload.window === windowLabel()) handler()
+    }),
 }

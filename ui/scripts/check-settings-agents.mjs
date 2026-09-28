@@ -890,6 +890,19 @@ try {
       'a second window takes its settings project from useActiveProject and the two can differ',
   )
   /*
+   * The tab's half, and the one issue #1 was about. `configure` opens the Settings tab on
+   * `'agents'`; when that tab is already open, Rust re-points its section and the screen learns
+   * it only through its `section` prop. A `SettingsTab` that seeds `active` from the prop once
+   * and never again stays on whatever was last clicked, and `focusRole` above is then taken by
+   * nothing because the Agents section is not on screen.
+   */
+  const settingsTabCode = stripComments(read('../src/settings/SettingsTab.tsx'))
+  ok(
+    /if\s*\(\s*seeded\s*!==\s*section\s*\)\s*\{[^}]*setActive\(\s*section\s*\)/.test(settingsTabCode),
+    'SettingsTab re-seeds its active section when the tab is re-pointed — seeding only on mount ' +
+      'lands Configure on whichever section was last clicked (issue #1)',
+  )
+  /*
    * Every arm of `Opening` that asks the screen to *do* something has a branch. A screen that
    * called `screenOpening` and then answered two of its three actionable arms would hold the
    * request for ever in the third — `unknown` above all, which is the arm that clears it.
