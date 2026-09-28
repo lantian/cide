@@ -455,7 +455,84 @@ pub fn child_path_in(
     Some(("PATH".to_string(), Some(joined.into_string().ok()?)))
 }
 
-/// Apply [`bundle_scrub`] and [`child_path`] to a [`Command`] that is about to be spawned.
+/// The locale a child falls back to when cide itself was given none. See [`child_locale_in`].
+const FALLBACK_LANG: &str = "en_US.UTF-8";
+
+/// The `LANG` a child should be given, or `None` to leave its locale alone.
+///
+/// The impure wrapper: reads this process's `LC_ALL`, `LC_CTYPE` and `LANG` and hands them to
+/// [`child_locale_in`], on macOS only — see there for why not elsewhere.
+pub fn child_locale() -> Option<EnvChange> {
+    child_locale_in(
+        cfg!(target_os = "macos"),
+        ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name))),
+    )
+}
+
+/// The rule itself, over a platform flag and the three variables that decide a character set.
+///
+/// # The failure
+///
+/// A macOS user copied a selection out of a Claude pane and pasted
+///
+/// ```text
+/// –Я–Њ—З–µ–Љ—Г –≤—Б–њ–ї—Л–ї–Њ –Є–Љ–µ–љ–љ–Њ —Б–µ–є—З–∞—Б вАФ 24.09
+/// ```
+///
+/// for *«Почему всплыло именно сейчас — 24.09»*: the UTF-8 bytes of the text, read back as
+/// **Mac Cyrillic** — `'…'.encode('utf-8').decode('mac_cyrillic')` reproduces it exactly. With
+/// mouse reporting on, the selection is not xterm.js's (whose copy goes through the Tauri
+/// clipboard plugin and is Unicode end to end) but the CLI's own, and on macOS the CLI copies by
+/// piping to `pbcopy`. `pbcopy` decodes its stdin by the locale; with no `LANG`/`LC_CTYPE`/`LC_ALL`
+/// at all it falls back to the legacy encoding of the user's system language — Mac Roman for
+/// English, Mac Cyrillic for Russian. A Finder- or Dock-launched `.app` is given no locale by
+/// launchd, and until this pass cide passed that absence on to every child.
+///
+/// It did not reproduce on a developer's Mac, and that is worth writing down because it will
+/// happen again: an instance started from a terminal inherits the terminal's
+/// `LANG=…UTF-8`, and one whose system language is English only mangles non-ASCII text, which
+/// an English-speaking tester rarely selects. `pbcopy` is the loud case; `git` quoting paths as
+/// octal escapes, `less`, `ls` and Python's `sys.stdout` encoding are the same absence, quieter.
+///
+/// # The rule
+///
+/// **When none of `LC_ALL`, `LC_CTYPE` or `LANG` is set to anything, set `LANG=en_US.UTF-8`.**
+///
+/// * `LANG`, the lowest-precedence of the three, so any `LC_*` the user or a child sets still
+///   wins, and the child's own profile can override it as it would in Terminal.app.
+/// * `en_US`, not the user's `AppleLocale`: before this pass a child ran in the `C` locale, whose
+///   messages are English, and `cide-pty` already parses `LC_MESSAGES`-sensitive output (see its
+///   note on a non-English `LC_MESSAGES`). Adding only the character set changes the one thing
+///   that was wrong and nothing that was right. `en_US.UTF-8` exists on every macOS install.
+/// * Any value present — even `C` or a non-UTF-8 one — is the user's choice and left alone: a
+///   child's environment should differ from its parent's only where we can say why, and "you
+///   were given nothing" is the only case we can.
+/// * Empty counts as unset, because to `setlocale` it is.
+///
+/// # Why macOS only
+///
+/// A Linux desktop session always sets `LANG` (systemd's `locale.conf`, the display manager), so
+/// the case this fixes does not arise there — and where it would, `en_US.UTF-8` is not guaranteed
+/// to be generated, and a locale that does not exist makes every `bash` in a pane open on
+/// `warning: setlocale: LC_CTYPE: cannot change locale`. The flag is a parameter so the rule is
+/// testable on the Linux CI that runs it.
+pub fn child_locale_in<'a>(
+    macos: bool,
+    vars: impl IntoIterator<Item = (&'a str, Option<std::ffi::OsString>)>,
+) -> Option<EnvChange> {
+    if !macos {
+        return None;
+    }
+    let any_set = vars
+        .into_iter()
+        .any(|(_, value)| value.is_some_and(|value| !value.is_empty()));
+    (!any_set).then(|| ("LANG".to_string(), Some(FALLBACK_LANG.to_string())))
+}
+
+/// Apply [`bundle_scrub`], [`child_path`] and [`child_locale`] to a [`Command`] that is about
+/// to be spawned.
 ///
 /// For the children spawned with `std::process` — the language servers, `cargo metadata`,
 /// `go list`, the `claude` one-shots, `git push`, `claude --version`. PTY children take the same
@@ -522,7 +599,7 @@ pub fn prepare_command_with(command: &mut Command, extra: &[std::path::PathBuf])
     let scrub = bundle_scrub();
     let dirs = dirs_with(&crate::toolchain::discovered_dirs(), extra);
     let path = child_path_in(&scrub, std::env::var_os("PATH").as_deref(), &dirs);
-    for (name, value) in scrub.into_iter().chain(path) {
+    for (name, value) in scrub.into_iter().chain(path).chain(child_locale()) {
         match value {
             Some(value) => command.env(name, value),
             None => command.env_remove(name),
@@ -790,6 +867,10 @@ fn run_filter_inner(
 /// — so the check and the spawn now consult the same list instead of disagreeing about a
 /// directory and turning a refusal with a remedy in it into an opaque `ENOENT`.
 ///
+/// [`child_locale`] rides on the same chain for the same reason: launchd gives a Finder-launched
+/// `.app` no `LANG` either, and a `claude` whose `pbcopy` inherits none copies UTF-8 as Mac
+/// Cyrillic. It is before `extra`, so a `LANG` in the user's launch configuration still wins.
+///
 /// # The `CLAUDE_CODE_*` pass, and why it is late
 ///
 /// [`claude_env`] turns the user's [`cide_ipc::ClaudeSettings`] into the same `EnvChange` list,
@@ -845,7 +926,11 @@ pub fn terminal_child_env(
 ) -> Vec<EnvChange> {
     let scrub = bundle_scrub();
     let path = child_path(&scrub);
-    let mut changes: Vec<EnvChange> = scrub.into_iter().chain(path).collect();
+    let mut changes: Vec<EnvChange> = scrub
+        .into_iter()
+        .chain(path)
+        .chain(child_locale())
+        .collect();
     changes.extend([
         ("TERM".to_string(), Some("xterm-256color".to_string())),
         ("COLORTERM".to_string(), Some("truecolor".to_string())),
@@ -1353,6 +1438,52 @@ mod tests {
         let vars = [("PATH".to_string(), "/usr/bin".to_string())];
         assert!(bundle_scrub_from(vars.clone(), "").is_empty());
         assert!(bundle_scrub_from(vars, "usr").is_empty());
+    }
+
+    // --- the locale a child is given ------------------------------------------------------
+
+    fn locale(macos: bool, vars: &[(&'static str, &str)]) -> Option<EnvChange> {
+        child_locale_in(
+            macos,
+            vars.iter()
+                .map(|(k, v)| (*k, Some(std::ffi::OsString::from(v)))),
+        )
+    }
+
+    #[test]
+    fn a_finder_launch_with_no_locale_gets_utf8() {
+        // launchd's environment: none of the three at all. This is the `pbcopy` Mac Cyrillic
+        // case, and the answer must be a UTF-8 `LANG` rather than nothing.
+        assert_eq!(
+            locale(true, &[]),
+            Some(("LANG".to_string(), Some("en_US.UTF-8".to_string())))
+        );
+        // Empty is unset to `setlocale`, so it is unset here too.
+        assert_eq!(
+            locale(true, &[("LANG", "")]),
+            Some(("LANG".to_string(), Some("en_US.UTF-8".to_string())))
+        );
+    }
+
+    #[test]
+    fn any_locale_the_user_set_is_left_alone() {
+        // Terminal.app's own `LC_CTYPE=UTF-8`, a terminal launch's `LANG`, and a deliberate `C`:
+        // each is somebody's choice, and a pass that overrode it would be the drift this file's
+        // header warns against.
+        for vars in [
+            [("LC_CTYPE", "UTF-8")],
+            [("LANG", "ru_RU.UTF-8")],
+            [("LC_ALL", "C")],
+        ] {
+            assert_eq!(locale(true, &vars), None, "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn linux_is_never_given_a_locale() {
+        // `en_US.UTF-8` may not be generated there, and a missing locale is a `setlocale`
+        // warning at the top of every shell pane.
+        assert_eq!(locale(false, &[]), None);
     }
 
     // --- part one and a half: the PATH a child is given ---------------------------------

@@ -593,6 +593,20 @@ code path can be exercised at all. Measured here on 2026-08-31 with `PATH=/usr/b
 and it recovered nvm, pyenv, linuxbrew, sdkman and `~/go/bin` — every one of them a directory no
 static list can name.
 
+### …and no locale either, which is why a copy came out as Mac Cyrillic
+
+launchd hands a Finder-launched `.app` no `LANG`, `LC_CTYPE` or `LC_ALL`, and until 2026-09-28
+cide passed that on. A Russian-language Mac then pasted `–Я–Њ—З–µ–Љ—Г` for *«Почему»*, copied out of
+a Claude pane: with mouse reporting on the selection is the CLI's own, the CLI copies through
+`pbcopy`, and `pbcopy` with no locale decodes UTF-8 input in the system language's legacy
+encoding (Mac Cyrillic here, Mac Roman for English). It does not reproduce from a terminal launch,
+which inherits `LANG=…UTF-8`, nor visibly on an English system copying ASCII.
+
+`child_env::child_locale` now gives every child `LANG=en_US.UTF-8` on macOS when none of the three
+is set, and leaves any value that is set alone. Unit-tested on Linux through `child_locale_in`;
+**not yet confirmed on a Mac** — the check is a Finder-launched instance copying Cyrillic out of a
+Claude pane with mouse reporting on.
+
 ## Docker on Linux, from a Mac
 
 The whole Docker integration (M41–M47) was written on macOS against colima, and `docs/journal.md`
