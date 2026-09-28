@@ -1676,7 +1676,84 @@ fn resolve(app: &AppHandle, hello: &Hello) -> Scope {
     let Some(state) = app.try_state::<WorkspaceState>() else {
         return Scope::Unscoped;
     };
-    state.with(|ws| scope_of(ws, hello))
+    let session = hello
+        .session
+        .as_deref()
+        .and_then(|value| value.parse::<SessionId>().ok());
+    let sessions = app.try_state::<SessionRegistry>();
+    settle(
+        || state.with(|ws| scope_of(ws, hello)),
+        || match (session, sessions.as_ref()) {
+            (Some(id), Some(sessions)) => sessions.get(id).map(|live| !live.has_exited()),
+            _ => Some(false),
+        },
+        BIND_WAIT,
+        BIND_TICK,
+    )
+}
+
+/// How long a connection naming a session this process spawned may wait for a pane to hold it.
+///
+/// # The race this closes
+///
+/// The scope is decided once per connection (see the module header), and the pane that a
+/// console's `CIDE_SESSION` names is not always in the workspace yet when its bridge connects.
+/// `pane_bind_session` is the webview's call, made *after* `session_spawn` returns, and two
+/// spawns hand the child an id no pane holds until then:
+///
+/// * **A fresh console** — cide mints the id, and nothing but that later call files it.
+/// * **A console restored after a `/clear`** — the resume names `Pane::conversation`, the CLI
+///   keeps that id, and `CIDE_SESSION` is it; the pane still holds the id it opened with.
+///
+/// Losing that race used to cost the pane every `mcp__cide__*` tool for its whole life, with a
+/// green `cide` server in `/mcp` and nothing in any log. It was lost most often at launch, when
+/// the webview is restoring every pane at once and the bind queues behind the rest — measured in
+/// the CLI's own transcripts: a console resumed at 07:25 recorded all 22 `mcp__cide__*` tools as
+/// *removed* and got them back only from a manual `/mcp` reconnect at 07:42.
+///
+/// Waiting here does not widen the boundary: the scope is still whatever [`scope_of`] answers,
+/// only asked again until the bind lands. The wait is bounded well inside the CLI's 30 s MCP
+/// connect timeout, and runs on this connection's own thread, so no other agent waits for it.
+const BIND_WAIT: Duration = Duration::from_secs(10);
+const BIND_TICK: Duration = Duration::from_millis(50);
+
+/// How long a session the registry has never heard of is waited for before giving up.
+///
+/// `session_spawn` inserts into the registry right after the fork, and a `claude` boots for far
+/// longer than that before it starts an MCP server. So an id still unknown after this is one this
+/// process did not spawn — a stale or foreign `CIDE_SESSION` — and it gets its empty tool list
+/// now rather than after [`BIND_WAIT`].
+const UNKNOWN_SESSION_GRACE: Duration = Duration::from_millis(500);
+
+/// Ask `scope` until it places the connection, while `spawned` says the waiting is worth it.
+///
+/// `spawned` answers `Some(true)` for a live session this process spawned, `Some(false)` for one
+/// there is no point waiting on (exited, or no session named at all), and `None` for an id the
+/// registry does not hold, which is waited on only for [`UNKNOWN_SESSION_GRACE`].
+///
+/// Closures rather than an `AppHandle` for [`scope_of`]'s reason: a boundary nothing can call
+/// without an app is a boundary nothing tests.
+fn settle(
+    mut scope: impl FnMut() -> Scope,
+    mut spawned: impl FnMut() -> Option<bool>,
+    wait: Duration,
+    tick: Duration,
+) -> Scope {
+    let started = Instant::now();
+    loop {
+        let answer = scope();
+        if answer != Scope::Unscoped {
+            return answer;
+        }
+        let worth_waiting = match spawned() {
+            Some(live) => live,
+            None => started.elapsed() < UNKNOWN_SESSION_GRACE,
+        };
+        if !worth_waiting || started.elapsed() >= wait {
+            return answer;
+        }
+        thread::sleep(tick);
+    }
 }
 
 /// The run arm: is this header's `CIDE_RUN` a run this process dispatched?
@@ -1836,10 +1913,11 @@ fn project_of_primary(ws: &Workspace, session: SessionId) -> Option<ProjectId> {
 ///   `SplitIntent::Resume`, and `cmd::pane::pane_for` writes the session into the row at
 ///   creation, before `session_spawn` is called at all. There is nothing to race.
 /// * A **plain second Claude pane** is created session-less and bound after the spawn resolves,
-///   so the binding and the child's bridge do race. The binding is one IPC round trip; the child
-///   has a whole CLI to boot before it forks `cide-hook mcp`. It is not a race the child can
-///   realistically win, and losing it costs what this pane had before M30 — an empty tool list —
-///   rather than anything wrong.
+///   so the binding and the child's bridge do race. So do a fresh console and a console restored
+///   after a `/clear`. This comment used to say the child could not realistically win that race
+///   because the bind is one IPC round trip. At launch, with the webview restoring every pane,
+///   the child won it often enough that consoles came up with no `mcp__cide__*` tools until a
+///   manual `/mcp` reconnect. [`settle`] now waits for the bind; see [`BIND_WAIT`].
 ///
 /// `cmd::pane`'s `a_resumed_pane_holds_its_session_before_anything_is_spawned` is what keeps the
 /// first bullet true from the other side.
@@ -3562,6 +3640,73 @@ mod tests {
         // A JSON-RPC message is not a header, which is what makes the fall-through in `serve`
         // reachable rather than theoretical.
         assert!(parse_hello(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).is_err());
+    }
+
+    /// The bind race `BIND_WAIT` exists for: a console's bridge connects before
+    /// `pane_bind_session` files its session, and is placed once the bind lands rather than
+    /// being served an empty tool list for the rest of its life.
+    #[test]
+    fn a_console_whose_bind_lands_late_is_still_placed() {
+        let (ws, project, primary) = workspace_with_a_project();
+        let placed = Scope::Pane {
+            project,
+            session: primary,
+            primary: true,
+        };
+        let mut asked = 0;
+        let scope = settle(
+            || {
+                asked += 1;
+                if asked < 4 {
+                    Scope::Unscoped
+                } else {
+                    scope_of(&ws, &hello(Some(&primary.to_string()), None))
+                }
+            },
+            || Some(true),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        );
+        assert_eq!(scope, placed);
+        assert_eq!(asked, 4, "asked until the bind landed, and not after");
+    }
+
+    /// The wait never widens the boundary, and never costs a connection that has nothing to
+    /// wait for: an exited or unnamed session answers at once, a stranger after the grace, and a
+    /// live session that is never bound after the bound.
+    #[test]
+    fn the_bind_wait_is_bounded_and_skipped_when_there_is_nothing_to_wait_for() {
+        let timed = |spawned: Option<bool>, wait: Duration| {
+            let started = Instant::now();
+            let scope = settle(
+                || Scope::Unscoped,
+                || spawned,
+                wait,
+                Duration::from_millis(5),
+            );
+            (scope, started.elapsed())
+        };
+
+        let (scope, took) = timed(Some(false), Duration::from_secs(5));
+        assert_eq!(scope, Scope::Unscoped);
+        assert!(
+            took < Duration::from_millis(100),
+            "no wait for a dead session: {took:?}"
+        );
+
+        let (scope, took) = timed(None, Duration::from_secs(5));
+        assert_eq!(scope, Scope::Unscoped);
+        assert!(
+            took >= UNKNOWN_SESSION_GRACE && took < Duration::from_secs(2),
+            "an unknown session waits out the grace only: {took:?}"
+        );
+
+        let (scope, took) = timed(Some(true), Duration::from_millis(200));
+        assert_eq!(scope, Scope::Unscoped);
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            "a live session that is never bound waits out the bound only: {took:?}"
+        );
     }
 
     #[test]
