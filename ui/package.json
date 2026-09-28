@@ -1,7 +1,7 @@
 {
   "name": "cide-ui",
   "private": true,
-  "version": "0.11.1-dev",
+  "version": "0.11.2-dev",
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
