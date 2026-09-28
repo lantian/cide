@@ -549,8 +549,12 @@ jobs:
           cache-path: ~/go/pkg/mod
           cache-prefix: gopls-mod
 
-      # --dmg alone, and that is not a typo: tauri's dmg bundler runs the .app bundler first,
-      # so naming both would not add anything. --src is absent for a different reason — the
+      # --app *and* --dmg. The dmg bundler runs the .app bundler itself, and this said --dmg alone
+      # "because naming both would not add anything" — which cost the first signed release its
+      # macOS update. tauri-bundler decides whether to write `cide.app.tar.gz` from the bundle
+      # types *requested* (`package_types`), and for the v2 updater only `app` qualifies; the
+      # `.app` the dmg built on the way was never considered, so the archive was not made and
+      # the rename step below failed on a file that did not exist. --src is absent for a different reason — the
       # source tarball has one producer on purpose (see Targets::MACOS), because two hosts
       # running `git archive` produce files with the same name whose gzip layers differ, and
       # whichever upload lost would leave a published checksum matching neither.
@@ -563,8 +567,8 @@ jobs:
       # the bundle failed Gatekeeper's integrity check outright — "cide is damaged and can't
       # be opened", Move to Trash the only button. An ad-hoc seal is what turns that into the
       # "Apple could not verify" dialog, which System Settings lets a user open anyway.
-      - name: cargo xtask package --dmg --run
-        run: cargo --locked xtask package --dmg --run
+      - name: cargo xtask package --app --dmg --run
+        run: cargo --locked xtask package --app --dmg --run
 
       # The bundler names the update archive `cide.app.tar.gz` — no version, no architecture —
       # which would collide with the next architecture's in the flattened `dist/` and tells

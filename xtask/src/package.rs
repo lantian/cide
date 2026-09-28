@@ -330,7 +330,9 @@ pub struct Targets {
     pub deb: bool,
     pub flatpak: bool,
     /// macOS: the `.app` bundle. The `.dmg` is built from it, so asking for a dmg alone still
-    /// produces one — `cargo tauri build --bundles dmg` runs the app bundler first.
+    /// produces one — `cargo tauri build --bundles dmg` runs the app bundler first. **Not** the
+    /// update archive, though: tauri-bundler writes `cide.app.tar.gz` only when `app` is among the
+    /// bundles *requested*, so a signed release must name `--app` as well (release.yml does).
     pub app: bool,
     /// macOS: the disk image, which is what a person downloads.
     pub dmg: bool,
