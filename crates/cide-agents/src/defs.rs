@@ -4012,7 +4012,7 @@ Work one task at a time.
             &project,
             "a.md",
             "---\nname: a\ndescription: d\nharness: codex\nallow-commands: [blender -b, \
-             tools/ci/runners/e2e.sh]\nneeds: display, audio\nwritable-dirs: ~/.cache/godot\n---\nP.\n",
+             tools/ci/runners/e2e.sh]\nneeds: display, audio, gpu\nwritable-dirs: ~/.cache/godot\n---\nP.\n",
         );
         write(
             &project,
@@ -4022,7 +4022,7 @@ Work one task at a time.
         write(
             &project,
             "c.md",
-            "---\nname: c\ndescription: d\nneeds: gpu\n---\nP.\n",
+            "---\nname: c\ndescription: d\nneeds: vulkan\n---\nP.\n",
         );
         let catalog = load_from(
             &two(&dir.join("global"), &project),
@@ -4037,10 +4037,10 @@ Work one task at a time.
         );
         assert_eq!(
             a.sandbox.needs,
-            vec![SandboxNeed::Display, SandboxNeed::Audio]
+            vec![SandboxNeed::Display, SandboxNeed::Audio, SandboxNeed::Gpu]
         );
         assert_eq!(a.sandbox.writable_dirs, vec!["~/.cache/godot"]);
-        for (name, word) in [("b", "bash"), ("c", "gpu")] {
+        for (name, word) in [("b", "bash"), ("c", "vulkan")] {
             let greyed = agent(&catalog, name);
             assert!(
                 greyed

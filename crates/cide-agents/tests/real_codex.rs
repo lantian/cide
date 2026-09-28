@@ -3,7 +3,10 @@
 //! `#[ignore]`d, like every test in this workspace that spawns a real harness: they need
 //! `codex` on `PATH` and a logged-in account. Two of the three spend **nothing** — `codex debug
 //! prompt-input` renders what the model would be shown without calling one, and `codex mcp get`
-//! reads configuration — and are worth running on every change to `harness/codex.rs`:
+//! reads configuration — and are worth running on every change to `harness/codex.rs`. So is the
+//! `needs: [gpu]` one (M125), which runs a command in `codex sandbox` and no model, and skips
+//! itself on a machine without an NVIDIA GPU; it is the one a codex update that changes how it
+//! calls bwrap breaks:
 //!
 //! ```sh
 //! cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn
@@ -95,6 +98,7 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         git_dirs: Vec::new(),
         sandbox_brief: None,
         codex_trust_root: None,
+        codex_path_prepend: None,
     }
 }
 
@@ -476,4 +480,117 @@ fn a_real_turn_commits_from_a_sandboxed_worktree() {
         String::from_utf8_lossy(&out.stderr)
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What a `codex sandbox` command printed, and whether it succeeded.
+fn in_codex_sandbox(dir: &Path, path: &str, script: &str) -> (bool, String, String) {
+    let out = std::process::Command::new(codex())
+        .current_dir(dir)
+        .env("PATH", path)
+        // 0.157.1's spelling: `-P` is required, and `:workspace` is the built-in workspace-write
+        // profile (`workspace-write` without the colon asks the user's config for a
+        // `[permissions]` table). `-C` is where the command runs.
+        .args([
+            "sandbox",
+            "-P",
+            ":workspace",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
+            "-C",
+        ])
+        .arg(dir)
+        .args(["--", "sh", "-c", script])
+        .output()
+        .expect("codex sandbox runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `needs: [gpu]` puts the real GPU inside codex's sandbox (M125): the `PATH` the harness hands a
+/// `permission-mode: auto` run starts with the shim, and a real `codex sandbox` run on that
+/// `PATH` sees `/dev/dri` and `/dev/nvidia0` — which the same command on the plain `PATH` does
+/// not. Spends nothing: `codex sandbox` runs a command, not a model.
+///
+/// **This is the test a codex update breaks.** The shim depends on codex running the system
+/// `bwrap` off its `PATH` with a `--dev /dev` pair (0.157.1). If codex bundles its own bwrap,
+/// resolves it by absolute path, or builds `/dev` another way, the devices vanish and this fails
+/// — see the assertions for which of those it looks like. Skipped, not failed, on a machine with
+/// no codex, no bwrap or no NVIDIA nodes.
+#[test]
+#[ignore = "runs the real codex sandbox; needs codex, bwrap and an NVIDIA GPU's device nodes"]
+fn the_real_codex_sandbox_sees_the_gpu_through_the_shim() {
+    let missing: Vec<&str> = [
+        ("codex", cide_core::toolchain::which("codex").is_none()),
+        ("bwrap", cide_core::toolchain::which("bwrap").is_none()),
+        ("/dev/dri", !Path::new("/dev/dri").exists()),
+        ("/dev/nvidia0", !Path::new("/dev/nvidia0").exists()),
+    ]
+    .into_iter()
+    .filter_map(|(what, absent)| absent.then_some(what))
+    .collect();
+    if !missing.is_empty() {
+        eprintln!("skipped: this machine has no {}", missing.join(", "));
+        return;
+    }
+
+    // Two directories, not one: codex skips a `PATH` bwrap that lies inside one of the sandbox's
+    // writable roots (measured on 0.157.1 — a sandboxed command could rewrite it), and `-C` is
+    // one. With the shim under the cwd this test measured codex's bundled bwrap and failed.
+    let dir = temp_dir("gpu");
+    let shim_dir = temp_dir("gpu-shim");
+    cide_agents::sandbox::write_bwrap_gpu_shim(&shim_dir).expect("the shim is written");
+
+    // The PATH as the harness composes it, not as this test would.
+    let mut agent = role("unused");
+    agent.permission_mode = Some("auto".into());
+    agent.sandbox.needs = vec![cide_ipc::SandboxNeed::Gpu];
+    let mut run = plan(&agent, &dir, "unused");
+    run.codex_path_prepend = Some(shim_dir.clone());
+    let spec = CodexHarness.spawn_spec(&run).expect("spawnable").spec;
+    let path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone())
+        .expect("the harness sets PATH");
+    assert!(
+        path.starts_with(&format!("{}:", shim_dir.display())),
+        "the shim is first: {path}"
+    );
+
+    const PROBE: &str = "for n in /dev/dri /dev/nvidia0; do \
+                         if [ -e \"$n\" ]; then echo \"HAS $n\"; else echo \"NO $n\"; fi; done";
+
+    let plain = std::env::var("PATH").unwrap_or_default();
+    let (ok, stdout, stderr) = in_codex_sandbox(&dir, &plain, PROBE);
+    assert!(ok, "codex sandbox did not run at all:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("NO /dev/nvidia0"),
+        "codex's own sandbox now has the GPU — the shim may be unnecessary; re-measure:\n{stdout}"
+    );
+
+    let (ok, stdout, stderr) = in_codex_sandbox(&dir, &path, PROBE);
+    assert!(
+        ok,
+        "codex sandbox failed under the shim:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("cide gpu shim"),
+        "the shim ran and did not recognise codex's bwrap call — codex changed how it builds /dev:\n{stderr}"
+    );
+    for node in ["/dev/dri", "/dev/nvidia0"] {
+        assert!(
+            stdout.contains(&format!("HAS {node}")),
+            "{node} is not in the sandbox under the shim. If the shim printed nothing, codex no \
+             longer runs `bwrap` off its PATH (bundled, or by absolute path), or the shim sits \
+             inside a writable root:\n{stdout}\n{stderr}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&shim_dir).ok();
 }

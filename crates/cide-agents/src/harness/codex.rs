@@ -483,6 +483,30 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
         );
         spec = spec.env("__GLX_VENDOR_LIBRARY_NAME", "mesa".to_string());
     }
+    // The real GPU for a role that needs it (M125): a `bwrap` shim first on codex's `PATH`, which
+    // is where 0.157.1 finds the bwrap it builds the sandbox with. Under the same guard as the
+    // Mesa pass above, whose GLX override it leaves alone — that is GL for an Xvfb, and the GPU
+    // this is for is Vulkan's, which glvnd's vendor variables do not steer.
+    if plan.codex.cli.inject.permissions
+        && sandboxes_writes(policy)
+        && plan.agent.sandbox.needs(crate::sandbox::SandboxNeed::Gpu)
+        && let Some(dir) = &plan.codex_path_prepend
+    {
+        // The `PATH` the child would otherwise get: the last one the passes above set, which
+        // `child_path` always does, and cide's own when none did.
+        let current = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var("PATH").ok());
+        let path = match current {
+            Some(rest) if !rest.is_empty() => format!("{}:{rest}", dir.display()),
+            _ => dir.display().to_string(),
+        };
+        spec = spec.env("PATH", path);
+    }
     spec = spec.env("CIDE_SESSION", plan.session.to_string());
     spec = spec.env("CIDE_RUN", plan.run.to_string());
     if let Some(sock) = &plan.hook_sock {
@@ -654,17 +678,22 @@ pub fn sandbox_caveat(
         return None;
     }
     Some(match (git_dirs_known, grant.wants_network()) {
+        (true, true) if grant.needs(crate::sandbox::SandboxNeed::Gpu) => {
+            "codex runs it in its workspace-write sandbox with the network on for the role's \
+             `needs:` and the machine's GPU bound in for `needs: [gpu]`, so an Xvfb of its own, \
+             audio and Vulkan on the real GPU work there; it can edit and commit in its worktree"
+        }
         (true, true) => {
             "codex runs it in its workspace-write sandbox with the network on for the role's \
-             `needs:`, so an Xvfb of its own and audio work there; it can edit and commit in its \
-             worktree"
+             `needs:`, so an Xvfb of its own and audio work there, but Vulkan and GL run on \
+             llvmpipe without `needs: [gpu]`; it can edit and commit in its worktree"
         }
         (true, false) => {
             "codex runs it in its workspace-write sandbox: it can edit and commit in its worktree, \
              but the sandbox refuses unix sockets while the network is off, so it has no X display \
-             and no audio and an Xvfb e2e run or a Blender render fails there; a role that needs \
-             them says `needs: [display, audio]`, or lets the one command out with \
-             `allow-commands:`"
+             and no audio and an Xvfb e2e run or a Blender render fails there, and it has no GPU; \
+             a role that needs them says `needs: [display, audio, gpu]`, or lets the one command \
+             out with `allow-commands:`"
         }
         (false, _) => {
             "codex runs it in its workspace-write sandbox and the worktree's git directories could \
@@ -680,7 +709,11 @@ pub fn sandbox_caveat(
 /// by failing — t-586's Blender render, t-588's Xvfb run, retried. `rules_written` is whether
 /// cide put the role's `allow-commands` where codex reads them (a worktree run only); the list
 /// is repeated here with the one rule that decides whether codex lets a command out — every part
-/// of it must be allowed, so a `timeout` or a pipe around it keeps it in.
+/// of it must be allowed, so a `timeout` or a pipe around it keeps it in. `gpu_bound` is whether
+/// the caller wrote the `needs: [gpu]` shim ([`RunPlan::codex_path_prepend`]). (M125)
+// Eight flat facts from one call site, each a separate decision the caller has already made; a
+// struct for them would be a second copy of `RunPlan`'s fields with nothing gained.
+#[allow(clippy::too_many_arguments)]
 pub fn sandbox_brief(
     mode: Option<&str>,
     unattended: Unattended,
@@ -689,6 +722,7 @@ pub fn sandbox_brief(
     inject_permissions: bool,
     grant: &crate::sandbox::SandboxGrant,
     rules_written: bool,
+    gpu_bound: bool,
 ) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     let sandboxed = inject_permissions
@@ -714,18 +748,30 @@ pub fn sandbox_brief(
                      that open audio will not hang."
                         .into(),
                 );
-                // No GPU in here, whatever the role needs: codex binds a minimal `/dev` and has
-                // no setting that adds `/dev/dri` or `/dev/nvidia*` (0.157.1). Vulkan and GL
-                // fall to llvmpipe, which is what selfcraft's e2e runs got — Godot's Forward+
-                // then fell back to opengl3. Said, so a run does not debug a missing device.
-                lines.push(
-                    "There is no GPU in this sandbox: Vulkan and GL run on llvmpipe (software), and \
-                     no setting adds /dev/dri or /dev/nvidia*. Work that needs the GPU goes through \
-                     one of the role's allowed commands, which run outside the sandbox with the real \
-                     devices; if there is none for it, say so in your comment rather than debugging \
-                     the device."
-                        .into(),
-                );
+                // The GPU: codex binds a minimal `/dev` with no `/dev/dri` or `/dev/nvidia*`
+                // (0.157.1), and only `needs: [gpu]`'s bwrap shim puts them back (M125). Without
+                // it Vulkan and GL fall to llvmpipe, which is what selfcraft's e2e runs got —
+                // Godot's Forward+ fell back to opengl3, or aborted. `gpu_bound` is whether the
+                // shim was actually written, not whether the role asked: a run whose shim could
+                // not be written is told it has no GPU rather than promised one. Said either
+                // way, so a run does not debug a device.
+                if gpu_bound {
+                    lines.push(
+                        "This role needs the GPU, so your sandbox has the machine's real devices \
+                         (/dev/dri, /dev/nvidia*) bound in: Vulkan and CUDA see the real GPU, not \
+                         llvmpipe. Do not force software rendering."
+                            .into(),
+                    );
+                } else {
+                    lines.push(
+                        "There is no GPU in this sandbox: Vulkan and GL run on llvmpipe (software). \
+                         Work that needs the GPU goes through one of the role's allowed commands, \
+                         which run outside the sandbox with the real devices, or needs the role to \
+                         say `needs: [gpu]`; if neither is there, say so in your comment rather \
+                         than debugging the device."
+                            .into(),
+                    );
+                }
             } else {
                 lines.push(
                     "Your sandbox refuses unix sockets (the network is off), so it has no X display \
@@ -888,6 +934,7 @@ mod tests {
             git_dirs: Vec::new(),
             sandbox_brief: None,
             codex_trust_root: None,
+            codex_path_prepend: None,
         }
     }
 
@@ -1214,8 +1261,19 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            sandbox_caveat(Some("auto"), Unattended::Auto, true, true, true, &display)
-                .is_some_and(|s| s.contains("network on") && !s.contains("no X display"))
+            sandbox_caveat(Some("auto"), Unattended::Auto, true, true, true, &display).is_some_and(
+                |s| s.contains("network on")
+                    && !s.contains("no X display")
+                    && s.contains("llvmpipe")
+            )
+        );
+        let gpu = crate::sandbox::SandboxGrant {
+            needs: vec![crate::sandbox::SandboxNeed::Gpu],
+            ..Default::default()
+        };
+        assert!(
+            sandbox_caveat(Some("auto"), Unattended::Auto, true, true, true, &gpu)
+                .is_some_and(|s| s.contains("real GPU") && !s.contains("llvmpipe"))
         );
         let allowed = crate::sandbox::SandboxGrant {
             allow_commands: vec!["blender -b".into()],
@@ -1286,6 +1344,7 @@ mod tests {
                 true,
                 grant,
                 rules,
+                false,
             )
         };
         assert!(brief(&none, false).is_some_and(|b| b.contains("do not start Xvfb")));
@@ -1308,9 +1367,95 @@ mod tests {
                 true,
                 true,
                 &none,
+                false,
                 false
             ),
             None
+        );
+        // `needs: [gpu]` (M125): promised the real GPU only when the shim was written; told
+        // there is none — and how to get one — otherwise.
+        let gpu = crate::sandbox::SandboxGrant {
+            needs: vec![crate::sandbox::SandboxNeed::Gpu],
+            ..Default::default()
+        };
+        let bound = sandbox_brief(
+            Some("auto"),
+            Unattended::Auto,
+            true,
+            true,
+            true,
+            &gpu,
+            false,
+            true,
+        )
+        .expect("said");
+        assert!(
+            bound.contains("real GPU") && !bound.contains("no GPU"),
+            "{bound}"
+        );
+        let unbound = brief(&gpu, false).expect("said");
+        assert!(
+            unbound.contains("no GPU") && unbound.contains("needs: [gpu]"),
+            "{unbound}"
+        );
+    }
+
+    /// The shim's directory goes first on codex's `PATH` exactly where the grant reaches codex:
+    /// a writes sandbox cide decides, a role that needs the GPU, and a shim that was written.
+    /// (M125)
+    #[test]
+    fn a_gpu_role_gets_the_bwrap_shim_first_on_its_path() {
+        let session = SessionId::new();
+        let shim = PathBuf::from("/run/user/1000/cide-run-7.bin");
+        let path_of = |mode: Option<&str>,
+                       needs: Vec<crate::sandbox::SandboxNeed>,
+                       inject,
+                       dir: Option<&PathBuf>| {
+            let mut agent = role();
+            agent.permission_mode = mode.map(str::to_string);
+            agent.sandbox.needs = needs;
+            let mut plan = plan_for(&agent, session);
+            plan.codex.cli.inject.permissions = inject;
+            plan.codex_path_prepend = dir.cloned();
+            let spec = CodexHarness.spawn_spec(&plan).expect("spawnable").spec;
+            env_value(&spec, "PATH").map(str::to_string)
+        };
+        let gpu = || vec![crate::sandbox::SandboxNeed::Gpu];
+        let first = |path: Option<String>| {
+            path.is_some_and(|p| p.starts_with("/run/user/1000/cide-run-7.bin:"))
+        };
+        for mode in ["auto", "default", "dontAsk"] {
+            assert!(
+                first(path_of(Some(mode), gpu(), true, Some(&shim))),
+                "{mode}"
+            );
+        }
+        assert!(!first(path_of(
+            Some("bypassPermissions"),
+            gpu(),
+            true,
+            Some(&shim)
+        )));
+        assert!(!first(path_of(Some("plan"), gpu(), true, Some(&shim))));
+        assert!(
+            !first(path_of(Some("auto"), gpu(), false, Some(&shim))),
+            "a wrapper decides"
+        );
+        assert!(!first(path_of(
+            Some("auto"),
+            vec![crate::sandbox::SandboxNeed::Display],
+            true,
+            Some(&shim)
+        )));
+        assert!(
+            !first(path_of(Some("auto"), gpu(), true, None)),
+            "no shim written"
+        );
+        // The shim is one more directory in front, not a replacement: the rest stays.
+        let path = path_of(Some("auto"), gpu(), true, Some(&shim)).expect("a PATH");
+        assert!(
+            path.len() > "/run/user/1000/cide-run-7.bin:".len(),
+            "{path}"
         );
     }
 

@@ -16102,3 +16102,53 @@ would cost real turns to measure.
 
 Per-project notes, written for the user and not acted on: `~/work/selfcraft/llm-cost-notes.md`,
 `~/work/terrastrike/llm-cost-notes.md`.
+
+**Follow-up, the same day, after a morning of opencode runs on the fixed build.** No codex run
+happened (both projects on the `low-llms` profile), so the quota effect is still unmeasured; the
+behaviour is. The waiting paragraph reached every run's `opencode serve` and runs waited in one
+call (`while kill -0 …; do sleep 5; done`). A comment's answer was ~1.7k characters instead of the
+whole task — of which ~1k was the task's resolved links and ~400 the data fence. So two more cuts:
+`render_ack` draws the links only for `cide_task_link`/`cide_task_unlink`, and `cide_task_get`
+sends the last ten comments (`RECENT_COMMENTS`) with a line naming how many older ones it left out,
+the whole log under `all: true`. It also stopped drawing deleted comments, which rendered as empty
+`- from …:` entries although `TaskComment::deleted` says they are gone from every agent's view.
+Tests: `get_sends_the_recent_comments_unless_asked_for_all`, `only_a_link_answer_carries_the_links`.
+
+## The real GPU in codex's sandbox: `needs: [gpu]` (M125)
+
+selfcraft's Godot e2e runs on codex aborted with `LLVM ERROR X86ISD::MGATHER` (exit 134). Forward+
+was running on llvmpipe, because codex 0.157.1 builds its Linux sandbox with `bwrap … --dev /dev`,
+a `/dev` with no `/dev/dri` or `/dev/nvidia*`. None of M119's grants reached it: `writable-dirs`
+under `/dev` fails every command, and `needs` only switches the network on. codex has no setting
+for devices.
+
+codex runs the first `bwrap` on its `PATH`, so a role that says `needs: [gpu]` now gets a shim
+there (`cide_agents::sandbox::bwrap_gpu_shim`). It is POSIX `sh` that finds the real bwrap on
+`PATH`, skipping itself. After the first `--dev /dev` pair it inserts `--dev-bind N N` for
+`/dev/dri`, `/dev/nvidia0`, `nvidiactl`, `nvidia-modeset`, `nvidia-uvm` and `nvidia-uvm-tools`,
+whichever exist, then execs the real bwrap. Without that pair it warns on stderr and passes the
+arguments through unchanged. The app writes it to `cide-run-<run>.bin/` beside the run's event
+FIFO, only for codex under a write sandbox cide decides (`RunPlan::codex_path_prepend`). The
+harness puts that directory first on the child's `PATH`. The run's brief says it has the real GPU
+only when the shim was actually written. Otherwise it says there is none, and that
+`needs: [gpu]` is the way to get it. `SandboxNeed::Gpu` is on the wire, in the tool schema and
+on the Settings form.
+
+Measured while building it: **codex ignores a `PATH` bwrap inside one of the sandbox's writable
+roots** and uses its bundled `codex-resources/bwrap`, silently. The first draft of the real test
+put the shim under its own `-C` directory and saw no GPU. The same shim in `$XDG_RUNTIME_DIR` was
+used. That is why the shim lives beside the FIFO and not in the worktree.
+`codex sandbox` on 0.157.1 is spelled `-P :workspace` (required); there is no `linux` subcommand
+and no `--full-auto`.
+
+Tests: `cargo test -p cide-agents` (the shim against a fake bwrap: nodes inserted after the pair,
+unknown calls passed through with a warning, never exec'ing itself; the harness puts `PATH` first
+only under a write sandbox with `gpu` and a written shim; brief and caveat text; `gpu` parses).
+Also `cargo test -p cide-agents --test real_codex -- --ignored the_real_codex_sandbox_sees_the_gpu_through_the_shim`,
+which passed on this machine: without the shim the sandbox has no `/dev/nvidia0`, with it
+`/dev/dri` and `/dev/nvidia0` are there. It is the test a codex update that changes its bwrap call
+will break.
+
+Not yet seen live: no Godot Forward+ run through a cide-dispatched codex role, and no
+`vulkaninfo` from inside a real run's sandbox (the manual measurement before this work was
+`codex sandbox`, as is the test).

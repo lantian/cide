@@ -833,6 +833,16 @@ pub struct RunPlan<'a> {
     /// worktree is the **main** repository's root. `None` when no rules file was written — a
     /// role with no `allow-commands`, a run in the project root, a harness other than codex.
     pub codex_trust_root: Option<PathBuf>,
+    /// A directory cide wrote this run's `bwrap` shim into, to go first on codex's `PATH`, for a
+    /// role that says `needs: [gpu]`. (M125)
+    ///
+    /// codex 0.157.1 finds the system `bwrap` on its `PATH` and hands it `--dev /dev`, a `/dev`
+    /// with no GPU; the shim binds `/dev/dri` and `/dev/nvidia*` in after that pair and runs the
+    /// real one (`crate::sandbox::bwrap_gpu_shim`). Written by the caller, beside the run's event
+    /// FIFO, because this crate reads and writes no disk at spawn. `None` for every other role,
+    /// every other harness, and a run whose shim could not be written — whose brief then says it
+    /// has no GPU rather than promising one.
+    pub codex_path_prepend: Option<PathBuf>,
 }
 
 /// Where a run's server listens, and the password that guards it. See [`RunPlan::server`].
@@ -1373,6 +1383,7 @@ mod tests {
                     git_dirs: Vec::new(),
                     sandbox_brief: None,
                     codex_trust_root: None,
+                    codex_path_prepend: None,
                 };
                 let spec = harness
                     .spawn_spec(&plan)
@@ -1768,6 +1779,7 @@ mod tests {
                 git_dirs: Vec::new(),
                 sandbox_brief: None,
                 codex_trust_root: None,
+                codex_path_prepend: None,
             }
         }
 

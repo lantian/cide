@@ -3504,6 +3504,7 @@ mod tests {
             git_dirs: Vec::new(),
             sandbox_brief: None,
             codex_trust_root: None,
+            codex_path_prepend: None,
         }
     }
 

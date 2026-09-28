@@ -52,3 +52,5 @@ Thumbs.db
 
 # Local pnpm package cache.
 .pnpm-store/
+
+/tmp/
