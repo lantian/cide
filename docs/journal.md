@@ -16102,3 +16102,14 @@ would cost real turns to measure.
 
 Per-project notes, written for the user and not acted on: `~/work/selfcraft/llm-cost-notes.md`,
 `~/work/terrastrike/llm-cost-notes.md`.
+
+**Follow-up, the same day, after a morning of opencode runs on the fixed build.** No codex run
+happened (both projects on the `low-llms` profile), so the quota effect is still unmeasured; the
+behaviour is. The waiting paragraph reached every run's `opencode serve` and runs waited in one
+call (`while kill -0 …; do sleep 5; done`). A comment's answer was ~1.7k characters instead of the
+whole task — of which ~1k was the task's resolved links and ~400 the data fence. So two more cuts:
+`render_ack` draws the links only for `cide_task_link`/`cide_task_unlink`, and `cide_task_get`
+sends the last ten comments (`RECENT_COMMENTS`) with a line naming how many older ones it left out,
+the whole log under `all: true`. It also stopped drawing deleted comments, which rendered as empty
+`- from …:` entries although `TaskComment::deleted` says they are gone from every agent's view.
+Tests: `get_sends_the_recent_comments_unless_asked_for_all`, `only_a_link_answer_carries_the_links`.

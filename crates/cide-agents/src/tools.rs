@@ -1198,10 +1198,11 @@ pub fn description(name: &str) -> &'static str {
              cide_task_get for a task's body and comments."
         }
         tool::TASK_GET => {
-            "Read one task in full: its body, its attachments, and its whole comment log with \
-             the author of every comment and the files on each. Every attachment is listed with \
-             its absolute path, so a file the user attached — a screenshot, a design, a log — \
-             can be read from there."
+            "Read one task: its body, its attachments, and its comment log with the author of \
+             every comment and the files on each — the last ten comments, with a line saying how \
+             many older ones there are; pass `all: true` for the whole log. Every attachment is \
+             listed with its absolute path, so a file the user attached — a screenshot, a design, \
+             a log — can be read from there."
         }
         tool::TASK_CREATE => {
             "Add a task to this project's tracker. A task a dispatched run creates goes to the \
@@ -1625,6 +1626,11 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "id": { "type": "string", "description": "A task id, e.g. `t-17`." },
+                "all": {
+                    "type": "boolean",
+                    "description": "Every comment rather than the last ten. For a long task whose \
+                                    early discussion you need.",
+                },
             },
             "required": ["id"],
         }),
@@ -2647,6 +2653,12 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Ok(id) => id,
         Err(result) => return result,
     };
+    // The last `RECENT_COMMENTS` unless asked for everything (M124). See that const.
+    let recent = match optional_bool(arguments, "all") {
+        Ok(Some(true)) => None,
+        Ok(_) => Some(RECENT_COMMENTS),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_GET)),
+    };
     // The whole list rather than `sink.get`, because rendering one task now needs its
     // neighbours: an incoming link — "blocks t-7" — lives on the *other* task, and a link
     // line resolves its target's status and title. (M30)
@@ -2668,7 +2680,7 @@ fn task_get(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 .unwrap_or_default();
             ToolResult::text(format!(
                 "{milestone}{}",
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_full(&task, &all, sink.root(), recent))
             ))
         }
         Ok(None) => ToolResult::error(no_such(&id)),
@@ -2812,7 +2824,7 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Created {}.{why}\n{}",
                 task.id,
-                fenced(&render_full(&task, &all, sink.root()))
+                fenced(&render_full(&task, &all, sink.root(), None))
             ))
         }
         Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
@@ -2993,7 +3005,7 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Updated {}.\n{}",
                 task.id,
-                fenced(&render_ack(&task, &all, sink, false))
+                fenced(&render_ack(&task, &all, sink, false, false))
             ))
         }
         // Unreachable: `edits` was checked non-empty above and the loop returns on the first
@@ -3043,7 +3055,7 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ToolResult::text(format!(
                 "Commented on {}.\n{}",
                 task.id,
-                fenced(&render_ack(&task, &all, sink, true))
+                fenced(&render_ack(&task, &all, sink, true, false))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_COMMENT, &id, &why)),
@@ -3119,7 +3131,7 @@ fn task_link(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 task.id,
                 link_wire(link),
                 target,
-                fenced(&render_ack(&task, &all, sink, false))
+                fenced(&render_ack(&task, &all, sink, false, true))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_LINK, &id, &why)),
@@ -3153,7 +3165,7 @@ fn task_unlink(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 task.id,
                 link_wire(link),
                 target,
-                fenced(&render_ack(&task, &all, sink, false))
+                fenced(&render_ack(&task, &all, sink, false, true))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_UNLINK, &id, &why)),
@@ -3212,7 +3224,7 @@ fn task_attach(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 "Attached {} file(s) to {}.\n{}",
                 paths.len(),
                 task.id,
-                fenced(&render_ack(&task, &all, sink, false))
+                fenced(&render_ack(&task, &all, sink, false, false))
             ))
         }
         Err(why) => ToolResult::error(edit_failure(tool::TASK_ATTACH, &id, &why)),
@@ -6908,8 +6920,9 @@ fn link_section(task: &Task, row: &TaskRow, all: &[TaskRow]) -> String {
 ///
 /// # What is kept, and why
 ///
-/// - **The summary line** ([`render_summary`], the list's own row) and **the links**, each with
-///   its target's status and title: enough to see the mutation landed as meant.
+/// - **The summary line** ([`render_summary`], the list's own row), with the blocking pair; and,
+///   for `cide_task_link`/`cide_task_unlink` only (`links`), **every edge** with its target's
+///   status and title, since that is what the call changed.
 /// - **The attachments**, the task's and the just-added comment's, paths included: a caller that
 ///   just attached files needs the absolute path the store copied them to, and paths are small.
 /// - **Other authors' comments since the caller last commented** — the reason the whole task used
@@ -6925,10 +6938,21 @@ fn link_section(task: &Task, row: &TaskRow, all: &[TaskRow]) -> String {
 ///
 /// `cide_task_create` keeps [`render_full`] (a new task has no log to repeat) and `cide_task_get`
 /// is the explicit request for the whole task, which every tool description now points at.
-fn render_ack(task: &Task, all: &[TaskRow], sink: &dyn TaskSink, commented: bool) -> String {
+fn render_ack(
+    task: &Task,
+    all: &[TaskRow],
+    sink: &dyn TaskSink,
+    commented: bool,
+    links: bool,
+) -> String {
     let row = TaskRow::of(task);
     let mut out = render_summary(&row, all);
-    out.push_str(&link_section(task, &row, all));
+    // The links only when they are what changed. Every other mutation left them as they were,
+    // and resolved with their targets' titles they were most of an answer: seven edges on
+    // terrastrike's t-1246 were ~1k of a 1.7k comment answer. (M124)
+    if links {
+        out.push_str(&link_section(task, &row, all));
+    }
     out.push_str(&attachment_lines(
         &task.attachments,
         &task.id,
@@ -6985,7 +7009,17 @@ fn same_author(a: &TaskAuthor, b: &TaskAuthor) -> bool {
     }
 }
 
-fn render_full(task: &Task, all: &[TaskRow], root: &Path) -> String {
+/// How many of a task's newest comments `cide_task_get` shows unless asked for `all`. (M124)
+///
+/// A task handed back and forth grows a log that every read re-sends in full: terrastrike's
+/// t-1145 had fourteen comments, and a run that read it paid for all of them, again with every
+/// request after. The statement of the work is the **body**, always shown; what a run acts on
+/// from the log is the latest round — the last report, the review, the question. Ten covers
+/// several rounds, and the line naming the omitted count plus `all: true` is the road to the
+/// rest, so nothing is hidden, only not sent by default.
+pub const RECENT_COMMENTS: usize = 10;
+
+fn render_full(task: &Task, all: &[TaskRow], root: &Path, recent: Option<usize>) -> String {
     // Projected once. (M68) `render_full` is handed a whole `Task` — it draws the body and the
     // log, which only a `Task` has — and needs the row for the three things that read one: the
     // summary header, the outgoing link list, and the counts. `TaskRow::of` is the single producer
@@ -7024,11 +7058,21 @@ fn render_full(task: &Task, all: &[TaskRow], root: &Path) -> String {
     // After the body and before the log: a file on the task itself is part of the statement of
     // the work, and an agent reads it where it reads the body. (M39)
     out.push_str(&attachment_lines(&task.attachments, &task.id, root, "  "));
-    if task.comments.is_empty() {
+    // Tombstones are bookkeeping for the merge, never a line: a deleted comment is gone "from
+    // every agent's view of the task" (`TaskComment::deleted`), and drawing one drew an empty
+    // `- from …:` entry that every reader paid for. (M124)
+    let live: Vec<&cide_ipc::TaskComment> = task.comments.iter().filter(|c| !c.deleted).collect();
+    let skipped = recent.map_or(0, |keep| live.len().saturating_sub(keep));
+    if live.is_empty() {
         out.push_str("  no comments\n");
     } else {
+        if skipped > 0 {
+            out.push_str(&format!(
+                "  {skipped} older comment(s) not shown; pass all: true to read them\n"
+            ));
+        }
         out.push_str("  comments, oldest first:\n");
-        for comment in &task.comments {
+        for comment in &live[skipped..] {
             // The author on its own line above the text, and never omitted: a log of anonymous
             // assertions is one no reader can weigh. See the module header.
             out.push_str(&format!("  - from {}:\n", author_label(&comment.author)));
@@ -9710,6 +9754,87 @@ mod tests {
         );
         // And nothing was applied on the way to finding out.
         assert_eq!(sink.tasks.lock().len(), 3);
+    }
+
+    /// `cide_task_get` sends the last [`RECENT_COMMENTS`] and says how many it left out, `all:
+    /// true` sends every one, and a deleted comment is never a line (M124).
+    #[test]
+    fn get_sends_the_recent_comments_unless_asked_for_all() {
+        let sink = board();
+        {
+            let mut tasks = sink.tasks.lock();
+            let comments = &mut tasks[0].comments;
+            comments.clear();
+            for n in 0..(RECENT_COMMENTS + 2) {
+                comments.push(TaskComment {
+                    id: CommentId::new(),
+                    author: TaskAuthor::User,
+                    text: format!("note number {n:02}"),
+                    at_unix_ms: n as u64,
+                    edited_at_unix_ms: None,
+                    deleted: false,
+                    attachments: Vec::new(),
+                });
+            }
+            comments.push(TaskComment {
+                id: CommentId::new(),
+                author: TaskAuthor::User,
+                text: String::new(),
+                at_unix_ms: 99,
+                edited_at_unix_ms: None,
+                deleted: true,
+                attachments: Vec::new(),
+            });
+        }
+        let recent = text_of(&call(tool::TASK_GET, json!({ "id": "t-1" }), &sink));
+        assert!(recent.contains("2 older comment(s) not shown"), "{recent}");
+        assert!(!recent.contains("note number 01"), "{recent}");
+        assert!(recent.contains("note number 02") && recent.contains("note number 11"));
+        assert_eq!(
+            recent.matches("- from the user:").count(),
+            RECENT_COMMENTS,
+            "{recent}"
+        );
+
+        let whole = text_of(&call(
+            tool::TASK_GET,
+            json!({ "id": "t-1", "all": true }),
+            &sink,
+        ));
+        assert!(!whole.contains("not shown"), "{whole}");
+        assert!(whole.contains("note number 00"), "{whole}");
+        // Twelve live comments, and the tombstone drew nothing.
+        assert_eq!(
+            whole.matches("- from the user:").count(),
+            RECENT_COMMENTS + 2
+        );
+
+        let refused = call(tool::TASK_GET, json!({ "id": "t-1", "all": "yes" }), &sink);
+        assert!(refused.is_error, "{}", text_of(&refused));
+    }
+
+    /// Links ride a mutation's answer only when the mutation was a link or unlink (M124).
+    #[test]
+    fn only_a_link_answer_carries_the_links() {
+        let sink = board();
+        let linked = text_of(&call(
+            tool::TASK_LINK,
+            json!({"id": "t-2", "link": "related", "target": "t-3"}),
+            &sink,
+        ));
+        assert!(linked.contains("  links:\n"), "{linked}");
+        let commented = text_of(&call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-2", "text": "progress" }),
+            &sink,
+        ));
+        assert!(!commented.contains("  links:\n"), "{commented}");
+        let updated = text_of(&call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-2", "title": "renamed" }),
+            &sink,
+        ));
+        assert!(!updated.contains("  links:\n"), "{updated}");
     }
 
     /// The answer is the summary and what *others* said since the caller last spoke — never the
