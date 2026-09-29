@@ -21,6 +21,7 @@
  * lines arrives as one turn — the command is typed into a PTY and ended with Enter, so a newline
  * in the middle would submit the first half on its own.
  */
+import type { ReactNode } from 'react'
 import styles from './OpenSpecPanel.module.css'
 import { ASK_CANCEL, ASK_SEND, askPlaceholder, askTitle, canAsk, commandLine } from './model'
 
@@ -34,6 +35,11 @@ export interface ProposeFormProps {
   onText: (text: string) => void
   onSend: () => void
   onCancel: () => void
+  /**
+   * Who runs it — the host's harness picker. Optional so the render check's stories, which have
+   * no stores behind them, draw the form they always drew.
+   */
+  picker?: ReactNode
 }
 
 /**
@@ -78,6 +84,7 @@ export function ProposeFormView(props: ProposeFormProps) {
       <p className={styles.askPreview} data-audit="openspecAskPreview">
         {commandLine(line, text)}
       </p>
+      {props.picker}
       <div className={styles.actions}>
         <button
           type="button"
@@ -87,7 +94,7 @@ export function ProposeFormView(props: ProposeFormProps) {
           disabled={!ready}
           title={
             ready
-              ? 'Types this into the project’s Claude tab and takes you to it'
+              ? 'Opens a new session tab running this. Close the tab and it keeps going; the panel shows its state'
               : 'Say what the change should do first'
           }
           onClick={props.onSend}

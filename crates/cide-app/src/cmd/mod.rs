@@ -86,5 +86,7 @@ pub mod ext;
 // a separate crate apply one layer up as well.
 pub mod docker;
 pub mod spec;
+// OpenSpec sessions: Propose / Explore / Apply as runs with no task, and Publish / Integrate.
+pub mod spec_sessions;
 
 pub mod gitlab;

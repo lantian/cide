@@ -199,6 +199,10 @@ pub use spec::{
     SpecRename, SpecRequirement, SpecRequirementSet, SpecScenario, SpecSchema, SpecSummary,
     SpecTask, SpecTouch, SpecValidation, SpecWriteOutcome,
 };
+pub use spec::{
+    SpecCheckout, SpecIntegrated, SpecLauncher, SpecOp, SpecPublished, SpecRunRow,
+    SpecSessionStart, SpecSettings,
+};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

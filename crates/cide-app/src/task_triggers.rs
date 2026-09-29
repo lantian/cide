@@ -152,7 +152,13 @@ fn consider_blocking(
     // Fresh, per burst — see the module header. The catalog doubles as the mention filter: a
     // typo'd `@develoepr` must act on nothing, above all not on the assignee field.
     let loaded = cide_agents::load_project(&root);
-    if !loaded.config.agents.enabled || !loaded.config.agents.auto_dispatch {
+    // Nor with the tracker switched off (`config::load_tracker`): the switch is the user saying
+    // tasks are not how this project hands out work, and an edit that still reached the file —
+    // the panel is hidden, not the file — must not start a run.
+    if !loaded.config.agents.enabled
+        || !loaded.config.agents.auto_dispatch
+        || !cide_agents::config::load_tracker(&root)
+    {
         return;
     }
     let roles: Vec<AgentId> = loaded

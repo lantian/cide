@@ -131,6 +131,14 @@ export interface SpecDigest {
   rows: string[]
   /** Each change row's action, as `<change>|<start|open>`. */
   rowActions: string[]
+  /** OpenSpec sessions: each *Open session*, by its change or `loose`. */
+  openSessions: string[]
+  /** The × on ended sessions, by the run it dismisses. */
+  dismissals: number
+  /** What a finished change offers, as `<change>|<act>`. */
+  readyActs: string[]
+  /** Each change row's drawn stage, as `<change>|<stage>|<done>/<total>`. */
+  stages: string[]
   /** The composer: which command it is open on, what it will send, and whether it may. */
   ask: string | null
   askPreview: string | null
@@ -157,6 +165,9 @@ export interface SpecDigest {
   tabDeltas: string[]
   tabIssues: number
   tabStart: string | null
+  /** The page's *Open session*, and the acts a finished change offers there. */
+  tabOpenSession: boolean
+  tabReadyActs: string[]
   /**
    * *Split work*'s label, with `|inert` appended when it is drawn disabled — `rowActions`'
    * convention, so a story where it is live keeps the digest it would have had anyway. `null`
@@ -270,6 +281,8 @@ function digest(story: string, html: string): SpecDigest {
     ),
     tabIssues: hits(html, 'specTabIssue'),
     tabStart: (all(html, 'specTabStart')[0] ?? null) && text(all(html, 'specTabStart')[0] ?? ''),
+    tabOpenSession: hits(html, 'specTabOpenSession') > 0,
+    tabReadyActs: all(html, 'specTabReadyAct').map((fragment) => attr(fragment, 'data-act') ?? ''),
     tabSplit: ((f) =>
       f === undefined
         ? null
@@ -334,6 +347,20 @@ function digest(story: string, html: string): SpecDigest {
       (fragment) =>
         `${attr(fragment, 'data-change')}|${attr(fragment, 'data-action')}` +
         (attr(fragment, 'data-disabled') === 'true' ? '|inert' : ''),
+    ),
+    openSessions: all(html, 'openspecOpenSession').map(
+      (fragment) => attr(fragment, 'data-change') ?? 'loose',
+    ),
+    dismissals: hits(html, 'openspecDismissSession'),
+    readyActs: all(html, 'openspecRowActs').flatMap((fragment) => {
+      const change = attr(fragment, 'data-change') ?? ''
+      return [...fragment.matchAll(/data-act="([^"]*)"/g)].map((m) => `${change}|${m[1] ?? ''}`)
+    }),
+    stages: all(html, 'openspecChangeRow').map(
+      (fragment) =>
+        `${attr(fragment, 'data-change')}|${attr(fragment, 'data-stage')}|${text(
+          /<span class="[^"]*rowMeta[^"]*">([^<]*)<\/span>/.exec(fragment)?.[1] ?? '',
+        )}`,
     ),
     unclassed,
   }

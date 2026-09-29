@@ -26,6 +26,7 @@
   "cide://session-status",
   "cide://session-tool",
   "cide://spec-changed",
+  "cide://spec-runs-changed",
   "cide://tasks-changed",
   "cide://update-available",
   "cide://update-check-requested",

@@ -107,4 +107,11 @@ verifyRetries: number,
  * `agents.resumeAfterRestart`: whether runs a cide restart interrupted continue by
  * themselves at the next launch. (M118)
  */
-resumeAfterRestart: boolean, };
+resumeAfterRestart: boolean, 
+/**
+ * The task tracker and milestones are on for this project: the top-level `tracker` key,
+ * **not** under `agents`, read by `cide_agents::config::load_tracker`, whose doc holds the
+ * default rule (absent: on only when the project already has a board or milestones). Off,
+ * agents are not told about the board and get none of its tools.
+ */
+trackerEnabled: boolean, };

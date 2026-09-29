@@ -110,6 +110,7 @@ fn a_real_turn_is_interrupted_by_esc_and_the_next_line_is_taken_up() {
         harness: agent.def.harness,
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: true,
+        review: false,
         server: None,
         git_dirs: Vec::new(),
         sandbox_brief: None,

@@ -479,3 +479,43 @@
 .editorProblemLine {
   font-family: var(--font-mono);
 }
+
+/* ------------------------------------------------------------ OpenSpec sessions */
+
+/*
+ * A change row's second line: the session's state and the acts a finished change offers. Under
+ * the row rather than beside it — a 320px panel has room for one control beside a change's name,
+ * and Publish / Integrate / Archive are three.
+ */
+.rowActs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-5) var(--sp-2) calc(var(--sp-5) + var(--sp-4) + var(--sp-4));
+}
+
+/* The sessions with no change yet — a Propose or an Explore — above the tree. */
+.sessions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.sessionRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.sessionCaption {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui-12);
+}

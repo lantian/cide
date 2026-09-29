@@ -76,6 +76,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   agentRuns,
+  agents as agentsApi,
   attachments as attachmentsApi,
   tasks as tasksApi,
   fsReveal,
@@ -354,6 +355,15 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
     [project],
   )
 
+  const trackerOff = useAgents((s) => s.config?.trackerEnabled === false)
+  const onEnableTracker = useCallback(() => {
+    if (project === null) return
+    void agentsApi
+      .setConfig(project, { trackerEnabled: true })
+      .then((next) => useAgents.getState().adoptConfig(project, next))
+      .catch((reason: unknown) => notifyFailure(reason, { project }))
+  }, [project])
+
   const verifyingTasks = Object.keys(verifies).filter((t) => verifies[t] === 'running')
   const verifying = verifyingTasks.length
   const tabs = (
@@ -367,6 +377,21 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
       proposals={milestonesView?.proposals.length ?? 0}
     />
   )
+  /*
+   * The tracker switch (`.cide/config.json`'s `tracker`), off: the Agents panel's *off* screen,
+   * with the button that turns it back on. Only an explicit `false` — a config nobody has read
+   * yet keeps the board.
+   */
+  if (trackerOff) {
+    return (
+      <TasksPanelView
+        title="Tasks"
+        project={project}
+        off
+        onEnable={onEnableTracker}
+      />
+    )
+  }
   if (tab === 'milestones') {
     return <MilestonesPanel project={project} title={tabs} />
   }

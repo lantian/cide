@@ -953,11 +953,11 @@ try {
     // Two states of one gesture. Naming them differently matters: an *Open task* on a change
     // with no task would be a button that creates something while claiming to open it.
     const start = M.rowAction(null)
-    eq(start.id, 'start', 'a change nobody is working offers to start it')
-    ok(start.label.length > 0 && start.title.length > 0, 'with a label and a sentence')
+    eq(start.id, 'start', 'a change nobody is working offers to apply it')
+    eq(start.label, M.APPLY_LABEL, 'and says Apply, not Start work')
     ok(
-      start.title.includes('Assigning'),
-      `and the sentence says what actually starts the agent: ${start.title}`,
+      start.title.includes('No task is created'),
+      `and the sentence says the one thing that changed — no task: ${start.title}`,
     )
     const open = M.rowAction('t-14')
     eq(open.id, 'open', 'a change with a task opens it')
@@ -966,43 +966,92 @@ try {
     eq(open.disabledReason, undefined, 'nor is the open one')
 
     /*
-     * The third state, which is the bug this argument exists for.
+     * The tracker's arm no longer greys Apply. (OpenSpec sessions)
      *
-     * `task === null` means *this change has no task* only when the **task** board is `ready`.
-     * On `unknown` and `unreadable` it means nobody has looked, and the row was drawing that as
-     * a confident `Start work` — on a change whose task was finished. Pressing it did nothing
-     * whatever: `tasksStore.create` gates on `canWrite`, which is `false` for exactly those two
-     * arms, and returns without a word. So they are inert here, each with the sentence saying
-     * what would un-grey it.
-     *
-     * `absent` is *not* one of them, matching `canWrite`: there is no `.cide/tasks.json` and
-     * creating the first task is what writes one.
+     * It used to, because *Start work* wrote `.cide/tasks.json` and a write over a board nobody
+     * had read could double a task. Apply writes nothing to the tracker — it starts a session on
+     * the change — so the row is live on every arm. What survives is the other half: a task id
+     * read off a board nobody has read is still not evidence the task is there, so it does not
+     * turn the row into *Open task*.
      */
-    for (const arm of ['unknown', 'unreadable']) {
-      const blocked = M.rowAction(null, arm)
-      eq(blocked.id, 'start', `${arm}: still the start gesture`)
-      ok(
-        typeof blocked.disabledReason === 'string' && blocked.disabledReason.length > 20,
-        `${arm}: drawn inert with a sentence, not a bare grey: ${blocked.disabledReason}`,
-      )
-      // And an id in hand does not override it — a task read off a board nobody has read is not
-      // evidence that the task is there.
+    for (const arm of ['unknown', 'unreadable', 'absent']) {
+      const row = M.rowAction(null, arm)
+      eq(row.id, 'start', `${arm}: still Apply`)
+      eq(row.disabledReason, undefined, `${arm}: and live — nothing here writes the tracker`)
       eq(
-        M.rowAction('t-14', arm).disabledReason,
-        blocked.disabledReason,
-        `${arm}: a task id from an unread board does not unlock the row`,
+        M.rowAction('t-14', arm).id,
+        'start',
+        `${arm}: a task id from an unread board does not become Open task`,
       )
     }
-    ok(
-      M.rowAction(null, 'unreadable').disabledReason.includes('.cide/tasks.json'),
-      'and the unreadable one names the file the user has to go and look at',
-    )
-    eq(
-      M.rowAction(null, 'absent').disabledReason,
-      undefined,
-      'no tracker file yet is not the same as no answer: creating the first task writes one',
-    )
     eq(M.rowAction(null).disabledReason, undefined, 'the tracker defaults to ready')
+
+    /* ------------------------------------------------------------- OpenSpec sessions */
+
+    /*
+     * Apply creates no task, from either door. A comment naming `create` is fine — the needle is
+     * the call, on comment-stripped source (`CLAUDE.md`'s rule for a check that greps).
+     */
+    for (const rel of [
+      '../src/sidebar/OpenSpecPanel/OpenSpecPanelHost.tsx',
+      '../src/sidebar/OpenSpecPanel/SpecTab.tsx',
+    ]) {
+      const source = stripComments(read(rel))
+      ok(!/\.create\(\s*\{\s*\.\.\.EMPTY_DRAFT/.test(source), `${rel}: Apply makes no task`)
+      ok(source.includes('useApplyDialog'), `${rel}: it opens the Apply dialog`)
+    }
+
+    // A run's state as a chip. `idle` is done for now — alive, holding its conversation.
+    eq(M.sessionState({ state: 'running' }).tone, 'blue', 'working is blue')
+    eq(M.sessionState({ state: 'awaitingPermission' }).tone, 'yellow', 'needing you is amber')
+    eq(M.sessionState({ state: 'idle' }).live, true, 'an idle session is still live')
+    eq(M.sessionState({ state: 'finished', code: 0 }).live, false, 'a finished one is not')
+    eq(M.sessionState({ state: 'failed', reason: 'x' }).tone, 'red', 'a failed one is red')
+    eq(M.sessionState({ state: 'somethingNew' }).label, 'somethingNew', 'an unknown state reads as itself')
+
+    eq(
+      M.sessionTitle('apply', 'add-dark-mode', 'developer'),
+      'Apply · add-dark-mode · developer',
+      'a session tab is named by what, which change, and who',
+    )
+    eq(M.sessionTitle('explore', null, 'claude'), 'Explore · claude', 'with no change, by what and who')
+    eq(M.sessionCaption('propose', '  a   dark\ntheme '), 'a dark theme', 'a caption is the first words, flat')
+    eq(M.sessionCaption('explore', ''), 'Explore', 'or the workflow when nothing was typed')
+
+    // Per change only the newest Apply; loose sessions keep the live ones and three that ended.
+    const views = M.sessionViews([
+      { run: 'r5', op: 'apply', change: 'c1', text: '', label: 'dev', state: { state: 'running' } },
+      { run: 'r4', op: 'apply', change: 'c1', text: '', label: 'dev', state: { state: 'finished', code: 0 } },
+      { run: 'r3', op: 'propose', change: null, text: 'idea', label: 'OpenSpec · Claude', state: { state: 'idle' } },
+      { run: 'r2', op: 'explore', text: 'q1', label: 'x', state: { state: 'finished', code: 0 } },
+      { run: 'r1', op: 'explore', text: 'q2', label: 'x', state: { state: 'finished', code: 0 } },
+      { run: 'r0', op: 'explore', text: 'q3', label: 'x', state: { state: 'failed', reason: 'y' } },
+      { run: 'rz', op: 'explore', text: 'q4', label: 'x', state: { state: 'finished', code: 0 } },
+    ])
+    eq(views.byChange.c1.run, 'r5', 'a change shows its newest session')
+    eq(views.loose.map((v) => v.run), ['r3', 'r2', 'r1', 'r0'], 'the live one and three that ended')
+    eq(views.loose[0].caption, 'idea', 'named by what the user typed')
+
+    // What a finished change offers: three separate roads with a worktree, Archive without.
+    eq(M.readyActs(true).map((a) => a.id), ['publish', 'integrate', 'archive'], 'worktree: all three')
+    eq(M.readyActs(false).map((a) => a.id), ['archive'], 'project root: Archive only')
+    ok(
+      !M.readyActs(true).find((a) => a.id === 'integrate').title.includes('and archive'),
+      'Integrate never archives — that is its own act',
+    )
+
+    // The worktree's checklist wins: the root's copy is not ticked until the branch lands.
+    eq(
+      M.rowProgress({ done: 0, total: 4 }, { done: 4, total: 4 }).stage,
+      'ready',
+      'a change finished in its worktree is ready, whatever the root says',
+    )
+    eq(M.rowProgress({ done: 1, total: 4 }, null), { done: 1, total: 4, stage: 'inProgress' }, 'no worktree: the root')
+    eq(
+      M.rowProgress({ done: 1, total: 4 }, { done: undefined, total: undefined }).done,
+      1,
+      'an unreadable worktree keeps the root numbers',
+    )
 
     /*
      * `splitAction` — the change page's second button. (M31)

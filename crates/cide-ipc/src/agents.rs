@@ -735,6 +735,11 @@ pub struct OrchestrationConfig {
     /// `agents.resumeAfterRestart`: whether runs a cide restart interrupted continue by
     /// themselves at the next launch. (M118)
     pub resume_after_restart: bool,
+    /// The task tracker and milestones are on for this project: the top-level `tracker` key,
+    /// **not** under `agents`, read by `cide_agents::config::load_tracker`, whose doc holds the
+    /// default rule (absent: on only when the project already has a board or milestones). Off,
+    /// agents are not told about the board and get none of its tools.
+    pub tracker_enabled: bool,
 }
 
 impl Default for OrchestrationConfig {
@@ -756,6 +761,7 @@ impl Default for OrchestrationConfig {
             verify_exclusive: false,
             verify_retries: 3,
             resume_after_restart: true,
+            tracker_enabled: false,
         }
     }
 }
@@ -813,6 +819,11 @@ pub struct OrchestrationPatch {
     /// `agents.resumeAfterRestart`. (M118)
     #[ts(optional)]
     pub resume_after_restart: Option<bool>,
+    /// The top-level `tracker` key, written explicitly by `agents_config_set` rather than by
+    /// `AgentsConfig::apply` — it is not an `agents` key. Refused by the `cide_agents_config`
+    /// tool, `enabled`'s reason: a model must not switch its own board back on.
+    #[ts(optional)]
+    pub tracker_enabled: Option<bool>,
 }
 
 /// Dispatch one run. Inbound.

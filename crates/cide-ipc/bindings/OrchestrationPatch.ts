@@ -53,4 +53,10 @@ verifyRetries?: number,
 /**
  * `agents.resumeAfterRestart`. (M118)
  */
-resumeAfterRestart?: boolean, };
+resumeAfterRestart?: boolean, 
+/**
+ * The top-level `tracker` key, written explicitly by `agents_config_set` rather than by
+ * `AgentsConfig::apply` — it is not an `agents` key. Refused by the `cide_agents_config`
+ * tool, `enabled`'s reason: a model must not switch its own board back on.
+ */
+trackerEnabled?: boolean, };

@@ -246,3 +246,25 @@ fn attaching_to_a_dead_session_answers_from_the_mirror_without_waiting() {
     );
     assert_eq!(session.sink_count(), 1, "the sink must still be registered");
 }
+
+/// A child is told its own directory in `$PWD`, never the app's.
+///
+/// `printenv`, not a shell: a shell repairs a `PWD` that disagrees with its directory, and the
+/// children that did not — opencode's server among them — read and wrote the directory cide was
+/// started from instead of the project's.
+#[test]
+fn a_child_gets_its_own_directory_as_pwd() {
+    let dir = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+    let spec = SpawnSpec::new("/usr/bin/printenv", dir.clone()).arg("PWD");
+    let session = PtySession::spawn(spec).expect("spawn printenv");
+    let want = format!("{}\r\n", dir.display());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !contains(&session.screen_state(), &want) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        contains(&session.screen_state(), &want),
+        "PWD was not the spawn directory: {:?}",
+        String::from_utf8_lossy(&session.screen_state())
+    );
+}

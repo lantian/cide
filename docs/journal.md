@@ -16201,3 +16201,89 @@ passes `cargo clippy --target aarch64-apple-darwin --all-targets -D warnings` un
 Not yet seen live: the Settings button has not been clicked on a display, and the menu item has
 never been linked or run — a Mac has to confirm it draws after *About*, that the click reaches
 the focused window, and that exactly one toast appears with two project windows open.
+
+## OpenSpec without the tracker: sessions of their own, and a switch for tasks and milestones (M128)
+
+OpenSpec was built on the task tracker: *Start work* made a task, the task card dispatched it,
+*Integrate & Archive* closed it, and *Propose* / *Explore* typed into the pinned console. A project
+driving its work from OpenSpec alone got a board of tasks nobody asked for, and agents told about
+the board kept filing more. Two changes.
+
+**OpenSpec sessions** (`cmd::spec_sessions`). Propose, Explore and Apply each start an **agent run**
+with a new `RunPurpose::Spec` — not a `claude_tab::open` tab, which is `ephemeral` and dies with its
+tab. The panel opens a mirror onto the run (`specRuns.ts`, the MR reviewer's road), so the tab can
+be closed while the work goes on; the change row draws the run's state as a chip and offers *Open
+session*, and Propose/Explore sessions with no change yet sit above the tree.
+- *Propose* / *Explore* ask for a harness in the dialog — Default is Settings → Harness, the MR
+  reviewer's choice — and run in the project root (a proposal written in a worktree would be
+  invisible to the panel).
+- *Apply…* replaces *Start work* and **creates no task**: the main model on a harness, or a
+  subagent role (`SpecLauncher`). With `.cide/config.json`'s `openspec.applyInWorktree` (a switch
+  in the panel's gear) it works in `.cide/worktrees/spec-<change>` on `cide/spec-<change>`; the
+  uncommitted change folder is copied in first, because a worktree is cut from `HEAD`.
+- A change whose checklist is complete — read from the **worktree's** copy when there is one
+  (`spec_checkouts`), since that is where the boxes are ticked — offers *Publish* (commit what is
+  left, push the branch with upstream, then the forge's MR prompt), *Integrate* (commit, verify and
+  guards, merge into the checked-out branch, retire the worktree) and *Archive*, as three separate
+  acts; Integrate never archives. Without a worktree, Archive alone. Archive runs in the worktree
+  while it holds unmerged work, so the archive travels with the branch.
+- The runs are persisted (`SavedRun::spec`), unlike a review's, so a restart keeps the
+  change↔session link. A session's brief is `spec_session_brief` — no tracker tools named, and
+  its connection is served none (`Scope::Run { board: false }`).
+
+**The tracker switch** (`config::load_tracker`, the top-level `tracker` key). One switch for tasks
+and milestones together, in Settings → Agents → This project. Off: the connection is served no
+`cide_task_*` / `cide_milestone*` tool (`ORCHESTRATION_NO_TRACKER`), the console's paragraph
+drops every board sentence (`no_tracker_manual`, `SESSIONS_PARAGRAPH_NO_TRACKER`), role runs get no
+tracker preamble (`RunPlan::tracker_paragraphs`) but keep `ADHOC_PREAMBLE` when they stand in the
+root, the spinner / autodispatch / gate runs stand down, and the Tasks panel stays on the rail but
+draws the Agents panel's *off* screen — what the switch does and **Enable tasks and milestones**
+(the rail's count is dropped). The data is kept. Absent, the key reads **on** when the
+project already has `.cide/tasks.json` or milestones — no board vanishes on upgrade — and off
+otherwise; the New project wizard writes it explicitly (on for the Tasks road only) whenever it
+writes `.cide/config.json`. The `cide_agents_config` tool refuses the key, like `enabled`.
+`RunPlan::review` is new: codex's review approval policy read `!tracker_paragraphs` as "is a
+review", which the switch would have handed to every role run.
+
+Tests: `cargo test -p cide-agents config` (`the_tracker_defaults_from_what_the_project_already_has`,
+`spec_settings_round_trip_and_the_default_leaves_no_key`), the tool-list test, `cargo test -p
+cide-app cmd::session` (`a_project_without_the_tracker_is_never_told_about_the_board`),
+`cmd::spec_sessions` (the change-name guard, carrying an uncommitted change into a worktree);
+`check:openspec` (Apply, session chips, the ready acts, `rowProgress`, and no `tasks.create` from
+either door), `check:openspec-render`'s `board-sessions` story. The whole workspace and every UI
+check pass.
+
+Not yet seen live — none of this has been driven on a display: a Propose opening its tab and
+surviving the tab's close; Open session after a restart; an Apply on a subagent in a worktree
+through Publish (a real push, the MR prompt) and Integrate; the worktree's checklist moving the row
+to Ready; the Tasks panel's off screen and its Enable button, and a new console coming up with no task tools.
+The remote API still accepts task edits with the tracker off, and a non-Claude harness gets the
+skill's file path rather than the slash command (no check that it follows it).
+
+Found live the same day (`./run.sh --profile test`, an opencode Propose on `~/work/temp/test2`):
+the run's opencode server worked in `~/work/cide`. Its spawn directory was right; its **`$PWD`**
+was cide's own, inherited from the shell `run.sh` started in, and opencode (Bun) trusts `$PWD`
+over `getcwd()`. `PtySession::spawn` now sets `PWD` to the spawn directory for every PTY child
+(`a_child_gets_its_own_directory_as_pwd`); the installed build, launched from the desktop with no
+`PWD`, never showed it. The skill path in a non-Claude opening line is absolute now too.
+
+Second pass on the same day: the gear dialog's *Apply in a worktree* switch sits inset as one of
+the form's groups (it ran flush against the card), *Open the file* closes the dialog (the file
+opened in a tab under it), and an ended OpenSpec session gets a × on the panel —
+`spec_session_dismiss` → `AgentRegistry::forget_spec_run`, which forgets only a Spec run that is
+over (`only_an_ended_spec_session_can_be_dismissed`); a live one is refused with "stop it first".
+
+Third: the session chip stayed *Working* after a session ended until the panel was re-opened. The
+panel re-read on `cide://agents-changed`, which carries the roster — `Disabled` with no runs in a
+project with subagents off, so the coalescer's repeat check sent nothing. Sessions now have their
+own `cide://spec-runs-changed` (`emit::spec_runs_changed_unless_repeat`), sent from the same flush
+with the rows whole, and the panel adopts them.
+
+Fourth: the change page (the OpenSpec tab) knew nothing about sessions — it kept offering
+*Apply…* after one had run, and nothing when the change was done while the panel row showed
+Archive. The page now follows the sessions itself (`followSpecRuns`, the panel may be shut),
+offers *Open session* with the session's state instead of Apply, reads the change from its
+`spec-<change>` worktree when it has one, and draws the finished change's acts. Publish, Integrate
+and Archive moved into `specActs.ts` (Archive's confirm in `SpecActsConfirm`, mounted once), so
+the row, its menu and the page run the same code. A change's session has no × any more — it goes
+with the change; only the Propose/Explore rows above the tree can be dismissed.

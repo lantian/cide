@@ -704,6 +704,171 @@ pub struct SpecSchema {
     pub source: Option<String>,
 }
 
+/* ==============================================================================================
+ * OpenSpec sessions: Propose, Explore and Apply as runs of their own, with no task.
+ *
+ * Until these existed every OpenSpec gesture went through the tracker — *Start work* made a task,
+ * the task card dispatched it, *Integrate & Archive* closed it. A project that drives its work
+ * from OpenSpec alone got a board full of tasks nobody asked for. These types are the other road:
+ * a run started from the OpenSpec panel on a harness or a role the user picks, in a tab of its own
+ * that can be closed while the work goes on, found again by its change rather than by a task.
+ * ============================================================================================ */
+
+/// Which OpenSpec workflow a session runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SpecOp {
+    /// Draft a change from a one-line idea. Runs in the project root, so the change is on the
+    /// panel the moment its folder is written.
+    Propose,
+    /// Think it through before proposing. The project root, `Propose`'s reason.
+    Explore,
+    /// Implement one change. In `.cide/worktrees/spec-<change>` when the project's
+    /// `openspec.applyInWorktree` is on, otherwise in the root.
+    Apply,
+}
+
+/// Who runs an OpenSpec session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum SpecLauncher {
+    /// The main model: a role built in memory on this harness, whose whole brief is cide's
+    /// OpenSpec paragraph. `harness` is resolved by the dialog — "Default" means the user's
+    /// console harness, and is never sent as such.
+    Harness { harness: crate::Harness },
+    /// A subagent: one of this project's roles (`.cide/agents/`, `.claude/agents/`), with its own
+    /// prompt, model and tools, standing where the session stands.
+    Role { agent: crate::AgentId },
+}
+
+/// Start an OpenSpec session. Inbound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SpecSessionStart {
+    pub op: SpecOp,
+    /// The change an Apply implements. Required for `Apply`, ignored otherwise.
+    #[ts(optional)]
+    pub change: Option<ChangeName>,
+    /// What the user typed: the idea for a Propose, the question for an Explore. One line — it
+    /// is typed into a terminal.
+    #[ts(optional)]
+    pub text: Option<String>,
+    pub launcher: SpecLauncher,
+}
+
+/// One OpenSpec session the registry knows about, for the panel's status chip and its buttons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpecRunRow {
+    pub run: crate::RunId,
+    pub op: SpecOp,
+    /// The change it works on — `None` for a Propose or an Explore, which have not named one.
+    #[ts(optional)]
+    pub change: Option<ChangeName>,
+    /// What the user typed to start it, for a row with no change to be named by.
+    pub text: String,
+    /// Who runs it, as a person reads it: the role's label or the harness's name.
+    pub label: String,
+    pub state: crate::RunState,
+    /// The live child, when there is one.
+    #[ts(optional)]
+    pub session: Option<crate::SessionId>,
+    /// The branch an Apply works on in its own worktree, `cide/spec-<change>`; `None` in the
+    /// project root.
+    #[ts(optional)]
+    pub branch: Option<String>,
+    pub started_unix_ms: u64,
+}
+
+/// The worktree an applied change lives in, for the panel's Publish / Integrate / Archive.
+///
+/// Read from git rather than from a run, because the run can be forgotten (a restart, the history
+/// cap) while the branch with the work on it is still there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpecCheckout {
+    pub change: ChangeName,
+    /// `cide/spec-<change>`.
+    pub branch: String,
+    /// Commits on the branch the checked-out branch does not have yet; `None` when git could not
+    /// say.
+    #[ts(optional)]
+    pub unmerged: Option<u32>,
+    /// Uncommitted edits in the worktree — Publish and Integrate commit them first.
+    pub dirty: bool,
+    /// The change's checklist **as the worktree has it**: the session ticks boxes there, so the
+    /// project root's copy — what the board reads — stays unticked until the branch lands.
+    /// `None` when the worktree's `openspec` could not be read.
+    #[ts(optional)]
+    pub completed_tasks: Option<u32>,
+    #[ts(optional)]
+    pub total_tasks: Option<u32>,
+}
+
+/// What Publish did: the work committed and the branch pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum SpecPublished {
+    Pushed {
+        remote: String,
+        branch: String,
+        /// The commit Publish made of uncommitted edits, when there were any.
+        #[ts(optional)]
+        committed: Option<String>,
+    },
+    /// Nothing was pushed, with the sentence saying why and what to do.
+    Refused { reason: String },
+}
+
+/// What Integrate did. Never archives — that is its own button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum SpecIntegrated {
+    Merged {
+        #[ts(optional)]
+        commit: Option<String>,
+        files: u32,
+    },
+    UpToDate,
+    /// The merge would conflict; nothing changed.
+    Conflicts {
+        paths: Vec<String>,
+    },
+    Refused {
+        reason: String,
+    },
+}
+
+/// `.cide/config.json`'s `openspec` key, as the panel's gear edits it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct SpecSettings {
+    /// Apply a change in `.cide/worktrees/spec-<change>` on branch `cide/spec-<change>` rather
+    /// than in the project root. Only Apply: a proposal written in a worktree would be invisible
+    /// to the panel (which reads the root) until it was merged.
+    pub apply_in_worktree: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

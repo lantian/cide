@@ -342,6 +342,11 @@ pub fn run_gate_for(app: &AppHandle, project: ProjectId, milestone: String) -> R
 /// The one body both roads share: `which` names a milestone, `None` means the current one.
 fn run_gate_of(app: &AppHandle, project: ProjectId, which: Option<&str>) -> Option<CheckResult> {
     let root = root_of(app, project)?;
+    // Milestones are half of the tracker switch (`config::load_tracker`): off, no gate runs,
+    // whatever the committed plan still says.
+    if !cide_agents::config::load_tracker(&root) {
+        return None;
+    }
     let plan = cide_agents::config::load_milestones(&root);
     let current = plan.current()?.clone();
     let milestone = match which {
@@ -568,8 +573,23 @@ pub fn before_integrate(
     agent: &AgentId,
     task: Option<&TaskId>,
 ) -> Result<Option<String>, String> {
-    let plan = cide_agents::config::load_milestones(root);
     let name = cide_agents::checkout_name(agent, task);
+    before_integrate_at(app, project, root, agent, task, name)
+}
+
+/// [`before_integrate`] for a checkout named outright rather than by (role, task) — an OpenSpec
+/// session's `spec-<change>` (`cmd::spec_sessions::spec_integrate`), which has no task. The
+/// guards and the verify are the project's rule for anything merged into its branch, so they
+/// hold for a branch no task produced too.
+pub fn before_integrate_at(
+    app: &AppHandle,
+    project: ProjectId,
+    root: &Path,
+    agent: &AgentId,
+    task: Option<&TaskId>,
+    name: String,
+) -> Result<Option<String>, String> {
+    let plan = cide_agents::config::load_milestones(root);
     let branch = format!("cide/{name}");
 
     if !plan.guard_paths.is_empty() {

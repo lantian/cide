@@ -331,6 +331,10 @@ enum Scope {
         /// The run's working directory — its worktree — which is what a relative path in
         /// `cide_task_attach` is read against. From the registry, never from the child. (M39)
         cwd: PathBuf,
+        /// Whether the run works the board at all. False for an OpenSpec session
+        /// (`RunPurpose::Spec`), which has no task and is served no task tool whatever the
+        /// project's tracker switch says.
+        board: bool,
     },
     /// A run started from the GitLab MR panel to review one merge request. (M85) Served the
     /// `cide_mr_*` tools and **nothing** of the tracker or the orchestration — see
@@ -396,14 +400,20 @@ struct ProjectTools {
     /// its worktree. `None` for a console pane, whose cwd is the project root — filled in as
     /// exactly that when the sink is built, once the store (and so the root) is known. (M39)
     cwd: Option<PathBuf>,
+    /// Whether the project's tracker is on (`config::load_tracker`), read once when the
+    /// connection binds. Off, the connection is served no task or milestone tool at all: the
+    /// list is fixed for a connection's life (`listChanged: false`), so a switch flipped later
+    /// reaches the sessions started after it — which is what Settings says.
+    tracker: bool,
 }
 
 impl ToolAccess for ProjectTools {
     fn names(&self) -> &[&'static str] {
-        if self.orchestrator {
-            tools::tool::EVERY
-        } else {
-            tools::tool::ALL
+        match (self.orchestrator, self.tracker) {
+            (true, true) => tools::tool::EVERY,
+            (true, false) => tools::tool::ORCHESTRATION_NO_TRACKER,
+            (false, true) => tools::tool::ALL,
+            (false, false) => &[],
         }
     }
 
@@ -1511,6 +1521,13 @@ type Binder = dyn Fn(Option<&Hello>) -> Box<dyn ToolAccess> + Send + Sync;
 /// The production binder: resolve the header against the live workspace.
 fn app_binder(app: AppHandle) -> Arc<Binder> {
     Arc::new(move |hello: Option<&Hello>| -> Box<dyn ToolAccess> {
+        let tracker = |project: ProjectId| {
+            app.try_state::<WorkspaceState>()
+                .and_then(|workspace| crate::tasks_state::project_root(&workspace, project).ok())
+                // A project this process cannot place gets the tracker it always had: the tools
+                // then answer `gone()` themselves, which is a better sentence than no tools.
+                .is_none_or(|root| cide_agents::config::load_tracker(&root))
+        };
         match hello.map_or(Scope::Unscoped, |hello| resolve(&app, hello)) {
             Scope::Pane {
                 project, session, ..
@@ -1526,6 +1543,7 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 orchestrator: true,
                 session: Some(session),
                 cwd: None,
+                tracker: tracker(project),
             }),
             Scope::Worker { project, session } => Box::new(ProjectTools {
                 app: app.clone(),
@@ -1540,12 +1558,14 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 // the pane to report to; the author gate above refuses the start anyway.
                 session: Some(session),
                 cwd: None,
+                tracker: tracker(project),
             }),
             Scope::Run {
                 project,
                 agent,
                 label,
                 cwd,
+                board,
             } => Box::new(ProjectTools {
                 app: app.clone(),
                 project,
@@ -1557,6 +1577,7 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 orchestrator: false,
                 session: None,
                 cwd: Some(cwd),
+                tracker: board && tracker(project),
             }),
             Scope::Review {
                 run,
@@ -1795,6 +1816,14 @@ fn run_scope_of(runs: &[crate::agents::RunScope], run: RunId) -> Option<Scope> {
                 agent: live.agent.clone(),
                 label: live.label.clone(),
                 cwd: live.cwd.clone(),
+                board: true,
+            },
+            crate::agents::RunPurpose::Spec(_) => Scope::Run {
+                project: live.project,
+                agent: live.agent.clone(),
+                label: live.label.clone(),
+                cwd: live.cwd.clone(),
+                board: false,
             },
             // Decided by what the registry says the run was started as, never by its role id:
             // a real role could be called `mr-review` too. See `RunPurpose`.
@@ -3909,6 +3938,7 @@ mod tests {
                 // And so does the cwd: it is the worktree the app started the child in, which is
                 // what a relative path in `cide_task_attach` is read against. (M39)
                 cwd: PathBuf::from("/repo/.cide/worktrees/qa"),
+                board: true,
             })
         );
 

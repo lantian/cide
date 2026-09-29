@@ -312,6 +312,68 @@ pub fn spec_preamble(
     text
 }
 
+/// The brief of a session started from the OpenSpec panel. (OpenSpec sessions)
+///
+/// The whole of cide's instructions to such a run — it has no task, so [`TRACKER_PREAMBLE`] and
+/// [`SPEC_PREAMBLE`] (which both name tracker tools) are not told to it, and its connection is
+/// served none. What it needs instead: which workflow its opening line starts, where it stands and
+/// what that means for committing, and the one rule cide keeps for itself — archiving is a
+/// person's button.
+///
+/// `apply` is the project's own apply line (`/openspec-apply-change`), `cli` the resolved binary;
+/// both only matter to an Apply.
+pub fn spec_session_brief(
+    op: cide_ipc::SpecOp,
+    change: Option<&str>,
+    cli: Option<&std::path::Path>,
+    apply: Option<&str>,
+    in_worktree: bool,
+) -> String {
+    use cide_ipc::SpecOp;
+    let openspec = cli.map_or_else(|| "openspec".to_string(), |p| p.display().to_string());
+    let common = "Do not create tasks or look for a task board: this session works from OpenSpec \
+         alone. Never run `openspec archive` — archiving is the user's button in cide.";
+    match op {
+        SpecOp::Propose => format!(
+            "cide opened this session to write an OpenSpec change proposal; your first message \
+             starts OpenSpec's propose workflow with the user's idea. Write the change under \
+             openspec/changes/ in this directory, the project root, and do not commit it — the \
+             user reviews it on the OpenSpec panel. {common}"
+        ),
+        SpecOp::Explore => format!(
+            "cide opened this session to explore an idea with the user before anything is \
+             proposed; your first message starts OpenSpec's explore workflow. Think, read and ask \
+             — do not edit files unless the user asks you to. {common}"
+        ),
+        SpecOp::Apply => {
+            let change = change.unwrap_or("the change named in your first message");
+            let place = if in_worktree {
+                "You are in a git worktree of your own, on its own branch: commit each coherent \
+                 step as you finish it — the user publishes or integrates this branch when the \
+                 change is done, and an uncommitted edit is one they do not see."
+            } else {
+                "You are in the project's own checked-out tree, which the user works in too: do \
+                 not commit, stage, stash, checkout or reset unless they ask — leave your edits in \
+                 the working tree for them to review."
+            };
+            let mut text = format!(
+                "cide opened this session to implement the OpenSpec change {change}, whose \
+                 proposal, design, task checklist and delta specs are in \
+                 openspec/changes/{change}/. Before your first edit, run `{openspec} instructions \
+                 apply --change {change} --json`: its checklist is the work, in that order, and \
+                 it outranks this summary. Tick each box off in its file as you finish that step. \
+                 If implementing shows the proposal, design or a delta spec was wrong, correct \
+                 that file too. {place} When every box is ticked, say plainly what you did. \
+                 {common}"
+            );
+            if let Some(apply) = apply.map(str::trim).filter(|line| !line.is_empty()) {
+                text.push_str(&SPEC_APPLY_CLAUSE.replace("{APPLY}", apply));
+            }
+            text
+        }
+    }
+}
+
 /// What a run dispatched **without a task** is told, on top of [`TRACKER_PREAMBLE`]. (M40)
 ///
 /// # It exists to countermand one sentence of the paragraph above it
@@ -798,6 +860,11 @@ pub struct RunPlan<'a> {
     /// attached (it is `hook_bin`'s question, not this one); such a run's whole brief is its
     /// role's own system prompt.
     pub tracker_paragraphs: bool,
+    /// This run is a merge-request review (`RunPurpose::MrReview`). Its own field since the
+    /// tracker switch: `tracker_paragraphs` used to answer *is this a review* by implication,
+    /// and codex's review permissions read it that way — which would have handed every role run
+    /// in a project with the tracker off the reviewer's approval policy.
+    pub review: bool,
     /// The run's own headless server, when its harness is hosted behind one (opencode and MiMo
     /// since M104's follow-up). Each turn's `run` child attaches to it (`--attach`), so the
     /// conversation lives in a process a pane can attach a **full TUI** to while the run is
@@ -1379,6 +1446,7 @@ mod tests {
                     harness: kind,
                     unattended: crate::config::Unattended::Ask,
                     tracker_paragraphs: true,
+                    review: false,
                     server: None,
                     git_dirs: Vec::new(),
                     sandbox_brief: None,
@@ -1775,6 +1843,7 @@ mod tests {
                 // and the plan actually said; the skip default has tests of its own.
                 unattended: crate::config::Unattended::Ask,
                 tracker_paragraphs: true,
+                review: false,
                 server: None,
                 git_dirs: Vec::new(),
                 sandbox_brief: None,

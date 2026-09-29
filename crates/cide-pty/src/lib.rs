@@ -766,6 +766,14 @@ impl PtySession {
             cmd.arg(a);
         }
         cmd.cwd(&spec.cwd);
+        // `PWD` follows the directory, before the spec's own env so a caller can still say
+        // otherwise. Left alone it is **cide's** — the directory `./run.sh` was started from —
+        // and a child that trusts `$PWD` over `getcwd()` works there instead: opencode's server
+        // (Bun) did exactly that, so an OpenSpec session on `~/work/temp/test2` read and wrote
+        // `~/work/cide`. A launch from the desktop has no `PWD` at all, which is why nobody saw
+        // it on the installed build. A shell resets a `PWD` that disagrees with its directory;
+        // nothing else does.
+        cmd.env("PWD", &spec.cwd);
         for k in &spec.env_remove {
             cmd.env_remove(k);
         }

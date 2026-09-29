@@ -967,6 +967,26 @@ function AgentsEditor({ project }: { project: ProjectId }) {
       {(config !== null || configError !== null) && (
         <Group title="This project">
           {config !== null && (
+            /*
+             * One switch for the board and milestones together: a milestone is a task with a
+             * gate. Off hides the Tasks panel and stops agents being told about the board — the
+             * tool list and system prompt are fixed when a session starts, so it reaches the
+             * sessions started after it. The tasks on disk are kept either way.
+             */
+            <ToggleRow
+              label="Task tracker & milestones"
+              hint={
+                'Off: agents get no task tools and are not told about the board, the Tasks ' +
+                'panel is hidden, and nothing is planned or dispatched from tasks — for ' +
+                'a project that works from OpenSpec or elsewhere. Tasks already on the board ' +
+                'are kept, and come back when this is on again. Takes effect for sessions ' +
+                'started after the change. Written to .cide/config.json.'
+              }
+              checked={config.trackerEnabled}
+              onChange={(next) => patchConfig({ trackerEnabled: next })}
+            />
+          )}
+          {config !== null && (
             <SettingRow
               label="Concurrent runs"
               hint={

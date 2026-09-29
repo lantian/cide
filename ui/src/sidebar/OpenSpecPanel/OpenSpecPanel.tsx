@@ -14,6 +14,8 @@
  * would have to be translated at every one of those boundaries.
  */
 import { Icon, asIcon } from '@/icons/Icon'
+import { Badge } from '@/kit/components/Status'
+import { Button, IconButton } from '@/kit/components/Button'
 import styles from './OpenSpecPanel.module.css'
 import {
   ABSENT_CLAIM,
@@ -33,6 +35,14 @@ import {
   commandTitle,
   metaFigure,
   rowAction,
+  readyActs,
+  rowProgress,
+  DISMISS_SESSION_LABEL,
+  OPEN_SESSION_LABEL,
+  OPEN_SESSION_TITLE,
+  type CheckoutProgress,
+  type ReadyAct,
+  type SessionView,
   type TrackerKind,
   specRows,
   stageLabel,
@@ -99,6 +109,21 @@ export interface OpenSpecPanelViewProps {
    * is a control that cannot know what it would open.
    */
   onConfigure?: (() => void) | undefined
+  /**
+   * OpenSpec sessions (`sessionViews`): the newest Apply per change, and the Propose / Explore
+   * sessions with no change yet. Absent in a story that has none — the panel it always drew.
+   */
+  sessions?:
+    | { byChange: Readonly<Record<string, SessionView>>; loose: readonly SessionView[] }
+    | undefined
+  /** Each `spec-<change>` worktree's checklist, by change — the numbers a row draws. */
+  checkouts?: Readonly<Record<string, CheckoutProgress>> | undefined
+  /** Open a session's tab again. */
+  onOpenSession?: ((run: string) => void) | undefined
+  /** Forget an ended session, so it leaves the panel. Offered only on one that is over. */
+  onDismissSession?: ((run: string) => void) | undefined
+  /** Publish, Integrate or Archive a change whose checklist is complete. */
+  onReadyAct?: ((change: string, act: ReadyAct['id']) => void) | undefined
 }
 
 const STAGE_CLASS: Readonly<Record<ChangeStage, string>> = {
@@ -293,6 +318,40 @@ function body(props: OpenSpecPanelViewProps) {
           {EXPLORE_LABEL}
         </button>
       </div>
+      {props.sessions !== undefined && props.sessions.loose.length > 0 && (
+        <div className={styles.sessions} data-audit="openspecSessions">
+          {props.sessions.loose.map((session) => (
+            <div key={session.run} className={styles.sessionRow} data-run={session.run}>
+              <span className={styles.sessionCaption} title={`${session.caption} — ${session.who}`}>
+                {session.caption}
+              </span>
+              <Badge tone={session.state.tone} dot soft>
+                {session.state.label}
+              </Badge>
+              {props.onOpenSession !== undefined && (
+                <Button
+                  size="sm"
+                  variant="quiet"
+                  data-audit="openspecOpenSession"
+                  title={OPEN_SESSION_TITLE}
+                  onClick={() => props.onOpenSession?.(session.run)}
+                >
+                  {OPEN_SESSION_LABEL}
+                </Button>
+              )}
+              {!session.state.live && props.onDismissSession !== undefined && (
+                <IconButton
+                  icon="x"
+                  size="sm"
+                  label={DISMISS_SESSION_LABEL}
+                  data-audit="openspecDismissSession"
+                  onClick={() => props.onDismissSession?.(session.run)}
+                />
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       {rows.map((row) => (
         <Row key={`${row.kind}:${row.id}`} row={row} props={props} />
       ))}
@@ -378,44 +437,95 @@ function Row({ row, props }: { row: SpecRow; props: OpenSpecPanelViewProps }) {
  */
 function ChangeRow({ row, props }: { row: SpecRow & { kind: 'change' }; props: OpenSpecPanelViewProps }) {
   const action = rowAction(row.task, props.tracker)
+  const checkout = props.checkouts?.[row.id] ?? null
+  const progress = rowProgress(row, checkout)
+  const session = props.sessions?.byChange[row.id]
+  const acts = progress.stage === 'ready' && props.onReadyAct !== undefined
+    ? readyActs(checkout !== null)
+    : []
   return (
+    <>
     <div className={styles.changeRow} data-audit="openspecChangeRowWrap">
       <button
         type="button"
         className={styles.row}
         data-audit="openspecChangeRow"
         data-change={row.id}
-        data-stage={row.stage}
+        data-stage={progress.stage}
         onClick={() => props.onOpenChange(row.id)}
       >
         <Icon name={asIcon(CHANGE_ICON)} size={1} />
         <span className={styles.rowLabel}>{row.label}</span>
-        <span className={cx(styles.stage, STAGE_CLASS[row.stage])}>{stageLabel(row.stage)}</span>
+        <span className={cx(styles.stage, STAGE_CLASS[progress.stage])}>
+          {stageLabel(progress.stage)}
+        </span>
         <span className={styles.rowMeta}>
-          {row.done}/{row.total}
+          {progress.done}/{progress.total}
         </span>
       </button>
-      <button
-        type="button"
-        className={styles.rowAction}
-        data-audit="openspecRowAction"
-        data-action={action.id}
-        data-change={row.id}
-        data-write="true"
-        /*
-         * The reason *is* the tooltip when there is one, and the button goes inert with it.
-         * Drawing it live over a board nobody has read yet was the bug: `tasksStore.create`
-         * refuses on `unknown` and `unreadable` and returns without a word, so the row offered
-         * *Start work* on a change that already had a finished task and the click did nothing at
-         * all. See `rowAction`.
-         */
-        title={action.disabledReason ?? action.title}
-        disabled={action.disabledReason !== undefined}
-        data-disabled={action.disabledReason === undefined ? undefined : 'true'}
-        onClick={() => props.onRowAction(row.id, action.id)}
-      >
-        {action.label}
-      </button>
+      {/*
+        * A change with a session offers that session back, not a second one: *Apply…* again
+        * while one is applying would be refused by Rust anyway, with the sentence pointing here.
+        */}
+      {session !== undefined && props.onOpenSession !== undefined ? (
+        <button
+          type="button"
+          className={styles.rowAction}
+          data-audit="openspecOpenSession"
+          data-change={row.id}
+          title={OPEN_SESSION_TITLE}
+          onClick={() => props.onOpenSession?.(session.run)}
+        >
+          {OPEN_SESSION_LABEL}
+        </button>
+      ) : (
+        <button
+          type="button"
+          className={styles.rowAction}
+          data-audit="openspecRowAction"
+          data-action={action.id}
+          data-change={row.id}
+          data-write="true"
+          /*
+           * The reason *is* the tooltip when there is one, and the button goes inert with it.
+           * See `rowAction`.
+           */
+          title={action.disabledReason ?? action.title}
+          disabled={action.disabledReason !== undefined}
+          data-disabled={action.disabledReason === undefined ? undefined : 'true'}
+          onClick={() => props.onRowAction(row.id, action.id)}
+        >
+          {action.label}
+        </button>
+      )}
     </div>
+    {(session !== undefined || acts.length > 0) && (
+      <div className={styles.rowActs} data-audit="openspecRowActs" data-change={row.id}>
+        {session !== undefined && (
+          <Badge tone={session.state.tone} dot soft>
+            {`${session.state.label} · ${session.who}`}
+          </Badge>
+        )}
+        {/*
+          * No × here: a change's session goes when the change does (archived, it leaves the
+          * list), and until then it is how the change is reopened — Open session, not Apply.
+          */}
+        {acts.map((act) => (
+          <Button
+            key={act.id}
+            size="sm"
+            variant={act.id === 'archive' && acts.length > 1 ? 'quiet' : 'secondary'}
+            data-audit="openspecReadyAct"
+            data-act={act.id}
+            data-write="true"
+            title={act.title}
+            onClick={() => props.onReadyAct?.(row.id, act.id)}
+          >
+            {act.label}
+          </Button>
+        ))}
+      </div>
+    )}
+    </>
   )
 }

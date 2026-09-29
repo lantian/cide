@@ -410,27 +410,22 @@ export function rowAction(task: string | null, tracker: TrackerKind = 'ready'): 
       title: `Opens ${task}, which tracks this change.`,
     }
   }
-  const start: RowAction = {
+  /*
+   * *Apply…* — the change is implemented by a session of its own, on the main model or a
+   * subagent the dialog asks for, and **no task is created**. Until OpenSpec sessions this was
+   * *Start work*, which made a task and left starting an agent to the task card; a project that
+   * works from OpenSpec alone got a board of tasks nobody asked for. The tracker's state no
+   * longer gates it for the same reason: nothing here writes `.cide/tasks.json` any more.
+   *
+   * The tracker is still asked first above: a change that *does* have a task (made before this,
+   * or by an agent) keeps its way back to it.
+   */
+  void tracker
+  return {
     id: 'start',
-    label: 'Start work',
-    title:
-      'Creates a task for this change and opens it. Assigning that task is what starts an agent on the checklist — approving a change is assigning it.',
+    label: APPLY_LABEL,
+    title: APPLY_TITLE,
   }
-  if (tracker === 'unknown') {
-    return {
-      ...start,
-      disabledReason:
-        'Still reading this project’s task board. Until it answers, cide cannot tell whether this change already has a task.',
-    }
-  }
-  if (tracker === 'unreadable') {
-    return {
-      ...start,
-      disabledReason:
-        '.cide/tasks.json could not be read, so cide cannot tell whether this change already has a task — and will not write over a tracker it could not parse. Open the Tasks panel to see what is wrong with it.',
-    }
-  }
-  return start
 }
 
 /**
@@ -1253,9 +1248,9 @@ export const EXPLORE_COMMAND = 'explore'
 export function commandTitle(board: Board, command: string): string {
   const line = invocation(board, command)
   if (command === EXPLORE_COMMAND) {
-    return `Types ${line} into this project’s Claude tab — think a problem through before anything is written down. Nothing is created until you propose.`
+    return `Runs ${line} in a new session tab — think a problem through before anything is written down. Nothing is created until you propose.`
   }
-  return `Types ${line} into this project’s Claude tab, which drafts a change’s proposal, its task list and its requirement edits in one step.`
+  return `Runs ${line} in a new session tab, which drafts a change’s proposal, its task list and its requirement edits in one step.`
 }
 export const CLI_MISSING_CLAIM = 'The openspec command line tool is not installed.'
 export const CLI_INSTALL = 'npm install -g @fission-ai/openspec'
@@ -1280,3 +1275,220 @@ export const CONFIGURE_TITLE =
   'repository, not a cide preference.'
 
 export const RETRY_LABEL = 'Check again'
+
+/* ------------------------------------------------------------ OpenSpec sessions */
+
+/*
+ * Propose, Explore and Apply as sessions of their own — runs with no task, each in a tab that can
+ * be closed while the work goes on (`cmd::spec_sessions`). Everything here is plain data in and
+ * out, like the rest of this module, so `check:openspec` drives it without a store.
+ */
+
+/** Which OpenSpec workflow a session runs — the wire's `SpecOp`. */
+export type SessionOp = 'propose' | 'explore' | 'apply'
+
+/** A kit `Badge` tone, spelled here so this module imports nothing. */
+export type SessionTone = 'neutral' | 'blue' | 'yellow' | 'green' | 'red'
+
+/** A run's state as the panel draws it: a word, a tone, and whether it is still going. */
+export interface SessionStateView {
+  label: string
+  tone: SessionTone
+  /** Queued, working, or holding its turn — a second Apply of the change would double it. */
+  live: boolean
+}
+
+/**
+ * The chip for a session's run state. Takes the wire's `{ state }` object and nothing else.
+ *
+ * `idle` is **done for now**, not finished: the child is alive and holding its conversation, the
+ * ordinary state when the user decides whether the change is ready. `interrupted` is a run a cide
+ * restart cut off — *Open session* continues it.
+ */
+export function sessionState(state: { state: string }): SessionStateView {
+  switch (state.state) {
+    case 'queued':
+      return { label: 'Queued', tone: 'neutral', live: true }
+    case 'starting':
+    case 'running':
+      return { label: 'Working', tone: 'blue', live: true }
+    case 'awaitingPermission':
+      return { label: 'Needs you', tone: 'yellow', live: true }
+    case 'paused':
+      return { label: 'Paused', tone: 'neutral', live: true }
+    case 'idle':
+      return { label: 'Waiting', tone: 'green', live: true }
+    case 'interrupted':
+      return { label: 'Interrupted', tone: 'neutral', live: false }
+    case 'finished':
+      return { label: 'Ended', tone: 'neutral', live: false }
+    case 'failed':
+      return { label: 'Failed', tone: 'red', live: false }
+    default:
+      return { label: state.state, tone: 'neutral', live: false }
+  }
+}
+
+const OP_WORD: Readonly<Record<SessionOp, string>> = {
+  propose: 'Propose',
+  explore: 'Explore',
+  apply: 'Apply',
+}
+
+/** A session tab's title: `Apply · add-dark-mode · developer`, or `Explore · Claude`. */
+export function sessionTitle(op: SessionOp, change: string | null, who: string): string {
+  return [OP_WORD[op], change, who].filter((part) => part !== null && part !== '').join(' · ')
+}
+
+/** What names a session with no change yet: its first words, or its workflow. */
+export function sessionCaption(op: SessionOp, text: string): string {
+  const flat = text.split(/\s+/).filter((word) => word !== '').join(' ')
+  if (flat === '') return OP_WORD[op]
+  return flat.length > 60 ? `${flat.slice(0, 59)}…` : flat
+}
+
+/** The harness names the dialogs show, keyed by the wire's `Harness`. */
+export const HARNESS_NAME: Readonly<Record<string, string>> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  opencode: 'opencode',
+  qwen: 'Qwen',
+  mimo: 'MiMo',
+}
+
+/** The row's Apply button: who implements this change is chosen in the dialog it opens. */
+export const APPLY_LABEL = 'Apply…'
+export const APPLY_TITLE =
+  'Choose who implements this change — the main model or a subagent — and open it in a new tab. ' +
+  'No task is created. The tab can be closed; the work goes on and its state shows here.'
+
+/** The × on an ended session: it leaves the panel for good (the registry forgets it). */
+export const DISMISS_SESSION_LABEL = 'Dismiss this ended session'
+
+export const OPEN_SESSION_LABEL = 'Open session'
+export const OPEN_SESSION_TITLE =
+  'Open this session’s tab again, to see what it is doing now. Closing that tab does not stop it.'
+
+/** One of the buttons a finished change offers. */
+export interface ReadyAct {
+  id: 'publish' | 'integrate' | 'archive'
+  label: string
+  title: string
+}
+
+/**
+ * What a change whose checklist is complete offers — the user's three roads, never one bundled
+ * gesture:
+ *
+ * - applied **in a worktree** (`cide/spec-<change>`): *Publish* commits and pushes that branch
+ *   for a merge request, *Integrate* commits and merges it into the checked-out branch, and
+ *   *Archive* is its own act — done by hand, by the user or an agent, whenever they decide;
+ * - applied **in the project root**: there is no branch, so *Archive* is the only thing left.
+ */
+export function readyActs(worktree: boolean): readonly ReadyAct[] {
+  const archive: ReadyAct = {
+    id: 'archive',
+    label: 'Archive',
+    title:
+      'Merge this change’s requirement edits into openspec/specs/ and move it to the archive. ' +
+      (worktree
+        ? 'Runs in its worktree while that holds unmerged work, so the archive lands with it.'
+        : 'Runs in the project root.'),
+  }
+  if (!worktree) return [archive]
+  return [
+    {
+      id: 'publish',
+      label: 'Publish',
+      title:
+        'Commit what the session left uncommitted and push its branch, for a merge request. ' +
+        'Nothing is merged here.',
+    },
+    {
+      id: 'integrate',
+      label: 'Integrate',
+      title:
+        'Commit what the session left uncommitted and merge its branch into the branch this ' +
+        'project has checked out, after the project’s verify. Does not archive.',
+    },
+    archive,
+  ]
+}
+
+/** One session as the panel draws it. The host builds these from the wire's `SpecRunRow`s. */
+export interface SessionView {
+  run: string
+  op: SessionOp
+  change: string | null
+  /** What names it: the change, or the first words the user typed. */
+  caption: string
+  /** Who runs it: a role's label or the harness. */
+  who: string
+  state: SessionStateView
+}
+
+/**
+ * The sessions to draw, from the wire's rows, newest first.
+ *
+ * Per change, only the newest Apply — an older run of the same change is history, and two chips
+ * on one row would say two contradicting things. Sessions with no change keep the live ones and
+ * the last few that ended, so a Propose that finished a minute ago can still be opened.
+ */
+export function sessionViews(
+  rows: readonly {
+    run: string
+    op: SessionOp
+    change?: string | null | undefined
+    text: string
+    label: string
+    state: { state: string }
+  }[],
+): { byChange: Readonly<Record<string, SessionView>>; loose: readonly SessionView[] } {
+  const byChange: Record<string, SessionView> = {}
+  const loose: SessionView[] = []
+  let ended = 0
+  for (const row of rows) {
+    const change = row.change ?? null
+    const view: SessionView = {
+      run: row.run,
+      op: row.op,
+      change,
+      caption: change ?? sessionCaption(row.op, row.text),
+      who: row.label,
+      state: sessionState(row.state),
+    }
+    if (change !== null) {
+      if (!Object.hasOwn(byChange, change)) byChange[change] = view
+      continue
+    }
+    if (view.state.live) loose.push(view)
+    else if (ended < 3) {
+      ended += 1
+      loose.push(view)
+    }
+  }
+  return { byChange, loose }
+}
+
+/** A change's checklist as its worktree has it, when the session applied it in one. */
+export interface CheckoutProgress {
+  /** `undefined` when the worktree's `openspec` could not be read: the row keeps the root's. */
+  done?: number | undefined
+  total?: number | undefined
+}
+
+/**
+ * A change row's numbers, from its worktree when it has one.
+ *
+ * The session ticks boxes in **its** copy of the checklist, so the project root's copy — which the
+ * board reads — stays unticked until the branch lands, and the row would sit at *Proposed* with
+ * the work finished. The worktree's numbers win whenever they could be read.
+ */
+export function rowProgress(
+  row: { done: number; total: number },
+  checkout: CheckoutProgress | null,
+): { done: number; total: number; stage: ChangeStage } {
+  const done = checkout?.done ?? row.done
+  const total = checkout?.total ?? row.total
+  return { done, total, stage: summaryStage({ name: '', completed: done, total, status: '' }) }
+}

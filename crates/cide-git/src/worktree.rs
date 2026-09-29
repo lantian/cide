@@ -116,7 +116,7 @@ pub fn git_dirs(checkout: &Path) -> Result<GitDirs> {
 
 /// The ref namespace agent branches live in. `cide/` rather than a bare name so `git branch`
 /// groups them, and so a user's own `developer` branch is never the one an agent commits to.
-const BRANCH_PREFIX: &str = "cide";
+pub const BRANCH_PREFIX: &str = "cide";
 
 /// Where an agent's checkout lives and what branch it is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +566,78 @@ pub fn remove_if_integrated(root: &Path, agent: &str) -> Result<Retired> {
     Ok(Retired::Removed)
 }
 
+/// How many modified, staged or untracked paths a worktree has — [`remove_if_integrated`]'s own
+/// test of "would anything be lost", on its own. `0` when there is no such checkout.
+pub fn dirty(root: &Path, agent: &str) -> Result<usize> {
+    validate_agent(agent)?;
+    let path = path_of(&repo_mod::canonical(root), agent);
+    if !path.is_dir() {
+        return Ok(0);
+    }
+    let repo = repo_mod::open(&path)?;
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .include_unmodified(false);
+    Ok(repo.statuses(Some(&mut opts)).wrap()?.len())
+}
+
+/// Commit everything uncommitted in a worktree onto its branch, and answer the new commit —
+/// `None` when there was nothing to commit. (OpenSpec sessions)
+///
+/// For Publish and Integrate on a change applied in `.cide/worktrees/spec-<change>`: an agent
+/// told to commit as it goes still leaves the last ticked box uncommitted often enough, and a
+/// merge or a push of the branch alone would silently leave that edit behind. Everything the
+/// worktree's own `.gitignore` does not exclude is taken — the same set `git add -A` takes —
+/// because the tree belongs to the run, not to a person with half-staged work in it.
+///
+/// Refused while the checkout's `HEAD` is not on `cide/<agent>`, [`remove_if_integrated`]'s
+/// reason: committing onto whatever somebody checked out in there is not committing the change.
+pub fn commit_all(root: &Path, agent: &str, message: &str) -> Result<Option<String>> {
+    validate_agent(agent)?;
+    let path = path_of(&repo_mod::canonical(root), agent);
+    let described = describe(agent, &path)?;
+    if described.branch != branch_name(agent) {
+        return Err(GitError::Git {
+            detail: format!(
+                ".cide/worktrees/{agent} is on {}, not {}; commit there yourself",
+                described.branch,
+                branch_name(agent)
+            ),
+        });
+    }
+    let repo = repo_mod::open(&path)?;
+    let mut index = repo.index().wrap()?;
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .wrap()?;
+    // `add_all` adds and modifies; a deletion is only staged by `update_all`.
+    index.update_all(["*"].iter(), None).wrap()?;
+    index.write().wrap()?;
+    let tree_id = index.write_tree().wrap()?;
+    let head = repo.head().wrap()?.peel_to_commit().wrap()?;
+    if head.tree_id() == tree_id {
+        return Ok(None);
+    }
+    let tree = repo.find_tree(tree_id).wrap()?;
+    let signature = repo
+        .signature()
+        .or_else(|_| git2::Signature::now("cide", "cide@localhost"))
+        .wrap()?;
+    let commit = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&head],
+        )
+        .wrap()?;
+    Ok(Some(commit.to_string()))
+}
+
 // --- internals ------------------------------------------------------------------------------
 
 /// `cide/<agent>`.
@@ -755,6 +827,48 @@ mod tests {
 
         let plain = git_dirs(&root).expect("the root");
         assert_eq!(plain.git_dir, plain.common_dir);
+    }
+
+    /// Publish and Integrate commit what a session left behind — new, modified and deleted
+    /// files — onto the checkout's branch, and a clean checkout commits nothing.
+    #[test]
+    fn commit_all_takes_everything_the_session_left_and_nothing_twice() {
+        let root = project("commit-all");
+        let wt = ensure(&root, "spec-c1").expect("ensure");
+        let project_head = head_of(&root);
+        assert_eq!(dirty(&root, "spec-c1").unwrap(), 0);
+        assert_eq!(commit_all(&root, "spec-c1", "OpenSpec: c1").unwrap(), None);
+
+        write(&wt.path, "new.txt", "new\n");
+        write(&wt.path, "base.txt", "changed\n");
+        assert_eq!(dirty(&root, "spec-c1").unwrap(), 2);
+        let made = commit_all(&root, "spec-c1", "OpenSpec: c1")
+            .unwrap()
+            .expect("a commit");
+        assert_eq!(head_of(&wt.path), made);
+        assert_eq!(dirty(&root, "spec-c1").unwrap(), 0, "nothing left behind");
+        assert_eq!(
+            git(&root, &["log", "-1", "--format=%s", "cide/spec-c1"]).trim(),
+            "OpenSpec: c1"
+        );
+        assert_eq!(
+            head_of(&root),
+            project_head,
+            "the project's own branch is untouched"
+        );
+
+        std::fs::remove_file(wt.path.join("new.txt")).unwrap();
+        commit_all(&root, "spec-c1", "OpenSpec: c1")
+            .unwrap()
+            .expect("a deletion is a change too");
+        assert!(
+            git(&wt.path, &["ls-files"])
+                .lines()
+                .all(|line| line != "new.txt"),
+            "the deletion was committed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

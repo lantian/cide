@@ -98,6 +98,7 @@ export type SpecStoryName =
   | 'board-empty'
   | 'board-collapsed'
   | 'board-tracker-unread'
+  | 'board-sessions'
   | 'ask-propose'
   | 'ask-propose-legacy'
   | 'ask-explore'
@@ -195,6 +196,53 @@ export const SPEC_STORIES: Record<SpecStoryName, OpenSpecPanelViewProps> = {
    * the tracker's arm decides, not the map.
    */
   'board-tracker-unread': story(READY, { tracker: 'unknown' }),
+
+  /*
+   * OpenSpec sessions. (OpenSpec sessions)
+   *
+   * `rework-auth` is being applied, so its row offers that session back and draws its chip;
+   * `add-dark-mode` was applied in a worktree whose checklist is complete — 9/9 there while the
+   * root still says 3/9 — so it is ready and offers all three roads; `drop-legacy-theme` finished
+   * in the project root, so Archive is all it offers. A Propose with no change yet sits above
+   * the tree.
+   */
+  'board-sessions': story(READY, {
+    tasks: {},
+    sessions: {
+      byChange: {
+        'rework-auth': {
+          run: 'r2',
+          op: 'apply',
+          change: 'rework-auth',
+          caption: 'rework-auth',
+          who: 'developer',
+          state: { label: 'Working', tone: 'blue', live: true },
+        },
+      },
+      loose: [
+        {
+          run: 'r1',
+          op: 'propose',
+          change: null,
+          caption: 'a dark theme that follows the system',
+          who: 'OpenSpec · Claude',
+          state: { label: 'Waiting', tone: 'green', live: true },
+        },
+        {
+          run: 'r0',
+          op: 'explore',
+          change: null,
+          caption: 'What is this project about?',
+          who: 'OpenSpec · opencode',
+          state: { label: 'Ended', tone: 'neutral', live: false },
+        },
+      ],
+    },
+    onDismissSession: () => {},
+    checkouts: { 'add-dark-mode': { done: 9, total: 9 } },
+    onOpenSession: () => {},
+    onReadyAct: () => {},
+  }),
 
   /*
    * The buttons, with the composer open on each. (M28)
@@ -472,6 +520,7 @@ export type TabStoryName =
   | 'tab-with-task'
   | 'tab-tracker-unknown'
   | 'tab-ready'
+  | 'tab-session-ready'
   | 'tab-invalid'
   | 'tab-finding'
   | 'tab-finding-nothing'
@@ -532,6 +581,26 @@ export const TAB_STORIES: Record<TabStoryName, SpecTabViewProps> = {
   'tab-ready': tab({
     view: { ...CHANGE, completed: 4, total: 4 },
     task: { id: 't-14', agent: 'developer', status: 'review', session: null },
+  }),
+
+  /*
+   * Applied by an OpenSpec session in the project root, and finished. (OpenSpec sessions)
+   * The page offers the session back and Archive — never a second Apply.
+   */
+  'tab-session-ready': tab({
+    view: { ...CHANGE, completed: 4, total: 4 },
+    task: null,
+    session: {
+      run: 'r9',
+      op: 'apply',
+      change: CHANGE.name,
+      caption: CHANGE.name,
+      who: 'OpenSpec · opencode',
+      state: { label: 'Ended', tone: 'neutral', live: false },
+    },
+    onOpenSession: () => {},
+    readyActs: [{ id: 'archive', label: 'Archive', title: 'Archive it.' }],
+    onReadyAct: () => {},
   }),
 
   /** Finished and refused by the validator, which is the pair `tab-ready` exists against. */

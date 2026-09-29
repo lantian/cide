@@ -321,6 +321,27 @@ pub mod tool {
         MILESTONE_PROPOSALS,
     ];
 
+    /// [`ORCHESTRATION`] for a project whose tracker is off (`config::load_tracker`): the same
+    /// list without the two milestone tools. Served *instead of* [`EVERY`], so a pane in such a
+    /// project gets no `cide_task_*` either — a model that can see a task tool files tasks, which
+    /// is exactly what the switch exists to stop. `cide_agent_dispatch` and `cide_session_open`
+    /// stay: both take work that is not on a board.
+    pub const ORCHESTRATION_NO_TRACKER: &[&str] = &[
+        AGENTS_LIST,
+        AGENT_CREATE,
+        AGENT_UPDATE,
+        AGENTS_CONFIG,
+        AGENT_OVERRIDE,
+        AGENT_OVERRIDE_PROFILE,
+        LLM_PROVIDER,
+        LLM_POOL,
+        AGENT_DISPATCH,
+        SESSION_OPEN,
+        AGENT_RUNS,
+        AGENT_STOP,
+        AGENT_INTEGRATE,
+    ];
+
     /// Both families, in advertised order: [`ALL`] then [`ORCHESTRATION`].
     ///
     /// Spelled out rather than concatenated, because a `const fn` concatenation of two slices is
@@ -4315,6 +4336,16 @@ fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
             "{}: `enabled` is not something this tool can change. Switching subagents on is the \
              user's own opt-in to processes that edit their repository unattended, and it is made \
              in the Agents panel. Nothing was written.",
+            tool::AGENTS_CONFIG
+        ));
+    }
+    // `enabled`'s reason: the switch exists so the user can stop agents filing tasks, and a
+    // model that could turn it back on would make it no switch at all.
+    if arguments.get("trackerEnabled").is_some() {
+        return ToolResult::error(format!(
+            "{}: `trackerEnabled` is not something this tool can change. Whether this project \
+             uses the task tracker is the user's choice, made in Settings → Agents. Nothing was \
+             written.",
             tool::AGENTS_CONFIG
         ));
     }
@@ -8958,6 +8989,15 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(tool::EVERY, joined);
+
+        // With the tracker off a pane is served the orchestration list minus every task and
+        // milestone tool, and nothing else went missing with them.
+        let no_tracker: Vec<&str> = tool::ORCHESTRATION
+            .iter()
+            .copied()
+            .filter(|name| *name != tool::MILESTONES && *name != tool::MILESTONE_PROPOSALS)
+            .collect();
+        assert_eq!(tool::ORCHESTRATION_NO_TRACKER, no_tracker);
 
         // Pausing is a user gesture. An orchestrator that could `SIGSTOP` its own workers can
         // wedge the project with nobody at the keyboard, and it repairs no failure

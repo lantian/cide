@@ -23,6 +23,13 @@
  * one baked in previewed a line no project had. It is also still the only place a user can see
  * that their three-line description arrives as one turn.
  *
+ * # Where it goes now (OpenSpec sessions)
+ *
+ * Not into the project's console any more. Send starts a **session of its own** — an agent run on
+ * the harness picked here (Default is Settings → Harness, the MR reviewer's choice), in a new tab
+ * that can be closed while the work goes on; the OpenSpec panel shows its state and opens it
+ * again. `specRuns.ts` and `cmd::spec_sessions` carry the rest.
+ *
  * And the box still opens rather than the button just sending, for the reason it always did: both
  * commands take free text — *"the change name, OR a description of what the user wants to
  * build"* — and a bare one is legal and useless, because Claude answers by asking what to
@@ -32,13 +39,13 @@ import { create } from 'zustand'
 import { useCallback, useState } from 'react'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { notifyFailure } from '@/chrome/notices'
-import { spec as specApi, type ProjectId } from '@/ipc/client'
-import { revealPane } from '@/editor/revealPane'
-import { consolePaneOf } from '@/keys/target'
-import { useWorkspace } from '@/store/workspace'
+import type { ProjectId } from '@/ipc/client'
+import type { SpecLauncher } from '@/ipc/generated'
 import { useSpec } from '../specStore'
 import { ProposeFormView } from './ProposeForm'
 import { askTitle, invocation } from './model'
+import { DEFAULT_CHOICE, LauncherPicker, type LauncherChoice } from './LauncherPicker'
+import { startSession } from './specRuns'
 
 /**
  * Which command the composer is open on, or `null`.
@@ -72,30 +79,33 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
 
+  const [choice, setChoice] = useState<LauncherChoice>(DEFAULT_CHOICE)
+  const [resolved, setResolved] = useState<{ launcher: SpecLauncher } | { why: string }>({
+    why: 'Reading…',
+  })
+
+  /*
+   * A session of its own, in a new tab — no longer a line typed into the project's console.
+   *
+   * The console road (`spec_run_command`) put every proposal into the one conversation the user
+   * is also driving, and the answer arrived on a tab behind the one on screen. A session is an
+   * agent run (`cmd::spec_sessions`): the tab `startSession` opens is a mirror onto it, so it can
+   * be closed while the proposal is written, and the panel shows its state and opens it again.
+   * The harness is the user's choice here, as in the MR reviewer — Default is Settings → Harness.
+   */
   const onSend = useCallback(() => {
-    if (project === null || command === null) return
+    if (project === null || command === null || !('launcher' in resolved)) return
+    if (command !== 'propose' && command !== 'explore') return
     setBusy(true)
-    void specApi
-      .runCommand(project, command, text)
-      .then(async () => {
+    void startSession(project, {
+      op: command,
+      ...(text.trim() === '' ? {} : { text }),
+      launcher: resolved.launcher,
+    })
+      .then(() => {
         setBusy(false)
         setText('')
         close()
-        /*
-         * And then **take the user to the conversation**, which is the half that was missing.
-         *
-         * `spec_run_command` types into the project's *primary* session — the pinned Claude
-         * tab's own pane — and typing into a tab nobody is looking at is indistinguishable from
-         * nothing having happened. It was: the box shut, the sidebar sat there, and the answer
-         * arrived on a tab behind the one on screen.
-         *
-         * `consolePaneOf` is the same helper Ctrl+1 uses, rather than a second walk to `tabs[0]`
-         * — a second walk is how two surfaces come to disagree about which pane the console is.
-         * `revealPane` never throws and reports a reason instead, which is right here: the send
-         * has already landed, so a red toast would be a lie about what happened.
-         */
-        const target = consolePaneOf(useWorkspace.getState().boot)
-        if (target !== null) await revealPane(target.project, target.pane)
       })
       .catch((error: unknown) => {
         // The box stays up with the typing in it. A refusal that closed the composer would throw
@@ -103,7 +113,7 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
         setBusy(false)
         notifyFailure(error)
       })
-  }, [project, command, text, close])
+  }, [project, command, text, close, resolved])
 
   if (command === null) return null
   return (
@@ -114,7 +124,15 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
         text={text}
         busy={busy}
         onText={setText}
-        onSend={onSend}
+        onSend={'launcher' in resolved ? onSend : () => {}}
+        picker={
+          <LauncherPicker
+            choice={choice}
+            onChange={setChoice}
+            allowRoles={false}
+            onResolved={setResolved}
+          />
+        }
         onCancel={() => {
           if (busy) return
           setText('')

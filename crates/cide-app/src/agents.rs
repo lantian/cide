@@ -861,7 +861,7 @@ impl LiveRun {
     fn options(&self) -> Option<&WorkOptions> {
         match &self.purpose {
             RunPurpose::Work(options) => Some(options),
-            RunPurpose::MrReview { .. } => None,
+            RunPurpose::MrReview { .. } | RunPurpose::Spec(_) => None,
         }
     }
 
@@ -1022,6 +1022,33 @@ pub enum RunPurpose {
         /// travel together.
         harness: Harness,
     },
+    /// A session started from the OpenSpec panel — Propose, Explore or Apply — with no task.
+    /// Served no tracker tool (`agent_rpc`'s `Scope::Run { board: false }`) and told none of the
+    /// tracker's paragraphs; its brief is `cide_agents::harness::spec_session_brief`.
+    ///
+    /// Unlike a review this **is** persisted ([`SavedSpec`]): its worktree and branch outlive the
+    /// process, and the panel finds a change's session by this purpose after a restart.
+    Spec(SpecPurpose),
+}
+
+/// What an OpenSpec session was started as. See [`RunPurpose::Spec`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecPurpose {
+    pub op: cide_ipc::SpecOp,
+    #[serde(default)]
+    pub change: Option<String>,
+    /// What the user typed to start it.
+    #[serde(default)]
+    pub text: String,
+    /// Where it stands: the project root, or `.cide/worktrees/spec-<change>`.
+    pub cwd: PathBuf,
+    /// The worktree's name when it stands in one — `spec-<change>`.
+    #[serde(default)]
+    pub checkout: Option<String>,
+    pub launcher: cide_ipc::SpecLauncher,
+    /// cide's paragraph: the whole brief of a harness launch, appended to a role's own prompt.
+    pub brief: String,
 }
 
 impl Default for RunPurpose {
@@ -2833,6 +2860,38 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// Every OpenSpec session of a project, newest first, for the panel. (OpenSpec sessions)
+    pub fn spec_runs(&self, project: ProjectId) -> Vec<cide_ipc::SpecRunRow> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<(u64, cide_ipc::SpecRunRow)> = inner
+            .runs
+            .values()
+            .filter(|run| run.project == project)
+            .filter_map(|run| match &run.purpose {
+                RunPurpose::Spec(spec) => Some((
+                    run.seq,
+                    cide_ipc::SpecRunRow {
+                        run: run.run,
+                        op: spec.op,
+                        change: spec.change.clone().map(cide_ipc::ChangeName),
+                        text: spec.text.clone(),
+                        label: run.agent_label.clone(),
+                        state: run.state.clone(),
+                        session: run.session,
+                        branch: spec
+                            .checkout
+                            .as_ref()
+                            .map(|name| format!("{}/{name}", cide_git::worktree::BRANCH_PREFIX)),
+                        started_unix_ms: run.started_unix_ms,
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
     pub fn run_scopes_for(&self, project: ProjectId) -> Vec<RunScope> {
         let inner = self.inner.lock();
         inner
@@ -3602,6 +3661,44 @@ impl AgentRegistry {
             })
             .filter_map(|run| run.session)
             .collect()
+    }
+
+    /// Forget one OpenSpec session the user has dismissed from the panel. (OpenSpec sessions)
+    ///
+    /// Only a session that is over — finished, failed, or interrupted by a restart — and only an
+    /// OpenSpec one: this is the panel's *I don't need this any more*, not a way to drop a role's
+    /// history row or a run that is still working (stop it first). Its server, if one outlived
+    /// it, goes too. The branch and worktree of an Apply are git's and are left alone. Answers
+    /// the sentence when it refuses.
+    pub fn forget_spec_run(
+        &self,
+        project: ProjectId,
+        run: RunId,
+    ) -> std::result::Result<(), String> {
+        {
+            let mut inner = self.inner.lock();
+            let Some(live) = inner.runs.get(&run).filter(|live| live.project == project) else {
+                return Ok(());
+            };
+            if !matches!(live.purpose, RunPurpose::Spec(_)) {
+                return Err(
+                    "only an OpenSpec session can be dismissed from the OpenSpec panel".into(),
+                );
+            }
+            if !matches!(
+                live.state,
+                RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+            ) {
+                return Err("this session is still going — stop it first, then dismiss it".into());
+            }
+            inner.runs.remove(&run);
+        }
+        let server = self.inner.lock().servers.remove(&run);
+        if let Some(server) = server {
+            end_tree(&server.pty, "a dismissed session's server");
+        }
+        // Written by the coalescer's flush, which the caller's `mark_changed` sets off.
+        Ok(())
     }
 
     /// Drop the oldest finished runs of every project past [`RECENT_KEPT`].
@@ -5618,6 +5715,10 @@ struct SavedRun {
     /// before this field) reads as non-terminal.
     #[serde(default)]
     state: Option<RunState>,
+    /// [`RunPurpose::Spec`], for an OpenSpec session. Absent (every other run, and every file
+    /// from before these sessions) restores as work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spec: Option<SpecPurpose>,
     /// [`WorkOptions`], so a run dispatched onto another harness, model or external piece of work
     /// resumes as what it was. (M104) Without them a restored run would resolve to its role's own
     /// harness and resume a conversation that CLI never had. Absent in an older file, which reads
@@ -6051,7 +6152,7 @@ impl AgentRegistry {
             let mut runs: Vec<&LiveRun> = inner
                 .runs
                 .values()
-                .filter(|live| matches!(live.purpose, RunPurpose::Work(_)))
+                .filter(|live| matches!(live.purpose, RunPurpose::Work(_) | RunPurpose::Spec(_)))
                 .collect();
             runs.sort_by_key(|live| live.seq);
             RunsFile {
@@ -6096,6 +6197,10 @@ impl AgentRegistry {
                         external: live.options().and_then(|o| o.external.clone()),
                         chosen_harness: live.options().and_then(|o| o.harness),
                         chosen_model: live.options().and_then(|o| o.model.clone()),
+                        spec: match &live.purpose {
+                            RunPurpose::Spec(spec) => Some(spec.clone()),
+                            _ => None,
+                        },
                     })
                     .collect(),
             }
@@ -6268,12 +6373,16 @@ impl AgentRegistry {
                     project_limit: saved.project_limit.max(1),
                     checkout: saved.checkout,
                     notify: saved.notify,
-                    // Review runs are never saved (see `save_snapshot`), so a restored run was work.
-                    purpose: RunPurpose::Work(WorkOptions {
-                        external: saved.external,
-                        harness: saved.chosen_harness,
-                        model: saved.chosen_model,
-                    }),
+                    // Review runs are never saved (see `save_snapshot`), so a restored run was work
+                    // — or an OpenSpec session, which says so.
+                    purpose: match saved.spec {
+                        Some(spec) => RunPurpose::Spec(spec),
+                        None => RunPurpose::Work(WorkOptions {
+                            external: saved.external,
+                            harness: saved.chosen_harness,
+                            model: saved.chosen_model,
+                        }),
+                    },
                     // A restored run has no child until it is resumed, and the resume calls
                     // `note_cwd` like a first start does.
                     cwd: None,
@@ -7871,6 +7980,14 @@ impl AgentRegistry {
                     // marker, and most markers move nothing a window draws.
                     crate::emit::agents_changed_unless_repeat(&app, project, &roster);
                 }
+                // The OpenSpec panel's rows, on their own event — the roster above is `Disabled`
+                // with no runs in a project with subagents off, which is where these sessions
+                // usually live. See `emit::SPEC_RUNS_CHANGED`.
+                crate::emit::spec_runs_changed_unless_repeat(
+                    &app,
+                    project,
+                    self.spec_runs(project),
+                );
             }
             // The durable half rides the same coalescing: every burst that changed a roster
             // may have changed which runs a restart must bring back.
@@ -7918,6 +8035,19 @@ fn start_child(
     // see `RunPurpose`. Everything below it is the same fork every run takes.
     let synthetic = match &admission.purpose {
         RunPurpose::Work(_) => None,
+        RunPurpose::Spec(spec) => match &spec.launcher {
+            cide_ipc::SpecLauncher::Harness { harness } => {
+                Some(cide_agents::LoadedAgent::synthetic(
+                    &admission.agent.0,
+                    "OpenSpec",
+                    *harness,
+                    spec.brief.clone(),
+                    Vec::new(),
+                ))
+            }
+            // A role is read like any dispatch's; the brief is folded into it below.
+            cide_ipc::SpecLauncher::Role { .. } => None,
+        },
         RunPurpose::MrReview {
             brief,
             tools,
@@ -7943,9 +8073,11 @@ fn start_child(
     // A review belongs to no project role, so "subagents are off for this project" is not its
     // refusal to give: the rest of the gate — the bridge, the harness being installed, a
     // dangerous mode — is. The queue's pause still holds it, which is the user's own brake.
+    // An OpenSpec session likewise: the user started it by hand from the panel, which is the
+    // opt-in `enabled` stands for.
     let gate = match &admission.purpose {
         RunPurpose::Work(_) => project.config.agents.clone(),
-        RunPurpose::MrReview { .. } => cide_agents::AgentsConfig {
+        RunPurpose::MrReview { .. } | RunPurpose::Spec(_) => cide_agents::AgentsConfig {
             enabled: true,
             ..project.config.agents.clone()
         },
@@ -7965,6 +8097,9 @@ fn start_child(
             options.checkout_key(admission.task.as_ref()).as_ref(),
         ),
         RunPurpose::MrReview { .. } => None,
+        // Its launcher made the worktree (`cmd::spec::spec_session_start`), and `ensure` below
+        // repairs it if it was deleted while the session queued.
+        RunPurpose::Spec(spec) => spec.checkout.clone(),
     };
     let in_worktree = checkout.is_some();
     let cwd = match checkout {
@@ -8021,6 +8156,7 @@ fn start_child(
                         .into(),
                 ));
             }
+            RunPurpose::Spec(spec) => spec.cwd.clone(),
         },
     };
 
@@ -8068,6 +8204,12 @@ fn start_child(
             None => facts.resolve(agent),
         },
         RunPurpose::MrReview { .. } => facts.resolve_pinned(agent),
+        // The main model is pinned to the harness the dialog resolved; a role resolves as a
+        // dispatch of it would.
+        RunPurpose::Spec(spec) => match spec.launcher {
+            cide_ipc::SpecLauncher::Harness { .. } => facts.resolve_pinned(agent),
+            cide_ipc::SpecLauncher::Role { .. } => facts.resolve(agent),
+        },
     };
     // The only refusal this fold produces: an override naming a pool that is not configured
     // here. Refused rather than degraded, because falling back would answer with a model nobody
@@ -8084,7 +8226,33 @@ fn start_child(
     // until this fold existed the resolution's `model` and `effort` were computed and read by
     // nothing — the Settings screen's Model and Effort fields changed no child. `Resolved::apply`
     // says why it is a fold and not two more plan fields. The file on disk is untouched.
-    let folded = resolved.apply(agent);
+    let mut folded = resolved.apply(agent);
+    // Paragraphs a run needs that its harness's tracker gate would not give it, folded into the
+    // role's own prompt — which every harness reads — rather than into four harness modules:
+    // * an OpenSpec session run by a role gets the session's brief after the role's own words;
+    // * a task-less role run in a project whose tracker is off gets `ADHOC_PREAMBLE`, the rule
+    //   that keeps a run in the user's own tree from committing there. It normally rides inside
+    //   the tracker gate, which is closed here.
+    let extra = match &admission.purpose {
+        RunPurpose::Spec(spec) if matches!(spec.launcher, cide_ipc::SpecLauncher::Role { .. }) => {
+            Some(spec.brief.as_str())
+        }
+        RunPurpose::Work(options)
+            if options.checkout_key(admission.task.as_ref()).is_none()
+                && !cide_agents::config::load_tracker(&facts.root) =>
+        {
+            Some(cide_agents::harness::ADHOC_PREAMBLE)
+        }
+        _ => None,
+    };
+    if let Some(extra) = extra {
+        let own = folded.def.system_prompt.trim_end();
+        folded.def.system_prompt = if own.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{own}\n\n{extra}")
+        };
+    }
     let agent = &folded;
 
     // Where a harness that reports through a JSON event file would write it: beside the agent
@@ -8145,7 +8313,13 @@ fn start_child(
         unattended: project.config.agents.unattended(),
         // A review's connection lists the `cide_mr_*` tools only; its brief is the whole of
         // what it is told. See `RunPlan::tracker_paragraphs`.
-        tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work(_)),
+        //
+        // Off as well for a role run in a project whose tracker is switched off: its connection
+        // is served no task tool (`agent_rpc`'s `ProjectTools::tracker`), so the paragraph would
+        // name tools it cannot call — the same failure by a third road.
+        tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work(_))
+            && cide_agents::config::load_tracker(&facts.root),
+        review: matches!(admission.purpose, RunPurpose::MrReview { .. }),
         server: None,
         git_dirs,
         // Both decided just below, once the plan's policy can be read. (M119)
@@ -9315,6 +9489,48 @@ mod tests {
             purpose: RunPurpose::default(),
             pool: Vec::new(),
         }
+    }
+
+    /// The OpenSpec panel's dismiss forgets an ended session, and only an ended OpenSpec one.
+    #[test]
+    fn only_an_ended_spec_session_can_be_dismissed() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut session = spec(project, "openspec", 4, 4);
+        session.purpose = RunPurpose::Spec(SpecPurpose {
+            op: cide_ipc::SpecOp::Propose,
+            change: None,
+            text: "an idea".into(),
+            cwd: std::env::temp_dir(),
+            checkout: None,
+            launcher: cide_ipc::SpecLauncher::Harness {
+                harness: Harness::Opencode,
+            },
+            brief: String::new(),
+        });
+        let run = registry.enqueue(session);
+        let work = registry.enqueue(spec(project, "developer", 4, 4));
+
+        assert!(
+            registry.forget_spec_run(project, run).is_err(),
+            "a queued session is still going"
+        );
+        assert_eq!(registry.spec_runs(project).len(), 1);
+
+        for id in [run, work] {
+            registry.inner.lock().runs.get_mut(&id).expect("run").state =
+                RunState::Finished { code: 0 };
+        }
+        assert!(
+            registry.forget_spec_run(project, work).is_err(),
+            "a role's history row is not the panel's to drop"
+        );
+        registry.forget_spec_run(project, run).expect("dismissed");
+        assert!(registry.spec_runs(project).is_empty());
+        assert!(registry.inner.lock().runs.contains_key(&work));
+        registry
+            .forget_spec_run(project, run)
+            .expect("dismissing twice is not an error");
     }
 
     /// **A checkout is held while any run that is not over stands in it, and only then.** (M89)

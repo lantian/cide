@@ -161,6 +161,18 @@ fn still_quiet(quiet: &Quiet, config: &AgentsConfig) -> bool {
         && quiet.open_tasks > 0
 }
 
+/// The config the spinner decides on: the project's own, with `auto_spin` off when the project's
+/// task tracker is (`config::load_tracker`). The spinner plans *from the board*, and a planning
+/// tab opened in a project that switched its board off would be told to read tasks it has no
+/// tool for — and would file some.
+fn spin_config(root: &std::path::Path) -> AgentsConfig {
+    let mut config = cide_agents::config::load(root).agents;
+    if !cide_agents::config::load_tracker(root) {
+        config.auto_spin = false;
+    }
+    config
+}
+
 /// When each project was last seen *not* quiet.
 ///
 /// A `std::sync::Mutex` and not `parking_lot`'s: this is touched once every [`POLL`] by one
@@ -224,7 +236,7 @@ fn tick(app: &AppHandle) {
         let Ok(root) = crate::tasks_state::project_root(&state, project) else {
             continue;
         };
-        let config = cide_agents::config::load(&root).agents;
+        let config = spin_config(&root);
         if !should_spin(&quiet, &config) {
             continue;
         }
@@ -306,7 +318,7 @@ fn stand_down(app: &AppHandle, project: ProjectId, root: &std::path::Path) -> Op
     // Off the disk rather than from the config `tick` read, for the same reason `tick` reads it
     // per pass: `.cide/config.json` is committed, so a `git checkout` — or a person who has just
     // decided they have had enough of the timer — can switch this off under a running app.
-    let config = cide_agents::config::load(root).agents;
+    let config = spin_config(root);
     if still_quiet(&quiet, &config) {
         return None;
     }

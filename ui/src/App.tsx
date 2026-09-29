@@ -91,6 +91,9 @@ import { DocsPane } from '@/panes/DocsPane'
 import { useDocker } from '@/sidebar/dockerStore'
 import { OpenSpecPanel } from '@/sidebar/OpenSpecPanel'
 import { ProposeDialog, useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
+import { ApplyDialog, useApplyDialog } from '@/sidebar/OpenSpecPanel/ApplyDialog'
+import { SpecActsConfirm } from '@/sidebar/OpenSpecPanel/SpecActsConfirm'
+import { useSpecConfirm } from '@/sidebar/OpenSpecPanel/specActs'
 import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
 import { openCount } from '@/sidebar/TasksPanel/model'
@@ -1023,6 +1026,11 @@ export function App() {
   // Two primitives, not the roster: `adopt` builds a new roster per `agents-changed`, which
   // arrives continuously while runs are active, and this component is the whole shell.
   const liveAgents = useAgents((s) => liveCount(s.roster))
+  /*
+   * The project's tracker switch (`.cide/config.json`'s `tracker`). Off, the Tasks button stays
+   * — its panel draws the off screen with the button that turns it on — but carries no count.
+   */
+  const tasksEnabled = useAgents((s) => s.config?.trackerEnabled)
   const agentsAwaiting = useAgents(
     (s) => s.roster.kind === 'ready' && s.roster.runs.some((run) => run.phase === 'awaitingPermission'),
   )
@@ -1676,7 +1684,7 @@ export function App() {
                because a project with no tracker has no count, it has no tracker. The rail draws
                nothing for `null` and nothing for `0`, and those are two different claims: nobody
                looked, against looked and the tracker is clear. */
-            tasks={openTasks}
+            tasks={tasksEnabled === false ? null : openTasks}
             /* `liveCount` answers `null` for every roster arm but `ready` — nobody has looked,
                subagents are off, or no roles are defined — and a *number* only when something
                counted. The rail draws nothing for `null` and nothing for `0`, and those are two
@@ -2294,6 +2302,14 @@ export function App() {
           */}
         <PanelBoundary name="OpenSpec compose" onClose={() => useProposeDialog.getState().close()}>
           <ProposeDialog project={activeProjectId} />
+        </PanelBoundary>
+        {/* *Apply…* — `ProposeDialog`'s placement, for its reasons. */}
+        <PanelBoundary name="OpenSpec apply" onClose={() => useApplyDialog.getState().close()}>
+          <ApplyDialog project={activeProjectId} />
+        </PanelBoundary>
+        {/* Archive's confirm, for the panel and the change page alike — `specActs.ts`. */}
+        <PanelBoundary name="OpenSpec archive" onClose={() => useSpecConfirm.getState().set(null)}>
+          <SpecActsConfirm />
         </PanelBoundary>
 
         {/*

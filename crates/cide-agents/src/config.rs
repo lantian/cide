@@ -801,6 +801,10 @@ impl AgentsConfig {
             // The stored number, for `auto_spin_after_secs`' reason; `verify_retries()` clamps.
             verify_retries: self.verify_retries,
             resume_after_restart: self.resume_after_restart,
+            // Not an `agents` key: the one caller with a root fills it from `load_tracker`
+            // ([`wire_for`]). False here is what a caller that forgot would draw — a hidden
+            // board, which is loud — rather than a board the project switched off.
+            tracker_enabled: false,
         }
     }
 
@@ -1030,6 +1034,109 @@ pub fn write_milestones(project_root: &Path, plan: &cide_ipc::MilestonePlan) -> 
     write_0644(&path, &body)
 }
 
+/// The whole wire config of a project: its `agents` block plus the keys that live beside it.
+pub fn wire_for(project_root: &Path) -> OrchestrationConfig {
+    let mut wire = load(project_root).agents.to_wire();
+    wire.tracker_enabled = load_tracker(project_root);
+    wire
+}
+
+/// Whether this project uses the task tracker and milestones: the `tracker` key of
+/// `.cide/config.json`. (M-OpenSpec sessions)
+///
+/// One switch for both because a milestone *is* a task with a gate — a project with milestones
+/// and no board would have gates nobody can link work to. Off means: agents are not told about
+/// the board, the `cide_task_*`/`cide_milestone*` MCP tools are not offered, nothing spins or
+/// autodispatches, and the Tasks panel is gone. The data on disk is never touched, so switching
+/// back on restores every task exactly as it was.
+///
+/// # The default when the key is absent
+///
+/// Not a constant, and that is the decision this function exists to hold. A new project is off
+/// — the wizard writes the key explicitly, and a folder opened for the first time has no board —
+/// because an agent that is told about a tracker creates tasks in it, which is exactly the noise
+/// an OpenSpec-driven project did not ask for. But every project that already *has* a board
+/// predates this key, and reading "absent" as off would make its tasks vanish on upgrade. So
+/// absent reads as on when `.cide/tasks.json` exists or a `milestones` block is set, and off
+/// otherwise.
+///
+/// Read like [`load_milestones`], separately and tolerantly: a typo here must not switch
+/// subagents off (which is what [`load`] does to a file it cannot parse).
+pub fn load_tracker(project_root: &Path) -> bool {
+    let doc = std::fs::read(config_path(project_root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if let Some(enabled) = doc
+        .as_ref()
+        .and_then(|doc| doc.get("tracker"))
+        .and_then(|tracker| tracker.get("enabled"))
+        .and_then(Value::as_bool)
+    {
+        return enabled;
+    }
+    let has_milestones = doc
+        .as_ref()
+        .and_then(|doc| doc.get("milestones"))
+        .is_some_and(|value| !value.is_null());
+    has_milestones || project_root.join(CIDE_DIR).join("tasks.json").is_file()
+}
+
+/// Write the `tracker` key explicitly, leaving every other key as it was.
+///
+/// Always written, never removed when it matches the derived default: the derived default can
+/// change under the user (a `tasks.json` appears) and a switch they flipped must not flip back.
+pub fn write_tracker(project_root: &Path, enabled: bool) -> io::Result<()> {
+    write_key(project_root, "tracker", Some(json!({ "enabled": enabled })))
+}
+
+/// How OpenSpec work runs in this project: the `openspec` key of `.cide/config.json`.
+///
+/// cide's own behaviour around OpenSpec, not OpenSpec's — which is why it is here and not in
+/// `openspec/config.yaml`, a file upstream owns and whose unknown keys a future `openspec` could
+/// reject.
+pub use cide_ipc::SpecSettings;
+
+/// Read the `openspec` key; tolerant, like [`load_milestones`].
+pub fn load_spec_settings(project_root: &Path) -> SpecSettings {
+    std::fs::read(config_path(project_root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|doc| doc.get("openspec").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+/// Write the `openspec` key; the default removes it rather than committing `{}`-ish noise.
+pub fn write_spec_settings(project_root: &Path, settings: &SpecSettings) -> io::Result<()> {
+    let value = (*settings != SpecSettings::default())
+        .then(|| serde_json::to_value(settings))
+        .transpose()
+        .map_err(io::Error::other)?;
+    write_key(project_root, "openspec", value)
+}
+
+/// Replace (or, with `None`, remove) one top-level key, keeping every other one as it was.
+fn write_key(project_root: &Path, key: &str, value: Option<Value>) -> io::Result<()> {
+    let path = config_path(project_root);
+    let mut doc = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "version": SCHEMA_VERSION }));
+    let map = doc.as_object_mut().expect("filtered to an object above");
+    match value {
+        Some(value) => {
+            map.insert(key.to_string(), value);
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+    let mut body = serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?;
+    body.push(b'\n');
+    write_0644(&path, &body)
+}
+
 /// Write a project's config, creating `.cide/` if it is not there.
 ///
 /// # What this preserves, and why it is not just `to_vec_pretty(config)`
@@ -1227,6 +1334,63 @@ mod tests {
     fn put(root: &Path, text: &str) {
         std::fs::create_dir_all(cide_dir(root)).expect("cide dir");
         std::fs::write(config_path(root), text).expect("config");
+    }
+
+    /// Absent key: on for a project that already has a board or milestones, off for a fresh one;
+    /// an explicit key wins either way, and writing it keeps every other key.
+    #[test]
+    fn the_tracker_defaults_from_what_the_project_already_has() {
+        let root = temp("tracker-default");
+        assert!(!load_tracker(&root), "a fresh folder has no tracker");
+
+        std::fs::create_dir_all(cide_dir(&root)).unwrap();
+        std::fs::write(cide_dir(&root).join("tasks.json"), "{}").unwrap();
+        assert!(
+            load_tracker(&root),
+            "an existing board keeps working after an upgrade"
+        );
+
+        put(
+            &root,
+            r#"{ "agents": { "enabled": true }, "tracker": { "enabled": false } }"#,
+        );
+        assert!(
+            !load_tracker(&root),
+            "an explicit key wins over the board on disk"
+        );
+
+        write_tracker(&root, true).unwrap();
+        assert!(load_tracker(&root));
+        assert!(
+            load(&root).agents.enabled,
+            "writing the switch keeps agents"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = temp("tracker-milestones");
+        put(&root, r#"{ "milestones": { "items": [] } }"#);
+        assert!(
+            load_tracker(&root),
+            "a milestones block means the tracker is in use"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spec_settings_round_trip_and_the_default_leaves_no_key() {
+        let root = temp("spec-settings");
+        put(&root, r#"{ "agents": { "enabled": true } }"#);
+        assert_eq!(load_spec_settings(&root), SpecSettings::default());
+        let on = SpecSettings {
+            apply_in_worktree: true,
+        };
+        write_spec_settings(&root, &on).unwrap();
+        assert_eq!(load_spec_settings(&root), on);
+        write_spec_settings(&root, &SpecSettings::default()).unwrap();
+        let text = std::fs::read_to_string(config_path(&root)).unwrap();
+        assert!(!text.contains("openspec"), "{text}");
+        assert!(load(&root).agents.enabled);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The default that keeps an upgrade from spawning anything in somebody's repository.

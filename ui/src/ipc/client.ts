@@ -4864,6 +4864,68 @@ export const specConfig = {
     invoke<SpecBoard>('spec_init', { project, context }),
 }
 
+/* ==========================================================================================
+ * OpenSpec sessions — Propose, Explore and Apply as runs of their own, with no task.
+ *
+ * A session is an agent run (`cmd::spec_sessions`), so its tab is a mirror onto a child the
+ * registry owns: closing the tab leaves the work going, and the panel reopens it from the run.
+ * Every call is a gesture or a panel read that awaits and draws its own failure, so all are
+ * bare `invoke`s — `specConfig`'s rule.
+ * ======================================================================================== */
+import type {
+  GitLabReviewHarness,
+  RunId as SpecRunId,
+  SpecCheckout,
+  SpecIntegrated,
+  SpecPublished,
+  SpecRunRow,
+  SpecSessionStart,
+  SpecSettings,
+} from './generated'
+
+export const specSessions = {
+  /** Every harness a session can run on, and why not where it cannot — the MR reviewer's list. */
+  harnesses: () => invoke<GitLabReviewHarness[]>('spec_harnesses'),
+
+  /** `.cide/config.json`'s `openspec` key. */
+  settings: (project: ProjectId) => invoke<SpecSettings>('spec_settings_get', { project }),
+
+  setSettings: (project: ProjectId, settings: SpecSettings) =>
+    invoke<SpecSettings>('spec_settings_set', { project, settings }),
+
+  /** Start a session; answers the run at once, before it has a child. */
+  start: (project: ProjectId, request: SpecSessionStart) =>
+    invoke<SpecRunId>('spec_session_start', { project, request }),
+
+  /** Every OpenSpec session of the project, newest first. */
+  runs: (project: ProjectId) => invoke<SpecRunRow[]>('spec_runs', { project }),
+
+  /**
+   * A project's sessions changed — the rows, whole. Not `agentEvents.onChanged`: that carries the
+   * roster, which in a project with subagents off holds no runs, so it never moved when a session
+   * ended. See `emit::SPEC_RUNS_CHANGED`.
+   */
+  onChanged: (handler: (project: ProjectId, runs: SpecRunRow[]) => void) =>
+    listen<{ project: ProjectId; runs: SpecRunRow[] }>('cide://spec-runs-changed', (e) =>
+      handler(e.payload.project, e.payload.runs),
+    ),
+
+  /** Forget an ended session — it leaves the panel. Refused for one still going. */
+  dismiss: (project: ProjectId, run: SpecRunId) =>
+    invoke<void>('spec_session_dismiss', { project, run }),
+
+  /** Every `spec-<change>` worktree, with its branch, what it holds, and its checklist. */
+  checkouts: (project: ProjectId) => invoke<SpecCheckout[]>('spec_checkouts', { project }),
+
+  /** Commit what is uncommitted in the change's worktree and push its branch. */
+  publish: (project: ProjectId, change: ChangeName) =>
+    invoke<SpecPublished>('spec_publish', { project, change }),
+
+  /** Commit, then merge the change's branch into the checked-out one. Never archives. */
+  integrate: (project: ProjectId, change: ChangeName) =>
+    invoke<SpecIntegrated>('spec_integrate', { project, change }),
+}
+
 /* -----------------------------------------------------------------------------------------
  * Task attachments: files on a task's body or on a comment. (M39)
  *

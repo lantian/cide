@@ -188,4 +188,5 @@ export const CONFIG: OrchestrationConfig = {
   verifyExclusive: true,
   verifyRetries: 3,
   resumeAfterRestart: true,
+  trackerEnabled: true,
 }

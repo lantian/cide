@@ -287,7 +287,7 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     }
     // Refused before anything is built, so a role naming a mode this harness cannot honour is
     // refused at dispatch with the mode in the sentence.
-    let review_permissions = !plan.tracker_paragraphs && plan.codex.cli.inject.review_permissions;
+    let review_permissions = plan.review && plan.codex.cli.inject.review_permissions;
     let policy = if review_permissions {
         // The shorthand also selects a sandbox and conflicts with wrappers that pass -s.
         // Route requests to the automatic reviewer without overriding the wrapper's sandbox.
@@ -930,6 +930,7 @@ mod tests {
             harness: agent.def.harness,
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            review: false,
             server: None,
             git_dirs: Vec::new(),
             sandbox_brief: None,
@@ -1020,6 +1021,7 @@ mod tests {
         let session = SessionId::new();
         let mut plan = plan_for(&agent, session);
         plan.tracker_paragraphs = false;
+        plan.review = true;
         plan.codex.cli.inject.permissions = false;
         plan.codex.cli.inject.review_permissions = true;
 

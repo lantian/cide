@@ -52,7 +52,7 @@ type Result<T> = std::result::Result<T, GitError>;
 /// Read here rather than inside `cide-git`, which takes no configuration and must not learn
 /// what a `WorkspaceState` is. Read *outside* [`blocking`] for the usual reason: the
 /// workspace lock is `parking_lot` and must not be held across an await.
-fn git_proxy(state: &WorkspaceState) -> cide_core::proxy::ProxyEnv {
+pub(crate) fn git_proxy(state: &WorkspaceState) -> cide_core::proxy::ProxyEnv {
     let proxy = state.with(|ws| ws.settings.proxy.clone());
     cide_core::proxy::ProxyEnv::for_target(&proxy, proxy.scope.git)
 }

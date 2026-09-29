@@ -391,3 +391,9 @@
   color: var(--dim);
   line-height: 1.5;
 }
+
+/* `.cide/config.json`'s `openspec` switches, above the form: the form's inset, not its scroller. */
+.sessionSettings {
+  flex: none;
+  padding: var(--sp-4) var(--sp-4) 0;
+}

@@ -10,21 +10,29 @@
  * listener registered inside a panel goes stale the moment that panel unmounts.
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
-import { spec as specApi, type ProjectId } from '@/ipc/client'
+import {
+  spec as specApi,
+  specSessions,
+  type ProjectId,
+} from '@/ipc/client'
 import { notify, notifyFailure } from '@/chrome/notices'
-import { ConfirmDestructive, type ConfirmState } from '@/chrome/ConfirmDestructive'
 import { useContextMenu } from '@/menus'
 import type { MenuEntry } from '@/menus/model'
 import { useSpec } from '../specStore'
 import { useTasks } from '../tasksStore'
-import { EMPTY_DRAFT } from '../TasksPanel/model'
 import { OpenSpecPanelView } from './OpenSpecPanel'
 import {
   changeRowActions,
+  sessionViews,
   specRowActions,
+  type CheckoutProgress,
+  type ReadyAct,
   type RowMenuAction,
   type TrackerKind,
 } from './model'
+import { useApplyDialog } from './ApplyDialog'
+import { followSpecRuns, openSession, useSpecRuns } from './specRuns'
+import { archiveChange, runReadyAct } from './specActs'
 import { ConfigDialog } from './ConfigDialog'
 import { reloadConsoleAfterSetUp } from './consoleReload'
 import { useProposeDialog } from './ProposeDialog'
@@ -82,52 +90,51 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
   }, [taskBoard])
 
   /**
-   * Start work on a change, or open the task that already tracks it.
+   * *Apply…* a change, or open the task that already tracks it.
    *
-   * *Start* creates the task **pre-linked**, which is the ordering `TaskSink::create` argues in
-   * Rust: the auto-dispatch trigger reads the task a mutation left behind, so a create-then-link
-   * would publish a task with no change and any dispatch from it would be told nothing about the
-   * checklist. It deliberately does **not** assign — assigning is what starts an agent, and that
-   * is the user's decision to make on the card that has just opened.
+   * *Apply…* opens the dialog that starts a session on the change — the main model or a
+   * subagent, in a tab of its own — and **creates no task**. It used to be *Start work*, which
+   * made a task and left starting an agent to the task card; a project that works from OpenSpec
+   * alone got a board of tasks nobody asked for. A change that already has a task keeps its way
+   * back to it.
    */
   const onRowAction = useCallback(
     (change: string, action: 'start' | 'open') => {
-      const store = useTasks.getState()
       if (action === 'open') {
         const existing = tasks[change]
-        if (existing !== undefined) store.select(existing as never)
+        if (existing !== undefined) useTasks.getState().select(existing as never)
         return
       }
-      void store
-        .create({ ...EMPTY_DRAFT, title: change, change })
-        .then(() => {
-          // Selected after the write lands, from the board the create adopted — `create`
-          // answers with nothing, and guessing an id here would be inventing one.
-          const board = useTasks.getState().board
-          /*
-           * Both misses below are *silence* if they merely `return`, and silence after a click
-           * is the one thing this whole path was reported for. The write may well have landed;
-           * what failed is finding the row it made, so the sentence says that rather than
-           * claiming the task was not created.
-           */
-          if (board.kind !== 'ready') {
-            notify(`Created a task for ${change}, but the task board has not answered yet.`, {
-              kind: 'warn',
-            })
-            return
-          }
-          const made = board.tasks.filter((task) => task.change === change).at(-1)
-          if (made === undefined) {
-            notify(`Created a task for ${change}, but it is not on the board yet.`, {
-              kind: 'warn',
-            })
-            return
-          }
-          useTasks.getState().select(made.id as never)
-        })
-        .catch(notifyFailure)
+      useApplyDialog.getState().open(change)
     },
     [tasks],
+  )
+
+  /*
+   * OpenSpec sessions: the runs, as `cide://spec-runs-changed` carries them (so a chip is as live
+   * as the Agents panel, subagents on or off), and the `spec-<change>` worktrees, re-read when the board moves — each of those reads
+   * is an `openspec list` per worktree, so never on a run event. `specRuns.ts` has the rest.
+   */
+  const runs = useSpecRuns((state) => state.runs)
+  const checkoutRows = useSpecRuns((state) => state.checkouts)
+  useEffect(() => followSpecRuns(project), [project])
+  const sessions = useMemo(() => sessionViews(runs), [runs])
+  const checkouts = useMemo(() => {
+    const byChange: Record<string, CheckoutProgress> = {}
+    for (const checkout of checkoutRows) {
+      byChange[checkout.change] = { done: checkout.completedTasks, total: checkout.totalTasks }
+    }
+    return byChange
+  }, [checkoutRows])
+
+  const onOpenSession = useCallback(
+    (run: string) => {
+      if (project === null) return
+      const row = useSpecRuns.getState().runs.find((candidate) => candidate.run === run)
+      if (row === undefined) return
+      void openSession(project, row).catch(notifyFailure)
+    },
+    [project],
   )
 
   useEffect(() => {
@@ -254,8 +261,6 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
    * is computed until the gesture happens and nothing can be stale, which is `useContextMenu`'s
    * own rule for `items`.
    */
-  const [confirming, setConfirming] = useState<ConfirmState | null>(null)
-
   /** Run one menu action against one change. */
   const runChange = useCallback(
     (change: string, action: RowMenuAction['id']) => {
@@ -288,60 +293,33 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
         return
       }
 
-      /*
-       * Archive: plan first, then confirm, then run.
-       *
-       * The plan is a subprocess — it validates and reads the deltas — so it cannot be part of
-       * building the menu. A refusal therefore arrives *after* the click, and is shown as a
-       * notice naming what to do rather than as a dialog the user then has to dismiss for
-       * nothing.
-       */
-      void specApi
-        .changePlan(project, change as never)
-        .then((plan) => {
-          if (plan.refusals.length > 0) {
-            notify(`${change} cannot be archived yet.`, {
-              kind: 'error',
-              detail: plan.refusals.join('\n\n'),
-            })
-            return
-          }
-          setConfirming({
-            title: `Archive ${change}?`,
-            body:
-              'Merges this change’s requirement edits into openspec/specs/ — the project’s ' +
-              'source of truth — and moves the change to openspec/changes/archive/. Both are ' +
-              'ordinary file edits in your repository, so git is the way back.',
-            // Named, not counted: `ConfirmDestructive`'s rule is that the user is about to act
-            // on *specific* files and "3 requirements" is not something anybody can check.
-            files: plan.specsTouched.map(
-              (touch) =>
-                `openspec/specs/${touch.spec}/spec.md — ${touch.requirements} ${
-                  touch.requirements === 1 ? 'requirement' : 'requirements'
-                } ${touch.operation}`,
-            ),
-            confirmLabel: 'Archive',
-            mark: 'file-diff',
-            run: () => {
-              void specApi
-                .archiveChange(project, change as never)
-                .then((outcome) => {
-                  if (outcome.kind === 'refused') {
-                    notify(`${change} was not archived.`, {
-                      kind: 'error',
-                      detail: outcome.plan.refusals.join('\n\n'),
-                    })
-                    return
-                  }
-                  notify(`${change} archived.`, { kind: 'ok' })
-                })
-                .catch(notifyFailure)
-            },
-          })
-        })
-        .catch(notifyFailure)
+      // Archive: the shared plan → confirm → run, so the row, its menu and the page agree.
+      archiveChange(project, change)
     },
     [onOpenChange, project],
+  )
+
+  const onDismissSession = useCallback(
+    (run: string) => {
+      if (project === null) return
+      void specSessions
+        .dismiss(project, run as never)
+        .then(() => useSpecRuns.getState().refreshRuns())
+        .catch(notifyFailure)
+    },
+    [project],
+  )
+
+  /*
+   * The three roads a finished change offers — never one bundled gesture (the user's call):
+   * Publish pushes its branch for a merge request, Integrate merges it here, Archive is its own
+   * act. Archive reuses the row menu's plan → confirm → run, so the two doors cannot disagree.
+   */
+  const onReadyAct = useCallback(
+    (change: string, act: ReadyAct['id']) => {
+      if (project !== null) runReadyAct(project, change, act)
+    },
+    [project],
   )
 
   const { onContextMenu, menu } = useContextMenu({
@@ -357,8 +335,14 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
             ? board.changes.find((candidate) => candidate.name === name)
             : undefined
         if (name === undefined || row === undefined) return []
+        // The worktree's checklist when the change was applied in one — that is where the boxes
+        // are ticked, and where Archive runs while the branch holds unmerged work.
+        const checkout = checkouts[row.name]
         return toEntries(
-          changeRowActions({ done: row.completed, total: row.total }),
+          changeRowActions({
+            done: checkout?.done ?? row.completed,
+            total: checkout?.total ?? row.total,
+          }),
           (action) => runChange(name, action),
         )
       }
@@ -394,18 +378,12 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
       onConfigure={project === null || board.kind === 'unknown' ? undefined : onConfigure}
       onContextMenu={onContextMenu}
       menu={menu}
+      sessions={sessions}
+      checkouts={checkouts}
+      onOpenSession={onOpenSession}
+      onDismissSession={onDismissSession}
+      onReadyAct={onReadyAct}
     />
-    {confirming !== null && (
-      <ConfirmDestructive
-        state={confirming}
-        onCancel={() => setConfirming(null)}
-        onConfirm={() => {
-          const run = confirming.run
-          setConfirming(null)
-          run?.()
-        }}
-      />
-    )}
     {configuring && project !== null && (
       <ConfigDialog project={project} onClose={() => setConfiguring(false)} />
     )}

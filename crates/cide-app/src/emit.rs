@@ -803,6 +803,47 @@ pub fn agents_changed_unless_repeat(
     agents_changed(app, project, roster);
 }
 
+/// A project's OpenSpec sessions changed: the rows the OpenSpec panel draws, whole. (OpenSpec
+/// sessions)
+///
+/// Its own event and not a ride on [`AGENTS_CHANGED`], because that one carries the **roster**, and
+/// in a project with subagents off the roster is `Disabled` with no runs in it — the same value on
+/// every flush, so [`agents_changed_unless_repeat`] sent nothing at all and the panel's chip said
+/// *Working* over a session that had ended until the panel was re-opened. Sent from the same
+/// coalescer flush, unless the rows are the ones already sent.
+pub const SPEC_RUNS_CHANGED: &str = "cide://spec-runs-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpecRunsChanged {
+    project: cide_ipc::ProjectId,
+    runs: Vec<cide_ipc::SpecRunRow>,
+}
+
+pub fn spec_runs_changed_unless_repeat(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    runs: Vec<cide_ipc::SpecRunRow>,
+) {
+    {
+        let mut last = LAST_SPEC_RUNS.lock();
+        if last.get(&project) == Some(&runs) {
+            return;
+        }
+        if last.len() >= LAST_ROSTER_CAP && !last.contains_key(&project) {
+            last.clear();
+        }
+        last.insert(project, runs.clone());
+    }
+    if let Err(error) = app.emit(SPEC_RUNS_CHANGED, SpecRunsChanged { project, runs }) {
+        tracing::debug!(%error, "spec-runs-changed reached no window");
+    }
+}
+
+static LAST_SPEC_RUNS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<cide_ipc::ProjectId, Vec<cide_ipc::SpecRunRow>>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// The roster each project was last sent. A handful of projects, a few tens of kilobytes each;
 /// cleared outright past [`LAST_ROSTER_CAP`] rather than evicted with care, because forgetting
 /// only costs one broadcast that could have been skipped.

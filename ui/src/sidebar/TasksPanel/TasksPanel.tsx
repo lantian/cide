@@ -191,6 +191,14 @@ export interface TasksPanelViewProps {
    * Absent draws no mark, so every story that predates it draws what it always drew.
    */
   verifies?: Readonly<Record<string, 'running' | 'passed' | 'failed'>> | undefined
+  /**
+   * The project switched its task tracker (and milestones) off — `.cide/config.json`'s
+   * `tracker`. The panel stays on the rail and draws the Agents panel's *off* screen: what the
+   * switch does, and the one button that turns it back on. The tasks on disk are untouched.
+   */
+  off?: boolean | undefined
+  /** Turn the tracker on for this project. */
+  onEnable?: (() => void) | undefined
 }
 
 export function TasksPanelView({
@@ -216,6 +224,8 @@ export function TasksPanelView({
   planning = false,
   onReveal,
   onRetry,
+  off = false,
+  onEnable,
 }: TasksPanelViewProps) {
   /*
    * The one gate every writing control goes through, asked once. Two copies of "may this panel
@@ -393,6 +403,39 @@ export function TasksPanelView({
             The task tracker lives in the project, at <code>.cide/tasks.json</code>. Open one
             from the header’s <b>+</b> button.
           </p>
+        </div>
+      ) : off ? (
+        <div className={styles.body} data-audit="tasksBody">
+          <p className={cx(styles.claim, styles.claimQuiet)} data-audit="tasksClaim">
+            The task tracker is off for this project.
+          </p>
+          <p className={styles.detail}>
+            Tasks and milestones are how the session in your console tab plans work and hands it
+            to subagents. While this is off, agents get no task tools and are not told about a
+            board — for a project that works from OpenSpec or somewhere else. Tasks already on
+            the board are kept.
+          </p>
+          <p className={styles.warn} data-audit="tasksWarn">
+            Turning it on writes this project’s switch to{' '}
+            <code className={styles.path} data-audit="tasksPath">
+              .cide/config.json
+            </code>
+            , which your repository will contain. Sessions already running keep the tools they
+            started with.
+          </p>
+          <div className={styles.actions} data-audit="tasksActions">
+            {onEnable !== undefined && (
+              <button
+                type="button"
+                className={cx(styles.action, styles.actionPrimary)}
+                data-audit="tasksEnable"
+                data-write="true"
+                onClick={onEnable}
+              >
+                Enable tasks and milestones
+              </button>
+            )}
+          </div>
         </div>
       ) : board.kind === 'unknown' ? (
         /* Nobody has looked. Nothing is drawn — see the file header. */

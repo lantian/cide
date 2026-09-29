@@ -416,6 +416,24 @@ pub async fn project_new(
         report(NewProjectStep::Agents, outcome.map_err(|e| e.to_string()));
     }
 
+    // The task tracker and milestones: on for the Tasks road, whose brief creates milestones and
+    // tasks, and off for every other — a new project does not get a board it did not ask for,
+    // and an agent that is not told about one files nothing in it. Written explicitly whenever
+    // `.cide/config.json` is being written anyway, so the choice survives a `tasks.json` a
+    // teammate commits later (`config::load_tracker`'s derived default would read that as on);
+    // a bare project with no `.cide/` at all already reads as off, and gets no file for it.
+    let tracker = kind == NewProjectKind::Tasks;
+    if agents || tracker {
+        let at = root.clone();
+        let written = blocking(move || {
+            cide_agents::config::write_tracker(&at, tracker).map_err(CoreError::from)
+        })
+        .await;
+        if let Err(error) = written {
+            tracing::warn!(%error, "could not record the task tracker switch for a new project");
+        }
+    }
+
     // Left before the open, so the webview's spawn — which the open's broadcast sets off —
     // cannot run first and find nothing. See the module header.
     let briefing = kind == NewProjectKind::Tasks;

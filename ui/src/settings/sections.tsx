@@ -127,7 +127,7 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     id: 'agents',
     title: 'Agents',
     description:
-      'The subagent roles this project and you define. Each one is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
+      'This project’s switches — the task tracker and milestones, how many runs at once — and the subagent roles this project and you define. Each one is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
   },
   {
     // Between Inspections and Agents, which is where `SettingsSection::Extensions` sits in the

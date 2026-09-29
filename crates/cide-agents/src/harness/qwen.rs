@@ -616,6 +616,7 @@ mod tests {
             harness: agent.def.harness,
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            review: false,
             server: None,
             git_dirs: Vec::new(),
             sandbox_brief: None,

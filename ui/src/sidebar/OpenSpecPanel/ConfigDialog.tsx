@@ -49,7 +49,9 @@
 import { IconButton } from '@/kit/components/Button'
 import { useCallback, useEffect, useState } from 'react'
 import type { ProjectId, SpecBoard, SpecConfig, SpecSchema } from '@/ipc/client'
-import { file, spec, specConfig } from '@/ipc/client'
+import { file, spec, specConfig, specSessions } from '@/ipc/client'
+import { FormRow } from '@/kit/components/Field'
+import { Switch } from '@/kit/components/Choice'
 import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { ConfigForm, ConfigWizard, type SaveStatus } from './ConfigForm'
@@ -111,13 +113,69 @@ export function ConfigDialog({
           * leaving one project's unsaved draft sitting over another project's file. A draft
           * carried across would be Saved into the wrong repository.
           */}
-        <OpenSpecEditor key={project} project={project} />
+        <SessionSettings key={`sessions:${project}`} project={project} />
+        <OpenSpecEditor key={project} project={project} onClose={onClose} />
       </div>
     </OverlayCard>
   )
 }
 
-function OpenSpecEditor({ project }: { project: ProjectId }) {
+/**
+ * How cide runs OpenSpec work in this project — `.cide/config.json`'s `openspec` key, not
+ * `openspec/config.yaml`, which is upstream's file. Saved the moment the switch moves, like every
+ * other switch: it is one key, and a Save button for it would sit beside the form's own Save and
+ * read as part of that file.
+ */
+function SessionSettings({ project }: { project: ProjectId }) {
+  const [worktree, setWorktree] = useState<boolean | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    specSessions.settings(project).then(
+      (settings) => alive && setWorktree(settings.applyInWorktree),
+      (e: unknown) => alive && setError(errorText(e)),
+    )
+    return () => {
+      alive = false
+    }
+  }, [project])
+  return (
+    /*
+     * Drawn as one of the form's own groups, inset by the form's padding — it sits above the
+     * form's scroller rather than inside it, and flush against the card's edge it read as a
+     * stray line of text.
+     */
+    <div className={styles.sessionSettings} data-audit="specSessionSettings">
+      <div className={styles.group}>
+      <FormRow
+        label="Apply in a worktree"
+        hint={
+          error ??
+          'Apply works in .cide/worktrees/spec-<change> on its own branch, cide/spec-<change>, ' +
+            'and a finished change offers Publish (push the branch) and Integrate (merge it ' +
+            'here). Off, it works in the project root and Archive is all that is left. ' +
+            'Written to .cide/config.json.'
+        }
+      >
+        <Switch
+          label="Apply in a worktree"
+          checked={worktree === true}
+          disabled={worktree === null}
+          onChange={(next) => {
+            setError(null)
+            specSessions.setSettings(project, { applyInWorktree: next }).then(
+              (settings) => setWorktree(settings.applyInWorktree),
+              (e: unknown) => setError(errorText(e)),
+            )
+          }}
+        />
+      </FormRow>
+      </div>
+    </div>
+  )
+}
+
+function OpenSpecEditor({ project, onClose }: { project: ProjectId; onClose: () => void }) {
   const [board, setBoard] = useState<SpecBoard | null>(null)
   const [config, setConfig] = useState<SpecConfig | null>(null)
   const [schemas, setSchemas] = useState<SpecSchema[]>([])
@@ -233,7 +291,10 @@ function OpenSpecEditor({ project }: { project: ProjectId }) {
     // mints a tab for a path whether or not it exists. A rejection here reaches `Failures`,
     // which is where a gesture's refusal belongs.
     void file.open(project, config.path)
-  }, [project, config])
+    // And get out of the way: the file opens in a tab *under* this modal, and a dialog left
+    // standing over it reads as a button that did nothing.
+    onClose()
+  }, [project, config, onClose])
 
   if (config === null || draft === null) {
     /*

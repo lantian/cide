@@ -589,8 +589,9 @@ fn orchestrator_paragraph(
         return Some(WORKER_PARAGRAPH.to_string());
     }
     let agents = cide_agents::load_project(&root);
+    let tracker = cide_agents::config::load_tracker(&root);
     if !agents.enabled() {
-        return Some(SESSIONS_PARAGRAPH.to_string());
+        return Some(sessions_paragraph(tracker).to_string());
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
@@ -611,11 +612,11 @@ fn orchestrator_paragraph(
                 total: cide_agents::overrides::capacity(ready.map(|(_, r)| r), project_max),
             }
         });
-    let paragraph = roster_paragraph(&roles, voice.unwrap_or(inferred), limits);
+    let paragraph = roster_paragraph(&roles, voice.unwrap_or(inferred), limits, tracker);
     // Subagents on, but nobody can be dispatched right now — no roles, or every one refused:
     // `cide_agent_dispatch` would refuse, and `cide_session_open` is the road (M104).
     if roles.iter().all(|def| def.unavailable.is_some()) {
-        return Some(format!("{paragraph} {SESSIONS_PARAGRAPH}"));
+        return Some(format!("{paragraph} {}", sessions_paragraph(tracker)));
     }
     Some(paragraph)
 }
@@ -683,6 +684,24 @@ const SESSIONS_PARAGRAPH: &str = "This project in cide has no subagent roles to 
      one. Each session commits on its own branch and, for a board task, sets it to review when \
      done; you review the branch and merge it with git.";
 
+/// [`SESSIONS_PARAGRAPH`] for a project whose tracker is off: the same road without the board.
+const SESSIONS_PARAGRAPH_NO_TRACKER: &str = "This project in cide has no subagent roles to hand \
+     work to, and does not use cide's task tracker — create no tasks. You can still run work in \
+     parallel: `mcp__cide__cide_session_open` opens a new tab running a coding agent on one \
+     piece of work, in a git worktree and branch of its own, and returns at once. Call it once \
+     per piece of work, as `title` + a one-line `brief` (+ `ref` when the work is written down \
+     elsewhere, such as an issue you read through another system's tools). `harness` picks the \
+     CLI for that tab (claude, codex or opencode) when the user asks for one. Each session \
+     commits on its own branch; you review the branch and merge it with git.";
+
+fn sessions_paragraph(tracker: bool) -> &'static str {
+    if tracker {
+        SESSIONS_PARAGRAPH
+    } else {
+        SESSIONS_PARAGRAPH_NO_TRACKER
+    }
+}
+
 /// The paragraph itself, as a pure function of the roles and of which pane is being told.
 ///
 /// Split from [`orchestrator_paragraph`] so the prose — which is a contract with a language model
@@ -694,7 +713,12 @@ const SESSIONS_PARAGRAPH: &str = "This project in cide has no subagent roles to 
 /// as one — without being told it *is*, because a task's conversation pane opened from the Tasks
 /// panel has just been handed a task to work, and two identities in one prompt is a model
 /// guessing which to be.
-fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<Limits>) -> String {
+fn roster_paragraph(
+    roles: &[&cide_ipc::AgentDef],
+    voice: Voice,
+    limits: Option<Limits>,
+    tracker: bool,
+) -> String {
     let roles = if roles.is_empty() {
         // Said rather than omitted: a session told it is the product owner and handed no roles
         // would call `cide_agents_list`, get an empty answer, and have no idea whether that is a
@@ -760,8 +784,15 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<
         ),
         None => String::new(),
     };
+    // Every opening says "decompose a goal into tasks"; with no board that is an instruction to
+    // create something this session has no tool for.
+    let opening = if tracker {
+        opening.to_string()
+    } else {
+        opening.replace("into tasks", "into pieces of work")
+    };
 
-    format!(
+    let authoring = format!(
         "{opening} {roles} That list was read when this session \
          started; `mcp__cide__cide_agents_list` is the current one. A role is a markdown file at \
          `.cide/agents/<name>.md` — frontmatter `name:` and `description:` (optionally \
@@ -781,7 +812,13 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<
          files in a directory it does not own, and a subagent is dispatched by naming it to \
          `claude --agent`, so its own `model`, `tools`, `permissionMode`, `skills` and `hooks` \
          apply and cide adds none of them; where two files declare one name, `.cide/agents/` \
-         wins. Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
+         wins."
+    );
+    if !tracker {
+        return format!("{authoring} {}", no_tracker_manual(&limits));
+    }
+    format!(
+        "{authoring} Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
          write this project's shared task tracker at `.cide/tasks.json`: create the task before \
          you hand it to anybody, because a run is pointed at its task and reads the statement of \
          the work from there. Anything you notice in passing — a defect, a gap, a piece of work \
@@ -831,6 +868,31 @@ fn roster_paragraph(roles: &[&cide_ipc::AgentDef], voice: Voice, limits: Option<
          the board before deciding what is next — the board, not your context, is the plan of \
          record. When you need the user, end your turn with a direct question: cide marks the \
          pane and the window title while you are awaiting input."
+    )
+}
+
+/// The dispatch manual for a project whose task tracker is off (`config::load_tracker`).
+///
+/// Every sentence of the tracker manual that names a board, an inbox, a milestone or a review
+/// status is gone, because the session is served none of those tools (`agent_rpc`'s
+/// `ORCHESTRATION_NO_TRACKER`) and a paragraph naming them is a model reaching for a vocabulary
+/// it does not have. What is left is the dispatch that takes work not on a board: `title` +
+/// `brief` (its own worktree), or `instructions` alone (the project root).
+fn no_tracker_manual(limits: &str) -> String {
+    format!(
+        "This project does not use cide's task tracker: there is no board, and you create no \
+         tasks. Hand work to a role with `mcp__cide__cide_agent_dispatch` — with `title` and a \
+         one-line `brief` (+ `ref` when it is written down elsewhere) for real work, which runs \
+         in a worktree and branch of its own, or with `instructions` alone for a quick check or \
+         a small piece of work in the project root. A role runs up to its `max-concurrent` \
+         pieces of work at once and the project caps concurrent runs{limits} — anything past a \
+         cap queues in order. When a run hands its turn back or ends, cide types one line about \
+         it into a console pane (`notify` on the dispatch: `here`, `main` or `none`); read what \
+         it did in its branch, take work you accept with `mcp__cide__cide_agent_integrate`, or \
+         dispatch it again with a one-line instruction saying what is still wrong. Watch runs \
+         with `mcp__cide__cide_agent_runs`; stop one with `mcp__cide__cide_agent_stop`. When \
+         you need the user, end your turn with a direct question: cide marks the pane and the \
+         window title while you are awaiting input."
     )
 }
 
@@ -2435,7 +2497,7 @@ mod tests {
     fn the_roster_paragraph_names_the_roles_and_the_namespaced_tools() {
         let developer = role("developer", "Implements one task\n  end to end.");
         let qa = role("qa", "");
-        let paragraph = roster_paragraph(&[&developer, &qa], Voice::ProductOwner, None);
+        let paragraph = roster_paragraph(&[&developer, &qa], Voice::ProductOwner, None, true);
         // Printed on purpose: this is prose handed to a language model, and the assertions below
         // check fragments of it. `cargo test -p cide-app roster_paragraph -- --nocapture`.
         eprintln!("{paragraph}");
@@ -2547,8 +2609,8 @@ mod tests {
     #[test]
     fn a_second_pane_is_told_it_may_orchestrate_and_everything_else_is_the_same() {
         let developer = role("developer", "Implements one task end to end.");
-        let console = roster_paragraph(&[&developer], Voice::ProductOwner, None);
-        let pane = roster_paragraph(&[&developer], Voice::Pane, None);
+        let console = roster_paragraph(&[&developer], Voice::ProductOwner, None, true);
+        let pane = roster_paragraph(&[&developer], Voice::Pane, None, true);
 
         assert!(
             console.starts_with("You are the product owner"),
@@ -2742,9 +2804,9 @@ mod tests {
     #[test]
     fn a_tab_cide_opened_is_told_it_is_acting_as_the_product_owner() {
         let developer = role("developer", "Implements one task end to end.");
-        let acting = roster_paragraph(&[&developer], Voice::Acting, None);
-        let pane = roster_paragraph(&[&developer], Voice::Pane, None);
-        let console = roster_paragraph(&[&developer], Voice::ProductOwner, None);
+        let acting = roster_paragraph(&[&developer], Voice::Acting, None, true);
+        let pane = roster_paragraph(&[&developer], Voice::Pane, None, true);
+        let console = roster_paragraph(&[&developer], Voice::ProductOwner, None, true);
 
         assert!(
             acting.starts_with("You are acting as the product owner"),
@@ -2773,9 +2835,30 @@ mod tests {
         assert!(tail(&acting).is_some());
     }
 
+    /// With the tracker off the session is served no task or milestone tool, so no paragraph it
+    /// is given may name one — or tell it to make tasks.
+    #[test]
+    fn a_project_without_the_tracker_is_never_told_about_the_board() {
+        let developer = role("developer", "Implements one piece of work.");
+        for voice in [Voice::ProductOwner, Voice::Pane, Voice::Acting] {
+            let paragraph = roster_paragraph(&[&developer], voice, None, false);
+            for needle in ["cide_task_", "cide_milestones", "inbox", "into tasks"] {
+                assert!(!paragraph.contains(needle), "{needle} in {paragraph}");
+            }
+            assert!(
+                paragraph.contains("mcp__cide__cide_agent_dispatch"),
+                "{paragraph}"
+            );
+        }
+        for needle in ["cide_task_", "board task"] {
+            assert!(!sessions_paragraph(false).contains(needle));
+        }
+        assert!(sessions_paragraph(true).contains("cide_task_list"));
+    }
+
     #[test]
     fn a_project_with_no_roles_gets_a_paragraph_that_says_so_and_names_the_file() {
-        let paragraph = roster_paragraph(&[], Voice::ProductOwner, None);
+        let paragraph = roster_paragraph(&[], Voice::ProductOwner, None, true);
         assert!(paragraph.contains(".cide/agents/<name>.md"), "{paragraph}");
         assert!(paragraph.contains("nobody to dispatch to"), "{paragraph}");
     }
@@ -2791,6 +2874,7 @@ mod tests {
                 project: 4,
                 total: 3,
             }),
+            true,
         );
         assert!(
             paragraph.contains("(at most 4 at once here)"),
@@ -2802,7 +2886,7 @@ mod tests {
         );
         assert!(paragraph.contains("running limit"), "{paragraph}");
 
-        let unknown = roster_paragraph(&[], Voice::ProductOwner, None);
+        let unknown = roster_paragraph(&[], Voice::ProductOwner, None, true);
         assert!(!unknown.contains("can actually be live"), "{unknown}");
     }
 
@@ -2857,7 +2941,7 @@ mod tests {
     #[test]
     fn the_paragraph_folds_into_the_users_own_append_system_prompt() {
         let developer = role("developer", "Implements one task end to end.");
-        let paragraph = roster_paragraph(&[&developer], Voice::ProductOwner, None);
+        let paragraph = roster_paragraph(&[&developer], Voice::ProductOwner, None, true);
 
         let mut args = vec![
             "--append-system-prompt".to_string(),
@@ -3433,7 +3517,7 @@ mod tests {
     /// so a future edit that moves the paragraph out from behind the gate has to answer for it.
     #[test]
     fn the_roster_paragraph_is_only_worth_sending_with_the_tools_that_back_it() {
-        let paragraph = roster_paragraph(&[], Voice::ProductOwner, None);
+        let paragraph = roster_paragraph(&[], Voice::ProductOwner, None, true);
         for tool in ["mcp__cide__cide_agents_list", "mcp__cide__cide_task_"] {
             assert!(paragraph.contains(tool), "{paragraph}");
         }

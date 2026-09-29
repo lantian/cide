@@ -38,7 +38,10 @@ import { file, spec as specApi, type ChangeName, type ProjectId, type SpecId } f
 import { useSpec } from '../specStore'
 import { useTasks } from '../tasksStore'
 import { useAgents } from '../agentsStore'
-import { EMPTY_DRAFT } from '../TasksPanel/model'
+import { useApplyDialog } from './applyStore'
+import { Badge } from '@/kit/components/Status'
+import { followSpecRuns, openSession, useSpecRuns } from './specRuns'
+import { runReadyAct } from './specActs'
 import { adaptChange } from './adapt'
 import { RequirementEditor } from './RequirementEditor'
 import styles from './SpecTab.module.css'
@@ -64,9 +67,15 @@ import {
   taskProgress,
   unattributedIssues,
   validateBadge,
+  readyActs,
+  sessionViews,
+  OPEN_SESSION_LABEL,
+  OPEN_SESSION_TITLE,
   type ActionOffer,
   type ChangeView,
+  type ReadyAct,
   type RowAction,
+  type SessionView,
 } from './model'
 import {
   compose,
@@ -153,7 +162,25 @@ export interface SpecTabViewProps {
    * a thing you do to a change nobody has started. See `splitAction` in `model.ts`.
    */
   splitAction: ActionOffer
+  /**
+   * `false` when the project's task tracker is off: *Split work* makes tasks, so it is not
+   * offered at all. Absent in the render check's stories, which keep the page they always drew.
+   */
+  canSplit?: boolean | undefined
   onSplit: () => void
+  /**
+   * The change's OpenSpec session, when it has one (`sessionViews`). The page then offers it
+   * back — *Open session*, with its state — instead of a second *Apply…*, which Rust would
+   * refuse anyway. Absent in the render check's older stories.
+   */
+  session?: SessionView | null | undefined
+  onOpenSession?: ((run: string) => void) | undefined
+  /**
+   * What the finished change offers — `readyActs`, empty until the checklist is complete. The
+   * panel row's buttons, on the page too, run by the same `specActs.ts`.
+   */
+  readyActs?: readonly ReadyAct[] | undefined
+  onReadyAct?: ((act: ReadyAct['id']) => void) | undefined
   onOpenDoc: (path: string) => void
   onEditOpen: (target: string, requirement: { name: string; text: string; scenarios: readonly { title: string; body: string }[] }) => void
   onEditDraft: (draft: RequirementDraft) => void
@@ -259,6 +286,8 @@ function Block({
 
 export function SpecTabView(props: SpecTabViewProps) {
   const { view, failed, reading, task, edit, find } = props
+  const session = props.session ?? null
+  const acts = props.readyActs ?? []
   const query = find?.query ?? ''
   // One counter threaded through every `Marked` on the page, so a mark's index is its position in
   // reading order and next/prev can address it without the marks knowing about each other.
@@ -386,7 +415,38 @@ export function SpecTabView(props: SpecTabViewProps) {
           * out of work that is finished. *Open task* survives, because a link back to the task
           * that did it is the most useful thing on this page once it is archived.
           */}
-        {(task !== null || view.archivedAs == null) && (
+        {task === null && session !== null && view.archivedAs == null && (
+          <>
+            <button
+              type="button"
+              className={cx(styles.button, acts.length === 0 && styles.primary)}
+              data-audit="specTabOpenSession"
+              title={OPEN_SESSION_TITLE}
+              onClick={() => props.onOpenSession?.(session.run)}
+            >
+              {OPEN_SESSION_LABEL}
+            </button>
+            <Badge tone={session.state.tone} dot soft>
+              {`${session.state.label} · ${session.who}`}
+            </Badge>
+          </>
+        )}
+        {task === null &&
+          acts.map((act) => (
+            <button
+              key={act.id}
+              type="button"
+              className={cx(styles.button, act.id !== 'archive' && styles.primary)}
+              data-audit="specTabReadyAct"
+              data-act={act.id}
+              data-write="true"
+              title={act.title}
+              onClick={() => props.onReadyAct?.(act.id)}
+            >
+              {act.label}
+            </button>
+          ))}
+        {(task !== null || view.archivedAs == null) && (task !== null || session === null) && (
         <button
           type="button"
           className={cx(styles.button, styles.primary)}
@@ -420,7 +480,7 @@ export function SpecTabView(props: SpecTabViewProps) {
           * Not `styles.primary`: the accent belongs to the one action that is the change's next
           * step, and two accented buttons say neither is.
           */}
-        {task === null && (
+        {task === null && session === null && props.canSplit !== false && (
           <button
             type="button"
             className={styles.button}
@@ -828,10 +888,26 @@ function ChangeTab({
    * for a run's own worktree fires `cide://spec-changed`, `specStore` adopts it, and this asks
    * again. Without the dependency the page would be a snapshot of the moment it was opened.
    */
+  /*
+   * OpenSpec sessions: follow them (the panel may be shut), and find this change's — its session,
+   * and its `spec-<change>` worktree when it was applied in one. The page reads the change **from
+   * that worktree** then: the session ticks the boxes there, and the root's copy stays unticked
+   * until the branch lands, which would leave the page offering nothing on finished work.
+   */
+  useEffect(() => followSpecRuns(project), [project])
+  const runs = useSpecRuns((state) => state.runs)
+  const checkouts = useSpecRuns((state) => state.checkouts)
+  const session = useMemo(() => sessionViews(runs).byChange[change] ?? null, [runs, change])
+  const hasCheckout = checkouts.some((checkout) => checkout.change === change)
+  const worktree =
+    hasCheckout && board.kind === 'ready'
+      ? `${board.root}/.cide/worktrees/spec-${change}`
+      : undefined
+
   useEffect(() => {
     let live = true
     void specApi
-      .change(project, change as ChangeName)
+      .change(project, change as ChangeName, worktree)
       .then((wire) => {
         if (!live) return
         setReading(false)
@@ -851,7 +927,7 @@ function ChangeTab({
     return () => {
       live = false
     }
-  }, [project, change, board])
+  }, [project, change, board, worktree])
 
   /*
    * The proposal's text: a second read, keyed on the *path* rather than on `view`.
@@ -926,6 +1002,7 @@ function ChangeTab({
   }, [roster, task])
 
   const startAction = rowAction(task === null ? null : task.id, tasks.kind)
+  const trackerOn = useAgents((s) => s.config?.trackerEnabled) !== false
   /**
    * *Split work*'s offer. Takes no task id — the button is drawn only while there is none — but
    * still asks the tracker's arm, because a control that writes must not be live while nobody
@@ -933,34 +1010,16 @@ function ChangeTab({
    */
   const split = splitAction(tasks.kind)
 
+  /*
+   * *Apply…*, or back to the task that already tracks this change. Apply opens the dialog that
+   * starts a session on the change and creates no task — the panel row's gesture, one door more.
+   */
   const onStart = useCallback(() => {
-    const store = useTasks.getState()
     if (task !== null) {
-      store.select(task.id as never)
+      useTasks.getState().select(task.id as never)
       return
     }
-    void store
-      .create({ ...EMPTY_DRAFT, title: change, change })
-      .then(() => {
-        const next = useTasks.getState().board
-        // Silence after a click is what this path was reported for. The write may well have
-        // landed — what failed is finding the row it made — so the sentence says that.
-        if (next.kind !== 'ready') {
-          notify(`Created a task for ${change}, but the task board has not answered yet.`, {
-              kind: 'warn',
-            })
-          return
-        }
-        const made = next.tasks.filter((row) => row.change === change).at(-1)
-        if (made === undefined) {
-          notify(`Created a task for ${change}, but it is not on the board yet.`, {
-              kind: 'warn',
-            })
-          return
-        }
-        useTasks.getState().select(made.id as never)
-      })
-      .catch(notifyFailure)
+    useApplyDialog.getState().open(change)
   }, [task, change])
 
   /**
@@ -1236,6 +1295,18 @@ function ChangeTab({
       edit={{ target, draft, busy, problem }}
       startAction={startAction}
       onStart={onStart}
+      canSplit={trackerOn}
+      session={session}
+      onOpenSession={(run) => {
+        const row = useSpecRuns.getState().runs.find((candidate) => candidate.run === run)
+        if (row !== undefined) void openSession(project, row).catch(notifyFailure)
+      }}
+      readyActs={
+        view !== null && view.archivedAs == null && stageOf(view) === 'ready'
+          ? readyActs(hasCheckout)
+          : []
+      }
+      onReadyAct={(act) => runReadyAct(project, change, act)}
       splitAction={split}
       onSplit={onSplit}
       onOpenDoc={(path) => void file.open(project, path).catch(notifyFailure)}

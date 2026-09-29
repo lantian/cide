@@ -211,19 +211,55 @@ try {
       'a change with a task opens it; one without offers to start the work',
     )
     /*
-     * And the same board with the **task** tracker unread draws none of them live.
+     * And the same board with the **task** tracker unread. (OpenSpec sessions)
      *
-     * The reported bug, exactly: `tasks` is empty on three of `Board`'s four arms and the panel
-     * read empty as *no task*, so a change with a finished task got a confident `Start work` —
-     * on a button that then did nothing at all, because `tasksStore.create` refuses `unknown`
-     * and `unreadable` without a word. Note `add-dark-mode` greys too: its task is in the map,
-     * but a map built from a board nobody has read is not evidence of anything.
+     * Every row offers *Apply…*, live: Apply starts a session and writes nothing to the tracker,
+     * so an unread board is no reason to grey it. `add-dark-mode`'s task id is still not trusted
+     * — a map built from a board nobody has read is not evidence — so it is not *Open task*.
      */
     eq(
       t('board-tracker-unread').rowActions,
-      ['drop-legacy-theme|start|inert', 'rework-auth|start|inert', 'add-dark-mode|start|inert'],
-      'a tracker that has not answered greys every row action rather than guessing',
+      ['drop-legacy-theme|start', 'rework-auth|start', 'add-dark-mode|start'],
+      'a tracker that has not answered neither greys Apply nor trusts its task ids',
     )
+
+    /*
+     * OpenSpec sessions: the chip, Open session, and the three roads a finished change offers.
+     */
+    {
+      const sessions = t('board-sessions')
+      eq(
+        sessions.openSessions.sort(),
+        ['loose', 'loose', 'rework-auth'],
+        'a change being applied offers its session back, and so does a Propose with no change yet',
+      )
+      eq(
+        sessions.rowActions,
+        ['drop-legacy-theme|start', 'add-dark-mode|start'],
+        'and only the changes with no session offer Apply — never a second session over the first',
+      )
+      ok(
+        sessions.stages.includes('add-dark-mode|ready|9/9'),
+        `a change finished in its worktree is ready with the worktree's numbers: ${sessions.stages}`,
+      )
+      eq(
+        sessions.readyActs,
+        [
+          'drop-legacy-theme|archive',
+          'add-dark-mode|publish',
+          'add-dark-mode|integrate',
+          'add-dark-mode|archive',
+        ],
+        'a worktree offers Publish, Integrate and Archive; the project root only Archive',
+      )
+      eq(board.readyActs, [], 'and a panel with no session handlers draws none of it')
+      eq(
+        sessions.dismissals,
+        1,
+        'an ended session can be dismissed — and only that one: the live Propose and the ' +
+          'working Apply keep theirs',
+      )
+    }
 
     ok(board.meta !== null && board.meta.includes('2 specs'), `the header counts: ${board.meta}`)
     eq(
@@ -495,8 +531,18 @@ try {
       'the checklist is drawn with each box in its real state',
     )
     eq(page.tabDeltas, ['added|dark-mode'], 'and the requirement edits it makes')
-    eq(page.tabStart, 'Start work', 'a change nobody is working offers to start it')
+    eq(page.tabStart, 'Apply…', 'a change nobody is working offers to apply it')
     eq(t('tab-with-task').tabStart, 'Open t-14', 'and one with a task opens it')
+    {
+      // A change with an OpenSpec session: the page offers it back, never a second Apply, and a
+      // finished one offers its acts — the panel row's, run by the same `specActs.ts`.
+      const done = t('tab-session-ready')
+      eq(done.tabStart, null, 'no Apply once the change has a session')
+      eq(done.tabOpenSession, true, 'Open session instead')
+      eq(done.tabReadyActs, ['archive'], 'and a finished change applied in the root offers Archive')
+      eq(done.tabSplit, null, 'nor Split work — it has a session')
+      eq(page.tabOpenSession, false, 'a change with no session has no Open session')
+    }
 
     /*
      * *Split work*, and the three things its rendering has to say. (M31)
@@ -529,9 +575,8 @@ try {
     )
     eq(
       t('tab-tracker-unknown').tabStart,
-      'Start work',
-      'the primary keeps its name while inert — an unnamed grey button is the complaint the ' +
-        'whole reason-not-a-boolean convention exists for',
+      'Apply…',
+      'and Apply stays live while the task board is unread — it writes nothing to it',
     )
     ok(page.tabSplitPlaced, 'split sits after the primary and before the hint about the primary')
 

@@ -153,7 +153,7 @@ pub async fn agents_config_get(
     project: ProjectId,
 ) -> Result<OrchestrationConfig> {
     let root = project_root(&state, project)?;
-    blocking(move || Ok(config::load(&root).agents.to_wire())).await
+    blocking(move || Ok(config::wire_for(&root))).await
 }
 
 /// Change `.cide/config.json`, and tell every window what the project looks like now.
@@ -191,6 +191,9 @@ pub async fn agents_config_set(
         // (it carries the spinner's prompt), so the enabling gate below cannot read the patch
         // back off the stack any more; it reads the one field it is about, first.
         let enabling = patch.enabled == Some(true);
+        // Not an `agents` key: written on its own, explicitly, so the derived default
+        // (`config::load_tracker`) can never flip a switch the user set.
+        let tracker = patch.tracker_enabled;
         file.agents.apply(patch);
 
         // Only the *gesture that enables* is gated. A project already switched on by hand keeps
@@ -205,11 +208,14 @@ pub async fn agents_config_set(
         }
 
         config::write(&root, &file)?;
+        if let Some(enabled) = tracker {
+            config::write_tracker(&root, enabled)?;
+        }
         // Built after the write, from the file that is now on disk, so the roster the other
         // windows are handed and the config this call answers with cannot disagree about what
         // just happened.
         Ok((
-            file.agents.to_wire(),
+            config::wire_for(&root),
             roster(
                 &root,
                 runs,

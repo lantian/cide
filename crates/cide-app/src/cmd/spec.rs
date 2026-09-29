@@ -50,7 +50,7 @@ type Result<T> = std::result::Result<T, CoreError>;
 /// `cmd::tasks`' helper, and its doc's argument applies with more force here: these calls spawn a
 /// Node process and wait up to sixty seconds for it. `#[tauri::command(async)]` would only move
 /// that onto a runtime worker, where a blocking wait occupies it for the whole duration.
-async fn blocking<T>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
+pub(super) async fn blocking<T>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
 where
     T: Send + 'static,
 {
@@ -117,7 +117,7 @@ fn inside_worktrees(root: &std::path::Path, candidate: &std::path::Path) -> bool
 }
 
 /// Open the CLI for a directory, turning "no binary" into a `CoreError` the panel can print.
-fn open(cwd: PathBuf) -> Result<Openspec> {
+pub(super) fn open(cwd: PathBuf) -> Result<Openspec> {
     Openspec::open(&cwd).map_err(|error| CoreError::Io(error.to_string()))
 }
 
@@ -413,30 +413,7 @@ pub async fn spec_run_command(
     // project set up — or migrated by `openspec update` — while cide was running is answered
     // correctly with no refresh, and a list that went stale in a panel can never put a name on a
     // terminal.
-    let Some(invocation) = cide_spec::claude::line(&root, &command) else {
-        let installed = cide_spec::claude::installed(&root);
-        return Err(CoreError::Io(if installed.is_empty() {
-            // Deliberately **not** `openspec update`, which is what this said for a year and is a
-            // dead end: on a project whose tools are recorded and current it answers "all tools
-            // up to date" and writes nothing at all.
-            "this project has no OpenSpec commands for Claude Code. `openspec init --tools \
-             claude` in the project root installs them — as skills under .claude/skills/ on a \
-             current CLI, as slash commands under .claude/commands/opsx/ on an older one — and \
-             cide runs whichever it finds."
-                .to_string()
-        } else {
-            format!(
-                "this project has no `{command}` command. What it has: {}. Which commands \
-                 OpenSpec installs depends on the profile it was set up with, and cide does not \
-                 choose it.",
-                installed
-                    .iter()
-                    .map(|command| command.line.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }));
-    };
+    let invocation = resolve_command(&root, &command)?;
 
     let session = state
         .with(|ws| {
@@ -515,6 +492,37 @@ pub async fn spec_run_command(
     tracing::info!(%project, %line, "typing an OpenSpec command into the product owner");
     crate::agents::type_submitted_line(&app, session, &pty, bytes);
     Ok(())
+}
+
+/// The line this project types for one of its OpenSpec commands, or the sentence saying it has
+/// none. Shared by the console road ([`spec_run_command`]) and the session road
+/// (`spec_sessions::spec_session_start`), so both refuse a missing command in the same words.
+pub(super) fn resolve_command(root: &Path, command: &str) -> Result<String> {
+    let Some(invocation) = cide_spec::claude::line(root, command) else {
+        let installed = cide_spec::claude::installed(root);
+        return Err(CoreError::Io(if installed.is_empty() {
+            // Deliberately **not** `openspec update`, which is what this said for a year and is a
+            // dead end: on a project whose tools are recorded and current it answers "all tools
+            // up to date" and writes nothing at all.
+            "this project has no OpenSpec commands for Claude Code. `openspec init --tools \
+             claude` in the project root installs them — as skills under .claude/skills/ on a \
+             current CLI, as slash commands under .claude/commands/opsx/ on an older one — and \
+             cide runs whichever it finds."
+                .to_string()
+        } else {
+            format!(
+                "this project has no `{command}` command. What it has: {}. Which commands \
+                 OpenSpec installs depends on the profile it was set up with, and cide does not \
+                 choose it.",
+                installed
+                    .iter()
+                    .map(|command| command.line.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }));
+    };
+    Ok(invocation)
 }
 
 /// Open a change or a capability as a workspace tab, or activate the one it already has. (M28)
@@ -929,7 +937,10 @@ pub async fn spec_split_work(
 ///
 /// The name is cide's handle and not the line: the older surface spells this one `apply`, which
 /// is `cide_spec::claude`'s business and not this module's.
-fn apply_invocation(root: &Path, started: Option<std::time::SystemTime>) -> Option<String> {
+pub(super) fn apply_invocation(
+    root: &Path,
+    started: Option<std::time::SystemTime>,
+) -> Option<String> {
     let invocation = cide_spec::claude::line(root, "apply-change")?;
     if let Some(installed_at) = cide_spec::claude::installed_at(root, "apply-change")
         && let Some(started) = started
@@ -1185,7 +1196,15 @@ pub async fn spec_change_plan(
     change: ChangeName,
 ) -> Result<cide_ipc::SpecAcceptPlan> {
     let root = tasks_state::project_root(&state, project)?;
-    blocking(move || plan_change(&root, &change)).await
+    // Where Archive will actually run — `spec_change_archive`'s rule — so the preview's
+    // checklist count is the one the archive will be refused or allowed on.
+    blocking(move || {
+        plan_change(
+            &super::spec_sessions::archive_dir(&root, &change.0),
+            &change,
+        )
+    })
+    .await
 }
 
 /// Archive one change: merge its deltas into `openspec/specs/` and move it to the archive.
@@ -1219,7 +1238,12 @@ pub async fn spec_change_archive(
     let change_for_work = change.clone();
     let store_for_work = Arc::clone(&store);
     let outcome = blocking(move || {
-        let mut plan = plan_change(&root_for_work, &change_for_work)?;
+        // A change applied in its own worktree (`spec_sessions`) is archived **there** while the
+        // worktree still holds work the project's branch lacks: that is where its ticked
+        // checklist is, and the archive then lands with Publish or Integrate instead of putting
+        // requirements into the root's `specs/` ahead of the code. Anywhere else, the root.
+        let dir = super::spec_sessions::archive_dir(&root_for_work, &change_for_work.0);
+        let mut plan = plan_change(&dir, &change_for_work)?;
 
         // A task on this change whose role has a live worktree means there is code to merge, and
         // this path cannot merge it. Refuse and name where the gesture that can lives, rather
@@ -1250,7 +1274,7 @@ pub async fn spec_change_archive(
             return Ok(SpecAccepted::Refused { plan });
         }
 
-        open(root_for_work.clone())?
+        open(dir)?
             .archive(&change_for_work)
             .map_err(|error| CoreError::Io(error.to_string()))?;
         Ok(SpecAccepted::Accepted {
@@ -1661,7 +1685,7 @@ fn console_is_codex(state: &WorkspaceState, session: cide_ipc::SessionId) -> boo
 /// codex's composer answers an unknown slash command with an error — but what a skill *is* is
 /// prose instructions for a model, so a codex console is told to follow the file, with the same
 /// input. Any other line, and any line for claude, is returned as it was.
-fn for_console(codex: bool, root: &std::path::Path, line: String) -> String {
+pub(super) fn for_console(codex: bool, root: &std::path::Path, line: String) -> String {
     if !codex {
         return line;
     }
@@ -1680,6 +1704,14 @@ fn for_console(codex: bool, root: &std::path::Path, line: String) -> String {
     };
     let Some(file) = cide_spec::claude::file(root, &command.name) else {
         return line;
+    };
+    // Absolute, whatever `file` answers: a relative path is read against the *child's* directory,
+    // which for an Apply in a worktree is not `root` — and a child that got its directory wrong
+    // (a stale `$PWD`) read cide's own `.claude/` instead of the project's.
+    let file = if file.is_absolute() {
+        file
+    } else {
+        root.join(file)
     };
     let rest = line[line.find(first).map_or(0, |at| at + first.len())..].trim();
     if rest.is_empty() {
@@ -1711,12 +1743,13 @@ mod tests {
         let line = "/openspec-propose Add dark mode".to_string();
         assert_eq!(super::for_console(false, &root, line.clone()), line);
         let codex = super::for_console(true, &root, line);
-        assert!(
-            codex.starts_with(
-                "Follow the OpenSpec instructions in `.claude/skills/openspec-propose/SKILL.md`"
-            ),
-            "{codex}"
+        // Absolute: a relative path is read against the child's directory, which is not always
+        // the project root (an Apply in a worktree, or a child with a stale `$PWD`).
+        let expected = format!(
+            "Follow the OpenSpec instructions in `{}`",
+            skill.join("SKILL.md").display()
         );
+        assert!(codex.starts_with(&expected), "{codex}");
         assert!(codex.ends_with("with this input: Add dark mode"), "{codex}");
         assert_eq!(
             super::for_console(true, &root, "plain words".into()),
