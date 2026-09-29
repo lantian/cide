@@ -202,7 +202,11 @@ fn plan_session(
                 .map(|change| change.0.clone())
                 .ok_or_else(|| CoreError::Io("Merge needs the change to merge".into()))?;
             checked_change(&change)?;
-            let branch = format!("{}/{}", cide_git::worktree::BRANCH_PREFIX, checkout_for(&change));
+            let branch = format!(
+                "{}/{}",
+                cide_git::worktree::BRANCH_PREFIX,
+                checkout_for(&change)
+            );
             let line = format!(
                 "Merge the branch {branch} (the OpenSpec change {change}) into the branch this \
                  project has checked out, and resolve the conflicts. cide's Integrate could not \
