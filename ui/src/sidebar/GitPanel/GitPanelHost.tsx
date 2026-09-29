@@ -41,6 +41,7 @@ import { copyText } from '../copyText'
 import { repoRoot } from './repoRoots'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
+import { useWorktrees, type Worktrees } from '@/chrome/useWorktrees'
 import { DEFAULT_CHANGELIST, changelistIdOf, groupOf, type Row } from './model'
 import { grab, plural, trackMenuLabel } from './dragDrop'
 
@@ -86,8 +87,35 @@ export interface GitPanelProps {
  */
 export const GitPanel = memo(GitPanelImpl)
 
-function GitPanelImpl({ project, onOpenDiff, onShowHistory, onUpdate }: GitPanelProps) {
-  const git = useGitPanel(project, { onOpenDiff })
+/*
+ * Which working tree the panel shows — the project's, or an agent checkout under
+ * `.cide/worktrees/` — chosen in the header, and the model keyed by it.
+ *
+ * Keyed, i.e. a remount per choice, rather than handing the worktree to one long-lived model:
+ * the model's state is a composed commit — ticks, expansion, the merge bar, the guard bar's
+ * answers — about *one* working tree, and every one of those would otherwise have to notice the
+ * switch and reset itself. `useGitPanel` files its caches under the same pair, so switching back
+ * paints the last-known tree and ticks of that checkout at once.
+ */
+function GitPanelImpl(props: GitPanelProps) {
+  const choice = useWorktrees('panel', props.project)
+  return (
+    <GitPanelScoped
+      key={`${props.project ?? ''}\u0000${choice.worktree ?? ''}`}
+      {...props}
+      choice={choice}
+    />
+  )
+}
+
+function GitPanelScoped({
+  project,
+  onOpenDiff,
+  onShowHistory,
+  onUpdate,
+  choice,
+}: GitPanelProps & { choice: Worktrees }) {
+  const git = useGitPanel(project, { onOpenDiff, worktree: choice.worktree })
   const iconTheme = useIconTheme()
 
   /** The `Row` a menu gesture landed on, or `null` for the empty space below the tree. */
@@ -324,6 +352,10 @@ function GitPanelImpl({ project, onOpenDiff, onShowHistory, onUpdate }: GitPanel
       git={git}
       iconTheme={iconTheme}
       treeMenu={{ onContextMenu, menu }}
+      worktrees={choice.worktrees}
+      worktree={choice.worktree}
+      projectBranch={choice.projectBranch}
+      onSelectWorktree={choice.choose}
       {...(onUpdate !== undefined ? { onUpdate } : {})}
     />
   )

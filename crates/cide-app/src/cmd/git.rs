@@ -21,7 +21,7 @@
 //! **Nothing here runs on the main thread.** Every handler is `async` and hands its git work to
 //! [`blocking`]; see that function for why `#[tauri::command(async)]` on its own is not enough.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cide_git::{
     branch, changelist, commit as git_commit, conflict, diff, patch, push, shelf, stage, stash,
@@ -31,7 +31,7 @@ use cide_ipc::git::{
     BranchInfo, BranchList, ChangesTree, CheckoutMode, CheckoutOutcome, CommitOutcome,
     CommitRequest, ConflictFile, ConflictSide, ContinueOutcome, DiffSide, FetchOutcome, FileDiff,
     GitError, MergeOutcome, MergeState, PathSelection, PullRequest, PushOutcome, PushPreview,
-    PushRequest, RepoInfo, ShelfEntry, StashEntry, TreeStatusMap,
+    PushRequest, RepoInfo, ShelfEntry, StashEntry, TreeStatusMap, WorktreeInfo,
 };
 use cide_ipc::{ProjectId, RepoId, ToolTabId};
 use tauri::State;
@@ -77,19 +77,71 @@ fn roots(state: &WorkspaceState, project: ProjectId) -> Result<Vec<PathBuf>> {
 /// Takes the roots rather than the `WorkspaceState` so it can run inside [`blocking`]: reading
 /// the workspace takes a lock that must not be held across an await, while *this* is the part
 /// that touches the disk.
+///
+/// An agent worktree under `.cide/worktrees/` is found too, *after* the project's own repos: the
+/// Git panel and the Log can be pointed at one, and from then on every command they send carries
+/// the checkout's `RepoId`. Without the fallback each of those — stage, commit, diff, revert —
+/// answers `NoSuchRepo`, because discovery walks roots and submodules and a linked worktree is
+/// neither. The fallback matches only what `cide_git::worktree::list` reports, so the ids this
+/// resolves are exactly the checkouts cide made, never an arbitrary directory.
 fn repo_root(roots: &[PathBuf], repo: RepoId) -> Result<PathBuf> {
-    Ok(cide_git::repo::find(roots, repo)?.root)
+    match cide_git::repo::find(roots, repo) {
+        Ok(info) => Ok(info.root),
+        Err(error) => cide_git::worktree::find(roots, repo)
+            .map(|info| info.root)
+            .ok_or(error),
+    }
 }
 
 fn tree(roots: &[PathBuf], include_ignored: bool) -> Result<ChangesTree> {
     status::changes_tree(roots, status::StatusRequest { include_ignored })
 }
 
-/// Recompute the tree, broadcast it, and return it.
-fn refreshed(app: &tauri::AppHandle, roots: &[PathBuf], project: ProjectId) -> Result<ChangesTree> {
-    let tree = tree(roots, false)?;
-    crate::emit::git_status(app, project, &tree);
+/// The agent worktree `root` is, when it is one of this project's — `None` for a project repo.
+///
+/// The pure path test goes first so the common case, a mutation in the project's own checkout,
+/// opens nothing; only a path shaped like `<x>/.cide/worktrees/<name>` pays for the listing that
+/// proves it is one cide made.
+fn worktree_of(roots: &[PathBuf], root: &Path) -> Option<PathBuf> {
+    cide_git::worktree::root_of_checkout(root)?;
+    cide_git::worktree::resolve(roots, root)
+}
+
+/// Recompute the tree `root` belongs to, broadcast it, and return it.
+///
+/// Scoped by `root` because the panel can be looking at an agent worktree: a commit made there
+/// must answer — and broadcast — the *worktree's* tree, tagged with its path. Broadcasting the
+/// project's tree instead, as this did when every repository was a project repository, would
+/// have the panel adopt it and snap back to the project checkout the moment the user committed.
+fn refreshed(
+    app: &tauri::AppHandle,
+    roots: &[PathBuf],
+    project: ProjectId,
+    root: &Path,
+) -> Result<ChangesTree> {
+    let worktree = worktree_of(roots, root);
+    let tree = match &worktree {
+        Some(path) => tree(std::slice::from_ref(path), false)?,
+        None => tree(roots, false)?,
+    };
+    crate::emit::git_status(app, project, worktree.as_deref(), &tree);
     Ok(tree)
+}
+
+/// The roots a whole-tree call walks: the project's, or the one agent worktree the caller named.
+///
+/// A named worktree that is not one of this project's is refused rather than walked — the path
+/// comes from the webview, and "any directory the UI cares to send" is not a status the panel
+/// should be able to read.
+fn scoped(roots: Vec<PathBuf>, worktree: Option<PathBuf>) -> Result<Vec<PathBuf>> {
+    let Some(wanted) = worktree else {
+        return Ok(roots);
+    };
+    cide_git::worktree::resolve(&roots, &wanted)
+        .map(|path| vec![path])
+        .ok_or_else(|| GitError::NotARepository {
+            path: wanted.display().to_string(),
+        })
 }
 
 /// Run git work on the blocking pool.
@@ -129,9 +181,35 @@ pub async fn git_status(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     include_ignored: bool,
+    worktree: Option<PathBuf>,
 ) -> Result<ChangesTree> {
     let roots = roots(&state, project)?;
-    blocking(move || tree(&roots, include_ignored)).await
+    blocking(move || tree(&scoped(roots, worktree)?, include_ignored)).await
+}
+
+/// The agent worktrees under `.cide/worktrees/` of every repository in the project — what the
+/// Git panel's header and the Log's filter bar offer beside the project's own checkout.
+///
+/// Only cide's checkouts, never a user's own `git worktree add`: those are listed by the path
+/// filter in `cide_git::worktree::list`, and [`repo_root`]'s fallback resolves exactly this set,
+/// so a selector can never name a worktree the commands would then refuse.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_worktrees(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Vec<WorktreeInfo>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        Ok(cide_git::worktree::list_for(&roots)
+            .into_iter()
+            .map(|wt| WorktreeInfo {
+                repo: cide_git::worktree::info(&wt),
+                branch: wt.branch,
+                head: wt.head,
+            })
+            .collect())
+    })
+    .await
 }
 
 /// Which repositories a project actually contains, roots before their submodules.
@@ -268,8 +346,18 @@ pub async fn git_log(
         // names `RepoId`s and only discovery can turn those into work trees.
         let all = cide_git::repo::discover(&roots);
         let wanted: Vec<cide_ipc::git::RepoInfo> = match &query.scope {
+            // An agent worktree is only ever named alone — the Log's worktree selector pins a
+            // `One` scope — so the fallback lives here and not in the merged arm: "every repo"
+            // stays the project's, and a merged graph never grows a lane per agent checkout.
             cide_ipc::history::LogScope::One { repo } => {
-                all.into_iter().filter(|i| i.id == *repo).collect()
+                let one: Vec<_> = all.into_iter().filter(|i| i.id == *repo).collect();
+                if one.is_empty() {
+                    cide_git::worktree::find(&roots, *repo)
+                        .into_iter()
+                        .collect()
+                } else {
+                    one
+                }
             }
             cide_ipc::history::LogScope::Merged { repos } if repos.is_empty() => all,
             cide_ipc::history::LogScope::Merged { repos } => {
@@ -629,7 +717,7 @@ pub async fn git_stage(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         stage::stage(&root, &selections)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -646,7 +734,7 @@ pub async fn git_unstage(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         stage::unstage(&root, &selections)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -666,7 +754,7 @@ pub async fn git_rollback(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         stage::rollback(&root, &selections)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -685,7 +773,7 @@ pub async fn git_commit(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = git_commit::commit(&root, &request)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -719,7 +807,7 @@ pub async fn git_push(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = push::push(&root, &request, &proxy)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -829,7 +917,7 @@ pub async fn git_branch_create(
         if checkout {
             branch::checkout(&root, &name, CheckoutMode::Refuse)?;
         }
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(lists(&roots))
     })
     .await
@@ -854,7 +942,7 @@ pub async fn git_branch_checkout(
         let root = repo_root(&roots, repo)?;
         let outcome = branch::checkout(&root, &name, mode)?;
         // A switch rewrites the working tree, so every open panel is looking at stale status.
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -892,7 +980,7 @@ pub async fn git_branch_rename(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         branch::rename(&root, &from, &to)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(lists(&roots))
     })
     .await
@@ -913,7 +1001,7 @@ pub async fn git_branch_delete(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         branch::delete(&root, &name, force)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(lists(&roots))
     })
     .await
@@ -935,7 +1023,7 @@ pub async fn git_fetch(
         let root = repo_root(&roots, repo)?;
         let outcome = branch::fetch(&root, remote.as_deref(), &proxy)?;
         // Nothing in the working tree moved, but every branch row's behind-count did.
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -970,7 +1058,7 @@ pub async fn git_pull(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::pull::pull_with(&root, &request, fallback, &proxy);
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         outcome
     })
     .await
@@ -997,7 +1085,7 @@ pub async fn git_merge(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::merge::merge_into_head(&root, &name);
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         outcome
     })
     .await
@@ -1048,7 +1136,7 @@ pub async fn git_conflict_resolve(
         let root = repo_root(&roots, repo)?;
         conflict::resolve(&root, &path, content.as_bytes())?;
         let state = conflict::state(&root)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(state)
     })
     .await
@@ -1069,7 +1157,7 @@ pub async fn git_conflict_take(
         let root = repo_root(&roots, repo)?;
         conflict::take_side(&root, &path, side)?;
         let state = conflict::state(&root)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(state)
     })
     .await
@@ -1089,7 +1177,7 @@ pub async fn git_conflict_unresolve(
         let root = repo_root(&roots, repo)?;
         conflict::unresolve(&root, &path)?;
         let state = conflict::state(&root)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(state)
     })
     .await
@@ -1108,7 +1196,7 @@ pub async fn git_merge_continue(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = conflict::cont(&root, message.as_deref());
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         outcome
     })
     .await
@@ -1126,7 +1214,7 @@ pub async fn git_merge_abort(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = conflict::abort(&root);
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         outcome
     })
     .await
@@ -1150,7 +1238,7 @@ pub async fn git_adopt_index(
         let root = repo_root(&roots, repo)?;
         let handle = cide_git::repo::open(&root)?;
         changelist::record_index(&root, &handle)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1171,7 +1259,7 @@ pub async fn git_set_use_staging_area(
             data.use_staging_area = enabled;
             Ok(())
         })?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1191,7 +1279,7 @@ pub async fn git_changelist_create(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         changelist::update(&root, |data| data.create(&name, &comment))?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1210,7 +1298,7 @@ pub async fn git_changelist_rename(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         changelist::update(&root, |data| data.rename(&id, &name, &comment))?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1227,7 +1315,7 @@ pub async fn git_changelist_delete(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         changelist::update(&root, |data| data.delete(&id))?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1245,7 +1333,7 @@ pub async fn git_changelist_move_paths(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         changelist::update(&root, |data| data.move_paths(&id, &paths))?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1268,7 +1356,7 @@ pub async fn git_changelist_set_active(
         let root = repo_root(&roots, repo)?;
         let live = status::live_paths(&root)?;
         changelist::update(&root, |data| data.set_active(&id, &live))?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1288,7 +1376,7 @@ pub async fn git_shelve(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let entry = shelf::shelve(&root, &name, &selections)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(entry)
     })
     .await
@@ -1307,7 +1395,7 @@ pub async fn git_unshelve(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         shelf::unshelve(&root, &id, keep)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1372,7 +1460,7 @@ pub async fn git_stash_save(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         stash::save(&root, &message, include_untracked)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1403,7 +1491,7 @@ pub async fn git_stash_pop(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         stash::pop(&root, index)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1420,7 +1508,7 @@ pub async fn git_stash_apply(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         stash::apply(&root, index)?;
-        refreshed(&app, &roots, project)
+        refreshed(&app, &roots, project, &root)
     })
     .await
 }
@@ -1459,7 +1547,7 @@ pub async fn git_stash_drop(
  * gets its tree — through the `refreshed` broadcast below, on `cide://git-status`, which is
  * the channel the watcher and every other window already listen on.
  *
- * **Every mutating one ends with `let _ = refreshed(&app, &roots, project);`.** A reset, a
+ * **Every mutating one ends with `let _ = refreshed(&app, &roots, project, &root);`.** A reset, a
  * revert, a cherry-pick and a detach all rewrite the working tree, so every open panel in
  * every window is looking at a `ChangesTree` describing a repository that no longer exists.
  * `git_tag_create` calls it too even though it moves no file: a tag changes the ref
@@ -1509,7 +1597,7 @@ pub async fn git_revert(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::replay::revert(&root, &request)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -1533,7 +1621,7 @@ pub async fn git_cherry_pick(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::replay::cherry_pick(&root, &request)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -1586,7 +1674,7 @@ pub async fn git_reset(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::reset::reset(&root, &request)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -1619,7 +1707,7 @@ pub async fn git_tag_create(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let outcome = cide_git::tag::create(&root, &request)?;
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await
@@ -1652,7 +1740,7 @@ pub async fn git_checkout_detached(
         let root = repo_root(&roots, repo)?;
         let outcome = branch::checkout_detached(&root, &revision, mode)?;
         // The working tree is now some other commit's. Same reason as `git_branch_checkout`.
-        let _ = refreshed(&app, &roots, project);
+        let _ = refreshed(&app, &roots, project, &root);
         Ok(outcome)
     })
     .await

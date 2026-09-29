@@ -727,6 +727,9 @@ pub enum SpecOp {
     /// Implement one change. In `.cide/worktrees/spec-<change>` when the project's
     /// `openspec.applyInWorktree` is on, otherwise in the root.
     Apply,
+    /// Merge a change's `cide/spec-<change>` into the checked-out branch and resolve what
+    /// conflicts — the way out Integrate offers when it could not merge by itself. In the root.
+    Merge,
 }
 
 /// Who runs an OpenSpec session.
@@ -847,6 +850,10 @@ pub enum SpecIntegrated {
         #[ts(optional)]
         commit: Option<String>,
         files: u32,
+        /// The root's own copies of files in the change's folder that the user edited while the
+        /// session worked, set aside rather than dropped when the branch's versions landed — as
+        /// paths under the project root, where they now are.
+        kept: Vec<String>,
     },
     UpToDate,
     /// The merge would conflict; nothing changed.

@@ -252,25 +252,44 @@
 
 /* -------------------------------------------------------------------------- the tree */
 
-.section {
+/*
+ * A section's head is the kit's caption — small, uppercase, `--faint`, the count at the right —
+ * as a button, because it folds. The same caption heads the sessions list, so the panel has one
+ * kind of heading, not three.
+ */
+.caption {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   width: 100%;
-  padding: var(--sp-1) var(--sp-5);
+  margin: 0;
+  padding: var(--sp-4) var(--sp-5) var(--sp-2);
   font: inherit;
+  font-size: var(--fs-ui-11);
   font-weight: 600;
-  color: var(--dim);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
   background: none;
   border: 0;
-  cursor: pointer;
   text-align: left;
 }
 
-.sectionCount {
-  margin-left: auto;
-  font-size: var(--fs-ui-11);
+button.caption {
+  cursor: pointer;
+}
+
+button.caption:hover {
   color: var(--dim);
+}
+
+.captionCount {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
 }
 
 /*
@@ -279,43 +298,20 @@
  * even then it is a caption rather than content.
  */
 .sectionHint {
-  padding: 0 var(--sp-5) var(--sp-2) calc(var(--sp-5) + var(--sp-4));
+  padding: 0 var(--sp-5) var(--sp-2);
   color: var(--faint);
   font-size: var(--fs-ui-11);
   line-height: 1.45;
 }
 
-/*
- * A change row is two controls side by side: the row itself, and the action.
- *
- * Siblings in a wrapper and not a button inside a button, which is not legal markup — the browser
- * un-nests it and the inner control ends up outside the row it belongs to.
- */
-.changeRow {
-  display: flex;
-  align-items: center;
-}
-
-.changeRow .row {
-  flex: 1;
-  min-width: 0;
-  padding-right: var(--sp-2);
-}
-
-.rowAction {
-  composes: button sm quiet from '../../kit/components/Button.module.css';
-  flex: 0 0 auto;
-  margin-right: var(--sp-5);
-}
-
-
-
+/* A capability: one compact line, the kit's `Row`. */
 .row {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   width: 100%;
-  padding: var(--sp-1) var(--sp-5) var(--sp-1) calc(var(--sp-5) + var(--sp-4));
+  min-height: calc(26px * var(--ui-scale));
+  padding: 0 var(--sp-5);
   font: inherit;
   background: none;
   border: 0;
@@ -329,42 +325,161 @@
 }
 
 .rowLabel {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .rowMeta {
-  margin-left: auto;
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--dim);
-  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
 }
 
-/* ------------------------------------------------------------------------ the stages */
+/* ------------------------------------------------------------------- a change, as a card */
 
-.stage {
-  flex: 0 0 auto;
-  font-size: var(--fs-ui-11);
-  padding: 0 var(--sp-1);
+/*
+ * Four lines, each with one job: what (name, steps), where (stage, session), how far (a bar), and
+ * what to do (the acts). A card and not a row because a change carries up to four controls, and
+ * a row that grew them wrapped into the ragged block this replaced.
+ */
+.changeCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0 var(--sp-4) var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--panel);
+}
+
+.changeCard:hover {
+  border-color: var(--border);
+}
+
+.changeHead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-hi);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.changeHead:hover .rowLabel {
+  text-decoration: underline;
+}
+
+.changeHead:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
   border-radius: var(--r-1);
-  border: 1px solid var(--border);
-  color: var(--dim);
 }
 
-.stageReady {
-  border-color: var(--green);
-  color: var(--green);
+.changeFacts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  min-width: 0;
 }
 
-.stageInProgress {
-  border-color: var(--accent);
-  color: var(--accent);
+.changeSession {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
 }
 
-.stageInvalid {
-  border-color: var(--red);
-  color: var(--red);
+.changeWho {
+  min-width: 0;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The checklist, as a hairline: the figure is on the head, this is the glance. */
+.changeBar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border-soft);
+  overflow: hidden;
+}
+
+.changeBar > span {
+  display: block;
+  height: 100%;
+  background: var(--green);
+  transform-origin: left center;
+}
+
+/* Acts in a fixed order: the finished change's roads, a gap, then the way to the work. */
+.changeActs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.changeActsGap {
+  flex: 1;
+}
+
+/* ------------------------------------------------------------------------- sessions */
+
+.sessions {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.sessions .caption {
+  padding-top: var(--sp-3);
+}
+
+.sessionRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-1) var(--sp-3) var(--sp-1) var(--sp-5);
+}
+
+.sessionRow:hover {
+  background: var(--panel-2);
+}
+
+.sessionText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sessionCaption,
+.sessionMeta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionMeta {
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
 }
 
 /* ------------------------------------------------------------- the requirement editor (M28) */
@@ -478,44 +593,4 @@
 
 .editorProblemLine {
   font-family: var(--font-mono);
-}
-
-/* ------------------------------------------------------------ OpenSpec sessions */
-
-/*
- * A change row's second line: the session's state and the acts a finished change offers. Under
- * the row rather than beside it — a 320px panel has room for one control beside a change's name,
- * and Publish / Integrate / Archive are three.
- */
-.rowActs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: 0 var(--sp-5) var(--sp-2) calc(var(--sp-5) + var(--sp-4) + var(--sp-4));
-}
-
-/* The sessions with no change yet — a Propose or an Explore — above the tree. */
-.sessions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-1);
-  padding: var(--sp-2) var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.sessionRow {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
-.sessionCaption {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--fs-ui-12);
 }

@@ -43,6 +43,25 @@ pub struct RepoInfo {
     pub is_submodule: bool,
 }
 
+/// An agent's checkout under `.cide/worktrees/`, as the Git panel's and the Log's worktree
+/// selectors offer it.
+///
+/// Carries a whole [`RepoInfo`] rather than a path because everything the panel does after the
+/// choice is keyed by `RepoId` — stage, commit, diff, the log's scope — and the backend resolves
+/// exactly these ids as a fallback behind the project's own repositories. `repo.root` is the
+/// checkout's canonical path, which is what `git_status` takes to walk it alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct WorktreeInfo {
+    /// The checkout as a repository; `repo.name` is its `<role>-<task>` directory name.
+    pub repo: RepoInfo,
+    /// What `HEAD` is on now — normally `cide/<name>`, read rather than assumed.
+    pub branch: String,
+    /// Full hex id `HEAD` resolves to; empty on an unborn `HEAD`.
+    pub head: String,
+}
+
 /// An absolute path resolved to the repository that contains it. (M18)
 ///
 /// Absolute in, repo-relative out. Every surface that starts from a *file* — blame on the open

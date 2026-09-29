@@ -166,3 +166,21 @@ export function commitChoice(rows: readonly BranchRow[], highlight: number): Bra
   const real = rows.filter((r) => !r.synthetic)
   return real.length === 1 ? (real[0] ?? null) : null
 }
+
+/**
+ * The worktree a branch row's branch is checked out in, as that checkout's directory name, or
+ * `null` for a plain branch — and for *Current branch*, *All branches* and a bare revision, which
+ * are not branches at all. The branch box draws a folder and this name for the first, a branch
+ * mark for the second: the Log's separate worktree picker was dropped as redundant, because a
+ * worktree's branch in this list already shows its history.
+ *
+ * Structural rather than `WorktreeInfo`, so this module stays import-free for `check:log`.
+ */
+export function worktreeOfRow(
+  value: string,
+  worktrees: readonly { branch: string; repo: { name: string } }[],
+): string | null {
+  if (!value.startsWith('b:')) return null
+  const name = value.slice(2)
+  return worktrees.find((wt) => wt.branch === name)?.repo.name ?? null
+}

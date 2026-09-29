@@ -106,7 +106,9 @@
 }
 
 .branchRow {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
   width: 100%;
   padding: 3px 8px;
   border: 0;
@@ -136,6 +138,22 @@
   /* The kit's "selected": `--sel`, not an accent bar with inverted text. */
   background: var(--sel);
   color: var(--text-hi);
+}
+
+/* The name takes the room; the worktree's directory sits after it, quieter. */
+.branchRowLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A worktree row's directory, after its branch: the part that tells two checkouts apart. */
+.branchRowDetail {
+  margin-left: auto;
+  padding-left: var(--sp-3);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
 }
 
 .branchNote {

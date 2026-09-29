@@ -3,4 +3,10 @@
 /**
  * What Integrate did. Never archives — that is its own button.
  */
-export type SpecIntegrated = { "kind": "merged", commit?: string, files: number, } | { "kind": "upToDate" } | { "kind": "conflicts", paths: Array<string>, } | { "kind": "refused", reason: string, };
+export type SpecIntegrated = { "kind": "merged", commit?: string, files: number, 
+/**
+ * The root's own copies of files in the change's folder that the user edited while the
+ * session worked, set aside rather than dropped when the branch's versions landed — as
+ * paths under the project root, where they now are.
+ */
+kept: Array<string>, } | { "kind": "upToDate" } | { "kind": "conflicts", paths: Array<string>, } | { "kind": "refused", reason: string, };

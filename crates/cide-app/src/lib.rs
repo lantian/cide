@@ -480,6 +480,7 @@ pub fn run() {
             cmd::diag::diag_log,
             cmd::git::git_status,
             cmd::git::git_repos,
+            cmd::git::git_worktrees,
             cmd::git::git_locate,
             cmd::git::file_properties_git,
             cmd::git::git_blame,

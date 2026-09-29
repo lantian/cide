@@ -105,6 +105,28 @@ const SURFACES: &[Surface] = &[
     },
 ];
 
+/// Where `openspec init --tools codex` puts the same skills, newest first — see [`codex_line`].
+///
+/// Only skills: codex never had OpenSpec slash commands, so there is no older shape to rename
+/// from and `renames` is empty in both rows.
+const CODEX_SURFACES: &[Surface] = &[
+    // `skillsDir: '.agents'` in the CLI's tool table — the directory codex shares with other
+    // agents that read `.agents/skills/`.
+    Surface {
+        dir: ".agents/skills",
+        entry: "openspec-{name}/SKILL.md",
+        line: "$openspec-{name}",
+        renames: &[],
+    },
+    // `legacySkillsDirs: ['.codex']`: what an older CLI wrote, still on disk and still read.
+    Surface {
+        dir: ".codex/skills",
+        entry: "openspec-{name}/SKILL.md",
+        line: "$openspec-{name}",
+        renames: &[],
+    },
+];
+
 /// Is this a name cide may look up and interpolate?
 ///
 /// The value reaches [`line`] from the frontend and is about to be joined onto a path *and*
@@ -123,10 +145,31 @@ pub fn valid_name(name: &str) -> bool {
 /// project that was set up — or migrated — while cide was running gets the right line without a
 /// board refresh, and a stale list in a panel can never put a name on a terminal.
 pub fn line(root: &Path, name: &str) -> Option<String> {
+    line_in(SURFACES, root, name)
+}
+
+/// What a **codex** conversation in this project types to run `name`, or `None` if codex has no
+/// such skill here.
+///
+/// # Why codex is its own table and not a third row of [`SURFACES`]
+///
+/// Because it is a different *reader*, not a different layout for the same one. `openspec init
+/// --tools codex` writes the very same skills — `openspec-apply-change/SKILL.md` — but under
+/// `.agents/skills/` (`.codex/skills/` on an older CLI), and codex invokes a skill as
+/// `$openspec-apply-change`: it answers `/openspec-apply-change` with an unknown-command error,
+/// which is what every codex console got until this existed. A row in `SURFACES` would have
+/// offered `$…` to Claude Code on a project with only the codex files, the same failure pointed
+/// the other way. (Upstream's own table: `SKILL_INVOCATION_PREFIX` in the CLI's
+/// `utils/command-references.js`, verified against 1.10.0.)
+pub fn codex_line(root: &Path, name: &str) -> Option<String> {
+    line_in(CODEX_SURFACES, root, name)
+}
+
+fn line_in(surfaces: &[Surface], root: &Path, name: &str) -> Option<String> {
     if !valid_name(name) {
         return None;
     }
-    SURFACES.iter().find_map(|surface| {
+    surfaces.iter().find_map(|surface| {
         let local = surface.spelling(name);
         entry_path(root, surface, &local)
             .is_file()
@@ -169,10 +212,19 @@ pub fn file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
 }
 
 pub fn installed_at(root: &Path, name: &str) -> Option<std::time::SystemTime> {
+    installed_at_in(SURFACES, root, name)
+}
+
+/// [`installed_at`] for codex's copy of the skill — see [`codex_line`].
+pub fn codex_installed_at(root: &Path, name: &str) -> Option<std::time::SystemTime> {
+    installed_at_in(CODEX_SURFACES, root, name)
+}
+
+fn installed_at_in(surfaces: &[Surface], root: &Path, name: &str) -> Option<std::time::SystemTime> {
     if !valid_name(name) {
         return None;
     }
-    SURFACES.iter().find_map(|surface| {
+    surfaces.iter().find_map(|surface| {
         entry_path(root, surface, &surface.spelling(name))
             .metadata()
             .ok()
@@ -411,6 +463,58 @@ mod tests {
         std::fs::create_dir_all(root.join(".claude/skills/openspec-propose")).expect("the dir");
         assert_eq!(line(&root, "propose"), None);
         assert!(installed(&root).is_empty());
+    }
+
+    #[test]
+    fn codex_types_the_skill_with_a_dollar_from_its_own_directory() {
+        // Codex answers `/openspec-apply-change` with an unknown command; it runs a skill as
+        // `$openspec-apply-change`, and reads it from `.agents/skills/`, not `.claude/`.
+        let root = scratch("codex");
+        assert_eq!(codex_line(&root, "apply-change"), None, "nothing yet");
+        touch(&root, ".claude/skills/openspec-apply-change/SKILL.md");
+        assert_eq!(
+            codex_line(&root, "apply-change"),
+            None,
+            "Claude Code's copy is not codex's"
+        );
+        touch(&root, ".agents/skills/openspec-apply-change/SKILL.md");
+        touch(&root, ".agents/skills/release/SKILL.md");
+        assert_eq!(
+            codex_line(&root, "apply-change").as_deref(),
+            Some("$openspec-apply-change")
+        );
+        assert_eq!(
+            codex_line(&root, "release"),
+            None,
+            "the project's own skill"
+        );
+        assert!(codex_installed_at(&root, "apply-change").is_some());
+        assert_eq!(
+            line(&root, "apply-change").as_deref(),
+            Some("/openspec-apply-change"),
+            "and Claude Code's line is untouched by codex's files"
+        );
+    }
+
+    #[test]
+    fn codex_reads_the_legacy_directory_and_prefers_the_current_one() {
+        let root = scratch("codex-legacy");
+        touch(&root, ".codex/skills/openspec-propose/SKILL.md");
+        assert_eq!(
+            codex_line(&root, "propose").as_deref(),
+            Some("$openspec-propose")
+        );
+        std::fs::create_dir_all(root.join(".agents/skills/openspec-explore")).expect("the dir");
+        assert_eq!(
+            codex_line(&root, "explore"),
+            None,
+            "a skill directory without its file is not a command"
+        );
+        touch(&root, ".agents/skills/openspec-propose/SKILL.md");
+        assert_eq!(
+            codex_line(&root, "propose").as_deref(),
+            Some("$openspec-propose")
+        );
     }
 
     #[test]

@@ -255,9 +255,9 @@ try {
       eq(board.readyActs, [], 'and a panel with no session handlers draws none of it')
       eq(
         sessions.dismissals,
-        1,
-        'an ended session can be dismissed — and only that one: the live Propose and the ' +
-          'working Apply keep theirs',
+        2,
+        'the ended Explore and the waiting Propose can be dismissed (a Claude at its prompt never ' +
+          'ends by itself); the Apply mid-turn cannot, and a change’s session has no × at all',
       )
     }
 
@@ -865,7 +865,7 @@ try {
       // And the content starts on the same left edge as the title, which is the other half of
       // looking like one panel: a header at one indent over rows at another reads as a fault.
       ok(
-        /\.section \{[^}]*padding:[^;]*var\(--sp-5\)/.test(css),
+        /\.caption \{[^}]*padding:[^;]*var\(--sp-5\)/.test(css),
         'section rows start on the header’s own left edge',
       )
     }

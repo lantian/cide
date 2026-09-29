@@ -33,7 +33,8 @@ import { Button } from '@/kit/components/Button'
 import { Banner } from '@/kit/components/Feedback'
 import { PanelHeader, Tabs } from '@/kit/components/Surface'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import type { ProjectId, RepoId } from '@/ipc/client'
+import type { ProjectId, RepoId, WorktreeInfo } from '@/ipc/client'
+import { WorktreeSelect } from '@/chrome/WorktreeSelect'
 import type { IconTheme } from '@/icons/iconFor'
 import { ChangelistDialog } from './ChangelistDialog'
 import { ChangesTree } from './ChangesTree'
@@ -84,6 +85,17 @@ export interface GitPanelViewProps {
    * notice are one code path and not two.
    */
   onUpdate?: (() => void) | undefined
+  /**
+   * The agent checkouts under `.cide/worktrees/` the header can switch to. Absent or empty, the
+   * header keeps its plain branch readout — the common project with no agents draws exactly
+   * what it drew before.
+   */
+  worktrees?: readonly WorktreeInfo[] | undefined
+  /** The checkout shown — its path — or `null` for the project's own. */
+  worktree?: string | null | undefined
+  /** The project's branch, for the selector's first row while a checkout is shown. */
+  projectBranch?: string | null | undefined
+  onSelectWorktree?: ((worktree: string | null) => void) | undefined
 }
 
 export function GitPanelView({
@@ -92,6 +104,10 @@ export function GitPanelView({
   iconTheme,
   treeMenu,
   onUpdate,
+  worktrees = [],
+  worktree = null,
+  projectBranch = null,
+  onSelectWorktree,
 }: GitPanelViewProps) {
   const [tab, setTab] = useState<PanelTab>('commit')
   /*
@@ -147,7 +163,26 @@ export function GitPanelView({
       <PanelHeader
         title="Git"
         tools={
-          repos.length === 1 && repos[0] !== undefined && repos[0].branch.head !== '' ? (
+          /*
+           * With agent checkouts to choose from the readout becomes a selector: its trigger
+           * still names the branch shown, and choosing a checkout re-points every row, stage
+           * and commit below at that working tree and nothing else. The project's row names the
+           * project's branch — read from the view while it is the one shown, since that is
+           * fresher than the host's copy.
+           */
+          worktrees.length > 0 && onSelectWorktree !== undefined ? (
+            <WorktreeSelect
+              audit="gitWorktree"
+              worktrees={worktrees}
+              value={worktree}
+              projectBranch={
+                worktree === null && repos.length === 1 && repos[0] !== undefined
+                  ? repos[0].branch.head
+                  : projectBranch
+              }
+              onChange={onSelectWorktree}
+            />
+          ) : repos.length === 1 && repos[0] !== undefined && repos[0].branch.head !== '' ? (
             <span className={styles.branch}>
               <Icon name="git-branch" size={0} />
               <span className={styles.branchName}>{repos[0].branch.head}</span>

@@ -1090,7 +1090,7 @@ export const SETUP_LABEL = 'Set up OpenSpec'
  */
 export const SETUP_BUSY_LABEL = 'Setting up…'
 export const SETUP_TITLE =
-  'Runs `openspec init` here. Adds an openspec/ folder to this repository, and OpenSpec’s own workflow commands to this project’s Claude Code. The project’s Claude conversation then restarts — keeping its transcript — so those commands are known to it.'
+  'Runs `openspec init` here. Adds an openspec/ folder to this repository, and OpenSpec’s own workflow commands to this project’s Claude Code and Codex. The project’s Claude conversation then restarts — keeping its transcript — so those commands are known to it.'
 
 /**
  * What to say once Set up has landed, per how the console reload went.
@@ -1285,7 +1285,7 @@ export const RETRY_LABEL = 'Check again'
  */
 
 /** Which OpenSpec workflow a session runs — the wire's `SpecOp`. */
-export type SessionOp = 'propose' | 'explore' | 'apply'
+export type SessionOp = 'propose' | 'explore' | 'apply' | 'merge'
 
 /** A kit `Badge` tone, spelled here so this module imports nothing. */
 export type SessionTone = 'neutral' | 'blue' | 'yellow' | 'green' | 'red'
@@ -1296,6 +1296,11 @@ export interface SessionStateView {
   tone: SessionTone
   /** Queued, working, or holding its turn — a second Apply of the change would double it. */
   live: boolean
+  /**
+   * Mid-turn right now. The one state a session cannot be dismissed from — the user may want
+   * what it is doing; a waiting one (a Claude at its prompt never ends by itself) can be.
+   */
+  working: boolean
 }
 
 /**
@@ -1308,24 +1313,24 @@ export interface SessionStateView {
 export function sessionState(state: { state: string }): SessionStateView {
   switch (state.state) {
     case 'queued':
-      return { label: 'Queued', tone: 'neutral', live: true }
+      return { label: 'Queued', tone: 'neutral', live: true, working: false }
     case 'starting':
     case 'running':
-      return { label: 'Working', tone: 'blue', live: true }
+      return { label: 'Working', tone: 'blue', live: true, working: true }
     case 'awaitingPermission':
-      return { label: 'Needs you', tone: 'yellow', live: true }
+      return { label: 'Needs you', tone: 'yellow', live: true, working: false }
     case 'paused':
-      return { label: 'Paused', tone: 'neutral', live: true }
+      return { label: 'Paused', tone: 'neutral', live: true, working: false }
     case 'idle':
-      return { label: 'Waiting', tone: 'green', live: true }
+      return { label: 'Waiting', tone: 'green', live: true, working: false }
     case 'interrupted':
-      return { label: 'Interrupted', tone: 'neutral', live: false }
+      return { label: 'Interrupted', tone: 'neutral', live: false, working: false }
     case 'finished':
-      return { label: 'Ended', tone: 'neutral', live: false }
+      return { label: 'Ended', tone: 'neutral', live: false, working: false }
     case 'failed':
-      return { label: 'Failed', tone: 'red', live: false }
+      return { label: 'Failed', tone: 'red', live: false, working: false }
     default:
-      return { label: state.state, tone: 'neutral', live: false }
+      return { label: state.state, tone: 'neutral', live: false, working: false }
   }
 }
 
@@ -1333,6 +1338,7 @@ const OP_WORD: Readonly<Record<SessionOp, string>> = {
   propose: 'Propose',
   explore: 'Explore',
   apply: 'Apply',
+  merge: 'Merge',
 }
 
 /** A session tab's title: `Apply · add-dark-mode · developer`, or `Explore · Claude`. */
@@ -1363,7 +1369,7 @@ export const APPLY_TITLE =
   'No task is created. The tab can be closed; the work goes on and its state shows here.'
 
 /** The × on an ended session: it leaves the panel for good (the registry forgets it). */
-export const DISMISS_SESSION_LABEL = 'Dismiss this ended session'
+export const DISMISS_SESSION_LABEL = 'Dismiss this session — a waiting one is stopped'
 
 export const OPEN_SESSION_LABEL = 'Open session'
 export const OPEN_SESSION_TITLE =

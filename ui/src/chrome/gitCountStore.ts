@@ -185,8 +185,12 @@ export function useGitChangeCount(project: ProjectId | null): number | null {
   useEffect(() => {
     if (project === null) return
     // Carries the whole recomputed tree, so this costs no round trip at all.
-    const stop = events.onGitStatus((changed: ProjectId, tree: ChangesTree) => {
-      if (changed === useGitCount.getState().project) noteChangeCount(changed, tree)
+    // A tree tagged with a worktree is one agent checkout's, broadcast because the Git panel was
+    // looking at it when it committed — not the project's count, so it must not replace it.
+    const stop = events.onGitStatus((changed: ProjectId, tree: ChangesTree, worktree) => {
+      if (worktree === null && changed === useGitCount.getState().project) {
+        noteChangeCount(changed, tree)
+      }
     })
     return () => void stop.then((off: () => void) => off())
   }, [project])

@@ -36,7 +36,7 @@ use cide_ipc::{
 };
 use tauri::{AppHandle, State};
 
-use super::spec::{apply_invocation, blocking, for_console, resolve_command};
+use super::spec::{apply_invocation, blocking, follow_file, for_harness, resolve_command};
 use crate::agents::{AgentRegistry, DispatchSpec, RunPurpose, SpecPurpose};
 use crate::tasks_state;
 use crate::workspace_state::WorkspaceState;
@@ -182,7 +182,7 @@ fn plan_session(
             } else {
                 "explore"
             };
-            let invocation = resolve_command(root, command)?;
+            let invocation = resolve_command(root, command, harness == Harness::Codex)?;
             let line = if text.is_empty() {
                 invocation
             } else {
@@ -192,8 +192,28 @@ fn plan_session(
                 root.to_path_buf(),
                 None,
                 None,
-                for_console(harness != Harness::Claude, root, line),
+                for_harness(harness, root, line),
             )
+        }
+        SpecOp::Merge => {
+            let change = request
+                .change
+                .as_ref()
+                .map(|change| change.0.clone())
+                .ok_or_else(|| CoreError::Io("Merge needs the change to merge".into()))?;
+            checked_change(&change)?;
+            let branch = format!("{}/{}", cide_git::worktree::BRANCH_PREFIX, checkout_for(&change));
+            let line = format!(
+                "Merge the branch {branch} (the OpenSpec change {change}) into the branch this \
+                 project has checked out, and resolve the conflicts. cide's Integrate could not \
+                 merge it by itself."
+            );
+            let line = if text.is_empty() {
+                line
+            } else {
+                format!("{line} {text}")
+            };
+            (root.to_path_buf(), None, Some(change), line)
         }
         SpecOp::Apply => {
             let change = request
@@ -212,7 +232,7 @@ fn plan_session(
                 let name = checkout_for(&change);
                 let tree = cide_git::worktree::ensure(root, &name)
                     .map_err(|error| CoreError::Io(error.to_string()))?;
-                carry_change(root, &tree.path, &change)?;
+                carry_change(root, &tree.path, &change, &carried_dir(root, &name))?;
                 (tree.path, Some(name))
             } else {
                 (root.to_path_buf(), None)
@@ -220,18 +240,30 @@ fn plan_session(
             // The slash form only where the session will find the skill: a claude standing in a
             // worktree whose checkout lacks it (the skills were never committed) would answer
             // `Unknown command`, so it is handed the root's file instead, as codex always is.
+            //
+            // Codex has its own copy under `.agents/skills/`, invoked `$openspec-apply-change`, and
+            // gets it on the same terms: only where the session stands next to it. Codex finds a
+            // project's skills from its working directory, and a worktree whose checkout lacks
+            // `.agents/` (never committed) is not guaranteed to reach the root's — so it falls
+            // back to the root's file like claude does, rather than typing a `$` line into a
+            // conversation that may not have it.
             let invocation = apply_invocation(&cwd, None).or_else(|| apply_invocation(root, None));
             let slash_works = harness == Harness::Claude && apply_invocation(&cwd, None).is_some();
-            let line = match invocation {
-                Some(invocation) => {
+            let dollar = (harness == Harness::Codex)
+                .then(|| cide_spec::claude::codex_line(&cwd, "apply-change"))
+                .flatten();
+            let line = match (dollar, invocation) {
+                (Some(dollar), _) => format!("{dollar} {change}"),
+                (None, Some(invocation)) => {
                     let line = format!("{invocation} {change}");
                     if slash_works {
                         line
                     } else {
-                        for_console(true, root, line)
+                        // The root's file, never the root's `$` line (see above).
+                        follow_file(root, line)
                     }
                 }
-                None => format!(
+                (None, None) => format!(
                     "Implement the OpenSpec change {change} as your instructions describe, \
                      starting with its apply instructions."
                 ),
@@ -249,7 +281,13 @@ fn plan_session(
         request.op,
         change.as_deref(),
         cide_spec::discover::find().ok().as_deref(),
-        cide_spec::claude::line(root, "apply-change").as_deref(),
+        // The line this session's own CLI answers to — codex's `$` spelling for codex, which has
+        // no use for Claude Code's.
+        match harness {
+            Harness::Codex => cide_spec::claude::codex_line(root, "apply-change"),
+            _ => cide_spec::claude::line(root, "apply-change"),
+        }
+        .as_deref(),
         checkout.is_some(),
     );
     Ok(DispatchSpec {
@@ -277,6 +315,7 @@ fn plan_session(
             checkout,
             launcher: request.launcher,
             brief,
+            dismissed: false,
         }),
         // Resolved at the fork, like a review's.
         pool: Vec::new(),
@@ -300,17 +339,60 @@ fn harness_label(harness: Harness) -> &'static str {
 /// checkout with no such change and report that there is nothing to apply. Copied, not moved:
 /// the root keeps its copy, so the panel still shows the change and its checklist, and the
 /// worktree's copy is committed with the work.
-fn carry_change(root: &Path, checkout: &Path, change: &str) -> Result<()> {
+///
+/// And a **base** copy beside it, under `.cide/spec-carried/spec-<change>/base/`: the folder
+/// exactly as it was carried. Integrate compares the root's copy with it — a file the user has
+/// not touched since is dropped when the branch's version lands, and one they edited while the
+/// session worked is kept (see [`settle_parked`]). Without the base the two cannot be told apart,
+/// and the root's copy is always "different" from the branch's, which has the ticks.
+fn carry_change(root: &Path, checkout: &Path, change: &str, carried: &Path) -> Result<()> {
     let from = root.join("openspec/changes").join(change);
     let to = checkout.join("openspec/changes").join(change);
     if to.is_dir() {
         return Ok(());
     }
-    copy_dir(&from, &to).map_err(|error| {
+    let failed = |error: std::io::Error| {
         CoreError::Io(format!(
             "could not copy {change} into its worktree: {error}"
         ))
-    })
+    };
+    copy_dir(&from, &to).map_err(failed)?;
+    let base = carried.join("base").join("openspec/changes").join(change);
+    let _ = std::fs::remove_dir_all(&base);
+    copy_dir(&from, &base).map_err(failed)
+}
+
+/// `.cide/spec-carried/<checkout>`: the base copy [`carry_change`] made, and what Integrate parks.
+fn carried_dir(root: &Path, checkout: &str) -> PathBuf {
+    root.join(cide_agents::config::CIDE_DIR)
+        .join("spec-carried")
+        .join(checkout)
+}
+
+/// After a merge that landed: drop each parked file the user never touched (it is byte for byte
+/// the base copy Apply carried), keep the rest where they are parked, and answer the kept ones as
+/// paths under the root. The base goes either way — the change is in the branch now.
+fn settle_parked(root: &Path, carried: &Path, parked: &[PathBuf]) -> Vec<String> {
+    let park = carried.join("parked");
+    let base = carried.join("base");
+    let mut kept = Vec::new();
+    for rel in parked {
+        let at = park.join(rel);
+        let untouched = match (std::fs::read(&at), std::fs::read(base.join(rel))) {
+            (Ok(mine), Ok(carried)) => mine == carried,
+            _ => false,
+        };
+        if untouched {
+            let _ = std::fs::remove_file(&at);
+        } else if let Ok(shown) = at.strip_prefix(root) {
+            kept.push(shown.display().to_string());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    if kept.is_empty() {
+        let _ = std::fs::remove_dir_all(carried);
+    }
+    kept
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -346,10 +428,23 @@ pub async fn spec_session_dismiss(
     project: ProjectId,
     run: RunId,
 ) -> Result<()> {
-    agents
+    let dismissed = agents
         .forget_spec_run(project, run)
         .map_err(CoreError::Io)?;
     agents.mark_changed(&app, project);
+    // A session still alive — a Claude waiting at its prompt — is hidden already; stop its child
+    // now, forcefully: the user has said they do not need it, and there is no turn to wind down.
+    if dismissed == crate::agents::Dismissed::Stopping {
+        crate::cmd::agents::agents_stop_with(
+            app,
+            project,
+            run,
+            crate::agents::StopBy::User,
+            None,
+            true,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -492,6 +587,7 @@ pub async fn spec_integrate(
         return Ok(SpecIntegrated::Refused { reason });
     }
     let change = checked_change(&change.0)?.to_string();
+    let change_name = change.clone();
     let name = checkout_for(&change);
 
     let root_for_work = root.clone();
@@ -534,16 +630,40 @@ pub async fn spec_integrate(
 
     let root_for_work = root.clone();
     let name_for_work = name.clone();
+    let change_dir = PathBuf::from("openspec/changes").join(&change_name);
     let merged = blocking(move || {
-        cide_git::worktree::integrate(&root_for_work, &name_for_work)
+        // The root's untracked copy of the change folder — the proposal, never committed, that
+        // Apply carried into the worktree (`carry_change`) — would make git refuse the checkout
+        // ("N conflicts prevent checkout") over files the branch is the continuation of. Parked
+        // for the merge, put back if it does not land, dropped once it has.
+        let carried = carried_dir(&root_for_work, &name_for_work);
+        let park = carried.join("parked");
+        let parked =
+            cide_git::worktree::park_untracked(&root_for_work, &name_for_work, &change_dir, &park)
+                .map_err(|error| CoreError::Io(error.to_string()))?;
+        let merged = cide_git::worktree::integrate(&root_for_work, &name_for_work);
+        let kept = match &merged {
+            Ok(
+                cide_git::worktree::Integration::Merged { .. }
+                | cide_git::worktree::Integration::UpToDate,
+            ) => settle_parked(&root_for_work, &carried, &parked),
+            _ => {
+                cide_git::worktree::unpark(&root_for_work, &park, &parked);
+                Vec::new()
+            }
+        };
+        merged
+            .map(|merged| (merged, kept))
             .map_err(|error| CoreError::Io(error.to_string()))
     })
     .await?;
+    let (merged, kept) = merged;
     let outcome = match merged {
         cide_git::worktree::Integration::UpToDate => SpecIntegrated::UpToDate,
         cide_git::worktree::Integration::Merged { commit, files } => SpecIntegrated::Merged {
             commit: Some(commit),
             files: files as u32,
+            kept,
         },
         cide_git::worktree::Integration::Conflicts { paths } => {
             return Ok(SpecIntegrated::Conflicts { paths });
@@ -595,16 +715,51 @@ mod tests {
         std::fs::write(root.join("openspec/changes/c1/tasks.md"), "- [ ] one\n").unwrap();
         std::fs::write(root.join("openspec/changes/c1/specs/a/spec.md"), "x").unwrap();
         std::fs::create_dir_all(&tree).unwrap();
-        carry_change(&root, &tree, "c1").unwrap();
+        let carried = dir.join("carried");
+        carry_change(&root, &tree, "c1", &carried).unwrap();
         assert!(tree.join("openspec/changes/c1/tasks.md").is_file());
+        assert!(
+            carried.join("base/openspec/changes/c1/tasks.md").is_file(),
+            "and the base copy Integrate compares against"
+        );
         assert!(tree.join("openspec/changes/c1/specs/a/spec.md").is_file());
         // A second carry leaves the worktree's own (possibly edited) copy alone.
         std::fs::write(tree.join("openspec/changes/c1/tasks.md"), "- [x] one\n").unwrap();
-        carry_change(&root, &tree, "c1").unwrap();
+        carry_change(&root, &tree, "c1", &carried).unwrap();
         assert_eq!(
             std::fs::read_to_string(tree.join("openspec/changes/c1/tasks.md")).unwrap(),
             "- [x] one\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root copy the user never touched is dropped once the branch lands; one they edited while
+    /// the session worked is kept, and named.
+    #[test]
+    fn an_edited_root_copy_is_kept_and_an_untouched_one_dropped() {
+        let root = std::env::temp_dir().join(format!("cide-spec-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let carried = root.join(".cide/spec-carried/spec-c1");
+        let base = carried.join("base/openspec/changes/c1");
+        let park = carried.join("parked/openspec/changes/c1");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&park).unwrap();
+        std::fs::write(base.join("tasks.md"), "- [ ] one\n").unwrap();
+        std::fs::write(base.join("proposal.md"), "why\n").unwrap();
+        std::fs::write(park.join("tasks.md"), "- [ ] one\n").unwrap();
+        std::fs::write(park.join("proposal.md"), "why, edited by me\n").unwrap();
+        let parked = vec![
+            PathBuf::from("openspec/changes/c1/tasks.md"),
+            PathBuf::from("openspec/changes/c1/proposal.md"),
+        ];
+        let kept = settle_parked(&root, &carried, &parked);
+        assert_eq!(
+            kept,
+            vec![".cide/spec-carried/spec-c1/parked/openspec/changes/c1/proposal.md".to_string()]
+        );
+        assert!(!park.join("tasks.md").exists(), "untouched: dropped");
+        assert!(park.join("proposal.md").exists(), "edited: kept");
+        assert!(!carried.join("base").exists(), "the base goes either way");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

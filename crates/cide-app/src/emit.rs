@@ -418,16 +418,25 @@ pub const GIT_STATUS: &str = "cide://git-status";
 #[serde(rename_all = "camelCase")]
 struct GitStatus {
     project: cide_ipc::ProjectId,
+    /// The agent worktree this tree describes, or `None` for the project's own repositories.
+    ///
+    /// A mutation made while the Git panel looks at a worktree re-reads and broadcasts *that*
+    /// checkout's tree. Every listener that mirrors the project — the header's change count
+    /// above all — has to be able to tell, or a commit in an agent's checkout would repaint the
+    /// project's count with the worktree's.
+    worktree: Option<std::path::PathBuf>,
     tree: cide_ipc::git::ChangesTree,
 }
 
 pub fn git_status(
     app: &AppHandle,
     project: cide_ipc::ProjectId,
+    worktree: Option<&std::path::Path>,
     tree: &cide_ipc::git::ChangesTree,
 ) {
     let payload = GitStatus {
         project,
+        worktree: worktree.map(std::path::Path::to_path_buf),
         tree: tree.clone(),
     };
     if let Err(error) = app.emit(GIT_STATUS, payload) {

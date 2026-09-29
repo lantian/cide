@@ -191,6 +191,77 @@ pub fn list(root: &Path) -> Result<Vec<AgentWorktree>> {
     Ok(out)
 }
 
+/// Every agent worktree of every repository at `roots`, in root order, each once.
+///
+/// The set the Git panel's and the Log's worktree selectors offer, and — through [`find`] and
+/// [`resolve`] — the *only* set a command keyed by a worktree's `RepoId` or path will act on.
+/// A project root is resolved to its work tree first ([`repo_mod::discover_root`]), so a root
+/// that is a subdirectory of its repository still finds the checkouts `ensure` made beside the
+/// repository's own `.cide/`. A root that is not a repository, or whose worktrees cannot be
+/// read, contributes nothing rather than failing the rest: the same answer [`repo_mod::discover`]
+/// gives for an unmounted root.
+pub fn list_for(roots: &[PathBuf]) -> Vec<AgentWorktree> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        let Some(work) = repo_mod::discover_root(root) else {
+            continue;
+        };
+        if !seen.insert(work.clone()) {
+            continue;
+        }
+        match list(&work) {
+            Ok(found) => out.extend(found),
+            Err(error) => {
+                tracing::debug!(root = %work.display(), %error, "no agent worktrees read")
+            }
+        }
+    }
+    out
+}
+
+/// The agent worktree under `roots` whose `RepoId` is `repo`, as the `RepoInfo` discovery would
+/// have built for it — or `None`.
+///
+/// The fallback behind every `(project, RepoId)` command once the panel is looking at a
+/// worktree: [`repo_mod::find`] only knows roots and submodules, so without this a checkout's
+/// id — a perfectly good `repo_id` of its canonical work tree — is `NoSuchRepo` to stage,
+/// commit, diff and the log alike. Only what [`list`] reports is matched, which is the trust
+/// boundary: a user's own `git worktree add ../hotfix`, or any other directory whose id a caller
+/// could compute, is never resolved through here.
+pub fn find(roots: &[PathBuf], repo: cide_ipc::RepoId) -> Option<cide_ipc::git::RepoInfo> {
+    list_for(roots)
+        .into_iter()
+        .find(|wt| repo_mod::repo_id(&wt.path) == repo)
+        .map(|wt| info(&wt))
+}
+
+/// `path` canonicalised, when it is one of the agent worktrees under `roots`; `None` otherwise.
+///
+/// For the calls that take a whole tree rather than one repository (`git_status` with a
+/// worktree selected): the UI names the checkout by path, and this is the check that the path
+/// is one cide made rather than anything the webview cares to send.
+pub fn resolve(roots: &[PathBuf], path: &Path) -> Option<PathBuf> {
+    let wanted = repo_mod::canonical(path);
+    list_for(roots)
+        .into_iter()
+        .find(|wt| wt.path == wanted)
+        .map(|wt| wt.path)
+}
+
+/// The `RepoInfo` a worktree stands as: a top-level repository of its own, named after its
+/// checkout. Not a submodule and not parented — it shares the object database with the root, but
+/// its index, `HEAD` and changelists are its own, which is everything the panel keys on.
+pub fn info(wt: &AgentWorktree) -> cide_ipc::git::RepoInfo {
+    cide_ipc::git::RepoInfo {
+        id: repo_mod::repo_id(&wt.path),
+        root: wt.path.clone(),
+        name: wt.agent.clone(),
+        parent: None,
+        is_submodule: false,
+    }
+}
+
 /// Idempotent: create `.cide/worktrees/<agent>` on `cide/<agent>` from the project's current
 /// `HEAD`, or return the existing one. Safe to call before every dispatch.
 ///
@@ -220,6 +291,11 @@ pub fn ensure(root: &Path, agent: &str) -> Result<AgentWorktree> {
     validate_agent(agent)?;
     let root = repo_mod::canonical(root);
     let repo = repo_mod::open(&root)?;
+    // Best effort: a checkout that cannot be hidden from `git status` is noise, not a reason to
+    // refuse the run.
+    if let Err(error) = exclude_worktrees(repo.commondir()) {
+        tracing::warn!(%error, "could not add .cide/worktrees/ to info/exclude");
+    }
     let path = path_of(&root, agent);
     let wanted_branch = branch_name(agent);
 
@@ -638,6 +714,116 @@ pub fn commit_all(root: &Path, agent: &str, message: &str) -> Result<Option<Stri
     Ok(Some(commit.to_string()))
 }
 
+/// Move the project root's **untracked** copies of files `cide/<agent>` adds under `dir` out of
+/// the way, into `park`, so a merge of that branch can write them. Answers what was moved, as
+/// paths relative to the root, for [`unpark`]. (OpenSpec sessions)
+///
+/// The case it exists for: an OpenSpec change is proposed in the root and, as it usually is, not
+/// committed; Apply in a worktree copies the change's folder in (a worktree is cut from `HEAD`)
+/// and the session commits it there with its ticks. Merging that branch back then meets the
+/// root's own untracked copy of every one of those files, and git refuses the checkout — "N
+/// conflicts prevent checkout" — over files the branch is the continuation of. Only a path that
+/// is untracked in the root **and** added by the branch is moved; anything tracked, anything the
+/// branch does not have, and anything outside `dir` is left exactly where it is.
+pub fn park_untracked(root: &Path, agent: &str, dir: &Path, park: &Path) -> Result<Vec<PathBuf>> {
+    validate_agent(agent)?;
+    let root = repo_mod::canonical(root);
+    let repo = repo_mod::open(&root)?;
+    let Ok(branch) = repo.find_branch(&branch_name(agent), BranchType::Local) else {
+        return Ok(Vec::new());
+    };
+    let tree = branch.into_reference().peel_to_tree().wrap()?;
+    let index = repo.index().wrap()?;
+    let mut moved = Vec::new();
+    let mut stack = vec![root.join(dir)];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&root) else {
+                continue;
+            };
+            let rel = rel.to_path_buf();
+            let tracked = index.get_path(&rel, 0).is_some();
+            if tracked || tree.get_path(&rel).is_err() {
+                continue;
+            }
+            let target = park.join(&rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| GitError::Io {
+                    detail: e.to_string(),
+                })?;
+            }
+            std::fs::rename(&path, &target).map_err(|e| GitError::Io {
+                detail: e.to_string(),
+            })?;
+            moved.push(rel);
+        }
+    }
+    Ok(moved)
+}
+
+/// Put back what [`park_untracked`] moved — after a merge that did not land. A path the merge has
+/// since written is left as the merge wrote it, and its parked copy stays in `park`.
+pub fn unpark(root: &Path, park: &Path, moved: &[PathBuf]) {
+    let root = repo_mod::canonical(root);
+    for rel in moved {
+        let at = root.join(rel);
+        if at.exists() {
+            continue;
+        }
+        if let Some(parent) = at.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(park.join(rel), &at);
+    }
+}
+
+/// The line [`ensure`] keeps in the repository's `info/exclude`.
+///
+/// Anchored with the leading `/`, so it matches `.cide/worktrees/` **at the root of each
+/// checkout** and nothing below it — in the project root that is every agent checkout, and in a
+/// checkout it is nothing at all (there is no `.cide/worktrees/` inside one), so what a run
+/// commits on its branch is exactly what it committed before. `info/exclude` and not
+/// `.gitignore`: it is cide's rule, local to this clone, and a `.gitignore` edit is a change
+/// somebody would commit. Git reads a linked worktree's excludes from the **common** directory,
+/// so one line covers them all. Without it the root's `git status` lists the checkouts as
+/// untracked, and a `git add -A` there commits whole copies of the tree.
+pub const WORKTREES_EXCLUDE: &str = "/.cide/worktrees/";
+
+/// Add [`WORKTREES_EXCLUDE`] to `<common>/info/exclude` unless it is there.
+fn exclude_worktrees(common: &Path) -> std::io::Result<()> {
+    let exclude = common.join("info").join("exclude");
+    let current = match std::fs::read_to_string(&exclude) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if current.lines().any(|line| line.trim() == WORKTREES_EXCLUDE) {
+        return Ok(());
+    }
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = current;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("# cide: agent and OpenSpec worktrees\n");
+    text.push_str(WORKTREES_EXCLUDE);
+    text.push('\n');
+    std::fs::write(&exclude, text)
+}
+
 // --- internals ------------------------------------------------------------------------------
 
 /// `cide/<agent>`.
@@ -871,6 +1057,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The OpenSpec case: an uncommitted change folder in the root, carried into the worktree and
+    /// committed there. The root's untracked copies are parked so the merge can land, a tracked
+    /// file and a file the branch lacks stay, and unparking after a failed merge restores them.
+    #[test]
+    fn untracked_copies_the_branch_adds_are_parked_and_only_those() {
+        let root = project("park");
+        let wt = ensure(&root, "spec-c1").expect("ensure");
+        std::fs::create_dir_all(wt.path.join("openspec/changes/c1")).unwrap();
+        write(
+            &wt.path.join("openspec/changes/c1"),
+            "tasks.md",
+            "- [x] one\n",
+        );
+        git(&wt.path, &["add", "-A"]);
+        git(&wt.path, &["commit", "-qm", "work"]);
+
+        std::fs::create_dir_all(root.join("openspec/changes/c1")).unwrap();
+        write(&root.join("openspec/changes/c1"), "tasks.md", "- [ ] one\n");
+        write(&root.join("openspec/changes/c1"), "notes.md", "mine\n");
+
+        let park = root.join(".cide/spec-carried/c1");
+        let moved =
+            park_untracked(&root, "spec-c1", Path::new("openspec/changes/c1"), &park).unwrap();
+        assert_eq!(moved, vec![PathBuf::from("openspec/changes/c1/tasks.md")]);
+        assert!(!root.join("openspec/changes/c1/tasks.md").exists());
+        assert!(
+            root.join("openspec/changes/c1/notes.md").exists(),
+            "not on the branch: kept"
+        );
+
+        unpark(&root, &park, &moved);
+        assert_eq!(
+            std::fs::read_to_string(root.join("openspec/changes/c1/tasks.md")).unwrap(),
+            "- [ ] one\n"
+        );
+
+        let moved =
+            park_untracked(&root, "spec-c1", Path::new("openspec/changes/c1"), &park).unwrap();
+        assert!(matches!(
+            integrate(&root, "spec-c1").unwrap(),
+            Integration::Merged { .. }
+        ));
+        assert_eq!(moved.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("openspec/changes/c1/tasks.md")).unwrap(),
+            "- [x] one\n",
+            "the branch's copy, with its ticks, landed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The checkouts are hidden from the root's `git status`, once, and what a checkout commits
+    /// is unchanged — the pattern is anchored, so inside a checkout it matches nothing.
+    #[test]
+    fn ensure_hides_the_checkouts_from_the_root_and_nothing_from_a_checkout() {
+        let root = project("exclude");
+        let wt = ensure(&root, "spec-c1").expect("ensure");
+        ensure(&root, "spec-c2").expect("a second");
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|l| l.trim() == WORKTREES_EXCLUDE)
+                .count(),
+            1,
+            "written once: {exclude}"
+        );
+        assert!(
+            !git(&root, &["status", "--porcelain"]).contains(".cide/worktrees"),
+            "the root does not list its checkouts"
+        );
+        write(&wt.path, "work.txt", "done\n");
+        assert!(commit_all(&root, "spec-c1", "work").unwrap().is_some());
+        assert!(
+            git(&wt.path, &["ls-files"])
+                .lines()
+                .any(|l| l == "work.txt"),
+            "a checkout's own files commit as before"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn ensure_twice_returns_the_same_worktree() {
         let root = project("idempotent");
@@ -976,6 +1244,60 @@ mod tests {
         );
         assert_eq!(listed[0].branch, "cide/developer");
         assert_eq!(listed[1].path, root.join(".cide/worktrees/qa"));
+
+        let _ = std::fs::remove_dir_all(theirs.parent().expect("parent"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The worktree selectors' trust boundary: a checkout `ensure` made resolves by id and by
+    /// path from the project's roots — including a root that is a subdirectory of the repository
+    /// — while the root's own id, a user's worktree and an arbitrary directory never do.
+    #[test]
+    fn find_and_resolve_answer_only_for_agent_worktrees() {
+        let root = project("find");
+        std::fs::create_dir_all(root.join("sub")).expect("sub");
+        let made = ensure(&root, "developer-t-7").expect("ensure");
+        let theirs = scratch("find-theirs").join("hotfix");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                theirs.to_str().unwrap(),
+                "-b",
+                "hf",
+            ],
+        );
+
+        for roots in [vec![root.clone()], vec![root.join("sub")]] {
+            let info = find(&roots, repo_mod::repo_id(&made.path)).expect("found by id");
+            assert_eq!(info.root, made.path);
+            assert_eq!(info.name, "developer-t-7");
+            assert!(info.parent.is_none() && !info.is_submodule);
+            assert_eq!(resolve(&roots, &made.path), Some(made.path.clone()));
+            assert_eq!(
+                list_for(&roots).len(),
+                1,
+                "one root, one checkout, listed once"
+            );
+        }
+        let roots = vec![root.clone()];
+        assert!(
+            find(&roots, repo_mod::repo_id(&root)).is_none(),
+            "not the root"
+        );
+        assert!(
+            find(&roots, repo_mod::repo_id(&theirs)).is_none(),
+            "not theirs"
+        );
+        assert_eq!(resolve(&roots, &theirs), None);
+        assert_eq!(resolve(&roots, &root.join("sub")), None);
+        assert_eq!(
+            list_for(&[root.clone(), root.clone()]).len(),
+            1,
+            "a repeated root is one"
+        );
 
         let _ = std::fs::remove_dir_all(theirs.parent().expect("parent"));
         let _ = std::fs::remove_dir_all(&root);

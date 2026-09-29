@@ -344,13 +344,19 @@ impl Openspec {
     /// the prose cide deliberately does not write for itself. A `none` here would leave the
     /// pinned session with nothing to offer and cide paraphrasing upstream's instructions
     /// instead. Which surface a project ended up with is [`claude`]'s question, not this one's.
+    ///
+    /// And `codex` beside it, always: a console or a role can be switched to codex at any time,
+    /// and codex neither reads `.claude/skills/` nor answers `/openspec-*` — it runs its own copy
+    /// from `.agents/skills/` as `$openspec-*` ([`claude::codex_line`]). Installing it only when
+    /// something already ran on codex would make the answer depend on state that changes after
+    /// `init` has run; a directory of prose skills is the cheaper mistake.
     pub fn init(&self) -> Result<(), SpecError> {
         self.run(
             &[
                 "init",
                 ".",
                 "--tools",
-                "claude",
+                "claude,codex",
                 "--force",
                 "--no-animation",
             ],

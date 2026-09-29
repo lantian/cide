@@ -164,8 +164,8 @@ const EMPTY: StatusView = { repos: [] }
  * payloads, so a failed status (`EMPTY`, `authoritative: false`) can neither blank the cache
  * nor be served from it.
  */
-const lastStatus = new Map<ProjectId, StatusView>()
-const lastMerges = new Map<ProjectId, Record<string, MergeState>>()
+const lastStatus = new Map<string, StatusView>()
+const lastMerges = new Map<string, Record<string, MergeState>>()
 
 /**
  * The ticks each project's panel last held, per window. (M31)
@@ -189,7 +189,21 @@ const lastMerges = new Map<ProjectId, Record<string, MergeState>>()
  * is the whole requirement; surviving a restart would resurrect a half-built commit against a
  * tree that has since moved.
  */
-const lastTicks = new Map<ProjectId, ReadonlySet<string>>()
+const lastTicks = new Map<string, ReadonlySet<string>>()
+
+/**
+ * The key the three caches above are filed under: the project, or the project *and* the agent
+ * worktree the panel is looking at.
+ *
+ * A worktree is a different working tree with its own index and its own half-composed commit, so
+ * sharing the project's slot would seed a worktree view with the project's tree and — worse —
+ * with the project's ticks, which the next Commit there would try to apply to files that are
+ * not in that checkout. `null` for no project, so every `.get`/`.set` site keeps its guard.
+ */
+function cacheKey(project: ProjectId | null, worktree: string | null): string | null {
+  if (project === null) return null
+  return worktree === null ? project : `${project}\u0000${worktree}`
+}
 
 /**
  * The empty tick set, as one instance.
@@ -546,6 +560,15 @@ export interface GitPanelOptions {
    * — which is what the panel did before, and it made ◫ and double-click look broken.
    */
   onOpenDiff?: ((diff: FileDiff, repo: RepoId) => void) | undefined
+  /**
+   * The agent checkout under `.cide/worktrees/` the panel shows instead of the project — its
+   * path, `WorktreeInfo.repo.root` — or `null`/absent for the project's own repositories.
+   *
+   * Read once per mount: `GitPanelHost` keys the panel by it, so choosing another worktree is a
+   * remount seeded from that scope's caches, never a live swap that would carry one checkout's
+   * ticks, expansion and merge bar into another.
+   */
+  worktree?: string | null | undefined
 }
 
 /**
@@ -584,6 +607,8 @@ export function useGitPanel(
   options: GitPanelOptions = {},
 ): GitPanelModel & GitPanelActions {
   const { onOpenDiff } = options
+  const worktree = options.worktree ?? null
+  const scope = cacheKey(project, worktree)
   // Read once. A story is a property of how the window was opened; re-reading the URL each
   // render would let a navigation swap the panel's data source mid-session.
   const [story] = useState<GitStory | null>(() => storyFromQuery())
@@ -601,7 +626,7 @@ export function useGitPanel(
     () =>
       story
         ? normalizeStatus(story.status)
-        : ((project !== null ? lastStatus.get(project) : undefined) ?? EMPTY),
+        : ((scope !== null ? lastStatus.get(scope) : undefined) ?? EMPTY),
     // Initializer-only, hence the empty deps: the `useState` calls below read this once, on
     // mount, and the mount effect re-adopts on any later project change.
     [],
@@ -621,7 +646,7 @@ export function useGitPanel(
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => {
     // A story names its own ticks — it is a panel somebody has already been working in.
     if (story !== null) return story.ticks.length === 0 ? EMPTY_TICKS : new Set(story.ticks)
-    return (project !== null ? lastTicks.get(project) : undefined) ?? EMPTY_TICKS
+    return (scope !== null ? lastTicks.get(scope) : undefined) ?? EMPTY_TICKS
   })
   /*
    * The row selection and the cursor, both empty to begin with.
@@ -650,7 +675,7 @@ export function useGitPanel(
   const [merges, setMerges] = useState<Record<string, MergeState>>(
     // The cache, on `initial`'s terms: a remount paints the last-known merge bar while the
     // mount effect's conflict probe revalidates it.
-    () => (story ? storyMerges(story) : ((project !== null ? lastMerges.get(project) : undefined) ?? {})),
+    () => (story ? storyMerges(story) : ((scope !== null ? lastMerges.get(scope) : undefined) ?? {})),
   )
   const [message, setMessage] = useState('')
   const [amend, setAmendFlag] = useState(false)
@@ -677,8 +702,8 @@ export function useGitPanel(
    * would hand them to the next real panel that opens on this project.
    */
   useEffect(() => {
-    if (story === null && project !== null) lastTicks.set(project, selected)
-  }, [story, project, selected])
+    if (story === null && scope !== null) lastTicks.set(scope, selected)
+  }, [story, scope, selected])
 
   const rows = useMemo(() => buildRows(view, expanded), [view, expanded])
   const picked = useMemo(() => selectedFiles(view, selected), [view, selected])
@@ -822,7 +847,7 @@ export function useGitPanel(
     // Remembered for the next mount of this project's panel — see `lastStatus`. Real
     // answers only: adopting `EMPTY` on a failed status or a project switch is not
     // evidence about the repository.
-    if (authoritative && project !== null) lastStatus.set(project, next)
+    if (authoritative && scope !== null) lastStatus.set(scope, next)
     const live = allFiles(next)
     // A partial selection outlives the panel that made it (it lives in a module store shared
     // with the diff pane), so the payload that says a file is gone is also the only signal
@@ -918,9 +943,10 @@ export function useGitPanel(
       const still = new Set([...prev].filter((id) => stillDiverged.has(id)))
       return still.size === prev.size ? prev : still
     })
-    // `project` is the one dependency: the effects that hold `adopt` in their arrays all
-    // key on `project` too, so its identity moves exactly when theirs re-run anyway.
-  }, [project])
+    // `scope` — the project, plus the worktree when one is shown — is the one dependency: the
+    // effects that hold `adopt` in their arrays all key on both too, so its identity moves
+    // exactly when theirs re-run anyway.
+  }, [scope])
 
   /**
    * `viewOf`, plus the two facts in a tree that outlive the panel.
@@ -976,7 +1002,7 @@ export function useGitPanel(
     const mine = generation.current
     setLoading(true)
     const raw = await guarded('git status', () =>
-      gitApi.status(project, includeIgnoredRef.current),
+      gitApi.status(project, includeIgnoredRef.current, worktree),
     )
     if (generation.current !== mine) return
     setLoading(false)
@@ -1010,9 +1036,9 @@ export function useGitPanel(
     // round trip per repository, so it is the half most likely to be overtaken.
     if (generation.current !== mine) return
     // Remembered beside the tree it was probed with — see `lastMerges`.
-    lastMerges.set(project, found)
+    if (scope !== null) lastMerges.set(scope, found)
     setMerges(found)
-  }, [project, story, guarded, adopt, absorb])
+  }, [project, worktree, scope, story, guarded, adopt, absorb])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
   const pending = useRef<number | null>(null)
@@ -1069,8 +1095,13 @@ export function useGitPanel(
     // window's commit produces, and briefly missing the ignored rows is a smaller lie than
     // showing files that were just committed away.
     track(
-      events.onGitStatus((forProject, tree) => {
-        if (project !== null && forProject === project) adopt(absorb(tree))
+      events.onGitStatus((forProject, tree, forWorktree) => {
+        // Only a tree about what this panel shows: a commit made in an agent's checkout
+        // broadcasts that checkout's tree, and a project panel adopting it — or a worktree
+        // panel adopting the project's — would replace every row with another working tree's.
+        if (project !== null && forProject === project && forWorktree === worktree) {
+          adopt(absorb(tree))
+        }
       }),
       'git-status',
     )
@@ -1115,7 +1146,7 @@ export function useGitPanel(
       gone = true
       for (const fn of unlisten) fn()
     }
-  }, [schedule, story, project, adopt, absorb])
+  }, [schedule, story, project, worktree, adopt, absorb])
 
   const toggleCheck = useCallback((row: Row) => setSelected((prev) => toggleRow(row, prev)), [])
 

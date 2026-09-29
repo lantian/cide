@@ -16287,3 +16287,164 @@ offers *Open session* with the session's state instead of Apply, reads the chang
 and Archive moved into `specActs.ts` (Archive's confirm in `SpecActsConfirm`, mounted once), so
 the row, its menu and the page run the same code. A change's session has no × any more — it goes
 with the change; only the Propose/Explore rows above the tree can be dismissed.
+
+## M129 — Codex runs OpenSpec as `$openspec-*`
+
+Codex has its own copy of OpenSpec's skills. `openspec init --tools codex` writes them to
+`.agents/skills/` (`.codex/skills/` on an older CLI), and codex invokes a skill as
+`$openspec-apply-change`; a `/openspec-apply-change` line answers with an unknown command. Until
+now a codex console or session got M93's "follow the instructions in `.claude/skills/…/SKILL.md`"
+prose, and a codex *role* was worse off: its preamble named `/openspec-apply-change` as the
+workflow to run.
+
+- `cide_spec::claude::codex_line` / `codex_installed_at` read a second surface table,
+  `CODEX_SURFACES`, kept apart from Claude Code's `SURFACES` so neither CLI is offered the other's
+  spelling.
+- `for_console` (a codex console) types `$openspec-<name> <input>` when codex's copy is
+  installed, and falls back to the follow-the-file prose otherwise. `for_harness` does the same
+  for sessions, and only for codex: opencode and qwen keep the prose, since `$…` is a literal word
+  to them. An Apply in a worktree uses `$` only when the checkout itself has `.agents/skills/`.
+- `resolve_command` and *Make a proposal* accept a project set up for codex alone, when the
+  conversation is codex.
+- Role runs: `Facts::spec_apply_codex`, chosen by `resolved.harness`. A codex run gets codex's line
+  or no clause at all. The session brief does the same.
+- Set up now runs `openspec init --tools claude,codex`. `real_cli`'s
+  `init_installs_the_commands_the_panel_offers` pins the three `$` lines against OpenSpec 1.10.0.
+
+Not confirmed on a display: a live codex console receiving `$openspec-propose`. Not changed: the
+panel's tooltip preview still shows Claude Code's spelling, because it comes off
+`SpecCommand::line` on the board. Also unanswered: whether codex, like Claude Code, reads skills
+only at startup. The "installed after this conversation started" refusal still skips codex, as
+M93 decided.
+
+## M130 — opencode review and OpenSpec tabs open the TUI; Ctrl+C after an opencode selection
+
+Two opencode complaints.
+
+**Review and OpenSpec tabs opened read-only.** Both are agent runs, and an opencode run's child
+is `opencode run --format json`, which never reads stdin. The attached TUI already existed
+(M104 follow-up): `open_plan_with` answers `Continue` for a run behind a live `opencode serve`,
+and `session_spawn` turns that into `attach_spec`. It needs the run's `ses_…`, though, and
+`gitlab/agentReview.ts` and `OpenSpecPanel/specRuns.ts` ask for a plan the moment the child
+exists. That is before opencode prints its first event, so they got `Mirror` and kept it for
+good.
+- `open_plan_with` now answers `Unavailable` ("opencode has not named this run's session
+  yet…") for an opencode or mimo run while all three hold: its server is live, its child is
+  alive, and it has no conversation yet.
+- Both openers already retry on that answer, so the tab opens a second later as the attached
+  TUI.
+- A standalone run (no server) keeps the mirror, and so does a child that died before naming
+  its session.
+- Pinned by `a_served_opencode_run_waits_for_its_session_instead_of_opening_a_mirror`.
+
+**Ctrl+C with text selected interrupted opencode.** The copy rule only sees xterm's selection.
+opencode turns on mouse tracking, so a plain drag reaches the child as mouse reports: opencode
+draws and copies its own selection, and `getSelection()` is `''`.
+- `xterm.ts::watchChildDrags` notes a left drag (≥ 4px, no Shift) that happened under mouse
+  tracking. It uses document capture listeners and never stops the event.
+- `terminalClipboardAction` turns the next Ctrl+C into `{ kind: 'swallow' }`: no ETX and no
+  clipboard write, since the child already copied.
+- Any keydown or press clears the flag, so a second Ctrl+C interrupts.
+- Not keyed on the harness; it applies to any mouse-tracking TUI.
+- `check:terminal-keys` sweeps the new fact (640 chords).
+
+Not confirmed on a display: neither the attached TUI appearing in a review or OpenSpec tab, nor
+opencode actually copying on select — the swallow assumes it does.
+
+## M131 — A worktree selector in the Git panel and the Log
+
+The Git panel's header readout of the branch is now a dropdown when the project has agent
+checkouts under `.cide/worktrees/`. It lists the project's own checkout, named by its branch,
+and each checkout, named by the branch it is on with its `<role>-<task>` directory beside it.
+
+Choosing a checkout points the panel at that working tree: its changes, stage, rollback,
+changelists and commit, which lands on that checkout's branch and nowhere else. The Log's filter
+bar has the same selector, first in the bar, and walks only the chosen checkout's history. The
+two choices are independent, per project, and kept per window but not on disk.
+
+**Backend: one fallback, not a new parameter on sixty commands.** Every git command is keyed
+`(project, RepoId)`, and `repo::find` only knew roots and submodules, so a checkout's id was
+`NoSuchRepo` to every one of them.
+- `cmd/git.rs::repo_root` now falls back to `cide_git::worktree::find`, so stage, commit, diff,
+  revert and the rest resolve a checkout's id unchanged. `git_log`'s `One` scope has the same
+  fallback.
+- The `Merged` walk stays project-only, so a merged graph never grows a lane per agent.
+- The trust boundary is `worktree::list`: only checkouts cide made under `.cide/worktrees/`
+  resolve. A user's own `git worktree add`, or any other directory, does not. This is pinned by
+  `find_and_resolve_answer_only_for_agent_worktrees`.
+- `git_status` takes an optional `worktree` path, validated by `worktree::resolve`. The new
+  `git_worktrees` command lists `WorktreeInfo { repo, branch, head }`.
+
+**`cide://git-status` now carries `worktree`.** `refreshed` rescans whichever tree the mutated
+repo belongs to, and tags the broadcast with the checkout when there is one.
+- Without the tag, a commit in a checkout would broadcast the project's tree, and the panel would
+  snap back to the project.
+- Without the tag, the header's change count (`gitCountStore`) would also adopt the checkout's
+  tree. It now skips tagged trees.
+- The panel adopts only broadcasts for the tree it shows.
+
+**The UI.**
+- `chrome/WorktreeSelect.tsx` is the kit `Select`, shared by both surfaces and SSR-safe.
+- `chrome/useWorktrees.ts` loads the list and holds the choice. It re-reads the list on
+  `git-status` and `fs-changed`, and falls back to the project when the chosen checkout is
+  removed.
+- `GitPanelHost` keys the model by `(project, worktree)`, so switching remounts with that scope's
+  own cached tree and ticks. A half-built commit never carries across working trees.
+- The Log's scope chain is `oneScope ?? pinnedScope ?? worktreeScope ?? mergedScope`. A *View
+  commits* filter drops the checkout choice.
+
+Checks:
+- `check:render` gains two worktree stories.
+- `check:log-render` asserts the selector is absent without checkouts and first in the bar with
+  one.
+- `check:log` pins the new scope chain.
+
+Not confirmed on a display: the dropdown opening in the panel header and the Log bar, and a real
+commit from the panel landing on a checkout's branch. The backend path is covered only by
+`cide-git`'s unit test, not end to end. Edits inside a checkout reach the panel through the
+watcher only when they move a ref or touch something it already watches. A plain file edit in a
+checkout may need ↻, because `.cide/worktrees/` is gitignored and not watched recursively.
+
+Fifth: a waiting session (a Claude at its prompt never ends by itself) can be dismissed too —
+`forget_spec_run` hides it at once (`SpecPurpose::dismissed`) and the command stops its child;
+only a session mid-turn refuses (`a_spec_session_is_dismissed_unless_it_is_mid_turn`). And the
+panel's tree was redrawn on the kit, on the user's "a hell of buttons": section heads are the kit's
+caption (uppercase, `--faint`, count right), sessions are one line each (state dot, caption,
+open and × as icon buttons), and a change is a card — name and steps; stage badge and the
+session's state; a hairline progress bar; then one row of acts in a fixed order (the finished
+change's Publish/Integrate/Archive, primary first, then the way to the work: Open session, Apply
+or Open task). Not yet looked at on a display.
+
+Sixth, from `~/work/temp/test6`: Integrate of a worktree Apply failed with "4 conflicts prevent
+checkout". The proposal was never committed, so the root held it untracked; Apply had carried it
+into the worktree and the session committed it there, and merging back met the root's untracked
+copy of every one of those files. `spec_integrate` now parks the root's untracked copies of paths
+the branch adds under `openspec/changes/<change>/` (`worktree::park_untracked`, into
+`.cide/spec-carried/`), merges, and drops them — or puts them back when the merge does not land
+(`untracked_copies_the_branch_adds_are_parked_and_only_those`). The card's session state is a
+kit badge now; the bare pulsing dot drew a ring larger than its line.
+
+Seventh: `.cide/worktrees/` is hidden from the project's `git status` — `worktree::ensure` adds
+the anchored `/.cide/worktrees/` to the repository's `info/exclude` (cide's local file, never a
+committed `.gitignore`), which matches nothing inside a checkout, so a run's commits are unchanged
+(`ensure_hides_the_checkouts_from_the_root_and_nothing_from_a_checkout`). And Integrate no longer
+drops a root copy of the change's folder the user edited while the session worked: Apply keeps a
+base copy of what it carried (`.cide/spec-carried/spec-<change>/base/`), Integrate drops only a
+parked file byte-identical to it, keeps the rest in `…/parked/`, and says which
+(`SpecIntegrated::Merged::kept`, `an_edited_root_copy_is_kept_and_an_untouched_one_dropped`). A
+worktree carried before this has no base, so all of its parked copies are kept — conservative.
+
+Eighth: a failed Integrate is no longer a dead end. Its notice — the conflict list, or git's
+refusal (untracked files in the way, a checkout it would overwrite) — carries **Resolve in a new
+session**, which starts `SpecOp::Merge` on the main model (Settings → Harness, Claude or Codex) in
+the project root: merge `cide/spec-<change>`, resolve every conflict keeping both sides' intent,
+run the checks, commit, ask when a decision is the user's (`spec_session_brief`'s Merge arm). And
+the Log's worktree picker is a filter box like the branch box beside it (`WorktreeBox` in
+`gitlog/LogView.tsx`, placeholder *Worktree*, the directory beside each branch); the Git panel
+keeps `chrome/WorktreeSelect`.
+
+Ninth, the user's call: the Log's worktree picker is gone — a worktree shares the project's refs,
+so its branch in the branch box already shows its history. The branch box marks each row instead:
+a branch icon, or a folder and the checkout's directory for a branch checked out under
+`.cide/worktrees/` (`branchFilter.worktreeOfRow`, pinned in `check:log`). `LogTab` no longer walks
+a worktree scope.

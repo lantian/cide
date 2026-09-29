@@ -1005,6 +1005,8 @@ try {
     eq(M.sessionState({ state: 'running' }).tone, 'blue', 'working is blue')
     eq(M.sessionState({ state: 'awaitingPermission' }).tone, 'yellow', 'needing you is amber')
     eq(M.sessionState({ state: 'idle' }).live, true, 'an idle session is still live')
+    eq(M.sessionState({ state: 'idle' }).working, false, 'but not working, so it can be dismissed')
+    eq(M.sessionState({ state: 'running' }).working, true, 'a session mid-turn cannot')
     eq(M.sessionState({ state: 'finished', code: 0 }).live, false, 'a finished one is not')
     eq(M.sessionState({ state: 'failed', reason: 'x' }).tone, 'red', 'a failed one is red')
     eq(M.sessionState({ state: 'somethingNew' }).label, 'somethingNew', 'an unknown state reads as itself')

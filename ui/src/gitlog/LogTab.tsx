@@ -144,6 +144,7 @@ import { gestureOf, logFileClick } from '@/sidebar/clickSemantics'
 import { copyText } from '@/sidebar/copyText'
 import { shareEqual } from '@/store/shareEqual'
 import { useWorkspace } from '@/store/workspace'
+import { useWorktrees } from '@/chrome/useWorktrees'
 import {
   applyLocalText,
   comparePair,
@@ -656,6 +657,21 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
     if (ids.length === 1 && first !== undefined) return { kind: 'one', repo: first }
     return { kind: 'merged', repos: ids }
   }, [repoKey])
+  /*
+   * The agent checkouts under `.cide/worktrees/`, for the branch box to **mark** — not to choose
+   * which checkout the log reads. There was a worktree picker in the filter bar, and the user's
+   * call was that it is redundant: a linked worktree shares the project's object database and
+   * refs, so filtering the log to `cide/<role>-<task>` already shows that checkout's history. The
+   * branch box now draws which of its branches are checked out in a worktree, and where.
+   *
+   * The Log tab only: a History tab is one file in one repository already.
+   */
+  const logTab = repo === null && path === null
+  const checkouts = useWorktrees('log', logTab ? project : null)
+  const logWorktrees = useMemo(
+    () => (logTab ? checkouts.worktrees : undefined),
+    [logTab, checkouts.worktrees],
+  )
   const scope = oneScope ?? pinnedScope ?? mergedScope
 
   // --- the debounce -------------------------------------------------------------------------
@@ -2117,6 +2133,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         onFilter={setTyped}
         onRefresh={() => setRefreshes((n) => n + 1)}
         onFindCommit={onFindCommit}
+        worktrees={logWorktrees}
         /*
          * One pane, two answers, decided in one place.
          *

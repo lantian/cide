@@ -197,6 +197,17 @@ fn init_installs_the_commands_the_panel_offers() {
         );
     }
 
+    // Codex's copy too, in codex's spelling: `init` passes `--tools claude,codex`, and a codex
+    // console typed `/openspec-propose` answers with an unknown command.
+    for offered in ["propose", "explore", "apply-change"] {
+        assert_eq!(
+            cide_spec::claude::codex_line(&scratch.0, offered).as_deref(),
+            Some(format!("$openspec-{offered}").as_str()),
+            "codex has no `{offered}` skill under .agents/skills/ — the CLI's codex `skillsDir` \
+             may have moved; see `cide_spec::claude::CODEX_SURFACES`"
+        );
+    }
+
     // And the one that caught the first failure, pinned as *absent* — so a future release adding
     // it is a failure that says "you can offer onboard now" rather than a silent chance nobody
     // takes.

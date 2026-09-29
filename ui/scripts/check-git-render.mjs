@@ -132,6 +132,34 @@ try {
     'the guard bar changes nothing about the tree below it — it is a warning, not a mode',
   )
 
+  // --- the worktree selector --------------------------------------------------------------
+  /*
+   * With agent checkouts under `.cide/worktrees/` the header's branch readout becomes a
+   * selector, and without any it must stay the readout: most projects have no agents, and a
+   * dropdown with one row is a control that offers nothing. Its trigger names a *branch* either
+   * way — the project's, or the one the chosen checkout is on — because that is what the
+   * readout it replaced said.
+   */
+  eq(byName.mock.worktree, null, 'no agent checkouts: the plain branch readout, no selector')
+  eq(
+    byName['worktree-project'].worktree,
+    { value: '', label: 'hub-provider-config' },
+    "agent checkouts listed, project shown: the selector, on the project's own branch — read "
+      + "from the tree it is showing (the mock's), not the host's `projectBranch` copy, which "
+      + 'can lag a checkout by one reload',
+  )
+  eq(
+    byName['worktree-chosen'].worktree,
+    { value: '/work/demo/.cide/worktrees/developer-t-7', label: 'cide/developer-t-7' },
+    "a checkout chosen: the selector holds its path and names the branch it is on",
+  )
+  eq(
+    byName['worktree-chosen'].rows,
+    byName.mock.rows,
+    'the selector changes nothing about the tree below it — the rows are whatever the model '
+      + 'holds, and which working tree the model reads is the host’s business',
+  )
+
   // --- two roots and a submodule ----------------------------------------------------------
 
   eq(

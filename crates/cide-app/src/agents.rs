@@ -1031,6 +1031,15 @@ pub enum RunPurpose {
     Spec(SpecPurpose),
 }
 
+/// What dismissing an OpenSpec session did. See [`AgentRegistry::forget_spec_run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dismissed {
+    /// It was over, or already gone, and is forgotten.
+    Gone,
+    /// It was alive and not working: hidden now, and the caller must stop its child.
+    Stopping,
+}
+
 /// What an OpenSpec session was started as. See [`RunPurpose::Spec`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1049,6 +1058,11 @@ pub struct SpecPurpose {
     pub launcher: cide_ipc::SpecLauncher,
     /// cide's paragraph: the whole brief of a harness launch, appended to a role's own prompt.
     pub brief: String,
+    /// The user dismissed it from the panel while its child was still alive — a Claude session
+    /// waiting at its prompt, which never ends by itself. Hidden from [`AgentRegistry::spec_runs`]
+    /// at once, stopped, and forgotten by the history cap like any ended run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dismissed: bool,
 }
 
 impl Default for RunPurpose {
@@ -2868,7 +2882,7 @@ impl AgentRegistry {
             .values()
             .filter(|run| run.project == project)
             .filter_map(|run| match &run.purpose {
-                RunPurpose::Spec(spec) => Some((
+                RunPurpose::Spec(spec) if !spec.dismissed => Some((
                     run.seq,
                     cide_ipc::SpecRunRow {
                         run: run.run,
@@ -3514,6 +3528,40 @@ impl AgentRegistry {
             });
         }
 
+        // The same run a second earlier: the server is up and the turn's child is alive, but
+        // `opencode run` has not printed its first event yet, so there is no `ses_…` to attach
+        // to. Answering `Mirror` here is what made an MR review or an OpenSpec session with the
+        // opencode harness open **read-only**: both frontends (`gitlab/agentReview.ts`,
+        // `OpenSpecPanel/specRuns.ts`) ask the moment a child exists, take the first answer that
+        // is not `unavailable`, and keep that tab for good — so they got the rendered JSON log
+        // of a child that never reads stdin, while a claude or codex run of the same purpose
+        // opened its real TUI. Both already poll on `Unavailable`, and the id arrives with the
+        // first event, so saying "not yet" costs a second and gets them the attached TUI.
+        //
+        // Only with a live server: a run that went standalone (no server came up, or a CLI that
+        // cannot attach) has nothing better than the mirror, and must still get it rather than
+        // a tab that never opens. And only while the child lives: one that died before naming
+        // its session falls through to the retained mirror below, as it always did.
+        if conversation.is_none()
+            && matches!(live.harness, Harness::Opencode | Harness::Mimo)
+            && inner
+                .servers
+                .get(&run)
+                .is_some_and(|server| !server.pty.has_exited())
+            && live
+                .session
+                .and_then(|session| sessions.get(session))
+                .is_some_and(|pty| !pty.has_exited())
+        {
+            return Ok(RunOpen::Unavailable {
+                reason: format!(
+                    "{} has not named this run's session yet — its TUI opens once it has, \
+                     usually within a second or two.",
+                    harness_label(live.harness)
+                ),
+            });
+        }
+
         if let Some(session) = live.session
             && let Some(pty) = sessions.get(session)
             && !pty.has_exited()
@@ -3674,31 +3722,50 @@ impl AgentRegistry {
         &self,
         project: ProjectId,
         run: RunId,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Dismissed, String> {
         {
             let mut inner = self.inner.lock();
-            let Some(live) = inner.runs.get(&run).filter(|live| live.project == project) else {
-                return Ok(());
+            let Some(live) = inner
+                .runs
+                .get_mut(&run)
+                .filter(|live| live.project == project)
+            else {
+                return Ok(Dismissed::Gone);
             };
-            if !matches!(live.purpose, RunPurpose::Spec(_)) {
+            let RunPurpose::Spec(spec) = &mut live.purpose else {
                 return Err(
                     "only an OpenSpec session can be dismissed from the OpenSpec panel".into(),
                 );
+            };
+            match live.state {
+                RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted => {
+                    inner.runs.remove(&run);
+                }
+                // Mid-turn: the user may want what it is doing. Stop is a separate, explicit act.
+                RunState::Starting | RunState::Running => {
+                    return Err(
+                        "this session is working right now — open it and stop it, or wait for its \
+                         turn to end, then dismiss it"
+                            .into(),
+                    );
+                }
+                // Alive but not working — above all a Claude session waiting at its prompt, which
+                // never ends by itself. Hidden now; the caller stops it.
+                RunState::Queued
+                | RunState::Idle
+                | RunState::AwaitingPermission
+                | RunState::Paused { .. } => {
+                    spec.dismissed = true;
+                    return Ok(Dismissed::Stopping);
+                }
             }
-            if !matches!(
-                live.state,
-                RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
-            ) {
-                return Err("this session is still going — stop it first, then dismiss it".into());
-            }
-            inner.runs.remove(&run);
         }
         let server = self.inner.lock().servers.remove(&run);
         if let Some(server) = server {
             end_tree(&server.pty, "a dismissed session's server");
         }
         // Written by the coalescer's flush, which the caller's `mark_changed` sets off.
-        Ok(())
+        Ok(Dismissed::Gone)
     }
 
     /// Drop the oldest finished runs of every project past [`RECENT_KEPT`].
@@ -6561,6 +6628,9 @@ struct Facts {
     /// Read off `.claude/` here, on the thread that already has the root, because
     /// `cide_agents` may not go to disk — see `RunPlan::spec_apply`.
     spec_apply: Option<String>,
+    /// The same command as codex spells it (`$openspec-apply-change`), read off `.agents/skills/`.
+    /// Which of the two a run is told is decided where its harness is known.
+    spec_apply_codex: Option<String>,
 }
 
 /// Read the workspace and the two sockets. One lock acquisition, released before anything forks.
@@ -6590,6 +6660,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         // A project that never ran `openspec init --tools claude` has none, which is the
         // ordinary case and adds nothing to the brief. Read before `root` moves into the struct.
         spec_apply: cide_spec::claude::line(&root, "apply-change"),
+        spec_apply_codex: cide_spec::claude::codex_line(&root, "apply-change"),
         root,
         theme,
         proxy,
@@ -8270,7 +8341,16 @@ fn start_child(
         task_title: admission.task_title.clone(),
         change: admission.change.clone(),
         spec_cli: facts.spec_cli.clone(),
-        spec_apply: facts.spec_apply.clone(),
+        // The line *this* run's CLI answers to. Codex runs a skill as `$openspec-apply-change` and
+        // reads its own copy from `.agents/skills/`; told Claude Code's `/openspec-apply-change`
+        // it tried a command it does not have. A codex run on a project set up for Claude Code
+        // only gets no clause at all rather than one it cannot follow — the preamble's own
+        // paragraph is the whole workflow without it. `resolved.harness` for the reason given
+        // where the harness is picked below.
+        spec_apply: match resolved.harness {
+            cide_ipc::Harness::Codex => facts.spec_apply_codex.clone(),
+            _ => facts.spec_apply.clone(),
+        },
         prompt: admission.prompt.clone(),
         hook_bin: facts.hook_bin.clone(),
         hook_sock: facts.hook_sock.clone(),
@@ -9493,7 +9573,7 @@ mod tests {
 
     /// The OpenSpec panel's dismiss forgets an ended session, and only an ended OpenSpec one.
     #[test]
-    fn only_an_ended_spec_session_can_be_dismissed() {
+    fn a_spec_session_is_dismissed_unless_it_is_mid_turn() {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let mut session = spec(project, "openspec", 4, 4);
@@ -9507,15 +9587,30 @@ mod tests {
                 harness: Harness::Opencode,
             },
             brief: String::new(),
+            dismissed: false,
         });
         let run = registry.enqueue(session);
         let work = registry.enqueue(spec(project, "developer", 4, 4));
 
+        registry.inner.lock().runs.get_mut(&run).expect("run").state = RunState::Running;
         assert!(
             registry.forget_spec_run(project, run).is_err(),
-            "a queued session is still going"
+            "a session mid-turn is not dismissed under the user"
         );
         assert_eq!(registry.spec_runs(project).len(), 1);
+
+        // Waiting at its prompt — a Claude session never ends by itself: hidden at once, and the
+        // caller is told to stop it.
+        registry.inner.lock().runs.get_mut(&run).expect("run").state = RunState::Idle;
+        assert_eq!(
+            registry.forget_spec_run(project, run),
+            Ok(Dismissed::Stopping)
+        );
+        assert!(
+            registry.spec_runs(project).is_empty(),
+            "hidden while it is stopped"
+        );
+        assert!(registry.inner.lock().runs.contains_key(&run));
 
         for id in [run, work] {
             registry.inner.lock().runs.get_mut(&id).expect("run").state =
@@ -9525,12 +9620,14 @@ mod tests {
             registry.forget_spec_run(project, work).is_err(),
             "a role's history row is not the panel's to drop"
         );
-        registry.forget_spec_run(project, run).expect("dismissed");
-        assert!(registry.spec_runs(project).is_empty());
+        assert_eq!(registry.forget_spec_run(project, run), Ok(Dismissed::Gone));
+        assert!(!registry.inner.lock().runs.contains_key(&run));
         assert!(registry.inner.lock().runs.contains_key(&work));
-        registry
-            .forget_spec_run(project, run)
-            .expect("dismissing twice is not an error");
+        assert_eq!(
+            registry.forget_spec_run(project, run),
+            Ok(Dismissed::Gone),
+            "dismissing twice is not an error"
+        );
     }
 
     /// **A checkout is held while any run that is not over stands in it, and only then.** (M89)
@@ -14058,6 +14155,74 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(pty.has_exited());
+    }
+
+    /// An opencode run behind a live server answers "not yet" until it has named its session,
+    /// then the attached TUI — never the mirror of its JSON stream, which is what opened an MR
+    /// review or an OpenSpec session read-only. A standalone run (no server) keeps the mirror.
+    #[test]
+    fn a_served_opencode_run_waits_for_its_session_instead_of_opening_a_mirror() {
+        let registry = Arc::new(AgentRegistry::default());
+        let sessions = SessionRegistry::default();
+        let project = ProjectId::new();
+        let root = std::env::temp_dir();
+        let sleeper = || {
+            PtySession::spawn(
+                SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                    .arg("-c")
+                    .arg("sleep 30"),
+            )
+            .expect("spawn sh")
+        };
+
+        let run = registry.enqueue(opencode_spec(project, "developer"));
+        registry.take_admissions();
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        let child = sleeper();
+        sessions.insert(session, Arc::clone(&child));
+
+        // Standalone: the mirror is the best there is, and the tab must still open.
+        assert!(matches!(
+            registry
+                .open_plan_with(project, run, &sessions, &root, true, |_, _, _| false)
+                .expect("the run exists"),
+            RunOpen::Mirror { .. }
+        ));
+
+        let server = sleeper();
+        registry.inner.lock().servers.insert(
+            run,
+            LiveServer {
+                url: "http://127.0.0.1:1".into(),
+                password: "pw".into(),
+                harness: Harness::Opencode,
+                cwd: std::env::temp_dir(),
+                pty: Arc::clone(&server),
+                clients: Vec::new(),
+            },
+        );
+        match registry
+            .open_plan_with(project, run, &sessions, &root, true, |_, _, _| false)
+            .expect("the run exists")
+        {
+            RunOpen::Unavailable { reason } => assert!(reason.contains("opencode"), "{reason}"),
+            other => panic!("no session yet, so not yet, got {other:?}"),
+        }
+
+        assert!(registry.note_harness_session(run, "ses_named".into()));
+        match registry
+            .open_plan_with(project, run, &sessions, &root, true, |_, _, _| false)
+            .expect("the run exists")
+        {
+            RunOpen::Continue { conversation } => assert_eq!(conversation.id, "ses_named"),
+            other => panic!("a named session on a live server attaches, got {other:?}"),
+        }
+
+        child.kill();
+        server.kill();
+        wait_exited(&child);
+        wait_exited(&server);
     }
 
     /// **A follow-up is the same run, continuing.**

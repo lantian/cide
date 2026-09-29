@@ -3,4 +3,4 @@
 /**
  * Which OpenSpec workflow a session runs.
  */
-export type SpecOp = "propose" | "explore" | "apply";
+export type SpecOp = "propose" | "explore" | "apply" | "merge";

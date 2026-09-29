@@ -409,12 +409,6 @@ pub async fn spec_run_command(
         )));
     }
 
-    // Resolved here rather than taken from the board, and this is the load-bearing half: a
-    // project set up — or migrated by `openspec update` — while cide was running is answered
-    // correctly with no refresh, and a list that went stale in a panel can never put a name on a
-    // terminal.
-    let invocation = resolve_command(&root, &command)?;
-
     let session = state
         .with(|ws| {
             cide_core::workspace::project(ws, project).map(|project| project.primary_session)
@@ -425,10 +419,16 @@ pub async fn spec_run_command(
 
     let registry = app.try_state::<crate::state::SessionRegistry>();
 
-    // A codex console (M93) is handed the skill's file instead of the command — see
-    // [`for_console`] — and reads it when told to, so the "installed after this conversation
-    // started" refusal below does not apply to it.
+    // A codex console (M93) is handed codex's own `$` spelling, or the skill's file where codex
+    // has no copy — see [`for_console`] — so the "installed after this conversation started"
+    // refusal below, which is about Claude Code's files, does not apply to it.
     let codex = console_is_codex(&state, session);
+
+    // Resolved here rather than taken from the board, and this is the load-bearing half: a
+    // project set up — or migrated by `openspec update` — while cide was running is answered
+    // correctly with no refresh, and a list that went stale in a panel can never put a name on a
+    // terminal. After `codex`, because a project set up for codex alone has only codex's line.
+    let invocation = resolve_command(&root, &command, codex)?;
 
     // ---------------------------------------------------------------------------------------
     // Is this conversation old enough to have missed the command?
@@ -497,17 +497,27 @@ pub async fn spec_run_command(
 /// The line this project types for one of its OpenSpec commands, or the sentence saying it has
 /// none. Shared by the console road ([`spec_run_command`]) and the session road
 /// (`spec_sessions::spec_session_start`), so both refuse a missing command in the same words.
-pub(super) fn resolve_command(root: &Path, command: &str) -> Result<String> {
-    let Some(invocation) = cide_spec::claude::line(root, command) else {
+///
+/// `codex` is whether the line is for a codex conversation. The answer is still Claude Code's
+/// spelling whenever there is one — [`for_console`] re-spells it — but a project set up with
+/// `--tools codex` alone has no Claude line at all, and refusing it would tell a codex user their
+/// correctly set up project has no commands. So a codex caller falls back to codex's own `$` line,
+/// which `for_console` passes through untouched (it does not start with `/`).
+pub(super) fn resolve_command(root: &Path, command: &str, codex: bool) -> Result<String> {
+    let found = cide_spec::claude::line(root, command).or_else(|| {
+        codex
+            .then(|| cide_spec::claude::codex_line(root, command))
+            .flatten()
+    });
+    let Some(invocation) = found else {
         let installed = cide_spec::claude::installed(root);
         return Err(CoreError::Io(if installed.is_empty() {
             // Deliberately **not** `openspec update`, which is what this said for a year and is a
             // dead end: on a project whose tools are recorded and current it answers "all tools
             // up to date" and writes nothing at all.
-            "this project has no OpenSpec commands for Claude Code. `openspec init --tools \
-             claude` in the project root installs them — as skills under .claude/skills/ on a \
-             current CLI, as slash commands under .claude/commands/opsx/ on an older one — and \
-             cide runs whichever it finds."
+            "this project has no OpenSpec commands for this conversation. `openspec init --tools \
+             claude,codex` in the project root installs them — as skills under .claude/skills/ \
+             and .agents/skills/ on a current CLI — and cide runs whichever it finds."
                 .to_string()
         } else {
             format!(
@@ -661,16 +671,6 @@ pub async fn spec_propose_for_task(
         )));
     }
 
-    let Some(invocation) = cide_spec::claude::line(&root, "propose") else {
-        return Err(CoreError::Io(
-            "this project has no OpenSpec propose command for Claude Code. `openspec init \
-             --tools claude` in the project root installs one — as a skill under .claude/skills/ \
-             on a current CLI, as a slash command under .claude/commands/opsx/ on an older one — \
-             and cide runs whichever it finds."
-                .into(),
-        ));
-    };
-
     /*
      * Which conversation, and the order is the whole of the decision.
      *
@@ -704,6 +704,23 @@ pub async fn spec_propose_for_task(
     // once, at startup, so a conversation older than the file answers `Unknown command`. Not a
     // codex console's (M93), which is handed the file and reads it then.
     let codex = console_is_codex(&state, session);
+
+    // After `codex`, because a project set up for codex alone has only codex's `$` line — see
+    // `resolve_command`, whose rule this is.
+    let Some(invocation) = cide_spec::claude::line(&root, "propose").or_else(|| {
+        codex
+            .then(|| cide_spec::claude::codex_line(&root, "propose"))
+            .flatten()
+    }) else {
+        return Err(CoreError::Io(
+            "this project has no OpenSpec propose command for this conversation. `openspec init \
+             --tools claude,codex` in the project root installs one — as a skill under \
+             .claude/skills/ and .agents/skills/ on a current CLI — and cide runs whichever it \
+             finds."
+                .into(),
+        ));
+    };
+
     if !codex
         && let Some(installed_at) = cide_spec::claude::installed_at(&root, "propose")
         && let Some(started) = registry
@@ -1685,10 +1702,47 @@ fn console_is_codex(state: &WorkspaceState, session: cide_ipc::SessionId) -> boo
 /// codex's composer answers an unknown slash command with an error — but what a skill *is* is
 /// prose instructions for a model, so a codex console is told to follow the file, with the same
 /// input. Any other line, and any line for claude, is returned as it was.
+///
+/// # Codex's own spelling first, the file second
+///
+/// Codex *has* a skill surface of its own — `openspec init --tools codex` writes the same skills
+/// to `.agents/skills/`, invoked as `$openspec-apply-change` — and a line in that spelling is the
+/// real workflow rather than a paraphrase of where to find it. So when codex's copy is installed
+/// the command is re-spelt for it, and the follow-the-file prose is left for a project whose
+/// skills were set up for Claude Code only (anything `init`ed before cide passed `codex` too).
 pub(super) fn for_console(codex: bool, root: &std::path::Path, line: String) -> String {
     if !codex {
         return line;
     }
+    respell(root, line, true)
+}
+
+/// [`for_console`] for a session, whose harness may be neither Claude Code nor codex.
+///
+/// The `$` spelling is **codex's** and nobody else's: an opencode or qwen session typed
+/// `$openspec-propose` gets a literal dollar word, which is exactly the unknown-command failure
+/// this exists to prevent, one harness over. So only codex is offered it, and every other
+/// non-Claude harness keeps the follow-the-file prose it always had.
+pub(super) fn for_harness(
+    harness: cide_ipc::Harness,
+    root: &std::path::Path,
+    line: String,
+) -> String {
+    match harness {
+        cide_ipc::Harness::Claude => line,
+        cide_ipc::Harness::Codex => respell(root, line, true),
+        _ => follow_file(root, line),
+    }
+}
+
+/// A Claude Code command line turned into "follow this file", whoever reads it — for a
+/// conversation that cannot be trusted to have either tool's copy of the skill where it stands.
+pub(super) fn follow_file(root: &std::path::Path, line: String) -> String {
+    respell(root, line, false)
+}
+
+/// The body of [`for_console`]: `dollar` is whether codex's own `$` line may be used.
+fn respell(root: &std::path::Path, line: String, dollar: bool) -> String {
     let Some(first) = line
         .split_whitespace()
         .next()
@@ -1702,6 +1756,17 @@ pub(super) fn for_console(codex: bool, root: &std::path::Path, line: String) -> 
     else {
         return line;
     };
+    let rest = line[line.find(first).map_or(0, |at| at + first.len())..].trim();
+    if let Some(dollar) = dollar
+        .then(|| cide_spec::claude::codex_line(root, &command.name))
+        .flatten()
+    {
+        return if rest.is_empty() {
+            dollar
+        } else {
+            format!("{dollar} {rest}")
+        };
+    }
     let Some(file) = cide_spec::claude::file(root, &command.name) else {
         return line;
     };
@@ -1713,7 +1778,6 @@ pub(super) fn for_console(codex: bool, root: &std::path::Path, line: String) -> 
     } else {
         root.join(file)
     };
-    let rest = line[line.find(first).map_or(0, |at| at + first.len())..].trim();
     if rest.is_empty() {
         format!(
             "Follow the OpenSpec instructions in `{}` exactly, as if they had been invoked as \
@@ -1754,6 +1818,33 @@ mod tests {
         assert_eq!(
             super::for_console(true, &root, "plain words".into()),
             "plain words"
+        );
+
+        // With codex's own copy installed (`openspec init --tools codex`), codex is typed the
+        // command in its own spelling — the real workflow, not a pointer to Claude Code's file.
+        let own = root.join(".agents/skills/openspec-propose");
+        std::fs::create_dir_all(&own).expect("mkdir");
+        std::fs::write(own.join("SKILL.md"), "# propose").expect("write");
+        let line = "/openspec-propose Add dark mode".to_string();
+        assert_eq!(
+            super::for_console(true, &root, line.clone()),
+            "$openspec-propose Add dark mode"
+        );
+        assert_eq!(
+            super::for_console(true, &root, "/openspec-propose".into()),
+            "$openspec-propose"
+        );
+        assert_eq!(super::for_console(false, &root, line.clone()), line);
+        // …and only codex: another harness would read `$openspec-propose` as a literal word.
+        let other = super::for_harness(cide_ipc::Harness::Opencode, &root, line.clone());
+        assert!(other.starts_with(&expected), "{other}");
+        assert_eq!(
+            super::for_harness(cide_ipc::Harness::Codex, &root, line.clone()),
+            "$openspec-propose Add dark mode"
+        );
+        assert_eq!(
+            super::for_harness(cide_ipc::Harness::Claude, &root, line.clone()),
+            line
         );
         let _ = std::fs::remove_dir_all(&root);
     }

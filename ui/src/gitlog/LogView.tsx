@@ -27,6 +27,7 @@ import type {
   RepoInfo,
   RevisionChange,
   RevisionRange,
+  WorktreeInfo,
 } from '@/ipc/generated'
 /*
  * From the component's own module, **not** the `@/icons` barrel.
@@ -46,6 +47,7 @@ import {
   branchRows,
   commitChoice,
   moveHighlight,
+  worktreeOfRow,
   type BranchRow,
 } from './branchFilter'
 import {
@@ -178,6 +180,17 @@ export interface LogViewProps {
    * file's diff — which is the whole argument on the Rust field.
    */
   split: number
+  /**
+   * The agent checkouts under `.cide/worktrees/`, so the branch box can mark which of its
+   * branches is checked out in one, and where. Not a choice of what the log walks: a worktree
+   * shares the project's refs, so its branch in the branch box already shows its history — the
+   * separate worktree picker this replaced was the user's "we don't need it". Absent in a History
+   * tab and a fixture, where every branch row is a plain branch.
+   *
+   * A prop rather than a hook call here, because this view is server-rendered by
+   * `check:log-render` and the list is read over IPC by `LogTab`.
+   */
+  worktrees?: readonly WorktreeInfo[] | undefined
 }
 
 export function LogView({
@@ -202,6 +215,7 @@ export function LogView({
   details,
   rowMenu,
   split,
+  worktrees,
 }: LogViewProps) {
   const filtered = isFiltered(filter)
   const strip = repoStripOn(repos)
@@ -281,6 +295,7 @@ export function LogView({
           busy={busy}
           onFilter={onFilter}
           onRefresh={onRefresh}
+          worktrees={worktrees}
         />
         {/*
          * The context menu is armed on the scroller and not on each row.
@@ -1086,13 +1101,17 @@ function BranchBox({
   branches,
   scopeName,
   onFilter,
+  worktrees,
 }: {
   filter: LogFilter
   branches: readonly string[]
   scopeName: string | null
   onFilter: (next: LogFilter) => void
+  /** The agent checkouts, to mark the branches they are on. See `LogViewProps.worktrees`. */
+  worktrees?: readonly WorktreeInfo[] | undefined
 }) {
   const [query, setQuery] = useState('')
+
   const [open, setOpen] = useState(false)
   const [highlight, setHighlight] = useState(-1)
 
@@ -1187,7 +1206,25 @@ function BranchBox({
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => choose(row)}
               >
-                {row.label}
+                {/*
+                 * What a row *is*, at a glance: a branch, or a branch checked out in a worktree
+                 * under `.cide/worktrees/` (a folder, with that checkout's directory after it).
+                 * The two readings — *Current branch*, *All branches* — are not refs and carry
+                 * no mark.
+                 */}
+                {!row.synthetic && (
+                  <Icon
+                    name={worktreeOfRow(row.value, worktrees ?? []) === null ? 'git-branch' : 'folder'}
+                    size={0}
+                    label={worktreeOfRow(row.value, worktrees ?? []) === null ? 'Branch' : 'Worktree'}
+                  />
+                )}
+                <span className={styles.branchRowLabel}>{row.label}</span>
+                {worktreeOfRow(row.value, worktrees ?? []) !== null && (
+                  <span className={styles.branchRowDetail}>
+                    {worktreeOfRow(row.value, worktrees ?? [])}
+                  </span>
+                )}
               </button>
             </li>
           ))}
@@ -1240,6 +1277,7 @@ function FilterBar({
   busy,
   onFilter,
   onRefresh,
+  worktrees,
 }: {
   filter: LogFilter
   filtered: boolean
@@ -1248,10 +1286,17 @@ function FilterBar({
   busy: boolean
   onFilter: (next: LogFilter) => void
   onRefresh: () => void
+  worktrees: readonly WorktreeInfo[] | undefined
 }) {
   return (
     <div className={styles.filters} data-audit="logFilters">
-      <BranchBox filter={filter} branches={branches} scopeName={scopeName} onFilter={onFilter} />
+      <BranchBox
+        filter={filter}
+        branches={branches}
+        scopeName={scopeName}
+        onFilter={onFilter}
+        worktrees={worktrees}
+      />
       <input
         className={styles.input}
         data-audit="logAuthor"

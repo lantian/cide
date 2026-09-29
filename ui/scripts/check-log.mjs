@@ -315,6 +315,14 @@ try {
 
   const m = await import(`file://${join(out, 'gitlog', 'logModel.js')}`)
   const bf = await import(`file://${join(out, 'gitlog', 'branchFilter.js')}`)
+  {
+    // Which branch rows are worktrees: a folder and the checkout's directory, not a second picker.
+    const wts = [{ branch: 'cide/spec-a', repo: { name: 'spec-a' } }]
+    eq(bf.worktreeOfRow('b:cide/spec-a', wts), 'spec-a', 'a branch checked out in a worktree names it')
+    eq(bf.worktreeOfRow('b:master', wts), null, 'a plain branch is a branch')
+    eq(bf.worktreeOfRow('head', wts), null, 'Current branch is not a ref')
+    eq(bf.worktreeOfRow('r:cide/spec-a', wts), null, 'nor is a bare revision, whatever it names')
+  }
   const fr = await import(`file://${join(out, 'gitlog', 'fileRows.js')}`)
   const fm = await import(`file://${join(out, 'gitlog', 'fileMenu.js')}`)
   const cs = await import(`file://${join(out, 'sidebar', 'clickSemantics.js')}`)
@@ -1248,7 +1256,12 @@ try {
     )
     ok(
       /oneScope \?\? pinnedScope \?\? mergedScope/.test(tab),
-      '…behind the History tab’s own repository, which no filter changes',
+      '…behind the History tab’s own repository, which no filter changes — and no worktree scope: '
+        + 'a worktree’s branch is chosen in the branch box, which already shows its history',
+    )
+    ok(
+      /useWorktrees\('log', logTab \? project : null\)/.test(tab),
+      'the worktree list is the Log tab’s alone: a History tab is one file in one repository',
     )
     const dispatch = stripComments(readFileSync(join(UI, 'src', 'keys', 'dispatch.ts'), 'utf8'))
     ok(

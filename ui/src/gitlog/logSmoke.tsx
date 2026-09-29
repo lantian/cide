@@ -18,6 +18,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { LOG_STORIES, storyPair, storyView, type LogStory, type LogStoryName } from './fixture'
 import { ChangedFileList } from './LogView'
 import { LogView, RangeDetails } from './LogView'
+import type { WorktreeInfo } from '@/ipc/generated'
 
 /** What the check script asserts on. Strings and counts, so a failure prints something readable. */
 export interface LogDigest {
@@ -113,6 +114,12 @@ export interface LogDigest {
   rangeCounts: string[]
   /** The capped-list sentence, or `null`. */
   rangeTruncated: string | null
+  /**
+   * The filter bar's worktree selector — its value (`''` for the project's checkout) and the
+   * branch its trigger names — or `null` when none is drawn. Every story renders without a
+   * worktree list, so it is `null` throughout; `worktreeStory` below draws the one that has it.
+   */
+  worktree: { value: string; label: string } | null
 }
 
 /*
@@ -123,10 +130,16 @@ export interface LogDigest {
  */
 const noop = () => {}
 
-function render(story: LogStory, asTree = true, collapsed?: ReadonlySet<string>): string {
+function render(
+  story: LogStory,
+  asTree = true,
+  collapsed?: ReadonlySet<string>,
+  worktrees?: readonly WorktreeInfo[],
+): string {
   return renderToStaticMarkup(
     <LogView
       {...storyView(story)}
+      worktrees={worktrees}
       onSelect={noop}
       onMore={noop}
       onFilter={noop}
@@ -487,11 +500,53 @@ const digests: LogDigest[] = LOG_STORIES.map((story) => {
     rangeFiles: all(html, 'logFile', 'button').map(fileLabel),
     rangeCounts: all(html, 'logFileCounts', 'span').map(text),
     rangeTruncated: mapText(one(html, 'logRangeTruncated', 'div')),
+    worktree: worktreeOf(html),
   }
 })
+
+/** The selector's value and trigger label, read the way `check:render` reads the Git panel's. */
+function worktreeOf(html: string): { value: string; label: string } | null {
+  // An input now, like the branch box beside it: the value is the chosen checkout, and what the
+  // closed box shows is its `value` attribute.
+  const tag = /<input[^>]*data-audit="logWorktree"[^>]*>/.exec(html)?.[0]
+  if (tag === undefined) return null
+  const chosen = /data-value="([^"]*)"/.exec(tag)?.[1] ?? ''
+  const shown = /\svalue="([^"]*)"/.exec(tag)?.[1] ?? ''
+  return { value: chosen, label: text(shown) }
+}
+
+/*
+ * The `mock` story with one agent checkout listed and chosen — the Log tab's filter bar as it is
+ * while an agent's history is on screen. Beside the story digests rather than among them: the
+ * stories are `LogStoryName`s the check indexes by, and this is the same story with one prop.
+ */
+const CHECKOUT = '/work/demo/.cide/worktrees/developer-t-7'
+const mockStory = LOG_STORIES.find((s) => s.name === 'mock')
+const worktreeHtml =
+  mockStory === undefined
+    ? ''
+    : render(mockStory, true, undefined, [
+        {
+          repo: {
+            id: '00000000-0000-4000-8000-000000000007',
+            root: CHECKOUT,
+            name: 'developer-t-7',
+            parent: null,
+            isSubmodule: false,
+          },
+          branch: 'cide/developer-t-7',
+          head: '',
+        },
+      ])
+const worktreeStory = {
+  worktree: worktreeOf(worktreeHtml),
+  controls: [...worktreeHtml.matchAll(/data-audit="(logWorktree|logBranch|logAuthor|logText|logRefresh)"/g)].map(
+    (m) => m[1] ?? '',
+  ),
+}
 
 function mapText(fragment: string | null): string | null {
   return fragment === null ? null : text(fragment)
 }
 
-console.log(JSON.stringify(digests))
+console.log(JSON.stringify({ digests, worktreeStory }))

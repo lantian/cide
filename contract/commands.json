@@ -193,6 +193,7 @@
   "git_tree_status",
   "git_unshelve",
   "git_unstage",
+  "git_worktrees",
   "gitlab_after_push",
   "gitlab_draft_discuss",
   "gitlab_local_file",

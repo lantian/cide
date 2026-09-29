@@ -15,6 +15,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
 import type { GitStoryName } from './fixture'
+import type { WorktreeInfo } from '@/ipc/generated'
 
 /** What the check script asserts on. Strings, so a failure prints something readable. */
 export interface StoryDigest {
@@ -39,6 +40,11 @@ export interface StoryDigest {
   mergeBar: string | null
   summary: string | null
   commitEnabled: boolean
+  /**
+   * The header's worktree selector: the value it holds (`''` for the project's own checkout) and
+   * the label its trigger shows, or `null` when the header draws the plain branch readout.
+   */
+  worktree: { value: string; label: string } | null
 }
 
 const STORIES: GitStoryName[] = ['mock', 'guard', 'multi', 'empty', 'conflict']
@@ -52,19 +58,63 @@ const STORIES: GitStoryName[] = ['mock', 'guard', 'multi', 'empty', 'conflict']
  * window's keymap and theme through `@/store/workspace`, which touches `document` at import
  * time and would end this render before it started. See the header of `GitPanel.tsx`.
  */
-function Story() {
+function Story({ worktree }: { worktree?: string | null | undefined }) {
   const git = useGitPanel(null)
   // `dark` because the fixture digests are about structure, not colour, and the icon file a
   // row points at is not something static markup is asserted on either way.
-  return <GitPanelView project={null} git={git} iconTheme="dark" />
+  return worktree === undefined ? (
+    <GitPanelView project={null} git={git} iconTheme="dark" />
+  ) : (
+    <GitPanelView
+      project={null}
+      git={git}
+      iconTheme="dark"
+      worktrees={WORKTREES}
+      worktree={worktree}
+      projectBranch="main"
+      onSelectWorktree={() => undefined}
+    />
+  )
 }
 
-const digests = STORIES.map((story) => {
+/** One agent checkout, as `git.worktrees` would list it, for the header's selector. */
+const WORKTREE_ROOT = '/work/demo/.cide/worktrees/developer-t-7'
+const WORKTREES: WorktreeInfo[] = [
+  {
+    repo: {
+      id: '00000000-0000-4000-8000-000000000007',
+      root: WORKTREE_ROOT,
+      name: 'developer-t-7',
+      parent: null,
+      isSubmodule: false,
+    },
+    branch: 'cide/developer-t-7',
+    head: '',
+  },
+]
+
+/** The `mock` story again, with a worktree list: once on the project, once on the checkout. */
+const WORKTREE_STORIES: Array<[GitStoryName | 'worktree-project' | 'worktree-chosen', string | null]> = [
+  ['worktree-project', null],
+  ['worktree-chosen', WORKTREE_ROOT],
+]
+
+const runs: Array<[string, GitStoryName, string | null | undefined]> = [
+  ...STORIES.map((story): [string, GitStoryName, undefined] => [story, story, undefined]),
+  ...WORKTREE_STORIES.map(([name, chosen]): [string, GitStoryName, string | null] => [
+    name,
+    'mock',
+    chosen,
+  ]),
+]
+
+const digests = runs.map(([story, fixture, worktree]) => {
   // `storyFromQuery` reads `location.search` when the component first renders, so the
   // story is selected by rewriting it between renders rather than by a prop the app does
   // not have.
-  ;(globalThis.location as unknown as { search: string }).search = `?git-story=${story}`
-  const html = renderToStaticMarkup(<Story />)
+  ;(globalThis.location as unknown as { search: string }).search = `?git-story=${fixture}`
+  const html = renderToStaticMarkup(<Story worktree={worktree} />)
+  const selector = /data-audit="gitWorktree" data-value="([^"]*)">(.*?)<\/button>/.exec(html)
   // `[^>]*>` skips the rest of the bar's own attributes; the bar holds only spans and
   // buttons, so the first `</div>` after it is its own.
   const guard = /data-audit="gitGuard"[^>]*>(.*?)<\/div>/.exec(html)?.[1]
@@ -82,7 +132,9 @@ const digests = STORIES.map((story) => {
     mergeBar: merge === undefined ? null : text(merge),
     summary: /data-audit="gitSummary"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
     commitEnabled: !/data-audit="gitCommit"[^>]*disabled/.test(html),
-  } satisfies StoryDigest
+    worktree:
+      selector === null ? null : { value: selector[1] ?? '', label: text(selector[2] ?? '') },
+  } satisfies Omit<StoryDigest, 'story'> & { story: string }
 })
 
 console.log(JSON.stringify(digests))

@@ -345,6 +345,23 @@ pub fn spec_session_brief(
              proposed; your first message starts OpenSpec's explore workflow. Think, read and ask \
              — do not edit files unless the user asks you to. {common}"
         ),
+        SpecOp::Merge => {
+            let change = change.unwrap_or("the change named in your first message");
+            format!(
+                "cide opened this session because it could not merge the OpenSpec change \
+                 {change} by itself. Its work is on the branch cide/spec-{change}, in the worktree \
+                 .cide/worktrees/spec-{change}; you are in the project root, on the branch the \
+                 user has checked out. Merge cide/spec-{change} into it with git, resolve every \
+                 conflict by understanding both sides — keep the user's work and the change's \
+                 intent, never discard either side to make the conflict go away — run the \
+                 project's checks, and commit the merge. If an untracked file in the project root \
+                 blocks the merge and is a copy of a file the branch adds under \
+                 openspec/changes/{change}/, compare the two and keep anything the user added. If \
+                 a conflict needs a decision only the user can make, stop and ask. When the merge \
+                 is committed, say what you resolved and how. Do not delete the worktree or the \
+                 branch. {common}"
+            )
+        }
         SpecOp::Apply => {
             let change = change.unwrap_or("the change named in your first message");
             let place = if in_worktree {

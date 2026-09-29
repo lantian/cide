@@ -119,37 +119,68 @@ try {
   let swept = 0
   for (const kind of ['claude', 'shell']) {
     for (const selection of ['', SELECTION]) {
-      for (const key of ['c', 'v', 'C', 'x', 'Enter']) {
-        for (let bits = 0; bits < 16; bits++) {
-          const mods = {
-            ctrl: (bits & 1) !== 0,
-            alt: (bits & 2) !== 0,
-            shift: (bits & 4) !== 0,
-            meta: (bits & 8) !== 0,
-          }
-          const plainCtrl = mods.ctrl && !mods.alt && !mods.shift && !mods.meta
-          const letter = key.toLowerCase()
-          const expected =
-            !plainCtrl || (letter !== 'c' && letter !== 'v')
-              ? null
-              : letter === 'c'
-                ? selection === ''
-                  ? null
-                  : { kind: 'copy', text: selection }
-                : { kind: 'paste' }
+      for (const childSelection of [false, true]) {
+        for (const key of ['c', 'v', 'C', 'x', 'Enter']) {
+          for (let bits = 0; bits < 16; bits++) {
+            const mods = {
+              ctrl: (bits & 1) !== 0,
+              alt: (bits & 2) !== 0,
+              shift: (bits & 4) !== 0,
+              meta: (bits & 8) !== 0,
+            }
+            const plainCtrl = mods.ctrl && !mods.alt && !mods.shift && !mods.meta
+            const letter = key.toLowerCase()
+            const expected =
+              !plainCtrl || (letter !== 'c' && letter !== 'v')
+                ? null
+                : letter === 'c'
+                  ? selection !== ''
+                    ? { kind: 'copy', text: selection }
+                    : childSelection
+                      ? { kind: 'swallow' }
+                      : null
+                  : { kind: 'paste' }
 
-          swept += 1
-          eq(
-            terminalClipboardAction(ev({ key, ...mods }), { selection, kind }),
-            expected,
-            `${JSON.stringify(mods)} ${key} in a ${kind} pane with ` +
-              `${selection === '' ? 'no selection' : 'a selection'}`,
-          )
+            swept += 1
+            eq(
+              terminalClipboardAction(ev({ key, ...mods }), { selection, kind, childSelection }),
+              expected,
+              `${JSON.stringify(mods)} ${key} in a ${kind} pane with ` +
+                `${selection === '' ? 'no selection' : 'a selection'}` +
+                `${childSelection ? ' after a drag the child got' : ''}`,
+            )
+          }
         }
       }
     }
   }
-  eq(swept, 2 * 2 * 5 * 16, 'swept both pane kinds × both selection states × the key set × 16')
+  eq(
+    swept,
+    2 * 2 * 2 * 5 * 16,
+    'swept both pane kinds × both selection states × child drag or not × the key set × 16',
+  )
+
+  // opencode's own selection: a drag under mouse tracking goes to the child, xterm has no
+  // selection, and Ctrl+C used to interrupt the program the user was copying from.
+  eq(
+    terminalClipboardAction(ev({ key: 'c', ctrl: true }), {
+      selection: '',
+      kind: 'shell',
+      childSelection: true,
+    }),
+    { kind: 'swallow' },
+    'Ctrl+C right after a drag the child received is swallowed, not an interrupt — the child ' +
+      'copied its own selection, and ETX would kill the turn the user was copying from',
+  )
+  eq(
+    terminalClipboardAction(ev({ key: 'c', ctrl: true }), {
+      selection: '\n',
+      kind: 'shell',
+      childSelection: false,
+    }),
+    null,
+    'with no child drag the whitespace rule is untouched: still the INTERRUPT',
+  )
 
   /* ------------------------------------------------- the four claims, said in their own words */
 

@@ -83,7 +83,9 @@ try {
   await import(`file://${resolve(out, 'logSmoke.js')}`)
   console.log = log
 
-  const byName = Object.fromEntries(JSON.parse(printed.at(-1)).map((d) => [d.story, d]))
+  const smoke = JSON.parse(printed.at(-1))
+  const byName = Object.fromEntries(smoke.digests.map((d) => [d.story, d]))
+  const worktreeStory = smoke.worktreeStory
 
   const eq = (actual, expected, what) => {
     checked += 1
@@ -383,6 +385,22 @@ try {
     byName.mock.controls,
     ['logBranch', 'logAuthor', 'logText', 'logRefresh'],
     'branch, author, text, refresh — in that order, and all four present on an unfiltered log',
+  )
+  /*
+   * No worktree picker, whatever the Log tab lists: the branch box marks which of its branches
+   * are checked out in a worktree instead (the user's call — a worktree's branch there already
+   * shows its history). The marking itself is `branchFilter.worktreeOfRow`, pinned by `check:log`.
+   */
+  eq(
+    Object.values(byName).filter((d) => d.worktree !== null).length,
+    0,
+    'no story draws a worktree picker',
+  )
+  eq(worktreeStory.worktree, null, 'not even with an agent checkout listed')
+  eq(
+    worktreeStory.controls,
+    ['logBranch', 'logAuthor', 'logText', 'logRefresh'],
+    '…the bar is the same four controls, with or without checkouts',
   )
   eq(byName.mock.branch, 'head', 'the branch control starts on the current branch')
   eq(

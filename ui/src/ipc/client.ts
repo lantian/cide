@@ -104,6 +104,7 @@ import type {
   ShelfEntry,
   StashEntry,
   TreeStatusMap,
+  WorktreeInfo,
 } from './generated'
 
 export type * from './generated'
@@ -1601,9 +1602,18 @@ export const events = {
    * *was* wired to it — stayed correct and disagreed. Both subscribe now, as do the file tree,
    * its status tags, the log, blame, the diff pane and the branch readout.
    */
-  onGitStatus: (handler: (project: ProjectId, tree: ChangesTree) => void) =>
-    listen<{ project: ProjectId; tree: ChangesTree }>('cide://git-status', (e) =>
-      handler(e.payload.project, e.payload.tree),
+  /*
+   * `worktree` is the agent checkout the tree describes, or `null` for the project's own repos.
+   * A mutation made while the Git panel looks at a `.cide/worktrees/` checkout broadcasts *that*
+   * checkout's tree, so a listener mirroring the project — the header's change count above all —
+   * must skip a non-null one, or a commit in an agent's checkout repaints the project's count.
+   */
+  onGitStatus: (
+    handler: (project: ProjectId, tree: ChangesTree, worktree: string | null) => void,
+  ) =>
+    listen<{ project: ProjectId; tree: ChangesTree; worktree?: string | null }>(
+      'cide://git-status',
+      (e) => handler(e.payload.project, e.payload.tree, e.payload.worktree ?? null),
     ),
 
   /**
@@ -1634,8 +1644,21 @@ export const events = {
  */
 export const git = {
   /** `includeIgnored` walks ignored files, which on a repo with a big `target/` is slow. */
-  status: (project: ProjectId, includeIgnored = false) =>
-    invoke<ChangesTree>('git_status', { project, includeIgnored }),
+  /*
+   * `worktree` walks one agent checkout under `.cide/worktrees/` instead of the project — its
+   * path, as `worktrees()` reported it in `repo.root`. Rust refuses a path that is not one of
+   * this project's checkouts rather than walking whatever the caller sent.
+   */
+  status: (project: ProjectId, includeIgnored = false, worktree: string | null = null) =>
+    invoke<ChangesTree>('git_status', { project, includeIgnored, worktree }),
+
+  /**
+   * The agent checkouts under `.cide/worktrees/` — what the Git panel's header and the Log's
+   * filter bar offer beside the project's own checkout. Each carries its checkout as a
+   * `RepoInfo`, and every `(project, repo)` command in here resolves that id, so choosing one is
+   * all it takes for stage, commit, diff and the log to act on it and on nothing else.
+   */
+  worktrees: (project: ProjectId) => invoke<WorktreeInfo[]>('git_worktrees', { project }),
 
   /**
    * Per-path status for the **file tree**, keyed by the absolute path a `TreeRow` carries.

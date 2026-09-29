@@ -156,6 +156,13 @@ export interface ClipboardFacts {
   /** `term.getSelection()`. The string, not the terminal — the fact, not the object. */
   selection: string
   kind: TerminalPaneKind
+  /**
+   * The last thing the pointer did in this pane was a drag the *child* received — xterm had
+   * forwarded it as mouse reports because the program turned mouse tracking on — and no key or
+   * press has come since. See the Ctrl+C branch of [`terminalClipboardAction`]. Optional so a
+   * caller with no pointer to speak of reads as "no".
+   */
+  childSelection?: boolean
 }
 
 /**
@@ -165,7 +172,12 @@ export interface ClipboardFacts {
  * key, which for Ctrl+C with nothing selected is the interrupt. Every branch that is not a copy
  * or a paste has to reach it.
  */
-export type ClipboardAction = { kind: 'copy'; text: string } | { kind: 'paste' } | null
+export type ClipboardAction =
+  | { kind: 'copy'; text: string }
+  | { kind: 'paste' }
+  /** Stop the keystroke and do nothing else — the child already copied what it selected. */
+  | { kind: 'swallow' }
+  | null
 
 /**
  * ESC CR — Shift+Enter as `/terminal-setup` encodes it.
@@ -249,7 +261,24 @@ export function terminalClipboardAction(
     // selection of nothing but whitespace copies nothing, which no one does on purpose; the
     // cost of not trimming is an interrupt that does not happen, which is the one keystroke
     // in this app that must never regress.
-    return facts.selection.trim() === '' ? null : { kind: 'copy', text: facts.selection }
+    if (facts.selection.trim() !== '') return { kind: 'copy', text: facts.selection }
+    /*
+     * A selection xterm cannot see. opencode — and any TUI that turns mouse tracking on — gets a
+     * plain drag as mouse reports, draws its own highlight and copies it itself (copy-on-select),
+     * so `getSelection()` is `''` and the branch above used to answer `null`: the user selected
+     * text, pressed Ctrl+C to copy it the way a claude or codex pane had taught them, and
+     * interrupted opencode instead. Those two panes never hit this because neither turns mouse
+     * tracking on, so a drag there is a real xterm selection.
+     *
+     * Swallow, don't copy: the text is not ours to read (the child may write the clipboard
+     * natively rather than by OSC 52), and it is already on the clipboard. The flag is
+     * consumed by this very keystroke (`xterm.ts` clears it on every keydown), so a second
+     * Ctrl+C interrupts — an accidental drag costs one extra press, never the interrupt.
+     *
+     * Not keyed on the harness, and deliberately: the frontend only knows an opencode pane
+     * indirectly, and "drag, then Ctrl+C" means "not kill" in vim or htop just as much.
+     */
+    return facts.childSelection === true ? { kind: 'swallow' } : null
   }
 
   if (letter(ev, 'v')) {

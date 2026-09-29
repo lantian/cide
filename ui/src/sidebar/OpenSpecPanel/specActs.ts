@@ -17,10 +17,10 @@ import {
   specSessions,
   type ProjectId,
 } from '@/ipc/client'
-import { notify, notifyFailure } from '@/chrome/notices'
+import { notify, notifyFailure, type NoticeAction } from '@/chrome/notices'
 import type { ConfirmState } from '@/chrome/ConfirmDestructive'
 import type { ReadyAct } from './model'
-import { useSpecRuns } from './specRuns'
+import { startSession, useSpecRuns } from './specRuns'
 
 interface ConfirmStore {
   confirming: ConfirmState | null
@@ -123,6 +123,29 @@ export function publishChange(project: ProjectId, change: string): void {
     .catch(notifyFailure)
 }
 
+/**
+ * The way out of an Integrate that could not merge: a session of the main model (Settings →
+ * Harness — Claude or Codex), in a new tab, told to merge `cide/spec-<change>` and resolve the
+ * conflicts. Offered on every notice where Integrate stopped short, so a conflict is never a
+ * dead end with a list of paths.
+ */
+function resolveAction(project: ProjectId, change: string): NoticeAction {
+  return {
+    label: 'Resolve in a new session',
+    run: () => {
+      void (async () => {
+        const { useWorkspace } = await import('@/store/workspace')
+        const setting = useWorkspace.getState().boot?.workspace.settings.consoleHarness
+        await startSession(project, {
+          op: 'merge',
+          change,
+          launcher: { kind: 'harness', harness: setting === 'codex' ? 'codex' : 'claude' },
+        })
+      })().catch(notifyFailure)
+    },
+  }
+}
+
 /** Integrate: commit, verify, merge into the checked-out branch. Never archives. */
 export function integrateChange(project: ProjectId, change: string): void {
   void specSessions
@@ -130,7 +153,19 @@ export function integrateChange(project: ProjectId, change: string): void {
     .then((outcome) => {
       switch (outcome.kind) {
         case 'merged':
-          notify(`Integrated ${change}: ${outcome.files} files.`, { kind: 'ok' })
+          notify(`Integrated ${change}: ${outcome.files} files.`, {
+            kind: outcome.kept.length === 0 ? 'ok' : 'warn',
+            // The root's own copies the user edited while the session worked: set aside, not
+            // dropped, when the branch's versions landed.
+            ...(outcome.kept.length === 0
+              ? {}
+              : {
+                  detail:
+                    'You had edited these in the project while the session worked; the ' +
+                    'branch’s versions landed, and yours are kept here:\n' +
+                    outcome.kept.join('\n'),
+                }),
+          })
           break
         case 'upToDate':
           notify(`${change} was already in this branch.`, { kind: 'ok' })
@@ -139,6 +174,7 @@ export function integrateChange(project: ProjectId, change: string): void {
           notify(`${change} would conflict, so nothing was merged.`, {
             kind: 'error',
             detail: outcome.paths.join('\n'),
+            actions: [resolveAction(project, change)],
           })
           break
         case 'refused':
@@ -147,5 +183,13 @@ export function integrateChange(project: ProjectId, change: string): void {
       }
       void useSpecRuns.getState().refreshCheckouts()
     })
-    .catch(notifyFailure)
+    // A merge git refused outright — untracked files in the way, a checkout it would overwrite —
+    // arrives as an error rather than a conflict list, and wants the same way out.
+    .catch((error: unknown) => {
+      notify(`${change} could not be integrated.`, {
+        kind: 'error',
+        detail: error instanceof Error ? error.message : String(error),
+        actions: [resolveAction(project, change)],
+      })
+    })
 }

@@ -180,6 +180,63 @@ function oneLine(text: string): string {
  * id is already in hand. A terminal is built for exactly one pane and never moves between
  * panes; hosts are keyed by pane id and outlive every mount.
  */
+/**
+ * Whether the last pointer gesture in this terminal was a drag handed to the child.
+ *
+ * Under mouse tracking xterm writes a plain drag to the pty as mouse reports instead of
+ * selecting, so opencode's own selection is invisible to `getSelection()` and the Ctrl+C that
+ * follows it would be an interrupt. `terminalClipboardAction` turns that Ctrl+C into nothing
+ * when this says yes — `keys.ts` carries the argument.
+ *
+ * Listeners on `document` in capture, not on the pane's element: they must see the press
+ * before xterm's own `mousedown` (which writes the report), they must never stop it — the child
+ * is entitled to the drag — and `createTerminal` runs before `term.open()` gives the terminal
+ * an element. They are removed with the terminal, through an addon's `dispose`.
+ *
+ * Shift is xterm's force-selection modifier on Linux, so a Shift+drag is a real xterm selection
+ * and not the child's; a press that never moved is a click, not a selection.
+ */
+function watchChildDrags(term: Terminal): { take(): boolean } {
+  let pressed: { x: number; y: number; moved: boolean } | null = null
+  let dragged = false
+  const inside = (ev: MouseEvent) =>
+    term.element !== undefined && ev.target instanceof Node && term.element.contains(ev.target)
+  const down = (ev: MouseEvent) => {
+    dragged = false
+    pressed =
+      inside(ev) && ev.button === 0 && !ev.shiftKey && term.modes.mouseTrackingMode !== 'none'
+        ? { x: ev.clientX, y: ev.clientY, moved: false }
+        : null
+  }
+  const move = (ev: MouseEvent) => {
+    if (pressed !== null && Math.hypot(ev.clientX - pressed.x, ev.clientY - pressed.y) >= 4) {
+      pressed.moved = true
+    }
+  }
+  const up = () => {
+    dragged = pressed?.moved === true
+    pressed = null
+  }
+  document.addEventListener('mousedown', down, true)
+  document.addEventListener('mousemove', move, true)
+  document.addEventListener('mouseup', up, true)
+  term.loadAddon({
+    activate() {},
+    dispose() {
+      document.removeEventListener('mousedown', down, true)
+      document.removeEventListener('mousemove', move, true)
+      document.removeEventListener('mouseup', up, true)
+    },
+  })
+  return {
+    take() {
+      const was = dragged
+      dragged = false
+      return was
+    },
+  }
+}
+
 export function createTerminal(kind: TerminalPaneKind, paneId: string): TerminalHandle {
   const style = getComputedStyle(document.documentElement)
   const theme = readTheme(style)
@@ -362,7 +419,12 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
    */
   const input = new InputGuard()
 
+  const childDrag = watchChildDrags(term)
+
   term.attachCustomKeyEventHandler((ev) => {
+    // Read before anything can return, cleared for every keydown: the fact is "the last thing
+    // done in this pane was a drag the child got", and any key ends that.
+    const childSelection = ev.type === 'keydown' ? childDrag.take() : false
     if (ev.type === 'keydown') {
       /*
        * An input method has taken this key: it has *not* been handled here, and something on
@@ -427,9 +489,14 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
      * That ordering is the whole of the interception: the bytes are stopped by the return
      * value, not by the promise, so nothing is racing the pty.
      */
-    const action = terminalClipboardAction(ev, { selection: term.getSelection(), kind })
+    const action = terminalClipboardAction(ev, {
+      selection: term.getSelection(),
+      kind,
+      childSelection,
+    })
     if (action !== null) {
       ev.preventDefault()
+      if (action.kind === 'swallow') return false
       const done =
         action.kind === 'copy' ? copyTerminalSelection(term) : pasteIntoTerminal(term, kind)
       void done.catch((error: unknown) => {
