@@ -245,4 +245,33 @@ pub trait RemoteHost: Send + Sync + 'static {
         let _ = (project, kind, key);
         Ok(None)
     }
+
+    /// Up to `len` bytes of a task attachment from `offset`, named by its record. (M136)
+    ///
+    /// The host resolves the record inside the task and refuses a tombstoned one: **the path is
+    /// never the device's to name.** `len` is already clamped to
+    /// [`cide_ipc::remote::ATTACHMENT_CHUNK`] by the server; a host may return fewer bytes, and
+    /// returns none exactly at the end of the file. Defaulted to a refusal for the reason the
+    /// milestone methods are.
+    fn attachment_slice(
+        &self,
+        project: ProjectId,
+        task: cide_ipc::TaskId,
+        attachment: cide_ipc::TaskAttachmentId,
+        offset: u64,
+        len: u32,
+    ) -> Result<AttachmentSlice, String> {
+        let _ = (project, task, attachment, offset, len);
+        Err("this cide does not serve attachments to a device".to_owned())
+    }
+}
+
+/// What [`RemoteHost::attachment_slice`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentSlice {
+    /// The file's size on disk now.
+    pub total: u64,
+    pub bytes: Vec<u8>,
+    /// Sniffed from the file's own header, and only on the slice at offset 0.
+    pub image: Option<cide_ipc::ImageFormat>,
 }

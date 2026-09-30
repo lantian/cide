@@ -34,6 +34,9 @@ parking_lot = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Standard-alphabet base64 for `AttachmentChunk`: the phone hands the string straight to
+# `expo-file-system`, which speaks exactly that. `seal`'s hand-rolled helpers are base64url.
+base64 = { workspace = true }
 
 [dev-dependencies]
 # `test-util` for tokio's pausable clock, and only here: one test waits out a twenty-second

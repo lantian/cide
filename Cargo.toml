@@ -289,6 +289,9 @@ parking_lot = "0.12.5"
 smallvec = "1"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 blake3 = "1.8.6"
+# Standard base64: GitLab's file API, and a task attachment's bytes on their way to a phone
+# (`ServerBody::AttachmentChunk`), which `expo-file-system` writes without decoding in JS.
+base64 = "0.22.1"
 
 # The pairing QR, encoded in `cide_core::remote::qr`. `default-features = false` is the whole
 # point of the entry: the defaults are `image`, `pic` and `svg`, and `image` is the decoder

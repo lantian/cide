@@ -547,6 +547,14 @@ the `--r-*`, `--sp-*`, `--shadow-*` and `--dur-*` families in `tokens.css`. `--s
 
 Since M91 a project's snapshot is **four** frames — runs, roster, board, milestones — and the milestone view is re-pushed whenever the project is marked dirty, `emit::milestones_changed` included. A server test that reads frames by *count* after a subscribe goes stale every time the snapshot grows; `subscribing_to_a_project_serves_its_runs_roster_and_board` is bounded by a clock for that reason, and `heard` skips all four. PgUp/PgDn arrive as `scrollView`, **not** as keys: `keys::page` sends a normal screen to the desk (`RemoteHost::scroll_view` → `cide://remote-scroll` → the pane host's `term.scrollPages`) and writes nothing to the child, and an alternate screen gets a wheel, or the key where no mouse was asked for. On the phone, `seq` belongs to the **connection**, not the console screen — cide's watermark is per socket, so a per-screen counter drops every key after a console is reopened — and `watchScreen`/`acknowledge` are interests replayed on every `welcome`, because `tell` drops anything said before `ready` and a notification's tap opens the console before the socket is up.
 
+Since M136 **a task attachment's bytes cross this wire**, as `attachmentRead` → `attachmentChunk`. Four failures here are silent:
+- **A slice that does not end on a multiple of three** (`ATTACHMENT_CHUNK`, pinned by a const assert) produces a file on the phone that is wrong with no error anywhere. The phone concatenates the slices' base64 and writes it undecoded.
+- **A host that resolves anything but the record** — a path from the device, or a symlink inside `.cide/` that leads out — is a download of any file on the machine. `attachment_slice` goes through `attachment_path` and then refuses anything that canonicalises outside `.cide/`.
+- **`TaskNew.attachments` from a device** is the same hole from the other side, so the remote road refuses it.
+- **`image` from the record's `kind`** instead of the sniff lets a hand-edited tracker vouch for a file as a picture.
+
+Gates: `cargo test -p cide-remote` (`an_attachment_is_served_in_slices_that_concatenate`), `cargo test -p cide-app -- remote::`, and cide-mobile's `npm run check`, whose end-to-end test downloads `fake_cide`'s two fixture attachments.
+
 ### A Claude tab cide opened by itself
 
 **Touches:** a Claude tab cide opened by itself — `cide_app::claude_tab`, `cide_app::spinner`, `TabKind::ClaudeFull::ephemeral`, `AgentsConfig`'s `finish_in_new_tab`/`auto_spin*`, `agent_rpc`'s `review_prompt`/`live_reviewer`, `cmd::session::spawn_session`

@@ -15,7 +15,7 @@ serde_json.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 git2.workspace = true
-base64 = "0.22.1"
+base64 = { workspace = true }
 globset.workspace = true
 blake3.workspace = true
 tracing.workspace = true

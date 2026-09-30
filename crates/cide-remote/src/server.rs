@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cide_ipc::remote::{
-    ClientBody, ClientFrame, PROTOCOL_VERSION, ServerBody, ServerFrame, error_kind,
+    ATTACHMENT_CHUNK, ClientBody, ClientFrame, PROTOCOL_VERSION, ServerBody, ServerFrame,
+    error_kind,
 };
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -153,6 +154,8 @@ pub const FEATURES: &[&str] = &[
     "scrollView",
     // Milestones, their gates' state and logs, running a gate and accepting one. (M91)
     "milestones",
+    // A task attachment's bytes, a slice at a time. (M136)
+    "attachments",
 ];
 
 /// Something that happened in cide, on its way to whichever devices care.
@@ -1691,6 +1694,50 @@ async fn serve(
 
             (
                 true,
+                ClientBody::AttachmentRead {
+                    project,
+                    task,
+                    attachment,
+                    offset,
+                    len,
+                },
+            ) => {
+                // Clamped here as well as documented on the host: a host is cide's code, the
+                // `len` is the device's, and the frame budget is this crate's to keep.
+                let len = len.min(ATTACHMENT_CHUNK);
+                let (t, a) = (task.clone(), attachment.clone());
+                let sent = match ask(&inner, move |host| {
+                    host.attachment_slice(project, t, a, offset, len)
+                })
+                .await
+                {
+                    Ok(slice) => {
+                        use base64::Engine as _;
+                        say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::AttachmentChunk {
+                                project,
+                                task,
+                                attachment,
+                                offset,
+                                total: slice.total,
+                                data: base64::engine::general_purpose::STANDARD
+                                    .encode(&slice.bytes),
+                                image: slice.image,
+                            },
+                        )
+                        .await
+                    }
+                    Err(why) => refused(&out_tx, id_of, Err(why)).await,
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+
+            (
+                true,
                 ClientBody::AnswerPrompt {
                     session,
                     option,
@@ -2309,7 +2356,38 @@ mod tests {
         }
     }
 
+    /// The one attachment the fake serves: a PNG header and then a chunk and a bit of filler, so
+    /// a whole read takes two slices and the second is short.
+    fn fake_attachment() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend((0..ATTACHMENT_CHUNK as usize + 5).map(|i| (i % 251) as u8));
+        bytes
+    }
+
     impl RemoteHost for FakeHost {
+        /// Serves [`fake_attachment`] as `a1`, **without clamping `len`** — so a test that asks
+        /// for more than a chunk and gets a chunk is proving the server's clamp, not the host's.
+        fn attachment_slice(
+            &self,
+            _project: ProjectId,
+            _task: cide_ipc::TaskId,
+            attachment: cide_ipc::TaskAttachmentId,
+            offset: u64,
+            len: u32,
+        ) -> Result<crate::AttachmentSlice, String> {
+            if attachment.0 != "a1" {
+                return Err("no such attachment: nope".to_owned());
+            }
+            let all = fake_attachment();
+            let from = (offset as usize).min(all.len());
+            let to = from.saturating_add(len as usize).min(all.len());
+            Ok(crate::AttachmentSlice {
+                total: all.len() as u64,
+                bytes: all[from..to].to_vec(),
+                image: (offset == 0).then_some(cide_ipc::ImageFormat::Png),
+            })
+        }
+
         fn instance(&self) -> InstanceInfo {
             InstanceInfo {
                 id: "i-test".to_owned(),
@@ -4097,6 +4175,102 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&written[0].bytes),
             "\x1b[<64;11;1M\x1b[<64;11;1M"
+        );
+    }
+
+    /// An attachment arrives a slice at a time, each slice no bigger than `ATTACHMENT_CHUNK`
+    /// however much the device asked for, and the slices' base64 concatenates into the whole
+    /// file's — the property the phone writes the file with. (M136)
+    #[tokio::test]
+    async fn an_attachment_is_served_in_slices_that_concatenate() {
+        use base64::Engine as _;
+        let (h, first, _second) = harness().await;
+        let (device, key) = pair(&h).await;
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        for _ in 0..3 {
+            heard(&mut ws).await.expect("the snapshot");
+        }
+
+        let task = cide_ipc::TaskId::from("t1".to_owned());
+        let mut joined = String::new();
+        let mut offset = 0u64;
+        let mut asked = 10;
+        let mut images = Vec::new();
+        loop {
+            say(
+                &mut ws,
+                Some(asked),
+                ClientBody::AttachmentRead {
+                    project: first,
+                    task: task.clone(),
+                    attachment: cide_ipc::TaskAttachmentId("a1".to_owned()),
+                    offset,
+                    len: u32::MAX,
+                },
+            )
+            .await;
+            let frame = loop {
+                let frame = heard_frame(&mut ws).await.expect("an answer");
+                if frame.id == Some(asked) {
+                    break frame;
+                }
+            };
+            let ServerBody::AttachmentChunk {
+                offset: at,
+                total,
+                data,
+                image,
+                ..
+            } = frame.body
+            else {
+                panic!("expected a chunk, got {:?}", frame.body);
+            };
+            assert_eq!(at, offset);
+            let got = base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .expect("base64")
+                .len() as u64;
+            assert!(got <= u64::from(ATTACHMENT_CHUNK), "{got} is over a chunk");
+            images.push(image);
+            joined.push_str(&data);
+            offset += got;
+            asked += 1;
+            if offset == total {
+                break;
+            }
+        }
+        assert_eq!(images.len(), 2, "a chunk and a bit is two slices");
+        assert_eq!(images, vec![Some(cide_ipc::ImageFormat::Png), None]);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&joined)
+                .expect("the concatenation is base64"),
+            fake_attachment()
+        );
+
+        say(
+            &mut ws,
+            Some(99),
+            ClientBody::AttachmentRead {
+                project: first,
+                task,
+                attachment: cide_ipc::TaskAttachmentId("nope".to_owned()),
+                offset: 0,
+                len: 16,
+            },
+        )
+        .await;
+        let frame = loop {
+            let frame = heard_frame(&mut ws).await.expect("an answer");
+            if frame.id == Some(99) {
+                break frame;
+            }
+        };
+        assert!(
+            matches!(&frame.body, ServerBody::Error { kind, .. } if kind == error_kind::REFUSED),
+            "{:?}",
+            frame.body
         );
     }
 

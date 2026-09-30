@@ -536,6 +536,7 @@ impl RemoteHost for AppRemoteHost {
     }
 
     fn task_new(&self, task: cide_ipc::TaskNew) -> Result<(), String> {
+        refuse_device_attachments(&task)?;
         let app = self.app.clone();
         on_the_runtime(async move {
             let state = app.state::<WorkspaceState>();
@@ -649,6 +650,101 @@ impl RemoteHost for AppRemoteHost {
             .map_err(|_| "that project is not open here".to_owned())?;
         Ok(crate::milestones::read_log(&root, kind, key))
     }
+
+    /// One slice of an attachment, through the desk's own jail. (M136)
+    ///
+    /// `cmd::tasks::attachment_path` builds the path from the record the store holds and refuses
+    /// a tombstone, so nothing the device sent is ever a path. On top of that, and only on this
+    /// road: the path is canonicalised and must still be under the project's `.cide/`. A
+    /// committed tracker is hand-editable and so is the tree it sits in — a symlink checked in
+    /// at `.cide/tasks/<t>/attachments/<id>/notes.txt` pointing at `~/.ssh/id_ed25519` is one
+    /// `git pull` away — and the desk opening such a file for the person at it is not the same
+    /// act as handing its bytes to a phone on the network.
+    fn attachment_slice(
+        &self,
+        project: ProjectId,
+        task: cide_ipc::TaskId,
+        attachment: cide_ipc::TaskAttachmentId,
+        offset: u64,
+        len: u32,
+    ) -> Result<cide_remote::AttachmentSlice, String> {
+        let Some(state) = self.app.try_state::<WorkspaceState>() else {
+            return Err("this cide is still starting".to_owned());
+        };
+        let root = crate::tasks_state::project_root(&state, project)
+            .map_err(|_| "that project is not open here".to_owned())?;
+        let stores = self
+            .app
+            .try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>()
+            .ok_or("this cide is still starting")?;
+        let store = stores.ensure(project, &root);
+        let path = crate::cmd::tasks::attachment_path(&store, &task, &attachment)
+            .map_err(|error| error.to_string())?;
+        read_attachment_slice(&root, &path, offset, len)
+    }
+}
+
+/// The phone never names a file on this machine. (M136)
+///
+/// `TaskNew.attachments` are **source paths on the desktop**, which the desk's picker fills and
+/// `TaskStore::attach` copies into the tracker. Passed through from a device, that is a paired
+/// phone asking cide to copy any file it can read — a key, a token — into `.cide/tasks/…`, and
+/// since `AttachmentRead` it would then be a download. Refused rather than stripped: a task
+/// created without the files its author meant to attach is a quieter wrong than an error.
+fn refuse_device_attachments(task: &cide_ipc::TaskNew) -> Result<(), String> {
+    match &task.attachments {
+        Some(paths) if !paths.is_empty() => {
+            Err("attachments are added on the computer, not from a device".to_owned())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Read up to `len` bytes of `path` from `offset`, refusing anything outside `root/.cide`.
+fn read_attachment_slice(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    offset: u64,
+    len: u32,
+) -> Result<cide_remote::AttachmentSlice, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let gone = |e: std::io::Error| format!("the attachment could not be read: {e}");
+    let real = std::fs::canonicalize(path).map_err(gone)?;
+    let jail = std::fs::canonicalize(root.join(".cide")).map_err(gone)?;
+    if !real.starts_with(&jail) {
+        return Err("that attachment points outside the tracker, so it is not served".to_owned());
+    }
+    let mut file = std::fs::File::open(&real).map_err(gone)?;
+    let meta = file.metadata().map_err(gone)?;
+    if !meta.is_file() {
+        return Err("that attachment is not a regular file".to_owned());
+    }
+    let total = meta.len();
+    if offset > total {
+        return Err(format!(
+            "offset {offset} is past the end of the attachment ({total} bytes)"
+        ));
+    }
+    file.seek(SeekFrom::Start(offset)).map_err(gone)?;
+    // `take(..).read_to_end`, not one `read`: a short read is legal without being at EOF, and a
+    // slice that came back short would still line up (the device asks from where it got to),
+    // but it would break the multiple-of-three rule `ATTACHMENT_CHUNK` states for the base64.
+    let want = u64::from(len.min(cide_ipc::remote::ATTACHMENT_CHUNK)).min(total - offset);
+    let mut bytes = Vec::with_capacity(want as usize);
+    file.take(want).read_to_end(&mut bytes).map_err(gone)?;
+    // Sniffed once, on the first slice, by the same reader the desk's thumbnail goes through —
+    // it reads the 8 KiB header and refuses a file whose name and contents disagree.
+    let image = if offset == 0 {
+        cide_core::image::read(&real).ok().map(|doc| doc.format)
+    } else {
+        None
+    };
+    Ok(cide_remote::AttachmentSlice {
+        total,
+        bytes,
+        image,
+    })
 }
 
 impl AppRemoteHost {
@@ -1143,6 +1239,77 @@ mod tests {
         };
         ws.settings.proxy.http = format!("http://user:{PLANTED_KEY}@proxy.corp:3128");
         ws
+    }
+
+    /// A device asking cide to copy a desktop file into a task is refused whole. (M136)
+    #[test]
+    fn a_device_cannot_name_a_desktop_file_to_attach() {
+        let with = |attachments: serde_json::Value| -> cide_ipc::TaskNew {
+            serde_json::from_value(serde_json::json!({
+                "project": ProjectId::new(),
+                "title": "t",
+                "attachments": attachments,
+            }))
+            .expect("a TaskNew")
+        };
+        let refused =
+            refuse_device_attachments(&with(serde_json::json!(["/home/u/.ssh/id_ed25519"])));
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(refuse_device_attachments(&with(serde_json::json!([]))).is_ok());
+        assert!(refuse_device_attachments(&with(serde_json::Value::Null)).is_ok());
+    }
+
+    fn attachment_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("cide-remote-att-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".cide/tasks/t/attachments/a")).expect("mkdir");
+        root
+    }
+
+    /// Slices line up, stop at the end, and only the first is sniffed. (M136)
+    #[test]
+    fn an_attachment_is_read_a_slice_at_a_time() {
+        let root = attachment_root("slices");
+        let path = root.join(".cide/tasks/t/attachments/a/shot.png");
+        let chunk = cide_ipc::remote::ATTACHMENT_CHUNK as usize;
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(chunk + 10, 7);
+        std::fs::write(&path, &bytes).expect("write");
+
+        // A device asking for more than a chunk gets a chunk.
+        let first = read_attachment_slice(&root, &path, 0, u32::MAX).expect("first");
+        assert_eq!(first.total, bytes.len() as u64);
+        assert_eq!(first.bytes, bytes[..chunk]);
+        assert_eq!(first.image, Some(cide_ipc::ImageFormat::Png));
+
+        let second = read_attachment_slice(&root, &path, chunk as u64, u32::MAX).expect("second");
+        assert_eq!(second.bytes, bytes[chunk..]);
+        assert_eq!(second.image, None, "sniffed on the first slice only");
+
+        let end = read_attachment_slice(&root, &path, bytes.len() as u64, 16).expect("end");
+        assert!(end.bytes.is_empty());
+        assert!(read_attachment_slice(&root, &path, bytes.len() as u64 + 1, 16).is_err());
+
+        // A file that is not an image is served, and not vouched for as one.
+        let text = root.join(".cide/tasks/t/attachments/a/notes.txt");
+        std::fs::write(&text, b"hello").expect("write");
+        let slice = read_attachment_slice(&root, &text, 0, 16).expect("text");
+        assert_eq!((slice.bytes.as_slice(), slice.image), (&b"hello"[..], None));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A committed symlink out of the tracker is not a way off the machine. (M136)
+    #[cfg(unix)]
+    #[test]
+    fn an_attachment_symlinked_out_of_the_tracker_is_refused() {
+        let root = attachment_root("jail");
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, b"key").expect("write");
+        let link = root.join(".cide/tasks/t/attachments/a/notes.txt");
+        std::os::unix::fs::symlink(&secret, &link).expect("symlink");
+        let refused = read_attachment_slice(&root, &link, 0, 16);
+        assert!(refused.is_err(), "{refused:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The rule this module exists for. If a projection ever grows a field that reaches into

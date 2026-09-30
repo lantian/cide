@@ -42,7 +42,7 @@ pub mod seal;
 pub mod server;
 
 pub use devices::{Device, DeviceStore};
-pub use host::RemoteHost;
+pub use host::{AttachmentSlice, RemoteHost};
 pub use server::{RemoteEvent, RemoteServer, ServerEvent};
 
 /// Everything this crate refuses to do, and why.

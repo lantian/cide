@@ -185,6 +185,8 @@ for (const arm of ['off', 'refused']) {
 const KNOWN_CLIENT_FRAMES = [
   'acknowledge',
   'answerPrompt',
+  // M136: a task attachment's bytes, a slice at a time, for the phone's task screen.
+  'attachmentRead',
   // M91: the Milestones screen reads a check's log, runs the active gate, accepts it.
   'checkLog',
   'dispatch',

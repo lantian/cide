@@ -16801,3 +16801,110 @@ its transcript and cached in the journal.
   been seen end to end.
 - Neither Open road (reveal, or continue into a tab) has been pressed in a running app.
 - Transcript search has not been timed over a large `~/.claude/projects`.
+
+## M135 — A restart leaves parked runs parked
+
+**Reported:** terrastrike's runs were idle when cide closed. They had turns ended and questions
+out to the user ("Waiting for your answer"), and one sat on an approval. At the next launch every
+one of them started working again.
+
+**Cause:** the snapshot already saved each run's real state. The restore turned every
+non-terminal state into `Interrupted`. M118's launch pass (`resume_after_restart` →
+`requeue_interrupted`) then requeued every `Interrupted` row with "cide restarted while you were
+working … continue". Codex takes that as the positional prompt of `codex resume`, so a new turn
+started. Nothing on that road read the task. The question rule that autodispatch, `task_refusal`
+and the planner all keep had one way around it, and this was it.
+
+**Fix (`cide-app/src/agents.rs`):**
+- `ParkedAtQuit` (`Idle` | `Permission`) is the one bit of a non-terminal state that now
+  survives a restart. It is kept on `LiveRun` and in `SavedRun.parkedAtQuit`, so a second
+  restart before anybody acts keeps it. A snapshot from before the field falls back to its
+  `state`, which already said `idle`.
+- `requeue_interrupted` takes a `Requeue`:
+  - `Launch` skips parked runs, and runs whose task has an open question or is out of
+    `todo`/`doing` (`idle_tasks`, read off the board at launch).
+  - `Resume`, the button, is unchanged.
+- A parked row's note says what starts it. That is the user's answer, which continues its
+  conversation through `hand_back_to_run` → dispatch (M116, since `Interrupted` does not hold the
+  pair), a dispatch, or Resume.
+- A parked run that is resumed opens with `Restarted::CideWhileWaiting` ("while you were
+  waiting … read its newest comments first") instead of "while you were working".
+
+**Verified:** two new tests. One covers working/idle/permission through two restarts, the launch
+pass, the M116 lookup, and Resume's wording. The other covers the task gate. `cargo test -p
+cide-app -- agents agent_rpc lifecycle` passes, and clippy (`--no-deps`; `cide-ipc`'s `remote.rs`
+has another session's in-flight lint) and fmt are clean.
+
+**Not confirmed on a display:** no real quit-and-relaunch with a parked codex run has been
+watched.
+
+## M136 — The phone shows a task's attachments
+
+**Asked:** on cide-mobile, a task's attached images should be viewable and its other files
+downloadable to the phone. A task with many images and comments must not freeze the app, so
+content should load as it scrolls in and unload as it scrolls out.
+
+**Before:** the phone's task screen ignored attachments. `TaskDetail` already sent every record
+(the body's and each comment's), but nothing on the wire could carry bytes. The screen was one
+eager `ScrollView` that mounted every comment the moment the task arrived.
+
+**Wire (additive, `PROTOCOL_VERSION` stays 1; feature `"attachments"`):**
+- `ClientBody::AttachmentRead { project, task, attachment, offset, len }` is answered with
+  `ServerBody::AttachmentChunk { …, offset, total, data (base64), image? }`.
+- Slices are pulled one at a time, never pushed. The server clamps `len` to `ATTACHMENT_CHUNK`
+  (192 KiB, which is 256 KiB of base64). One slice in flight per download means the bounded
+  outbound queue cannot fill behind a 32 MiB file. A download nobody wants any more stops because
+  nobody asks for the next slice.
+- `ATTACHMENT_CHUNK` is a multiple of three, which a const assert pins. That makes the slices'
+  base64 strings concatenate into the file's base64, so the phone writes the file with one
+  `expo-file-system` call and never decodes it in JS.
+- `image` is sniffed from the file's header on slice 0 by `cide_core::image::read`, the same
+  reader the desk's thumbnail uses. It, and not the record's `kind`, decides whether the phone
+  draws a picture.
+
+**Host (`cide_app::remote::attachment_slice`):**
+- The path comes from `cmd::tasks::attachment_path`: from the record, with tombstones refused and
+  the legacy location falling back through `path_of`.
+- It is then canonicalised and must be under the project's `.cide/`. A committed symlink inside
+  the tracker must not be a way to get a file off the machine.
+
+**Closed on the way:** `ClientBody::TaskNew` passed `attachments` (desktop *source paths*)
+through to `TaskStore::attach`. A paired device could make cide copy any readable file into
+`.cide/tasks/…`, and with `AttachmentRead` it could then download it. The remote road now refuses
+a `TaskNew` whose `attachments` is non-empty (`refuse_device_attachments`).
+
+**Phone (`cide-mobile`):**
+- `src/attachments/`:
+  - `fetchChunks.ts` does the reassembly and validation: offsets, a total that changed mid-read,
+    the 32 MiB cap, the multiple-of-three rule, and abort between slices.
+  - `queue.ts` downloads two at a time, newest wanted first. It forgets a released key and aborts
+    a running one once nobody wants it.
+  - `store.ts` keeps per-attachment state through `useSyncExternalStore`. It has a disk cache
+    under `cacheDirectory/attachments/<instance>/<id>/`, where `meta.json` is written last and
+    means the download finished. The cache is trimmed oldest-first to 200 MiB.
+  - `export.ts` saves through a SAF folder the person picks once, and shares through
+    `expo-sharing`.
+- The task screen is a `FlatList`: the header holds the task, and each item is a comment,
+  memoised by value. Each attachment strip is a horizontal `FlatList`, and the viewer is a paging
+  `FlatList` with a window of three.
+- Image tiles load while mounted. Images over 8 MiB wait for a tap, and files are fetched only on
+  Save or Share. `expo-image` downsamples to the view and frees pixels on unmount.
+- New dependencies: `expo-file-system`, `expo-sharing`, `expo-image`. They are native modules and
+  need a rebuild.
+
+**Verified:**
+- cide: `cargo test -p cide-remote` includes a loopback test that asks for `u32::MAX` and gets
+  clamped slices whose base64 concatenates to the file, plus a refused unknown id.
+  `cargo test -p cide-app -- remote::` covers slices, sniff-on-first-only, the symlink jail and
+  the `TaskNew` refusal. `cargo test -p xtask protocol`, `cargo test -p cide-ipc -- remote`,
+  `check:remote`, `codegen --check`, `contract-check`, and clippy on the touched crates pass.
+- cide-mobile: `npm run check` passes (266 tests). That includes the end-to-end test that
+  downloads `fake_cide`'s PNG and text attachments over a real sealed socket.
+
+**Not confirmed on a device:** nothing here has been run on a phone:
+- the rebuild with the three native modules;
+- the scroll feel on a long card;
+- the viewer's paging;
+- SAF saving (including the `shot.png.png` extension rule);
+- the share sheet.
+The viewer has no pinch-zoom.

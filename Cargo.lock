@@ -994,6 +994,7 @@ dependencies = [
 name = "cide-remote"
 version = "0.11.2-dev"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
  "cide-ipc",

@@ -162,6 +162,34 @@ fn project() -> ProjectId {
         .expect("a uuid")
 }
 
+/// The fixture's two attachments, by id: a 1×1 PNG on the body and a text file on the reviewer's
+/// comment. (M136) A test downloads both and compares the bytes it wrote with these.
+fn attachment_bytes(id: &str) -> Option<Vec<u8>> {
+    match id {
+        "a-png" => Some(vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99,
+            0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]),
+        "a-txt" => Some(b"what the reviewer saw\n".repeat(20)),
+        _ => None,
+    }
+}
+
+fn attachment(id: &str, name: &str, kind: cide_ipc::AttachmentKind) -> cide_ipc::TaskAttachment {
+    cide_ipc::TaskAttachment {
+        id: cide_ipc::TaskAttachmentId(id.to_owned()),
+        name: name.to_owned(),
+        bytes: attachment_bytes(id).map_or(0, |b| b.len() as u64),
+        kind,
+        added_by: cide_ipc::TaskAuthor::User,
+        added_unix_ms: 1_789_900_000_000,
+        deleted: false,
+    }
+}
+
 impl Constants {
     /// The one task, and the conversation on it. See [`RemoteHost::board`].
     fn detail(&self) -> cide_ipc::TaskDetail {
@@ -190,7 +218,7 @@ impl Constants {
                 created_unix_ms: 1_789_900_000_000,
                 updated_unix_ms: 1_789_903_600_000,
                 comment_count: 3,
-                attachment_count: 0,
+                attachment_count: 2,
                 acceptance: None,
                 question: None,
                 touches: Vec::new(),
@@ -210,7 +238,13 @@ impl Constants {
                     1_789_901_400_000,
                     "Handing this to `reviewer`. Three separate defects, one screen.",
                 ),
-                comment(
+                cide_ipc::TaskComment {
+                    attachments: vec![attachment(
+                        "a-txt",
+                        "notes.txt",
+                        cide_ipc::AttachmentKind::File,
+                    )],
+..comment(
                     3,
                     cide_ipc::TaskAuthor::Agent {
                         agent: "reviewer".to_owned().into(),
@@ -218,9 +252,14 @@ impl Constants {
                     },
                     1_789_903_600_000,
                     "## What I found\n\n1. The header renders `JSON.stringify(author)`.\n2. Nothing carries `at_unix_ms` to the screen.\n3. Markdown is drawn as source.\n\nThe parser is already shared with the panel — see `editor/markdown/blocks.ts`.",
-                ),
+                )
+                },
             ],
-            attachments: Vec::new(),
+            attachments: vec![attachment(
+                "a-png",
+                "dot.png",
+                cide_ipc::AttachmentKind::Image,
+            )],
             history: vec![cide_ipc::TaskStatusChange {
                 from: cide_ipc::TaskStatus::Todo,
                 to: cide_ipc::TaskStatus::Doing,
@@ -374,6 +413,31 @@ impl RemoteHost for Constants {
             return None;
         }
         Some(detail)
+    }
+
+    /// The fixture's attachments, in slices, like the real host. (M136)
+    fn attachment_slice(
+        &self,
+        project: ProjectId,
+        _task: cide_ipc::TaskId,
+        attachment: cide_ipc::TaskAttachmentId,
+        offset: u64,
+        len: u32,
+    ) -> Result<cide_remote::AttachmentSlice, String> {
+        let all = attachment_bytes(&attachment.0)
+            .filter(|_| project == self::project())
+            .ok_or_else(|| format!("no such attachment: {attachment}"))?;
+        let from = usize::try_from(offset)
+            .ok()
+            .filter(|&at| at <= all.len())
+            .ok_or("that offset is past the end of the attachment")?;
+        let to = from.saturating_add(len as usize).min(all.len());
+        Ok(cide_remote::AttachmentSlice {
+            total: all.len() as u64,
+            bytes: all[from..to].to_vec(),
+            image: (offset == 0 && all.starts_with(b"\x89PNG"))
+                .then_some(cide_ipc::ImageFormat::Png),
+        })
     }
 
     /// Three consoles, of the two kinds, in three states. (M76)

@@ -39,7 +39,7 @@ use crate::agents::{AgentScope, DispatchRequest, Harness};
 use crate::ids::{AgentId, PaneId, ProjectId, RunId, SessionId, TabId};
 use crate::screen::{Cursor, ScreenInfo, ScreenLine, ScrollbackCapture};
 use crate::tasks::{TaskEdit, TaskNew};
-use crate::{PaneKind, PaneRole, SessionState, TaskId};
+use crate::{PaneKind, PaneRole, SessionState, TaskAttachmentId, TaskId};
 
 /// Which cide a device is talking to.
 ///
@@ -553,10 +553,42 @@ pub enum ClientBody {
         kind: String,
         key: String,
     },
+    /// Read one slice of a task attachment's bytes. (M136) Answered with
+    /// [`ServerBody::AttachmentChunk`]. Offered when `features` carries `"attachments"`.
+    ///
+    /// **Pulled a slice at a time, never pushed whole.** An attachment may be 32 MiB. One frame
+    /// that size would be over the 1 MiB budget a frame is written against, and it would hold
+    /// the device's single outbound writer long enough that screen frames queue behind it until
+    /// the bounded queue `Desync`s the connection. A device that asks for the next slice only
+    /// after the last one arrived paces the transfer itself, and one that stops asking (the
+    /// user scrolled past the image) has stopped it. `len` is a wish: the server clamps it to
+    /// [`ATTACHMENT_CHUNK`].
+    ///
+    /// The file is named by the record, never by a path. The server resolves the record inside
+    /// the task and refuses a tombstoned one, the way the desk's `attachment_path` does.
+    AttachmentRead {
+        project: ProjectId,
+        task: TaskId,
+        attachment: TaskAttachmentId,
+        #[ts(type = "number")]
+        offset: u64,
+        len: u32,
+    },
     /// Keep the connection honest. RN's `WebSocket` exposes no protocol-level ping, and a NAT
     /// mapping that has gone away is otherwise indistinguishable from a quiet server.
     Ping,
 }
+
+/// The most bytes one [`ServerBody::AttachmentChunk`] carries: 192 KiB, which is 256 KiB of
+/// base64 and a quarter of the frame budget.
+///
+/// **A multiple of three, and that is load-bearing.** Base64 encodes three bytes into four
+/// characters with no carry between groups, so the encodings of slices that each start on a
+/// multiple of three concatenate into the encoding of the whole file. The phone relies on it
+/// to write a download to disk in one call without ever decoding it in JavaScript, where a
+/// 32 MiB `Uint8Array` round trip is what freezes the UI thread.
+pub const ATTACHMENT_CHUNK: u32 = 192 * 1024;
+const _: () = assert!(ATTACHMENT_CHUNK.is_multiple_of(3));
 
 /// One frame to a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -743,6 +775,29 @@ pub enum ServerBody {
         #[ts(optional)]
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+    },
+    /// One slice of an attachment, the answer to [`ClientBody::AttachmentRead`].
+    ///
+    /// `data` is base64 of the bytes at `offset`; it is empty exactly when `offset == total`.
+    /// `total` is the file's size on disk now, which is what the device loops to, rather than
+    /// the record's `bytes`: the record is a committed, hand-editable file.
+    ///
+    /// `image` is the format the server sniffed from the file's own header, sent on the slice
+    /// at offset 0 only. **It, and not the record's `kind`, decides whether a device draws the
+    /// file as a picture** — the desk's rule for `task_attachment_image`, for the same reason:
+    /// `kind` is a hint anybody with the repository can edit.
+    AttachmentChunk {
+        project: ProjectId,
+        task: TaskId,
+        attachment: TaskAttachmentId,
+        #[ts(type = "number")]
+        offset: u64,
+        #[ts(type = "number")]
+        total: u64,
+        data: String,
+        #[ts(optional)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<crate::ImageFormat>,
     },
     Desync {
         why: String,

@@ -708,7 +708,7 @@ pub async fn task_pick_attachments(
 /// The jail is the construction: the path is `root/.cide/attachments/<task>/<id>/<name>` from a
 /// record the store holds, so there is nothing for `openable`'s containment ladder to check.
 /// A tombstoned record answers "no such attachment", like a deleted comment.
-fn attachment_path(
+pub(crate) fn attachment_path(
     store: &TaskStore,
     task: &TaskId,
     attachment: &TaskAttachmentId,

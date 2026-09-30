@@ -391,6 +391,15 @@ struct LiveRun {
     /// restored run is `Interrupted`, and this flag exists only on the short walk from Resume
     /// to admission.
     continuing: bool,
+    /// What a restored run was doing when cide quit, when that was **waiting** rather than
+    /// working — see [`ParkedAtQuit`]. `None` for every run this process forked, and for a
+    /// restored one that was mid-turn.
+    ///
+    /// Persisted (`SavedRun::parked_at_quit`), unlike `continuing`: a second restart before
+    /// anybody acts must not turn a parked row into a working one, and by then the row's state
+    /// on disk is `Interrupted`, which says nothing either way. Taken at admission, where it
+    /// picks the continuation's opening sentence.
+    parked_at_quit: Option<ParkedAtQuit>,
     /// What the next admission forks, when a child's opening prompt never started a turn and
     /// the run went back to the queue for it. See [`AgentRegistry::abandon_unsubmitted`].
     /// Taken at admission and read nowhere else; never persisted, for `continuing`'s reason.
@@ -709,6 +718,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
             stale_turn: false,
             harness_session: None,
             continuing: false,
+            parked_at_quit: None,
             requeued: None,
             follow_ups: Vec::new(),
             opening_requeues: 0,
@@ -2111,6 +2121,8 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>, noted: &mut Ve
             // conversation to continue (it was still queued when cide quit) starts fresh with
             // its original prompt, which is the honest reading of "nothing happened yet".
             let requeued = live.requeued.take();
+            // Read here and nowhere after: it only chooses this continuation's first sentence.
+            let parked_at_quit = live.parked_at_quit.take();
             let resume = match (&requeued, live.continuing) {
                 (Some(requeued), _) => requeued.resume.clone(),
                 (None, true) => resume_point(live),
@@ -2140,7 +2152,10 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>, noted: &mut Ve
                         // state a user reaches.
                         cide_hook_binary()
                             .and_then(|_| cide_agents::harness::for_kind(live.harness)),
-                        Restarted::Cide,
+                        match parked_at_quit {
+                            Some(_) => Restarted::CideWhileWaiting,
+                            None => Restarted::Cide,
+                        },
                     ),
                     false => live.prompt.clone(),
                 },
@@ -2754,12 +2769,108 @@ enum Restarted {
     /// It was paused, and resumed when its role had no free slot, so it waited in the queue
     /// with its process ended. See [`AgentRegistry::reclaim_slots`].
     Requeued,
+    /// The cide process went down and came back while the run was **waiting** — its turn over,
+    /// or parked on an approval — and a person has now resumed it. [`Self::Cide`]'s "while you
+    /// were working" would be a false lead: nothing was cut off, and what may have changed is
+    /// the task (an answer, a comment), not the tree.
+    CideWhileWaiting,
+}
+
+/// Who is asking [`AgentRegistry::requeue_interrupted`] to put interrupted runs back.
+#[derive(Clone, Copy)]
+enum Requeue<'a> {
+    /// A person pressed Resume: their decision, so everything it names goes back.
+    Resume,
+    /// cide's own launch pass ([`AgentRegistry::resume_after_restart`]), which nobody asked
+    /// for and so wakes only work that was under way: never a run parked at quit, and never
+    /// one on a task in `idle_tasks` (task id → why, from [`idle_tasks`]).
+    Launch {
+        idle_tasks: &'a HashMap<TaskId, String>,
+    },
+}
+
+/// The tasks the launch must not wake a run on, each with the reason its row says. (See
+/// [`Requeue::Launch`].)
+///
+/// A run that was mid-turn at quit is resumed — unless its task stopped being work while cide
+/// was down or at the moment it went: a question for the user is open (autodispatch and
+/// `task_refusal` refuse exactly that, and the launch pass used to be the one road around both),
+/// or the task is no longer `todo`/`doing` — moved to review, done, back to the inbox. The
+/// user's answer, a dispatch or Resume start it again, as they would any other run.
+fn idle_tasks(rows: &[cide_ipc::TaskRow]) -> HashMap<TaskId, String> {
+    rows.iter()
+        .filter_map(|row| {
+            let why = match (&row.question, row.status) {
+                (Some(_), _) => format!(
+                    "{} is waiting for the user's answer to its question",
+                    row.id
+                ),
+                (None, cide_ipc::TaskStatus::Todo | cide_ipc::TaskStatus::Doing) => return None,
+                (None, status) => format!(
+                    "{} is in {}, not being worked",
+                    row.id,
+                    format!("{status:?}").to_lowercase()
+                ),
+            };
+            Some((row.id.clone(), why))
+        })
+        .collect()
+}
+
+/// What a run was waiting on when cide quit — the one bit of a non-terminal state a restart
+/// keeps. (See `SavedRun::state`.)
+///
+/// It exists for [`AgentRegistry::resume_after_restart`]: a run whose turn had ended, or which
+/// sat on an approval prompt, was not working, and waking it at launch with "cide restarted
+/// while you were working … continue" started a turn nobody asked for — terrastrike's runs,
+/// each parked on a question for the user, all set off again at the next launch. A parked run
+/// stays `Interrupted` instead, and the roads that would have woken it anyway wake it: the
+/// user's answer (`hand_back_to_run` continues its conversation, M116), a dispatch, or Resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ParkedAtQuit {
+    /// `Idle`: the turn was handed back and the child sat at its prompt.
+    Idle,
+    /// `AwaitingPermission`: an approval prompt was up. It died with the child, so a Resume
+    /// makes the run ask again rather than carrying on as if it had been granted.
+    Permission,
+}
+
+impl ParkedAtQuit {
+    /// `None` for every state that is not waiting on a person — a working run is resumed at
+    /// launch, as before.
+    fn of(state: &RunState) -> Option<Self> {
+        match state {
+            RunState::Idle => Some(Self::Idle),
+            RunState::AwaitingPermission => Some(Self::Permission),
+            _ => None,
+        }
+    }
+
+    /// The restored row's note: why it did not start by itself, and what does start it.
+    fn note(self) -> &'static str {
+        match self {
+            Self::Idle => {
+                "its turn had ended when cide closed, so it was not resumed; it continues when \
+                 the task is answered or dispatched again, or on Resume"
+            }
+            Self::Permission => {
+                "it was waiting for an approval when cide closed, so it was not resumed; the \
+                 prompt ended with its child — Resume continues it and it asks again"
+            }
+        }
+    }
 }
 
 impl Restarted {
     fn opening(self) -> &'static str {
         match self {
             Self::Cide => "cide restarted while you were working.",
+            Self::CideWhileWaiting => {
+                "cide restarted while you were waiting; the conversation so far is yours, the \
+                 process is new. The task may have moved since — an answer, a comment — so read \
+                 its newest comments first."
+            }
             Self::Settings => {
                 "cide restarted you on new model settings while you were paused; the \
                  conversation so far is yours, the process is new."
@@ -4280,7 +4391,13 @@ impl AgentRegistry {
         // the pump, so this press is what starts them; through the queue, because an
         // interrupted run holds no slot and its role's worktree may meanwhile belong to a
         // newer run — admission is the arbiter, exactly as for a dispatch.
-        self.requeue_interrupted(project, run, sessions.as_deref(), settings_now.as_ref())?;
+        self.requeue_interrupted(
+            project,
+            run,
+            sessions.as_deref(),
+            settings_now.as_ref(),
+            Requeue::Resume,
+        )?;
 
         // The queue is open again, so whatever was waiting may start.
         self.pump(app);
@@ -4340,9 +4457,19 @@ impl AgentRegistry {
                 continue;
             }
             let settings_now = settings_now(app, project);
-            if let Err(error) =
-                self.requeue_interrupted(project, None, sessions.as_deref(), settings_now.as_ref())
-            {
+            let idle_tasks = app
+                .try_state::<Arc<crate::tasks_state::TasksStores>>()
+                .map(|stores| idle_tasks(&stores.ensure(project, &root).list()))
+                .unwrap_or_default();
+            if let Err(error) = self.requeue_interrupted(
+                project,
+                None,
+                sessions.as_deref(),
+                settings_now.as_ref(),
+                Requeue::Launch {
+                    idle_tasks: &idle_tasks,
+                },
+            ) {
                 tracing::warn!(%project, %error, "could not resume the runs a restart interrupted");
             }
             self.mark_changed(app, project);
@@ -4767,12 +4894,18 @@ impl AgentRegistry {
     /// which is right while the pool is the one it settled into and wrong once a person has
     /// edited it while cide was down — a position into a list that no longer exists. Such a
     /// run has its stamp cleared here, so the fork re-stamps from the top of the current pool.
+    ///
+    /// `why` is who is asking. A person's Resume ([`Requeue::Resume`]) requeues whatever it
+    /// names. The launch ([`Requeue::Launch`]) requeues only runs that were **working** when
+    /// cide quit, on a task that is still being worked — see [`ParkedAtQuit`] and
+    /// [`idle_tasks`] for the two it leaves alone and why.
     fn requeue_interrupted(
         &self,
         project: ProjectId,
         run: Option<RunId>,
         sessions: Option<&SessionRegistry>,
         settings_now: &SettingsNow<'_>,
+        why: Requeue<'_>,
     ) -> Result<()> {
         let one_run = run.is_some();
         let mut inner = self.inner.lock();
@@ -4805,6 +4938,20 @@ impl AgentRegistry {
             let Some(live) = inner.runs.get_mut(&run) else {
                 continue;
             };
+            // The launch's two skips, before the others: a run nobody was waiting on to work
+            // keeps its note saying what will start it, rather than being told that cide
+            // restarted "while you were working" and inventing a turn.
+            if let Requeue::Launch { idle_tasks } = why {
+                if let Some(parked) = live.parked_at_quit {
+                    tracing::info!(%run, agent = %live.agent, ?parked, "resume: left a run that was waiting at quit parked");
+                    continue;
+                }
+                if let Some(idle) = live.task.as_ref().and_then(|task| idle_tasks.get(task)) {
+                    tracing::info!(%run, agent = %live.agent, "resume: left a run whose task is no longer being worked");
+                    live.note = Some(format!("not resumed after the cide restart: {idle}"));
+                    continue;
+                }
+            }
             if viewed {
                 if one_run {
                     return Err(CoreError::Io(VIEWED_IN_A_PANE.into()));
@@ -6043,14 +6190,25 @@ struct SavedRun {
     /// field, which is what every run then had.
     #[serde(default)]
     notify: RunNotify,
-    /// The state at quit, kept **only** for its terminal arms: a `Finished` or `Failed` run
-    /// restores verbatim, because history is history — the user asked for the panel's tail to
-    /// be a durable record of runs, not a per-process scratchpad. Every other state restores
-    /// as [`RunState::Interrupted`], whatever it was: the child is gone either way, and the
-    /// old state would be a claim about a process that no longer exists. `None` (a file from
-    /// before this field) reads as non-terminal.
+    /// The state at quit. A `Finished` or `Failed` run restores verbatim, because history is
+    /// history — the user asked for the panel's tail to be a durable record of runs, not a
+    /// per-process scratchpad. Every other state restores as [`RunState::Interrupted`],
+    /// whatever it was: the child is gone either way, and the old state would be a claim about
+    /// a process that no longer exists. What survives of it is one bit, [`ParkedAtQuit`]:
+    /// whether the run was waiting (`Idle`, `AwaitingPermission`) or working. This paragraph
+    /// used to say the field was kept "only for its terminal arms", and the launch resume then
+    /// woke terrastrike's runs that had been sitting on questions for the user — every one of
+    /// them started a turn nobody asked for. `None` (a file from before this field) reads as
+    /// non-terminal and working.
     #[serde(default)]
     state: Option<RunState>,
+    /// Whether this run was **waiting** at quit rather than working — see [`ParkedAtQuit`].
+    /// Written beside `state` because a row a previous restart restored is saved as
+    /// `Interrupted`, and without this a second restart before anybody acted would forget it
+    /// and wake the run. Absent (a working run, history, or a file from before the field)
+    /// falls back to reading `state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parked_at_quit: Option<ParkedAtQuit>,
     /// [`RunPurpose::Spec`], for an OpenSpec session. Absent (every other run, and every file
     /// from before these sessions) restores as work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6604,6 +6762,12 @@ impl AgentRegistry {
                         checkout: live.checkout.clone(),
                         notify: live.notify.clone(),
                         state: Some(live.state.clone()),
+                        parked_at_quit: match live.state {
+                            // Still the row a restart parked: carry the flag, since its state
+                            // on disk will read `Interrupted` and say nothing either way.
+                            RunState::Interrupted => live.parked_at_quit,
+                            ref state => ParkedAtQuit::of(state),
+                        },
                         external: live.options().and_then(|o| o.external.clone()),
                         chosen_harness: live.options().and_then(|o| o.harness),
                         chosen_model: live.options().and_then(|o| o.model.clone()),
@@ -6715,6 +6879,15 @@ impl AgentRegistry {
             // nothing. Now Open asks the registry first, and for this row the answer is the
             // real harness on the transcript — which needs the id. A row whose transcript is
             // gone drops it, so the withheld-not-disabled rule holds through `openable`.
+            //
+            // A row that was *waiting* at quit — its turn over, or parked on an approval —
+            // remembers that, so the launch's resume leaves it waiting (`parked_at_quit`).
+            // Read from the saved flag first, because a row a previous restart already restored
+            // is saved as `Interrupted`; then from the state, which is also what makes a
+            // snapshot written before the flag existed restore right.
+            let parked_at_quit = saved
+                .parked_at_quit
+                .or_else(|| saved.state.as_ref().and_then(ParkedAtQuit::of));
             let (state, session, note) = match saved.state {
                 Some(state @ (RunState::Finished { .. } | RunState::Failed { .. })) => {
                     (state, saved.session.filter(|_| reopenable), None)
@@ -6723,11 +6896,20 @@ impl AgentRegistry {
                     RunState::Interrupted,
                     saved.session,
                     Some(
-                        "its child ended with a cide restart; Resume continues the conversation"
-                            .to_string(),
+                        match parked_at_quit {
+                            Some(parked) => parked.note(),
+                            None => {
+                                "its child ended with a cide restart; Resume continues the \
+                                     conversation"
+                            }
+                        }
+                        .to_string(),
                     ),
                 ),
             };
+            // History never comes back parked: the flag steers a resume, and a terminal row
+            // has none.
+            let parked_at_quit = parked_at_quit.filter(|_| state == RunState::Interrupted);
             inner.runs.insert(
                 saved.run,
                 LiveRun {
@@ -6801,6 +6983,7 @@ impl AgentRegistry {
                     stale_turn: false,
                     harness_session: saved.harness_session,
                     continuing: false,
+                    parked_at_quit,
                     requeued: None,
                     follow_ups: Vec::new(),
                     opening_requeues: 0,
@@ -12351,7 +12534,7 @@ mod tests {
         // Resume's two halves, exercised app-free: reopen the queue, requeue the interrupted.
         after.inner.lock().paused_projects.remove(&project);
         after
-            .requeue_interrupted(project, None, None, &|_| None)
+            .requeue_interrupted(project, None, None, &|_| None, Requeue::Resume)
             .expect("nobody is viewing anything in a test without a session registry");
         let mut admissions = after.take_admissions();
         admissions.sort_by_key(|admission| admission.run != worked);
@@ -12386,6 +12569,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **A run that was waiting at quit stays waiting after it.** Terrastrike's runs, each
+    /// parked on a question for the user, all started a turn at the next launch, because the
+    /// restore folded `Idle` and `AwaitingPermission` into `Interrupted` and the launch pass
+    /// requeued every `Interrupted` row with "cide restarted while you were working". Only the
+    /// run that was mid-turn is resumed now; the parked two keep a note saying what starts
+    /// them, keep it through a second restart, and still continue on an explicit Resume — with
+    /// the waiting sentence, not the working one.
+    #[test]
+    fn the_launch_resumes_working_runs_and_leaves_parked_ones_waiting() {
+        let dir = std::env::temp_dir().join(format!("cide-run-parked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+
+        let before = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let working = before.enqueue(opencode_spec(project, "developer"));
+        let idle = before.enqueue(opencode_spec(project, "artist"));
+        let asking = before.enqueue(opencode_spec(project, "designer"));
+        assert_eq!(
+            before.take_admissions().len(),
+            3,
+            "three roles, three slots"
+        );
+        for (run, state, conversation) in [
+            (working, RunState::Running, "ses_working"),
+            (idle, RunState::Idle, "ses_idle"),
+            (asking, RunState::AwaitingPermission, "ses_asking"),
+        ] {
+            assert!(before.note_harness_session(run, conversation.into()));
+            before.inner.lock().runs.get_mut(&run).expect("row").state = state;
+        }
+        before.write_snapshot_to(&path);
+
+        // Twice: the second restart reads a snapshot in which the parked rows are already
+        // `Interrupted`, which is the case the saved flag exists for.
+        let middle = Arc::new(AgentRegistry::default());
+        middle.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        middle.write_snapshot_to(&path);
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        for run in [working, idle, asking] {
+            assert_eq!(state_of(&after, run), RunState::Interrupted);
+        }
+        {
+            let inner = after.inner.lock();
+            assert_eq!(inner.runs[&working].parked_at_quit, None);
+            assert_eq!(inner.runs[&idle].parked_at_quit, Some(ParkedAtQuit::Idle));
+            assert_eq!(
+                inner.runs[&asking].parked_at_quit,
+                Some(ParkedAtQuit::Permission)
+            );
+            assert_eq!(
+                inner.runs[&idle].note.as_deref(),
+                Some(ParkedAtQuit::Idle.note())
+            );
+        }
+
+        let none = HashMap::new();
+        after
+            .requeue_interrupted(
+                project,
+                None,
+                None,
+                &|_| None,
+                Requeue::Launch { idle_tasks: &none },
+            )
+            .expect("no sessions");
+        let admissions = after.take_admissions();
+        assert_eq!(
+            admissions.iter().map(|a| a.run).collect::<Vec<_>>(),
+            vec![working],
+            "only the run that was working may start by itself"
+        );
+        assert!(admissions[0].prompt.contains("while you were working"));
+        assert_eq!(state_of(&after, idle), RunState::Interrupted);
+        assert_eq!(state_of(&after, asking), RunState::Interrupted);
+
+        // The answer's road: the pair is free and its conversation is still the parked run's,
+        // so a dispatch onto it continues that conversation (M116).
+        let task = TaskId("t-1".into());
+        after.inner.lock().runs.get_mut(&idle).expect("row").task = Some(task.clone());
+        let found = last_conversation_in(
+            &after.inner.lock(),
+            project,
+            &AgentId("artist".into()),
+            &task,
+        );
+        assert_eq!(
+            found,
+            Some((idle, Harness::Opencode, "ses_idle".to_string()))
+        );
+
+        // A person's Resume is their decision, and the resumed run is told it was waiting.
+        after
+            .requeue_interrupted(project, Some(idle), None, &|_| None, Requeue::Resume)
+            .expect("no sessions");
+        let admissions = after.take_admissions();
+        assert_eq!(admissions.len(), 1);
+        assert!(
+            admissions[0].prompt.contains("while you were waiting"),
+            "{}",
+            admissions[0].prompt
+        );
+        assert_eq!(
+            after.inner.lock().runs[&idle].parked_at_quit,
+            None,
+            "taken at admission"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that was mid-turn is still left alone at launch when its task stopped being work:
+    /// an open question (the rule autodispatch and `task_refusal` already keep, and the launch
+    /// was the one road around), or a status past `doing`.
+    #[test]
+    fn the_launch_does_not_wake_a_run_whose_task_waits_on_the_user() {
+        let row = |id: &str, status: &str, question: Option<&str>| -> cide_ipc::TaskRow {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "title": id, "status": status, "question": question,
+                "createdUnixMs": 0, "updatedUnixMs": 0, "commentCount": 0, "attachmentCount": 0,
+            }))
+            .expect("a task row")
+        };
+        let idle = idle_tasks(&[
+            row("t-1", "doing", Some("Which seed?")),
+            row("t-2", "doing", None),
+            row("t-3", "review", None),
+            row("t-4", "todo", None),
+        ]);
+        let mut keys: Vec<_> = idle.keys().map(|id| id.0.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, ["t-1", "t-3"]);
+
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(DispatchSpec {
+            task: Some(TaskId("t-1".into())),
+            ..opencode_spec(project, "artist")
+        });
+        registry.take_admissions();
+        assert!(registry.note_harness_session(run, "ses_x".into()));
+        registry.set_state(None, run, RunState::Interrupted);
+        registry
+            .requeue_interrupted(
+                project,
+                None,
+                None,
+                &|_| None,
+                Requeue::Launch { idle_tasks: &idle },
+            )
+            .expect("no sessions");
+        assert!(registry.take_admissions().is_empty());
+        assert_eq!(state_of(&registry, run), RunState::Interrupted);
+        let note = registry.inner.lock().runs[&run]
+            .note
+            .clone()
+            .unwrap_or_default();
+        assert!(note.contains("waiting for the user's answer"), "{note}");
+    }
+
     /// The claude flavour of the same continuation: the run's own [`SessionId`] is both the
     /// rebind and the conversation, which is what keeps hook routing and the row continuous.
     #[test]
@@ -12406,7 +12751,7 @@ mod tests {
         let after = Arc::new(AgentRegistry::default());
         after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
         after
-            .requeue_interrupted(project, Some(run), None, &|_| None)
+            .requeue_interrupted(project, Some(run), None, &|_| None, Requeue::Resume)
             .expect("nobody is viewing anything in a test without a session registry");
         let admissions = after.take_admissions();
         assert_eq!(admissions.len(), 1);
@@ -12646,7 +12991,7 @@ mod tests {
             .expect("an interrupted row holds nothing");
 
         registry
-            .requeue_interrupted(project, None, None, &|_| None)
+            .requeue_interrupted(project, None, None, &|_| None, Requeue::Resume)
             .expect("the project scope skips rather than refuses");
         assert_eq!(
             state_of(&registry, stale),
@@ -12662,7 +13007,7 @@ mod tests {
 
         // The single-run press gets the same fact as a refusal, like the viewed-in-a-pane arm.
         let why = registry
-            .requeue_interrupted(project, Some(stale), None, &|_| None)
+            .requeue_interrupted(project, Some(stale), None, &|_| None, Requeue::Resume)
             .expect_err("resuming one run says why it cannot")
             .to_string();
         assert!(why.contains("already going on this task"), "{why}");
@@ -12670,7 +13015,7 @@ mod tests {
         // And once the live one ends, the old row resumes as it always did.
         registry.set_state(None, fresh, RunState::Finished { code: 0 });
         registry
-            .requeue_interrupted(project, Some(stale), None, &|_| None)
+            .requeue_interrupted(project, Some(stale), None, &|_| None, Requeue::Resume)
             .expect("nothing holds the pair now");
         assert_eq!(state_of(&registry, stale), RunState::Queued);
     }
@@ -15124,13 +15469,19 @@ mod tests {
         assert!(!registry.owns_session(session));
 
         let refused = registry
-            .requeue_interrupted(project, Some(run), Some(&sessions), &|_| None)
+            .requeue_interrupted(
+                project,
+                Some(run),
+                Some(&sessions),
+                &|_| None,
+                Requeue::Resume,
+            )
             .expect_err("viewed");
         assert!(refused.to_string().contains("open in a pane"), "{refused}");
         assert_eq!(state_of(&registry, run), RunState::Interrupted);
 
         registry
-            .requeue_interrupted(project, None, Some(&sessions), &|_| None)
+            .requeue_interrupted(project, None, Some(&sessions), &|_| None, Requeue::Resume)
             .expect("the project scope skips rather than refuses");
         assert_eq!(state_of(&registry, run), RunState::Interrupted);
         let note = registry.inner.lock().runs[&run].note.clone();
@@ -15145,7 +15496,13 @@ mod tests {
         wait_exited(&pty);
         registry.forget_viewer(session);
         registry
-            .requeue_interrupted(project, Some(run), Some(&sessions), &|_| None)
+            .requeue_interrupted(
+                project,
+                Some(run),
+                Some(&sessions),
+                &|_| None,
+                Requeue::Resume,
+            )
             .expect("free again");
         assert_eq!(state_of(&registry, run), RunState::Queued);
     }
@@ -15643,7 +16000,13 @@ mod tests {
         let run = interrupted_on(&registry, project);
         let edited = vec![pool_entry("anthropic", "claude-sonnet-4-5")];
         registry
-            .requeue_interrupted(project, None, None, &|_| Some(settings(&edited)))
+            .requeue_interrupted(
+                project,
+                None,
+                None,
+                &|_| Some(settings(&edited)),
+                Requeue::Resume,
+            )
             .expect("requeued");
         assert_eq!(state_of(&registry, run), RunState::Queued);
         assert_eq!(registry.inner.lock().runs[&run].pool, edited);
@@ -15653,7 +16016,13 @@ mod tests {
         let project = ProjectId::new();
         let run = interrupted_on(&registry, project);
         registry
-            .requeue_interrupted(project, None, None, &|_| Some(settings(&pool)))
+            .requeue_interrupted(
+                project,
+                None,
+                None,
+                &|_| Some(settings(&pool)),
+                Requeue::Resume,
+            )
             .expect("requeued");
         assert_eq!(registry.inner.lock().runs[&run].pool, pool);
         assert_eq!(registry.inner.lock().runs[&run].pool_index, 2);

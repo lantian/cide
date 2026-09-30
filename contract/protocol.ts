@@ -333,7 +333,7 @@ expectScreen?: string, } | { "t": "paste", session: SessionId, text: string, seq
 /**
  * See [`Self::Input`]'s field of the same name.
  */
-expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "ping" };
+expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "ping" };
 
 /**
  * One frame from a device.
@@ -518,6 +518,23 @@ log?: string, };
  * the registry. That is the shape the trait was chosen for.
  */
 export type Harness = "claude" | "opencode" | "qwen" | "codex" | "mimo";
+
+/**
+ * The image formats cide will put on screen, as **sniffed from the file's own bytes**.
+ *
+ * Not derived from the extension. The extension decides which *viewer* a tab opens with —
+ * that rule is `ui/src/panes/imageKinds.ts`, on the frontend, because it has to be answered
+ * before any IPC happens — and this is the answer to the different question of what the file
+ * actually contains. Keeping them apart is what lets a `.png` that is really a JPEG render
+ * correctly *and* describe itself honestly in the status bar, and it is what makes
+ * "this claims to be a PNG and is not" a sentence rather than a blank pane.
+ *
+ * The list is what a WebKitGTK `<img>` decodes without help. TIFF, AVIF, JPEG XL and `.svgz`
+ * are deliberately absent: the first two are engine-version-dependent, and a gzipped SVG
+ * needs a `Content-Encoding` the asset protocol does not set, so it would fail *silently* in
+ * the image decoder — the one failure mode this whole feature is written to avoid.
+ */
+export type ImageFormat = "png" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg";
 
 /**
  * Which cide a device is talking to.
@@ -1135,7 +1152,7 @@ dispatching: boolean, } | { "t": "task", project: ProjectId, id: TaskId,
  * much stack. Serde and ts-rs both see straight through a `Box`, so the wire and the
  * TypeScript are unchanged.
  */
-task?: TaskDetail, } | { "t": "board", project: ProjectId, tasks: Array<TaskRow>, } | { "t": "milestones", project: ProjectId, view?: MilestonesView, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, text?: string, } | { "t": "desync", why: string, } | { "t": "pong" } | { "t": "goingAway", why: string, };
+task?: TaskDetail, } | { "t": "board", project: ProjectId, tasks: Array<TaskRow>, } | { "t": "milestones", project: ProjectId, view?: MilestonesView, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, text?: string, } | { "t": "attachmentChunk", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, total: number, data: string, image?: ImageFormat, } | { "t": "desync", why: string, } | { "t": "pong" } | { "t": "goingAway", why: string, };
 
 /**
  * One frame to a device.
