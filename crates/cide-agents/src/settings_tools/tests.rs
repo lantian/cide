@@ -534,6 +534,15 @@ fn a_tab_cide_opened_may_read_but_never_write() {
 
 // --- cide_keymap ------------------------------------------------------------------------------
 
+/// The palette's default chord as `cide_core::keymap::platform_defaults` spells it on this
+/// machine: the macOS layer moves `ctrl` to `meta`, so hard-coding `ctrl+shift+p` passed on Linux
+/// and failed only on the macOS CI runner ("ctrl+shift+p is not bound to anything").
+const PALETTE_KEY: &str = if cfg!(target_os = "macos") {
+    "shift+meta+p"
+} else {
+    "ctrl+shift+p"
+};
+
 #[test]
 fn find_answers_how_to_open_the_command_palette() {
     let sink = Fake::new();
@@ -544,7 +553,7 @@ fn find_answers_how_to_open_the_command_palette() {
     ));
     let first = found.lines().next().unwrap();
     assert!(first.starts_with("palette.commands"), "{found}");
-    assert!(first.contains("ctrl+shift+p"), "{found}");
+    assert!(first.contains(PALETTE_KEY), "{found}");
 }
 
 #[test]
@@ -552,7 +561,7 @@ fn lookup_names_the_command_a_default_key_runs() {
     let sink = Fake::new();
     let found = ok(ask(
         tool::KEYMAP,
-        json!({"action": "lookup", "key": "Ctrl+Shift+P"}),
+        json!({"action": "lookup", "key": PALETTE_KEY.to_uppercase()}),
         &sink,
     ));
     assert!(found.contains("palette.commands"), "{found}");
