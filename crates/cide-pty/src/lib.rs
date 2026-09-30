@@ -2363,6 +2363,15 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(session.has_exited());
+        // `has_exited` is not "the mirror has everything": the reaper sets it while the child's
+        // last bytes can still be in the coalescer's channel, the race the test above documents.
+        // CI lost it here with a replay of nothing but the alt-screen preamble. Wait for the
+        // last line to reach the mirror before reading it.
+        while !String::from_utf8_lossy(&session.full_state()).contains("last")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
 
         // The resize a pane would make on attach is refused, so the width stays at 100 and the
         // 150-character row keeps its wrap flag.
