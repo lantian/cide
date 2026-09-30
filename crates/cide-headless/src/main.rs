@@ -2118,6 +2118,9 @@ mod tests {
             updated_unix_ms: 2,
             comment_count: u32::try_from(comments).expect("a fixture's comment count"),
             attachment_count: 0,
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 

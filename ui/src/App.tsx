@@ -96,7 +96,7 @@ import { SpecActsConfirm } from '@/sidebar/OpenSpecPanel/SpecActsConfirm'
 import { useSpecConfirm } from '@/sidebar/OpenSpecPanel/specActs'
 import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
-import { openCount } from '@/sidebar/TasksPanel/model'
+import { openCount, waitingCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
@@ -918,6 +918,16 @@ export function App() {
   // The count, not the board: a board is a new object on every `tasks-changed`, and this
   // component is the whole shell. The rail's badge is the only thing here that reads it.
   const openTasks = useTasks((s) => openCount(s.board))
+  /*
+   * Tasks waiting for the user (M132) — accepted by eye and in review, or carrying an open
+   * question — for the rail's second mark on the Agents button, whose Waiting tab lists them.
+   * A number, not the lists, for `openTasks`' reason: the selector's answer is a primitive, so a
+   * board that changes nothing it counts re-renders nothing here. `null` for every board arm but
+   * `ready`, `openCount`'s rule — nobody looked is not "nothing waits".
+   */
+  const waitingTasks = useTasks((s) =>
+    s.board.kind === 'ready' ? waitingCount(s.board.tasks) : null,
+  )
   const attachTasks = useTasks((s) => s.attach)
   const adoptTasks = useTasks((s) => s.adopt)
   /*
@@ -1696,6 +1706,10 @@ export function App() {
                make a badge appear on its own — with `agents` `null` or `0` there is no pill to
                recolour — which is why it is a separate flag rather than a fourth count. */
             agentsAwaiting={agentsAwaiting}
+            /* What waits for the user on the board (M132), drawn as its own mark in the opposite
+               corner from the run pill — the two answer different questions and either can be
+               there without the other. Nothing with the tracker off, `tasks`' rule above. */
+            agentsWaiting={tasksEnabled === false ? null : waitingTasks}
             /*
              * The buttons extensions contribute, in registry order. (M22)
              *

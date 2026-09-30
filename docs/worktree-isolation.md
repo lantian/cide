@@ -1,7 +1,8 @@
 # Shared global state across worktrees
 
 For project authors whose roles run tests. This page covers what cide isolates between
-concurrent runs, what it doesn't, and the three settings in `.cide/config.json` that close the gap.
+concurrent runs, what it doesn't, the three settings in `.cide/config.json` that close the gap,
+and the `CIDE_CPUS` variable a project's scripts should size their parallelism by.
 
 ## What a worktree does and doesn't isolate
 
@@ -102,6 +103,67 @@ a worktree is retired, anything still running in it that nobody owns is ended to
 or an API call that fails as unauthenticated. `gh` and `git` are shared by default. Share
 anything else your runs need with `isolateEnvShare`, or leave `XDG_CONFIG_HOME` off the list.
 `XDG_CACHE_HOME` has a milder cost: a cold cache per worktree, which is slower but correct.
+
+## `CIDE_CPUS`: a run's share of the machine (M132)
+
+cide exports `CIDE_CPUS` to every run in a worktree, to the verify of its branch, and to every
+session opened in a checkout. It is **this machine's cores divided by `agents.maxConcurrent`, at
+least 1** (`AgentsConfig::cpu_share`). Every run and its verify see the same number.
+
+Use it in the project's scripts wherever they choose a degree of parallelism, instead of `nproc`
+or a hard-coded count:
+
+```sh
+jobs=${CIDE_CPUS:-$(nproc)}
+make -j"$jobs"
+cargo test -- --test-threads="$jobs"
+./tools/ci/run-tests.sh --shards "$jobs"
+```
+
+The `${CIDE_CPUS:-…}` fallback keeps the script working outside cide.
+
+Why it exists: selfcraft's check script took half the machine each time it ran, so three
+concurrent runs plus a verify asked for twice the cores there were. The project's global host
+locks were papering over that, and they serialised exactly the runs cide was trying to run side
+by side. With `CIDE_CPUS` each run
+asks for its share, and the sum fits the machine.
+
+## Running several game instances at once
+
+A game's tests usually start the game, and two runs starting it at once meet on three things a
+worktree does not isolate: the per-user data directory, the display, and the CPU. Close all three
+and parallel instances need no locks.
+
+- **Data: `isolateEnv`.** Godot's `user://` is `$XDG_DATA_HOME/godot/app_userdata/<project>`, so
+  with `XDG_DATA_HOME` on the list each worktree's game writes its saves, logs and
+  `.recovery_mode_lock` under its own directory. That was this page's original incident. Add
+  `XDG_CACHE_HOME` for the shader cache and `TMPDIR` for everything else. Share installed export
+  templates with `isolateEnvShare: ["godot/export_templates"]`.
+- **Display: a private X server per instance, with `Xvfb -displayfd`.** Do not use a fixed
+  `:99`, and do not use `xvfb-run -a`: both let two runs pick the same number, or race between
+  "is it free?" and "take it". With `-displayfd` the server chooses a free display itself and
+  writes its number to the descriptor once it is ready to accept clients:
+
+  ```sh
+  fifo=$(mktemp -u) && mkfifo "$fifo"
+  Xvfb -displayfd 3 -screen 0 1280x720x24 -nolisten tcp 3>"$fifo" &
+  xvfb=$!
+  trap 'kill "$xvfb" 2>/dev/null' EXIT
+  read -r display <"$fifo" && rm -f "$fifo"
+  export DISPLAY=":$display"
+  godot --path . res://tests/boot_smoke.tscn
+  ```
+
+  `read` returns only after the server is up, so there is no `sleep` to tune. On codex, a role that
+  starts a display needs `needs: [display]` (see [M119](#what-a-role-may-do-past-codexs-sandbox-m119)).
+- **CPU: `CIDE_CPUS`**, above.
+
+**Then remove the global host locks**: a `flock /tmp/game.lock` around the test runner, a "one
+Godot at a time" guard, a fixed-port mutex. They were the right fix while the instances really
+shared state. Once the state is private they only serialise runs, and on a busy board a lock like
+that turns `maxConcurrent: 3` into one game at a time with two runs waiting. Keep a lock only for
+something that is truly one per machine (a device, a licence server), and reach for
+`verifyExclusive` below before writing your own.
 
 ## `agents.verifyExclusive`: one verify at a time
 

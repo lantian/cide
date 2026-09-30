@@ -16448,3 +16448,163 @@ so its branch in the branch box already shows its history. The branch box marks 
 a branch icon, or a folder and the checkout's directory for a branch checked out under
 `.cide/worktrees/` (`branchFilter.worktreeOfRow`, pinned in `check:log`). `LogTab` no longer walks
 a worktree scope.
+
+## M132 — Autonomous work that moves the product
+
+terrastrike and selfcraft, two Godot games, ran on cide's autonomous loop for weeks, and neither
+product moved much. The executor models were not the bottleneck. The process spent their
+capacity:
+
+- **Ceremony per micro-task.** Every task paid for a worktree, an import, a verify and an Opus
+  reviewer session: 153 reviewer sessions on terrastrike, 443 on selfcraft.
+- **Gate rows that were quality proxies**, which work could satisfy without moving the game.
+- **The inbox leaking into milestones**, because planners pulled from it.
+- **Parallel writers on the same files.** On selfcraft eight sprite tasks ran together on
+  `tools/spritegen/*`, and all but one had to rebase.
+- **Runs narrating in comments.** selfcraft's tracker held 6 MB of comments against 1.3 MB of
+  game code.
+- **Models making taste calls**, on art and UI, which the user then rejected.
+- **A planner that invented work** when nothing concrete was left.
+
+M132 moves the user to the two places only the user can be (intent and taste) and strips the
+ceremony between them. The user guide is the new [`docs/autonomy.md`](autonomy.md). Its
+troubleshooting and reference tables are the short version of what follows.
+
+**Inbox ⟂ milestone.** An inbox task is never inside a milestone goal's `subtaskOf` subtree.
+- `cide_task_link` and the UI refuse the link (`milestones::inbox_rule`).
+- A create into the inbox under a milestone parent stores the link as `related`.
+- A move into the inbox rewrites `subtaskOf` to `related`.
+- `placement` no longer sends an over-full milestone's new task to the inbox. It refuses the
+  create, because the old road produced exactly the row the rule forbids.
+
+Only the user moves a task out of the inbox: from the UI, the phone, or their own console
+(`CallerKind::Console`, the only `attended()` one).
+- Tabs cide opened carry the new `PaneOrigin::Planner`/`Reviewer` and are `CideTab`. Workers and
+  runs are refused too.
+- Roles still file what they notice into the inbox.
+- M99's "decision owed" is retired: an inbox row under a goal no longer holds the gate, Accept or
+  the planner. Legacy links are "not part of the milestone". The console-only `cide_milestones`
+  action `detachInbox`, and a **Detach inbox** button in the Milestones tab, turn them into
+  `related`.
+
+**Quiet executors.** `TRACKER_PREAMBLE` no longer asks for a plan comment. A run commits each step
+and leaves one report of about ten lines: the result, what changed, how it was verified, what is
+left, and what it noticed.
+- A run's second comment in a turn marks its first `superseded` (`TaskComment.superseded`). The log
+  stays append-only, agents' `cide_task_get` hides superseded comments with a count, and the card
+  collapses them.
+- Comments from runs, workers and cide-opened tabs are capped by `agents.commentLimit` (1500
+  characters, 0 = off). A comment over the limit is refused with the report recipe.
+- The brief already asked for short comments and the boards still filled, so the limit lives in
+  the tool.
+
+**Path-disjoint scheduling.** Tasks carry `touches` (file globs).
+- A queued run whose touches overlap what another live run or unmerged task holds waits, with
+  `waiting: t-N holds <path>` on its row. A task holds its declared globs plus the files its branch
+  or checkout actually changed.
+- Empty touches means the whole repository, so such a task runs alone.
+- Overlap is by literal prefix and deliberately conservative (`cide_agents::paths`).
+- Admission skips a path-blocked entry rather than blocking the role's queue.
+- Every board change refreshes the table (`refresh_paths_and_pump`).
+
+**Human acceptance.** A task with `acceptance: "user"` whose branch verify is green, or which goes
+to review with no verify configured, is merged by cide itself through the reviewer's own
+`integrate_checked` (`absorb_for_user`, `GateVerdict::Absorbed`). No reviewer session opens.
+- cide comments "Merged at <sha>. Waiting for the user's acceptance" and leaves the task in review.
+- Only the user sets it done. Every MCP road except the console refuses.
+- A conflict goes back to the run with the paths.
+- The Tasks panel's new **Waiting** tab ("Waiting for you") offers Accept and Send back (a
+  one-line note; the same role continues in its own conversation) for acceptance tasks, and an
+  answer box for questions.
+- The new command `task_respond` takes `Accept | SendBack{note} | Answer{text}` and is authored as
+  the user.
+
+**Questions.** A task with an open `question` is not dispatched (autodispatch and an explicit
+dispatch refuse it). The planner timer does not count it as open work, and batch review skips it.
+Answering clears the question and continues the role.
+
+**Batched review** (`agents.review: "batch"`, now the default; `"each"` is the old
+one-reviewer-per-task).
+- Finished turns accumulate. One review tab (origin Reviewer) opens in the project root when
+  `agents.reviewBatch` (3) tasks wait, when the oldest has waited `agents.reviewAfterSecs` (600),
+  or when nothing in the project is working. It never opens while the previous batch reviewer is
+  mid-turn.
+- The prompt is `agents.batchReviewPrompt`, with a `{tasks}` placeholder; empty means cide's
+  default. It tells the reviewer to read reports and diffs, not to re-run checks, and to merge
+  everything it accepts in one `cide_agent_integrate` call with `tasks: [{task, agent}, …]`.
+- cide composes the merges in memory (`cide_git::worktree::compose_merges`, no ref moves) and
+  verifies once in a scratch checkout, `.cide/worktrees/batch-verify`. Only then does it advance
+  the branch (`advance_to`: a SAFE checkout, refused if the branch moved meanwhile).
+- A red combined verify moves nothing and falls back to per-branch integrate, so the good
+  branches land.
+- The `each`-mode prompt now also says verify already ran.
+
+**Bounded planner.** The new default spin prompt plans only from the active milestone's plan (the
+goal task's body) and the facts cide appends.
+- It never touches the inbox, and tasks in review are not the planner's.
+- It stops with a `question` on the milestone task instead of inventing work, and keeps the plan
+  in the goal body current.
+- cide appends a delta: "Since the last plan: tasks changed …; commits landed …"
+  (`worktree::subjects_since`).
+- A latch keeps the timer from waking the planner again while HEAD and every non-goal task's
+  (id, status, question?) are unchanged since the last plan.
+- Open work for the timer is todo and doing tasks without a question. Review is no longer the
+  planner's.
+
+**Smaller pieces.**
+- MCP callers cannot rewrite the body or title of a task with a live run (terrastrike's t-1266,
+  a correction nobody received). Comment the correction, or re-dispatch.
+- `CIDE_CPUS` (this machine's cores ÷ `agents.maxConcurrent`, at least 1) reaches every run in a
+  worktree, its verify, and sessions in a checkout. selfcraft's check script took half the
+  machine per invocation, and its global host locks were papering over the oversubscription.
+  Together with `isolateEnv` and a private `Xvfb -displayfd` display, parallel game instances
+  need no host locks (`docs/worktree-isolation.md`).
+- Prompts equal to cide's default are no longer written into `.cide/config.json`, so later
+  defaults reach projects. Settings → Agents has **Reset to cide's prompt**, the review mode,
+  batch size, review-after, comment limit and batch review prompt.
+- The tracker is written as schema 4 only while some row uses `touches`, `acceptance` or
+  `question`, following M83's precedent: an older build refuses the board rather than dropping
+  the fields when it writes the file back.
+
+Tests:
+- `cargo test -p cide-tasks`
+- `cargo test -p cide-agents -- milestones tools autodispatch config harness paths`
+- `cargo test -p cide-app -- agents agent_rpc spinner milestones cmd::agents cmd::session cmd::tasks`
+- `cargo test -p cide-git worktree`
+- `check:agents`, `check:agents-render`, `check:selectors`, `check:settings-agents`,
+  `check:theme`, `check:ui-scale`
+- `cargo --locked xtask codegen --check`, `cargo --locked xtask contract-check`
+
+Named tests:
+- `overlapping_touches_wait_and_disjoint_ones_run`
+- `a_batch_composes_in_memory_and_skips_the_conflict`
+- `a_batch_is_due_at_its_size_its_age_or_when_the_project_is_quiet`
+- `an_inbox_task_is_never_linked_into_a_milestone`
+- `only_an_attended_caller_moves_a_task_out_of_the_inbox`
+- `a_task_the_user_accepts_is_not_set_done_by_a_reviewer`
+- `a_run_reports_once_per_turn_within_the_limit`
+- `a_question_holds_the_task_until_it_is_answered`
+- `a_batch_integrate_names_each_task_and_the_road_it_took`
+
+`docs/checks.md` has four new sections: *Inbox ⟂ milestone and caller rules*, *Touches and
+path-disjoint admission*, *Batched review and multi-task integrate*, and *Acceptance, questions,
+Waiting for you*.
+
+Not confirmed on a display: none of this has been seen running. That includes the Waiting tab and
+its Accept, Send back and Answer; the Detach inbox button; a batch review tab opening and its
+single integrate landing on a real board; a queued run's `waiting: t-N holds …` note; an
+acceptance task merging itself; and the planner stopping with a question.
+
+Not done:
+- The batch pending set is in memory only. After a restart the tasks sit in review until
+  something announces them again.
+- The planner's latch and delta cursor are in memory too, so the first plan after a restart reads
+  everything.
+- There is no "drift" note for a live run editing files outside its touches. The files it changes
+  still hold against other tasks, but nothing tells anyone.
+- The New task dialog does not set `touches` or `acceptance`; the card and the tools do.
+- The planner's wake refusal is not written as a comment on the goal; the planner's `question`
+  covers it.
+- The per-branch fallback after a red combined verify verifies each branch alone, the `each`
+  road's guarantee, so two branches green alone and red together can still both land on that
+  road. The batch answer says so when it happens.

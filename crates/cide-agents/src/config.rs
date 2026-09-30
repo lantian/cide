@@ -145,22 +145,30 @@ pub const MAX_SPIN_AFTER_SECS: u32 = 86_400;
 /// is in review, send to the inbox what does not serve the active milestone — and the plan itself
 /// is aimed at the milestone's gate, drawing on the inbox before inventing work. The facts about
 /// the gate are appended by `cide_app::spinner::wake`, computed rather than asked for.
-pub const DEFAULT_SPIN_PROMPT: &str = "Nothing is running in this project and there is open \
-     work on the board, and there is nobody at the keyboard — decide every question yourself \
-     from what you can read, and do not end your turn by asking what to do. Before planning \
-     anything, survey what has actually happened: read the \
-     board with mcp__cide__cide_task_list, read the comments on the tasks in review or doing, \
-     check git log and git status to see what landed, and if the project has milestones read \
-     them and their gate with mcp__cide__cide_milestones. Then judge it — say plainly whether \
-     the work so far is going the way this project needs, and say so even if the answer is no. \
-     Then close before you open: merge or hand back what is in review, and move to the inbox \
-     (mcp__cide__cide_task_update, status inbox) any todo that does not move the active \
-     milestone. Only then plan what happens next — with milestones, only work that makes the \
-     active milestone's gate pass, as subtasks of its task, pulling from the inbox \
-     (mcp__cide__cide_task_list with status inbox and a query) before writing anything new; \
-     create or re-scope tasks with mcp__cide__cide_task_create and \
-     mcp__cide__cide_task_update, and put them on the roles mcp__cide__cide_agents_list knows \
-     about with mcp__cide__cide_task_assign, which is what starts them working.";
+///
+/// **Bounded since M132**, and two of the M83 steps went: the planner no longer finishes review
+/// (the batch reviewer does, and `acceptance: user` work is the user's) and no longer touches the
+/// inbox at all — drawing on it was how noticed work leaked into milestones the user had not
+/// chosen. It plans from the milestone's own plan (the goal task's body) plus the delta cide
+/// appends, and when that plan is exhausted it asks the user a `question` instead of inventing
+/// work.
+pub const DEFAULT_SPIN_PROMPT: &str = "Nothing is running in this project and nobody is at the \
+     keyboard; this is one short planning turn, not a survey. Read the active milestone's task \
+     with mcp__cide__cide_task_get — its body is the plan — and the facts cide appends below, \
+     which name the milestone, its gate and what changed since the last plan; do not read the \
+     whole board and do not run the project's checks. Tasks in review are not yours: cide \
+     gathers them into a review of their own. Plan only what the milestone's plan names and the \
+     board lacks: each task one coherent piece of work with its steps in the body, `subtaskOf` \
+     the milestone's task, its `touches` declared (the files and directories it will change — \
+     cide never runs two tasks whose touches overlap, and one without touches runs alone), \
+     `acceptance: user` when its quality is a matter of taste (art, the look of the UI), and \
+     assigned with mcp__cide__cide_task_assign so it starts — a few at a time. Never move a task \
+     out of the inbox and never link an inbox task into a milestone: only the user does that. \
+     When the plan is done but the gate still fails, or the next step needs a decision about \
+     taste, scope or design, do not invent work: ask it with mcp__cide__cide_task_update's \
+     `question` on the milestone's task and end your turn. Before you end, bring the plan in the \
+     milestone task's body up to date — what is done, what is next — and keep every comment \
+     short.";
 
 /// What a reviewer tab is told when a subagent's turn on a task ends, when the project has not
 /// written its own. A **template**: `{name}` placeholders are filled by [`fill_review_prompt`]
@@ -200,8 +208,8 @@ pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, o
      turn by asking what to do — a turn that ends in a question is a task nobody picks up. First \
      find out what actually happened: read the task with mcp__cide__cide_task_get and read its \
      comments, which are the only place the run reported; then diff the branch {branch} against \
-     the base to see what changed rather than what was claimed, and run whatever this repository \
-     uses to check itself. Then take one of exactly two actions. If the work is done and correct \
+     the base to see what changed rather than what was claimed. Verify already ran on this branch, \
+     so do not run the project's checks again. Then take one of exactly two actions. If the work is done and correct \
      and did what the task asked rather than something adjacent: comment your verdict with \
      mcp__cide__cide_task_comment, then **merge it yourself** with \
      mcp__cide__cide_agent_integrate (agent `{role}`, task {task_id}) — accepting work means \
@@ -229,8 +237,35 @@ pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, o
      Anything you notice that is wrong but is *not* this task — something the run broke \
      elsewhere, a gap it revealed, work this one turns out to depend on — goes on the board as \
      its own task with mcp__cide__cide_task_create and `inbox: true`, rather than into this \
-     task's verdict where it is read once and lost; the inbox is where noticed work waits until \
-     whoever plans decides it is needed.{others}";
+     task's verdict where it is read once and lost; the inbox is where noticed work waits for the \
+     user, outside every milestone — never link it into one. Keep every comment short.{others}";
+
+/// What a batch review tab is told, when the project has not written its own. (M132)
+///
+/// A template like [`DEFAULT_REVIEW_PROMPT`], with one placeholder of its own, `{tasks}`: the
+/// finished tasks, each as `t-12 (role `developer`, branch cide/developer-t-12): <the first
+/// line of its report>`. One line, for the terminal's reason.
+///
+/// It tells the reviewer to merge the accepted ones **in one call**: `cide_agent_integrate`
+/// with `tasks` merges them together and verifies the combined result once, which is both the
+/// saving and the check a per-branch verify cannot make — two branches green alone and red
+/// together.
+pub const DEFAULT_BATCH_REVIEW_PROMPT: &str = "These tasks finished and their branches passed \
+     verify: {tasks}. Review them as one batch; nobody is at the keyboard and nobody will answer \
+     you, so decide everything yourself and never end your turn with a question. For each, read \
+     its report with mcp__cide__cide_task_get and its diff (git diff HEAD...<branch>), and decide \
+     whether it did what the task asked rather than something adjacent — verify already ran, so \
+     do not run the project's checks again. Merge every one you accept in a single \
+     mcp__cide__cide_agent_integrate call with `tasks` naming each task and its role, in the \
+     order listed: cide merges them together and verifies the result once. Then set each task it \
+     merged to done with mcp__cide__cide_task_update. One it could not merge (a conflict, or the \
+     combined verify pinned on it) is not done: send it back. To send one back, comment in a few \
+     lines what is wrong and what is still needed, set it to doing, and hand it to the same role \
+     with mcp__cide__cide_agent_dispatch passing that feedback — do not fix it yourself, the \
+     role that built it has the context; if it was already sent back for the same reason, leave \
+     it in review with a one-line comment instead. Anything wrong that is not these tasks goes \
+     to the inbox with mcp__cide__cide_task_create and `inbox: true`, never linked into a \
+     milestone. Keep every comment short.";
 
 /// Every placeholder [`fill_review_prompt`] fills, with what it becomes. The Settings hint lists
 /// the same names; `every_placeholder_is_filled` holds the two ends of this table together.
@@ -556,10 +591,12 @@ pub struct AgentsConfig {
     /// whitespace-only value reads as the default rather than as an empty prompt, because a
     /// `claude` handed a lone Enter starts a turn about nothing and bills for it;
     /// [`Self::spin_prompt`] is the one reader that decides this.
+    #[serde(skip_serializing_if = "is_default_spin_prompt")]
     pub auto_spin_prompt: String,
     /// What a reviewer tab opened by [`Self::finish_in_new_tab`] is told. A template; see
     /// [`DEFAULT_REVIEW_PROMPT`] and [`fill_review_prompt`]. Blank reads as the default, on
     /// [`Self::auto_spin_prompt`]'s argument — [`Self::review_prompt_template`] decides it.
+    #[serde(skip_serializing_if = "is_default_review_prompt")]
     pub review_prompt: String,
     /// Which of `cide_core::isolated_env::VARS` (`XDG_DATA_HOME`, `XDG_CACHE_HOME`,
     /// `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `TMPDIR`) every worktree gets its own copy of, for
@@ -641,7 +678,67 @@ pub struct AgentsConfig {
     /// Disk-only, like `isolation`: hand-edited in `.cide/config.json`, not on the wire, so no
     /// panel round trip can reset it and no model can raise it to keep a context alive.
     pub fresh_above: u32,
+    /// The most characters one comment may carry when it comes from a run, a worker or a tab
+    /// cide opened — anything nobody is typing in. `0` is no limit. (M132)
+    ///
+    /// # Why a limit and not a sentence in the brief
+    ///
+    /// Because the brief already said it and the boards still filled: terrastrike's tracker held
+    /// 6 MB of text against 1.3 MB of game code, and every later reader of a task paid for all of
+    /// it. A comment is a report, and a report that does not fit in 1500 characters is a log;
+    /// the refusal says what a report holds, so the next call is shorter rather than absent.
+    pub comment_limit: u32,
+    /// How finished work is reviewed: one tab per finished run (`each`, M79) or one tab for a
+    /// batch of them (`batch`, the default since M132). See [`ReviewMode`].
+    pub review: ReviewMode,
+    /// How many finished tasks open a batch review at once. (M132) The batch also opens when the
+    /// oldest has waited [`Self::review_after_secs`], or when no run is left working.
+    pub review_batch: u8,
+    /// How long the oldest finished task waits for a batch review before one opens anyway.
+    /// Seconds. (M132)
+    pub review_after_secs: u32,
+    /// What a batch review tab is told, when the project has not written its own. A template with
+    /// `{tasks}`; blank reads as [`DEFAULT_BATCH_REVIEW_PROMPT`]. (M132)
+    #[serde(skip_serializing_if = "is_default_batch_review_prompt")]
+    pub batch_review_prompt: String,
 }
+
+/// The three prompts are written to `.cide/config.json` **only when a person changed them**.
+/// (M132)
+///
+/// Until M132 every save wrote cide's own text in full, so a project carried a frozen copy of the
+/// default of the day it first saved Settings, and no later improvement to the default ever
+/// reached it — both real boards were running a planner and a reviewer prompt several releases
+/// old. Leaving the key out when it says what the default says keeps the file honest about what
+/// was chosen, and lets the next default arrive. Blank reads as the default everywhere, so it is
+/// left out too.
+fn is_default_spin_prompt(prompt: &String) -> bool {
+    prompt.trim().is_empty() || prompt == DEFAULT_SPIN_PROMPT
+}
+fn is_default_review_prompt(prompt: &String) -> bool {
+    prompt.trim().is_empty() || prompt == DEFAULT_REVIEW_PROMPT
+}
+fn is_default_batch_review_prompt(prompt: &String) -> bool {
+    prompt.trim().is_empty() || prompt == DEFAULT_BATCH_REVIEW_PROMPT
+}
+
+/// How finished work reaches a reviewer (M132) — on the wire as `cide_ipc::ReviewMode`.
+///
+/// # Why batches are the default
+///
+/// One reviewer tab per finished run was 153 Opus sessions on terrastrike and 443 on selfcraft,
+/// each reading the project from nothing and re-running the checks verify had just run. A batch
+/// reads the same diffs once, sees two branches that touch one file side by side, and merges them
+/// together behind one verify of the combined result — the one check that catches two branches
+/// green alone and red together.
+pub use cide_ipc::ReviewMode;
+
+/// The default for [`AgentsConfig::comment_limit`]. About ten short lines of report.
+pub const DEFAULT_COMMENT_LIMIT: u32 = 1500;
+/// The default for [`AgentsConfig::review_batch`].
+pub const DEFAULT_REVIEW_BATCH: u8 = 3;
+/// The default for [`AgentsConfig::review_after_secs`]. Ten minutes.
+pub const DEFAULT_REVIEW_AFTER_SECS: u32 = 600;
 
 impl AgentsConfig {
     /// The environment a child working in `worktree` gets for [`Self::isolate_env`], its
@@ -654,6 +751,29 @@ impl AgentsConfig {
             .into_iter()
             .map(|(name, value)| (name, Some(value)))
             .collect()
+    }
+
+    /// [`Self::isolated_env`] plus `CIDE_CPUS`: this machine's cores divided by
+    /// `agents.maxConcurrent`, at least one. (M132)
+    ///
+    /// Every run, and the verify of its branch, sees the same number — the share of the machine
+    /// one of the project's concurrent runs may use. A project's scripts read it for their own
+    /// parallelism (`--jobs ${CIDE_CPUS}`, a shard count) instead of `nproc`: selfcraft's check
+    /// script took half the machine per invocation, and three concurrent runs plus a verify
+    /// asked for twice the cores there were, which is what the global host locks were papering
+    /// over.
+    #[must_use]
+    pub fn worktree_env(&self, worktree: &Path) -> Vec<(String, Option<String>)> {
+        let mut env = self.isolated_env(worktree);
+        env.push(("CIDE_CPUS".to_string(), Some(self.cpu_share().to_string())));
+        env
+    }
+
+    /// The number [`Self::worktree_env`] exports as `CIDE_CPUS`.
+    #[must_use]
+    pub fn cpu_share(&self) -> usize {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        (cores / usize::from(self.max_concurrent.max(1))).max(1)
     }
 }
 
@@ -690,6 +810,11 @@ impl Default for AgentsConfig {
             verify_retries: DEFAULT_VERIFY_RETRIES,
             resume_after_restart: true,
             fresh_above: DEFAULT_FRESH_ABOVE,
+            comment_limit: DEFAULT_COMMENT_LIMIT,
+            review: ReviewMode::Batch,
+            review_batch: DEFAULT_REVIEW_BATCH,
+            review_after_secs: DEFAULT_REVIEW_AFTER_SECS,
+            batch_review_prompt: DEFAULT_BATCH_REVIEW_PROMPT.to_string(),
         }
     }
 }
@@ -744,6 +869,17 @@ impl AgentsConfig {
             DEFAULT_REVIEW_PROMPT
         } else {
             &self.review_prompt
+        }
+    }
+
+    /// The batch review template to fill, blank meaning the default — [`Self::spin_prompt`]'s
+    /// rule. (M132)
+    #[must_use]
+    pub fn batch_review_prompt_template(&self) -> &str {
+        if self.batch_review_prompt.trim().is_empty() {
+            DEFAULT_BATCH_REVIEW_PROMPT
+        } else {
+            &self.batch_review_prompt
         }
     }
 
@@ -805,6 +941,11 @@ impl AgentsConfig {
             // ([`wire_for`]). False here is what a caller that forgot would draw — a hidden
             // board, which is loud — rather than a board the project switched off.
             tracker_enabled: false,
+            review: self.review,
+            review_batch: self.review_batch,
+            review_after_secs: self.review_after_secs,
+            batch_review_prompt: self.batch_review_prompt.clone(),
+            comment_limit: self.comment_limit,
         }
     }
 
@@ -892,6 +1033,34 @@ impl AgentsConfig {
             // Clamped on the way in, `auto_spin_after_secs`' rule: the file holds what is used.
             self.verify_retries = retries.min(MAX_VERIFY_RETRIES);
         }
+        // (M132)
+        if let Some(review) = patch.review {
+            self.review = review;
+        }
+        if let Some(batch) = patch.review_batch {
+            // A batch of none never opens; clamped rather than refused, `max_concurrent`'s trade.
+            self.review_batch = batch.max(1);
+        }
+        if let Some(secs) = patch.review_after_secs {
+            self.review_after_secs = secs.clamp(MIN_SPIN_AFTER_SECS, MAX_SPIN_AFTER_SECS);
+        }
+        if let Some(prompt) = patch.batch_review_prompt {
+            // Flattened on the way in, `auto_spin_prompt`'s rule and reason.
+            self.batch_review_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        if let Some(limit) = patch.comment_limit {
+            self.comment_limit = limit;
+        }
+    }
+
+    /// How long the oldest finished task waits for a batch review, with the floor applied.
+    /// (M132)
+    #[must_use]
+    pub fn review_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(
+            self.review_after_secs
+                .clamp(MIN_SPIN_AFTER_SECS, MAX_SPIN_AFTER_SECS),
+        ))
     }
 
     /// How many red verifies in a row go back to the run before the reviewer takes over, with the
@@ -1202,7 +1371,15 @@ pub fn write(project_root: &Path, config: &CideConfig) -> io::Result<()> {
 
 /// `agents` keys written only while set (`skip_serializing_if`), which [`write`] therefore has to
 /// remove itself when a patch empties one.
-const CLEARED_WHEN_EMPTY: &[&str] = &["isolateEnv", "isolateEnvShare", "verifyExclusive"];
+const CLEARED_WHEN_EMPTY: &[&str] = &[
+    "isolateEnv",
+    "isolateEnvShare",
+    "verifyExclusive",
+    // Written only when customised (M132): a reset to the default must leave the file.
+    "autoSpinPrompt",
+    "reviewPrompt",
+    "batchReviewPrompt",
+];
 
 /// Overwrite the keys of `ours` into `doc`, one level deep on nested objects.
 ///
@@ -1964,6 +2141,11 @@ mod tests {
             verify_retries: 7,
             resume_after_restart: false,
             fresh_above: 42_000,
+            comment_limit: 900,
+            review: ReviewMode::Each,
+            review_batch: 4,
+            review_after_secs: 120,
+            batch_review_prompt: String::new(),
         };
         config.apply(cide_ipc::OrchestrationPatch::default());
         assert_eq!(config.verify_retries, 7);

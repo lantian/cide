@@ -637,6 +637,20 @@ fn find_mut<'a>(file: &'a mut TaskFile, id: &TaskId) -> Option<&'a mut TaskRow> 
     file.tasks.iter_mut().find(|task| &task.id == id)
 }
 
+/// A `touches` declaration as it is stored: each glob trimmed, blanks and duplicates dropped,
+/// order kept. (M132) One rule for the create and the edit, so the two doors agree.
+#[must_use]
+pub fn clean_touches(touches: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for glob in touches {
+        let glob = glob.trim().trim_start_matches("./").to_string();
+        if !glob.is_empty() && !out.contains(&glob) {
+            out.push(glob);
+        }
+    }
+    out
+}
+
 /// The other half of [`TaskRow::of`]: a task's content, projected out of it. (M68)
 ///
 /// The pair is what lets every mutation go on operating on a whole [`Task`] — the shape each arm of
@@ -668,6 +682,9 @@ pub fn task_of(row: &TaskRow, content: &TaskContent) -> Task {
         session: row.session,
         change: row.change.clone(),
         links: row.links.clone(),
+        touches: row.touches.clone(),
+        acceptance: row.acceptance,
+        question: row.question.clone(),
         created_by: row.created_by.clone(),
         created_unix_ms: row.created_unix_ms,
         updated_unix_ms: row.updated_unix_ms,
@@ -863,6 +880,7 @@ fn new_comment(
         at_unix_ms: now,
         edited_at_unix_ms: None,
         deleted: false,
+        superseded: false,
         attachments,
     }
 }
@@ -1513,6 +1531,8 @@ fn reconcile_comment(mine: &TaskComment, theirs: &TaskComment) -> TaskComment {
         mine.clone()
     };
     out.attachments = attachments;
+    // Either side's flag wins, `deleted`'s rule: it only ever goes false → true. (M132)
+    out.superseded = mine.superseded || theirs.superseded;
     out
 }
 
@@ -2769,6 +2789,11 @@ impl TaskStore {
                 // take without anybody choosing.
                 session: None,
                 links,
+                // Trimmed and emptied of blanks, `SetTouches`' rule. (M132)
+                touches: clean_touches(req.touches.as_deref().unwrap_or(&[])),
+                acceptance: req.acceptance,
+                // No shape for it at creation: a question is asked of a task that exists.
+                question: None,
                 comments: Vec::new(),
                 // Files, if any, arrive through `attach` once the id exists — `cmd::tasks::task_new`
                 // makes the two one broadcast. (M39)
@@ -2961,6 +2986,33 @@ impl TaskStore {
                 }
                 TaskEdit::Link { .. } | TaskEdit::Unlink { .. } => {
                     unreachable!("returned through apply_link/apply_unlink above")
+                }
+                // (M132) Plain field writes: who may make them is decided upstream of the store,
+                // where the caller's kind is known — this crate sees only an author.
+                TaskEdit::SetTouches { touches } => task.touches = clean_touches(&touches),
+                TaskEdit::SetAcceptance { acceptance } => task.acceptance = acceptance,
+                TaskEdit::SetQuestion { question } => {
+                    task.question = question
+                        .map(|q| q.trim().to_string())
+                        .filter(|q| !q.is_empty());
+                }
+                /*
+                 * One report per turn (M132), and still append-only: the new line was appended by an
+                 * ordinary `Comment`, and the earlier one is only *flagged* here. The
+                 * flag is refused unless the earlier comment is live and by this same author —
+                 * so the one thing this arm lets an agent do to words already written is hide
+                 * its **own**, and never anyone else's. See `TaskComment::superseded`.
+                 */
+                TaskEdit::Supersede { comment } => {
+                    let earlier = task
+                        .comments
+                        .iter_mut()
+                        .find(|c| c.id == comment && !c.deleted)
+                        .ok_or_else(|| no_such_comment(&comment))?;
+                    if earlier.author != author {
+                        return Err(agents_may_not_rewrite());
+                    }
+                    earlier.superseded = true;
                 }
             }
             task.updated_unix_ms = now;
@@ -3602,6 +3654,9 @@ mod tests {
             created_by: TaskAuthor::User,
             created_unix_ms: 1_000,
             updated_unix_ms: updated,
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 
@@ -3637,6 +3692,7 @@ mod tests {
             edited_at_unix_ms: None,
             deleted: false,
             attachments: Vec::new(),
+            superseded: false,
         }
     }
 
@@ -3845,6 +3901,7 @@ mod tests {
             edited_at_unix_ms: None,
             deleted: false,
             attachments: Vec::new(),
+            superseded: false,
         };
         // `repair_content` rather than `repair` since M68: a comment's id is content, and the index
         // half of repair has no comment to look at. The claim is unchanged — two readers of one
@@ -3903,6 +3960,8 @@ mod tests {
                     change: None,
                     links: None,
                     attachments: None,
+                    acceptance: None,
+                    touches: None,
                 },
                 TaskAuthor::User,
             )
@@ -4650,6 +4709,141 @@ mod tests {
         );
     }
 
+    /// (M132) The three new row fields take the file to 4, on 3's rule: only while a row uses
+    /// one, so an older build refuses the board rather than dropping a declaration on rewrite.
+    #[test]
+    fn the_schema_on_disk_is_four_only_while_a_row_declares_touches_acceptance_or_a_question() {
+        let dir = TempDir::new("schema-four");
+        let schema = |dir: &TempDir| -> u64 {
+            let raw = fs::read_to_string(dir.tasks()).expect("written");
+            let value: Value = serde_json::from_str(&raw).expect("json");
+            value["schemaVersion"].as_u64().expect("a number")
+        };
+        let store = TaskStore::open(dir.root());
+        let task = store
+            .create(&new_task("plain"), TaskAuthor::User)
+            .expect("created");
+        store.write_now();
+        assert_eq!(schema(&dir), 2);
+
+        for (edit, undo) in [
+            (
+                TaskEdit::SetTouches {
+                    touches: vec!["tools/spritegen/".into()],
+                },
+                TaskEdit::SetTouches { touches: vec![] },
+            ),
+            (
+                TaskEdit::SetAcceptance {
+                    acceptance: Some(cide_ipc::Acceptance::User),
+                },
+                TaskEdit::SetAcceptance { acceptance: None },
+            ),
+            (
+                TaskEdit::SetQuestion {
+                    question: Some("Grass or pebbles?".into()),
+                },
+                TaskEdit::SetQuestion { question: None },
+            ),
+        ] {
+            store.edit(&task.id, edit, TaskAuthor::User).expect("set");
+            store.write_now();
+            assert_eq!(schema(&dir), 4, "a row uses a field only M132 knows");
+            store
+                .edit(&task.id, undo, TaskAuthor::User)
+                .expect("cleared");
+            store.write_now();
+            assert_eq!(schema(&dir), 2, "nothing uses it any more");
+        }
+    }
+
+    /// (M132) Touches are stored trimmed, without blanks, `./` or duplicates, in order.
+    #[test]
+    fn touches_are_cleaned_on_the_way_in() {
+        assert_eq!(
+            clean_touches(&[
+                " tools/spritegen/ ".into(),
+                "".into(),
+                "./game/view/map_view.gd".into(),
+                "tools/spritegen/".into(),
+            ]),
+            vec![
+                "tools/spritegen/".to_string(),
+                "game/view/map_view.gd".to_string()
+            ]
+        );
+    }
+
+    /// (M132) A later report supersedes an earlier one of the same author, and nothing is
+    /// rewritten: both lines stay, the earlier is only flagged. Another author's comment cannot
+    /// be superseded — the one thing this lets an agent do to written words is hide its own.
+    #[test]
+    fn a_comment_supersedes_only_its_own_authors_earlier_line() {
+        let dir = TempDir::new("supersede");
+        let store = TaskStore::open(dir.root());
+        let task = store
+            .create(&new_task("draw the cursors"), TaskAuthor::User)
+            .expect("created");
+        let artist = TaskAuthor::Agent {
+            agent: AgentId("artist".into()),
+            label: "Artist".into(),
+        };
+        let first = store
+            .edit(
+                &task.id,
+                TaskEdit::Comment {
+                    text: "Plan: …".into(),
+                },
+                artist.clone(),
+            )
+            .expect("commented");
+        let first_id = first.comments[0].id.clone();
+        store
+            .edit(
+                &task.id,
+                TaskEdit::Comment {
+                    text: "Done: six cursors.".into(),
+                },
+                artist.clone(),
+            )
+            .expect("reported");
+        let after = store
+            .edit(
+                &task.id,
+                TaskEdit::Supersede {
+                    comment: first_id.clone(),
+                },
+                artist.clone(),
+            )
+            .expect("superseded");
+        assert_eq!(after.comments.len(), 2, "appended, not replaced");
+        assert!(after.comments[0].superseded);
+        assert_eq!(
+            after.comments[0].text, "Plan: …",
+            "the words stand as written"
+        );
+        assert!(!after.comments[1].superseded);
+
+        let users = store
+            .edit(
+                &task.id,
+                TaskEdit::Comment {
+                    text: "Looks good".into(),
+                },
+                TaskAuthor::User,
+            )
+            .expect("commented")
+            .comments[2]
+            .id
+            .clone();
+        assert!(
+            store
+                .edit(&task.id, TaskEdit::Supersede { comment: users }, artist,)
+                .is_err(),
+            "an agent may not hide somebody else's words"
+        );
+    }
+
     #[test]
     fn a_duplicate_id_keeps_the_first_and_the_file_still_validates() {
         let dir = TempDir::new("dupe");
@@ -5308,6 +5502,8 @@ mod tests {
             change: None,
             links: None,
             attachments: None,
+            acceptance: None,
+            touches: None,
         }
     }
 

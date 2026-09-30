@@ -229,20 +229,20 @@ window.CIDE_SITE = {
           shot: 'milestones',
           en: {
             title: 'Milestones with a gate',
-            body: 'Group tasks into milestones and let them run. Nothing merges until your verify command passes, done is refused while a branch is unmerged, and anything that needs you goes to the inbox — so you check milestones instead of every task.',
+            body: 'Plan a milestone with Claude and let it run. Nothing merges until your verify command passes, finished work is reviewed in batches, and anything that needs you — a question, art to accept — waits in one list. What the agents notice goes to an inbox that only you promote — so you check milestones instead of every task.',
             points: [
               'A verify command runs before every merge',
-              'A finished run opens its own reviewer, from a per-project template',
-              'An inbox for the decisions that are really yours',
+              'Finished tasks are reviewed together and merged on one combined verify',
+              'Waiting for you: accept or send back visual work, answer questions',
             ],
           },
           ru: {
             title: 'Вехи с контрольной точкой',
-            body: 'Объединяйте задачи в вехи и запускайте их. Ничего не вливается, пока не прошла ваша команда проверки; задачу нельзя закрыть, пока её ветка не влита; всё, что требует вашего решения, попадает во входящие. Вы проверяете вехи, а не каждую задачу.',
+            body: 'Спланируйте веху вместе с Claude и запускайте её. Ничего не вливается, пока не прошла ваша команда проверки; готовые задачи проходят ревью пачками; всё, что требует вас — вопрос или графика на приёмку, — ждёт в одном списке. Замеченное агентами попадает во входящие, и в работу оттуда задачи переносите только вы. Вы проверяете вехи, а не каждую задачу.',
             points: [
               'Команда проверки запускается перед каждым слиянием',
-              'Завершённый запуск сам открывает ревьюера по шаблону проекта',
-              'Входящие — для решений, которые действительно за вами',
+              'Готовые задачи ревьюятся вместе и вливаются после одной общей проверки',
+              '«Ждёт вас»: примите или верните визуальную работу, ответьте на вопросы',
             ],
           },
         },

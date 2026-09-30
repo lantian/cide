@@ -103,6 +103,8 @@ function comment(over: Partial<CommentView> & Pick<CommentView, 'text' | 'atMs'>
     id: `c-${over.atMs}`,
     author: { kind: 'user' },
     editedMs: null,
+    // Not superseded, which is every comment before M132 and most after it.
+    superseded: false,
     // No files, which is most comments — and the value that keeps every existing story's
     // digest byte-identical to what it was before M39.
     attachments: [],
@@ -159,6 +161,11 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
     // comments over a log of two.
     commentCount: 0,
     attachmentCount: 0,
+    // The whole repository, the ordinary road, no question — M132's defaults, which draw nothing
+    // new on a card that passes none of M132's handlers.
+    touches: [],
+    acceptance: null,
+    question: null,
     // The user, by default, because that is what the panel's own New task button produces. The
     // stories that need the other answer say so; see `BARE`, which is the card's half of the pair
     // that pins the creator to the author enum rather than to a name.
@@ -875,6 +882,7 @@ export type CardStoryName =
   | 'card-attachments-readonly'
   | 'card-attach-empty'
   | 'card-composer-staged'
+  | 'card-waiting'
 
 /* ---------------------------------------------------------------- attachment fixtures (M39) */
 
@@ -943,6 +951,36 @@ const ATTACHMENT_HANDLERS: Partial<TaskDetailProps> = {
   onViewAttachment: () => {},
   onComposerStaged: () => {},
 }
+
+/*
+ * A task that waits on the user (M132): accepted by eye, three globs, an open question, and a
+ * run that reported twice in one turn — the first report superseded. The card's three M132 rows
+ * and the folded report are drawn by this story alone; `CARD_HANDLERS` carries none of the three
+ * handlers, so every other story is the card it was before M132.
+ */
+const WAITING = detail({
+  id: 't-51',
+  title: 'Redraw the pickaxe sprite',
+  body: 'The pickaxe reads as a hammer at 16px.',
+  status: 'review',
+  agent: 'artist',
+  touches: ['assets/sprites/tools/**', 'assets/atlas.json'],
+  acceptance: 'user',
+  question: 'Keep the wooden handle, or match the iron tier?',
+  comments: [
+    comment({
+      text: 'Drew it; exported the atlas.',
+      atMs: NOW_MS - 900_000,
+      author: { kind: 'agent', agent: 'artist', label: 'Artist' },
+      superseded: true,
+    }),
+    comment({
+      text: 'Redrew the head at 16px, re-exported the atlas.\nverify: PASS',
+      atMs: NOW_MS - 600_000,
+      author: { kind: 'agent', agent: 'artist', label: 'Artist' },
+    }),
+  ],
+})
 
 export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
   /*
@@ -1272,6 +1310,20 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
     task: T14,
     composerStaged: STAGED,
     ...ATTACHMENT_HANDLERS,
+  }),
+
+  /* M132: the question, the globs, the switch on, and the earlier report folded. */
+  'card-waiting': card({
+    task: WAITING,
+    onSetTouches: () => {},
+    onSetAcceptance: () => {},
+    onSetQuestion: () => {},
+    milestoneChoices: [
+      { id: 'look', title: 'The game looks like its own game' },
+      { id: 'base', title: 'A base worth defending' },
+    ],
+    onSetMilestone: () => {},
+    onAnswer: () => {},
   }),
 }
 

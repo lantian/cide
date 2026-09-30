@@ -646,6 +646,40 @@ impl ToolResult {
 
 // --- the seam to the store -------------------------------------------------------------------
 
+/// Who is on the other end of a tracker connection, as far as the rules that belong to the user
+/// are concerned. (M132)
+///
+/// Decided by the app from the connection — the pane or run the header names — exactly as the
+/// author is, and never from anything a call carries. Not a [`TaskAuthor`]: that type is on disk
+/// (`history.by`, `created_by`), and these four are a fact about a connection, not about a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerKind {
+    /// A Claude pane the user opened: the project's console, or another pane they split. The
+    /// user may be typing in it, so it may make the user's gestures on their word.
+    Console,
+    /// A tab cide opened by itself — the planner, a reviewer. Nobody is typing in it.
+    CideTab,
+    /// A session `cide_session_open` started to implement one piece of work.
+    Worker,
+    /// A dispatched run.
+    Run,
+}
+
+impl CallerKind {
+    /// Whether the user can be behind this call — the only caller the user's own gestures
+    /// (taking a task out of the inbox, accepting work the user accepts) are open to.
+    #[must_use]
+    pub fn attended(self) -> bool {
+        matches!(self, Self::Console)
+    }
+
+    /// Whether the report discipline applies: one short report per turn, capped in length.
+    #[must_use]
+    pub fn reports(self) -> bool {
+        !self.attended()
+    }
+}
+
 /// Where the task tools read and write.
 ///
 /// Implemented in `cide-app` over `cide_tasks::TaskStore`, which is the single owning actor for
@@ -720,6 +754,40 @@ pub trait TaskSink: Send + Sync {
     /// A run's new task goes to the inbox (see `milestones`' header). Decided by the app from the
     /// connection, as the author is — never from anything in a call's arguments.
     fn by_run(&self) -> bool;
+
+    /// Who the connection is, for the rules that are the user's (M132). Defaulted from
+    /// [`Self::by_run`] so a test sink needs to say nothing: a run is a run, anything else the
+    /// console.
+    fn caller(&self) -> CallerKind {
+        if self.by_run() {
+            CallerKind::Run
+        } else {
+            CallerKind::Console
+        }
+    }
+
+    /// The label of the role running on `task` right now, if a run is working on it — queued,
+    /// starting, running, waiting on a permission or paused; not one that handed its turn back.
+    /// (M132) The fact the body guard reads: a run implements the body it was started on, and a
+    /// rewrite under it is a brief it never sees. Defaulted to none for a test sink.
+    fn live_run_on(&self, _task: &TaskId) -> Option<String> {
+        None
+    }
+
+    /// The comment this connection's run already left on `task` in its current turn, if any
+    /// (M132): a second one supersedes it. Always `None` for anything but a run.
+    fn turn_report(&self, _task: &TaskId) -> Option<cide_ipc::CommentId> {
+        None
+    }
+
+    /// Record `comment` as this run's report on `task` for the current turn. (M132)
+    fn note_report(&self, _task: &TaskId, _comment: cide_ipc::CommentId) {}
+
+    /// The most characters a comment from a caller that [`CallerKind::reports`] may carry; `0` is
+    /// no limit. (M132) Read from the project's `agents.commentLimit`.
+    fn comment_limit(&self) -> usize {
+        crate::config::load(self.root()).agents.comment_limit as usize
+    }
 
     /// Who this connection writes as — the author the store signs its comments with. (M124)
     ///
@@ -813,6 +881,24 @@ pub enum Integrated {
     },
     /// Refused **before touching anything**, listing the conflicting paths.
     Conflicts { paths: Vec<String> },
+}
+
+/// What a batch [`tool::AGENT_INTEGRATE`] did, task by task. (M132)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchIntegrated {
+    /// Merged, with the commit the branch now stands at after it.
+    pub merged: Vec<(TaskId, String)>,
+    /// Nothing the project's branch lacked.
+    pub up_to_date: Vec<TaskId>,
+    /// Conflicted with the base or an earlier task of the batch; nothing of it merged.
+    pub conflicts: Vec<(TaskId, Vec<String>)>,
+    /// Refused before merging — a guard, uncommitted work, or (after a red combined verify) its
+    /// own verify — with the reason.
+    pub refused: Vec<(TaskId, String)>,
+    /// The line about the one combined verify, when it ran.
+    pub verified: Option<String>,
+    /// The combined verify was red, and the tasks were merged one by one instead.
+    pub fell_back: Option<String>,
 }
 
 /// What [`tool::AGENT_STOP`] did. See [`AgentSink::stop`].
@@ -989,6 +1075,14 @@ pub trait AgentSink: Send + Sync {
     /// nothing here to integrate.
     fn integrate(&self, agent: &AgentId, task: Option<&TaskId>) -> Result<Integrated, String>;
 
+    /// Merge several tasks' branches as one batch: composed in memory, verified once on the
+    /// combined head, and only then moved onto the project's branch — or, when that verify is
+    /// red, merged one by one so the good ones still land. (M132)
+    fn integrate_batch(&self, pairs: &[(AgentId, TaskId)]) -> Result<BatchIntegrated, String> {
+        let _ = pairs;
+        Err("merging several tasks at once is not available here; merge them one by one".into())
+    }
+
     /// Now, in epoch milliseconds.
     ///
     /// # Why a clock is on this trait when the task tools refused one
@@ -1130,6 +1224,12 @@ pub trait AgentSink: Send + Sync {
         Err("milestones are not available here".into())
     }
 
+    /// Take every inbox task still linked into a milestone out of it — `subtaskOf` becomes
+    /// `related` — and answer `(task, parent)` per link changed. (M132) The console's only.
+    fn milestones_detach_inbox(&self) -> Result<Vec<(TaskId, TaskId)>, String> {
+        Err("milestones are not available here".into())
+    }
+
     /// Record a proposed change as a comment on the active milestone's task, and answer its id.
     fn milestones_propose(&self, _text: &str) -> Result<TaskId, String> {
         Err("milestones are not available here".into())
@@ -1234,7 +1334,9 @@ pub fn description(name: &str) -> &'static str {
              true` to file something noticed rather than planned. Give it a \
              title a person can act on, and put the statement of the work in the body. If the \
              work is an OpenSpec change, name it in `change` — a run started on that task is \
-             pointed at its proposal, design and task checklist. `links` records edges to \
+             pointed at its proposal, design and task checklist. Give it `touches` (the files it \
+             will change) so it can run beside others, and `acceptance: user` for taste work. An \
+             inbox task is never part of a milestone. `links` records edges to \
              existing tasks at creation — name a `blockedBy` link here rather than adding it \
              afterwards, so the task is never dispatchable before its blocker is known. \
              `attachments` are files to put on the task's body as it is created, by path."
@@ -1250,14 +1352,18 @@ pub fn description(name: &str) -> &'static str {
              enabled, an assignment made by the user or the product owner also starts that role \
              on the task. `change` links the task to an OpenSpec change, or unlinks it when null. \
              `attachments` puts files on the task's body by path — the same as cide_task_attach; \
-             files already attached stay. The answer is the task's summary line plus any comments \
+             files already attached stay. `touches`, `acceptance` and `question` set those fields \
+             (null clears); only the user moves a task out of the inbox or accepts a task marked \
+             `acceptance: user`. The answer is the task's summary line plus any comments \
              others added since your last one, not the whole task; that is cide_task_get."
         }
         tool::TASK_COMMENT => {
-            "Append an entry to a task's log: what you did, what you found, or why you are \
-             stopping. Comments are append-only and are how agents report back on a task. Your \
-             identity is recorded by cide; do not sign the text. A person reads this, so give a \
-             report of any length structure — see `text` for the markdown the card draws. The \
+            "Append an entry to a task's log: your report when you stop — the result, what \
+             changed, how you verified it, what is left — in at most about ten short lines; not \
+             a plan, progress, logs or measurements. Comments are append-only and are how agents \
+             report back on a task; a run's later comment in the same turn supersedes its earlier \
+             one. Your identity is recorded by cide; do not sign the text. See `text` for the \
+             markdown the card draws. The \
              answer is the task's summary line plus any comments others added since your previous \
              one, not the whole task; that is cide_task_get."
         }
@@ -1501,7 +1607,8 @@ pub fn description(name: &str) -> &'static str {
              root and has nothing to integrate; omitting `task` merges `cide/<agent>`, which only \
              holds work left there by an older cide. Do this once you have read what the run \
              did. On a conflict **nothing is changed** and the conflicting paths come back, so \
-             you can hand them to a role as a new task."
+             you can hand them to a role as a new task. To merge several reviewed tasks, pass \
+             `tasks` instead: one call, one verify on the combined result."
         }
         // Unreachable while `descriptors` walks `ALL`, and empty rather than a placeholder: a
         // tool advertised with a made-up sentence is worse than the test failure below.
@@ -1575,7 +1682,7 @@ pub fn input_schema(name: &str) -> Value {
         tool::MILESTONES => json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["get", "define", "propose"] },
+                "action": { "type": "string", "enum": ["get", "define", "propose", "detachInbox"] },
                 "milestones": {
                     "type": "array",
                     "items": {
@@ -1699,6 +1806,23 @@ pub fn input_schema(name: &str) -> Value {
                          link here rather than in a follow-up cide_task_link, so the task is \
                          never dispatchable before its blocker is known.",
                 },
+                "touches": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description":
+                        "The files and directories this task's work will change, as globs \
+                         relative to the project root (`tools/spritegen/`, `game/ui/hud.gd`, \
+                         `art/units/*.png`). cide never runs two tasks whose touches overlap; a \
+                         task without touches runs alone.",
+                },
+                "acceptance": {
+                    "type": ["string", "null"],
+                    "enum": ["user", null],
+                    "description":
+                        "`user` when the work's quality is a matter of taste (art, the look of \
+                         the UI): cide merges it once verify is green and the user accepts it by \
+                         eye; no reviewer sets it done.",
+                },
                 "inbox": {
                     "type": "boolean",
                     "description":
@@ -1747,6 +1871,30 @@ pub fn input_schema(name: &str) -> Value {
                         "The OpenSpec change this task implements. Omit to leave it alone; null \
                          to unlink it.",
                 },
+                "touches": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description":
+                        "The files and directories this task's work will change, as globs \
+                         relative to the project root (`tools/spritegen/`, `game/ui/hud.gd`, \
+                         `art/units/*.png`). cide never runs two tasks whose touches overlap; a \
+                         task without touches runs alone.",
+                },
+                "acceptance": {
+                    "type": ["string", "null"],
+                    "enum": ["user", null],
+                    "description":
+                        "`user` when the work's quality is a matter of taste (art, the look of \
+                         the UI): cide merges it once verify is green and the user accepts it by \
+                         eye; no reviewer sets it done.",
+                },
+                "question": {
+                    "type": ["string", "null"],
+                    "description":
+                        "A question for the user — a decision about taste, scope or design that \
+                         is not yours. The task is not started or planned until the user \
+                         answers; null clears it.",
+                },
                 "attachments": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -1770,10 +1918,9 @@ pub fn input_schema(name: &str) -> Value {
                     // walls of prose because the tool told them formatting would be discarded.
                     // `cide_ipc::TaskComment::text` carries the rest of the story.
                     "description":
-                        "What to append, as markdown: blank line between paragraphs, `-` or `1.` \
-                         for a list, ``` for code, and one newline is one line break. A report \
-                         with more than a couple of parts should use them — this is read by a \
-                         person in a narrow card, not parsed.",
+                        "What to append, as markdown: `-` for a list, ``` for code, and one \
+                         newline is one line break. Short: it is read by a person in a narrow \
+                         card, and a comment past the project's limit is refused.",
                 },
                 "attachments": {
                     "type": "array",
@@ -2407,8 +2554,23 @@ pub fn input_schema(name: &str) -> Value {
                          task works in the project root and has nothing to integrate; omit this \
                          only to merge `cide/<agent>`, a base branch left by an older cide.",
                 },
+                "tasks": {
+                    "type": "array",
+                    "description":
+                        "Several tasks to merge as one batch, in order, each with the role whose \
+                         branch holds it. cide merges them together and runs the project's \
+                         verify once on the result; if that is red it merges them one by one. \
+                         Use this instead of `agent`/`task` when reviewing a batch.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": { "type": "string" },
+                            "agent": { "type": "string" },
+                        },
+                        "required": ["task", "agent"],
+                    },
+                },
             },
-            "required": ["agent"],
         }),
         // Unreachable while `descriptors` walks `ALL`; an empty object is the answer that cannot
         // mislead a client into sending arguments we would ignore.
@@ -2789,17 +2951,50 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             ));
         }
     };
-    let placed = crate::milestones::placement(sink.by_run(), &plan, &rows, parent.as_ref());
-    // Asking for the inbox always wins: it is *less* than any placement, so it needs no rule.
-    // Asking for todo is not a parameter at all — that is `placement`'s decision.
-    let inbox = asked_inbox || placed.status == TaskStatus::Inbox;
     let placed = if asked_inbox {
+        // Asking for the inbox always wins: it is *less* than any placement, so it needs no rule.
         crate::milestones::Placement {
             status: TaskStatus::Inbox,
             reason: None,
         }
     } else {
-        placed
+        match crate::milestones::placement(sink.by_run(), &plan, &rows, parent.as_ref()) {
+            Ok(placed) => placed,
+            Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+        }
+    };
+    let inbox = placed.status == TaskStatus::Inbox;
+    /*
+     * An inbox task is never part of a milestone (M132). A task that lands in the inbox — a run's
+     * always does — with a parent inside one keeps the link as `related` instead of `subtaskOf`:
+     * the connection is still written down, and nothing counts it as the milestone's work until
+     * the user moves it out of the inbox and links it.
+     */
+    let mut links = links;
+    let mut related_note = None;
+    if inbox
+        && let Some(parent) = parent.as_ref()
+        && let Some(milestone) = crate::milestones::inside_milestone(&plan, &rows, parent)
+    {
+        for link in &mut links {
+            if link.link == LinkType::SubtaskOf && &link.target == parent {
+                link.link = LinkType::Related;
+            }
+        }
+        related_note = Some(format!(
+            " It is linked `related` to {parent} rather than `subtaskOf`: an inbox task is never \
+             part of a milestone (`{}`), and only the user moves it into one.",
+            milestone.id
+        ));
+    }
+    let touches = match optional_string_list(arguments, "touches") {
+        Ok(list) => list,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+    };
+    let acceptance = match optional_acceptance(arguments) {
+        Ok(Field::Value(acceptance)) => Some(acceptance),
+        Ok(_) => None,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
     };
     if inbox && let Some(existing) = crate::milestones::duplicate_of(&rows, &title) {
         let note = if body.trim().is_empty() {
@@ -2836,6 +3031,25 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         inbox,
     ) {
         Ok(task) => {
+            // The two M132 fields, in the same call and so before any trigger reads the task:
+            // `consider` runs once the handler has returned.
+            let mut task = task;
+            for edit in [
+                (!touches.is_empty()).then(|| TaskEdit::SetTouches {
+                    touches: touches.clone(),
+                }),
+                acceptance.map(|acceptance| TaskEdit::SetAcceptance {
+                    acceptance: Some(acceptance),
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                match sink.edit(&task.id, edit) {
+                    Ok(updated) => task = updated,
+                    Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
+                }
+            }
             let all = match board_for_render(tool::TASK_CREATE, sink) {
                 Ok(all) => all,
                 Err(result) => return result,
@@ -2844,14 +3058,91 @@ fn task_create(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 .reason
                 .map(|reason| format!(" {}", capitalise(&reason)))
                 .unwrap_or_default();
+            // The short answer since M132, `render_ack`'s — the caller just wrote the whole task.
             ToolResult::text(format!(
-                "Created {}.{why}\n{}",
+                "Created {}.{why}{}\n{}",
                 task.id,
-                fenced(&render_full(&task, &all, sink.root(), None))
+                related_note.unwrap_or_default(),
+                fenced(&render_ack(&task, &all, sink, false, true))
             ))
         }
         Err(why) => ToolResult::error(format!("{}: {why}", tool::TASK_CREATE)),
     }
+}
+
+/// The first of `cide_task_update`'s M132 refusals that applies to this call, if any.
+///
+/// * **Out of the inbox is the user's move.** A tab cide opened, a worker or a run may not take a
+///   task out of the inbox: the inbox is where noticed work waits for the user, and a planner that
+///   pulled from it was how observations became the plan.
+/// * **Accepting taste work is the user's.** An `acceptance: user` task is set done by the user, or
+///   by a console the user is typing in — never by a reviewer or a run.
+/// * **Nobody but the console hands taste work back to a reviewer**, and runs and workers do not
+///   decide who accepts their own work at all.
+/// * **A live run's brief is not rewritten under it.** The run implements the body it was started
+///   on; a new one it never reads is a correction nobody receives (terrastrike's t-1266).
+fn user_gesture_refusal(
+    id: &TaskId,
+    current: &Task,
+    edits: &[TaskEdit],
+    acceptance: &Field<cide_ipc::Acceptance>,
+    sink: &dyn TaskSink,
+) -> Option<String> {
+    let caller = sink.caller();
+    let leaves_inbox = current.status == TaskStatus::Inbox
+        && edits.iter().any(
+            |edit| matches!(edit, TaskEdit::SetStatus { status } if *status != TaskStatus::Inbox),
+        );
+    if leaves_inbox && !caller.attended() {
+        return Some(
+            "It is in the inbox, and only the user moves a task out of the inbox. Name it in your \
+             report, or ask the user with `question`."
+                .to_string(),
+        );
+    }
+    let to_done = edits.iter().any(|edit| {
+        matches!(
+            edit,
+            TaskEdit::SetStatus {
+                status: TaskStatus::Done
+            }
+        )
+    });
+    if to_done
+        && current.acceptance == Some(cide_ipc::Acceptance::User)
+        && current.status != TaskStatus::Done
+        && !caller.attended()
+    {
+        return Some(
+            "It is accepted by the user (`acceptance: user`): they set it done from Waiting for \
+             you, once they have looked at it. Leave it in review."
+                .to_string(),
+        );
+    }
+    match (acceptance, caller) {
+        (Field::Absent, _) | (_, CallerKind::Console) => {}
+        (_, CallerKind::Run | CallerKind::Worker) => {
+            return Some(
+                "Who accepts a task's work is not the working run's to decide; ask in your \
+                 report instead."
+                    .to_string(),
+            );
+        }
+        (Field::Null, CallerKind::CideTab) => {
+            return Some("Only the user hands work they accept back to a reviewer.".to_string());
+        }
+        (Field::Value(_), CallerKind::CideTab) => {}
+    }
+    let rewrites = edits
+        .iter()
+        .any(|edit| matches!(edit, TaskEdit::SetBody { .. } | TaskEdit::SetTitle { .. }));
+    if rewrites && let Some(role) = sink.live_run_on(id) {
+        return Some(format!(
+            "A run is working on it right now ({role}) from the body it was started on, and would \
+             never read a new one. Comment the correction, or stop the run and dispatch again."
+        ));
+    }
+    None
 }
 
 /// `it went…` → `It went…`, for a reason that starts a sentence of its own.
@@ -2927,6 +3218,34 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         }),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
     }
+    // The three M132 fields.
+    match nullable_strings(arguments, "touches", "path globs") {
+        Ok(Field::Absent) => {}
+        Ok(Field::Null) => edits.push(TaskEdit::SetTouches {
+            touches: Vec::new(),
+        }),
+        Ok(Field::Value(touches)) => edits.push(TaskEdit::SetTouches { touches }),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    }
+    let acceptance = match optional_acceptance(arguments) {
+        Ok(field) => field,
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    };
+    match &acceptance {
+        Field::Absent => {}
+        Field::Null => edits.push(TaskEdit::SetAcceptance { acceptance: None }),
+        Field::Value(value) => edits.push(TaskEdit::SetAcceptance {
+            acceptance: Some(*value),
+        }),
+    }
+    match nullable_string(arguments, "question") {
+        Ok(Field::Absent) => {}
+        Ok(Field::Null) => edits.push(TaskEdit::SetQuestion { question: None }),
+        Ok(Field::Value(question)) => edits.push(TaskEdit::SetQuestion {
+            question: Some(question),
+        }),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    }
     // Files onto the body, last in the sequence: the same road as `cide_task_attach`, here
     // because a run that has just written a file and moves the task to `review` in one breath
     // should be able to hand the file over in the same call. (M39)
@@ -2938,7 +3257,7 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
     if edits.is_empty() && attachments.is_empty() {
         return ToolResult::error(format!(
             "{}: nothing to change. Send at least one of `title`, `body`, `status`, `assignee`, \
-             `change` or `attachments`.",
+             `change`, `touches`, `acceptance`, `question` or `attachments`.",
             tool::TASK_UPDATE
         ));
     }
@@ -2950,6 +3269,55 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Ok(None) => return ToolResult::error(no_such(&id)),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
     };
+
+    // The gestures that are the user's, and the one a live run forbids. (M132) Each refuses the
+    // whole call, the M86 rule below: a caller told "updated" would read the rest as applied.
+    if let Some(refusal) = user_gesture_refusal(&id, &current, &edits, &acceptance, sink) {
+        return ToolResult::error(format!(
+            "{}: {id} was not changed, and nothing else in this call was applied either. {refusal}",
+            tool::TASK_UPDATE
+        ));
+    }
+    // A task moved *into* the inbox leaves any milestone it was part of (M132): an inbox task is
+    // never part of one. The `subtaskOf` edge becomes `related`, so the connection stays on the
+    // record, and the answer says so.
+    let mut detached_note = None;
+    let to_inbox = edits.iter().any(|edit| {
+        matches!(
+            edit,
+            TaskEdit::SetStatus {
+                status: TaskStatus::Inbox
+            }
+        )
+    });
+    if to_inbox && current.status != TaskStatus::Inbox {
+        let rows = match sink.list() {
+            Ok(rows) => rows,
+            Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+        };
+        let plan = sink.milestones();
+        if let Some(parent) = current
+            .links
+            .iter()
+            .find(|l| l.link == LinkType::SubtaskOf && !l.deleted)
+            .map(|l| l.target.clone())
+            && let Some(milestone) = crate::milestones::inside_milestone(&plan, &rows, &parent)
+        {
+            edits.push(TaskEdit::Unlink {
+                link: LinkType::SubtaskOf,
+                target: parent.clone(),
+            });
+            edits.push(TaskEdit::Link {
+                link: LinkType::Related,
+                target: parent.clone(),
+            });
+            detached_note = Some(format!(
+                " It left milestone `{}`: an inbox task is never part of one, so its `subtaskOf` \
+                 {parent} is now `related`.",
+                milestone.id
+            ));
+        }
+    }
 
     // **`done` over a branch that never landed is refused.** (M86) Accepting a run's work means
     // taking it into this branch; the review prompt has said so since M79, and said that a merge
@@ -3026,8 +3394,9 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
                 Err(result) => return result,
             };
             ToolResult::text(format!(
-                "Updated {}.\n{}",
+                "Updated {}.{}\n{}",
                 task.id,
+                detached_note.unwrap_or_default(),
                 fenced(&render_ack(&task, &all, sink, false, false))
             ))
         }
@@ -3057,6 +3426,28 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Ok(paths) => paths,
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_COMMENT)),
     };
+    // A report, not a log (M132): from a caller nobody is typing in, a comment past the
+    // project's `agents.commentLimit` is refused with what a report holds, so the next call is
+    // shorter rather than absent. The console is the user's voice and is not limited.
+    let caller = sink.caller();
+    let limit = sink.comment_limit();
+    let length = text.chars().count();
+    if caller.reports() && limit > 0 && length > limit {
+        return ToolResult::error(format!(
+            "{}: not posted — {length} characters, and a comment here is at most {limit}. Write \
+             a report, not a log: the result (done / partly / blocked), what changed (paths), how \
+             you verified it (the command and PASS or FAIL, no pasted output), what is left or \
+             assumed, anything you noticed — about ten short lines. Put long output in a file and \
+             name its path.",
+            tool::TASK_COMMENT
+        ));
+    }
+    // The comment this run already left on this task in this turn, which the new one supersedes.
+    let earlier = if caller == CallerKind::Run {
+        sink.turn_report(&id)
+    } else {
+        None
+    };
 
     // One call either way. With files, the comment and its attachments are one mutation in the
     // store — `AttachTarget::NewComment`'s reason: a refused path must not leave a comment
@@ -3071,13 +3462,38 @@ fn task_comment(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         // comment another author added while it was working — the only way it would ever find
         // out. But only *those*, not the whole task: see `render_ack` for what that cost. (M124)
         Ok(task) => {
+            // One report per turn (M132): the line just written is this turn's report, and the
+            // one before it — if this run left one — is flagged superseded. Never rewritten; the
+            // store refuses the flag on anybody else's words.
+            let mut task = task;
+            let mut superseded = false;
+            if caller == CallerKind::Run
+                && let Some(new) = task.comments.iter().rev().find(|c| !c.deleted)
+            {
+                let new = new.id.clone();
+                if let Some(earlier) = earlier.filter(|earlier| *earlier != new) {
+                    // An `Err` is an earlier one that is gone (the user deleted it): nothing to
+                    // hide.
+                    if let Ok(updated) = sink.edit(&id, TaskEdit::Supersede { comment: earlier }) {
+                        task = updated;
+                        superseded = true;
+                    }
+                }
+                sink.note_report(&id, new);
+            }
             let all = match board_for_render(tool::TASK_COMMENT, sink) {
                 Ok(all) => all,
                 Err(result) => return result,
             };
             ToolResult::text(format!(
-                "Commented on {}.\n{}",
+                "Commented on {}.{}\n{}",
                 task.id,
+                if superseded {
+                    " It supersedes your earlier comment of this turn, which other agents no longer \
+                     read."
+                } else {
+                    ""
+                },
                 fenced(&render_ack(&task, &all, sink, true, false))
             ))
         }
@@ -3135,6 +3551,17 @@ fn task_link(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         Err(result) => return result,
     };
 
+    // An inbox task is never part of a milestone (M132), and this is the gesture that would put
+    // one in. Decided here, beside the board and the plan, because `cide-tasks` sees neither.
+    if link == LinkType::SubtaskOf {
+        let rows = match sink.list() {
+            Ok(rows) => rows,
+            Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_LINK)),
+        };
+        if let Some(why) = crate::milestones::inbox_rule(&sink.milestones(), &rows, &id, &target) {
+            return ToolResult::error(format!("{}: not linked. {why}", tool::TASK_LINK));
+        }
+    }
     // Every interesting refusal — self-link, duplicate, missing target, a cycle with its chain
     // named — originates in `cide-tasks` and arrives here as a sentence through the sink.
     match sink.edit(
@@ -3380,8 +3807,26 @@ fn milestones(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
                 Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
             }
         }
+        // (M132) The one-shot migration for boards written before inbox tasks were kept out of
+        // milestones.
+        "detachInbox" => match sink.milestones_detach_inbox() {
+            Ok(links) if links.is_empty() => ToolResult::text(
+                "No inbox task is linked into a milestone; nothing changed.".to_string(),
+            ),
+            Ok(links) => ToolResult::text(format!(
+                "Detached {} inbox task(s) from their milestones — each `subtaskOf` is now \
+                 `related`: {}.",
+                links.len(),
+                links
+                    .iter()
+                    .map(|(task, parent)| format!("{task} (was under {parent})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Err(why) => ToolResult::error(format!("{}: {why}", tool::MILESTONES)),
+        },
         other => ToolResult::error(format!(
-            "{}: no action `{other}` — it is `get`, `define` or `propose`.",
+            "{}: no action `{other}` — it is `get`, `define`, `propose` or `detachInbox`.",
             tool::MILESTONES
         )),
     }
@@ -3579,30 +4024,31 @@ fn render_milestones(view: &cide_ipc::MilestonesView) -> String {
                 .iter()
                 .filter(|t| t.status != TaskStatus::Done)
                 .collect();
-            // Inbox rows under the goal are counted apart (M99): they are not work in flight,
-            // but they do hold the milestone — the Accept button and the spinner's stand-down
-            // both wait on them (`cide_agents::milestones::inbox_under`) — and a model told only
-            // "3 open" cannot see that one of the three is a decision it owes rather than work.
-            let undecided = open
+            // Inbox rows are not part of a milestone (M132): links from before that rule are
+            // counted apart, said to be nothing to plan from, and left to the user — a model told
+            // only "3 open" would plan from one of them.
+            let legacy = open
                 .iter()
                 .filter(|t| t.status == TaskStatus::Inbox)
                 .count();
             out.push_str(&format!(
                 "  tasks: {} open, {done} done{}\n",
-                open.len() - undecided,
-                if undecided == 0 {
+                open.len() - legacy,
+                if legacy == 0 {
                     String::new()
                 } else {
                     format!(
-                        ", {undecided} in the inbox under it — undecided, and this milestone \
-                         cannot be accepted until each is moved to todo or unlinked from the goal"
+                        ", and {legacy} inbox task(s) still linked under it from before inbox \
+                         tasks were kept out of milestones — not part of it; leave them to the \
+                         user (the console can detach them with `action: detachInbox`)"
                     )
                 }
             ));
             // Every open one for the active milestone — that is the work — and a count for the
             // rest, whose lists are read when they become active, not before.
             if active.as_deref() == Some(m.id.as_str()) && !view.accepted.contains(&m.id) {
-                for t in open {
+                // Legacy inbox links are not the milestone's work (M132), so they are not listed.
+                for t in open.into_iter().filter(|t| t.status != TaskStatus::Inbox) {
                     out.push_str(&format!(
                         "  {}- {} [{}] {}{}\n",
                         "  ".repeat(t.depth as usize),
@@ -5850,6 +6296,9 @@ fn stopped_text(run: RunId, outcome: &Stopped) -> String {
 }
 
 fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    if arguments.get("tasks").is_some_and(|tasks| !tasks.is_null()) {
+        return agent_integrate_batch(arguments, sink);
+    }
     let agent = match required_role(arguments, "agent", tool::AGENT_INTEGRATE) {
         Ok(agent) => agent,
         Err(result) => return result,
@@ -6306,6 +6755,113 @@ fn nullable_string(arguments: &Value, key: &str) -> Result<Nullable, String> {
         Some(other) => Err(format!(
             "`{key}` must be a string or null, not {}",
             kind_of(other)
+        )),
+    }
+}
+
+/// `touches` and its kind: an array of globs, absent or null meaning none. (M132)
+fn optional_string_list(arguments: &Value, key: &str) -> Result<Vec<String>, String> {
+    match nullable_strings(arguments, key, "path globs")? {
+        Field::Value(list) => Ok(list),
+        Field::Absent | Field::Null => Ok(Vec::new()),
+    }
+}
+
+/// `cide_agent_integrate` with `tasks`: the batch road. (M132)
+fn agent_integrate_batch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let bad = |why: &str| ToolResult::error(format!("{}: {why}", tool::AGENT_INTEGRATE));
+    let Some(items) = arguments.get("tasks").and_then(Value::as_array) else {
+        return bad("`tasks` must be a list of {\"task\", \"agent\"} objects");
+    };
+    if items.is_empty() {
+        return bad("`tasks` is empty");
+    }
+    let mut pairs: Vec<(AgentId, TaskId)> = Vec::new();
+    for item in items {
+        let task = item.get("task").and_then(Value::as_str).map(str::trim);
+        let agent = item
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .or_else(|| {
+                arguments
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+            });
+        match (task, agent) {
+            (Some(task), Some(agent)) if !task.is_empty() && !agent.is_empty() => {
+                let pair = (AgentId(agent.to_string()), TaskId(task.to_string()));
+                if !pairs.contains(&pair) {
+                    pairs.push(pair);
+                }
+            }
+            _ => {
+                return bad(
+                    "every entry of `tasks` names a `task` and the `agent` (role) whose branch \
+                     holds it, e.g. {\"task\": \"t-12\", \"agent\": \"developer\"}",
+                );
+            }
+        }
+    }
+    match sink.integrate_batch(&pairs) {
+        Ok(done) => ToolResult::text(render_batch(&done)),
+        Err(why) => bad(&why),
+    }
+}
+
+/// The batch answer: one line per outcome, what the model acts on next.
+fn render_batch(done: &BatchIntegrated) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(why) = &done.fell_back {
+        lines.push(format!(
+            "The combined verify was red, so the tasks were merged one by one instead: {}",
+            one_line(why)
+        ));
+    } else if let Some(line) = &done.verified {
+        lines.push(one_line(line));
+    }
+    if !done.merged.is_empty() {
+        lines.push(format!(
+            "Merged: {}. Set each of these to done.",
+            done.merged
+                .iter()
+                .map(|(task, commit)| format!("{task} ({})", short(commit)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !done.up_to_date.is_empty() {
+        lines.push(format!(
+            "Already in, nothing merged: {}.",
+            done.up_to_date
+                .iter()
+                .map(TaskId::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for (task, paths) in &done.conflicts {
+        lines.push(format!(
+            "Not merged, conflicts: {task} in {} — send it back to its role.",
+            paths.join(", ")
+        ));
+    }
+    for (task, why) in &done.refused {
+        lines.push(format!("Not merged: {task} — {}", one_line(why)));
+    }
+    lines.join("\n")
+}
+
+/// `acceptance`: `"user"`, or null to hand the task back to the reviewer. (M132)
+fn optional_acceptance(arguments: &Value) -> Result<Field<cide_ipc::Acceptance>, String> {
+    match nullable_string(arguments, "acceptance")? {
+        Field::Absent => Ok(Field::Absent),
+        Field::Null => Ok(Field::Null),
+        Field::Value(text) if text == "user" => Ok(Field::Value(cide_ipc::Acceptance::User)),
+        Field::Value(text) => Err(format!(
+            "`acceptance` must be \"user\" or null, not `{}`",
+            one_line(&text)
         )),
     }
 }
@@ -7095,7 +7651,16 @@ fn render_full(task: &Task, all: &[TaskRow], root: &Path, recent: Option<usize>)
     // every agent's view of the task" (`TaskComment::deleted`), and drawing one drew an empty
     // `- from …:` entry that every reader paid for. (M124)
     let live: Vec<&cide_ipc::TaskComment> = task.comments.iter().filter(|c| !c.deleted).collect();
+    // A superseded comment is its author's earlier word in the same turn, replaced by the report
+    // after it (M132): counted, never drawn, so no later reader pays for a plan the report
+    // already answers. `all: true` does not bring them back — the card is where a person reads
+    // them.
+    let superseded = live.iter().filter(|c| c.superseded).count();
+    let live: Vec<&cide_ipc::TaskComment> = live.into_iter().filter(|c| !c.superseded).collect();
     let skipped = recent.map_or(0, |keep| live.len().saturating_sub(keep));
+    if superseded > 0 {
+        out.push_str(&format!("  {superseded} superseded comment(s) not shown\n"));
+    }
     if live.is_empty() {
         out.push_str("  no comments\n");
     } else {
@@ -7186,6 +7751,13 @@ mod tests {
         plan: cide_ipc::MilestonePlan,
         /// What [`TaskSink::unmerged`] answers for every task: `None` is a branch that is in.
         unmerged: Option<usize>,
+        /// What [`TaskSink::caller`] answers; `None` derives it from `run`, as the default does.
+        /// (M132)
+        caller: Option<CallerKind>,
+        /// What [`TaskSink::live_run_on`] answers. (M132)
+        live: Vec<(TaskId, String)>,
+        /// The turn's report per task, as [`TaskSink::turn_report`]/`note_report` keep it. (M132)
+        reports: Mutex<Vec<(TaskId, cide_ipc::CommentId)>>,
     }
 
     impl FakeSink {
@@ -7196,16 +7768,16 @@ mod tests {
                 run: false,
                 plan: cide_ipc::MilestonePlan::default(),
                 unmerged: None,
+                caller: None,
+                live: Vec::new(),
+                reports: Mutex::new(Vec::new()),
             }
         }
 
         fn broken(why: &str) -> Self {
             Self {
-                tasks: Mutex::new(Vec::new()),
                 broken: Some(why.to_string()),
-                run: false,
-                plan: cide_ipc::MilestonePlan::default(),
-                unmerged: None,
+                ..Self::new(Vec::new())
             }
         }
     }
@@ -7297,6 +7869,9 @@ mod tests {
                 created_unix_ms: 1,
                 updated_unix_ms: 1,
                 attachments: fake_records(attachments),
+                acceptance: None,
+                question: None,
+                touches: Vec::new(),
             };
             tasks.push(task.clone());
             Ok(task)
@@ -7304,6 +7879,39 @@ mod tests {
 
         fn by_run(&self) -> bool {
             self.run
+        }
+
+        fn caller(&self) -> CallerKind {
+            self.caller.unwrap_or(if self.run {
+                CallerKind::Run
+            } else {
+                CallerKind::Console
+            })
+        }
+
+        fn live_run_on(&self, task: &TaskId) -> Option<String> {
+            self.live
+                .iter()
+                .find(|(id, _)| id == task)
+                .map(|(_, label)| label.clone())
+        }
+
+        fn turn_report(&self, task: &TaskId) -> Option<cide_ipc::CommentId> {
+            self.reports
+                .lock()
+                .iter()
+                .find(|(id, _)| id == task)
+                .map(|(_, comment)| comment.clone())
+        }
+
+        fn note_report(&self, task: &TaskId, comment: cide_ipc::CommentId) {
+            let mut reports = self.reports.lock();
+            reports.retain(|(id, _)| id != task);
+            reports.push((task.clone(), comment));
+        }
+
+        fn comment_limit(&self) -> usize {
+            1500
         }
 
         fn unmerged(&self, _agent: &AgentId, _task: &TaskId) -> Result<Option<usize>, String> {
@@ -7391,6 +7999,7 @@ mod tests {
                     edited_at_unix_ms: None,
                     deleted: false,
                     attachments: Vec::new(),
+                    superseded: false,
                 }),
                 /*
                  * Refused here too, matching the real store. (M21)
@@ -7407,6 +8016,19 @@ mod tests {
                 | TaskEdit::DeleteComment { .. }
                 | TaskEdit::DetachAttachment { .. } => {
                     return Err("only the user can edit or delete a comment".to_string());
+                }
+                TaskEdit::SetTouches { touches } => task.touches = touches,
+                TaskEdit::SetAcceptance { acceptance } => task.acceptance = acceptance,
+                TaskEdit::SetQuestion { question } => task.question = question,
+                TaskEdit::Supersede { comment } => {
+                    let Some(earlier) = task
+                        .comments
+                        .iter_mut()
+                        .find(|c| c.id == comment && !c.deleted)
+                    else {
+                        return Err(format!("no comment {comment} on {id}"));
+                    };
+                    earlier.superseded = true;
                 }
             }
             Ok(task.clone())
@@ -7455,6 +8077,7 @@ mod tests {
                     edited_at_unix_ms: None,
                     deleted: false,
                     attachments: records,
+                    superseded: false,
                 }),
             }
             Ok(task.clone())
@@ -7477,6 +8100,9 @@ mod tests {
             created_unix_ms: 1,
             updated_unix_ms: 1,
             attachments: Vec::new(),
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 
@@ -9315,6 +9941,7 @@ mod tests {
                 edited_at_unix_ms: None,
                 deleted: false,
                 attachments: Vec::new(),
+                superseded: false,
             },
             TaskComment {
                 id: CommentId::new(),
@@ -9327,6 +9954,7 @@ mod tests {
                 edited_at_unix_ms: None,
                 deleted: false,
                 attachments: Vec::new(),
+                superseded: false,
             },
             TaskComment {
                 id: CommentId::new(),
@@ -9336,6 +9964,7 @@ mod tests {
                 edited_at_unix_ms: None,
                 deleted: false,
                 attachments: Vec::new(),
+                superseded: false,
             },
         ];
         let text = text_of(&call(
@@ -9388,6 +10017,7 @@ mod tests {
             edited_at_unix_ms: None,
             deleted: false,
             attachments: Vec::new(),
+            superseded: false,
         }];
 
         let text = text_of(&call(
@@ -9603,9 +10233,8 @@ mod tests {
         );
     }
 
-    /// An inbox row under the active milestone is listed, counted apart from the open work, and
-    /// says what clears it. (M99) The bug it comes from: selfcraft's `slice`, gate green and one
-    /// inbox row under the goal, read everywhere as finished.
+    /// An inbox row still linked under the active milestone (from before M132) is counted apart,
+    /// said not to be part of it, and not listed as its work.
     #[test]
     fn the_milestones_answer_counts_the_inbox_under_the_goal_apart() {
         let task_of = |id: &str, status, depth| cide_ipc::MilestoneTask {
@@ -9641,10 +10270,11 @@ mod tests {
         };
         let text = render_milestones(&view);
         assert!(
-            text.contains("  tasks: 0 open, 1 done, 1 in the inbox under it — undecided"),
+            text.contains("  tasks: 0 open, 1 done, and 1 inbox task(s) still linked under it"),
             "{text}"
         );
-        assert!(text.contains("- t-3 [inbox] work t-3"), "{text}");
+        assert!(text.contains("not part of it"), "{text}");
+        assert!(!text.contains("- t-3 [inbox] work t-3"), "{text}");
     }
 
     /// With milestones, the orchestrator's task is todo only under the active one. (M83)
@@ -9673,10 +10303,7 @@ mod tests {
             &sink,
         );
         let text = text_of(&loose);
-        assert!(
-            text.contains("not part of the active milestone `slice`"),
-            "{text}"
-        );
+        assert!(text.contains("not part of any milestone"), "{text}");
         assert_eq!(sink.tasks.lock()[1].status, TaskStatus::Inbox);
 
         let serving = call(
@@ -9687,6 +10314,236 @@ mod tests {
         );
         assert!(!serving.is_error, "{}", text_of(&serving));
         assert_eq!(sink.tasks.lock()[2].status, TaskStatus::Todo);
+    }
+
+    fn slice_plan() -> cide_ipc::MilestonePlan {
+        cide_ipc::MilestonePlan {
+            items: vec![cide_ipc::Milestone {
+                id: "slice".into(),
+                title: "The slice".into(),
+                task: Some(TaskId("t-1".into())),
+                gate: "true".into(),
+                timeout_secs: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn with_parent(mut task: Task, parent: &str) -> Task {
+        task.links.push(TaskLink {
+            link: LinkType::SubtaskOf,
+            target: TaskId(parent.into()),
+            deleted: false,
+            at_unix_ms: 1,
+        });
+        task
+    }
+
+    /// (M132) Only the user moves a task out of the inbox: a tab cide opened, a worker and a run
+    /// are refused and nothing in the call applies; the console, which the user types in, may.
+    #[test]
+    fn only_an_attended_caller_moves_a_task_out_of_the_inbox() {
+        for caller in [CallerKind::CideTab, CallerKind::Worker, CallerKind::Run] {
+            let mut sink = FakeSink::new(vec![task("t-1", "Noticed", TaskStatus::Inbox, None)]);
+            sink.caller = Some(caller);
+            let answer = call(
+                tool::TASK_UPDATE,
+                json!({ "id": "t-1", "status": "todo", "title": "Renamed" }),
+                &sink,
+            );
+            assert!(answer.is_error, "{caller:?}");
+            assert!(text_of(&answer).contains("only the user moves a task out of the inbox"));
+            let tasks = sink.tasks.lock();
+            assert_eq!(tasks[0].status, TaskStatus::Inbox);
+            assert_eq!(tasks[0].title, "Noticed", "nothing in the call applied");
+        }
+        let sink = FakeSink::new(vec![task("t-1", "Noticed", TaskStatus::Inbox, None)]);
+        let answer = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "status": "todo" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert_eq!(sink.tasks.lock()[0].status, TaskStatus::Todo);
+    }
+
+    /// (M132) Work the user accepts is set done by the user's console only.
+    #[test]
+    fn a_task_the_user_accepts_is_not_set_done_by_a_reviewer() {
+        let mut art = task("t-1", "Cursor set", TaskStatus::Review, Some("artist"));
+        art.acceptance = Some(cide_ipc::Acceptance::User);
+        let mut sink = FakeSink::new(vec![art.clone()]);
+        sink.caller = Some(CallerKind::CideTab);
+        let answer = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "status": "done" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(text_of(&answer).contains("accepted by the user"));
+        let console = FakeSink::new(vec![art]);
+        assert!(
+            !call(
+                tool::TASK_UPDATE,
+                json!({ "id": "t-1", "status": "done" }),
+                &console
+            )
+            .is_error
+        );
+    }
+
+    /// (M132) A run's brief is not rewritten under it; a comment still lands.
+    #[test]
+    fn the_body_of_a_task_with_a_live_run_is_not_rewritten() {
+        let mut sink = FakeSink::new(vec![task(
+            "t-1",
+            "Lakes",
+            TaskStatus::Doing,
+            Some("developer"),
+        )]);
+        sink.live = vec![(TaskId("t-1".into()), "Developer".into())];
+        let answer = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "body": "no, oases" }),
+            &sink,
+        );
+        assert!(answer.is_error);
+        assert!(text_of(&answer).contains("Comment the correction"));
+        assert!(
+            !call(
+                tool::TASK_COMMENT,
+                json!({ "id": "t-1", "text": "Oases, not lakes." }),
+                &sink
+            )
+            .is_error
+        );
+    }
+
+    /// (M132) Moving a milestone's task into the inbox takes it out of the milestone.
+    #[test]
+    fn a_task_moved_to_the_inbox_leaves_its_milestone() {
+        let mut sink = FakeSink::new(vec![
+            task("t-1", "Milestone: the slice", TaskStatus::Todo, None),
+            with_parent(task("t-2", "Later maybe", TaskStatus::Todo, None), "t-1"),
+        ]);
+        sink.plan = slice_plan();
+        let answer = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-2", "status": "inbox" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(text_of(&answer).contains("left milestone `slice`"));
+        let tasks = sink.tasks.lock();
+        let links: Vec<_> = tasks[1].links.iter().filter(|l| !l.deleted).collect();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].link, LinkType::Related);
+    }
+
+    /// (M132) A run's new task lands in the inbox with its milestone parent kept as `related`,
+    /// and an inbox task is never linked into a milestone afterwards.
+    #[test]
+    fn an_inbox_task_is_kept_out_of_milestones_on_create_and_link() {
+        let mut sink = FakeSink::new(vec![
+            task("t-1", "Milestone: the slice", TaskStatus::Todo, None),
+            task("t-2", "Loose", TaskStatus::Inbox, None),
+        ]);
+        sink.plan = slice_plan();
+        sink.run = true;
+        let made = call(
+            tool::TASK_CREATE,
+            json!({ "title": "Grass reads as noise",
+                    "links": [{ "link": "subtaskOf", "target": "t-1" }] }),
+            &sink,
+        );
+        assert!(!made.is_error, "{}", text_of(&made));
+        assert!(text_of(&made).contains("`related`"));
+        {
+            let tasks = sink.tasks.lock();
+            assert_eq!(tasks[2].status, TaskStatus::Inbox);
+            assert_eq!(tasks[2].links[0].link, LinkType::Related);
+        }
+        sink.run = false;
+        let linked = call(
+            tool::TASK_LINK,
+            json!({ "id": "t-2", "link": "subtaskOf", "target": "t-1" }),
+            &sink,
+        );
+        assert!(linked.is_error);
+        assert!(text_of(&linked).contains("never part of a milestone"));
+    }
+
+    /// (M132) A report, not a log: a run's over-long comment is refused with the recipe, the
+    /// console's is not, and a run's second comment of a turn supersedes its first.
+    #[test]
+    fn a_run_reports_once_per_turn_within_the_limit() {
+        let long = "x".repeat(1600);
+        let mut sink = FakeSink::new(vec![task(
+            "t-1",
+            "Cursors",
+            TaskStatus::Doing,
+            Some("artist"),
+        )]);
+        sink.run = true;
+        let refused = call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-1", "text": long }),
+            &sink,
+        );
+        assert!(refused.is_error);
+        assert!(text_of(&refused).contains("at most 1500"));
+
+        assert!(
+            !call(
+                tool::TASK_COMMENT,
+                json!({ "id": "t-1", "text": "Plan: six cursors." }),
+                &sink
+            )
+            .is_error
+        );
+        let second = call(
+            tool::TASK_COMMENT,
+            json!({ "id": "t-1", "text": "Done: six cursors." }),
+            &sink,
+        );
+        assert!(!second.is_error, "{}", text_of(&second));
+        assert!(text_of(&second).contains("supersedes your earlier comment"));
+        {
+            let tasks = sink.tasks.lock();
+            assert!(tasks[0].comments[0].superseded);
+            assert!(!tasks[0].comments[1].superseded);
+        }
+        let read = call(tool::TASK_GET, json!({ "id": "t-1" }), &sink);
+        let text = text_of(&read);
+        assert!(!text.contains("Plan: six cursors."), "{text}");
+        assert!(text.contains("1 superseded comment(s) not shown"), "{text}");
+
+        let console = FakeSink::new(vec![task("t-1", "Cursors", TaskStatus::Doing, None)]);
+        assert!(
+            !call(
+                tool::TASK_COMMENT,
+                json!({ "id": "t-1", "text": "y".repeat(1600) }),
+                &console
+            )
+            .is_error
+        );
+    }
+
+    /// (M132) `touches`, `acceptance` and `question` are fields a caller sets.
+    #[test]
+    fn touches_acceptance_and_question_are_set_through_update() {
+        let sink = FakeSink::new(vec![task("t-1", "Cursors", TaskStatus::Todo, None)]);
+        let answer = call(
+            tool::TASK_UPDATE,
+            json!({ "id": "t-1", "touches": ["art/cursors/", "tools/spritegen/cursors.py"],
+                    "acceptance": "user", "question": "Arrow or hand?" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let tasks = sink.tasks.lock();
+        assert_eq!(tasks[0].touches.len(), 2);
+        assert_eq!(tasks[0].acceptance, Some(cide_ipc::Acceptance::User));
+        assert_eq!(tasks[0].question.as_deref(), Some("Arrow or hand?"));
     }
 
     #[test]
@@ -9816,6 +10673,7 @@ mod tests {
                     edited_at_unix_ms: None,
                     deleted: false,
                     attachments: Vec::new(),
+                    superseded: false,
                 });
             }
             comments.push(TaskComment {
@@ -9826,6 +10684,7 @@ mod tests {
                 edited_at_unix_ms: None,
                 deleted: true,
                 attachments: Vec::new(),
+                superseded: false,
             });
         }
         let recent = text_of(&call(tool::TASK_GET, json!({ "id": "t-1" }), &sink));
@@ -9907,6 +10766,7 @@ mod tests {
             edited_at_unix_ms: None,
             deleted: false,
             attachments: Vec::new(),
+            superseded: false,
         });
         let text = text_of(&call(
             tool::TASK_COMMENT,
@@ -11269,6 +12129,42 @@ mod tests {
             "{blocked}"
         );
         assert!(blocked.contains("permission prompt"), "{blocked}");
+    }
+
+    /// `tasks` takes the batch road: every entry needs a task and a role, and the answer names
+    /// what merged, what conflicted and whether the combined verify fell back. (M132)
+    #[test]
+    fn a_batch_integrate_names_each_task_and_the_road_it_took() {
+        let refused = ask(
+            tool::AGENT_INTEGRATE,
+            json!({ "tasks": [{ "task": "t-1" }] }),
+            &roster(),
+        );
+        assert!(refused.is_error, "an entry with no role is refused");
+
+        let unsupported = ask(
+            tool::AGENT_INTEGRATE,
+            json!({ "tasks": [{ "task": "t-1", "agent": "developer" }] }),
+            &roster(),
+        );
+        assert!(
+            text_of(&unsupported).contains("one by one"),
+            "{}",
+            text_of(&unsupported)
+        );
+
+        let done = BatchIntegrated {
+            merged: vec![(TaskId("t-1".into()), "0123456789".into())],
+            up_to_date: Vec::new(),
+            conflicts: vec![(TaskId("t-2".into()), vec!["a.rs".into()])],
+            refused: Vec::new(),
+            verified: None,
+            fell_back: Some("verify failed on the combination".into()),
+        };
+        let text = render_batch(&done);
+        assert!(text.contains("merged one by one"), "{text}");
+        assert!(text.contains("t-1 (01234567)"), "{text}");
+        assert!(text.contains("t-2 in a.rs"), "{text}");
     }
 
     #[test]

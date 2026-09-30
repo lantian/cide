@@ -148,6 +148,43 @@
 }
 
 /*
+ * The Agents button's waiting mark: tasks on the board wait for the user. (M132)
+ *
+ * The **bottom-right** corner, because the run pill owns the top right and the two are drawn
+ * together as often as apart — see `agentsWaiting` in `ActivityRail.tsx`. Anchored flush to the
+ * 32px button's bottom-right, an 8px dot spans 24…32px down; the pill's `calc(16px *
+ * --ui-scale)` ends at 16px at UI size 13 and grows downward only to 24px at size 19.5, so the
+ * two stay apart across the whole ladder but its very top (size 20, where they meet and the pill,
+ * later in the markup, paints over the ring). The dot itself is **not** scaled: it is a mark on
+ * the button, which is a fixed 32px, not a box around text (`check:ui-scale`'s subject) — a dot
+ * that grew with the type would be the thing that ran into the pill. The hexagon's 20px box sits
+ * at 6…26px, so the dot overlaps its corner the way the pill overlaps the other, and the ring
+ * below is what keeps it legible there.
+ *
+ * `--grad-yellow`, the kit's "waiting on someone" fill, under `--fill-sheen` like every small
+ * filled mark. Not `--grad-neutral` (the pill's quiet count) and not `--grad-red` (a run stopped
+ * at a prompt right now, `.badgeError`): a third meaning gets a third colour. The ring is
+ * `--chrome`, the rail's own ground, so the dot reads as a mark on the button rather than a
+ * smudge on the icon; on a lit (current) button the ring still separates it from the tint.
+ *
+ * Static on purpose: the busy dot below pulses because it says "working", and this says
+ * "yours to do" — it stays until the user does it, and a mark that throbs for hours is noise.
+ */
+.waitingMark {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-full);
+  background: var(--grad-yellow);
+  box-shadow:
+    var(--fill-sheen),
+    0 0 0 2px var(--chrome);
+  pointer-events: none;
+}
+
+/*
  * The analyser busy dot, on the warning triangle while something is scanning and there is
  * no error pill to show. (M25)
  *

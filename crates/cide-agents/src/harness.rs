@@ -142,32 +142,41 @@ pub const SERVER: &str = "cide";
 /// told to reach for a vocabulary it cannot see, and it has nothing to say about why the call
 /// failed; `cmd/session.rs` gates its roster paragraph on the same question for the same reason.
 ///
-/// Kept to six sentences on purpose. This is prepended to every turn of every run for ever, and
-/// a page of cide's prose in front of the role's own is a role diluted by its host. The fifth is
-/// the checkpoint discipline (P4 of the debug-report plan — its runs died mid-turn with an empty
-/// worktree branch and a silent task, so nothing said how far they got): the plan comment proves
-/// liveness on the board, and a commit per coherent step makes the worktree branch the durable
-/// record a death cannot erase. The sixth is the done-workflow convention's durable half (the
-/// opening prompt says it too, but an opening prompt is one turn ago by the time the work is
-/// done): finish → review + comment, and `done` belongs to whoever reviews.
+/// Kept short on purpose. This is prepended to every turn of every run for ever, and a page of
+/// cide's prose in front of the role's own is a role diluted by its host.
+///
+/// **One report, no narration (M132).** Until M132 this asked for a plan comment before the work
+/// and a report after, and runs read that as licence to narrate: selfcraft's tracker held 6 MB of
+/// comments against 1.3 MB of game code, most of it progress notes, pasted test output and
+/// measurements that nobody read and every later `cide_task_get` re-sent. Liveness is the
+/// registry's job (the run row, its state), and the durable record a death cannot erase is the
+/// branch's commits — P4's checkpoint discipline survives as "commit each step". The report is
+/// one comment with a fixed shape and a length cap (`agents.commentLimit`, enforced by the tool),
+/// and a second comment in the same turn supersedes the first. The done-workflow half stays:
+/// finish → review + comment, and `done` belongs to whoever reviews — or to the user, for a task
+/// with `acceptance: user`.
+///
+/// **`touches` is a claim, not a fence.** The first cut said "stay inside the files the task's
+/// touches names", and on terrastrike's t-1160 a codex run read that as a permission rule: it
+/// found one file missing from the list (`sim/sim_event.gd`), implemented nothing, set a
+/// `question` asking whether it might edit it, and the task sat waiting for the user. The field
+/// exists for the scheduler (`cide_app::agents`' path gate), and a run widening its own claim
+/// is exactly what the gate wants to hear about — so it is told to do that and go on.
 pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.json, and cide holds \
-     the only writer for it: one process owns that file, so a write made behind its back is \
-     either overwritten by that process's next write or merged unpredictably with it, and the \
-     work in it is lost. Editing the file directly is refused, so it is not a fallback. Read with \
-     {cide_task_get} and {cide_task_list}; change a task's title, body or \
-     status with {cide_task_update}, append a comment with {cide_task_comment}, \
-     set the role a task is for with {cide_task_assign}, and open a new one with \
-     {cide_task_create}. Those comments are how you report back: whoever dispatched you \
-     reads the task, not your transcript, so a run that finishes without leaving one has reported \
-     nothing, and a comment is markdown a person reads: give a report of any length structure. \
-     Before you start, comment your plan on the task, and commit each coherent step of \
-     the work as you finish it: a run can die mid-turn, and the plan comment plus your branch's \
-     commits are the only record of how far you got. If you notice something wrong that is \
-     not this task, do not fix it and do not let it go: file it with {cide_task_create} \
-     saying what you saw and where — it lands in the inbox, where whoever plans the work picks \
-     it up if it is needed — then carry on with yours. \
-     When the work is done, set the task's status to review and comment what you did \
-     and where; done is the reviewer's call, not yours.";
+     the only writer for it: editing the file directly is refused. Read with {cide_task_get} and \
+     {cide_task_list}; change a task's status or fields with {cide_task_update}, comment with \
+     {cide_task_comment}, set its role with {cide_task_assign}, open one with {cide_task_create}. \
+     Comments are how you report back, and you report once: do not comment a plan, progress, \
+     logs or measurements while you work — commit each coherent step instead, because your \
+     branch's commits are the record if the run dies. When you stop (done, blocked or out of \
+     time) leave one short comment of at most ten lines: the result, what changed (paths), how \
+     you verified it (the command and pass or fail, no pasted output), what is left, anything \
+     you noticed. A later comment in the same turn supersedes the earlier one. Then set the \
+     task's status to review; done is the reviewer's call, or the user's. The task's touches \
+     is what cide holds for you so parallel runs do not collide, not a permission: if the work \
+     needs another file, add it with {cide_task_update} and carry on. Something wrong that is not \
+     this task: do not fix it here — file it with {cide_task_create} (it lands in the inbox, \
+     outside every milestone) or name it in your report.";
 
 /// Every tracker tool cide's prose is allowed to name.
 ///

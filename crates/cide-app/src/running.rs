@@ -287,6 +287,7 @@ pub(crate) fn counts_for(
             runs: 0,
             panes: 0,
             tabs: Vec::new(),
+            waiting: waiting_in(tasks),
         };
     };
 
@@ -373,7 +374,26 @@ pub(crate) fn counts_for(
         runs: runs as u32,
         panes: panes as u32,
         tabs,
+        waiting: waiting_in(tasks),
     }
+}
+
+/// Tasks waiting for the user (M132) — the Agents panel's *Waiting* list, one rule for the
+/// project tab's badge and the OS title: an open question, or a user-accepted task in review.
+pub(crate) fn waiting_in(tasks: &[TaskRow]) -> u32 {
+    tasks
+        .iter()
+        .filter(|row| {
+            row.question.is_some()
+                || (row.acceptance == Some(cide_ipc::Acceptance::User)
+                    && row.status == cide_ipc::TaskStatus::Review)
+        })
+        .count() as u32
+}
+
+/// [`waiting_in`] over a project's board, or `0` when its tracker has never been opened.
+pub(crate) fn waiting_for(app: &AppHandle, project: ProjectId) -> usize {
+    waiting_in(rows_of(&board_of(app, project))) as usize
 }
 
 /// Whether a console pane should turn its **tab's** spinner: [`pane_is_busy`]'s `Working`
@@ -431,7 +451,7 @@ pub(crate) fn compute(app: &AppHandle, ws: &Workspace) -> ProjectRunningSet {
             // proves it — see `Busy`.
             counts_for(app, ws, project, rows_of(&board), Busy::Working)
         })
-        .filter(|running| running.runs > 0 || running.panes > 0)
+        .filter(|running| running.runs > 0 || running.panes > 0 || running.waiting > 0)
         .collect();
     ProjectRunningSet {
         projects,
@@ -823,12 +843,14 @@ mod tests {
             runs: 1,
             panes: 0,
             tabs: Vec::new(),
+            waiting: 0,
         }];
         let two = vec![ProjectRunning {
             project,
             runs: 2,
             panes: 0,
             tabs: Vec::new(),
+            waiting: 0,
         }];
 
         // Whatever the static holds from another test in this binary, the first distinct set is

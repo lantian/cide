@@ -305,6 +305,14 @@ enum Scope {
         session: SessionId,
         primary: bool,
     },
+    /// The header named a Claude pane inside a tab cide opened by itself — the planner or a
+    /// reviewer (`PaneOrigin::Planner`/`Reviewer`). (M132) Every tool a console has, signing as
+    /// the orchestrator, but nobody is typing in it, so the tracker refuses it the gestures that
+    /// are the user's own (`cide_agents::tools::CallerKind::CideTab`).
+    CideTab {
+        project: ProjectId,
+        session: SessionId,
+    },
     /// The header named a pane `cide_session_open` opened to implement one piece of work —
     /// `PaneOrigin::Worker`, any kind: a claude or codex console, or the opencode TUI in a Shell
     /// pane. (M104) The task tools and nothing else, like a run: the user asked for a session per
@@ -405,6 +413,9 @@ struct ProjectTools {
     /// list is fixed for a connection's life (`listChanged: false`), so a switch flipped later
     /// reaches the sessions started after it — which is what Settings says.
     tracker: bool,
+    /// Who the connection is, for the rules that are the user's own. (M132) See
+    /// [`tools::CallerKind`]; decided here from the scope, as the author is.
+    caller: tools::CallerKind,
 }
 
 impl ToolAccess for ProjectTools {
@@ -437,6 +448,15 @@ impl ToolAccess for ProjectTools {
                 .cwd
                 .clone()
                 .unwrap_or_else(|| store.root().to_path_buf()),
+            caller: self.caller_now(),
+            live: live_runs_by_task(&self.app, self.project),
+            reports: match &self.author {
+                TaskAuthor::Agent { agent, .. } if self.caller == tools::CallerKind::Run => {
+                    turn_reports_of(self.project, agent)
+                }
+                _ => Vec::new(),
+            },
+            new_reports: Mutex::new(Vec::new()),
         };
         // The task family first, then — **only for a pane** — the orchestration one. The
         // [`RegistrySink`] is built *inside* the arm, so a run's connection never constructs one
@@ -454,6 +474,7 @@ impl ToolAccess for ProjectTools {
                     app: self.app.clone(),
                     project: self.project,
                     session: self.session?,
+                    caller: self.caller_now(),
                 };
                 tools::dispatch_orchestration(name, arguments, &agents)
             })
@@ -474,6 +495,13 @@ impl ToolAccess for ProjectTools {
         let notify = self
             .session
             .map_or(RunNotify::Primary, |session| RunNotify::Session { session });
+        // The report this run just left becomes its turn's report (M132): the next comment it
+        // makes on the same task this turn supersedes it.
+        if let TaskAuthor::Agent { agent, .. } = &self.author {
+            for (task, comment) in sink.new_reports.into_inner() {
+                remember_turn_report(self.project, agent, task, comment);
+            }
+        }
         let mutations = sink.mutations.into_inner();
         // A run that just set its task to review has, by its own account, finished: verify its
         // branch now. (M83) Since M114 this is also the gate the reviewer waits behind — a red
@@ -498,6 +526,16 @@ impl ToolAccess for ProjectTools {
 }
 
 impl ProjectTools {
+    /// Who is calling, **now**: a tab cide opened becomes the user's console the moment they
+    /// submit a line in it. See [`TYPED`]. (M132)
+    fn caller_now(&self) -> tools::CallerKind {
+        if self.caller == tools::CallerKind::CideTab && was_typed_into(self.session) {
+            tools::CallerKind::Console
+        } else {
+            self.caller
+        }
+    }
+
     /// This project's tracker, opening it if this is the first ask.
     ///
     /// The `Arc` is cloned out of the `DashMap` before anything touches the disk — see the module
@@ -543,6 +581,15 @@ struct StoreSink {
     mutations: Mutex<Vec<TaskMutation>>,
     /// See [`ProjectTools::cwd`]; resolved to a value by the time a sink exists. (M39)
     cwd: PathBuf,
+    /// See [`ProjectTools::caller`]. (M132)
+    caller: tools::CallerKind,
+    /// Which tasks a run is working on right now, and its role's label — read from the registry
+    /// when the call arrives, as plain data so this type stays `AppHandle`-free. (M132)
+    live: Vec<(TaskId, String)>,
+    /// This run's report comment per task in its current turn (M132), from [`TURN_REPORTS`].
+    reports: Vec<(TaskId, cide_ipc::CommentId)>,
+    /// Reports this call left, written back to [`TURN_REPORTS`] by [`ProjectTools::call`].
+    new_reports: Mutex<Vec<(TaskId, cide_ipc::CommentId)>>,
 }
 
 impl TaskSink for StoreSink {
@@ -590,6 +637,8 @@ impl TaskSink for StoreSink {
                 Some(links.to_vec())
             },
             attachments: None,
+            acceptance: None,
+            touches: None,
         };
         let task = self
             .store
@@ -684,6 +733,28 @@ impl TaskSink for StoreSink {
         matches!(self.author, TaskAuthor::Agent { .. })
     }
 
+    fn caller(&self) -> tools::CallerKind {
+        self.caller
+    }
+
+    fn live_run_on(&self, task: &TaskId) -> Option<String> {
+        self.live
+            .iter()
+            .find(|(id, _)| id == task)
+            .map(|(_, label)| label.clone())
+    }
+
+    fn turn_report(&self, task: &TaskId) -> Option<cide_ipc::CommentId> {
+        self.reports
+            .iter()
+            .find(|(id, _)| id == task)
+            .map(|(_, comment)| comment.clone())
+    }
+
+    fn note_report(&self, task: &TaskId, comment: cide_ipc::CommentId) {
+        self.new_reports.lock().push((task.clone(), comment));
+    }
+
     fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -756,6 +827,8 @@ struct RegistrySink {
     /// `Scope`, never out of a payload: a model naming a session id would be the
     /// identity-in-the-payload shape the header forbids.
     session: SessionId,
+    /// See [`ProjectTools::caller`]. (M132)
+    caller: tools::CallerKind,
 }
 
 impl RegistrySink {
@@ -973,6 +1046,19 @@ impl AgentSink for RegistrySink {
 
     fn milestones_view(&self) -> Result<cide_ipc::MilestonesView, String> {
         crate::milestones::view(&self.app, self.project).ok_or_else(|| gone().to_string())
+    }
+
+    fn milestones_detach_inbox(&self) -> Result<Vec<(TaskId, TaskId)>, String> {
+        // The user's to ask for, from their console: a tab cide opened must not rearrange the
+        // board's milestones on its own initiative. (M132)
+        if self.caller != tools::CallerKind::Console {
+            return Err(
+                "detaching the inbox from milestones is done from the user's console, when they \
+                 ask for it"
+                    .into(),
+            );
+        }
+        crate::milestones::detach_inbox(&self.app, self.project, TaskAuthor::Orchestrator)
     }
 
     fn milestones_define(
@@ -1376,63 +1462,20 @@ impl AgentSink for RegistrySink {
             .ok_or_else(|| gone().to_string())?;
         let root = crate::tasks_state::project_root(&workspace, self.project)
             .map_err(|error| error.to_string())?;
-        // Straight to `cide-git`, because there is no command in front of it to reuse: the merge
-        // has no wire surface yet. It is real work on a real repository and it happens on this
-        // connection's thread, which is the one thread in the process that is allowed to wait for
-        // it — the caller asked, and the accept loop is untouched. The name is the same
-        // composite a dispatch's checkout gets, so the branch merged is by construction the one
-        // that run committed to.
-        //
-        // The milestone checks first (M83): a branch that moves a gate, leaves work uncommitted,
-        // or fails the project's verify command is refused here with the reason — this is the
-        // model's road, and the panel's Integrate (the user's) does not pass through it.
-        let verified =
-            crate::milestones::before_integrate(&self.app, self.project, &root, agent, task)?;
-        let outcome =
-            cide_git::worktree::integrate(&root, &cide_agents::checkout_name(agent, task))
-                .map(|outcome| match outcome {
-                    cide_git::worktree::Integration::UpToDate => Integrated::UpToDate { verified },
-                    cide_git::worktree::Integration::Merged { commit, files } => {
-                        Integrated::Merged {
-                            commit,
-                            files,
-                            verified,
-                        }
-                    }
-                    cide_git::worktree::Integration::Conflicts { paths } => {
-                        Integrated::Conflicts { paths }
-                    }
-                })
-                .map_err(|error| error.to_string())?;
-        // Something landed, so the active milestone's gate is asked again — in the background,
-        // because the answer is for whoever plans next, not for this call. Unless the plan's
-        // `gateRuns` says otherwise: a gate that runs for a quarter of an hour, rerun after each
-        // of a batch of merges minutes apart, never finishes about the commit that matters. Under
-        // `idle` the spinner's wake runs it once the batch is in; under `manual` the user does.
-        if matches!(outcome, Integrated::Merged { .. })
-            && cide_agents::config::load_milestones(&root).gate_after_merge()
-        {
-            crate::milestones::run_gate(&self.app, self.project);
-        }
-        // And the task's checkout, whose work is now in, is removed — the same rule and the same
-        // guards as the panel's Integrate (`agents::retire_worktree`): not while a run stands in
-        // it, not while it holds anything the branch does not. (M89) The run that did the work
-        // is usually idle at this point, so the removal normally lands when it ends instead.
-        if task.is_some()
-            && matches!(
-                outcome,
-                Integrated::Merged { .. } | Integrated::UpToDate { .. }
-            )
-            && let Some(registry) = self.app.try_state::<Arc<crate::agents::AgentRegistry>>()
-        {
-            crate::agents::retire_worktree(
-                &self.app,
-                &registry,
-                self.project,
-                cide_agents::checkout_name(agent, task),
-            );
-        }
-        Ok(outcome)
+        integrate_checked(&self.app, self.project, &root, agent, task)
+    }
+
+    fn integrate_batch(
+        &self,
+        pairs: &[(AgentId, TaskId)],
+    ) -> Result<cide_agents::tools::BatchIntegrated, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        let root = crate::tasks_state::project_root(&workspace, self.project)
+            .map_err(|error| error.to_string())?;
+        integrate_batch_checked(&self.app, self.project, &root, pairs)
     }
 
     fn now_unix_ms(&self) -> u64 {
@@ -1544,6 +1587,19 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 session: Some(session),
                 cwd: None,
                 tracker: tracker(project),
+                caller: tools::CallerKind::Console,
+            }),
+            Scope::CideTab { project, session } => Box::new(ProjectTools {
+                app: app.clone(),
+                project,
+                // Signed as the orchestrator, like any pane cide opened before M132; what
+                // differs is `caller`, which the user's own gestures are refused on.
+                author: TaskAuthor::Orchestrator,
+                orchestrator: true,
+                session: Some(session),
+                cwd: None,
+                tracker: tracker(project),
+                caller: tools::CallerKind::CideTab,
             }),
             Scope::Worker { project, session } => Box::new(ProjectTools {
                 app: app.clone(),
@@ -1559,6 +1615,7 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 session: Some(session),
                 cwd: None,
                 tracker: tracker(project),
+                caller: tools::CallerKind::Worker,
             }),
             Scope::Run {
                 project,
@@ -1578,6 +1635,7 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 session: None,
                 cwd: Some(cwd),
                 tracker: board && tracker(project),
+                caller: tools::CallerKind::Run,
             }),
             Scope::Review {
                 run,
@@ -1878,6 +1936,12 @@ fn scope_of(ws: &Workspace, hello: &Hello) -> Scope {
         return Scope::Worker { project, session };
     }
 
+    // A tab cide opened before the wider question, which would otherwise answer it as a pane the
+    // user is typing in. (M132)
+    if let Some(project) = project_of_cide_tab(ws, session) {
+        return Scope::CideTab { project, session };
+    }
+
     match project_of_claude_pane(ws, session) {
         Some(project) => Scope::Pane {
             project,
@@ -1904,6 +1968,25 @@ fn project_of_worker_pane(ws: &Workspace, session: SessionId) -> Option<ProjectI
             .chain(project.detached.values())
             .any(|pane| {
                 pane.origin == Some(cide_ipc::PaneOrigin::Worker) && pane.session == Some(session)
+            })
+            .then_some(*id)
+    })
+}
+
+/// The project one of whose planner or reviewer panes — a tab cide opened by itself — holds this
+/// session, if any. (M132) See [`Scope::CideTab`].
+fn project_of_cide_tab(ws: &Workspace, session: SessionId) -> Option<ProjectId> {
+    ws.projects.iter().find_map(|(id, project)| {
+        project
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.tree.panes.values())
+            .chain(project.detached.values())
+            .any(|pane| {
+                matches!(
+                    pane.origin,
+                    Some(cide_ipc::PaneOrigin::Planner | cide_ipc::PaneOrigin::Reviewer)
+                ) && pane.session == Some(session)
             })
             .then_some(*id)
     })
@@ -2177,6 +2260,72 @@ static NUDGES: NudgeCoalescer = NudgeCoalescer::new();
 /// them have nothing in common to collide over.
 static REVIEWERS: Mutex<Vec<Reviewer>> = Mutex::new(Vec::new());
 
+/// Each run's report comment per task in its **current turn**, keyed by project, role and task —
+/// a role has one run per task at a time. (M132)
+///
+/// A run reports once per turn: its second comment on the same task supersedes the first
+/// (`TaskComment::superseded`), and this is where "the first" is remembered. Cleared by
+/// [`new_turn`] whenever the pair is handed new instructions — a dispatch, a follow-up, a verify
+/// hand-back — so a new turn's report never hides the last turn's. In memory: after a restart a
+/// run's next comment is simply a new report.
+static TURN_REPORTS: Mutex<Vec<(ProjectId, AgentId, TaskId, cide_ipc::CommentId)>> =
+    Mutex::new(Vec::new());
+
+/// This role's current-turn reports in `project`, as `(task, comment)`. (M132)
+fn turn_reports_of(project: ProjectId, agent: &AgentId) -> Vec<(TaskId, cide_ipc::CommentId)> {
+    TURN_REPORTS
+        .lock()
+        .iter()
+        .filter(|(p, a, _, _)| *p == project && a == agent)
+        .map(|(_, _, task, comment)| (task.clone(), comment.clone()))
+        .collect()
+}
+
+/// Record `comment` as the pair's report for its current turn. (M132)
+fn remember_turn_report(
+    project: ProjectId,
+    agent: &AgentId,
+    task: TaskId,
+    comment: cide_ipc::CommentId,
+) {
+    let mut reports = TURN_REPORTS.lock();
+    reports.retain(|(p, a, t, _)| !(*p == project && a == agent && *t == task));
+    reports.push((project, agent.clone(), task, comment));
+}
+
+/// The pair `(agent, task)` was handed new instructions: its next comment starts a new report.
+/// (M132) Called from `cmd::agents::dispatch_or_duplicate`, the one road every dispatch, follow-up
+/// and hand-back takes.
+pub(crate) fn new_turn(project: ProjectId, agent: &AgentId, task: &TaskId) {
+    TURN_REPORTS
+        .lock()
+        .retain(|(p, a, t, _)| !(*p == project && a == agent && t == task));
+}
+
+/// The tasks a run of `project` is working on right now, with the role's label: queued,
+/// starting, running, waiting on a permission or paused — not one that handed its turn back.
+/// (M132) The fact `cide_task_update`'s body guard reads.
+fn live_runs_by_task(app: &AppHandle, project: ProjectId) -> Vec<(TaskId, String)> {
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return Vec::new();
+    };
+    registry
+        .runs_for(project)
+        .into_iter()
+        .filter(|run| {
+            matches!(
+                run.state,
+                RunState::Queued
+                    | RunState::Starting
+                    | RunState::Running
+                    | RunState::AwaitingPermission
+                    | RunState::Paused { .. }
+            )
+        })
+        .filter_map(|run| run.task.map(|task| (task, run.agent_label)))
+        .collect()
+}
+
 /// One open review tab: the task it owns and the claude in it.
 struct Reviewer {
     project: ProjectId,
@@ -2235,6 +2384,518 @@ pub(crate) fn reviewer_of(app: &AppHandle, project: ProjectId, task: &TaskId) ->
     reviewer_for(app, project, task)
 }
 
+/// `cide_agent_integrate`'s single-branch body, reachable without a sink: the model's road (the
+/// milestone checks, then the merge, then the gate and the checkout's retirement), which cide's
+/// own auto-merge of an `acceptance: user` task walks too (M132). One function so the two cannot
+/// drift — a task the user accepts must land by exactly the rules a reviewer's merge does.
+pub(crate) fn integrate_checked(
+    app: &AppHandle,
+    project: ProjectId,
+    root: &Path,
+    agent: &AgentId,
+    task: Option<&TaskId>,
+) -> Result<Integrated, String> {
+    // Straight to `cide-git`, because there is no command in front of it to reuse: the merge
+    // has no wire surface yet. It is real work on a real repository and it happens on this
+    // connection's thread, which is the one thread in the process that is allowed to wait for
+    // it — the caller asked, and the accept loop is untouched. The name is the same
+    // composite a dispatch's checkout gets, so the branch merged is by construction the one
+    // that run committed to.
+    //
+    // The milestone checks first (M83): a branch that moves a gate, leaves work uncommitted,
+    // or fails the project's verify command is refused here with the reason — this is the
+    // model's road, and the panel's Integrate (the user's) does not pass through it.
+    let verified = crate::milestones::before_integrate(app, project, root, agent, task)?;
+    let outcome = cide_git::worktree::integrate(root, &cide_agents::checkout_name(agent, task))
+        .map(|outcome| match outcome {
+            cide_git::worktree::Integration::UpToDate => Integrated::UpToDate { verified },
+            cide_git::worktree::Integration::Merged { commit, files } => Integrated::Merged {
+                commit,
+                files,
+                verified,
+            },
+            cide_git::worktree::Integration::Conflicts { paths } => Integrated::Conflicts { paths },
+        })
+        .map_err(|error| error.to_string())?;
+    // Something landed, so the active milestone's gate is asked again — in the background,
+    // because the answer is for whoever plans next, not for this call. Unless the plan's
+    // `gateRuns` says otherwise: a gate that runs for a quarter of an hour, rerun after each
+    // of a batch of merges minutes apart, never finishes about the commit that matters. Under
+    // `idle` the spinner's wake runs it once the batch is in; under `manual` the user does.
+    if matches!(outcome, Integrated::Merged { .. })
+        && cide_agents::config::load_milestones(root).gate_after_merge()
+    {
+        crate::milestones::run_gate(app, project);
+    }
+    // And the task's checkout, whose work is now in, is removed — the same rule and the same
+    // guards as the panel's Integrate (`agents::retire_worktree`): not while a run stands in
+    // it, not while it holds anything the branch does not. (M89) The run that did the work
+    // is usually idle at this point, so the removal normally lands when it ends instead.
+    if task.is_some()
+        && matches!(
+            outcome,
+            Integrated::Merged { .. } | Integrated::UpToDate { .. }
+        )
+        && let Some(registry) = app.try_state::<Arc<crate::agents::AgentRegistry>>()
+    {
+        crate::agents::retire_worktree(
+            app,
+            &registry,
+            project,
+            cide_agents::checkout_name(agent, task),
+        );
+    }
+    Ok(outcome)
+}
+
+/// Finished turns waiting for a batched review, and the review tabs already opened. (M132)
+///
+/// # Why a batch
+///
+/// Until M132 every finished turn opened its own reviewer: a fresh Opus session that re-read the
+/// task, re-diffed the branch, often re-ran the project's checks, and merged one branch — 153 of
+/// them on terrastrike and 443 on selfcraft, each costing more than the change it reviewed, and
+/// each merge followed by a verify of its own. One reviewer for three or four finished tasks
+/// reads the same diffs with one warm context and merges them in one call with one verify on the
+/// combined result (`cide_agent_integrate` with `tasks`).
+///
+/// A batch opens when `agents.reviewBatch` turns wait, or the oldest has waited
+/// `agents.reviewAfterSecs`, or nothing in the project is working any more (so the last task of
+/// a burst is not held for ten minutes for company that is not coming). Never while the previous
+/// batch's reviewer is still mid-turn: two reviewers merging into one branch at once is the race
+/// a batch exists to avoid. In memory only — after a restart the tasks still sit in review, and
+/// the planner and the Waiting-for-you list show them.
+static BATCHES: Mutex<Vec<PendingReview>> = Mutex::new(Vec::new());
+static BATCH_TABS: Mutex<Vec<(ProjectId, SessionId)>> = Mutex::new(Vec::new());
+
+struct PendingReview {
+    turn: Turn,
+    since: std::time::Instant,
+}
+
+/// Add a burst's turns to the project's pending batch. A task already waiting keeps its place
+/// and its age; its newest turn replaces the old one, which says the more recent thing.
+fn queue_for_batch(project: ProjectId, turns: Vec<Turn>) {
+    let mut pending = BATCHES.lock();
+    for turn in turns {
+        match pending.iter_mut().find(|p| {
+            p.turn.project == project && p.turn.task.is_some() && p.turn.task == turn.task
+        }) {
+            Some(waiting) => waiting.turn = turn,
+            None => pending.push(PendingReview {
+                turn,
+                since: std::time::Instant::now(),
+            }),
+        }
+    }
+}
+
+/// Whether a batch is due, pure: see [`BATCHES`] for the three conditions.
+fn batch_due(
+    waiting: usize,
+    oldest: std::time::Duration,
+    batch: u8,
+    after: std::time::Duration,
+    working: bool,
+) -> bool {
+    waiting > 0 && (waiting >= usize::from(batch.max(1)) || oldest >= after || !working)
+}
+
+/// Open the project's batch review if it is due. Called when a turn joins the batch and from the
+/// spinner's tick, which is what opens a batch that is due by age alone.
+pub(crate) fn flush_due_batch(app: &AppHandle, project: ProjectId) {
+    let (waiting, oldest) = {
+        let pending = BATCHES.lock();
+        let mine: Vec<&PendingReview> = pending
+            .iter()
+            .filter(|p| p.turn.project == project)
+            .collect();
+        let oldest = mine
+            .iter()
+            .map(|p| p.since.elapsed())
+            .max()
+            .unwrap_or_default();
+        (mine.len(), oldest)
+    };
+    if waiting == 0 {
+        return;
+    }
+    let Some(workspace) = app.try_state::<WorkspaceState>() else {
+        return;
+    };
+    let Ok(root) = crate::tasks_state::project_root(&workspace, project) else {
+        return;
+    };
+    let config = cide_agents::config::load(&root).agents;
+    // The previous batch's reviewer, still mid-turn, holds the next one back.
+    let busy = {
+        let sessions = app.try_state::<SessionRegistry>();
+        let hooks = app.try_state::<crate::hooks::HookServer>();
+        let mut tabs = BATCH_TABS.lock();
+        tabs.retain(|(_, session)| {
+            sessions
+                .as_ref()
+                .and_then(|s| s.get(*session))
+                .is_some_and(|pty| !pty.has_exited())
+        });
+        tabs.iter().any(|(p, session)| {
+            *p == project
+                && hooks
+                    .as_ref()
+                    .is_some_and(|hooks| !may_be_typed_into(hooks.state(*session)))
+        })
+    };
+    if busy {
+        return;
+    }
+    let working = app
+        .try_state::<Arc<AgentRegistry>>()
+        .is_some_and(|registry| {
+            registry.runs_for(project).iter().any(|run| {
+                matches!(
+                    run.state,
+                    cide_ipc::RunState::Queued
+                        | cide_ipc::RunState::Starting
+                        | cide_ipc::RunState::Running
+                        | cide_ipc::RunState::AwaitingPermission
+                )
+            })
+        });
+    // A branch still being verified is work still coming (M132). Without this, a run that set
+    // review went Idle, "nothing is working" held, and the batch opened a second before that
+    // branch's verify answered — terrastrike's first two batches were one task each, t-1318 then
+    // t-1310 ninety seconds apart, for exactly this reason.
+    let working = working
+        || GATES
+            .lock()
+            .iter()
+            .any(|gate| gate.project == project && gate.verdict.is_none());
+    if !batch_due(
+        waiting,
+        oldest,
+        config.review_batch,
+        config.review_after(),
+        working,
+    ) {
+        return;
+    }
+    let turns: Vec<Turn> = {
+        let mut pending = BATCHES.lock();
+        let (mine, rest): (Vec<PendingReview>, Vec<PendingReview>) =
+            pending.drain(..).partition(|p| p.turn.project == project);
+        *pending = rest;
+        mine.into_iter().map(|p| p.turn).collect()
+    };
+    // What is still the reviewer's: a task that went done, was deleted, is waiting for the user
+    // or was handed back while it waited is not reviewed.
+    let board: Vec<cide_ipc::TaskRow> = app
+        .try_state::<Arc<TasksStores>>()
+        .and_then(|stores| stores.get(project))
+        .map(|store| store.list())
+        .unwrap_or_default();
+    let turns: Vec<Turn> = turns
+        .into_iter()
+        .filter(|turn| match &turn.task {
+            None => true,
+            Some(task) => board.iter().any(|row| {
+                &row.id == task
+                    && row.status == cide_ipc::TaskStatus::Review
+                    && row.question.is_none()
+                    && row.acceptance.is_none()
+            }),
+        })
+        .collect();
+    if turns.is_empty() {
+        return;
+    }
+    let listing = batch_listing(&turns, &board);
+    let prompt = one_line(&cide_agents::config::fill_review_prompt(
+        config.batch_review_prompt_template(),
+        &[("tasks", &listing)],
+    ));
+    let title = format!("Review · {} task(s)", turns.len());
+    match crate::claude_tab::open_with_prompt(
+        app,
+        project,
+        &title,
+        None,
+        &prompt,
+        crate::claude_tab::TabMode {
+            unattended: config.unattended(),
+            behind: true,
+        },
+        // The project root: a batch spans several branches, and the merge it makes lands here.
+        None,
+        Some(cide_ipc::PaneOrigin::Reviewer),
+    ) {
+        Ok((session, tab)) => {
+            tracing::info!(%project, %session, %tab, tasks = turns.len(), "a batch review opened");
+            BATCH_TABS.lock().push((project, session));
+            for task in turns.iter().filter_map(|turn| turn.task.clone()) {
+                remember_reviewer(app, project, task, session);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%project, %error, "no batch review tab; the tasks stay in review");
+        }
+    }
+}
+
+/// `{tasks}` for the batch prompt: one clause per task — id, role, branch, what the gate said,
+/// title.
+fn batch_listing(turns: &[Turn], board: &[cide_ipc::TaskRow]) -> String {
+    turns
+        .iter()
+        .map(|turn| match &turn.task {
+            Some(task) => {
+                let branch = format!(
+                    "cide/{}",
+                    cide_agents::checkout_name(&turn.agent, Some(task))
+                );
+                let title = board
+                    .iter()
+                    .find(|row| &row.id == task)
+                    .map(|row| clip(&one_line(&row.title)))
+                    .unwrap_or_default();
+                let gate = match turn.gate {
+                    Some(GateNote::Passed) | None => String::new(),
+                    Some(GateNote::Failed { times, .. }) => {
+                        format!(", verify red {times} times — see its newest comment")
+                    }
+                };
+                format!(
+                    "{task} (role `{}`, branch {branch}{gate}): {title}",
+                    turn.agent
+                )
+            }
+            None => format!(
+                "a run of `{}` with no task (it worked in the project root)",
+                turn.agent
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The task, when the **user** accepts it and it sits in review — the one shape cide merges by
+/// itself once its branch is green. (M132)
+pub(crate) fn awaiting_user_merge(app: &AppHandle, project: ProjectId, task: &TaskId) -> bool {
+    app.try_state::<Arc<TasksStores>>()
+        .and_then(|stores| stores.get(project))
+        .and_then(|store| store.get(task))
+        .is_some_and(|task| {
+            task.acceptance == Some(cide_ipc::Acceptance::User)
+                && task.status == cide_ipc::TaskStatus::Review
+                && task.question.is_none()
+        })
+}
+
+/// Merge a green `acceptance: user` task without a reviewer, and say what became of it. (M132)
+///
+/// The user asked for visual work to be **merged, then accepted**: they look at it in the running
+/// game, which needs it on their branch, and a reviewer model has nothing to judge a sprite's
+/// look by. So a green branch goes in by the reviewer's own road ([`integrate_checked`] — the
+/// same checks, the same gate and checkout rules) and the task stays in review with one comment,
+/// which is what the Waiting-for-you list shows. A conflict goes back to the run that can resolve
+/// it, with the paths; any other refusal is written on the task and falls through to a reviewer,
+/// who can at least send it back.
+pub(crate) fn absorb_for_user(
+    app: &AppHandle,
+    project: ProjectId,
+    root: &Path,
+    agent: &AgentId,
+    task: &TaskId,
+) -> GateVerdict {
+    let note = |text: String| {
+        if let Some(stores) = app.try_state::<Arc<TasksStores>>()
+            && let Some(store) = stores.get(project)
+        {
+            match store.edit(task, TaskEdit::Comment { text }, TaskAuthor::Orchestrator) {
+                Ok(_) => crate::tasks_state::broadcast(app, project, &store),
+                Err(error) => tracing::debug!(%task, %error, "no merge note; the task is gone"),
+            }
+        }
+    };
+    match integrate_checked(app, project, root, agent, Some(task)) {
+        Ok(Integrated::Merged { commit, .. }) => {
+            let short: String = commit.chars().take(10).collect();
+            note(format!(
+                "Merged at {short}. Waiting for the user's acceptance — Accept or Send back in \
+                 Waiting for you."
+            ));
+            GateVerdict::Absorbed
+        }
+        Ok(Integrated::UpToDate { .. }) => {
+            note("Nothing new to merge. Waiting for the user's acceptance.".to_string());
+            GateVerdict::Absorbed
+        }
+        Ok(Integrated::Conflicts { paths }) => {
+            let branch = format!("cide/{}", cide_agents::checkout_name(agent, Some(task)));
+            note(format!(
+                "Not merged: {branch} conflicts with the base in {}. Handed back to the run.",
+                paths.join(", ")
+            ));
+            hand_back_to_run(
+                app,
+                project,
+                agent,
+                task,
+                &format!(
+                    "Your branch {branch} passed verify but conflicts with the project's branch in \
+                     {}. Merge or rebase the base into your branch, resolve those paths, commit, \
+                     and set {task} to review again.",
+                    paths.join(", ")
+                ),
+            );
+            GateVerdict::HandedBack
+        }
+        Err(why) => {
+            note(format!("Not merged automatically: {why}"));
+            GateVerdict::Passed
+        }
+    }
+}
+
+/// A batch review's merge: several tasks' branches composed in memory, verified **once** on the
+/// combined head in a scratch checkout, then moved onto the project's branch. (M132)
+///
+/// Red combined verify: nothing moved, and the tasks are merged one by one through
+/// [`integrate_checked`] — each branch's own verify was green at review (and is cached by head),
+/// so the good ones land and the one that breaks the combination is the one refused. The
+/// reviewer's answer names which road was taken.
+pub(crate) fn integrate_batch_checked(
+    app: &AppHandle,
+    project: ProjectId,
+    root: &Path,
+    pairs: &[(AgentId, TaskId)],
+) -> Result<cide_agents::tools::BatchIntegrated, String> {
+    use cide_agents::tools::BatchIntegrated;
+    let mut out = BatchIntegrated::default();
+    let mut admitted: Vec<(AgentId, TaskId, String)> = Vec::new();
+    for (agent, task) in pairs {
+        let name = cide_agents::checkout_name(agent, Some(task));
+        match cide_git::worktree::unmerged(root, &name) {
+            Ok(None) => out.up_to_date.push(task.clone()),
+            Err(error) => out.refused.push((task.clone(), error.to_string())),
+            Ok(Some(_)) => match crate::milestones::guards_only(root, &name) {
+                Ok(()) => admitted.push((agent.clone(), task.clone(), name)),
+                Err(why) => out.refused.push((task.clone(), why)),
+            },
+        }
+    }
+    if admitted.is_empty() {
+        return Ok(out);
+    }
+    let names: Vec<&str> = admitted.iter().map(|(_, _, name)| name.as_str()).collect();
+    let composed =
+        cide_git::worktree::compose_merges(root, &names).map_err(|error| error.to_string())?;
+    let task_of = |name: &str| {
+        admitted
+            .iter()
+            .find(|(_, _, n)| n == name)
+            .map(|(_, task, _)| task.clone())
+    };
+    for (name, paths) in &composed.conflicts {
+        if let Some(task) = task_of(name) {
+            out.conflicts.push((task, paths.clone()));
+        }
+    }
+    let Some(head) = composed.head.clone() else {
+        out.up_to_date
+            .extend(composed.up_to_date.iter().filter_map(|name| task_of(name)));
+        return Ok(out);
+    };
+    let scratch = "batch-verify";
+    let verdict = cide_git::worktree::scratch_at(root, scratch, &head)
+        .map_err(|error| error.to_string())
+        .and_then(|path| {
+            crate::milestones::verify_scratch(app, project, root, &path, &format!("cide/{scratch}"))
+        });
+    if let Err(error) = cide_git::worktree::remove(root, scratch) {
+        tracing::debug!(%error, "the batch's scratch checkout was not removed");
+    }
+    let moved = verdict.and_then(|line| {
+        cide_git::worktree::advance_to(root, &composed.base, &head)
+            .map(|_| line)
+            .map_err(|error| error.to_string())
+    });
+    match moved {
+        Ok(line) => {
+            out.verified = line;
+            for name in &composed.merged {
+                if let Some(task) = task_of(name) {
+                    out.merged.push((task, head.clone()));
+                }
+            }
+            out.up_to_date
+                .extend(composed.up_to_date.iter().filter_map(|name| task_of(name)));
+            if cide_agents::config::load_milestones(root).gate_after_merge() {
+                crate::milestones::run_gate(app, project);
+            }
+            if let Some(registry) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+                for (_, _, name) in admitted
+                    .iter()
+                    .filter(|(_, _, name)| composed.merged.contains(name))
+                {
+                    crate::agents::retire_worktree(app, &registry, project, name.clone());
+                }
+            }
+        }
+        Err(why) => {
+            // One by one, in order, skipping what already conflicted in the compose.
+            out.fell_back = Some(why.lines().next().unwrap_or_default().to_string());
+            for (agent, task, name) in &admitted {
+                if composed.conflicts.iter().any(|(n, _)| n == name) {
+                    continue;
+                }
+                match integrate_checked(app, project, root, agent, Some(task)) {
+                    Ok(Integrated::Merged { commit, .. }) => {
+                        out.merged.push((task.clone(), commit));
+                    }
+                    Ok(Integrated::UpToDate { .. }) => out.up_to_date.push(task.clone()),
+                    Ok(Integrated::Conflicts { paths }) => {
+                        out.conflicts.push((task.clone(), paths));
+                    }
+                    Err(why) => out.refused.push((task.clone(), why)),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Sessions a person has submitted a line into, from a pane or from the phone. (M132)
+///
+/// A tab cide opened by itself (a planner, a reviewer) is `CallerKind::CideTab`: nobody is at
+/// its keyboard, so it may not do what only the user decides — take a task out of the inbox,
+/// accept a user-accepted task. But people do answer those tabs. On terrastrike the user typed
+/// "дал разрешение перенести эти задачи из инбокса" into the planner's tab, the planner tried,
+/// was refused as unattended, wrote itself a memory that "only the UI can move an inbox task",
+/// and the next console session — the user's own, which may — believed it and asked the user
+/// to drag six cards by hand. So a submitted line (an Enter, `\r`, from `session_write` or
+/// the phone) marks the session attended for as long as this process lives; keystrokes alone
+/// do not, because the TUI's focus and mouse reports arrive through the same road. cide's
+/// own typed lines (`agents::type_submitted_line`) write to the PTY directly and never pass here.
+static TYPED: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+/// Record that a person submitted a line into `session`. See [`TYPED`].
+pub(crate) fn note_typed(session: SessionId) {
+    let mut typed = TYPED.lock();
+    if typed.contains(&session) {
+        return;
+    }
+    // Bounded: every console a person types into lands here, and a long-lived process would
+    // otherwise keep them all. The oldest is the least likely to be a live cide tab.
+    if typed.len() >= 512 {
+        typed.remove(0);
+    }
+    typed.push(session);
+}
+
+fn was_typed_into(session: Option<SessionId>) -> bool {
+    session.is_some_and(|session| TYPED.lock().contains(&session))
+}
+
 /// Tasks whose branch is being verified before anybody reviews it, and the turns waiting on that
 /// answer. (M114)
 ///
@@ -2282,6 +2943,11 @@ pub(crate) enum GateVerdict {
     /// nothing committed since the last red one (M118), which a hand-back would not change. The
     /// reviewer's now.
     Escalated { times: u8, stuck: bool },
+    /// Green on a task the **user** accepts (`acceptance: user`, M132): cide merged it itself and
+    /// it waits in the user's Waiting-for-you list. No reviewer opens — a reviewer may not set
+    /// the task done anyway, and an Opus session that reads a diff to say "looks fine, over to
+    /// the user" is the ceremony this milestone removes.
+    Absorbed,
 }
 
 /// A verify of `task`'s branch has started; hold its reviewer until [`gate_closed`].
@@ -2342,7 +3008,7 @@ fn close_gate(
 fn with_verdict(mut turn: Turn, verdict: GateVerdict) -> Option<Turn> {
     turn.gate = match verdict {
         GateVerdict::Passed => Some(GateNote::Passed),
-        GateVerdict::HandedBack => return None,
+        GateVerdict::HandedBack | GateVerdict::Absorbed => return None,
         GateVerdict::Escalated { times, stuck } => Some(GateNote::Failed { times, stuck }),
     };
     Some(turn)
@@ -2544,6 +3210,28 @@ pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
     let Some(turn) = gate_turn(&mut GATES.lock(), turn) else {
         return;
     };
+    // A task the user accepts, in a project with no verify: nothing gated it, so it is merged
+    // here instead of by `settle_gate` (M132). Off this thread — a merge checks out a tree.
+    if turn.gate.is_none()
+        && let Some(task) = turn.task.clone()
+        && awaiting_user_merge(app, project, &task)
+        && let Some(workspace) = app.try_state::<WorkspaceState>()
+        && let Ok(root) = crate::tasks_state::project_root(&workspace, project)
+    {
+        let app = app.clone();
+        let agent = turn.agent.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cide-absorb".into())
+            .spawn(move || {
+                if absorb_for_user(&app, project, &root, &agent, &task) == GateVerdict::Passed {
+                    announce(&app, turn);
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "no thread to merge a user-accepted task");
+        }
+        return;
+    }
     announce(app, turn);
 }
 
@@ -2845,6 +3533,13 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
         {
             return note_to_reviewer(app, project, session, turns);
         }
+        // Batched review (M132, the default): the turn waits with the others and one reviewer
+        // takes several — see [`BATCHES`].
+        if config.review == cide_agents::config::ReviewMode::Batch {
+            queue_for_batch(project, turns);
+            flush_due_batch(app, project);
+            return;
+        }
         let prompt = review_prompt(
             config.review_prompt_template(),
             &turns,
@@ -2872,6 +3567,8 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
             // had no checkout of its own (M40), and the helper falls back to the root for a
             // worktree that has since gone.
             review_checkout(&root, &turns),
+            // Marked, so the tracker knows nobody is typing in it. (M132)
+            Some(cide_ipc::PaneOrigin::Reviewer),
         ) {
             Ok((session, tab)) => {
                 tracing::info!(%project, %session, %tab, turns = turns.len(), "a finished run opened its own reviewer");
@@ -3583,6 +4280,39 @@ impl NudgeCoalescer {
 
 #[cfg(test)]
 mod tests {
+
+    /// A submitted line marks a session attended; nothing else does, and one mark is enough.
+    /// (M132)
+    #[test]
+    fn a_line_typed_into_a_session_marks_it_attended() {
+        let session = SessionId::new();
+        assert!(!was_typed_into(Some(session)));
+        note_typed(session);
+        note_typed(session);
+        assert!(was_typed_into(Some(session)));
+        assert!(!was_typed_into(None));
+        assert_eq!(TYPED.lock().iter().filter(|s| **s == session).count(), 1);
+    }
+
+    /// A batch opens at its size, at its age, or when nothing is working any more — and never
+    /// empty. (M132)
+    #[test]
+    fn a_batch_is_due_at_its_size_its_age_or_when_the_project_is_quiet() {
+        use std::time::Duration;
+        let ten = Duration::from_secs(600);
+        assert!(!batch_due(0, ten, 3, ten, false), "nothing waiting");
+        assert!(!batch_due(2, Duration::from_secs(5), 3, ten, true));
+        assert!(batch_due(3, Duration::from_secs(5), 3, ten, true), "full");
+        assert!(batch_due(1, ten, 3, ten, true), "old enough");
+        assert!(
+            batch_due(1, Duration::from_secs(5), 3, ten, false),
+            "nothing else coming"
+        );
+        assert!(
+            batch_due(1, Duration::from_secs(5), 0, ten, true),
+            "a batch of 0 is 1"
+        );
+    }
     use super::*;
     use cide_agents::config::DEFAULT_REVIEW_PROMPT;
     use cide_core::workspace;
@@ -4472,6 +5202,10 @@ mod tests {
             changed: AtomicBool::new(false),
             mutations: Mutex::new(Vec::new()),
             cwd: root.clone(),
+            caller: tools::CallerKind::Console,
+            live: Vec::new(),
+            reports: Vec::new(),
+            new_reports: Mutex::new(Vec::new()),
         };
 
         assert!(sink.list().expect("list").is_empty());
@@ -4569,6 +5303,10 @@ mod tests {
             changed: AtomicBool::new(false),
             mutations: Mutex::new(Vec::new()),
             cwd: worktree.clone(),
+            caller: tools::CallerKind::Run,
+            live: Vec::new(),
+            reports: Vec::new(),
+            new_reports: Mutex::new(Vec::new()),
         };
         let made = sink
             .create("Draw the thing", "", None, None, &[], &[], false)

@@ -1367,6 +1367,14 @@ pub enum PaneOrigin {
     /// A session `cide_session_open` started to implement one piece of work in its own
     /// worktree. Owns its child; is served the task tools only.
     Worker,
+    /// The planner tab cide opens by itself — the spinner's, or the Tasks panel's **Plan tasks**.
+    /// (M132) Served every tool a console is, but unattended: `agent_rpc` scopes it as a tab cide
+    /// opened, and the tracker refuses such a caller the gestures that are the user's alone —
+    /// moving a task out of the inbox, accepting work the user accepts.
+    Planner,
+    /// A review tab cide opens by itself, for one finished run or a batch of them. (M132)
+    /// Scoped like [`Self::Planner`], for its reason.
+    Reviewer,
 }
 /// Which container a pane is attached to, and how. (M42)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

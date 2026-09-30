@@ -468,6 +468,11 @@ impl RemoteHost for AppRemoteHost {
         epoch: &str,
         seq: u64,
     ) -> Result<(), String> {
+        // A line submitted from the phone is the user at a keyboard as much as one typed at the
+        // desk — see `agent_rpc::note_typed`. (M132)
+        if bytes.contains(&b'\r') {
+            crate::agent_rpc::note_typed(session);
+        }
         let Some(registry) = self.app.try_state::<SessionRegistry>() else {
             return Err("this cide is still starting".to_owned());
         };

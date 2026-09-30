@@ -44,6 +44,7 @@ pub mod limits;
 pub mod mentions;
 pub mod milestones;
 pub mod overrides;
+pub mod paths;
 /// The merge-request review vocabulary. (M85)
 pub mod review;
 /// What a role may do past a harness's sandbox. (M119)

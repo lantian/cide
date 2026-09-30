@@ -94,6 +94,17 @@ editedAtUnixMs: bigint | null,
  */
 deleted: boolean, 
 /**
+ * Superseded by a later comment its own author left in the same turn. (M132)
+ *
+ * A run reports **once** per turn: a later comment of its own on its own task in the same
+ * turn supersedes the earlier one instead of piling up beside it. Nothing is rewritten —
+ * the log stays append-only, which is the whole of [`Self::text`]'s trust argument — this only
+ * hides the earlier one from other agents' reads (`cide_task_get`) and collapses it on the
+ * card. Like [`Self::deleted`] it only ever goes false → true, so a merge takes either side's
+ * `true`.
+ */
+superseded?: boolean, 
+/**
  * Files attached to this comment, oldest first. (M39)
  *
  * `#[serde(default)]` for [`Task::links`]' reason and with the same non-bump of

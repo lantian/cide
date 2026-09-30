@@ -48,6 +48,12 @@ export interface Tally {
    * also a turning tab. `ProjectRunning::tabs` in `cide-ipc` carries the argument.
    */
   readonly tabs: ReadonlyMap<string, number>
+  /**
+   * Tasks waiting for the user (M132): an open question, or a user-accepted task in review.
+   * Not part of [`runningIn`] — nothing is *running* — but carried on the same broadcast so a
+   * background project's tab can badge it; the header folds it into the awaiting badge.
+   */
+  readonly waiting: number
 }
 
 /** One entry of a `cide://project-running` broadcast, as this module reads it. */
@@ -56,13 +62,14 @@ export interface RunningEntry {
   readonly runs: number
   readonly panes: number
   readonly tabs: readonly { readonly tab: string; readonly panes: number }[]
+  readonly waiting: number
 }
 
 /** The table, keyed by project id. */
 export type Counts = ReadonlyMap<string, Tally>
 
 /** A project nothing is running in. */
-export const NOTHING: Tally = { runs: 0, panes: 0, tabs: new Map() }
+export const NOTHING: Tally = { runs: 0, panes: 0, tabs: new Map(), waiting: 0 }
 
 /**
  * Fold a whole broadcast into a table.
@@ -79,14 +86,21 @@ export const NOTHING: Tally = { runs: 0, panes: 0, tabs: new Map() }
 export function foldRunning(entries: readonly RunningEntry[]): Counts {
   const counts = new Map<string, Tally>()
   for (const entry of entries) {
-    if (entry.runs <= 0 && entry.panes <= 0) continue
+    // `!(… > 0)` for `waiting`: an entry from a cide before M132 carries no such field, and
+    // `undefined <= 0` is false — which would keep an all-zero project in the table.
+    if (entry.runs <= 0 && entry.panes <= 0 && !(entry.waiting > 0)) continue
     // Last one wins, rather than summing: a broadcast carries one entry per project, and
     // summing a malformed duplicate would inflate a badge rather than make the bug visible.
     const tabs = new Map<string, number>()
     // Zero tabs dropped for the same reason zero projects are: absence is the only spelling of
     // "nothing turning here", so `runningInTab` cannot disagree with itself.
     for (const one of entry.tabs) if (one.panes > 0) tabs.set(one.tab, one.panes)
-    counts.set(entry.project, { runs: entry.runs, panes: entry.panes, tabs })
+    counts.set(entry.project, {
+      runs: entry.runs,
+      panes: entry.panes,
+      tabs,
+      waiting: entry.waiting > 0 ? entry.waiting : 0,
+    })
   }
   return counts
 }
@@ -145,6 +159,11 @@ export function runningInTab(
   tab: string,
 ): number {
   return tallyIn(counts, project).tabs.get(tab) ?? 0
+}
+
+/** Tasks waiting for the user in one project (M132). See [`Tally::waiting`]. */
+export function waitingTasksIn(counts: Counts, project: string | null | undefined): number {
+  return tallyIn(counts, project).waiting
 }
 
 /** The agent-run half alone, which is what [`runningHint`] needs to word itself. */

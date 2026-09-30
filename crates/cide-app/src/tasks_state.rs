@@ -228,6 +228,20 @@ pub fn broadcast(app: &AppHandle, project: ProjectId, store: &TaskStore) {
     {
         registry.retire_done(app, project, &board);
     }
+    // A board change can free or take paths — a task merged, a status moved, `touches` edited —
+    // so admission gets the new facts. (M132)
+    crate::agents::refresh_paths_and_pump(app, project);
+    board_announced(app);
+}
+
+/// A board moved, so the *Waiting* counts may have (M132): the project tabs' badges ride
+/// `cide://project-running` and the OS titles ride `retitle`, and neither funnel saw a task
+/// edit before — both were about sessions and runs.
+pub(crate) fn board_announced(app: &AppHandle) {
+    crate::running::mark(app);
+    if let Some(state) = tauri::Manager::try_state::<crate::workspace_state::WorkspaceState>(app) {
+        crate::cmd::window::retitle(app, &state.snapshot());
+    }
 }
 
 /// The directory a project's tracker lives under, or [`CoreError::NoSuchProject`].

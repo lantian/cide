@@ -247,6 +247,15 @@ export interface CommentView {
   editedMs: number | null
   /** Files on this comment, oldest first, live only. (M39) */
   attachments: readonly AttachmentView[]
+  /**
+   * A run's earlier report in the same turn, replaced by a later one. (M132)
+   *
+   * Kept in the log and drawn **collapsed**, not dropped: `adapt.ts` filters deleted comments
+   * because nobody asked for them, but a superseded report is something a run said — hiding it
+   * would make the log disagree with what the run's conversation shows, and a reviewer reading
+   * why the second report differs from the first needs the first.
+   */
+  superseded: boolean
 }
 
 
@@ -326,6 +335,20 @@ export interface TaskView {
   commentCount: number
   /** Live attachments across the body and every live comment, as one number. (M39's count.) */
   attachmentCount: number
+  /**
+   * File globs this task will change; empty means the whole repository. (M132) `Task::touches`.
+   * Read by the dispatcher to keep two runs off the same files, so an empty list is not "unknown"
+   * but the widest claim there is.
+   */
+  touches: readonly string[]
+  /**
+   * `'user'` when the user accepts this task by eye (M132): cide merges it on a green verify and
+   * it waits in *Waiting for you* rather than going to a model reviewer. `null` for the ordinary
+   * road. Restates `Acceptance`, whose one variant is `user`.
+   */
+  acceptance: 'user' | null
+  /** An open question to the user, or `null`. The task is not dispatched while it is set. (M132) */
+  question: string | null
   /**
    * Who asked for this task. Structural restatement of `Task::createdBy`.
    *
@@ -2299,4 +2322,67 @@ export function dropZoneAt(
     if (best === null || zone.width * zone.height < best.width * best.height) best = zone
   }
   return best === null ? null : best.key
+}
+
+/* ------------------------------------------------------------------ waiting for you (M132) */
+
+/**
+ * What the Tasks panel's *Waiting for you* tab lists: tasks the user accepts by eye that have
+ * reached review, and tasks carrying an open question. (M132)
+ *
+ * Two lists and not one sorted list, because the two ask for different answers — a verdict on
+ * work, or a sentence — and a row that mixed them would put an Accept button beside a question.
+ * A task can be in both (a question asked about work already in review) and is listed in both;
+ * [`waitingCount`] counts it once, because the badge is a number of tasks, not of rows.
+ *
+ * `inbox` and `done` never qualify for review: a `user` task in review is the only state in which
+ * the user's Accept is what moves it (`task_respond`); anywhere else Accept would be a status
+ * change the status segment already offers.
+ */
+export function waitingFor(tasks: readonly TaskView[]): {
+  review: TaskView[]
+  questions: TaskView[]
+} {
+  return {
+    review: tasks.filter((t) => t.acceptance === 'user' && t.status === 'review'),
+    questions: tasks.filter((t) => t.question !== null && t.question.trim() !== ''),
+  }
+}
+
+/** How many distinct tasks [`waitingFor`] lists — the tab's badge. */
+export function waitingCount(tasks: readonly TaskView[]): number {
+  const { review, questions } = waitingFor(tasks)
+  return new Set([...review, ...questions].map((t) => t.id)).size
+}
+
+/**
+ * The first line of the newest comment that was not superseded, or `null` for none. (M132)
+ *
+ * The run's own report is what the user judges a user-accepted task by, and a superseded one is
+ * by definition not its report any more — quoting it would show the draft the run replaced.
+ * Newest by `atMs`, not by position: the log is oldest-first today, and a reader that took the
+ * last element would quietly answer the oldest if that order ever flipped.
+ */
+export function latestReport(comments: readonly CommentView[]): string | null {
+  let best: CommentView | null = null
+  for (const c of comments) {
+    if (c.superseded) continue
+    if (best === null || c.atMs >= best.atMs) best = c
+  }
+  if (best === null) return null
+  const line = best.text.split('\n').find((l) => l.trim() !== '')
+  return line === undefined ? null : line.trim()
+}
+
+/**
+ * The card's Touches editor text → the globs to send. One per line; blanks and repeats dropped,
+ * order kept, so a list the user typed in an order they meant comes back in it. (M132)
+ */
+export function parseTouches(text: string): string[] {
+  const out: string[] = []
+  for (const raw of text.split('\n')) {
+    const g = raw.trim()
+    if (g !== '' && !out.includes(g)) out.push(g)
+  }
+  return out
 }

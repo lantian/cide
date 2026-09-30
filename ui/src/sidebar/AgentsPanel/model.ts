@@ -1099,6 +1099,13 @@ export interface RunRow {
   hint: string | null
   /** The verify gate's line for this run, or `null`. See [`gateLine`]. (M114) */
   gate: string | null
+  /**
+   * Whether [`gate`] is the "Waiting for your answer" line rather than a gate's (M132). The view
+   * draws that one as a link to the Agents panel's Waiting tab, where the answer box is; a flag
+   * rather than a prefix test on the sentence, because a check that greps English is asserting
+   * the wording, and the wording is the thing most likely to be edited.
+   */
+  asks: boolean
   /** The open review tab that owns this run's task — [`RunView.reviewer`], repeated. (M114) */
   reviewer: string | null
 }
@@ -1299,8 +1306,17 @@ function runRow(
   run: RunView,
   titles: Readonly<Record<string, string>>,
   gates: Readonly<Record<string, GateView>>,
+  questions: Readonly<Record<string, string>> = {},
 ): RunRow {
   const gate = run.task !== null && Object.hasOwn(gates, run.task) ? gates[run.task] : undefined
+  /*
+   * A task waiting for the user's answer (M132) says so, ahead of the gate: its run is idle
+   * because the task is the user's now, and "Verify gate passed" — true of a branch with no
+   * commits — read as "done, somebody will pick it up". terrastrike's t-1160 sat like that,
+   * its question visible only on the Waiting tab (now the Agents panel's, which this line links to).
+   */
+  const question =
+    run.task !== null && Object.hasOwn(questions, run.task) ? questions[run.task] : undefined
   return {
     run,
     glyph: phaseGlyph(run.phase),
@@ -1311,7 +1327,8 @@ function runRow(
     canPause: canPause(run),
     staleTurn: staleTurnLine(run),
     hint: phaseHint(run.phase),
-    gate: gateLine(run, gate),
+    gate: question !== undefined ? `Waiting for your answer: ${question}` : gateLine(run, gate),
+    asks: question !== undefined,
     reviewer: run.reviewer,
   }
 }
@@ -1396,11 +1413,12 @@ function roleRow(
   runs: readonly RunView[],
   titles: Readonly<Record<string, string>>,
   gates: Readonly<Record<string, GateView>>,
+  questions: Readonly<Record<string, string>> = {},
 ): RoleRow {
   const active = runs
     .filter((run) => run.agent === def.id && isActivePhase(run.phase))
     .sort(byUrgency)
-    .map((run) => runRow(run, titles, gates))
+    .map((run) => runRow(run, titles, gates, questions))
   const first = active[0]
   return {
     def,
@@ -1463,11 +1481,12 @@ export function sections(
   roster: Roster,
   taskTitles: Readonly<Record<string, string>>,
   gates: Readonly<Record<string, GateView>> = {},
+  questions: Readonly<Record<string, string>> = {},
 ): Section[] {
   if (roster.kind !== 'ready') return []
 
   const roles: RoleRow[] = roster.agents.map((def) =>
-    roleRow(def, roster, roster.runs, taskTitles, gates),
+    roleRow(def, roster, roster.runs, taskTitles, gates, questions),
   )
 
   /*
@@ -1482,7 +1501,7 @@ export function sections(
     if (!isActivePhase(run.phase)) continue
     if (defined.has(run.agent) || orphans.includes(run.agent)) continue
     orphans.push(run.agent)
-    roles.push(roleRow(undefinedRole(run), roster, roster.runs, taskTitles, gates))
+    roles.push(roleRow(undefinedRole(run), roster, roster.runs, taskTitles, gates, questions))
   }
 
   const recent = roster.runs.filter((run) => isDonePhase(run.phase))
@@ -1504,7 +1523,7 @@ export function sections(
       // a per-process scratchpad. The *kind* stays 'recent' — it is an internal name in every
       // fixture and check, and renaming a wire-adjacent identifier to chase a label is churn.
       label: 'History',
-      rows: recent.slice(0, RECENT_CAP).map((run) => runRow(run, taskTitles, gates)),
+      rows: recent.slice(0, RECENT_CAP).map((run) => runRow(run, taskTitles, gates, questions)),
     })
   }
   return out

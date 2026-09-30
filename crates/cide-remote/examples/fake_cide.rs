@@ -175,6 +175,7 @@ impl Constants {
                 edited_at_unix_ms: None,
                 deleted: false,
                 attachments: Vec::new(),
+                superseded: false,
             };
         cide_ipc::TaskDetail {
             row: cide_ipc::TaskRow {
@@ -190,6 +191,9 @@ impl Constants {
                 updated_unix_ms: 1_789_903_600_000,
                 comment_count: 3,
                 attachment_count: 0,
+                acceptance: None,
+                question: None,
+                touches: Vec::new(),
             },
             body: "Comments are **markdown** on the desktop and were raw text here.\n\n- the author was a tagged enum, printed as JSON\n- no time was drawn at all\n- `text` reached the screen as its own source"
                 .to_owned(),

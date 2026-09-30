@@ -128,6 +128,7 @@ function TaskDetailHostImpl() {
   const selected = useTasks((s) => s.selected)
   const select = useTasks((s) => s.select)
   const editTask = useTasks((s) => s.edit)
+  const respondTask = useTasks((s) => s.respond)
   const removeTask = useTasks((s) => s.remove)
 
   /*
@@ -664,6 +665,14 @@ function TaskDetailHostImpl() {
     () => (open === null ? null : milestoneOfTask(milestonesView, String(open.id))),
     [milestonesView, open],
   )
+  /* The milestones a task can be put under: those with a goal task to link to (M132). */
+  const milestoneChoices = useMemo(
+    () =>
+      (milestonesView?.plan.items ?? [])
+        .filter((m) => m.task !== undefined && m.task !== null)
+        .map((m) => ({ id: m.id, title: m.title })),
+    [milestonesView],
+  )
 
   if (open === null) return null
   /*
@@ -685,6 +694,35 @@ function TaskDetailHostImpl() {
       key={open.id}
       task={detail}
       milestone={milestone}
+      milestoneChoices={milestoneChoices}
+      onSetMilestone={(target) => {
+        /*
+         * Three edits in order, each awaited, because the store refuses the next one otherwise:
+         * an inbox task is moved to todo first (the user picking a milestone for it *is* the
+         * decision that it is work now, and an inbox task is never under a milestone — M132), its
+         * current parent is unlinked (a task has one `subtaskOf`), then the goal is linked. "No
+         * milestone" unlinks only a parent that is inside one, so a plain parent/child pair
+         * outside every milestone is left alone.
+         */
+        const id = String(detail.id)
+        const goal =
+          target === null
+            ? null
+            : (milestonesView?.plan.items.find((m) => m.id === target)?.task ?? null)
+        const parent = detail.links.find((l) => l.kind === 'subtaskOf')?.target ?? null
+        const run = async () => {
+          if (goal !== null && detail.status === 'inbox') {
+            await editTask(id, { kind: 'setStatus', status: 'todo' })
+          }
+          if (parent !== null && parent !== goal && (goal !== null || milestone !== null)) {
+            await editTask(id, { kind: 'unlink', link: 'subtaskOf', target: parent })
+          }
+          if (goal !== null && parent !== goal) {
+            await editTask(id, { kind: 'link', link: 'subtaskOf', target: String(goal) })
+          }
+        }
+        guarded(run())
+      }}
       verify={verify}
       onOpenVerifyLog={() => setVerifyLog(true)}
       onOpenMilestone={(id) => {
@@ -951,6 +989,16 @@ function TaskDetailHostImpl() {
       onSetStatus={(task, status) => guarded(editTask(task, { kind: 'setStatus', status }))}
       onSetAssignee={(task, agent) => guarded(editTask(task, { kind: 'assign', agent }))}
       onSetBody={(task, body) => guarded(editTask(task, { kind: 'setBody', body }))}
+      // M132's rows. `supersede` is the fourth new edit and is never sent from here: it is a
+      // run's own record that a later report replaced an earlier one, not a user gesture.
+      onSetTouches={(task, touches) => guarded(editTask(task, { kind: 'setTouches', touches }))}
+      onSetAcceptance={(task, acceptance) =>
+        guarded(editTask(task, { kind: 'setAcceptance', acceptance }))
+      }
+      onSetQuestion={(task, question) =>
+        guarded(editTask(task, { kind: 'setQuestion', question }))
+      }
+      onAnswer={(task, text) => guarded(respondTask(task, { kind: 'answer', text }))}
       onAddComment={(task, text, attachments) =>
         // Text alone is a `TaskEdit::Comment`; text with files is one `task_attach` on the
         // `newComment` target, so the comment and its screenshots land together or not at all.

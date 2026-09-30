@@ -71,6 +71,7 @@ try {
     isAwaiting,
     awaitingBadge,
     awaitingHint,
+    waitingHint,
     acknowledgesKey,
     acknowledgesButton,
   } = await import(`file://${join(out, 'awaitingRule.js')}`)
@@ -592,6 +593,18 @@ try {
       'every tab after it sideways under the pointer, which is the one thing it may not do',
   )
   eq(awaitingHint(0, 'tab'), undefined, 'no sentence when there is nothing to say')
+  // M132: the project tab's badge counts waiting tasks too, and its tooltip tells them apart.
+  eq(waitingHint(2, 0, 'project'), awaitingHint(2, 'project'), 'no tasks: the old sentence')
+  eq(
+    waitingHint(0, 1, 'project'),
+    '1 task waits for you in this project (Agents → Waiting)',
+    'tasks alone say where to find them',
+  )
+  eq(
+    waitingHint(1, 3, 'project'),
+    '1 session and 3 tasks wait for you in this project (Agents → Waiting)',
+    'both, in one sentence',
+  )
   eq(
     awaitingHint(1, 'tab'),
     '1 session in this tab is waiting for you',

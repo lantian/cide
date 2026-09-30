@@ -121,6 +121,11 @@ pub fn trigger(
     if blockers.iter().any(|s| *s != TaskStatus::Done) {
         return None;
     }
+    // A task waiting for the user's answer starts nothing either (M132): the answer clears the
+    // question, and that edit is what starts it again.
+    if after.question.is_some() {
+        return None;
+    }
 
     let mut dispatch: Vec<AgentId> = Vec::new();
 
@@ -136,8 +141,11 @@ pub fn trigger(
     // an assignment would. Without this the promotion is a status flip carrying the assignee
     // along, which fires nothing — and the orchestrator would have to learn to re-assign.
     let promoted = before.is_some_and(|task| task.status == TaskStatus::Inbox);
+    // An answered question is the same kind of edge (M132): the task sat inert on purpose, and
+    // clearing the question is the user saying "go on".
+    let answered = before.is_some_and(|task| task.question.is_some());
     if let Some(agent) = after.agent.as_ref()
-        && (assign_gesture || promoted || previously != Some(agent))
+        && (assign_gesture || promoted || answered || previously != Some(agent))
     {
         dispatch.push(agent.clone());
     }
@@ -183,6 +191,9 @@ mod tests {
             created_unix_ms: 1,
             updated_unix_ms: 1,
             attachments: Vec::new(),
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 
@@ -192,6 +203,39 @@ mod tests {
 
     fn ids(trigger: &Trigger) -> Vec<&str> {
         trigger.dispatch.iter().map(|id| id.0.as_str()).collect()
+    }
+
+    /// A task with an open question starts nothing, and the answer — the question cleared —
+    /// starts the role on it. (M132)
+    #[test]
+    fn a_question_holds_the_task_until_it_is_answered() {
+        let mut asking = task(TaskStatus::Todo, Some("qa"));
+        asking.question = Some("Which palette?".into());
+        assert!(
+            trigger(
+                None,
+                &asking,
+                &[],
+                &TaskAuthor::User,
+                true,
+                &[],
+                &roles(&["qa"])
+            )
+            .is_none(),
+            "an assignment on a task waiting for an answer starts nothing"
+        );
+        let answered = task(TaskStatus::Todo, Some("qa"));
+        let fired = trigger(
+            Some(&asking),
+            &answered,
+            &[],
+            &TaskAuthor::User,
+            false,
+            &[],
+            &roles(&["qa"]),
+        )
+        .expect("the answer starts the role");
+        assert_eq!(ids(&fired), ["qa"]);
     }
 
     /// The inbox is not work: nothing there starts, whoever assigns it — and leaving it for

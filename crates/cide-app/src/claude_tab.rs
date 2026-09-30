@@ -142,6 +142,7 @@ pub(crate) fn open_with_prompt(
     prompt: &str,
     mode: TabMode,
     cwd: Option<std::path::PathBuf>,
+    origin: Option<cide_ipc::PaneOrigin>,
 ) -> Result<(SessionId, TabId), CoreError> {
     open(
         app,
@@ -155,7 +156,9 @@ pub(crate) fn open_with_prompt(
             harness: None,
             model: None,
             voice: crate::cmd::session::Voice::Acting,
-            origin: None,
+            // `Planner` or `Reviewer` since M132: what `agent_rpc` scopes a tab cide opened by,
+            // so the tracker can tell it from a pane the user is typing in.
+            origin,
         },
     )
 }

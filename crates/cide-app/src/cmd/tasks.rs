@@ -169,7 +169,22 @@ pub async fn task_new(
     let root = tasks_state::project_root(&state, project)?;
     let stores = Arc::clone(&stores);
     let (store, mutation) = blocking(move || {
-        let store = tracker(&stores, project, root);
+        let store = tracker(&stores, project, root.clone());
+        // An inbox task is never part of a milestone (M132): created straight into the inbox
+        // with a parent inside one, its edge is kept as `related`.
+        let mut req = req;
+        if req.status == Some(cide_ipc::TaskStatus::Inbox) {
+            let plan = cide_agents::config::load_milestones(&root);
+            let rows = store.list();
+            for link in req.links.iter_mut().flatten() {
+                if link.link == cide_ipc::LinkType::SubtaskOf
+                    && cide_agents::milestones::inside_milestone(&plan, &rows, &link.target)
+                        .is_some()
+                {
+                    link.link = cide_ipc::LinkType::Related;
+                }
+            }
+        }
         // Captured before `req` is consumed: the creation body is the fresh text a mention
         // trigger may scan — see `TaskMutation::fresh_text`.
         let fresh_text: Vec<String> = req.body.clone().into_iter().collect();
@@ -229,8 +244,9 @@ pub async fn task_edit(
 ) -> Result<TaskBoard> {
     let root = tasks_state::project_root(&state, project)?;
     let stores = Arc::clone(&stores);
-    let (store, mutation) = blocking(move || {
-        let store = tracker(&stores, project, root);
+    let task_for_handback = task.clone();
+    let (store, mutation, continue_role) = blocking(move || {
+        let store = tracker(&stores, project, root.clone());
         // The prose this mutation introduces, read before `edit` is consumed. Everything else —
         // a status flip, a title, a comment edit — carries none, so an old mention in the stored
         // body cannot re-fire.
@@ -248,7 +264,105 @@ pub async fn task_edit(
         // anyway) and corrupts nothing; holding one lock across both would mean a closure API
         // the store deliberately does not offer for edits.
         let before = store.get(&task);
-        let after = store.edit(&task, edit, TaskAuthor::User)?;
+        // The milestone half of the inbox rule (M132), on the user's road as on the model's:
+        // linking an inbox task into a milestone is refused, and moving a milestone's task into
+        // the inbox takes it out of the milestone — its `subtaskOf` becomes `related`.
+        let plan = cide_agents::config::load_milestones(&root);
+        if let TaskEdit::Link {
+            link: cide_ipc::LinkType::SubtaskOf,
+            target,
+        } = &edit
+            && let Some(why) =
+                cide_agents::milestones::inbox_rule(&plan, &store.list(), &task, target)
+        {
+            return Err(CoreError::Io(why));
+        }
+        let detach = match (&edit, before.as_ref()) {
+            (
+                TaskEdit::SetStatus {
+                    status: cide_ipc::TaskStatus::Inbox,
+                },
+                Some(current),
+            ) if current.status != cide_ipc::TaskStatus::Inbox => current
+                .links
+                .iter()
+                .find(|l| l.link == cide_ipc::LinkType::SubtaskOf && !l.deleted)
+                .map(|l| l.target.clone())
+                .filter(|parent| {
+                    cide_agents::milestones::inside_milestone(&plan, &store.list(), parent)
+                        .is_some()
+                }),
+            _ => None,
+        };
+        /*
+         * The two plain edits that are really an answer to a task waiting for the user (M132):
+         * clearing its question, and moving it from review back to work. The phone has no
+         * `task_respond` (its protocol carries `TaskEdit` only), so it answers with a comment and
+         * one of these — and either one, from anywhere, must continue the role that asked in its
+         * own conversation, or the answer lands on a board the idle run never re-reads. Decided
+         * here, before `edit` is consumed. The note itself is the newest comment, which the run
+         * reads when it wakes; the line points at the board rather than quoting it, because the
+         * phone's two frames are not ordered by anything this could rely on.
+         */
+        let continue_role = match (&edit, before.as_ref()) {
+            (TaskEdit::SetQuestion { question: None }, Some(current))
+                if current.question.is_some()
+                    && matches!(
+                        current.status,
+                        cide_ipc::TaskStatus::Todo
+                            | cide_ipc::TaskStatus::Doing
+                            | cide_ipc::TaskStatus::Review
+                    ) =>
+            {
+                current.agent.clone().map(|agent| {
+                    (
+                        agent,
+                        format!(
+                            "The user answered the question on {task} — the answer is the newest \
+                             comment on it; read it with cide_task_get and carry on with {task} \
+                             on that basis."
+                        ),
+                    )
+                })
+            }
+            (
+                TaskEdit::SetStatus {
+                    status: cide_ipc::TaskStatus::Doing | cide_ipc::TaskStatus::Todo,
+                },
+                Some(current),
+            ) if current.status == cide_ipc::TaskStatus::Review => {
+                current.agent.clone().map(|agent| {
+                    (
+                        agent,
+                        format!(
+                            "The user sent {task} back from review — why is in its newest \
+                             comments; read them with cide_task_get, fix that in your branch, \
+                             commit, and set {task} to review again."
+                        ),
+                    )
+                })
+            }
+            _ => None,
+        };
+        let mut after = store.edit(&task, edit, TaskAuthor::User)?;
+        if let Some(parent) = detach {
+            store.edit(
+                &task,
+                TaskEdit::Unlink {
+                    link: cide_ipc::LinkType::SubtaskOf,
+                    target: parent.clone(),
+                },
+                TaskAuthor::User,
+            )?;
+            after = store.edit(
+                &task,
+                TaskEdit::Link {
+                    link: cide_ipc::LinkType::Related,
+                    target: parent,
+                },
+                TaskAuthor::User,
+            )?;
+        }
         let mutation = TaskMutation {
             before,
             after,
@@ -256,12 +370,133 @@ pub async fn task_edit(
             assign_gesture,
             fresh_text,
         };
-        Ok((store, mutation))
+        Ok((store, mutation, continue_role))
     })
     .await?;
     let board = answer(&app, project, &store);
-    // From the panel, so no session to name: the primary pane hears about any run this starts.
-    task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
+    match continue_role {
+        // The same road `task_respond` takes; `consider` is skipped so the answered edge in
+        // `autodispatch::trigger` cannot start a second dispatch beside this one.
+        Some((agent, line)) => {
+            crate::agent_rpc::hand_back_to_run(&app, project, &agent, &task_for_handback, &line);
+        }
+        // From the panel, so no session to name: the primary pane hears about any run this
+        // starts.
+        None => {
+            task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
+        }
+    }
+    Ok(board)
+}
+
+/// The user answers a task that waits for them: accept it, send it back, or answer its question.
+/// (M132)
+///
+/// Authored as the user, because it is: these are the only roads by which a task the user
+/// accepts becomes done (the MCP roads refuse a reviewer or a run that tries, `tools.rs`'s
+/// `user_gesture_refusal`), and by which an open question is closed from the list.
+///
+/// Send back and answer continue **the same role** on the task through `hand_back_to_run` —
+/// the M116 road a red verify uses — so the run that made the sprite reads why it was sent back
+/// in the conversation that made it, rather than a fresh one re-deriving the task. The note is
+/// written on the task first, so the board holds it even when no run can be reached.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_respond(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    project: ProjectId,
+    task: TaskId,
+    response: cide_ipc::TaskResponse,
+) -> Result<TaskBoard> {
+    let root = tasks_state::project_root(&state, project)?;
+    let stores = Arc::clone(&stores);
+    let for_thread = task.clone();
+    let (store, continue_with) = blocking(move || {
+        let task = for_thread;
+        let store = tracker(&stores, project, root);
+        let current = store
+            .get(&task)
+            .ok_or_else(|| CoreError::Io(format!("{task} no longer exists")))?;
+        let comment = |store: &TaskStore, text: String| {
+            store.edit(&task, TaskEdit::Comment { text }, TaskAuthor::User)
+        };
+        let continue_with = match response {
+            cide_ipc::TaskResponse::Accept => {
+                store.edit(
+                    &task,
+                    TaskEdit::SetStatus {
+                        status: cide_ipc::TaskStatus::Done,
+                    },
+                    TaskAuthor::User,
+                )?;
+                None
+            }
+            cide_ipc::TaskResponse::SendBack { note } => {
+                let note = note.trim().to_string();
+                if note.is_empty() {
+                    return Err(CoreError::Io(
+                        "say in a line what is wrong, so the role knows what to change".into(),
+                    ));
+                }
+                comment(&store, format!("**Sent back by the user:** {note}"))?;
+                match current.agent.clone() {
+                    Some(agent) => Some((
+                        agent,
+                        format!(
+                            "The user looked at {task} and sent it back: {note} — fix that in \
+                             your branch, commit, and set {task} to review again."
+                        ),
+                    )),
+                    None => {
+                        store.edit(
+                            &task,
+                            TaskEdit::SetStatus {
+                                status: cide_ipc::TaskStatus::Todo,
+                            },
+                            TaskAuthor::User,
+                        )?;
+                        None
+                    }
+                }
+            }
+            cide_ipc::TaskResponse::Answer { text } => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Err(CoreError::Io("the answer is empty".into()));
+                }
+                comment(&store, format!("**The user answered:** {text}"))?;
+                store.edit(
+                    &task,
+                    TaskEdit::SetQuestion { question: None },
+                    TaskAuthor::User,
+                )?;
+                // Only a task that is work continues a role; a question on a milestone's goal is
+                // the planner's, which reads the answer on its next wake.
+                match (current.agent.clone(), current.status) {
+                    (
+                        Some(agent),
+                        cide_ipc::TaskStatus::Todo
+                        | cide_ipc::TaskStatus::Doing
+                        | cide_ipc::TaskStatus::Review,
+                    ) => Some((
+                        agent,
+                        format!(
+                            "The user answered the question on {task}: {text} — carry on with \
+                             {task} on that basis."
+                        ),
+                    )),
+                    _ => None,
+                }
+            }
+        };
+        Ok((store, continue_with))
+    })
+    .await?;
+    let board = answer(&app, project, &store);
+    if let Some((agent, line)) = continue_with {
+        crate::agent_rpc::hand_back_to_run(&app, project, &agent, &task, &line);
+    }
     Ok(board)
 }
 
@@ -590,5 +825,6 @@ fn answer(app: &tauri::AppHandle, project: ProjectId, store: &TaskStore) -> Task
     if let Some(registry) = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>() {
         registry.retire_done(app, project, &board);
     }
+    tasks_state::board_announced(app);
     board
 }

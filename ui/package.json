@@ -79,6 +79,7 @@
     "check:proxy": "node scripts/check-proxy.mjs",
     "check:pull-strategy": "node scripts/check-pull-strategy.mjs",
     "check:push": "node scripts/check-push.mjs",
+    "check:rail-marks": "node scripts/check-rail-marks.mjs",
     "check:rail-overflow": "node scripts/check-rail-overflow.mjs",
     "check:reformat": "node scripts/check-reformat.mjs",
     "check:render": "node scripts/check-git-render.mjs",

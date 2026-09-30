@@ -21,6 +21,11 @@
 export const PROTOCOL_VERSION = 1
 
 /**
+ * Who accepts a task's work when it is not a reviewer. See [`Task::acceptance`]. (M132)
+ */
+export type Acceptance = "user";
+
+/**
  * A subagent role name — `developer`, `qa`, `artist`. (M18)
  *
  * A string, and not a uuid, because **the user writes it themselves in a file in their own
@@ -632,7 +637,8 @@ active?: string,
 verify: string, 
 /**
  * How many open tasks (todo, doing, review) the active milestone may hold before a new one
- * the orchestrator creates goes to the inbox instead. `None` is [`DEFAULT_MAX_OPEN`].
+ * the orchestrator creates under it is refused (it went to the inbox until M132, which is
+ * how milestones filled up with noticed work). `None` is [`DEFAULT_MAX_OPEN`].
  */
 maxOpen?: number, 
 /**
@@ -1332,6 +1338,17 @@ editedAtUnixMs: bigint | null,
  */
 deleted: boolean, 
 /**
+ * Superseded by a later comment its own author left in the same turn. (M132)
+ *
+ * A run reports **once** per turn: a later comment of its own on its own task in the same
+ * turn supersedes the earlier one instead of piling up beside it. Nothing is rewritten —
+ * the log stays append-only, which is the whole of [`Self::text`]'s trust argument — this only
+ * hides the earlier one from other agents' reads (`cide_task_get`) and collapses it on the
+ * card. Like [`Self::deleted`] it only ever goes false → true, so a merge takes either side's
+ * `true`.
+ */
+superseded?: boolean, 
+/**
  * Files attached to this comment, oldest first. (M39)
  *
  * `#[serde(default)]` for [`Task::links`]' reason and with the same non-bump of
@@ -1399,7 +1416,7 @@ attachments: Array<TaskAttachment>, history: Array<TaskStatusChange>, };
  * from no code path, and whose handling arm would have minted a pane showing nothing. Add it
  * with the gesture, in the same commit.
  */
-export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, } | { "kind": "detachAttachment", attachment: TaskAttachmentId, };
+export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, } | { "kind": "detachAttachment", attachment: TaskAttachmentId, } | { "kind": "setTouches", touches: Array<string>, } | { "kind": "setAcceptance", acceptance: Acceptance | null, } | { "kind": "setQuestion", question: string | null, } | { "kind": "supersede", comment: CommentId, };
 
 /**
  * One task in `.cide/tasks.json`, as a short string — `t-17`. (M18)
@@ -1526,7 +1543,15 @@ links?: Array<TaskLinkSpec>,
  * board is broadcast once with the attachments in place instead of once without and once
  * with, and a dropped file in the New task dialog is one gesture, not two.
  */
-attachments?: Array<string>, };
+attachments?: Array<string>, 
+/**
+ * [`Task::touches`] at creation. Absent means none declared. (M132)
+ */
+touches?: Array<string>, 
+/**
+ * [`Task::acceptance`] at creation. (M132)
+ */
+acceptance?: Acceptance, };
 
 /**
  * One task as the *board* carries it: everything except its body, its log and its files. (M68)
@@ -1583,7 +1608,20 @@ change?: ChangeName,
  * to open one file per task to answer "is this one blocked" would be loading the whole board
  * to render a list, which is the cost this type exists to avoid.
  */
-links: Array<TaskLink>, createdBy: TaskAuthor, createdUnixMs: bigint, 
+links: Array<TaskLink>, 
+/**
+ * [`Task::touches`], on the row because admission reads it across tasks. (M132)
+ */
+touches?: Array<string>, 
+/**
+ * [`Task::acceptance`]. (M132)
+ */
+acceptance?: Acceptance, 
+/**
+ * [`Task::question`], on the row because the planner and *Waiting for you* read it across
+ * tasks. (M132)
+ */
+question?: string, createdBy: TaskAuthor, createdUnixMs: bigint, 
 /**
  * See [`Task::updated_unix_ms`] — the merge tiebreak and the panel's in-group sort key.
  *

@@ -71,7 +71,16 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { foldRunning, isNewer, runningIn, runningInTab, runsIn, runningBadge, runningHint } =
+  const {
+    foldRunning,
+    isNewer,
+    runningIn,
+    runningInTab,
+    runsIn,
+    runningBadge,
+    runningHint,
+    waitingTasksIn,
+  } =
     await import(
     `file://${join(out, 'runningRule.js')}`
   )
@@ -110,6 +119,19 @@ try {
     0,
     'an explicit zero entry is dropped rather than stored as a present-but-empty project',
   )
+
+  // Tasks waiting for the user (M132) ride the same set: a project with nothing running but a
+  // question open is present, badges its tab, and is still not "running".
+  {
+    const asked = foldRunning([{ project: 'q', runs: 0, panes: 0, tabs: [], waiting: 2 }])
+    eq(waitingTasksIn(asked, 'q'), 2, 'a waiting-only project is kept, with its count')
+    eq(runningIn(asked, 'q'), 0, 'and waiting is not running: the running chip stays dark')
+    eq(
+      waitingTasksIn(foldRunning([{ project: 'o', runs: 1, panes: 0, tabs: [] }]), 'o'),
+      0,
+      'an entry from a cide before M132, with no waiting field, reads as none waiting',
+    )
+  }
 
   // `isNewer` — the whole reason the payload carries a generation. A catch-up reply describes
   // the set as it was when the question landed, and a broadcast can overtake it on the way

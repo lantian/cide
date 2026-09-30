@@ -466,7 +466,18 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
 pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
     for (label, role) in &ws.windows {
         let sessions = sessions_of(ws, role);
-        let count = windows::awaiting_among(&sessions);
+        // Tasks waiting for the user count like a waiting session (M132): the shell window
+        // holding a project announces its *Waiting* list the way it announces a finished turn —
+        // same title, same urgency hint — rather than a second mechanism nobody would notice.
+        // Only the shell: a detached pane or tab is one conversation, not the project.
+        let tasks = match role {
+            WindowRole::Shell { projects, .. } => projects
+                .iter()
+                .map(|project| crate::running::waiting_for(app, *project))
+                .sum(),
+            _ => 0,
+        };
+        let count = windows::awaiting_among(&sessions) + tasks;
         // Third of the three attention-chain lines — see the note in `hooks.rs`. `debug`, not
         // `info`: this runs on every workspace mutation, so at `info` it would drown the two
         // above, which fire once per turn. What it answers is the last question — whether the

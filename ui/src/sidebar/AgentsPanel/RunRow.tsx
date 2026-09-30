@@ -127,6 +127,11 @@ export interface RunRowProps {
   onRevealTask?: ((task: string) => void) | undefined
   /** Reveal the review tab that owns this run's task. (M114) Without it the words are plain. */
   onOpenReviewer?: ((session: string, task: string) => void) | undefined
+  /**
+   * Switch the Agents panel to its Waiting tab, where the open question this run's task carries
+   * can be answered (M132). Without it the "Waiting for your answer" line is plain words.
+   */
+  onShowWaiting?: (() => void) | undefined
   /** Re-send the turn the freeze may have killed. */
   onRetryTurn?: ((run: string) => void) | undefined
   /** Dismiss the stale-turn bar without re-sending anything. */
@@ -156,6 +161,7 @@ export function ActivityRow({
   onStop,
   onRevealTask,
   onOpenReviewer,
+  onShowWaiting,
   onRetryTurn,
   onAckStaleTurn,
 }: RunRowProps) {
@@ -210,7 +216,7 @@ export function ActivityRow({
         {usingLabel(run)}
       </p>
       <RunNotes row={row} />
-      <GateNotes row={row} onOpenReviewer={onOpenReviewer} />
+      <GateNotes row={row} onOpenReviewer={onOpenReviewer} onShowWaiting={onShowWaiting} />
       <StaleBar row={row} onRetryTurn={onRetryTurn} onAckStaleTurn={onAckStaleTurn} />
     </div>
   )
@@ -231,6 +237,7 @@ export function RunRow({
   onStop,
   onRevealTask,
   onOpenReviewer,
+  onShowWaiting,
   onRetryTurn,
   onAckStaleTurn,
   armed = false,
@@ -318,7 +325,7 @@ export function RunRow({
       </div>
 
       <RunNotes row={row} />
-      <GateNotes row={row} onOpenReviewer={onOpenReviewer} />
+      <GateNotes row={row} onOpenReviewer={onOpenReviewer} onShowWaiting={onShowWaiting} />
       <StaleBar row={row} onRetryTurn={onRetryTurn} onAckStaleTurn={onAckStaleTurn} />
     </div>
   )
@@ -580,17 +587,39 @@ function RunNotes({ row }: { row: RunRowData }) {
 function GateNotes({
   row,
   onOpenReviewer,
+  onShowWaiting,
 }: {
   row: RunRowData
   onOpenReviewer?: ((session: string, task: string) => void) | undefined
+  onShowWaiting?: (() => void) | undefined
 }) {
   const { run } = row
   const reviewer = row.reviewer
   return (
     <>
+      {/*
+        * The question line (M132, `row.asks`) is a link to the Waiting tab: the row says the run
+        * is waiting on the user, and the one thing the user can do about that — answer — is on
+        * the other tab, so a plain sentence left them to find the tab by name. Not a link to the
+        * task card, which the task link one line up already is; the card shows the question but
+        * the Waiting tab is where it is answered beside every other thing owed. Plain words with
+        * no handler, `onOpenReviewer`'s rule below.
+        */}
       {row.gate !== null && (
         <p className={styles.rowNote} data-audit="agentsGate">
-          {row.gate}
+          {row.asks && onShowWaiting !== undefined ? (
+            <Button
+              variant="link"
+              size="sm"
+              data-audit="agentsWaitingLink"
+              title="Answer it on the Waiting tab"
+              onClick={onShowWaiting}
+            >
+              {row.gate}
+            </Button>
+          ) : (
+            row.gate
+          )}
         </p>
       )}
       {reviewer !== null && run.task !== null && (

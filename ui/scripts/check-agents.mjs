@@ -958,6 +958,41 @@ try {
         'groups are gone, and their order was the thing the user could not read',
     )
     eq(sections(DISABLED, TITLES), [], 'a non-ready roster draws its designed screen, not a list')
+
+    /*
+     * A task waiting for the user's answer says so on its run's row, ahead of any gate line
+     * (M132): terrastrike's t-1160 read "Verify gate passed" while it waited on a question.
+     */
+    {
+      const asked = sections(READY, TITLES, {}, { 't-14': 'May sim/sim_event.gd be added?' })
+      const lines = asked
+        .flatMap((section) => section.rows)
+        .flatMap((row) => (row.runs ?? [row]).map((r) => r.gate))
+        .filter((line) => typeof line === 'string')
+      eq(
+        lines.some((line) => line === 'Waiting for your answer: May sim/sim_event.gd be added?'),
+        true,
+        'the run row of a task with an open question says it waits for the user',
+      )
+      /*
+       * …and flags it, so the view can draw that line as a link to the Agents panel's Waiting
+       * tab (M132) without matching on its English. Only that row: a gate line is not a link.
+       */
+      const runs = asked.flatMap((section) => section.rows).flatMap((row) => row.runs ?? [row])
+      eq(
+        runs.filter((r) => r.asks === true).map((r) => r.run.task),
+        ['t-14'],
+        'exactly the run whose task carries the question is flagged `asks`',
+      )
+      eq(
+        sections(READY, TITLES)
+          .flatMap((section) => section.rows)
+          .flatMap((row) => row.runs ?? [row])
+          .some((r) => r.asks !== false),
+        false,
+        'with no questions, no run row is flagged',
+      )
+    }
     eq(sections(ROSTER_UNKNOWN, TITLES), [], 'and so does the boot state')
 
     const agentsSection = list.find((s) => s.kind === 'agents')

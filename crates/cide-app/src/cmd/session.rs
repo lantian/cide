@@ -663,8 +663,8 @@ const WORKER_PARAGRAPH: &str = "cide opened this session to implement one piece 
      session that opened you reviews the branch and merges it, so an uncommitted change is a \
      change nobody sees. You are the worker, not the product owner: you cannot dispatch or open \
      other sessions, and you do not merge. When the work is on this project's board, the \
-     `mcp__cide__cide_task_*` tools read and write it — comment on the task as you make \
-     decisions, and set it to `review` when you are done. Anything you notice that is not your \
+     `mcp__cide__cide_task_*` tools read and write it — leave one short report on the task when \
+     you are done (no progress comments), and set it to `review`. Anything you notice that is not your \
      work goes on the board as a new task with `inbox: true` rather than into this branch.";
 
 /// The sentence a console gets when the project has **nobody to dispatch to**. (M104)
@@ -821,16 +821,27 @@ fn roster_paragraph(
         "{authoring} Track the work itself with the `mcp__cide__cide_task_*` tools, which read and \
          write this project's shared task tracker at `.cide/tasks.json`: create the task before \
          you hand it to anybody, because a run is pointed at its task and reads the statement of \
-         the work from there. Anything you notice in passing — a defect, a gap, a piece of work \
-         something else turns out to need — goes on the board too, the moment you see it, \
-         rather than into whatever is in flight or this conversation, because a conversation \
-         ends and the board does not; but it goes to the **inbox** (status `inbox` — pass \
-         `inbox: true` to `mcp__cide__cide_task_create`), where noticed work waits and nothing \
-         starts it, and tasks the roles create land there by themselves. `todo` is for work you have decided the project does now. When the \
-         project has milestones (`mcp__cide__cide_milestones`), that means work towards the \
-         active one: link it `subtaskOf` the milestone's task, pull from the inbox only what \
-         its gate needs, and let the gate — a command cide runs, not your judgement — say when \
-         it is met. Assigning a todo or doing task to a role — with \
+         the work from there. Make each task one coherent piece of work with its steps in the \
+         body — one role builds a feature end to end, rather than a chain of small tasks for \
+         different roles — and give it `touches`, the file globs it will change. Anything you \
+         notice in passing — a defect, a gap, a piece of work something else turns out to need \
+         — goes on the board too, the moment you see it, rather than into whatever is in flight \
+         or this conversation, because a conversation ends and the board does not; but it goes \
+         to the **inbox** (status `inbox` — pass `inbox: true` to \
+         `mcp__cide__cide_task_create`), where noticed work waits and nothing starts it, and \
+         tasks the roles create land there by themselves. The inbox is outside every milestone: \
+         a task leaves it only when the user asks — or asks for something an inbox task already \
+         describes, and then you update that task, set it to todo and link it. `todo` is for \
+         work the project does now. When the project has milestones \
+         (`mcp__cide__cide_milestones`), that means work towards the active one: link it \
+         `subtaskOf` the milestone's task, keep the milestone's plan in that task's body, and \
+         let the gate — a command cide runs, not your judgement — say when it is met. Work whose \
+         quality is a matter of taste (art, the look of the UI) gets `acceptance: user`: cide \
+         merges it once verify is green and the user accepts it by eye; feature work uses \
+         placeholders for it. A decision about taste, scope or design is the user's: set \
+         `question` on the task and it waits for the answer instead of being guessed. Never \
+         rewrite the body of a task a run is working on — comment the correction or dispatch \
+         the role with it. Assigning a todo or doing task to a role — with \
          `mcp__cide__cide_task_assign` or `mcp__cide__cide_task_update`, by creating the task \
          with an assignee, or by @mentioning a role in a task's body or a comment — starts that \
          role on it automatically; `mcp__cide__cide_agent_dispatch` (a role and a task id, \
@@ -848,15 +859,18 @@ fn roster_paragraph(
          you need to read, and keep it clear of files you or another run are editing. A role \
          runs up to its `max-concurrent` tasks at once, each task in its own worktree on branch \
          `cide/<role>-<task>`, and the project caps concurrent runs{limits} — anything past a \
-         cap queues in order, so fan out across tasks and roles freely. A role on a model pool \
+         cap queues in order. Parallel work only helps on disjoint files: cide never starts two \
+         tasks whose `touches` overlap (the later one waits, and `mcp__cide__cide_agent_runs` \
+         says on what), and a task without `touches` runs alone. A role on a model pool \
          is capped by the pool too: each of its models may carry a running limit, counted \
          across every project on this machine, a run starts on the first model with room, and \
          it waits in the queue when every one is full. A run that starts moves its \
          task to doing; when the work is done it sets the task to review and comments what it \
          did. A run reports back only through that tracker, so read those comments, take work \
          you accept into this branch with `mcp__cide__cide_agent_integrate` — naming the task, \
-         which picks that task's branch — and set the task done, or comment what to change and \
-         hand it back. Watch runs with `mcp__cide__cide_agent_runs`; stop one going the wrong \
+         which picks that task's branch, or several as `tasks` to merge them with one verify — \
+         and set the task done, or comment what to change and hand it back. Unattended, cide \
+         gathers finished tasks into one review of its own. Watch runs with `mcp__cide__cide_agent_runs`; stop one going the wrong \
          way with `mcp__cide__cide_agent_stop`. When a run hands its turn back or ends, cide \
          types one line about it into a console pane, and `notify` on \
          `mcp__cide__cide_agent_dispatch` says which: `here` (this pane, the default), `main` \
@@ -1710,7 +1724,7 @@ pub(crate) async fn spawn_session(
     if let Some(root) = cide_git::worktree::root_of_checkout(&spec.cwd) {
         let isolated = cide_agents::config::load(&root)
             .agents
-            .isolated_env(&spec.cwd);
+            .worktree_env(&spec.cwd);
         spec = spec.apply(isolated);
     }
 
@@ -2219,6 +2233,10 @@ pub fn session_write(
     if !registry.accept_write(session, window.label(), epoch.as_deref(), seq) {
         tracing::debug!(%session, ?seq, ?epoch, window = window.label(), "session write: dropped a replayed frame");
         return Ok(());
+    }
+    // A submitted line typed by a person makes a tab cide opened theirs. (M132)
+    if data.contains('\r') {
+        crate::agent_rpc::note_typed(session);
     }
     s.write(data.into_bytes());
     Ok(())

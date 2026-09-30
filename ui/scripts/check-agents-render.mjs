@@ -2895,6 +2895,133 @@ try {
     eq(t('compose-filled').staged, 0, 'a dialog on a host that cannot pick draws no attachments row at all')
   }
 
+  /*
+   * M132's card rows, and the superseded report. `card-waiting` is the only story passing the
+   * three handlers, so the pair with `card` pins both halves: the rows exist where they are
+   * wired, and a card handed none of them is the card it was before M132.
+   *
+   * The superseded report is asserted as **present and folded**: it must still be in the log
+   * (the run said it; hiding it makes the log disagree with the conversation), under the
+   * "Superseded report" summary rather than printed as a live comment beside its replacement.
+   */
+  {
+    const waiting = t('card-waiting')
+    const text = waiting.text ?? ''
+    ok(text.includes('Keep the wooden handle, or match the iron tier?'), 'the open question is on the card')
+    ok(
+      text.includes('assets/sprites/tools/**') && text.includes('assets/atlas.json'),
+      'every glob the task touches is drawn',
+    )
+    ok(text.includes('Accepted by the user'), 'the acceptance row is drawn')
+    ok(text.includes('Superseded report'), 'the earlier report is folded under its own summary')
+    eq((waiting.comments ?? []).length, 2, 'and still in the log: both reports, neither dropped')
+    // The milestone picker (M132): drawn where it is wired, with every milestone offered.
+    ok(text.includes('Add to milestone'), 'a task under no milestone offers to add it to one')
+    // The card answers its own question (M132), not only the Waiting list.
+    ok(/\bAnswer\b/.test(text), 'a card with an open question offers an Answer button')
+    const plain = t('card').text ?? ''
+    for (const needle of [
+      'Touches',
+      'Accepted by the user',
+      'Superseded report',
+      'Question',
+      'Add to milestone',
+    ]) {
+      ok(!plain.includes(needle), `a card with no M132 handlers draws no ${needle}`)
+    }
+  }
+
+  /*
+   * *Waiting for you* is the Agents panel's tab (M132), not the Tasks panel's.
+   *
+   * It landed as a third Tasks tab and moved: what it lists is the far end of the runs the
+   * Agents panel draws, and a run row's question line links to it. Four halves, because each has
+   * its own way to regress quietly: the strip is drawn where it is wired and nowhere else; the
+   * Waiting tab renders under that same strip, rows and all; the run row's question is a link
+   * only when there is a tab to go to; and the Tasks panel's strip no longer offers the tab —
+   * a Tasks tab that drew nothing, or a second copy of the list, is the drift this pins.
+   */
+  {
+    const tabs = a('panel-tabs')
+    eq(
+      tabs.panelTabs,
+      ['subagents|true|Subagents', 'waiting|false|Waiting 2'],
+      'the Agents panel header carries Subagents (on) and Waiting, with its count',
+    )
+    ok(
+      (tabs.labels ?? []).includes('Waiting 2') || (tabs.buttons ?? []).includes('Waiting 2'),
+      'the Waiting tab is a real button',
+    )
+    eq(tabs.waitingLinks, 1, 'the run row’s "Waiting for your answer" line is a link to the Waiting tab')
+    ok(
+      (tabs.gates ?? []).includes('Waiting for your answer: May sim/sim_event.gd be added?'),
+      'and it still says the question',
+    )
+    eq(tabs.tabs.length, 2, 'the inner Agents/History pair is still drawn under the strip')
+
+    const plain = a('question-plain')
+    eq(plain.panelTabs, [], 'a panel with no strip wired draws none')
+    eq(plain.headerTitle, 'Agents', '…and is titled Agents, as before')
+    eq(plain.waitingLinks, 0, 'with no Waiting tab to go to, the question line is plain words')
+    ok(
+      (plain.gates ?? []).includes('Waiting for your answer: May sim/sim_event.gd be added?'),
+      '…which still say the question',
+    )
+    for (const name of Object.keys(agents)) {
+      if (name === 'panel-tabs' || name === 'waiting-panel') continue
+      eq(a(name).panelTabs, [], `${name}: no top-level strip without \`onPanelTab\``)
+    }
+
+    const waiting = a('waiting-panel')
+    eq(
+      waiting.panelTabs,
+      ['subagents|false|Subagents', 'waiting|true|Waiting 2'],
+      'the Waiting tab renders under the same strip, with Waiting on',
+    )
+    eq(waiting.waitingOpens, 2, 'both waiting tasks are listed, each a link to its card')
+    eq(waiting.waitingAccepts, 1, 'the task to accept offers Accept')
+    eq(waiting.waitingAnswers, 1, 'the question offers Answer')
+    ok(
+      (waiting.text ?? '').includes('Redrew the head at 16px, re-exported the atlas.'),
+      'a review row carries its latest report',
+    )
+    eq(waiting.unclassed, 0, 'every hooked element on the Waiting tab has a class that exists')
+
+    // The Tasks panel's strip, as source (it reads the milestones store, so it is not rendered
+    // here): two tabs, and no `waiting` anywhere in it or in the type it switches on.
+    const milestonesPanel = src('../src/sidebar/TasksPanel/MilestonesPanel.tsx')
+    const strip = milestonesPanel.slice(
+      milestonesPanel.indexOf('export function TasksTabs'),
+      milestonesPanel.indexOf('export function MilestonesPanel'),
+    )
+    ok(strip.includes("(['tasks', 'milestones'] as const)"), 'the Tasks panel draws Tasks and Milestones')
+    // `'waiting'` and the label, not the word: the proposals count says "waiting for you" too.
+    ok(
+      !/'waiting'|>\s*Waiting|'Waiting'|waitingCount/.test(strip),
+      'and no Waiting tab — it is the Agents panel’s',
+    )
+    const store = src('../src/sidebar/milestonesStore.ts')
+    ok(
+      /export type TasksTab = 'tasks' \| 'milestones'\s/.test(store),
+      '`TasksTab` has no `waiting` for a caller to ask for',
+    )
+    ok(
+      /setTab: \(tab\) => set\(\{ tab: tab === 'milestones' \? 'milestones' : 'tasks' \}\)/.test(store),
+      'and a stale ask for it falls back to the board',
+    )
+    const tasksHost = src('../src/sidebar/TasksPanel/TasksPanelHost.tsx')
+    ok(!/WaitingPanel|waitingFor|waitingCount/.test(tasksHost), 'the Tasks panel host no longer wires the list')
+    const agentsHost = src('../src/sidebar/AgentsPanel/AgentsPanelHost.tsx')
+    ok(
+      /<WaitingPanel[\s\S]*?onOpenTask=\{\(task\) => revealTask\(task, project\)\}/.test(agentsHost),
+      'the Agents panel host mounts it, opening a task the way a run row’s task link does',
+    )
+    ok(
+      /if \(panelTab !== 'waiting' \|\| project === null/.test(agentsHost),
+      'and reads reports only while the Waiting tab is showing',
+    )
+  }
+
   if (failed === 0) {
     console.log(
       `check-agents-render: ok (${Object.keys(agents).length} agents stories, ` +

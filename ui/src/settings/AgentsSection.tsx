@@ -90,6 +90,7 @@ import {
   type OverrideProfilesState,
   type ProjectId,
   type ProjectOverrides,
+  type ReviewMode,
 } from '@/ipc/client'
 import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
@@ -1047,7 +1048,104 @@ function AgentsEditor({ project }: { project: ProjectId }) {
               }
               value={config.reviewPrompt}
               placeholder="Use cide's own prompt"
+              reset="Reset to cide's prompt"
               onCommit={(next) => patchConfig({ reviewPrompt: next })}
+            />
+          )}
+          {config !== null && (
+            /*
+             * M132: how finished work reaches a reviewer. `batch` (the default) holds finished
+             * tasks until there are `reviewBatch` of them or the oldest has waited
+             * `reviewAfterSecs`, then opens one review over all of them — one reviewer reading
+             * three related diffs catches what three reviewers each reading one cannot, and
+             * spends a third of the start-up reading. `each` is the pre-M132 road: one review per
+             * run as it ends.
+             */
+            <SettingRow
+              label="Review finished work"
+              hint={
+                'In batches, finished tasks wait until there are enough of them, or the oldest ' +
+                'has waited long enough, and one review looks at all of them together. One by ' +
+                'one reviews each task as its run ends.'
+              }
+              control={
+                <Select
+                  label="Review finished work"
+                  value={config.review}
+                  options={REVIEW_MODES}
+                  onChange={(next) => patchConfig({ review: next })}
+                />
+              }
+            />
+          )}
+          {config !== null && config.review === 'batch' && (
+            <>
+              <SettingRow
+                label="Tasks per review"
+                hint="How many finished tasks open a batch review."
+                control={
+                  <NumberField
+                    label="Tasks per review"
+                    value={config.reviewBatch}
+                    min={1}
+                    max={50}
+                    onChange={(next) => patchConfig({ reviewBatch: Math.round(next) })}
+                  />
+                }
+              />
+              <SettingRow
+                label="Review after, seconds"
+                hint={
+                  'How long the oldest finished task waits before its batch is reviewed anyway, ' +
+                  'however few are in it. Between 60 and 86400.'
+                }
+                control={
+                  <NumberField
+                    label="Review after, seconds"
+                    value={config.reviewAfterSecs}
+                    /* Rust's clamp, `AgentsConfig::apply`, restated so a commit never snaps. */
+                    min={60}
+                    max={86400}
+                    onChange={(next) => patchConfig({ reviewAfterSecs: Math.round(next) })}
+                  />
+                }
+              />
+              <TextArea
+                label="What to tell the batch reviewer"
+                hint={
+                  'The first prompt for a batch review. Leave it empty to use the one cide ' +
+                  'ships. Line breaks become spaces when it is saved.'
+                }
+                value={config.batchReviewPrompt}
+                placeholder="Empty uses cide's default prompt"
+                reset="Reset to cide's prompt"
+                onCommit={(next) => patchConfig({ batchReviewPrompt: next })}
+              />
+            </>
+          )}
+          {config !== null && (
+            /*
+             * M132. A run that writes a 20 KB report into a comment makes the card unreadable
+             * and every later prompt that quotes the task longer. The cap applies only to a caller
+             * nobody is typing in (`tools.rs`, `CallerKind::reports`): the user and a console the
+             * user drives are never refused.
+             */
+            <SettingRow
+              label="Comment limit, characters"
+              hint={
+                'The longest comment a subagent run may post on a task. A longer one is refused ' +
+                'and the run is told to shorten it. You, and a console you type in, are never ' +
+                'limited. 0 turns the limit off.'
+              }
+              control={
+                <NumberField
+                  label="Comment limit, characters"
+                  value={config.commentLimit}
+                  min={0}
+                  max={100000}
+                  onChange={(next) => patchConfig({ commentLimit: Math.round(next) })}
+                />
+              }
             />
           )}
           {config !== null && (
@@ -1158,6 +1256,7 @@ function AgentsEditor({ project }: { project: ProjectId }) {
                 }
                 value={config.autoSpinPrompt}
                 placeholder="Use cide's own prompt"
+                reset="Reset to cide's prompt"
                 onCommit={(next) => patchConfig({ autoSpinPrompt: next })}
               />
             </>
@@ -1463,6 +1562,12 @@ function RoleList({
  * `tabindex="-1"` is excluded for the same reason it exists — it means "focusable, but not a tab
  * stop".
  */
+/** `ReviewMode`, in the order the select lists them: the default first. (M132) */
+const REVIEW_MODES: readonly { value: ReviewMode; label: string }[] = [
+  { value: 'batch', label: 'In batches' },
+  { value: 'each', label: 'One by one' },
+]
+
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
 

@@ -50,4 +50,13 @@ panes: number,
  * header keeps its wider reading: it has no badge for "asking" separate from its own chip's
  * tooltip, and the auto-spin timer shares its predicate.
  */
-tabs: Array<TabRunning>, };
+tabs: Array<TabRunning>, 
+/**
+ * Tasks waiting for the user (M132): an open `question`, or `acceptance: user` in review —
+ * the Agents panel's *Waiting* list. Carried here so a **background** project's tab can
+ * badge it too: the webview holds the board of the active project only, and this set is
+ * the one per-project fact every window already receives. Folded into the project tab's
+ * awaiting badge and into the OS title's `Awaiting: N`, beside the waiting sessions —
+ * both are "something here needs you".
+ */
+waiting: number, };

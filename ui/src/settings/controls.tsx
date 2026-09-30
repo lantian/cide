@@ -315,6 +315,7 @@ export function TextArea({
   placeholder,
   rows,
   onCommit,
+  reset,
 }: {
   label: string
   hint?: ReactNode
@@ -322,6 +323,13 @@ export function TextArea({
   placeholder?: string
   rows?: number
   onCommit: (next: string) => void
+  /**
+   * The label of a link under the box that commits `''` — for a prompt whose empty value means
+   * "cide's own" (M132). Drawn only while there is something to reset: selecting a
+   * several-hundred-character prompt to delete it was the only way back, and a stray keystroke
+   * left behind is a prompt that is neither yours nor cide's.
+   */
+  reset?: string | undefined
 }) {
   const [draft, setDraft] = useState<string | null>(null)
   const commit = (text: string) => {
@@ -350,6 +358,20 @@ export function TextArea({
         }}
       />
       {hint !== undefined && <span className={styles.fieldHint}>{hint}</span>}
+      {reset !== undefined && value !== '' && (
+        <span>
+          <Button
+            size="sm"
+            variant="link"
+            onClick={() => {
+              setDraft(null)
+              onCommit('')
+            }}
+          >
+            {reset}
+          </Button>
+        </span>
+      )}
     </label>
   )
 }

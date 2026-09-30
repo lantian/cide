@@ -124,6 +124,9 @@ import { MentionTextarea } from './MentionTextarea'
 import { LinkTargetInput } from './LinkTargetInput'
 import { TaskMarkdown } from './TaskMarkdown'
 import { AttachmentStrip, StagedChips } from './AttachmentStrip'
+import { AcceptanceField, QuestionField, TouchesField } from './TaskWaitFields'
+import { Disclosure } from '@/kit/components/Surface'
+import { Select } from '@/kit/components/Select'
 import { wantsImagePaste } from '@/editor/pasteImage'
 import { RequirementEditor } from '@/sidebar/OpenSpecPanel/RequirementEditor'
 import {
@@ -591,6 +594,13 @@ export interface TaskDetailProps {
   /** Open that milestone in the Tasks panel's Milestones tab. Absent draws the line inert. */
   onOpenMilestone?: ((milestone: string) => void) | undefined
   /**
+   * The milestones this task may be put under — those with a goal task (M132). With
+   * `onSetMilestone`, the card draws a picker; absent draws none, so older stories are unchanged.
+   */
+  milestoneChoices?: readonly { id: string; title: string }[] | undefined
+  /** Put the task under that milestone's goal, or take it out of its milestone (`null`). */
+  onSetMilestone?: ((milestone: string | null) => void) | undefined
+  /**
    * The task, **with its content**. (M68)
    *
    * A `TaskDetailView` rather than the board's `TaskView`, and the type is doing real work: the
@@ -744,6 +754,16 @@ export interface TaskDetailProps {
   onSetStatus?: ((task: string, status: TaskStatus) => void) | undefined
   onSetAssignee?: ((task: string, agent: string | null) => void) | undefined
   onSetBody?: ((task: string, body: string) => void) | undefined
+  /**
+   * M132's three writes: `TaskEdit::SetTouches`, `SetAcceptance`, `SetQuestion`. Each **absent
+   * draws no row** (Question excepted: a set question is drawn read-only without its handler),
+   * so every story written before M132 renders the card it always did. See `TaskWaitFields.tsx`.
+   */
+  onSetTouches?: ((task: string, touches: string[]) => void) | undefined
+  onSetAcceptance?: ((task: string, acceptance: 'user' | null) => void) | undefined
+  onSetQuestion?: ((task: string, question: string | null) => void) | undefined
+  /** Answer the task's open question (M132). See `QuestionField`. */
+  onAnswer?: ((task: string, text: string) => void) | undefined
   /**
    * A new comment — with, since M39, the files the composer had staged. The host lands text
    * alone through `TaskEdit::Comment` and text-with-files through `task_attach`'s `newComment`
@@ -1007,6 +1027,10 @@ export function TaskDetail(props: TaskDetailProps) {
     composerStaged = NO_STAGED,
     onComposerStaged,
     dropHot = null,
+    onSetTouches,
+    onSetAcceptance,
+    onSetQuestion,
+    onAnswer,
   } = props
 
   const chip = agentChip(task, runs, roles)
@@ -1216,6 +1240,38 @@ export function TaskDetail(props: TaskDetailProps) {
           </button>
         )}
         {/*
+          * Which milestone the task is under, as a picker (M132). Before, a task was put under a
+          * milestone only by a model (`cide_task_link subtaskOf` the goal), and the user who is the
+          * only one allowed to take a task out of the inbox had no gesture that did it and linked
+          * it — they had to ask the console, or drag the card to Todo and ask anyway. Not on the
+          * goal's own card: a milestone is not under itself.
+          */}
+        {props.onSetMilestone !== undefined &&
+          props.milestoneChoices !== undefined &&
+          props.milestoneChoices.length > 0 &&
+          props.milestone?.goal !== true && (
+            <div className={styles.milestonePick} data-audit="taskMilestonePick">
+              <span className={styles.milestoneLabel}>
+                {props.milestone == null ? 'Add to milestone' : 'Move to milestone'}
+              </span>
+              <Select
+                size="sm"
+                aria-label="Milestone"
+                value={props.milestone?.id ?? ''}
+                placeholder="No milestone"
+                options={[
+                  { value: '', label: 'No milestone' },
+                  ...props.milestoneChoices.map((m) => ({
+                    value: m.id,
+                    label: m.title === '' ? m.id : m.title,
+                    detail: m.id,
+                  })),
+                ]}
+                onChange={(value) => props.onSetMilestone?.(value === '' ? null : value)}
+              />
+            </div>
+          )}
+        {/*
           * Verify on this task's branch (M83) — the check cide runs before a model may merge the
           * work. Running is drawn turning; a verdict names the command and when, and a failure
           * opens onto its output, which is exactly the feedback the reviewer hands back.
@@ -1370,6 +1426,17 @@ export function TaskDetail(props: TaskDetailProps) {
           <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
         )}
         <FieldRow field="body" task={task} roles={roles} editing={editing} run={run} props={props} />
+
+        {/*
+          * M132's rows, under the body because each qualifies the work it states: the question
+          * it waits on first (it is why nothing is happening), then which files it may change,
+          * then who judges it. Each is withheld without its handler — `TaskWaitFields.tsx`.
+          */}
+        <QuestionField task={task} onSetQuestion={onSetQuestion} onAnswer={onAnswer} />
+        {onSetTouches !== undefined && <TouchesField task={task} onSetTouches={onSetTouches} />}
+        {onSetAcceptance !== undefined && (
+          <AcceptanceField task={task} onSetAcceptance={onSetAcceptance} />
+        )}
 
         {/*
           * Files on the body, as a section under it. (M39) Drawn when there are files, or when
@@ -1958,7 +2025,32 @@ export function TaskDetail(props: TaskDetailProps) {
             </p>
           ) : (
             <div className={styles.log} data-audit="tasksLog">
-              {comments.map((comment) => (
+              {comments.map((comment) =>
+                /*
+                 * A superseded report (M132) — a run's earlier report in the same turn, replaced
+                 * by a later one — folds to one line rather than leaving the log. Hidden, the log
+                 * would disagree with the run's own conversation; drawn in full, a reviewer reads
+                 * two reports and has to work out which one stands. No Edit or Delete on it: it is
+                 * a record of what was said, and the live report is the one to act on.
+                 */
+                comment.superseded ? (
+                  <div
+                    className={styles.logEntry}
+                    data-audit="tasksComment"
+                    data-author={comment.author.kind}
+                    data-superseded="true"
+                    key={comment.id}
+                  >
+                    <Disclosure
+                      title="Superseded report"
+                      aside={`${authorLabel(comment.author)} · ${clock(comment.atMs)}`}
+                    >
+                      <div className={styles.logText} data-audit="tasksCommentText">
+                        <TaskMarkdown text={comment.text} />
+                      </div>
+                    </Disclosure>
+                  </div>
+                ) : (
                 <div
                   className={styles.logEntry}
                   data-audit="tasksComment"
@@ -2134,7 +2226,8 @@ export function TaskDetail(props: TaskDetailProps) {
                     </>
                   )}
                 </div>
-              ))}
+                ),
+              )}
             </div>
           )}
         </div>

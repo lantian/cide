@@ -20,8 +20,8 @@ import { useContextMenu } from '@/menus'
 import { projectMenu } from '@/ipc/client'
 import type { Pane as GeneratedPane, SplitIntent, Tab as GeneratedTab } from '@/ipc/generated'
 import { useAwaitingInProject } from '@/panes/awaiting'
-import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
-import { useRunningInProject, useRunsInProject } from '@/panes/running'
+import { awaitingBadge, waitingHint } from '@/panes/awaitingRule'
+import { useRunningInProject, useRunsInProject, useWaitingTasksInProject } from '@/panes/running'
 import { runningBadge, runningHint } from '@/panes/runningRule'
 import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
@@ -395,9 +395,17 @@ function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItem
   // `tabs`/`detached` are optional on `ProjectTab` so a four-field measurement fixture still
   // satisfies it, and a header rendered from one simply has nothing waiting. `App.tsx` passes
   // the generated `Project` straight through, which carries both.
-  const waiting = useAwaitingInProject(project)
+  /*
+   * Waiting sessions **plus** tasks waiting for the user (M132) — one badge, because both are
+   * "something in this project needs you", and a second chip on a 34px tab would be one more
+   * mark to learn. The tasks come from Rust's per-project broadcast, so a background project's
+   * Waiting list badges its tab too; the tooltip tells the two apart.
+   */
+  const sessionsWaiting = useAwaitingInProject(project)
+  const tasksWaiting = useWaitingTasksInProject(project.id)
+  const waiting = sessionsWaiting + tasksWaiting
   const badge = awaitingBadge(waiting)
-  const hint = awaitingHint(waiting, 'project')
+  const hint = waitingHint(sessionsWaiting, tasksWaiting, 'project')
   // Keyed by **id**, and that is the whole difference from the three lines above: the awaiting
   // count is a fold over sessions held by panes in this window's tree, while this one is Rust's
   // answer over three registries and over panes that may be in no window at all. Which is also

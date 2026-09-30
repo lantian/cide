@@ -951,6 +951,11 @@ pub(crate) async fn dispatch_or_duplicate(
 ) -> Result<DispatchOutcome> {
     let project = request.project;
     let root = project_root(&state, project)?;
+    // New instructions for the pair: whatever it reports next is a new turn's report, not a
+    // superseding of the last one. (M132)
+    if let Some(task) = request.task.as_ref() {
+        crate::agent_rpc::new_turn(project, &request.agent, task);
+    }
     // `ensure` rather than `get`, for `cmd::tasks::tracker`'s reason: the restore loop warms a
     // store per project but that list is capped, and a project past the cap would otherwise be
     // undispatchable with nothing anywhere saying why.
@@ -1067,8 +1072,10 @@ pub(crate) async fn dispatch_or_duplicate(
         }
     };
     registry.mark_changed(&app, project);
-    // Returns at once; each admitted run starts on its own task.
-    registry.pump(&app);
+    // Returns at once; each admitted run starts on its own task. The path table is refreshed
+    // first, off this thread, so a run is never admitted on facts older than its own dispatch.
+    // (M132)
+    crate::agents::refresh_paths_and_pump(&app, project);
     Ok(match continued {
         Some(from) => DispatchOutcome::Continued { run, from },
         None => DispatchOutcome::Started { run, why },
@@ -1770,9 +1777,27 @@ pub(crate) fn task_refusal(root: &Path, store: &TaskStore, task: &Task) -> Optio
      */
     if task.status == cide_ipc::TaskStatus::Inbox {
         return Some(format!(
-            "{} is in the inbox, which is where noticed work waits until something needs it: \
-             move it to todo first (cide_task_update with status todo), then start it.",
+            "{} is in the inbox, which is where noticed work waits until the user decides it is \
+             work now: only the user moves a task out of the inbox — name it in your report, or \
+             ask the user.",
             task.id
+        ));
+    }
+
+    /*
+     * A task with an open question waits for the user's answer. (M132)
+     *
+     * The question is the run's or the planner's way of saying "the next step is a decision about
+     * taste, scope or design that is not mine". Starting the task again before the answer is the
+     * loop the planner used to spin on: the same role re-reads the same ambiguity and invents an
+     * answer. The Waiting-for-you list's answer box clears it and re-dispatches.
+     */
+    if let Some(question) = task.question.as_deref() {
+        return Some(format!(
+            "{} is waiting for the user's answer to its question (\"{}\"); it starts again when the \
+             user answers.",
+            task.id,
+            question.lines().next().unwrap_or_default()
         ));
     }
 
@@ -1934,20 +1959,21 @@ pub(crate) fn opening_prompt(
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = task {
         // The middle sentence is P4's checkpoint discipline (the preamble carries the durable
-        // copy; this is the copy that lands while the run is deciding what to do first): the
-        // plan comment is what proves the run is alive on the board, and per-step commits are
-        // what a death cannot erase — the debug report's runs died mid-turn leaving neither.
+        // copy; this is the copy that lands while the run is deciding what to do first):
+        // per-step commits are what a death cannot erase. It asked for a plan comment too until
+        // M132, which runs took as licence to narrate — `TRACKER_PREAMBLE`'s header has the
+        // numbers.
         // The closing clause is the done-workflow convention's opening half; the durable mirror
         // rides every run's system prompt in `cide_agents::harness::TRACKER_PREAMBLE`, and the
         // orchestrator's side of the loop is taught in `roster_paragraph`.
         parts.push(match tools {
             Some(harness) => format!(
                 "Work on task {} ({}). Read it with {get}, and record what you do \
-                 with the {bare} tools rather than by editing the tracker file. Comment your \
-                 plan on the task before you start, and commit each coherent step as you go — your \
-                 branch is the record that survives if this run dies. When the work \
-                 is complete, set the task's status to review with {update} and \
-                 leave a comment summarising what you did and where.",
+                 with the {bare} tools rather than by editing the tracker file; commit each \
+                 coherent step as you go — your branch is the record that survives if this run \
+                 dies — and do not comment while you work. When the work is complete, set the \
+                 task's status to review with {update} and leave one short comment saying what \
+                 you did and where.",
                 task.id,
                 one_line(&task.title),
                 get = harness.tool_name("cide_task_get"),
@@ -2322,6 +2348,9 @@ mod tests {
             created_unix_ms: 0,
             updated_unix_ms: 0,
             attachments: Vec::new(),
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 
@@ -2942,6 +2971,9 @@ mod tests {
             created_unix_ms: 0,
             updated_unix_ms: 0,
             attachments: Vec::new(),
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         };
 
         let prompt = opening_prompt(Some(&task), Some("and\nmind the\ttabs"), claude());
@@ -2971,12 +3003,13 @@ mod tests {
             prompt.contains("status to review with mcp__cide__cide_task_update"),
             "say how to hand the work back: {prompt}"
         );
-        // P4's checkpoint discipline, both halves: the plan comment that proves liveness, and
-        // the per-step commits that survive a mid-turn death. `TRACKER_PREAMBLE` carries the
-        // durable copy; this is the one that lands before the run's first decision.
+        // P4's checkpoint discipline: the per-step commits that survive a mid-turn death.
+        // `TRACKER_PREAMBLE` carries the durable copy; this is the one that lands before the
+        // run's first decision. The plan comment it asked for until M132 is now refused in
+        // words: runs took it as licence to narrate (the preamble's header has the numbers).
         assert!(
-            prompt.contains("Comment your plan"),
-            "ask for the plan comment: {prompt}"
+            prompt.contains("do not comment while you work"),
+            "no progress comments: {prompt}"
         );
         assert!(
             prompt.contains("commit each coherent step"),
@@ -3067,7 +3100,7 @@ mod tests {
         for prompt in [&by_claude, &by_opencode] {
             assert!(prompt.contains("t-9"), "{prompt}");
             assert!(prompt.contains("wire the thing"), "{prompt}");
-            assert!(prompt.contains("Comment your plan"), "{prompt}");
+            assert!(prompt.contains("do not comment while you work"), "{prompt}");
             assert!(!prompt.contains('\n'), "one line, always: {prompt}");
         }
     }
@@ -3247,6 +3280,21 @@ pub async fn milestones_accept(
 ) -> Result<Option<cide_ipc::MilestonesView>> {
     blocking(move || {
         crate::milestones::accept(&app, project).map_err(CoreError::Io)?;
+        Ok(crate::milestones::view(&app, project))
+    })
+    .await
+}
+
+/// Take the inbox tasks still linked into milestones out of them (M132): each `subtaskOf` becomes
+/// `related`. The Milestones tab's button. Answers the refreshed view.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn milestones_detach_inbox(
+    app: tauri::AppHandle,
+    project: ProjectId,
+) -> Result<Option<cide_ipc::MilestonesView>> {
+    blocking(move || {
+        crate::milestones::detach_inbox(&app, project, cide_ipc::TaskAuthor::User)
+            .map_err(CoreError::Io)?;
         Ok(crate::milestones::view(&app, project))
     })
     .await

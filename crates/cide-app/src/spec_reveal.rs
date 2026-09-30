@@ -122,6 +122,9 @@ mod tests {
             created_unix_ms: 0,
             updated_unix_ms: 0,
             attachments: Vec::new(),
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 

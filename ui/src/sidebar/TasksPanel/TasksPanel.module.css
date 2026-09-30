@@ -2183,6 +2183,15 @@ button.linkRowMain {
   border-color: var(--yellow);
 }
 
+/* The milestone picker under the line (M132): a label and the kit's Select, on one row. */
+.milestonePick {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-ui-12);
+}
+
 .milestoneLabel {
   flex: none;
   color: var(--faint);
@@ -2290,3 +2299,104 @@ button.linkRowMain {
   margin-left: auto;
 }
 
+
+/* --- M132: the card's Touches / Acceptance / Question rows, and Waiting for you. ------------ */
+
+/* The sentence under a row's head — what the switch above it means right now. */
+.fieldHint {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* One kit `Tag` per glob, wrapping: a long path list must not push the card sideways. */
+.touchTags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-1) 0;
+}
+
+/* A one-line editor with its buttons on the same line (the question, a send-back note). */
+.inlineEdit,
+.waitDraft {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.inlineEdit > :first-child,
+.waitDraft > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.waitDraft {
+  width: 100%;
+}
+
+.waitActions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.waitQuiet {
+  margin: 0;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+/* The run's report, one line: the row says what it is about; the card has the rest. */
+.waitReport {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The question is the whole point of its row: three lines of it, the rest in the dialog. */
+.waitQuestionWrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-1);
+  white-space: normal;
+}
+
+.waitQuestion {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  /* The kit's `itemMeta` slot is one clipped line (`nowrap` + ellipsis), and `white-space`
+   * inherits: without this the question drew as its first forty characters and an ellipsis,
+   * which on terrastrike's t-1160 cut off the actual question. */
+  white-space: normal;
+  line-height: 1.45;
+}
+
+.waitQuestionFull {
+  margin: 0 0 var(--sp-3);
+  color: var(--text);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* The card's answer box under an open question (M132): the box, then its button. */
+.questionAnswer {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.questionAnswer > :first-child {
+  width: 100%;
+}

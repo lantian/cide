@@ -142,14 +142,14 @@ pub use agents::{
     AgentDef, AgentRoster, AgentRun, DispatchRequest, ExternalWork, Harness, LlmLimitsProbe,
     LlmModelTest, LogRunInfo, OrchestrationConfig, OrchestrationPatch, PoolBench, PoolEntryState,
     PoolEntryStats, PoolEvent, PoolEventKind, PoolProviderState, PoolRefusal, PoolRunRef, PoolSkip,
-    PoolSkipped, PoolState, PoolStateReport, PoolStepRate, RunNotify, RunOpen, RunState,
-    SandboxNeed, TokenUsage,
+    PoolSkipped, PoolState, PoolStateReport, PoolStepRate, ReviewMode, RunNotify, RunOpen,
+    RunState, SandboxNeed, TokenUsage,
 };
 pub use tasks::{
-    ATTACHMENTS_DIR, ATTACHMENTS_LEAF, AttachTarget, AttachmentKind, LinkType, StagedFile,
-    TASKS_DIR_RELATIVE, Task, TaskAttachment, TaskAuthor, TaskBoard, TaskComment, TaskContent,
-    TaskDetail, TaskEdit, TaskFile, TaskLink, TaskLinkSpec, TaskNew, TaskRow, TaskStatus,
-    TaskStatusChange,
+    ATTACHMENTS_DIR, ATTACHMENTS_LEAF, Acceptance, AttachTarget, AttachmentKind, LinkType,
+    StagedFile, TASKS_DIR_RELATIVE, Task, TaskAttachment, TaskAuthor, TaskBoard, TaskComment,
+    TaskContent, TaskDetail, TaskEdit, TaskFile, TaskLink, TaskLinkSpec, TaskNew, TaskResponse,
+    TaskRow, TaskStatus, TaskStatusChange,
 };
 
 // --- M22: extensions, and the marketplaces they come from ---
@@ -791,6 +791,14 @@ pub struct ProjectRunning {
     /// header keeps its wider reading: it has no badge for "asking" separate from its own chip's
     /// tooltip, and the auto-spin timer shares its predicate.
     pub tabs: Vec<TabRunning>,
+    /// Tasks waiting for the user (M132): an open `question`, or `acceptance: user` in review —
+    /// the Agents panel's *Waiting* list. Carried here so a **background** project's tab can
+    /// badge it too: the webview holds the board of the active project only, and this set is
+    /// the one per-project fact every window already receives. Folded into the project tab's
+    /// awaiting badge and into the OS title's `Awaiting: N`, beside the waiting sessions —
+    /// both are "something here needs you".
+    #[serde(default)]
+    pub waiting: u32,
 }
 
 /// One tab's working consoles, inside [`ProjectRunning::tabs`].

@@ -740,6 +740,30 @@ pub struct OrchestrationConfig {
     /// default rule (absent: on only when the project already has a board or milestones). Off,
     /// agents are not told about the board and get none of its tools.
     pub tracker_enabled: bool,
+    /// `agents.review`: one review tab per finished run, or one for a batch. (M132)
+    pub review: ReviewMode,
+    /// `agents.reviewBatch`: how many finished tasks open a batch review. (M132)
+    pub review_batch: u8,
+    /// `agents.reviewAfterSecs`: how long the oldest waits before a batch opens anyway. (M132)
+    pub review_after_secs: u32,
+    /// What a batch review tab is told, a template with `{tasks}`; empty means cide's own. (M132)
+    pub batch_review_prompt: String,
+    /// `agents.commentLimit`: characters per comment from a caller nobody is typing in; `0` is
+    /// no limit. (M132)
+    pub comment_limit: u32,
+}
+
+/// How finished work reaches a reviewer. (M132) `cide_agents::config::AgentsConfig::review`
+/// carries the argument for batches being the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ReviewMode {
+    /// One review tab for several finished tasks, merged behind one verify.
+    #[default]
+    Batch,
+    /// One review tab per finished run, as before M132.
+    Each,
 }
 
 impl Default for OrchestrationConfig {
@@ -762,6 +786,11 @@ impl Default for OrchestrationConfig {
             verify_retries: 3,
             resume_after_restart: true,
             tracker_enabled: false,
+            review: ReviewMode::Batch,
+            review_batch: 3,
+            review_after_secs: 600,
+            batch_review_prompt: String::new(),
+            comment_limit: 1500,
         }
     }
 }
@@ -824,6 +853,21 @@ pub struct OrchestrationPatch {
     /// tool, `enabled`'s reason: a model must not switch its own board back on.
     #[ts(optional)]
     pub tracker_enabled: Option<bool>,
+    /// `agents.review`. (M132)
+    #[ts(optional)]
+    pub review: Option<ReviewMode>,
+    /// `agents.reviewBatch`, clamped to at least 1 by `AgentsConfig::apply`. (M132)
+    #[ts(optional)]
+    pub review_batch: Option<u8>,
+    /// `agents.reviewAfterSecs`, clamped by `AgentsConfig::apply`. (M132)
+    #[ts(optional)]
+    pub review_after_secs: Option<u32>,
+    /// Flattened to one line by `AgentsConfig::apply`, `review_prompt`'s reason. (M132)
+    #[ts(optional)]
+    pub batch_review_prompt: Option<String>,
+    /// `agents.commentLimit`. (M132)
+    #[ts(optional)]
+    pub comment_limit: Option<u32>,
 }
 
 /// Dispatch one run. Inbound.

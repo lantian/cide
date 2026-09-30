@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+globset = { workspace = true }
 cide-ipc = { workspace = true }
 # `child_env` for `terminal_child_env`, `arm` and `signal_group`; `claude_cli` for the launch
 # filter and the `--append-system-prompt` fold. Every spawn site in the workspace passes through

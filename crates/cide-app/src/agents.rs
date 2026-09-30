@@ -1321,6 +1321,21 @@ struct Inner {
     /// comes (a killed child) is overwritten by that session's next start and otherwise costs a
     /// few bytes until the process ends.
     step_started: HashMap<(RunId, String), u64>,
+    /// Per project, which paths each task declares and which are held by work in flight — the
+    /// facts admission's path gate reads. (M132) Refreshed off the lock by [`refresh_paths`],
+    /// because the files a branch changed are a `git` question; absent for a project nobody has
+    /// refreshed yet, which gates nothing.
+    paths: HashMap<ProjectId, PathTable>,
+}
+
+/// What one project's path gate knows. (M132) See [`refresh_paths`].
+#[derive(Debug, Clone, Default)]
+struct PathTable {
+    /// Every open task's `touches`.
+    touches: HashMap<TaskId, Vec<String>>,
+    /// Tasks whose work is in flight — a run is on them, or their branch holds unmerged work —
+    /// and what each holds.
+    holds: Vec<(TaskId, cide_agents::paths::Held)>,
 }
 
 /// How many pool events [`Inner::pool_events`] keeps. Enough for an afternoon's dispatches to be
@@ -1866,20 +1881,65 @@ fn pool_full_note(inner: &Inner, pool: &[cide_ipc::PoolEntry], from: usize) -> S
     format!("every model in its pool is at its running limit ({each}); starts when one frees")
 }
 
+/// Why `run` must wait for paths another task holds, as its queue note — or `None`. (M132)
+///
+/// A run with no task stands in the project root (M40) and is not gated; a project whose table
+/// was never refreshed gates nothing, which is the behaviour before M132.
+fn path_wait(inner: &Inner, run: &RunId) -> Option<String> {
+    let live = inner.runs.get(run)?;
+    let task = live.task.as_ref()?;
+    let table = inner.paths.get(&live.project)?;
+    let touches = table.touches.get(task).cloned().unwrap_or_default();
+    // A task another run of the same pair is finishing holds nothing against itself.
+    table
+        .holds
+        .iter()
+        .filter(|(holder, _)| holder != task)
+        .find_map(|(holder, held)| {
+            cide_agents::paths::conflict(&touches, held)
+                .map(|what| format!("waiting: {holder} holds {what}"))
+        })
+}
+
 /// One pass of the admission scan: at most one run per agent, oldest dispatch first.
 fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>, noted: &mut Vec<ProjectId>) {
     let now = now_unix_ms();
     {
         // Dispatch order across the whole registry, so an agent that has been waiting longer
         // wins the project's last slot.
+        // The front of each role's queue — **past any run the path gate holds** (M132). A run
+        // waiting on another task's paths must not stall its role's later work that touches
+        // something else; among the runs that may start, the oldest still goes first.
         let mut fronts: Vec<(u64, RunId, AgentKey)> = inner
             .queues
             .iter()
             .filter_map(|(key, queue)| {
-                let run = *queue.front()?;
+                let run = queue
+                    .iter()
+                    .copied()
+                    .find(|run| path_wait(inner, run).is_none())
+                    .or_else(|| queue.front().copied())?;
                 Some((inner.runs.get(&run)?.seq, run, key.clone()))
             })
             .collect();
+        // Every path-held run says so on its row, whether or not it was the front.
+        let held: Vec<(RunId, String)> = inner
+            .queues
+            .values()
+            .flatten()
+            .filter_map(|run| path_wait(inner, run).map(|note| (*run, note)))
+            .collect();
+        for (run, note) in held {
+            if let Some(live) = inner.runs.get_mut(&run)
+                && live.note.as_deref() != Some(note.as_str())
+            {
+                let project = live.project;
+                live.note = Some(note);
+                if !noted.contains(&project) {
+                    noted.push(project);
+                }
+            }
+        }
         fronts.sort_by_key(|(seq, _, _)| *seq);
 
         for (_, run, key) in fronts {
@@ -1949,11 +2009,26 @@ fn admit_a_pass(inner: &mut Inner, admitted: &mut Vec<Admission>, noted: &mut Ve
             if occupied {
                 continue;
             }
+            // The path gate (M132): a run whose task's `touches` meet what another task in
+            // flight holds waits, and its row says who holds what. Two branches editing one file
+            // in parallel is the conflict a worktree cannot prevent; waiting here costs minutes,
+            // a conflict at the merge costs a second round of the whole task.
+            if let Some(note) = path_wait(inner, &run) {
+                let live = inner.runs.get_mut(&run).expect("just read above");
+                if live.note.as_deref() != Some(note.as_str()) {
+                    live.note = Some(note);
+                    if !noted.contains(&project) {
+                        noted.push(project);
+                    }
+                }
+                continue;
+            }
 
             inner.agent_slots.insert(key.clone(), agent_held + 1);
             inner.project_slots.insert(project, project_held + 1);
             if let Some(queue) = inner.queues.get_mut(&key) {
-                queue.pop_front();
+                // Not always the front since the path gate may skip past it. (M132)
+                queue.retain(|queued| *queued != run);
             }
             let live = inner.runs.get_mut(&run).expect("just read above");
             // The edge that opens the worked clock: everything before this was queue, and the
@@ -2612,9 +2687,10 @@ fn wind_down_prompt(
     };
     let report = match (task, tools) {
         (Some(id), Some(harness)) => format!(
-            " Post one final comment on task {id} with {} saying what you finished, what you \
-             were part-way through, and anything you learned that is not written down anywhere \
-             yet — then exit.",
+            " Post one final comment on task {id} with {} — at most ten short lines — saying \
+             what you finished, what you were part-way through, and anything you learned that is \
+             not written down anywhere yet; it supersedes any report you left this turn. Then \
+             exit.",
             harness.tool_name("cide_task_comment")
         ),
         // A task it cannot comment on is a task it can still be told about; the useful half of
@@ -6814,6 +6890,11 @@ struct Started {
 
 impl AgentRegistry {
     /// Start every run the queue will admit. Returns at once; each start runs on its own task.
+    /// Replace one project's path table. (M132) See [`refresh_paths`].
+    fn set_paths(&self, project: ProjectId, table: PathTable) {
+        self.inner.lock().paths.insert(project, table);
+    }
+
     pub fn pump(self: &Arc<Self>, app: &AppHandle) {
         let (admitted, noted) = self.take_admissions_noting();
         for project in noted {
@@ -8237,7 +8318,7 @@ fn start_child(
     // MR review is nobody's branch to verify. `milestones::before_integrate` calls the same
     // function on the same path, so the verify of this branch sees these very directories.
     let isolated = if in_worktree {
-        project.config.agents.isolated_env(&cwd)
+        project.config.agents.worktree_env(&cwd)
     } else {
         Vec::new()
     };
@@ -8872,11 +8953,17 @@ pub fn note_hook(app: &AppHandle, session: &str, frame: &HookFrame) {
 /// Both halves are cheap and neither does the work itself: `mark_changed` parks the emit on the
 /// coalescer, and `pump` takes the admissions under one lock and spawns a task per run.
 pub(crate) fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, run: RunId) {
-    if let Some(project) = registry.project_of(run) {
+    let project = registry.project_of(run);
+    if let Some(project) = project {
         registry.mark_changed(app, project);
     }
     registry.retire_server(run);
     registry.pump(app);
+    // What this run holds may have changed with it, and a run waiting on its paths may be free
+    // now. (M132)
+    if let Some(project) = project {
+        refresh_paths_and_pump(app, project);
+    }
     // A run that has ended may have been the last thing standing in a checkout whose branch was
     // already taken — the ordinary order is "the run hands its turn back, the orchestrator
     // integrates, the run is wound down", and at the integrate the idle child still held the
@@ -8884,6 +8971,109 @@ pub(crate) fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, r
     if let Some((project, name)) = registry.ended_checkout(run) {
         retire_worktree(app, registry, project, name);
     }
+}
+
+/// Recompute one project's path table from the board and the checkouts, then admit what it
+/// frees. (M132) Off the calling thread: the files a branch changed are `git` questions.
+///
+/// Called whenever what is in flight can have moved — a board change (`tasks_state::broadcast`),
+/// a run's transition, a dispatch — so admission reads facts no older than the last of those.
+pub(crate) fn refresh_paths_and_pump(app: &AppHandle, project: ProjectId) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+            return;
+        };
+        let registry = Arc::clone(&registry);
+        if let Some(table) = path_table(&app, &registry, project) {
+            registry.set_paths(project, table);
+        }
+        registry.pump(&app);
+    });
+}
+
+/// The path table as the board and the checkouts say it is now. (M132)
+///
+/// **Held** is every task a run is on (starting, running, waiting on a permission, paused, or
+/// idle having handed a turn back), and every task in doing or review whose branch or checkout
+/// holds changes — the declaration plus the files actually changed, so a run that strayed
+/// outside its `touches` still holds what it touched.
+fn path_table(
+    app: &AppHandle,
+    registry: &Arc<AgentRegistry>,
+    project: ProjectId,
+) -> Option<PathTable> {
+    let workspace = app.try_state::<crate::workspace_state::WorkspaceState>()?;
+    let root = crate::tasks_state::project_root(&workspace, project).ok()?;
+    let store = app
+        .try_state::<Arc<crate::tasks_state::TasksStores>>()?
+        .get(project)?;
+    let rows = store.list();
+    let mut table = PathTable::default();
+    for row in rows
+        .iter()
+        .filter(|r| r.status != cide_ipc::TaskStatus::Done)
+    {
+        table.touches.insert(row.id.clone(), row.touches.clone());
+    }
+    let runs = registry.runs_for(project);
+    let mut seen: Vec<TaskId> = Vec::new();
+    let mut candidates: Vec<(TaskId, AgentId, bool)> = Vec::new();
+    for run in &runs {
+        let live = matches!(
+            run.state,
+            RunState::Starting
+                | RunState::Running
+                | RunState::AwaitingPermission
+                | RunState::Paused { .. }
+                | RunState::Idle
+        );
+        if let (true, Some(task)) = (live, run.task.as_ref())
+            && !seen.contains(task)
+        {
+            seen.push(task.clone());
+            candidates.push((task.clone(), run.agent.clone(), true));
+        }
+    }
+    for row in rows.iter().filter(|r| {
+        matches!(
+            r.status,
+            cide_ipc::TaskStatus::Doing | cide_ipc::TaskStatus::Review
+        )
+    }) {
+        if let Some(agent) = row.agent.as_ref()
+            && !seen.contains(&row.id)
+        {
+            seen.push(row.id.clone());
+            candidates.push((row.id.clone(), agent.clone(), false));
+        }
+    }
+    for (task, agent, live) in candidates {
+        let name = cide_agents::checkout_name(&agent, Some(&task));
+        let mut files =
+            crate::milestones::changed_paths(&root, &format!("cide/{name}")).unwrap_or_default();
+        let checkout = cide_git::worktree::path_of(&root, &name);
+        if checkout.is_dir() {
+            for file in crate::milestones::dirty_paths(&checkout) {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
+            }
+        }
+        // A task in doing or review with nothing on its branch holds nothing yet.
+        if !live && files.is_empty() {
+            continue;
+        }
+        let touches = rows
+            .iter()
+            .find(|r| r.id == task)
+            .map(|r| r.touches.clone())
+            .unwrap_or_default();
+        table
+            .holds
+            .push((task, cide_agents::paths::Held { touches, files }));
+    }
+    Some(table)
 }
 
 /// Remove a task's worktree once its work has landed and nothing is standing in it. (M89)
@@ -11543,6 +11733,59 @@ mod tests {
     /// the same checkout, which since M40 means the same task twice (a run with no task takes
     /// no checkout at all — `spec()`'s `checkout: None` — and `a_role_with_room_for_three`
     /// is the test that such runs are held by nothing but the limits).
+    /// (M132) The path gate: a task whose `touches` meet what another task in flight holds waits
+    /// with a note naming the holder; a disjoint one starts beside it; and a waiting run does not
+    /// stall its own role's later, disjoint work.
+    #[test]
+    fn overlapping_touches_wait_and_disjoint_ones_run() {
+        let on_task = |project, agent: &str, task: &str| DispatchSpec {
+            task: Some(TaskId(task.into())),
+            checkout: Some(format!("{agent}-{task}")),
+            ..spec(project, agent, 3, 8)
+        };
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut table = PathTable::default();
+        let globs = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        table
+            .touches
+            .insert(TaskId("t-2".into()), globs(&["tools/spritegen/render.py"]));
+        table
+            .touches
+            .insert(TaskId("t-3".into()), globs(&["art/mobs/boar/"]));
+        table.holds.push((
+            TaskId("t-1".into()),
+            cide_agents::paths::Held {
+                touches: globs(&["tools/spritegen/"]),
+                files: Vec::new(),
+            },
+        ));
+        registry.set_paths(project, table);
+
+        let blocked = registry.enqueue(on_task(project, "artist", "t-2"));
+        let free = registry.enqueue(on_task(project, "artist", "t-3"));
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1, "only the disjoint one starts");
+        assert_eq!(
+            admitted[0].run, free,
+            "past the held front of the same role's queue"
+        );
+        assert_eq!(state_of(&registry, blocked), RunState::Queued);
+        let note = registry
+            .runs_for(project)
+            .into_iter()
+            .find(|r| r.run == blocked)
+            .and_then(|r| r.note)
+            .expect("says why");
+        assert!(note.contains("t-1 holds tools/spritegen"), "{note}");
+
+        // The holder's work lands: nothing is held, and the waiting run starts.
+        registry.set_paths(project, PathTable::default());
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, blocked);
+    }
+
     #[test]
     fn two_tasks_parallelise_and_one_checkout_serialises() {
         let with_checkout = |project, name: Option<&str>| DispatchSpec {

@@ -522,6 +522,198 @@ pub fn integrate(root: &Path, agent: &str) -> Result<Integration> {
     })
 }
 
+/// Several agent branches merged together **without moving anything**. (M132)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Composed {
+    /// The project's `HEAD` the merges started from.
+    pub base: String,
+    /// The combined commit — `None` when every branch was already in or refused.
+    pub head: Option<String>,
+    /// The agents whose branches are in `head`, in order.
+    pub merged: Vec<String>,
+    /// The agents whose branches had nothing `base` lacked.
+    pub up_to_date: Vec<String>,
+    /// The agents whose branches conflicted with what came before them, with the paths. Skipped;
+    /// the ones after them were still tried.
+    pub conflicts: Vec<(String, Vec<String>)>,
+}
+
+/// Merge `cide/<agent>` for each of `agents`, in order, on top of the project's `HEAD` —
+/// **in memory, moving no ref and touching no file**. (M132)
+///
+/// A batch review merges three or four finished branches and verifies the result once. Doing
+/// that with [`integrate`] would move the user's branch after the first merge, before anything
+/// verified the combination; this computes the whole chain the way `integrate` computes one
+/// merge (`merge_commits`, `has_conflicts`, `write_tree_to`), writes the merge commits as
+/// unreferenced objects, and hands back the head. The caller verifies that head in a scratch
+/// checkout and only then moves the branch with [`advance_to`]. A red verify moves nothing, and
+/// the unreferenced commits are what `git gc` collects.
+///
+/// A branch that conflicts with the chain so far is skipped and named, and the rest still go:
+/// one bad branch must not hold three good ones back.
+pub fn compose_merges(root: &Path, agents: &[&str]) -> Result<Composed> {
+    let root = repo_mod::canonical(root);
+    let repo = repo_mod::open(&root)?;
+    if let Some(operation) = repo_mod::operation_in_progress(&repo) {
+        return Err(GitError::OperationInProgress { operation });
+    }
+    if repo.head_detached().unwrap_or(false) {
+        let head = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .map(|o| o.to_string());
+        return Err(GitError::DetachedHead {
+            head: head.unwrap_or_default().chars().take(8).collect(),
+        });
+    }
+    let base = repo
+        .head()
+        .map_err(|_| GitError::Unborn)?
+        .peel_to_commit()
+        .wrap()?;
+    let head_name = repo
+        .head()
+        .ok()
+        .and_then(|h| h.shorthand().map(str::to_owned).ok())
+        .unwrap_or_else(|| "HEAD".to_string());
+    let signature = repo
+        .signature()
+        .or_else(|_| git2::Signature::now("cide", "cide@localhost"))
+        .wrap()?;
+    let mut out = Composed {
+        base: base.id().to_string(),
+        ..Composed::default()
+    };
+    let mut current = base.clone();
+    for agent in agents {
+        validate_agent(agent)?;
+        let name = branch_name(agent);
+        let theirs = repo
+            .find_branch(&name, BranchType::Local)
+            .map_err(|_| GitError::NoSuchBranch { name: name.clone() })?
+            .into_reference()
+            .peel_to_commit()
+            .wrap()?;
+        if theirs.id() == current.id()
+            || repo.graph_descendant_of(current.id(), theirs.id()).wrap()?
+        {
+            if current.id() == base.id() {
+                out.up_to_date.push((*agent).to_string());
+            } else {
+                // In because an earlier branch of the batch already carried it.
+                out.merged.push((*agent).to_string());
+            }
+            continue;
+        }
+        if repo.graph_descendant_of(theirs.id(), current.id()).wrap()? {
+            current = theirs;
+            out.merged.push((*agent).to_string());
+            continue;
+        }
+        let mut index = repo.merge_commits(&current, &theirs, None).wrap()?;
+        if index.has_conflicts() {
+            out.conflicts
+                .push(((*agent).to_string(), repo_mod::conflicts_of(&index)?));
+            continue;
+        }
+        let tree_id = index.write_tree_to(&repo).wrap()?;
+        let tree = repo.find_tree(tree_id).wrap()?;
+        let message = format!("Merge {name} into {head_name}");
+        let id = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&current, &theirs],
+            )
+            .wrap()?;
+        current = repo.find_commit(id).wrap()?;
+        out.merged.push((*agent).to_string());
+    }
+    if current.id() != base.id() {
+        out.head = Some(current.id().to_string());
+    }
+    Ok(out)
+}
+
+/// Move the project's checked-out branch from `base` to `head` — a commit [`compose_merges`]
+/// built on top of it — tree first, then the ref, with a `SAFE` checkout. (M132)
+///
+/// Refused when the branch is no longer at `base`: somebody committed or merged while the batch
+/// verified, and moving the ref now would drop their commit. The caller composes again.
+pub fn advance_to(root: &Path, base: &str, head: &str) -> Result<usize> {
+    let root = repo_mod::canonical(root);
+    let repo = repo_mod::open(&root)?;
+    if let Some(operation) = repo_mod::operation_in_progress(&repo) {
+        return Err(GitError::OperationInProgress { operation });
+    }
+    let mut reference = repo.head().map_err(|_| GitError::Unborn)?;
+    let ours = reference.peel_to_commit().wrap()?;
+    if ours.id().to_string() != base {
+        return Err(GitError::Io {
+            detail: format!(
+                "the branch moved while the batch was verified (it was at {}, it is at {}); \
+                 nothing was merged",
+                &base[..base.len().min(8)],
+                &ours.id().to_string()[..8]
+            ),
+        });
+    }
+    let target = repo.find_commit(git2::Oid::from_str(head).wrap()?).wrap()?;
+    let ours_tree = ours.tree().wrap()?;
+    let tree = target.tree().wrap()?;
+    checkout(&repo, &tree)?;
+    let files = changed(&repo, &ours_tree, &tree)?;
+    reference
+        .set_target(target.id(), "cide: merge a reviewed batch")
+        .wrap()?;
+    Ok(files)
+}
+
+/// A scratch checkout of `commit` at `.cide/worktrees/<name>`, on a branch `cide/<name>` forced to
+/// it — where a combined head is verified before anything moves. (M132) Any previous checkout by
+/// that name is removed first: it is cide's scratch, never a run's.
+pub fn scratch_at(root: &Path, name: &str, commit: &str) -> Result<PathBuf> {
+    validate_agent(name)?;
+    let root = repo_mod::canonical(root);
+    remove(&root, name)?;
+    let repo = repo_mod::open(&root)?;
+    let target = repo
+        .find_commit(git2::Oid::from_str(commit).wrap()?)
+        .wrap()?;
+    repo.branch(&branch_name(name), &target, true).wrap()?;
+    Ok(ensure(&root, name)?.path)
+}
+
+/// The subjects of the commits on `HEAD` since `from` (exclusive), newest first, at most
+/// `limit` — "what landed since the last plan", for the planner's facts. (M132) Empty when
+/// `from` is unknown to this repository.
+pub fn subjects_since(root: &Path, from: &str, limit: usize) -> Result<Vec<String>> {
+    let repo = repo_mod::open(&repo_mod::canonical(root))?;
+    let Ok(from) = git2::Oid::from_str(from) else {
+        return Ok(Vec::new());
+    };
+    if repo.find_commit(from).is_err() {
+        return Ok(Vec::new());
+    }
+    let mut walk = repo.revwalk().wrap()?;
+    walk.push_head().wrap()?;
+    walk.hide(from).wrap()?;
+    let mut out = Vec::new();
+    for id in walk.take(limit) {
+        let commit = repo.find_commit(id.wrap()?).wrap()?;
+        let short: String = commit.id().to_string().chars().take(8).collect();
+        out.push(format!(
+            "{short} {}",
+            commit.summary().ok().flatten().unwrap_or_default()
+        ));
+    }
+    Ok(out)
+}
+
 /// How many commits `cide/<agent>` has that the project's `HEAD` does not, or `None` when there
 /// is no such branch or everything on it is already in.
 ///
@@ -1490,6 +1682,43 @@ mod tests {
             git(&root, &["status", "--porcelain", "--untracked-files=no"]),
             "",
             "and the index came with it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Three branches, one conflicting with an earlier one: the other two compose, nothing moves
+    /// until `advance_to`, and the scratch checkout holds the combined head. (M132)
+    #[test]
+    fn a_batch_composes_in_memory_and_skips_the_conflict() {
+        let root = project("batch");
+        let a = ensure(&root, "dev-t-1").expect("ensure");
+        commit(&a.path, "a.txt", "a\n", "a");
+        let b = ensure(&root, "dev-t-2").expect("ensure");
+        commit(&b.path, "b.txt", "b\n", "b");
+        let c = ensure(&root, "dev-t-3").expect("ensure");
+        commit(&c.path, "a.txt", "not a\n", "c");
+        let before = head_of(&root);
+
+        let composed = compose_merges(&root, &["dev-t-1", "dev-t-2", "dev-t-3"]).expect("compose");
+        assert_eq!(composed.base, before);
+        assert_eq!(composed.merged, ["dev-t-1", "dev-t-2"]);
+        assert_eq!(composed.conflicts.len(), 1, "{composed:?}");
+        assert_eq!(composed.conflicts[0].0, "dev-t-3");
+        assert_eq!(head_of(&root), before, "composing moves nothing");
+        assert!(!root.join("a.txt").exists());
+
+        let head = composed.head.expect("a combined head");
+        let scratch = scratch_at(&root, "batch-verify", &head).expect("scratch");
+        assert!(scratch.join("a.txt").is_file() && scratch.join("b.txt").is_file());
+
+        let files = advance_to(&root, &composed.base, &head).expect("advance");
+        assert_eq!(files, 2);
+        assert_eq!(head_of(&root), head);
+        assert!(root.join("b.txt").is_file());
+        assert!(
+            advance_to(&root, &composed.base, &head).is_err(),
+            "a branch that moved since the compose is refused"
         );
 
         let _ = std::fs::remove_dir_all(&root);

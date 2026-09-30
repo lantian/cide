@@ -428,15 +428,15 @@ fn announce_met(
     // rest of the feature did not keep; the reader believed it and went looking for a button
     // that was not there.
     let rows = store.list();
-    let left = cide_agents::milestones::open_under(&rows, task)
-        + cide_agents::milestones::inbox_under(&rows, task);
+    // Open work only since M132: an inbox row under the goal is a legacy link, not part of the
+    // milestone, and holds nothing.
+    let left = cide_agents::milestones::open_under(&rows, task);
     let stands = if left == 0 {
         "It stays in review until you accept it in the Milestones tab of the Tasks panel; until \
          then cide does not wake this project to plan more."
     } else {
-        "Tasks under it are not finished, though — some are still open, or waiting in its inbox \
-         for somebody to decide — so this is not done: cide keeps planning, and Accept is not \
-         offered until the board under this goal is clear."
+        "Tasks under it are not finished, though — some are still open — so this is not done: \
+         cide keeps planning, and Accept is not offered until they are."
     };
     let text = format!(
         "**cide: the gate for milestone `{}` passes.** {stands}\n\n\
@@ -464,6 +464,50 @@ fn announce_met(
 }
 
 /// The user accepts the active milestone: its task is done and the next one becomes active.
+/// Take every inbox task out of the milestones it is still linked into — boards written before
+/// M132 have dozens — by turning its `subtaskOf` into `related`. (M132) Answers `(task, parent)`
+/// for each link it changed. The one body of the Milestones tab's button and the console's
+/// `cide_milestones detachInbox`, so the two cannot disagree about what "legacy" means.
+pub fn detach_inbox(
+    app: &AppHandle,
+    project: ProjectId,
+    by: TaskAuthor,
+) -> Result<Vec<(cide_ipc::TaskId, cide_ipc::TaskId)>, String> {
+    let root = root_of(app, project).ok_or("that project is not open")?;
+    let store = app
+        .try_state::<Arc<TasksStores>>()
+        .map(|stores| stores.ensure(project, &root))
+        .ok_or("the task tracker is not available")?;
+    let plan = cide_agents::config::load_milestones(&root);
+    let links = cide_agents::milestones::legacy_inbox_links(&plan, &store.list());
+    for (task, parent) in &links {
+        store
+            .edit(
+                task,
+                cide_ipc::TaskEdit::Unlink {
+                    link: cide_ipc::LinkType::SubtaskOf,
+                    target: parent.clone(),
+                },
+                by.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        // `related` may already be there, which is the answer we want anyway.
+        let _ = store.edit(
+            task,
+            cide_ipc::TaskEdit::Link {
+                link: cide_ipc::LinkType::Related,
+                target: parent.clone(),
+            },
+            by.clone(),
+        );
+    }
+    if !links.is_empty() {
+        crate::tasks_state::broadcast(app, project, &store);
+        crate::emit::milestones_changed(app, project);
+    }
+    Ok(links)
+}
+
 pub fn accept(app: &AppHandle, project: ProjectId) -> Result<(), String> {
     let root = root_of(app, project).ok_or("that project is not open")?;
     let mut plan = cide_agents::config::load_milestones(&root);
@@ -547,6 +591,8 @@ pub fn set_plan(
                 change: None,
                 links: None,
                 attachments: None,
+                acceptance: None,
+                touches: None,
             };
             let task = store
                 .create(&req, author.clone())
@@ -673,7 +719,7 @@ pub fn before_integrate_at(
             worktree: &worktree,
             command: &plan.verify,
             log: None,
-            env: &agents.isolated_env(&worktree),
+            env: &agents.worktree_env(&worktree),
             exclusive: agents.verify_exclusive,
             branch: &branch,
             keep_failure: false,
@@ -698,6 +744,84 @@ pub fn before_integrate_at(
         live: &live,
         isolating: !agents.isolate_env.is_empty(),
         log: log.as_deref(),
+    };
+    if result.passed {
+        Ok(Some(cide_agents::milestones::verify_ran_line(&report)))
+    } else {
+        Err(cide_agents::milestones::verify_refusal(&report))
+    }
+}
+
+/// [`before_integrate_at`]'s guard and uncommitted-work checks, **without** the verify — for a
+/// branch that is about to be merged as part of a batch, whose verify runs once on the combined
+/// head instead. (M132)
+pub(crate) fn guards_only(root: &Path, name: &str) -> Result<(), String> {
+    let plan = cide_agents::config::load_milestones(root);
+    let branch = format!("cide/{name}");
+    if !plan.guard_paths.is_empty() {
+        let touched = changed_paths(root, &branch)?;
+        if let Some(guarded) = touched.iter().find(|p| plan.guards(p)) {
+            return Err(format!(
+                "{branch} changes `{guarded}`, a file a milestone gate reads — the user's call; \
+                 send it back to drop that change"
+            ));
+        }
+    }
+    let worktree = cide_git::worktree::path_of(root, name);
+    if worktree.is_dir() {
+        let dirty = dirty_paths(&worktree);
+        if !dirty.is_empty() {
+            return Err(format!(
+                ".cide/worktrees/{name} has uncommitted changes ({}) — send it back to commit them",
+                dirty.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run the project's verify once in a scratch checkout of a batch's combined head. (M132)
+/// `Ok(None)` when the project has no verify command; `Ok(Some(line))` green; `Err(refusal)` red.
+pub(crate) fn verify_scratch(
+    app: &AppHandle,
+    project: ProjectId,
+    root: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let plan = cide_agents::config::load_milestones(root);
+    if plan.verify.trim().is_empty() {
+        return Ok(None);
+    }
+    let checks = checks(app)
+        .map(|s| Arc::clone(&s))
+        .ok_or("cide is shutting down")?;
+    let agents = cide_agents::config::load(root).agents;
+    let live = live_runs(app, project, root, "batch-verify");
+    let (result, ran) = verify(
+        &checks,
+        root,
+        &VerifyJob {
+            worktree,
+            command: &plan.verify,
+            log: None,
+            env: &agents.worktree_env(worktree),
+            exclusive: agents.verify_exclusive,
+            branch,
+            keep_failure: false,
+        },
+    );
+    let report = cide_agents::milestones::VerifyReport {
+        branch,
+        result: &result,
+        reused: ran.reused,
+        waited: ran
+            .waited_behind
+            .as_deref()
+            .map(|behind| (ran.waited_ms, behind)),
+        live: &live,
+        isolating: !agents.isolate_env.is_empty(),
+        log: None,
     };
     if result.passed {
         Ok(Some(cide_agents::milestones::verify_ran_line(&report)))
@@ -1016,7 +1140,7 @@ pub fn prewarm(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId
                     worktree: &worktree,
                     command: &plan.verify,
                     log: None,
-                    env: &agents.isolated_env(&worktree),
+                    env: &agents.worktree_env(&worktree),
                     exclusive: agents.verify_exclusive,
                     branch: &branch,
                     keep_failure: true,
@@ -1122,7 +1246,12 @@ fn settle_gate(
         }
     });
     crate::emit::milestones_changed(app, project);
-    let verdict = gate_verdict(passed, times, retries, progressed);
+    let mut verdict = gate_verdict(passed, times, retries, progressed);
+    // Green on a task the user accepts: cide merges it and no reviewer opens. (M132) This runs on
+    // the verify's own thread, which is already off the GTK loop.
+    if verdict == GateVerdict::Passed && crate::agent_rpc::awaiting_user_merge(app, project, task) {
+        verdict = crate::agent_rpc::absorb_for_user(app, project, root, agent, task);
+    }
     if !passed {
         comment_refusal(
             app,
@@ -1186,8 +1315,8 @@ fn refusal_comment(
                 "{times} in a row, past the {retries} that go back to the run — for the reviewer"
             )
         }
-        // `Passed` never writes a refusal.
-        GateVerdict::HandedBack | GateVerdict::Passed => {
+        // `Passed` and `Absorbed` never write a refusal.
+        GateVerdict::HandedBack | GateVerdict::Passed | GateVerdict::Absorbed => {
             format!("handed back to the run ({times} of {retries})")
         }
     };
@@ -1281,7 +1410,7 @@ fn now_ms() -> u64 {
 }
 
 /// Files the branch changes relative to where it forked from `HEAD`.
-fn changed_paths(root: &Path, branch: &str) -> Result<Vec<String>, String> {
+pub(crate) fn changed_paths(root: &Path, branch: &str) -> Result<Vec<String>, String> {
     let out = git(root, &["diff", "--name-only", &format!("HEAD...{branch}")])
         .map_err(|e| format!("could not read what {branch} changes: {e}"))?;
     Ok(out
@@ -1292,7 +1421,7 @@ fn changed_paths(root: &Path, branch: &str) -> Result<Vec<String>, String> {
 }
 
 /// Tracked changes and untracked, unignored files in a checkout.
-fn dirty_paths(dir: &Path) -> Vec<String> {
+pub(crate) fn dirty_paths(dir: &Path) -> Vec<String> {
     git(dir, &["status", "--porcelain", "--untracked-files=normal"])
         .map(|out| {
             out.lines()

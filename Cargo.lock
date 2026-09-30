@@ -696,6 +696,7 @@ dependencies = [
  "cide-core",
  "cide-ipc",
  "cide-pty",
+ "globset",
  "libc",
  "parking_lot",
  "reqwest",

@@ -341,6 +341,22 @@ export function awaitingBadge(count: number): string {
  * that ships. `where` names the container — the header's project tabs have exactly this
  * problem one level up and would otherwise need a second copy of the wording.
  */
+/**
+ * The project tab's sentence when the badge counts waiting **tasks** as well as sessions (M132):
+ * the badge is one number, so the tooltip is where the two are told apart.
+ */
+export function waitingHint(sessions: number, tasks: number, where: string): string | undefined {
+  if (tasks <= 0) return awaitingHint(sessions, where)
+  const t = tasks === 1 ? '1 task waits for you' : `${tasks} tasks wait for you`
+  const s =
+    sessions <= 0
+      ? ''
+      : sessions === 1
+        ? '1 session and '
+        : `${sessions} sessions and `
+  return `${s}${t} in this ${where} (Agents → Waiting)`
+}
+
 export function awaitingHint(count: number, where: string): string | undefined {
   if (count <= 0) return undefined
   return count === 1

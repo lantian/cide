@@ -54,46 +54,127 @@ impl Placement {
 /// Where a task created through `cide_task_create` goes. See the module header.
 ///
 /// `parent` is the task the new one is to be `subtaskOf`, if the call links one.
+///
+/// `Err` is a refusal with its sentence (M132): the active milestone is full. Until M132 that
+/// case went to the inbox with the milestone link kept — and an inbox task inside a milestone is
+/// exactly what the tracker no longer allows ([`inbox_rule`]), so the create is refused instead
+/// and the caller finishes something first.
 pub fn placement(
     by_run: bool,
     plan: &MilestonePlan,
     rows: &[TaskRow],
     parent: Option<&TaskId>,
-) -> Placement {
+) -> Result<Placement, String> {
     if by_run {
-        return Placement::inbox(
+        return Ok(Placement::inbox(
             "it went to the inbox, because a task a run creates is something noticed on the way \
-             and not yet a decision to do it; whoever plans the work moves it to todo when it is \
-             needed.",
-        );
+             and not yet a decision to do it; the user moves it into work when it is needed.",
+        ));
     }
     let Some(current) = plan.current() else {
-        return Placement::todo();
+        return Ok(Placement::todo());
     };
     let Some(goal) = current.task.as_ref() else {
         // A milestone with no task on the board has nothing to be a subtask of, so the rule
         // cannot be followed and is not enforced. `cide_milestones define` always makes one.
-        return Placement::todo();
+        return Ok(Placement::todo());
     };
+    // Under a *later* milestone's goal: todo, and it waits for its milestone — `outside_active`
+    // keeps it from starting. (M132) It used to go to the inbox, which is now outside every
+    // milestone by rule, so the link would have been dropped.
     let serves = parent.is_some_and(|p| p == goal || descends_from(rows, p, goal));
     if !serves {
-        return Placement::inbox(format!(
-            "it went to the inbox, because it is not part of the active milestone `{}` ({goal}). \
-             If it is needed for that milestone, link it `subtaskOf` {goal} (or a subtask of it) \
-             and set it to todo.",
+        if let Some(later) = parent.and_then(|p| milestone_of(plan, rows, p)) {
+            return Ok(Placement {
+                status: TaskStatus::Todo,
+                reason: Some(format!(
+                    "it is todo under milestone `{}`, which is not the active one, so it waits \
+                     until that milestone is.",
+                    later.id
+                )),
+            });
+        }
+        return Ok(Placement::inbox(format!(
+            "it went to the inbox, because it is not part of any milestone. The active one is `{}` \
+             ({goal}); a task for it is created with `subtaskOf` {goal} (or a subtask of it).",
             current.id
-        ));
+        )));
     }
     let open = open_under(rows, goal);
     let cap = plan.max_open() as usize;
     if open >= cap {
-        return Placement::inbox(format!(
-            "it went to the inbox, because milestone `{}` already has {open} open tasks, its limit. \
-             Finish, merge or move one out before adding more; then set this to todo.",
+        return Err(format!(
+            "milestone `{}` already has {open} open tasks, its limit, so nothing more is added to \
+             it now. Finish, merge or re-scope one first. (It was not created in the inbox \
+             instead: an inbox task is never part of a milestone.)",
             current.id
         ));
     }
-    Placement::todo()
+    Ok(Placement::todo())
+}
+
+/// The milestone whose subtree `task` sits in — its goal, or a descendant of one — if any.
+/// (M132) The one reading of "is this inside a milestone" every inbox rule uses.
+pub fn inside_milestone<'a>(
+    plan: &'a MilestonePlan,
+    rows: &[TaskRow],
+    task: &TaskId,
+) -> Option<&'a cide_ipc::Milestone> {
+    milestone_of(plan, rows, task)
+}
+
+/// Why linking `child` `subtaskOf` `parent` would put an inbox task inside a milestone, or
+/// `None` when it would not. (M132)
+///
+/// **An inbox task is never part of a milestone**: the inbox is where noticed work waits for the
+/// user, and a milestone is work the user decided on. Refused whether the child itself is in the
+/// inbox or carries inbox tasks under it — linking either would pull them in.
+pub fn inbox_rule(
+    plan: &MilestonePlan,
+    rows: &[TaskRow],
+    child: &TaskId,
+    parent: &TaskId,
+) -> Option<String> {
+    let milestone = inside_milestone(plan, rows, parent)?;
+    let status_of = |id: &TaskId| rows.iter().find(|r| &r.id == id).map(|r| r.status);
+    if status_of(child) == Some(TaskStatus::Inbox) {
+        return Some(format!(
+            "{child} is in the inbox, and an inbox task is never part of a milestone (`{}`). Only \
+             the user moves a task out of the inbox; ask them, or leave it where it is.",
+            milestone.id
+        ));
+    }
+    let under: Vec<String> = rows
+        .iter()
+        .filter(|r| r.status == TaskStatus::Inbox && descends_from(rows, &r.id, child))
+        .map(|r| r.id.to_string())
+        .collect();
+    if !under.is_empty() {
+        return Some(format!(
+            "{child} has inbox tasks under it ({}), and linking it into milestone `{}` would pull \
+             them in; an inbox task is never part of a milestone. Unlink them from {child} first.",
+            under.join(", "),
+            milestone.id
+        ));
+    }
+    None
+}
+
+/// Inbox tasks linked `subtaskOf` somewhere inside a milestone — boards written before M132 have
+/// them. They are **not part of** that milestone: nothing counts them, plans for them or waits on
+/// them. `cide_milestones detachInbox` turns each such link into `related`. `(task, parent)`.
+pub fn legacy_inbox_links(plan: &MilestonePlan, rows: &[TaskRow]) -> Vec<(TaskId, TaskId)> {
+    rows.iter()
+        .filter(|r| r.status == TaskStatus::Inbox)
+        .filter_map(|r| {
+            let parent = r
+                .links
+                .iter()
+                .find(|l| l.link == LinkType::SubtaskOf && !l.deleted)
+                .map(|l| l.target.clone())?;
+            inside_milestone(plan, rows, &parent).map(|_| (r.id.clone(), parent))
+        })
+        .collect()
 }
 
 /// Whether `task` is `subtaskOf` `goal`, through any chain of parents.
@@ -136,18 +217,13 @@ pub fn open_under(rows: &[TaskRow], goal: &TaskId) -> usize {
         .count()
 }
 
-/// Inbox tasks under `goal`, the goal itself not counted. (M99)
+/// Inbox tasks linked under `goal`, the goal itself not counted. (M99, reversed by M132)
 ///
-/// Kept apart from [`open_under`] because the two answer different questions and one number
-/// could not answer both. The inbox is not work in flight, so it must never count against
-/// [`MilestonePlan::max_open`] — that cap is about how much is started at once, and counting
-/// observations in it would close the board to new work. But an inbox task *linked under a
-/// milestone's goal* is not nothing either: it is something a run noticed while working on that
-/// milestone and nobody has decided about, and accepting the milestone over it marks the goal
-/// done with an undecided item hanging under it, where nobody looks again. So it is a decision
-/// owed, and the surfaces that ask "is this milestone finished" ([`facts_line`], the spinner's
-/// stand-down, the Accept button) count it; the rest of the inbox — anything not under this
-/// goal — is untouched, or every passing observation anywhere would hold every milestone open.
+/// Until M132 these were "a decision owed" that held the milestone open. Since M132 an inbox task
+/// is never part of a milestone ([`inbox_rule`]), so the only ones that exist are links written
+/// before it — and they count for nothing: not open work, not a decision, not a reason to keep
+/// planning. This number is reported only so the facts line can say they are there and how to
+/// detach them.
 pub fn inbox_under(rows: &[TaskRow], goal: &TaskId) -> usize {
     rows.iter()
         .filter(|r| &r.id != goal)
@@ -374,7 +450,7 @@ pub fn facts_line(
         .map(|goal| {
             tree_under(rows, goal)
                 .into_iter()
-                .filter(|(_, r)| r.status != TaskStatus::Done)
+                .filter(|(_, r)| !matches!(r.status, TaskStatus::Done | TaskStatus::Inbox))
                 .map(|(_, r)| {
                     let title: String = r.title.chars().take(60).collect();
                     format!("{} [{}] {title}", r.id, status_word(r.status))
@@ -396,27 +472,21 @@ pub fn facts_line(
     } else {
         format!(" Its unfinished tasks: {shown}.")
     };
-    // What to do about the undecided ones, spelled out (M99): the milestone cannot be accepted
-    // while one is there, and a turn told only that it is blocked would look for work to do
-    // instead of making the decision that unblocks it.
+    // Legacy links, said once with the road out (M132): they are not part of the milestone, and
+    // a planner told nothing would read them in the tree and plan from them.
     let owed = if undecided == 0 {
         String::new()
     } else {
         format!(
-            " {undecided} of its own {} in the inbox, undecided, and it cannot be accepted while \
-             {} does: either move it to todo (it is work this milestone needs) or unlink it from \
-             {} (it is not, and it stays in the inbox for a later milestone).",
+            " {undecided} inbox {} still linked under it from before inbox tasks were kept out \
+             of milestones; {} not part of it — leave {} to the user.",
             if undecided == 1 {
-                "tasks sits"
+                "task is"
             } else {
-                "tasks sit"
+                "tasks are"
             },
-            if undecided == 1 { "it" } else { "they" },
-            current
-                .task
-                .as_ref()
-                .map(TaskId::to_string)
-                .unwrap_or_else(|| "its goal".into())
+            if undecided == 1 { "it is" } else { "they are" },
+            if undecided == 1 { "it" } else { "them" },
         )
     };
     Some(format!(
@@ -755,6 +825,9 @@ mod tests {
             updated_unix_ms: 1,
             comment_count: 0,
             attachment_count: 0,
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 
@@ -800,37 +873,48 @@ mod tests {
     #[test]
     fn a_runs_task_is_inbox_whatever_it_links() {
         let t1 = TaskId("t-1".into());
-        let p = placement(true, &plan(12), &board(), Some(&t1));
+        let p = placement(true, &plan(12), &board(), Some(&t1)).expect("placed");
         assert_eq!(p.status, TaskStatus::Inbox);
-        let p = placement(true, &MilestonePlan::default(), &[], None);
+        let p = placement(true, &MilestonePlan::default(), &[], None).expect("placed");
         assert_eq!(p.status, TaskStatus::Inbox, "with or without milestones");
     }
 
+    /// (M132) An orchestrator's task under any milestone is todo — a later milestone's simply
+    /// waits — because an inbox task is never part of a milestone; a full active milestone
+    /// refuses rather than dropping the task into the inbox with the link kept.
     #[test]
-    fn the_orchestrators_task_is_todo_only_under_the_active_milestone_with_room() {
+    fn the_orchestrators_task_is_todo_under_a_milestone_and_a_full_one_refuses() {
         let rows = board();
         let t1 = TaskId("t-1".into());
         let t3 = TaskId("t-3".into());
         let t2 = TaskId("t-2".into());
+        let placed =
+            |plan: &MilestonePlan, parent: Option<&TaskId>| placement(false, plan, &rows, parent);
         assert_eq!(
-            placement(false, &plan(12), &rows, Some(&t1)).status,
+            placed(&plan(12), Some(&t1)).expect("placed").status,
             TaskStatus::Todo
         );
         assert_eq!(
-            placement(false, &plan(12), &rows, Some(&t3)).status,
+            placed(&plan(12), Some(&t3)).expect("placed").status,
             TaskStatus::Todo,
             "a subtask of a subtask serves the milestone too"
         );
-        let later = placement(false, &plan(12), &rows, Some(&t2));
+        let later = placed(&plan(12), Some(&t2)).expect("placed");
         assert_eq!(
             later.status,
-            TaskStatus::Inbox,
-            "a later milestone's work waits"
+            TaskStatus::Todo,
+            "a later milestone's work waits as todo"
         );
-        assert!(later.reason.expect("says why").contains("t-1"));
+        assert!(
+            later
+                .reason
+                .expect("says why")
+                .contains("not the active one")
+        );
         assert_eq!(
-            placement(false, &plan(12), &rows, None).status,
-            TaskStatus::Inbox
+            placed(&plan(12), None).expect("placed").status,
+            TaskStatus::Inbox,
+            "outside every milestone: the inbox"
         );
 
         assert_eq!(
@@ -838,14 +922,55 @@ mod tests {
             2,
             "doing and todo count, done does not"
         );
-        let full = placement(false, &plan(2), &rows, Some(&t1));
-        assert_eq!(full.status, TaskStatus::Inbox);
-        assert!(full.reason.expect("says why").contains("limit"));
+        let full = placed(&plan(2), Some(&t1)).expect_err("refused");
+        assert!(full.contains("limit"));
 
         assert_eq!(
-            placement(false, &MilestonePlan::default(), &rows, None).status,
+            placed(&MilestonePlan::default(), None)
+                .expect("placed")
+                .status,
             TaskStatus::Todo,
             "no milestones: the orchestrator plans as before"
+        );
+    }
+
+    /// (M132) Linking an inbox task — or a task carrying one — into a milestone is refused;
+    /// outside every milestone it is nobody's business.
+    #[test]
+    fn an_inbox_task_is_never_linked_into_a_milestone() {
+        let mut rows = board();
+        rows.push(row("t-7", "Noticed in passing", TaskStatus::Inbox, None));
+        rows.push(row("t-8", "Loose parent", TaskStatus::Todo, None));
+        rows.push(row(
+            "t-9",
+            "Noticed under it",
+            TaskStatus::Inbox,
+            Some("t-8"),
+        ));
+        let id = |s: &str| TaskId(s.into());
+        let refused = inbox_rule(&plan(12), &rows, &id("t-7"), &id("t-3")).expect("refused");
+        assert!(refused.contains("inbox"));
+        assert!(
+            inbox_rule(&plan(12), &rows, &id("t-8"), &id("t-1"))
+                .expect("carries one")
+                .contains("t-9")
+        );
+        assert!(inbox_rule(&plan(12), &rows, &id("t-7"), &id("t-8")).is_none());
+        assert!(inbox_rule(&plan(12), &rows, &id("t-4"), &id("t-1")).is_none());
+        assert_eq!(
+            legacy_inbox_links(&plan(12), &rows),
+            vec![],
+            "t-9's parent is outside every milestone"
+        );
+        rows.push(row(
+            "t-10",
+            "Old noticed row",
+            TaskStatus::Inbox,
+            Some("t-3"),
+        ));
+        assert_eq!(
+            legacy_inbox_links(&plan(12), &rows),
+            vec![(id("t-10"), id("t-3"))]
         );
     }
 
@@ -1121,11 +1246,11 @@ mod tests {
         assert!(facts_line(&MilestonePlan::default(), &rows, None).is_none());
     }
 
-    /// An inbox row under the goal is counted apart from the open ones, named with the rest, and
-    /// spelled out as the decision it is. The `max_open` cap must not see it: the cap is about
-    /// work in flight, and an observation nobody ruled on is not in flight.
+    /// (M132) An inbox row still linked under the goal — from before inbox tasks were kept out of
+    /// milestones — is not part of it: not open work, not listed as the milestone's task, and the
+    /// facts line says only that it is there and whose it is.
     #[test]
-    fn an_inbox_task_under_the_goal_is_a_decision_owed() {
+    fn a_legacy_inbox_link_under_the_goal_is_not_part_of_the_milestone() {
         let t1 = TaskId("t-1".into());
         let mut rows = board();
         rows.push(row(
@@ -1138,29 +1263,22 @@ mod tests {
 
         assert_eq!(inbox_under(&rows, &t1), 1, "only the one under the goal");
         assert_eq!(open_under(&rows, &t1), 2, "the inbox is not open work");
-        assert_eq!(
-            placement(false, &plan(2), &rows, Some(&t1)).status,
-            TaskStatus::Inbox,
-            "the cap still counts the two open ones, and the inbox row does not push it over"
+        assert!(
+            placement(false, &plan(3), &rows, Some(&t1)).is_ok(),
+            "the cap counts the two open ones, and the inbox row does not push it over"
         );
 
         let line = facts_line(&plan(12), &rows, None).expect("a plan");
         assert!(
-            line.contains("1 of its own tasks sits in the inbox, undecided"),
+            line.contains("1 inbox task is still linked under it"),
             "{line}"
         );
+        assert!(line.contains("leave it to the user"), "{line}");
         assert!(
-            line.contains("unlink it from t-1"),
-            "it says how to clear it: {line}"
+            !line.contains("t-7 [inbox]"),
+            "the legacy row is not listed as the milestone's work: {line}"
         );
-        assert!(
-            line.contains("t-7 [inbox] Hollowroot density decision"),
-            "the undecided row is named with the rest: {line}"
-        );
-        assert!(
-            !line.contains("t-8"),
-            "an inbox row outside the milestone is not its business: {line}"
-        );
+        assert!(!line.contains("t-8"), "{line}");
     }
 
     fn failed_verify() -> cide_ipc::CheckResult {

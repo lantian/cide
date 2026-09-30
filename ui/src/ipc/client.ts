@@ -3391,7 +3391,7 @@ export const history = {
  * happened, and the frame in between shows a list that is visibly wrong. It also means a
  * mutation needs no `hydrate()` follow-up and no wait for the broadcast to come back round.
  * --------------------------------------------------------------------------------------- */
-import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew } from './generated'
+import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew, TaskResponse } from './generated'
 
 export const tasks = {
   /**
@@ -3463,6 +3463,15 @@ export const tasks = {
     invoke<TaskBoard>('task_edit', { project, task, edit }),
 
   remove: (project: ProjectId, task: TaskId) => invoke<TaskBoard>('task_delete', { project, task }),
+
+  /*
+   * The user answering a task that waits for them (M132): accept, send back with a note, or
+   * answer its open question. Not `edit`, because it is more than a mutation — send back and
+   * answer continue the role's own run (`hand_back_to_run`), and accept is the one road by
+   * which a user-accepted task becomes done. Unwrapped, for the mutations' reason above.
+   */
+  respond: (project: ProjectId, task: TaskId, response: TaskResponse) =>
+    invoke<TaskBoard>('task_respond', { project, task, response }),
 }
 
 /**
@@ -5355,6 +5364,13 @@ export const milestones = {
     invoke<void>('milestones_gate_run', { project, milestone: milestone ?? null }),
   accept: (project: ProjectId) =>
     invoke<import('./generated').MilestonesView | null>('milestones_accept', { project }),
+  /**
+   * Turn every inbox task still linked `subtaskOf` a milestone into `related` (M132): an inbox
+   * task is never part of a milestone, and legacy links from before that rule are the Milestones
+   * tab's "Detach inbox" button. Answers the refreshed view.
+   */
+  detachInbox: (project: ProjectId) =>
+    invoke<import('./generated').MilestonesView | null>('milestones_detach_inbox', { project }),
   /** Apply a proposal exactly (a plan, or files written and committed) and dequeue it. */
   acceptProposal: (project: ProjectId, id: string) =>
     invoke<import('./generated').MilestonesView | null>('proposal_accept', { project, id }),

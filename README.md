@@ -50,6 +50,7 @@ pnpm --dir ui install
 | [docs/architecture.md](docs/architecture.md) | crates, the state loop, the wire contract, pane hosts, Claude hosting |
 | [docs/adr/](docs/adr/) | the decisions a refactor would otherwise undo |
 | [docs/platforms.md](docs/platforms.md) | what is known, and what is only read, off Linux |
+| [docs/autonomy.md](docs/autonomy.md) | running a project autonomously: milestones, batch review, what waits for you |
 | [docs/journal.md](docs/journal.md) | the milestone record, including what was never verified |
 | [docs/forks.md](docs/forks.md) | the rust-analyzer, salsa and gopls forks |
 

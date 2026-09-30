@@ -44,6 +44,7 @@ import { errorText } from '@/ipc/errorText'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { Icon, asIcon } from '@/icons/Icon'
 import { RadioGroup } from '@/kit/components/Choice'
+import { Button } from '@/kit/components/Button'
 import fieldStyles from '@/settings/controls.module.css'
 
 import { CheckLogModal, CheckLogView, type CheckLogTarget } from './CheckLogModal'
@@ -97,6 +98,8 @@ export function TasksTabs({
           data-tab={t}
           onClick={() => onTab(t)}
         >
+          {/* *Waiting for you* was a third tab here (M132) and is the Agents panel's now —
+              `agentsTabStore.ts` says why. */}
           {t === 'tasks' ? 'Tasks' : 'Milestones'}
           {t === 'milestones' && proposals > 0 && (
             <span
@@ -226,6 +229,26 @@ export function MilestonesPanel({
     })
   }
 
+  /*
+   * Legacy inbox links under a goal (M132, `legacyInbox`): offered only while there are some, so a
+   * board written after M132 never sees the button. Counted over every milestone, because the
+   * command detaches them all — a count of the active one's would promise less than it does.
+   */
+  const strays = (view?.tasks ?? []).reduce((n, list) => n + legacyInbox(list.tasks), 0)
+  const [detaching, setDetaching] = useState(false)
+  const detachInbox = () => {
+    if (project === null) return
+    setDetaching(true)
+    void milestonesApi
+      .detachInbox(project)
+      .then((next) => {
+        setView(next)
+        setError(null)
+      })
+      .catch((e: unknown) => setError(errorText(e)))
+      .finally(() => setDetaching(false))
+  }
+
   return (
     <aside className={panelStyles.panel} data-audit="sidebarMilestones" aria-label="Milestones">
       <div className={panelStyles.header} data-audit="tasksHeader">
@@ -267,6 +290,18 @@ export function MilestonesPanel({
                 >
                   Run gate
                 </button>
+              )}
+              {strays > 0 && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  busy={detaching}
+                  data-audit="milestonesDetachInbox"
+                  title={`${strays} inbox task${strays === 1 ? ' is' : 's are'} still linked under a milestone from before inbox tasks were kept out of milestones. Detaching turns each link into "related".`}
+                  onClick={detachInbox}
+                >
+                  Detach inbox
+                </Button>
               )}
             </div>
             {/*
@@ -797,6 +832,8 @@ function MilestoneTaskList({
             <span className={panelStyles.taskId}>{t.id}</span>
             <span className={panelStyles.taskTitle}>{t.title}</span>
             {t.agent !== undefined && <span className={styles.taskAgent}>{t.agent}</span>}
+            {/* A legacy link (M132): drawn, so it can be found and detached, but not counted. */}
+            {t.status === 'inbox' && <span className={styles.taskAgent}>not part</span>}
           </button>
         </div>
       ))}
@@ -976,45 +1013,46 @@ function Field({
 
 const NO_TASKS: readonly MilestoneTask[] = []
 
-/** `3 open · 5 done`, or a sentence for none. */
+/** `3 open · 5 done`, or a sentence for none. Legacy inbox rows are neither — see `legacyInbox`. */
 function countLine(tasks: readonly MilestoneTask[]): string {
-  if (tasks.length === 0) return 'no tasks'
-  const done = tasks.filter((t) => t.status === 'done').length
-  return `${tasks.length - done} open · ${done} done`
+  const part = tasks.filter((t) => t.status !== 'inbox')
+  const stray = tasks.length - part.length
+  const tail = stray === 0 ? '' : ` · ${stray} inbox, not part`
+  if (part.length === 0) return `no tasks${tail}`
+  const done = part.filter((t) => t.status === 'done').length
+  return `${part.length - done} open · ${done} done${tail}`
 }
 
 /**
- * Work still in flight under a milestone: todo, doing, review. The inbox is counted separately,
- * by `undecided` — it is by definition not work yet (`TaskStatus`'s account of it).
+ * Work still in flight under a milestone: todo, doing, review. The inbox is not counted at all:
+ * an inbox task is never part of a milestone (M132).
  */
 function openWork(tasks: readonly MilestoneTask[]): number {
   return tasks.filter((t) => t.status !== 'done' && t.status !== 'inbox').length
 }
 
 /**
- * Decisions owed under a milestone: rows sitting in the inbox *under its goal*. (M99)
+ * Inbox rows still linked `subtaskOf` somewhere under a goal — boards written before M132.
  *
- * These were not counted at all, on the reasoning that the inbox is not work and any passing
- * observation could otherwise block a milestone. Half right: the inbox at large is somebody
- * else's problem, and nothing here looks at it — `tasks` is only what is linked under this
- * goal. But a row a run put in the inbox *under this goal* is something noticed while working on
- * this milestone that nobody has ruled on, and Accept marks that goal done, burying it. So it
- * holds Accept, exactly as an open task does, and the way to clear it is one decision: move it
- * to todo, or unlink it from the goal. In selfcraft's `slice` this was the whole bug — gate
- * green, eighty subtasks done, one inbox row under the goal, and cide offering Accept while the
- * spinner stood down (`spinner::gate_blocks_planning` is the same rule on the Rust side).
+ * M99 counted these as "decisions owed" and held Accept on them: a row a run noticed under a goal
+ * would otherwise be buried by accepting it. M132 closed the door they came in by instead — Rust
+ * refuses an inbox task inside a milestone (`milestones::inbox_rule`), and a run that notices
+ * something files it outside every milestone — so a row still here is a leftover link, **not part
+ * of the milestone**, and holding Accept on it would block a finished goal on a link nobody means.
+ * The tab offers Detach inbox for them (`milestones_detach_inbox`: each link becomes `related`),
+ * which is what keeps them visible rather than silently ignored.
  */
-function undecided(tasks: readonly MilestoneTask[]): number {
+function legacyInbox(tasks: readonly MilestoneTask[]): number {
   return tasks.filter((t) => t.status === 'inbox').length
 }
 
 /**
  * Whether Accept is offered — the card's and the modal's one rule. The active milestone only
  * (`accept` takes no id; Rust accepts the current one), its gate's last run passed and none is
- * running, and nothing under it is still open or still undecided. The gate alone was the first
- * version, and it offered Accept on a milestone with tasks in doing: a gate that passed an hour
- * ago says nothing about work started since, and accepting marks the milestone's task done over
- * its open subtasks — or, with `undecided`, over an inbox row nobody ruled on.
+ * running, and nothing under it is still open. The gate alone was the first version, and it
+ * offered Accept on a milestone with tasks in doing: a gate that passed an hour ago says nothing
+ * about work started since, and accepting marks the milestone's task done over its open subtasks.
+ * Inbox rows do not hold it (M132, `legacyInbox`).
  */
 function readyToAccept(
   active: boolean,
@@ -1022,13 +1060,7 @@ function readyToAccept(
   gate: CheckResult | undefined,
   tasks: readonly MilestoneTask[],
 ): boolean {
-  return (
-    active &&
-    !gateRunning &&
-    gate?.passed === true &&
-    openWork(tasks) === 0 &&
-    undecided(tasks) === 0
-  )
+  return active && !gateRunning && gate?.passed === true && openWork(tasks) === 0
 }
 
 /**
@@ -1036,11 +1068,11 @@ function readyToAccept(
  *
  * It used to say one thing — *cide will not wake this project to plan until you accept it* — and
  * that is only true of a milestone that is actually finished. A green gate over work still in
- * flight, or over a row a run left in this milestone's inbox, is a milestone cide goes on
+ * flight is a milestone cide goes on
  * planning for (`spinner::gate_blocks_planning`) and does not offer Accept on, so the old
  * sentence told the reader to look for a button that was not drawn and to expect a silence that
  * was not coming. Now it says which of the two it is, and when it is the second it names what is
- * in the way and the one move that clears it.
+ * in the way. (M99 also named inbox rows under the goal here; M132 retired that — `legacyInbox`.)
  */
 function gateNote(
   current: Milestone,
@@ -1052,16 +1084,8 @@ function gateNote(
     return `The gate passes. cide will not wake this project to plan until you accept ${current.id} — or tighten its gate if this is not what you meant.`
   }
   const open = openWork(tasks)
-  const owed = undecided(tasks)
   const waits: string[] = []
   if (open > 0) waits.push(`its ${open} open task${open === 1 ? '' : 's'} to be done`)
-  if (owed > 0) {
-    waits.push(
-      `${owed} task${owed === 1 ? '' : 's'} in its inbox to be decided — move ${
-        owed === 1 ? 'it' : 'each'
-      } to todo if this milestone needs it, or unlink it from ${current.task ?? 'the goal'} if it does not`,
-    )
-  }
   const head = `The gate passes, but ${current.id} is not finished, so cide keeps planning rather than waiting on you.`
   return waits.length === 0 ? `${head} Accept is offered once the gate has finished running.` : `${head} Accept waits for ${waits.join(', and for ')}.`
 }

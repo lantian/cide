@@ -38,6 +38,7 @@ import {
   runningIn,
   runningInTab,
   runsIn,
+  waitingTasksIn,
   type Counts,
   type RunningEntry,
 } from './runningRule'
@@ -55,6 +56,7 @@ const entryOf = (entry: ProjectRunning): RunningEntry => ({
   runs: entry.runs,
   panes: entry.panes,
   tabs: entry.tabs.map((one) => ({ tab: one.tab, panes: one.panes })),
+  waiting: entry.waiting,
 })
 
 let counts: Counts = new Map()
@@ -142,6 +144,14 @@ export function useRunningInProject(project: string): number {
  * would never hold and every project tab would re-render whenever *any* project's count moved —
  * which is the exact cost the scalar shape exists to avoid.
  */
+export function useWaitingTasksInProject(project: string): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => waitingTasksIn(counts, project),
+    () => 0,
+  )
+}
+
 export function useRunsInProject(project: string): number {
   return useSyncExternalStore(
     subscribe,

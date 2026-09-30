@@ -234,6 +234,17 @@ pub struct TaskComment {
     /// that did not delete.
     #[serde(default)]
     pub deleted: bool,
+    /// Superseded by a later comment its own author left in the same turn. (M132)
+    ///
+    /// A run reports **once** per turn: a later comment of its own on its own task in the same
+    /// turn supersedes the earlier one instead of piling up beside it. Nothing is rewritten —
+    /// the log stays append-only, which is the whole of [`Self::text`]'s trust argument — this only
+    /// hides the earlier one from other agents' reads (`cide_task_get`) and collapses it on the
+    /// card. Like [`Self::deleted`] it only ever goes false → true, so a merge takes either side's
+    /// `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub superseded: bool,
     /// Files attached to this comment, oldest first. (M39)
     ///
     /// `#[serde(default)]` for [`Task::links`]' reason and with the same non-bump of
@@ -527,6 +538,38 @@ pub struct TaskLinkSpec {
     pub target: TaskId,
 }
 
+/// Who accepts a task's work when it is not a reviewer. See [`Task::acceptance`]. (M132)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum Acceptance {
+    /// The user, by eye, in *Waiting for you*.
+    User,
+}
+
+/// The user's answer to a task waiting for them — the Waiting-for-you list's three buttons.
+/// (M132) One command rather than three task edits, because each is several writes that must land
+/// together and one of them starts a run: "send back" is a comment, a status and a dispatch into
+/// the same role's conversation, and a UI composing that from `task_edit` calls would start the
+/// role before the note it is meant to read had reached the board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind",
+    deny_unknown_fields
+)]
+#[ts(export)]
+pub enum TaskResponse {
+    /// The work is right: the task is done.
+    Accept,
+    /// Not right yet: the note goes on the task and the same role continues on it.
+    SendBack { note: String },
+    /// The answer to the task's `question`: written on the task, the question cleared, and the
+    /// role on it (if any) continues.
+    Answer { text: String },
+}
+
 /// One task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -633,6 +676,40 @@ pub struct Task {
     /// default is not a shape change.
     #[serde(default)]
     pub links: Vec<TaskLink>,
+    /// The files and directories this task's work will change, as globs relative to the project
+    /// root (`tools/spritegen/`, `game/view/map_view.gd`, `art/units/`). Empty means *not
+    /// declared*, which the scheduler reads as the whole repository. (M132)
+    ///
+    /// # Why this is a field
+    ///
+    /// Because two runs editing the same file in parallel is the one conflict a worktree does not
+    /// prevent — it only moves it to the merge, where it costs a whole second round of the task.
+    /// On selfcraft eight sprite tasks started together on `tools/spritegen/*` and all but one came
+    /// back to rebase. `cide_app::agents`' admission reads this and will not start a run whose
+    /// `touches` overlap what another live or unmerged task holds; so it changes what dispatch
+    /// **does**, which is [`Self::change`]'s test for being a field at all.
+    ///
+    /// On the row, not the content file: admission reads it across tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub touches: Vec<String>,
+    /// Who accepts this task's work, when it is not a reviewer. (M132)
+    ///
+    /// `Some(Acceptance::User)` is work whose quality is a matter of taste — art, the look of the
+    /// UI — which a model reviewer cannot judge: cide merges it once verify passes and it waits
+    /// for the user in the Tasks panel's *Waiting for you*, and only the user (or a console the
+    /// user is typing in) may set it done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub acceptance: Option<Acceptance>,
+    /// A question this task waits on the user to answer, or `None`. (M132)
+    ///
+    /// Set by a planner or a reviewer instead of deciding a matter of taste, scope or design by
+    /// itself. A task with an open question is not dispatched and not planned; the user answers
+    /// in *Waiting for you*, which records the answer as a comment and clears this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub question: Option<String>,
     /// Oldest first, which is the order the panel renders and the order an agent reads.
     pub comments: Vec<TaskComment>,
     /// Files attached to the body, oldest first. (M39)
@@ -740,6 +817,19 @@ pub struct TaskRow {
     /// to render a list, which is the cost this type exists to avoid.
     #[serde(default)]
     pub links: Vec<TaskLink>,
+    /// [`Task::touches`], on the row because admission reads it across tasks. (M132)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub touches: Vec<String>,
+    /// [`Task::acceptance`]. (M132)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub acceptance: Option<Acceptance>,
+    /// [`Task::question`], on the row because the planner and *Waiting for you* read it across
+    /// tasks. (M132)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub question: Option<String>,
     #[serde(default = "TaskAuthor::user")]
     pub created_by: TaskAuthor,
     pub created_unix_ms: u64,
@@ -810,6 +900,9 @@ impl TaskRow {
             session: task.session,
             change: task.change.clone(),
             links: task.links.clone(),
+            touches: task.touches.clone(),
+            acceptance: task.acceptance,
+            question: task.question.clone(),
             created_by: task.created_by.clone(),
             created_unix_ms: task.created_unix_ms,
             updated_unix_ms: task.updated_unix_ms,
@@ -979,7 +1072,15 @@ impl TaskFile {
     /// build that predates it cannot parse. Such a build reads a row with `"status": "inbox"` as an
     /// unparseable file, and an unparseable tracker is set aside; a newer schema number is instead
     /// a clean *refusal* that touches nothing. The number exists to turn the first into the second.
-    pub const CURRENT_SCHEMA: u32 = 3;
+    ///
+    /// **4 since M132**, on 3's exact rule: written only while some row declares
+    /// [`TaskRow::touches`], [`TaskRow::acceptance`] or [`TaskRow::question`]. A build before M132
+    /// would read those rows, drop the keys it does not know and write the board back without
+    /// them — a declaration silently lost, which is worse than a board it refuses.
+    pub const CURRENT_SCHEMA: u32 = 4;
+
+    /// The schema a tracker with an inbox row, and nothing newer, is written as. (M83)
+    pub const SCHEMA_WITH_INBOX: u32 = 3;
 
     /// The schema a tracker is written as when nothing in it needs [`Self::CURRENT_SCHEMA`].
     pub const SCHEMA_WITHOUT_INBOX: u32 = 2;
@@ -1001,8 +1102,14 @@ impl TaskFile {
     /// *contains*, and bumping every tracker on first open would lock older builds out of files
     /// that differ from what they wrote in nothing but that number.
     pub fn schema_on_disk(&self) -> u32 {
-        if self.tasks.iter().any(|t| t.status == TaskStatus::Inbox) {
+        if self
+            .tasks
+            .iter()
+            .any(|t| !t.touches.is_empty() || t.acceptance.is_some() || t.question.is_some())
+        {
             Self::CURRENT_SCHEMA
+        } else if self.tasks.iter().any(|t| t.status == TaskStatus::Inbox) {
+            Self::SCHEMA_WITH_INBOX
         } else {
             Self::SCHEMA_WITHOUT_INBOX
         }
@@ -1135,6 +1242,12 @@ pub struct TaskNew {
     /// with, and a dropped file in the New task dialog is one gesture, not two.
     #[ts(optional)]
     pub attachments: Option<Vec<PathBuf>>,
+    /// [`Task::touches`] at creation. Absent means none declared. (M132)
+    #[ts(optional)]
+    pub touches: Option<Vec<String>>,
+    /// [`Task::acceptance`] at creation. (M132)
+    #[ts(optional)]
+    pub acceptance: Option<Acceptance>,
 }
 
 /// One change to one task. Inbound.
@@ -1270,6 +1383,26 @@ pub enum TaskEdit {
     DetachAttachment {
         attachment: TaskAttachmentId,
     },
+    /// Declare the files the task will change. `[]` clears the declaration. (M132)
+    SetTouches {
+        touches: Vec<String>,
+    },
+    /// Who accepts the work: `acceptance: null` returns it to the reviewer. (M132)
+    SetAcceptance {
+        acceptance: Option<Acceptance>,
+    },
+    /// Ask the user something, or `question: null` to withdraw it. (M132)
+    SetQuestion {
+        question: Option<String>,
+    },
+    /// Mark one comment superseded — the one-report-per-turn rule. (M132)
+    ///
+    /// Refused unless the comment is live and by the **same author** as the caller, so a run can
+    /// only ever hide its own earlier words; the text is never touched. Nothing in the UI sends
+    /// this: the app sends it after a run's second comment of a turn has landed.
+    Supersede {
+        comment: CommentId,
+    },
 }
 
 #[cfg(test)]
@@ -1302,6 +1435,7 @@ mod tests {
                 edited_at_unix_ms: None,
                 deleted: false,
                 attachments: vec![],
+                superseded: false,
             }],
             attachments: vec![TaskAttachment {
                 id: TaskAttachmentId("a-1".into()),
@@ -1321,6 +1455,9 @@ mod tests {
             created_by: TaskAuthor::Orchestrator,
             created_unix_ms: 1_699_999_999_000,
             updated_unix_ms: 1_700_000_000_000,
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
         }
     }
 

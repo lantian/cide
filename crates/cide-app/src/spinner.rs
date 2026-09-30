@@ -227,6 +227,8 @@ fn tick(app: &AppHandle) {
 
     let now = Instant::now();
     for project in projects {
+        // A batched review that is due by age alone opens here. (M132)
+        crate::agent_rpc::flush_due_batch(app, project);
         let Some(quiet) = facts(app, &state, &ws, project, now) else {
             continue;
         };
@@ -238,6 +240,13 @@ fn tick(app: &AppHandle) {
         };
         let config = spin_config(&root);
         if !should_spin(&quiet, &config) {
+            continue;
+        }
+        // Nothing changed since the last plan: the planner would read what it read then and
+        // either invent work or stop again. Latched until the board or the branch moves. (M132)
+        let print = fingerprint(app, project, &root);
+        if latched(project, &print) {
+            tracing::debug!(%project, "quiet, but nothing changed since the last plan; not waking");
             continue;
         }
 
@@ -385,7 +394,6 @@ fn wake(
             && gate_blocks_planning(
                 gate.as_ref().is_some_and(|g| g.passed),
                 open_under_goal(&rows, current),
-                undecided_under_goal(&rows, current),
             )
         {
             tracing::info!(%project, milestone = %current.id, "the gate passes; not planning past it");
@@ -402,6 +410,18 @@ fn wake(
             prompt = format!("{prompt} {facts}");
         }
     }
+    // What changed since the last plan (M132), so the planner reads a delta rather than the
+    // whole board — and the cursor moves to now.
+    let rows = app
+        .try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>()
+        .and_then(|stores| stores.get(project))
+        .map(|store| store.list())
+        .unwrap_or_default();
+    if let Some(delta) = delta_line(root, project, &rows) {
+        let delta = delta.split_whitespace().collect::<Vec<_>>().join(" ");
+        prompt = format!("{prompt} {delta}");
+    }
+    remember_spin(project, root, &rows, fingerprint(app, project, root));
     // And again, because the gate above is where the time goes. This is the check that stops a
     // planning tab opening in a project somebody paused while that gate was running — the one
     // [`still_quiet`] was written for.
@@ -429,6 +449,8 @@ fn wake(
         // The project root, and not a worktree: this one is planning for the whole board,
         // not reviewing one branch, and the root is the checkout its survey is about.
         None,
+        // Marked, so the tracker knows nobody is typing in it. (M132)
+        Some(cide_ipc::PaneOrigin::Planner),
     )
     .map(|_| ())
     .map_err(|error| {
@@ -471,7 +493,118 @@ pub(crate) fn plan_now(app: &AppHandle, project: ProjectId) -> Result<(), String
     wake(app, project, &root, &config, Caller::Button)
 }
 
-/// Gather one project's facts, and update its dwell.
+/// Where the last plan left off, per project: when it ran, the branch's head then, and the
+/// board's fingerprint then. (M132) In memory — after a restart the first plan reads everything.
+struct LastSpin {
+    at_ms: u64,
+    head: Option<String>,
+    print: String,
+}
+
+static LAST_SPIN: Mutex<Option<HashMap<ProjectId, LastSpin>>> = Mutex::new(None);
+
+/// What the latch compares: the branch's head and every non-goal task's (id, status, whether it
+/// asks a question). Bodies, comments and the goal itself are left out on purpose — a planner
+/// that only rewrote the goal's plan or asked the user something has not changed anything a
+/// second plan could act on.
+fn fingerprint(app: &AppHandle, project: ProjectId, root: &std::path::Path) -> String {
+    let plan = cide_agents::config::load_milestones(root);
+    let goals: Vec<&cide_ipc::TaskId> = plan.items.iter().filter_map(|m| m.task.as_ref()).collect();
+    let rows = crate::running::board_of(app, project);
+    let mut parts: Vec<String> = rows_of(&rows)
+        .iter()
+        .filter(|row| !goals.contains(&&row.id))
+        .map(|row| format!("{}:{:?}:{}", row.id, row.status, row.question.is_some()))
+        .collect();
+    parts.sort();
+    format!(
+        "{}|{}",
+        cide_core::check::head_of(root).unwrap_or_default(),
+        parts.join(",")
+    )
+}
+
+fn latched(project: ProjectId, print: &str) -> bool {
+    LAST_SPIN
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|m| m.get(&project))
+                .map(|l| l.print == print)
+        })
+        .unwrap_or(false)
+}
+
+fn remember_spin(project: ProjectId, root: &std::path::Path, rows: &[TaskRow], print: String) {
+    let at_ms = rows
+        .iter()
+        .map(|r| r.updated_unix_ms)
+        .max()
+        .unwrap_or_default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(at_ms);
+    if let Ok(mut guard) = LAST_SPIN.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(
+            project,
+            LastSpin {
+                at_ms: now_ms,
+                head: cide_core::check::head_of(root),
+                print,
+            },
+        );
+    }
+}
+
+/// "Since the last plan: …" — the tasks that changed and the commits that landed, capped, or
+/// `None` on a first plan or when nothing did.
+fn delta_line(root: &std::path::Path, project: ProjectId, rows: &[TaskRow]) -> Option<String> {
+    let (at_ms, head) = {
+        let guard = LAST_SPIN.lock().ok()?;
+        let last = guard.as_ref()?.get(&project)?;
+        (last.at_ms, last.head.clone())
+    };
+    let mut changed: Vec<&TaskRow> = rows.iter().filter(|r| r.updated_unix_ms > at_ms).collect();
+    changed.sort_by_key(|r| std::cmp::Reverse(r.updated_unix_ms));
+    let tasks: Vec<String> = changed
+        .iter()
+        .take(15)
+        .map(|r| {
+            let title: String = r.title.chars().take(60).collect();
+            let status = format!("{:?}", r.status).to_lowercase();
+            format!("{} [{status}] {title}", r.id)
+        })
+        .collect();
+    let commits = head
+        .as_deref()
+        .and_then(|from| cide_git::worktree::subjects_since(root, from, 20).ok())
+        .unwrap_or_default();
+    if tasks.is_empty() && commits.is_empty() {
+        return Some("Since the last plan nothing on the board changed and nothing landed.".into());
+    }
+    let mut out = String::from("Since the last plan:");
+    if !tasks.is_empty() {
+        out.push_str(&format!(
+            " tasks changed ({}{}): {}.",
+            changed.len(),
+            if changed.len() > 15 {
+                ", newest 15"
+            } else {
+                ""
+            },
+            tasks.join("; ")
+        ));
+    }
+    if !commits.is_empty() {
+        out.push_str(&format!(" commits landed: {}.", commits.join("; ")));
+    }
+    Some(out)
+}
+
+/// Gather one project's facts, and update its dwell./// Gather one project's facts, and update its dwell.
 ///
 /// `None` when the project has gone between the snapshot and here, which a close can do.
 ///
@@ -511,11 +644,13 @@ fn facts(
         // The inbox is not open work (M83): a project whose only undone tasks are things
         // somebody noticed has nothing planned, and waking it to plan from them is how a board
         // ends up growing faster than it closes.
+        //
+        // Nor, since M132, is work waiting for someone other than the planner: a task in review
+        // is the batch reviewer's (or the user's, under `acceptance: user`), and a task with an
+        // open question is the user's. A planner woken because a finished sprite waits for the
+        // user's eye has nothing to plan, and planning anyway is how it used to invent work.
         .filter(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Todo | TaskStatus::Doing | TaskStatus::Review
-            )
+            matches!(task.status, TaskStatus::Todo | TaskStatus::Doing) && task.question.is_none()
         })
         .count();
 
@@ -576,11 +711,7 @@ fn milestone_ready(app: &AppHandle, root: &std::path::Path, rows: &[TaskRow]) ->
     {
         return false;
     }
-    if !gate_blocks_planning(
-        true,
-        open_under_goal(rows, current),
-        undecided_under_goal(rows, current),
-    ) {
+    if !gate_blocks_planning(true, open_under_goal(rows, current)) {
         return false;
     }
     let head = cide_core::check::head_of(root);
@@ -597,34 +728,16 @@ fn open_under_goal(rows: &[TaskRow], milestone: &cide_ipc::Milestone) -> usize {
         .unwrap_or(0)
 }
 
-/// Inbox tasks under the milestone's goal task — decisions owed, not work in flight. See
-/// `cide_agents::milestones::inbox_under` for why they are counted apart from the open ones.
-fn undecided_under_goal(rows: &[TaskRow], milestone: &cide_ipc::Milestone) -> usize {
-    milestone
-        .task
-        .as_ref()
-        .map(|goal| cide_agents::milestones::inbox_under(rows, goal))
-        .unwrap_or(0)
-}
-
 /// Whether a milestone's gate stops the timer from planning: it passed, **and** nothing is left
-/// open under the milestone, **and** nothing under it waits in the inbox. One rule for [`wake`]
-/// and [`milestone_ready`], so the timer that decides to wake and the wake that decides to plan
-/// cannot disagree about the same board.
+/// open under the milestone. One rule for [`wake`] and [`milestone_ready`], so the timer that
+/// decides to wake and the wake that decides to plan cannot disagree about the same board.
 ///
-/// The inbox arm is M99, from selfcraft's `slice`: its gate went green with every subtask done
-/// but one row left in the inbox under the goal — a thing a run noticed and nobody ruled on. The
-/// project parked itself on the user, Accept offered, with an undecided item hanging under the
-/// goal Accept would mark done. Deciding it is exactly a planning turn's job — keep it and do it
-/// under this milestone, or unlink it and let it wait in the inbox — so the timer plans instead
-/// of standing down, and [`crate::milestones`]' Accept is not offered until the board is clear.
-/// Only the inbox *under this goal* counts; the rest of the inbox is somebody else's milestone.
-fn gate_blocks_planning(
-    gate_passed: bool,
-    open_under_goal: usize,
-    undecided_under_goal: usize,
-) -> bool {
-    gate_passed && open_under_goal == 0 && undecided_under_goal == 0
+/// It had an inbox arm from M99 to M132 — an inbox row under the goal was "a decision owed" that
+/// kept the timer planning. Since M132 an inbox task is never part of a milestone
+/// (`cide_agents::milestones::inbox_rule`): deciding about one is the user's, and a planner woken
+/// to decide it was a planner pulling from the inbox, which is the loop that rule closes.
+fn gate_blocks_planning(gate_passed: bool, open_under_goal: usize) -> bool {
+    gate_passed && open_under_goal == 0
 }
 
 /// How long this project has looked quiet, updating the record.
@@ -687,24 +800,19 @@ mod tests {
         }
     }
 
-    /// A green gate stands the timer down only when the milestone has nothing left open and
-    /// nothing left undecided; a red or unknown one never does. Two cases were wrong here: a
-    /// gate passing with tasks in todo, doing and review, and the planner refusing as if the
-    /// milestone were finished; and (M99) a gate passing with one inbox row under the goal,
-    /// which is a decision owed and the reason to plan, not a reason not to.
+    /// A green gate stands the timer down only when the milestone has nothing left open; a red
+    /// or unknown one never does. A gate passing with tasks in todo, doing and review is work to
+    /// plan around. (An inbox row under the goal held it open from M99 to M132; it is not part of
+    /// the milestone any more, so it has no say.)
     #[test]
     fn a_passing_gate_blocks_only_an_empty_milestone() {
-        assert!(gate_blocks_planning(true, 0, 0));
+        assert!(gate_blocks_planning(true, 0));
         assert!(
-            !gate_blocks_planning(true, 3, 0),
+            !gate_blocks_planning(true, 3),
             "open tasks under the goal are work to plan"
         );
-        assert!(
-            !gate_blocks_planning(true, 0, 1),
-            "an inbox task under the goal is a decision to make, and only a turn can make it"
-        );
-        assert!(!gate_blocks_planning(false, 0, 0));
-        assert!(!gate_blocks_planning(false, 3, 2));
+        assert!(!gate_blocks_planning(false, 0));
+        assert!(!gate_blocks_planning(false, 3));
     }
 
     #[test]

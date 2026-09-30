@@ -30,7 +30,8 @@ active?: string,
 verify: string, 
 /**
  * How many open tasks (todo, doing, review) the active milestone may hold before a new one
- * the orchestrator creates goes to the inbox instead. `None` is [`DEFAULT_MAX_OPEN`].
+ * the orchestrator creates under it is refused (it went to the inbox until M132, which is
+ * how milestones filled up with noticed work). `None` is [`DEFAULT_MAX_OPEN`].
  */
 maxOpen?: number, 
 /**

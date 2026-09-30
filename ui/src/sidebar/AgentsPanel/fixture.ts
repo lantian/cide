@@ -36,6 +36,7 @@
 import type { ProjectId } from '@/ipc/client'
 import type { AgentsPanelViewProps } from './AgentsPanel'
 import type { AgentDefView, Roster, RunPhase, RunView } from './model'
+import type { TaskView } from '@/sidebar/TasksPanel/model'
 
 /**
  * A fixed instant, so a digest of a story is the same on two runs.
@@ -522,6 +523,8 @@ export type AgentsStoryName =
   | 'role-pooled'
   | 'history'
   | 'history-empty'
+  | 'panel-tabs'
+  | 'question-plain'
 
 export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
   'no-project': story({ project: null, roster: ready([RUNNING]) }),
@@ -755,4 +758,68 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
 
   /* History chosen with nothing ended yet: a sentence, not a blank panel. */
   'history-empty': story({ roster: ready([RUNNING]), tab: 'history' }),
+
+  /*
+   * The top-level strip (M132): *Subagents* on, *Waiting* beside it with its count, and a run
+   * whose task carries an open question — so its "Waiting for your answer" line is a link to the
+   * Waiting tab. The only story passing `onPanelTab`; every other one is the panel as it was,
+   * titled *Agents*, and the check pins that too.
+   */
+  'panel-tabs': story({
+    roster: ready([RUNNING]),
+    taskQuestions: { 't-14': 'May sim/sim_event.gd be added?' },
+    onPanelTab: () => {},
+    waiting: 2,
+  }),
+
+  /* The same question with no strip wired: the line is plain words, not a link to nowhere. */
+  'question-plain': story({
+    roster: ready([RUNNING]),
+    taskQuestions: { 't-14': 'May sim/sim_event.gd be added?' },
+  }),
 }
+
+/*
+ * The Waiting tab's rows (M132), for the smoke entry's one `WaitingPanel` render: a task to
+ * accept and a task with a question. Written out rather than borrowed from the Tasks panel's
+ * fixture, whose `task()` helper is private to it — and a Tasks fixture change must not be able
+ * to move this panel's digest.
+ */
+function waitingTask(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskView {
+  return {
+    status: 'todo',
+    change: null,
+    session: null,
+    links: [],
+    agent: null,
+    commentCount: 0,
+    attachmentCount: 0,
+    touches: [],
+    acceptance: null,
+    question: null,
+    createdBy: { kind: 'user' },
+    createdMs: NOW_MS - 86_400_000,
+    updatedMs: NOW_MS - 600_000,
+    ...over,
+  }
+}
+
+export const WAITING_REVIEW: readonly TaskView[] = [
+  waitingTask({
+    id: 't-51',
+    title: 'Redraw the pickaxe sprite',
+    status: 'review',
+    agent: 'artist',
+    acceptance: 'user',
+  }),
+]
+
+export const WAITING_QUESTIONS: readonly TaskView[] = [
+  waitingTask({
+    id: 't-14',
+    title: 'Add the retry bar',
+    status: 'doing',
+    agent: 'developer',
+    question: 'May sim/sim_event.gd be added?',
+  }),
+]

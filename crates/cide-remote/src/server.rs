@@ -4543,6 +4543,8 @@ mod tests {
                     attachments: None,
                     links: None,
                     change: None,
+                    acceptance: None,
+                    touches: None,
                 },
             },
         )

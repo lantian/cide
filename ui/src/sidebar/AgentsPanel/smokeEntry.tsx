@@ -34,11 +34,20 @@
  */
 import { renderToStaticMarkup } from 'react-dom/server'
 import { AgentsPanelView } from './AgentsPanel'
-import { AGENTS_STORIES, type AgentsStoryName } from './fixture'
+import { AgentsPanelTabs } from './PanelTabs'
+import { WaitingPanel } from './WaitingPanel'
+import {
+  AGENTS_STORIES,
+  PROJECT,
+  WAITING_QUESTIONS,
+  WAITING_REVIEW,
+  type AgentsStoryName,
+} from './fixture'
 
 /** What the check script asserts on. Strings and counts, so a failure prints something legible. */
 export interface AgentsDigest {
-  story: AgentsStoryName
+  /** A fixture story, or `waiting-panel` — the Waiting tab's one render (M132). */
+  story: AgentsStoryName | 'waiting-panel'
   /** The header's right-hand figure. Empty string when `metaFigure` withheld it. */
   meta: string
   /** The panel's one claim, when it makes one. */
@@ -67,6 +76,18 @@ export interface AgentsDigest {
   labels: string[]
   /** The text of every `agentsUsing` line — what each run is on. (M89) */
   using: string[]
+  /** The top-level strip (M132) as `tab|selected|text`; empty when the header says *Agents*. */
+  panelTabs: string[]
+  /** The header title's text — *Agents*, or the strip's labels. */
+  headerTitle: string
+  /** Run rows' question lines drawn as a link to the Waiting tab. (M132) */
+  waitingLinks: number
+  /** Every run row's gate/question line, as text. (M114, M132) */
+  gates: string[]
+  /** `WaitingPanel`'s task links and answer buttons, counted. Zero outside `waiting-panel`. */
+  waitingOpens: number
+  waitingAnswers: number
+  waitingAccepts: number
   /** The tabs as `tab|pressed|text`, and which tab panels carry `hidden`. (M89) */
   tabs: string[]
   hiddenPanels: string[]
@@ -171,9 +192,34 @@ function inlineColor(html: string, audit: string): string {
 const digests = (Object.keys(AGENTS_STORIES) as AgentsStoryName[]).map((story) =>
   digest(story, renderToStaticMarkup(<AgentsPanelView {...AGENTS_STORIES[story]} />)),
 )
+/*
+ * The Waiting tab (M132), as `AgentsPanelHost` mounts it: `WaitingPanel` under the same strip,
+ * Waiting on. Its own entry rather than a fixture story, because the fixture's stories are
+ * `AgentsPanelView`'s props and this is another component; `digest` reads it the same way, and
+ * the fields about roles and runs simply come back empty.
+ */
+digests.push(
+  digest(
+    'waiting-panel',
+    renderToStaticMarkup(
+      <WaitingPanel
+        project={PROJECT}
+        title={<AgentsPanelTabs tab="waiting" onTab={() => {}} waiting={2} />}
+        review={WAITING_REVIEW}
+        questions={WAITING_QUESTIONS}
+        reports={{ 't-51': 'Redrew the head at 16px, re-exported the atlas.' }}
+        busy={new Set()}
+        onOpenTask={() => {}}
+        onAccept={() => {}}
+        onSendBack={() => {}}
+        onAnswer={() => {}}
+      />,
+    ),
+  ),
+)
 console.log(JSON.stringify(digests))
 
-function digest(story: AgentsStoryName, html: string): AgentsDigest {
+function digest(story: AgentsDigest['story'], html: string): AgentsDigest {
   const rows = all(html, 'agentsRow').map((row) => {
     const phase = attr(row, 'data-phase')
     const glyph = text(/data-audit="agentsGlyph"[^>]*>([^<]*)</.exec(row)?.[1] ?? '')
@@ -216,6 +262,21 @@ function digest(story: AgentsStoryName, html: string): AgentsDigest {
     opens: count(html, 'data-audit="agentsOpen"'),
     labels: labels(html),
     using: all(html, 'agentsUsing').map((line) => text(line)),
+    panelTabs: all(html, 'agentsPanelTab').map(
+      (tab) => `${attr(tab, 'data-tab')}|${attr(tab, 'aria-selected')}|${text(tab)}`,
+    ),
+    headerTitle: text(
+      /data-audit="agentsHeader"[^>]*>\s*<span[^>]*>([\s\S]*?)<\/span>\s*<span[^>]*data-audit="agentsMeta"/.exec(
+        html,
+      )?.[1] ??
+        /data-audit="agentsHeader"[^>]*>\s*<span[^>]*>([\s\S]*?)<\/span>\s*<span/.exec(html)?.[1] ??
+        '',
+    ),
+    waitingLinks: count(html, 'data-audit="agentsWaitingLink"'),
+    gates: all(html, 'agentsGate').map((line) => text(line)),
+    waitingOpens: count(html, 'data-audit="waitingOpen"'),
+    waitingAnswers: count(html, 'data-audit="waitingAnswer"'),
+    waitingAccepts: count(html, 'data-audit="waitingAccept"'),
     tabs: all(html, 'agentsTab').map(
       (tab) => `${attr(tab, 'data-tab')}|${attr(tab, 'aria-pressed')}|${text(tab)}`,
     ),

@@ -26,6 +26,12 @@
  * markup of every story would be History the render check could see in only one of them. Twenty
  * rows at most (`RECENT_CAP`) is nothing to keep in the DOM.
  *
+ * Above them, in the header, sits a second level (M132): *Subagents* — everything this file
+ * draws — and *Waiting* for you, which the host renders as `WaitingPanel` under the same strip
+ * (`PanelTabs.tsx`). Two levels and not a third segment beside History, because Waiting is not a
+ * view of the roster: it lists tasks, drawn with the Tasks panel's rows, and it is the tab the
+ * rail's waiting mark and a run row's question line send the user to.
+ *
  * # Open is drawn only when there is something to look at, and Configure always
  *
  * That is the user's own rule and it is enforced in two places that cannot disagree, because the
@@ -126,6 +132,8 @@ import {
   type Section,
 } from './model'
 import { ActivityRow, RunRow, TONE_CLASS, cx } from './RunRow'
+import { AgentsPanelTabs } from './PanelTabs'
+import type { AgentsPanelTab } from '@/sidebar/agentsTabStore'
 import type { ProjectId } from '@/ipc/client'
 import { Icon, asIcon } from '@/icons/Icon'
 
@@ -211,6 +219,8 @@ export interface AgentsPanelViewProps {
    * idle. A plain map, `taskTitles`' reason; a missing key draws no line.
    */
   taskGates?: Readonly<Record<string, GateView>> | undefined
+  /** Task id → its open question to the user (M132). A missing key draws no line. */
+  taskQuestions?: Readonly<Record<string, string>> | undefined
   /** The clock, as a prop. See the header. */
   nowMs: number
   /**
@@ -220,6 +230,16 @@ export interface AgentsPanelViewProps {
   tab?: AgentsTab | undefined
   /** Switch tabs. Without it the tabs are not drawn and the panel shows `tab` alone. */
   onTab?: ((tab: AgentsTab) => void) | undefined
+  /**
+   * The panel's **top-level** tab strip, *Subagents* and *Waiting* (M132), drawn in the header
+   * where the title says *Agents*. This view is the Subagents tab, so it draws the strip with
+   * Subagents on; the host renders `WaitingPanel` under the same strip for the other. Without
+   * `onPanelTab` the header says *Agents* as before and the question line on a run row is plain
+   * words — the rule every handler here follows.
+   */
+  onPanelTab?: ((tab: AgentsPanelTab) => void) | undefined
+  /** Tasks waiting for the user, for the Waiting tab's count. See [`AgentsPanelTabs`]. */
+  waiting?: number | undefined
   onOpen?: ((run: string) => void) | undefined
   onPause?: ((run: string) => void) | undefined
   onResume?: ((run: string) => void) | undefined
@@ -324,9 +344,12 @@ export function AgentsPanelView({
   roster = ROSTER_UNKNOWN,
   taskTitles = {},
   taskGates = {},
+  taskQuestions = {},
   nowMs,
   tab = 'agents',
   onTab,
+  onPanelTab,
+  waiting = 0,
   onOpen,
   onPause,
   onResume,
@@ -352,7 +375,7 @@ export function AgentsPanelView({
    * be recomputing on nearly every render anyway while adding a hook to a component whose
    * whole value is that it is a function of its props.
    */
-  const body = sections(roster, taskTitles, taskGates)
+  const body = sections(roster, taskTitles, taskGates, taskQuestions)
   const meta = metaFigure(roster)
   const roles = body.find((section) => section.kind === 'agents')
   const history = body.find((section) => section.kind === 'recent')
@@ -360,7 +383,13 @@ export function AgentsPanelView({
   return (
     <aside className={styles.panel} data-audit="sidebarAgents" aria-label="Agents">
       <div className={styles.header} data-audit="agentsHeader">
-        <span className={styles.headerTitle}>Agents</span>
+        <span className={styles.headerTitle}>
+          {onPanelTab === undefined ? (
+            'Agents'
+          ) : (
+            <AgentsPanelTabs tab="subagents" onTab={onPanelTab} waiting={waiting} />
+          )}
+        </span>
         {/*
           * Empty, not `—`, when `metaFigure` returns `null`.
           *
@@ -568,6 +597,7 @@ export function AgentsPanelView({
                     onStop={onStop}
                     onRevealTask={onRevealTask}
                     onOpenReviewer={onOpenReviewer}
+                    onShowWaiting={onPanelTab === undefined ? undefined : () => onPanelTab('waiting')}
                     onRetryTurn={onRetryTurn}
                     onAckStaleTurn={onAckStaleTurn}
                   />
@@ -599,6 +629,7 @@ export function AgentsPanelView({
                     onStop={onStop}
                     onRevealTask={onRevealTask}
                     onOpenReviewer={onOpenReviewer}
+                    onShowWaiting={onPanelTab === undefined ? undefined : () => onPanelTab('waiting')}
                     armed={integrateArmed === row.run.run}
                     onIntegrateArm={onIntegrateArm}
                     onIntegrate={onIntegrate}
@@ -830,6 +861,7 @@ function RoleLine({
   onStop,
   onRevealTask,
   onOpenReviewer,
+  onShowWaiting,
   onRetryTurn,
   onAckStaleTurn,
 }: {
@@ -842,6 +874,7 @@ function RoleLine({
   onStop?: ((run: string) => void) | undefined
   onRevealTask?: ((task: string) => void) | undefined
   onOpenReviewer?: ((session: string, task: string) => void) | undefined
+  onShowWaiting?: (() => void) | undefined
   onRetryTurn?: ((run: string) => void) | undefined
   onAckStaleTurn?: ((run: string) => void) | undefined
 }) {
@@ -978,6 +1011,7 @@ function RoleLine({
           onStop={onStop}
           onRevealTask={onRevealTask}
           onOpenReviewer={onOpenReviewer}
+          onShowWaiting={onShowWaiting}
           onRetryTurn={onRetryTurn}
           onAckStaleTurn={onAckStaleTurn}
         />

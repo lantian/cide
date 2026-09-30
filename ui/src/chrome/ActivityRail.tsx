@@ -17,6 +17,7 @@ import { groupDigits } from '@/overlays/format'
 import { Icon, type IconName, type IconSize } from '@/icons/Icon'
 import { useContextMenu } from '@/menus'
 import { railFit, railOverflowHint } from './railOverflow'
+import { agentsMarks } from './railMarks'
 import type { ActivityView } from './sidebarView'
 import styles from './ActivityRail.module.css'
 
@@ -241,6 +242,26 @@ export interface ActivityRailProps {
    */
   agentsAwaiting?: boolean | undefined
   /**
+   * Tasks waiting for the user — accepted by eye and in review, or carrying an open question —
+   * for a **second mark** on the hexagon: the Agents panel's Waiting tab lists them. (M132)
+   *
+   * Its own mark and not the pill, because the two are independent facts and either can be true
+   * alone: a question can sit on the board after its run has finished (no live runs, no pill),
+   * and runs can work with nothing owed (pill, no mark). Folding it into the pill would mean
+   * choosing which number to draw; retoning the pill, as `agentsAwaiting` does, would say
+   * nothing when no run is live — which is exactly when a task waits longest unnoticed.
+   *
+   * So it sits in the corner the pill does not (bottom right, the pill is top right), as a dot
+   * without a number: the count is in the button's name and on the Waiting tab, and a second
+   * pill on a 32px button would be two numbers to tell apart at a glance. Amber (`--grad-yellow`),
+   * the kit's "waiting on someone" tone — not the pill's neutral, which reads as a quiet count,
+   * and not the red `agentsAwaiting` takes, which means a run is stopped at a prompt this second.
+   *
+   * `errors`' rule for the value: `null` is nobody looked (no tracker, board not read), `0` is
+   * looked and nothing waits, and neither draws anything.
+   */
+  agentsWaiting?: number | null | undefined
+  /**
    * Open tasks in `.cide/tasks.json`, for the badge on the ticked box. (M18)
    *
    * Same rule again, and here the `null` is the common case rather than the exotic one: a
@@ -296,6 +317,7 @@ export function ActivityRail({
   busy,
   agents,
   agentsAwaiting,
+  agentsWaiting,
   tasks,
   onSelect,
   toolWindowOpen,
@@ -423,6 +445,9 @@ export function ActivityRail({
    * `groupDigits` and stay standalone-compilable for `check-git-tree.mjs`.
    */
   const count = changed ?? null
+  /* The Agents button's two marks and its name, decided in `railMarks.ts` — see its header for
+     why the run pill and the waiting mark are independent, and why the rule is not in here. */
+  const marks = agentsMarks(agents, agentsAwaiting, agentsWaiting, groupDigits)
   const badges: Record<
     string,
     { pill: string; name: string; pillClass?: string | undefined } | undefined
@@ -455,14 +480,13 @@ export function ActivityRail({
      * in both states, which is the half of the fact that does not matter.
      */
     agents:
-      typeof agents === 'number' && agents > 0
+      marks.runs !== null
         ? {
-            pill: badgeText(agents) ?? String(agents),
-            pillClass: agentsAwaiting === true ? styles.badgeError : undefined,
-            name:
-              agentsAwaiting === true
-                ? `${groupDigits(agents)} ${agents === 1 ? 'run' : 'runs'}, waiting for you`
-                : `${groupDigits(agents)} ${agents === 1 ? 'run' : 'runs'}`,
+            pill: badgeText(marks.runs) ?? String(marks.runs),
+            pillClass: marks.blocked ? styles.badgeError : undefined,
+            // `marks.name`, not a count of runs alone: it also names the waiting mark, which
+            // is drawn with or without this pill (`railMarks.ts`).
+            name: marks.name ?? '',
           }
         : undefined,
     tasks:
@@ -516,6 +540,13 @@ export function ActivityRail({
           // The name carries the busy fact even when the pill claims the visual slot.
           name = badge === undefined ? `${item.label} — analysing…` : `${name}, analysing…`
         }
+        // The waiting mark (M132) is drawn with or without the pill, so with no pill the name
+        // is carried here: "Agents — 1 task waiting for you". With one, the badge's name above
+        // already says both ("Agents — 2 runs, 1 task waiting for you").
+        const waitingHere = item.id === 'agents' && marks.waiting !== null
+        if (waitingHere && badge === undefined && marks.name !== null) {
+          name = `${item.label} — ${marks.name}`
+        }
         return (
           <Fragment key={item.id}>
             {/* Hidden from the accessibility tree: a tablist should own nothing but tabs,
@@ -543,6 +574,11 @@ export function ActivityRail({
                 /* The pulsing busy dot, in the pill's anchor corner. `aria-hidden` for the
                    badge's reason: the name above already says "analysing…". */
                 <span className={styles.busyDot} data-audit="problemsBusy" aria-hidden="true" />
+              )}
+              {waitingHere && (
+                /* The waiting mark, bottom right — the corner the pill is not in. `aria-hidden`
+                   for the pill's reason: the name above is the wording. */
+                <span className={styles.waitingMark} data-audit="railWaiting" aria-hidden="true" />
               )}
               {badge !== undefined && (
                 /*

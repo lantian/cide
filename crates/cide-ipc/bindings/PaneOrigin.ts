@@ -5,4 +5,4 @@
  *
  * See [`Pane::origin`].
  */
-export type PaneOrigin = "worker";
+export type PaneOrigin = "worker" | "planner" | "reviewer";

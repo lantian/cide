@@ -98,17 +98,31 @@
  * work lives on is `cide/<role>-<task>` and only the run knows both halves. The view hands back a
  * run id; this host looks the run up in the roster it already holds and passes its agent and
  * task to `useAgents.integrate` — never a role alone, which would reach the base branch that
- * per-task worktrees left empty.
+ * per-task worktrees left empty. *
+ * # *Waiting for you* is this host's too (M132)
+ *
+ * The panel's second top-level tab lists tasks, not runs — user-accepted work in review and open
+ * questions — and was the Tasks panel's third tab until it moved here (`agentsTabStore.ts` says
+ * why). What moved with it is everything `WaitingPanel` cannot do as a pure view: the derivation
+ * from the board, each review row's latest report (one `task_get` per row, only while the tab is
+ * showing), and the `task_respond` calls with the set of rows in flight. Opening a task from a
+ * Waiting row is the run row's own gesture, `revealTask`, so the card opens over this panel by
+ * the one road with the refusals written down.
  */
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
-import { fsReveal, type ProjectId } from '@/ipc/client'
+import { fsReveal, tasks as tasksApi, type ProjectId, type TaskResponse } from '@/ipc/client'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
 import { useTasks } from '@/sidebar/tasksStore'
 import { revealTask } from '@/chrome/taskReveal'
 import { followMilestones, useMilestones } from '@/sidebar/milestonesStore'
 import { openTaskSession } from '@/sidebar/TasksPanel/openSession'
+import { useAgentsTab } from '@/sidebar/agentsTabStore'
+import { adaptDetail } from '@/sidebar/TasksPanel/adapt'
+import { latestReport, waitingCount, waitingFor, type TaskView } from '@/sidebar/TasksPanel/model'
 import { AgentsPanelView, type AgentsTab } from './AgentsPanel'
+import { AgentsPanelTabs } from './PanelTabs'
+import { WaitingPanel } from './WaitingPanel'
 import type { GateView } from './model'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
@@ -161,6 +175,76 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     if (board.kind === 'ready') for (const task of board.tasks) titles[task.id] = task.title
     return titles
   }, [board])
+
+  /* Task id → open question (M132), for the run row's "Waiting for your answer". */
+  const taskQuestions = useMemo(() => {
+    const questions: Record<string, string> = {}
+    if (board.kind === 'ready')
+      for (const task of board.tasks) if (task.question) questions[task.id] = task.question
+    return questions
+  }, [board])
+
+  /*
+   * *Waiting for you* (M132) — see the header. Derived from the board in memos, because each
+   * builds arrays (`check:selectors`' rule for a derived value), and counted for the tab's badge
+   * whichever tab is showing: the badge is how the user learns there is something there.
+   */
+  const panelTab = useAgentsTab((s) => s.tab)
+  const setPanelTab = useAgentsTab((s) => s.setTab)
+  const waiting = useMemo(
+    () => waitingFor(board.kind === 'ready' ? board.tasks : NO_TASKS),
+    [board],
+  )
+  const waitingTotal = useMemo(
+    () => waitingCount(board.kind === 'ready' ? board.tasks : NO_TASKS),
+    [board],
+  )
+  /*
+   * Each review row's latest report. The board carries a comment *count*, not the comments (M68),
+   * so the line under a row to accept is one `task_get` per row — only while the Waiting tab is
+   * showing, and again when the board moves (a run that reported again is a board change). Few
+   * rows by nature: these are tasks the user alone can finish.
+   */
+  const [reports, setReports] = useState<Readonly<Record<string, string | null>>>({})
+  const reviewIds = waiting.review.map((t) => t.id).join(' ')
+  useEffect(() => {
+    if (panelTab !== 'waiting' || project === null || reviewIds === '') return
+    let live = true
+    for (const id of reviewIds.split(' ')) {
+      void tasksApi
+        .get(project, id)
+        .then((wire) => {
+          const detail = adaptDetail(wire)
+          if (!live || detail === null) return
+          setReports((all) => ({ ...all, [id]: latestReport(detail.comments) }))
+        })
+        // A failed read leaves the row without its line; the row itself and its buttons stand.
+        .catch(() => {})
+    }
+    return () => {
+      live = false
+    }
+  }, [panelTab, project, reviewIds, board])
+  // A report read for one project is not a report of the next one's task with the same id.
+  useEffect(() => setReports({}), [project])
+  /** Rows with a response in flight, so Accept cannot be pressed twice into two merges. */
+  const [responding, setResponding] = useState<ReadonlySet<string>>(NO_IDS)
+  const respondTask = useTasks((s) => s.respond)
+  const respond = useCallback(
+    (task: string, response: TaskResponse) => {
+      setResponding((now) => new Set([...now, task]))
+      void respondTask(task, response)
+        .catch((reason: unknown) => notifyFailure(reason, { project }))
+        .finally(() =>
+          setResponding((now) => {
+            const next = new Set(now)
+            next.delete(task)
+            return next
+          }),
+        )
+    },
+    [respondTask, project],
+  )
 
   /*
    * The verify gate per task (M114), for the line that says why an idle run is idle. The
@@ -295,12 +379,36 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
   const configPath =
     roster.kind === 'disabled' || roster.kind === 'empty' ? roster.configPath : null
 
+  /*
+   * The Waiting tab: `WaitingPanel` under the same strip the Subagents view draws. Only with a
+   * project open — with none, the view says so under a header reading *Agents* and no strip,
+   * because a Waiting tab of no project would be a list about nothing.
+   */
+  if (project !== null && panelTab === 'waiting') {
+    return (
+      <WaitingPanel
+        project={project}
+        title={<AgentsPanelTabs tab="waiting" onTab={setPanelTab} waiting={waitingTotal} />}
+        review={waiting.review}
+        questions={waiting.questions}
+        reports={reports}
+        busy={responding}
+        // The run row's task link, exactly — see `onRevealTask` below for the road and its refusals.
+        onOpenTask={(task) => revealTask(task, project)}
+        onAccept={(task) => respond(task, { kind: 'accept' })}
+        onSendBack={(task, note) => respond(task, { kind: 'sendBack', note })}
+        onAnswer={(task, text) => respond(task, { kind: 'answer', text })}
+      />
+    )
+  }
+
   return (
     <AgentsPanelView
       project={project}
       roster={roster}
       taskTitles={taskTitles}
       taskGates={taskGates}
+      taskQuestions={taskQuestions}
       nowMs={nowMs}
       /*
        * The write that touches the user's repository. Passed only with a project open, so the
@@ -406,6 +514,10 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
             onIntegrate: integrate,
             tab,
             onTab: (next: AgentsTab) => setTabs((all) => ({ ...all, [project]: next })),
+            /* The top-level strip (M132): Subagents is this view, Waiting is the branch above.
+               Its presence is also what turns a run row's question line into a link. */
+            onPanelTab: setPanelTab,
+            waiting: waitingTotal,
           })}
       /*
        * The agent→task link: selecting the task is the whole gesture now. `TaskDetailHost` is
@@ -434,3 +546,6 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     />
   )
 }
+
+const NO_TASKS: readonly TaskView[] = []
+const NO_IDS: ReadonlySet<string> = new Set()

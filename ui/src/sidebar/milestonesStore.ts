@@ -18,7 +18,14 @@ import { requestPanel } from '@/chrome/panelRequests'
 import { useTasks } from '@/sidebar/tasksStore'
 import type { TaskMilestone } from './TasksPanel/TaskDetail'
 
-/** Which tab the Tasks panel shows. Here rather than in the panel, so a task card can ask. */
+/**
+ * Which tab the Tasks panel shows. Here rather than in the panel, so a task card can ask.
+ *
+ * `waiting` (*Waiting for you*, M132) was a third value for a while and moved to the Agents
+ * panel (`agentsTabStore.ts`). `setTab` still folds anything that is not `milestones` into
+ * `tasks`, so a caller written against the three-tab strip lands on the board rather than on a
+ * tab that draws nothing.
+ */
 export type TasksTab = 'tasks' | 'milestones'
 
 interface MilestonesStore {
@@ -46,7 +53,7 @@ export const useMilestones = create<MilestonesStore>((set, get) => ({
   error: null,
   tab: 'tasks',
   focus: null,
-  setTab: (tab) => set({ tab }),
+  setTab: (tab) => set({ tab: tab === 'milestones' ? 'milestones' : 'tasks' }),
   reveal: (milestone, tab = 'overview') => {
     set({ tab: 'milestones', focus: { milestone, tab } })
     // The panel may be showing Files, or be shut: the tab is only seen if the Tasks panel is.
@@ -120,7 +127,9 @@ export function milestoneOfTask(view: MilestonesView | null, task: string): Task
   for (const m of items) {
     if (m.task === task) return { id: m.id, title: m.title, state: stateOf(m.id), goal: true }
     const list = view.tasks.find((t) => t.milestone === m.id)
-    if (list?.tasks.some((t) => t.id === task) === true) {
+    // An inbox row under a goal is a legacy link, not part of the milestone (M132) — the card
+    // must not claim it serves one while the Milestones tab says it does not.
+    if (list?.tasks.some((t) => t.id === task && t.status !== 'inbox') === true) {
       return { id: m.id, title: m.title, state: stateOf(m.id), goal: false }
     }
   }

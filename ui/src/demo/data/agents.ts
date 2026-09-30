@@ -189,4 +189,9 @@ export const CONFIG: OrchestrationConfig = {
   verifyRetries: 3,
   resumeAfterRestart: true,
   trackerEnabled: true,
+  review: 'batch',
+  reviewBatch: 3,
+  reviewAfterSecs: 600,
+  batchReviewPrompt: '',
+  commentLimit: 1500,
 }

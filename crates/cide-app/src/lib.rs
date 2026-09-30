@@ -725,6 +725,7 @@ pub fn run() {
             cmd::tasks::task_search,
             cmd::tasks::task_new,
             cmd::tasks::task_edit,
+            cmd::tasks::task_respond,
             cmd::tasks::task_delete,
             // M39: attachments.
             cmd::tasks::task_attach,
@@ -798,6 +799,7 @@ pub fn run() {
             cmd::agents::milestones_set,
             cmd::agents::milestones_gate_run,
             cmd::agents::milestones_accept,
+            cmd::agents::milestones_detach_inbox,
             cmd::agents::milestones_check_log,
             cmd::agents::proposal_accept,
             cmd::agents::proposal_reject,

@@ -123,6 +123,8 @@ function comment(from: WireComment): CommentView {
     atMs: ms(from.atUnixMs),
     editedMs: from.editedAtUnixMs === null ? null : ms(from.editedAtUnixMs),
     attachments: attachments(from.attachments),
+    // `=== true`: the key is absent on every comment written before M132 and on most after.
+    superseded: from.superseded === true,
   }
 }
 
@@ -191,6 +193,12 @@ function row(from: WireRow): TaskView {
      */
     commentCount: Number(from.commentCount),
     attachmentCount: Number(from.attachmentCount),
+    // All three optional on the wire (`skip_serializing_if`), so absent is the common case. (M132)
+    // `question` goes through `== null` for `session`'s reason above: a hand-edited file can
+    // spell "no question" as `null` as easily as by leaving the key out.
+    touches: from.touches ?? [],
+    acceptance: from.acceptance ?? null,
+    question: from.question == null ? null : from.question,
   }
 }
 

@@ -44,6 +44,7 @@ import {
   type TaskEdit,
   type TaskId,
   type TaskNew,
+  type TaskResponse,
 } from '@/ipc/client'
 import { adaptBoard } from './TasksPanel/adapt'
 import {
@@ -119,6 +120,12 @@ interface TasksStore {
    */
   create: (draft: TaskDraft) => Promise<void>
   edit: (task: TaskId, edit: TaskEdit) => Promise<void>
+  /**
+   * The user's answer to a task waiting on them (M132): accept, send back, answer. `edit`'s
+   * shape — the board comes back and is adopted — for `task_respond`, which also continues the
+   * role's run; see `tasks.respond`.
+   */
+  respond: (task: TaskId, response: TaskResponse) => Promise<void>
   remove: (task: TaskId) => Promise<void>
   /**
    * Files by path onto the body, a comment, or a new comment. (M39) The `edit` shape — the
@@ -338,6 +345,14 @@ export const useTasks = create<TasksStore>((set, get) => ({
     const project = get().project
     if (project === null) return
     const wire = await tasksApi.edit(project, task, edit)
+    if (get().project !== project) return
+    get().adopt(project, wire)
+  },
+
+  respond: async (task, response) => {
+    const project = get().project
+    if (project === null) return
+    const wire = await tasksApi.respond(project, task, response)
     if (get().project !== project) return
     get().adopt(project, wire)
   },
