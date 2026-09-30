@@ -114,29 +114,48 @@ export function ReviewPanel({
       setBusy(false)
     }
   }
+  // The loading view wears the loaded panel's chrome (`reviewPanel`, `reviewHeading`) and the
+  // inbox's centred `empty` state. It used to be bare `styles.reviewSidebar` with a raw `<p>` and
+  // `<button>`: that class has no padding of its own (the loaded view pads each section), so the
+  // text sat flush in the panel's top-left corner.
   if (!d)
     return (
-      <div className={styles.reviewSidebar}>
-        <header className={styles.sidebarHeader}>
-          <strong>Merge request</strong>
-          <button
-            aria-label="Close MR review"
-            disabled={busy}
-            onClick={() => void run(() => closeReview(review))}
+      <section
+        className={`${styles.reviewSidebar} ${chrome.reviewPanel}`}
+        aria-label="Loading merge request"
+      >
+        <div className={chrome.reviewHeading}>
+          <header className={chrome.reviewTopline}>
+            <span className={chrome.mrNumber}>Merge request</span>
+            <div className={chrome.headerTools}>
+              <IconButton
+                icon="x"
+                label="Close MR review"
+                disabled={busy}
+                onClick={() => void run(() => closeReview(review))}
+              />
+            </div>
+          </header>
+        </div>
+        <div className={chrome.empty}>
+          {error || snap.error ? (
+            <>
+              <Icon name="git-branch" size={3} />
+              <strong>Could not load merge request</strong>
+              <p role="alert">{error || snap.error}</p>
+            </>
+          ) : (
+            <Spinner label="Loading merge request…" />
+          )}
+          <Button
+            size="sm"
+            busy={busy}
+            onClick={() => void run(() => loadReview(review, true))}
           >
-            ×
-          </button>
-        </header>
-        <p>Loading merge request…</p>
-        {error && (
-          <div role="alert" className={styles.error}>
-            {error}
-          </div>
-        )}
-        <button onClick={() => void run(() => loadReview(review, true))}>
-          Retry
-        </button>
-      </div>
+            Retry
+          </Button>
+        </div>
+      </section>
     )
   const all = d.version.diffs ?? []
   const visible = visibleChanges(
