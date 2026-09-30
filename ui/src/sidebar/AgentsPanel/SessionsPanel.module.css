@@ -1,0 +1,83 @@
+/*
+ * The Sessions tab (M134): only what the kit and the Tasks panel's frame do not already draw —
+ * the gap between the controls, and the three text lines a row adds.
+ */
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-5);
+}
+
+/* The Tasks panel's filter row sits under a heading there; here it follows the checkbox. */
+.kinds {
+  margin-top: 0;
+}
+
+.count {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.top {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.onScreen {
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+.title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* What it was about: two lines at most — a first prompt can be a paragraph. */
+.about {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+/* A transcript search hit: the words around the match, as a quotation. */
+.snippet {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  margin-top: var(--sp-2);
+  color: var(--dim);
+  font-style: italic;
+}
+
+.facts {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+/* Open sits at the right end of the facts line, apart from what it acts on. */
+.open {
+  margin-left: auto;
+  flex: none;
+}
+
+/* The role select takes the width of its label, not the panel's. */
+.role {
+  align-self: flex-start;
+  min-width: calc(160px * var(--ui-scale));
+}

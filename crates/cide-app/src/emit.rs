@@ -897,6 +897,26 @@ pub fn milestones_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
     }
 }
 
+// --- the session journal (M134) -----------------------------------------------------------
+
+/// A project's session journal moved: a conversation was seen for the first time, re-keyed, or
+/// learned its run, task or title. The project only — the Agents panel's Sessions tab re-asks
+/// with `sessions_list`, which is also where liveness and the pane showing each row are joined in,
+/// neither of which the journal itself holds.
+pub const SESSIONS_CHANGED: &str = "cide://sessions-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionsChanged {
+    project: cide_ipc::ProjectId,
+}
+
+pub fn sessions_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
+    if let Err(error) = app.emit(SESSIONS_CHANGED, SessionsChanged { project }) {
+        tracing::debug!(%error, "sessions-changed reached no window");
+    }
+}
+
 // --- pool notices (t-1090) ---------------------------------------------------------------
 
 /// A pool entry's configuration is wrong, and a run has just moved past it: which pool, which

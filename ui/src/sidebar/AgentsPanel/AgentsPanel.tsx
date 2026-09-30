@@ -380,6 +380,22 @@ export function AgentsPanelView({
   const roles = body.find((section) => section.kind === 'agents')
   const history = body.find((section) => section.kind === 'recent')
 
+  /* The header's figure and scope control — in the header, or on the bar under it when the
+     top-level strip has taken the header's width. See the bar below. */
+  const stripped = onPanelTab !== undefined
+  const figure = (
+    <span className={styles.headerMeta} data-audit="agentsMeta">
+      {project === null ? '' : (meta ?? '')}
+    </span>
+  )
+  const scope =
+    project === null ? null : (
+      <ScopeControl roster={roster} onPauseAll={onPauseAll} onResumeAll={onResumeAll} />
+    )
+  const scopeOffered =
+    (onResumeAll !== undefined && anythingToResume(roster)) ||
+    (onPauseAll !== undefined && anythingToFreeze(roster))
+
   return (
     <aside className={styles.panel} data-audit="sidebarAgents" aria-label="Agents">
       <div className={styles.header} data-audit="agentsHeader">
@@ -403,19 +419,29 @@ export function AgentsPanelView({
           * than showing a roster: a figure counting runs in a project that is not on screen is
           * a number about nothing.
           */}
-        <span className={styles.headerMeta} data-audit="agentsMeta">
-          {project === null ? '' : (meta ?? '')}
-        </span>
+        {!stripped && figure}
         {/*
           * The project scope, beside the figure it qualifies.
           *
           * Withheld with no project open on the same argument as the figure: a control that
           * would freeze "this project" when there is no project is a button with no object.
           */}
-        {project === null ? null : (
-          <ScopeControl roster={roster} onPauseAll={onPauseAll} onResumeAll={onResumeAll} />
-        )}
+        {!stripped && scope}
       </div>
+      {/*
+        * With the top-level strip in the header (M132, three tabs since M134) there is no room
+        * left there: *Subagents Sessions Waiting 2* and then `8+3` and *Resume* ran into each
+        * other at the default sidebar width. So the figure and the scope control move to a bar of
+        * their own directly under the header — drawn whatever the body shows, because Resume must
+        * stay reachable from a window whose console is frozen, and the body's empty and disabled
+        * screens have no row to carry it. Drawn only when it holds something.
+        */}
+      {stripped && project !== null && ((meta ?? '') !== '' || scopeOffered) && (
+        <div className={styles.scopeBar} data-audit="agentsScopeBar">
+          {figure}
+          {scope}
+        </div>
+      )}
 
       {project === null ? (
         <div className={styles.body} data-audit="agentsBody">

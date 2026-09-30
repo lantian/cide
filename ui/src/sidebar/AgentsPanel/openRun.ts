@@ -74,6 +74,7 @@ import { revealPane } from '@/editor/revealPane'
 import {
   agentRuns,
   type HarnessSession,
+  type RunOpen,
   type Pane,
   type PaneId,
   type Project,
@@ -187,6 +188,29 @@ export async function openRunInPane(run: RunView): Promise<void> {
    */
   const plan = await agentRuns.open(target.project, run.run)
   if (plan.kind === 'unavailable') throw new Error(plan.reason)
+  const title = run.task !== null ? `${run.agentLabel} · ${run.task}` : run.agentLabel
+  await showOpenPlan(plan, title, 'run')
+}
+
+/**
+ * Steps 3 and 4 of [`openRunInPane`], for any answer shaped like `agents_run_open`'s: reveal a
+ * pane already showing the conversation, or build one for it where Settings says. (M134)
+ *
+ * Lifted out for the Sessions tab, whose `sessions_open` answers the same three ways about a
+ * console or tab conversation as this command does about a run — so the placement, the
+ * already-open test and the ownership rule are one road for both, and not a second copy that
+ * would drift on which of them it forgot. `noun` is what the sentences call it.
+ */
+export async function showOpenPlan(
+  plan: Exclude<RunOpen, { kind: 'unavailable' }>,
+  title: string,
+  noun: string,
+): Promise<void> {
+  const ws = useWorkspace.getState()
+  const boot = ws.boot
+  const target = consolePaneOf(boot)
+  const project = activeProjectOf(boot)
+  if (target === null || project === null) throw new Error(NO_CONSOLE)
   const session = plan.kind === 'mirror' ? plan.session : null
   const conversation = plan.kind === 'mirror' ? plan.continues : plan.conversation
 
@@ -209,7 +233,7 @@ export async function openRunInPane(run: RunView): Promise<void> {
     // `revealPane` never throws and reports a reason instead, because for a *mention* the send
     // had already landed and a red toast would have been a lie. Here the reveal is the entire
     // gesture, so a reason means nothing happened, and saying so is the point.
-    if (why !== null) throw new Error(`This run is already open, but ${why}.`)
+    if (why !== null) throw new Error(`This ${noun} is already open, but ${why}.`)
     return
   }
 
@@ -241,7 +265,6 @@ export async function openRunInPane(run: RunView): Promise<void> {
   const asTab = boot?.workspace.settings.openRunIn !== 'split'
   let pane: PaneId
   if (asTab) {
-    const title = run.task !== null ? `${run.agentLabel} · ${run.task}` : run.agentLabel
     pane = (await ws.newRunTab(target.project, title, intent)).pane
   } else {
     /*
@@ -266,7 +289,7 @@ export async function openRunInPane(run: RunView): Promise<void> {
   const why = await revealPane(target.project, pane)
   if (why !== null) {
     throw new Error(
-      `The run was opened ${asTab ? 'in a tab of its own' : 'in the project console'}, but ${why}.`,
+      `The ${noun} was opened ${asTab ? 'in a tab of its own' : 'in the project console'}, but ${why}.`,
     )
   }
 }

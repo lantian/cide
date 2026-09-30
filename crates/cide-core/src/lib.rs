@@ -56,6 +56,7 @@ pub mod remote;
 /// Editor colour schemes: importing a VS Code theme, and the imported ones on disk.
 pub mod scheme;
 pub mod scratch;
+pub mod sessions;
 pub mod shell;
 pub mod toolchain;
 pub mod toolwindow;

@@ -16743,3 +16743,61 @@ Asked to rebind a key or turn on word wrap, it told the user to open Settings.
   windows.
 - The parked-command path, where the request names a project other than the active one, is
   untried.
+
+## M134 — The Agents panel's Sessions tab
+
+**What.** A third top-level tab in the Agents panel, placed after *Subagents*. It lists every agent
+conversation cide has hosted for the active project, newest first:
+- the console and its splits;
+- Claude tabs, and worker, planner and reviewer tabs;
+- subagent runs, MR reviews and OpenSpec sessions.
+
+The tab has:
+- a multi-select kind filter;
+- a text search over what the journal holds (title, `/rename` name, first prompt, task, role,
+  branch, directory);
+- an opt-in *Search transcripts* checkbox that also searches what the conversations said;
+- a role select (*Every subagent*, Developer, Artist, …) that narrows the list to one subagent's
+  runs;
+- a run's task drawn as a link to its card, the Subagents tab's own `revealTask`;
+- an **Open** button on each row (*Show* when a pane already holds it). The row itself opens
+  nothing, so a missed task link cannot resume a conversation, which spawns a process.
+
+**Why a journal.** Nothing outlived a pane before this. `workspace.json` forgets a session when its
+pane closes. `agent-runs.json` keeps only work and OpenSpec runs, and only the last fifty.
+`sessions.json` (in the profile's state dir) keeps one row per *conversation*: up to 500 per
+project root, merged from two feeds.
+- The tree: `WorkspaceState::apply` calls `sessions_state::observe_workspace`.
+- The run registry: `AgentRegistry::flush` calls `observe_runs`.
+
+`cide_core::sessions` owns the merge rules. `docs/checks.md` lists its four silent failures.
+
+**Open** asks `sessions_open`, which gives `agents_run_open`'s three answers:
+1. a run still in the registry defers to `open_plan`;
+2. a live child with no pane is mirrored;
+3. an ended conversation is continued from its recorded cwd;
+4. anything else is `unavailable`, with a sentence.
+
+`openRun.ts`'s placement was lifted into `showOpenPlan`, so a run and a session open through one
+road (a tab or a console row, per *Open a run in*).
+
+**Transcripts.** This is the first code that opens them. Claude and Qwen are found through
+`lifecycle::transcript_of`, and codex through `codex_cli::rollout_of`. opencode keeps a database
+and is not searchable. A row's first prompt and `/rename` name are read lazily from the head of
+its transcript and cached in the journal.
+
+**Verified:**
+- `cargo test -p cide-core sessions` (14 new tests: merge, re-key, `/clear`, cap, head, search,
+  snippet), plus the full `cide-core`, `cide-ipc` and `cide-app` suites.
+- clippy `-D warnings`, fmt, `codegen --check` and `contract-check` (three commands and
+  `cide://sessions-changed`).
+- `tsc` and every `check:*`, including the new `check:sessions` (kinds pinned to Rust) and
+  `check:agents-render` (three new Sessions stories). `pnpm build`.
+
+**Not confirmed on a display.**
+- The tab has not been looked at. With three tabs, the strip may crowd the header's run figure
+  and Pause at the default sidebar width.
+- Journaling of a real console, a `/clear` and a codex console learning its thread id has not
+  been seen end to end.
+- Neither Open road (reveal, or continue into a tab) has been pressed in a running app.
+- Transcript search has not been timed over a large `~/.claude/projects`.

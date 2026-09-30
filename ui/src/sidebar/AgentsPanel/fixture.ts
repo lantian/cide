@@ -37,6 +37,7 @@ import type { ProjectId } from '@/ipc/client'
 import type { AgentsPanelViewProps } from './AgentsPanel'
 import type { AgentDefView, Roster, RunPhase, RunView } from './model'
 import type { TaskView } from '@/sidebar/TasksPanel/model'
+import type { SessionView } from './sessionsModel'
 
 /**
  * A fixed instant, so a digest of a story is the same on two runs.
@@ -822,4 +823,71 @@ export const WAITING_QUESTIONS: readonly TaskView[] = [
     agent: 'developer',
     question: 'May sim/sim_event.gd be added?',
   }),
+]
+
+/**
+ * The Sessions tab (M134): a live console, an ended worker tab with a `/rename` name, a subagent on
+ * a task, and an MR review — four kinds, so the filter row draws, and one of each liveness.
+ */
+const SESSION_BASE = {
+  name: null,
+  prompt: null,
+  task: null,
+  taskTitle: null,
+  agent: null,
+  branch: null,
+  cwd: '/home/dev/proj',
+  startedMs: NOW_MS - 3 * 3_600_000,
+  pane: null,
+  searchable: true,
+} as const
+
+export const SESSIONS: readonly SessionView[] = [
+  {
+    ...SESSION_BASE,
+    id: '11111111-1111-4111-8111-111111111111',
+    kind: 'console',
+    harness: 'claude',
+    title: 'proj : claude',
+    prompt: 'Add a Sessions tab to the Agents panel',
+    lastSeenMs: NOW_MS - 30_000,
+    live: true,
+    pane: 'pane-console',
+  },
+  {
+    ...SESSION_BASE,
+    id: '22222222-2222-4222-8222-222222222222',
+    kind: 'worker',
+    harness: 'codex',
+    title: 'Worker',
+    name: 'fix the flaky gate',
+    prompt: 'Make the gate retry once',
+    branch: 'worker-t-9',
+    cwd: '/home/dev/proj/.cide/worktrees/worker-t-9',
+    lastSeenMs: NOW_MS - 2 * 3_600_000,
+    live: false,
+  },
+  {
+    ...SESSION_BASE,
+    id: '33333333-3333-4333-8333-333333333333',
+    kind: 'subagent',
+    harness: 'claude',
+    title: 'Coder',
+    agent: 'Coder',
+    task: 't-14',
+    taskTitle: 'Split the renderer',
+    branch: 'coder-t-14',
+    lastSeenMs: NOW_MS - 26 * 3_600_000,
+    live: false,
+  },
+  {
+    ...SESSION_BASE,
+    id: 'ses_4',
+    kind: 'mrReview',
+    harness: 'opencode',
+    title: 'Review !42',
+    lastSeenMs: NOW_MS - 3 * 24 * 3_600_000,
+    live: false,
+    searchable: false,
+  },
 ]

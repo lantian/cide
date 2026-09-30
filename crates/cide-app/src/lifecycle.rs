@@ -284,6 +284,13 @@ fn run_teardown(app: &AppHandle) {
         positions.write_now();
     }
 
+    // The session journal (M134): the conversations of this last session — the ones the user is
+    // most likely to look for next — are exactly what is inside the debounce.
+    if let Some(sessions) = app.try_state::<std::sync::Arc<crate::sessions_state::SessionsState>>()
+    {
+        sessions.write_now();
+    }
+
     // M18: and every open project's task tracker, unconditionally for the same reason and a
     // stronger one. What is inside the debounce here is not this user's own scroll position but
     // a comment a subagent wrote as its turn ended, in a file the team commits and reads — the

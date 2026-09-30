@@ -38,6 +38,8 @@ pub mod properties;
 pub mod proposals;
 pub mod remote;
 pub mod screen;
+/// Every agent conversation cide has hosted: the Agents panel's Sessions tab. (M134)
+pub mod sessions;
 pub mod settings;
 pub mod settings_ops;
 /// Editor colour schemes — the `--tk-*` palette, as data. A different axis from [`Theme`],

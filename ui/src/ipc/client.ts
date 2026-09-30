@@ -5618,3 +5618,25 @@ export const update = {
       if (e.payload.window === windowLabel()) handler()
     }),
 }
+
+// --- the session journal (M134) ----------------------------------------------------------
+//
+// Appended, per this file's append-only rule. The Agents panel's Sessions tab: every agent
+// conversation cide has hosted for a project, from `sessions.json` (`cide-app`'s `sessions_state`).
+import type { SessionListing, TranscriptSearch } from './generated'
+
+export const sessionJournal = {
+  /** The project's agent sessions, newest first, with liveness and the pane showing each. */
+  list: (project: ProjectId) => invoke<SessionListing>('sessions_list', { project }),
+  /**
+   * Which conversations' transcripts say `query`. `token` must grow with every call: a search
+   * that a newer token overtook stops reading and answers `cancelled`.
+   */
+  search: (project: ProjectId, query: string, token: number) =>
+    invoke<TranscriptSearch>('sessions_search', { project, query, token }),
+  /** What Open means for one row: mirror a live child, continue an ended one, or why not. */
+  open: (project: ProjectId, id: string) => invoke<RunOpen>('sessions_open', { project, id }),
+  /** `cide://sessions-changed`: a project's journal moved; re-ask with `list`. */
+  onChanged: (handler: (project: ProjectId) => void) =>
+    listen<{ project: ProjectId }>('cide://sessions-changed', (e) => handler(e.payload.project)),
+}

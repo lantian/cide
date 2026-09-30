@@ -79,6 +79,7 @@ pub mod positions_state;
 pub mod proposals;
 pub mod remote;
 pub mod scratches;
+pub mod sessions_state;
 // Comment stripping for this crate's structural source assertions. Test-only: a source
 // assertion is a gate, not a product feature, and shipping the stripper in the binary would
 // invite it to be used for something.
@@ -432,6 +433,7 @@ pub fn run() {
         // Behind an `Arc` because the flusher thread outlives the call that starts it; Tauri's
         // `State` hands out a reference, which a `thread::spawn` cannot keep.
         .manage(std::sync::Arc::new(positions_state::PositionsState::load()))
+        .manage(std::sync::Arc::new(sessions_state::SessionsState::load()))
         // The Ctrl+Shift+T stack. Empty at launch by design — see `closed_tabs`'s note on why
         // it does not survive a restart — and managed here rather than in `setup` for the
         // plainer reason the two above are: `tab_close` pushes to it, and a command that cannot
@@ -794,6 +796,9 @@ pub fn run() {
             cmd::agents::agents_retry_turn,
             cmd::agents::agents_ack_stale_turn,
             cmd::agents::agents_run_open,
+            cmd::sessions::sessions_list,
+            cmd::sessions::sessions_search,
+            cmd::sessions::sessions_open,
             cmd::agents::agents_integrate,
             cmd::agents::agents_plan_now,
             cmd::agents::milestones_get,
@@ -944,6 +949,10 @@ pub fn run() {
             // same reason and by the same pattern. See `positions_state.rs`.
             app.state::<std::sync::Arc<positions_state::PositionsState>>()
                 .start_flusher();
+
+            // The session journal's (M133), by the same pattern. See `sessions_state.rs`.
+            app.state::<std::sync::Arc<sessions_state::SessionsState>>()
+                .start_flusher(app.handle().clone());
 
             // And the task trackers'. Same shape, same reason, and one more of its own: this is
             // the only store in the process whose file has writers cide does not control, so its

@@ -123,6 +123,9 @@ import { latestReport, waitingCount, waitingFor, type TaskView } from '@/sidebar
 import { AgentsPanelView, type AgentsTab } from './AgentsPanel'
 import { AgentsPanelTabs } from './PanelTabs'
 import { WaitingPanel } from './WaitingPanel'
+import { SessionsPanel } from './SessionsPanel'
+import { filterSessions, type SessionView } from './sessionsModel'
+import { useSessions } from '@/sidebar/sessionsStore'
 import type { GateView } from './model'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
@@ -380,6 +383,79 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     roster.kind === 'disabled' || roster.kind === 'empty' ? roster.configPath : null
 
   /*
+   * *Sessions* (M134): the journal of every agent conversation, from `sessionsStore`. Attached
+   * only while the tab shows — the listing stats a transcript per row, which is work for nobody
+   * while the user is on another tab — and re-attached on a project switch. The filter is memoised
+   * for `check:selectors`' rule: it builds an array.
+   */
+  const sessionRows = useSessions((s) => s.rows)
+  const sessionsError = useSessions((s) => s.error)
+  const sessionQuery = useSessions((s) => s.query)
+  const sessionKinds = useSessions((s) => s.kinds)
+  const sessionAgent = useSessions((s) => s.agent)
+  const sessionTranscripts = useSessions((s) => s.transcripts)
+  const sessionHits = useSessions((s) => s.hits)
+  const sessionSearching = useSessions((s) => s.searching)
+  const sessionCapped = useSessions((s) => s.capped)
+  useEffect(() => {
+    if (panelTab === 'sessions') useSessions.getState().attach(project)
+  }, [panelTab, project])
+  const shownSessions = useMemo(
+    () =>
+      sessionRows === null
+        ? NO_SESSIONS
+        : filterSessions(
+            sessionRows,
+            { query: sessionQuery, kinds: sessionKinds, agent: sessionAgent },
+            sessionHits,
+          ),
+    [sessionRows, sessionQuery, sessionKinds, sessionAgent, sessionHits],
+  )
+  const openSession = useCallback(
+    (id: string) => {
+      const view = sessionRows?.find((v) => v.id === id)
+      if (project === null || view === undefined) return
+      // A dynamic import, `agentsStore.openPane`'s reason: the open path reaches the workspace
+      // store and the pane hosts, which the render check of this panel must never load.
+      guarded(
+        import('./openJournalSession').then(({ openJournalSession }) =>
+          openJournalSession(project, view),
+        ),
+      )
+    },
+    [sessionRows, project, guarded],
+  )
+
+  if (project !== null && panelTab === 'sessions') {
+    const store = useSessions.getState()
+    return (
+      <SessionsPanel
+        project={project}
+        title={<AgentsPanelTabs tab="sessions" onTab={setPanelTab} waiting={waitingTotal} />}
+        rows={sessionRows}
+        shown={shownSessions}
+        error={sessionsError}
+        query={sessionQuery}
+        kinds={sessionKinds}
+        agent={sessionAgent}
+        transcripts={sessionTranscripts}
+        hits={sessionHits}
+        searching={sessionSearching}
+        capped={sessionCapped}
+        nowMs={nowMs}
+        onQuery={store.setQuery}
+        onToggleKind={store.toggleKind}
+        onAllKinds={store.clearKinds}
+        onAgent={store.setAgent}
+        onTranscripts={store.setTranscripts}
+        onOpen={openSession}
+        // The run row's task link, exactly — `revealTask` owns the refusals.
+        onRevealTask={(task: string) => revealTask(task, project)}
+      />
+    )
+  }
+
+  /*
    * The Waiting tab: `WaitingPanel` under the same strip the Subagents view draws. Only with a
    * project open — with none, the view says so under a header reading *Agents* and no strip,
    * because a Waiting tab of no project would be a list about nothing.
@@ -548,4 +624,5 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
 }
 
 const NO_TASKS: readonly TaskView[] = []
+const NO_SESSIONS: readonly SessionView[] = []
 const NO_IDS: ReadonlySet<string> = new Set()

@@ -775,3 +775,18 @@
 .toneError {
   color: var(--red);
 }
+
+/*
+ * The run figure and Pause/Resume, under the header when the top-level strip fills it (M134).
+ * The header's own height and gutter, so the two read as one header in two lines; the figure
+ * leads and the control sits at the right edge, where it was.
+ */
+.scopeBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  min-height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-5);
+  border-bottom: 1px solid var(--border-soft);
+}

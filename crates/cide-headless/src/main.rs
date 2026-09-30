@@ -49,6 +49,7 @@ usage:
   cide-headless docker                    resolve a Docker daemon and render what it holds
   cide-headless properties <path>         what the properties card would say about a path
   cide-headless remote                    what a remote listener would bind, and who is paired
+  cide-headless sessions <root>           the session journal's rows for a project, newest first
   cide-headless version                   print this binary's version";
 
 fn main() {
@@ -73,6 +74,7 @@ fn main() {
         "docker" => docker(rest),
         "properties" => properties(rest),
         "remote" => remote(),
+        "sessions" => sessions(rest),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         "version" | "-V" | "--version" => emit(&format!("{}\n", version())),
         other => {
@@ -80,6 +82,48 @@ fn main() {
             usage_and_exit();
         }
     }
+}
+
+/// The session journal's rows for one project, as `sessions.json` holds them. (M134)
+///
+/// The file, not the Sessions tab: liveness and which pane shows a row are joined in by the
+/// running app, and the rows hidden there (no transcript, never named) are printed here — this is
+/// how to see *why* a conversation the user expected is missing from the tab.
+fn sessions(args: &[String]) {
+    let Some(raw) = args.first() else {
+        eprintln!("cide-headless: sessions needs a project root");
+        usage_and_exit();
+    };
+    let root = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+    let path = cide_core::persist::state_dir().join("sessions.json");
+    // Read, never quarantined: this is an inspector, and moving a live app's file aside because
+    // this build could not parse it would be the inspector changing what it inspects.
+    let journal: cide_core::sessions::Journal = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let rows = journal.list(&root);
+    let mut out = format!(
+        "{} — {} session(s) in {}\n",
+        root.display(),
+        rows.len(),
+        path.display()
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "  {:<12} {:<8} {}{}  {}\n",
+            format!("{:?}", row.kind),
+            format!("{:?}", row.harness).to_lowercase(),
+            row.id,
+            if row.known { "" } else { " (stand-in)" },
+            row.name.as_deref().unwrap_or(&row.title),
+        ));
+        if let Some(prompt) = row.prompt.as_deref() {
+            out.push_str(&format!("               “{prompt}”\n"));
+        }
+        out.push_str(&format!("               cwd {}\n", row.cwd.display()));
+    }
+    emit(&out);
 }
 
 /// What the properties card would say about a path, without a window. (M70)

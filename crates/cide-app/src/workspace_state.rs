@@ -320,6 +320,11 @@ impl WorkspaceState {
             // Cheap and coalesced — `running::mark` takes one mutex and returns — so it is safe
             // on the path every gesture in the app runs through.
             crate::running::mark(app);
+            // And the session journal (M134), for the same reason once more: a Claude tab
+            // opened, a session bound to a pane, a `/clear` giving a pane a new conversation
+            // are all ordinary mutations with no journal code near them. A walk of the panes
+            // and one mutex; the write is the journal's own flusher's.
+            crate::sessions_state::observe_workspace(app, &snapshot);
         }
         outcome
     }

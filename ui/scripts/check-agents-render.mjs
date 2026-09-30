@@ -2944,8 +2944,8 @@ try {
     const tabs = a('panel-tabs')
     eq(
       tabs.panelTabs,
-      ['subagents|true|Subagents', 'waiting|false|Waiting 2'],
-      'the Agents panel header carries Subagents (on) and Waiting, with its count',
+      ['subagents|true|Subagents', 'sessions|false|Sessions', 'waiting|false|Waiting 2'],
+      'the Agents panel header carries Subagents (on), Sessions and Waiting, with its count',
     )
     ok(
       (tabs.labels ?? []).includes('Waiting 2') || (tabs.buttons ?? []).includes('Waiting 2'),
@@ -2957,6 +2957,14 @@ try {
       'and it still says the question',
     )
     eq(tabs.tabs.length, 2, 'the inner Agents/History pair is still drawn under the strip')
+    // Three tabs fill the header at the default sidebar width (M134): the figure and Pause/Resume
+    // move to the bar under it, or they run into the strip.
+    eq(tabs.metaInHeader, false, 'beside the strip, the run figure is not in the header')
+    eq(tabs.scopeInHeader, false, '…nor is Pause/Resume')
+    for (const name of Object.keys(agents)) {
+      if (name === 'panel-tabs' || name === 'waiting-panel' || name.startsWith('sessions-')) continue
+      eq(a(name).metaInHeader, true, `${name}: with no strip, the figure stays in the header`)
+    }
 
     const plain = a('question-plain')
     eq(plain.panelTabs, [], 'a panel with no strip wired draws none')
@@ -2967,14 +2975,79 @@ try {
       '…which still say the question',
     )
     for (const name of Object.keys(agents)) {
-      if (name === 'panel-tabs' || name === 'waiting-panel') continue
+      if (name === 'panel-tabs' || name === 'waiting-panel' || name.startsWith('sessions-')) continue
       eq(a(name).panelTabs, [], `${name}: no top-level strip without \`onPanelTab\``)
     }
+
+    /*
+     * *Sessions* (M134): every agent conversation of the project, under the same strip. Four
+     * halves, each with its own quiet way to regress: every row is drawn with its kind and its
+     * liveness; the kind chips count only the kinds present and start on All; a picked kind and a
+     * transcript hit narrow the list and draw the snippet; and an empty journal says so rather
+     * than drawing a filter row with nothing to filter.
+     */
+    const sessions = a('sessions-panel')
+    eq(
+      sessions.panelTabs,
+      ['subagents|false|Subagents', 'sessions|true|Sessions', 'waiting|false|Waiting 2'],
+      'the Sessions tab renders under the same strip, with Sessions on',
+    )
+    eq(
+      sessions.sessionRows,
+      [
+        'console|true|proj : claude',
+        'worker|false|fix the flaky gate',
+        'subagent|false|Coder',
+        'mrReview|false|Review !42',
+      ],
+      'every session is a row, newest first, named by its /rename name when it has one',
+    )
+    eq(
+      sessions.sessionKinds,
+      ['|true|All', 'console|false|Console 1', 'worker|false|Worker tab 1', 'subagent|false|Subagent 1', 'mrReview|false|MR review 1'],
+      'the kind chips are All (on) and one per kind present, each with its count',
+    )
+    ok((sessions.text ?? '').includes('Add a Sessions tab to the Agents panel'), 'a console row says what it was first asked')
+    ok((sessions.text ?? '').includes('t-14 · Split the renderer'), 'a run row says which task it was on')
+    eq(sessions.sessionHits, 0, 'no snippet is drawn without a transcript search')
+    eq(
+      sessions.sessionOpens,
+      ['Show', 'Open', 'Open', 'Open'],
+      'every row has its own Open button — Show for the one a pane already holds',
+    )
+    eq(sessions.sessionTasks, ['t-14 · Split the renderer'], 'a run’s task is a link to its card')
+    ok(sessions.sessionRole, 'the role filter is drawn when a subagent has run')
+    {
+      // Comments out first: the file's header explains, in prose, the `onOpen` it no longer passes.
+      const view = readFileSync(new URL('../src/sidebar/AgentsPanel/SessionsPanel.tsx', import.meta.url), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/[^\n]*/g, '')
+      ok(
+        !/<ListItem\b[^>]*\bonOpen=/.test(view),
+        'the row itself opens nothing: a missed task link must not resume a conversation',
+      )
+    }
+    eq(sessions.unclassed, 0, 'every hooked element on the Sessions tab has a class that exists')
+
+    const filtered = a('sessions-filtered')
+    eq(filtered.sessionRows, ['worker|false|fix the flaky gate'], 'a picked kind keeps only its rows')
+    eq(
+      filtered.sessionKinds.slice(0, 3),
+      ['|false|All', 'console|false|Console 1', 'worker|true|Worker tab 1'],
+      '…and its chip reads pressed, All does not, and the counts stay the whole journal’s',
+    )
+    eq(filtered.sessionHits, 1, 'a transcript hit draws its snippet under the row')
+    ok((filtered.text ?? '').includes('the gate retried once and passed'), '…with the words around the match')
+
+    const noSessions = a('sessions-empty')
+    eq(noSessions.sessionRows, [], 'an empty journal draws no rows')
+    eq(noSessions.sessionKinds, [], '…and no filter row, which would filter nothing')
+    ok((noSessions.text ?? '').includes('No agent session in this project yet'), '…and says why the list is empty')
 
     const waiting = a('waiting-panel')
     eq(
       waiting.panelTabs,
-      ['subagents|false|Subagents', 'waiting|true|Waiting 2'],
+      ['subagents|false|Subagents', 'sessions|false|Sessions', 'waiting|true|Waiting 2'],
       'the Waiting tab renders under the same strip, with Waiting on',
     )
     eq(waiting.waitingOpens, 2, 'both waiting tasks are listed, each a link to its card')

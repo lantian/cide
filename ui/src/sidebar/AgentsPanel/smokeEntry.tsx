@@ -36,9 +36,13 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { AgentsPanelView } from './AgentsPanel'
 import { AgentsPanelTabs } from './PanelTabs'
 import { WaitingPanel } from './WaitingPanel'
+import { SessionsPanel } from './SessionsPanel'
+import { filterSessions, type SessionKindName } from './sessionsModel'
 import {
   AGENTS_STORIES,
   PROJECT,
+  SESSIONS,
+  NOW_MS as SESSIONS_NOW,
   WAITING_QUESTIONS,
   WAITING_REVIEW,
   type AgentsStoryName,
@@ -47,7 +51,7 @@ import {
 /** What the check script asserts on. Strings and counts, so a failure prints something legible. */
 export interface AgentsDigest {
   /** A fixture story, or `waiting-panel` — the Waiting tab's one render (M132). */
-  story: AgentsStoryName | 'waiting-panel'
+  story: AgentsStoryName | 'waiting-panel' | 'sessions-panel' | 'sessions-filtered' | 'sessions-empty'
   /** The header's right-hand figure. Empty string when `metaFigure` withheld it. */
   meta: string
   /** The panel's one claim, when it makes one. */
@@ -88,6 +92,18 @@ export interface AgentsDigest {
   waitingOpens: number
   waitingAnswers: number
   waitingAccepts: number
+  /** The Sessions tab (M134): each row as `kind|live|title`, the kind chips as
+      `kind|pressed|text`, and how many transcript snippets are drawn. */
+  sessionRows: string[]
+  sessionKinds: string[]
+  sessionHits: number
+  /** Open buttons, task links, and whether the role select is drawn. */
+  sessionOpens: string[]
+  sessionTasks: string[]
+  sessionRole: boolean
+  /** Whether the run figure / scope control sit inside the header (M134: not beside a strip). */
+  metaInHeader: boolean
+  scopeInHeader: boolean
   /** The tabs as `tab|pressed|text`, and which tab panels carry `hidden`. (M89) */
   tabs: string[]
   hiddenPanels: string[]
@@ -217,6 +233,49 @@ digests.push(
     ),
   ),
 )
+/*
+ * The Sessions tab (M134), as the host mounts it: under the same strip, Sessions on. Three
+ * entries — everything, one kind picked with a transcript hit, and a project with no sessions.
+ */
+const sessionsProps = (kinds: ReadonlySet<SessionKindName>, hits: Record<string, string> | null) => ({
+  project: PROJECT,
+  title: <AgentsPanelTabs tab="sessions" onTab={() => {}} waiting={2} />,
+  rows: SESSIONS,
+  shown: filterSessions(SESSIONS, { query: '', kinds, agent: null }, hits),
+  error: null,
+  query: '',
+  kinds,
+  agent: null,
+  transcripts: hits !== null,
+  hits,
+  searching: false,
+  capped: false,
+  nowMs: SESSIONS_NOW,
+  onQuery: () => {},
+  onToggleKind: () => {},
+  onAllKinds: () => {},
+  onAgent: () => {},
+  onTranscripts: () => {},
+  onOpen: () => {},
+  onRevealTask: () => {},
+})
+digests.push(
+  digest('sessions-panel', renderToStaticMarkup(<SessionsPanel {...sessionsProps(new Set(), null)} />)),
+  digest(
+    'sessions-filtered',
+    renderToStaticMarkup(
+      <SessionsPanel
+        {...sessionsProps(new Set<SessionKindName>(['worker']), {
+          '22222222-2222-4222-8222-222222222222': 'the gate retried once and passed',
+        })}
+      />,
+    ),
+  ),
+  digest(
+    'sessions-empty',
+    renderToStaticMarkup(<SessionsPanel {...sessionsProps(new Set(), null)} rows={[]} shown={[]} />),
+  ),
+)
 console.log(JSON.stringify(digests))
 
 function digest(story: AgentsDigest['story'], html: string): AgentsDigest {
@@ -277,6 +336,19 @@ function digest(story: AgentsDigest['story'], html: string): AgentsDigest {
     waitingOpens: count(html, 'data-audit="waitingOpen"'),
     waitingAnswers: count(html, 'data-audit="waitingAnswer"'),
     waitingAccepts: count(html, 'data-audit="waitingAccept"'),
+    sessionRows: all(html, 'sessionRow').map((row, i) => {
+      const title = text(all(html, 'sessionTitle')[i] ?? '')
+      return `${attr(row, 'data-kind')}|${attr(row, 'data-live')}|${title}`
+    }),
+    sessionKinds: all(html, 'sessionsKind').map(
+      (chip) => `${attr(chip, 'data-kind')}|${attr(chip, 'aria-pressed')}|${text(chip)}`,
+    ),
+    sessionHits: count(html, 'data-audit="sessionsHit"'),
+    sessionOpens: all(html, 'sessionsOpen').map((b) => text(b)),
+    sessionTasks: all(html, 'sessionsTask').map((b) => text(b)),
+    sessionRole: count(html, 'data-audit="sessionsRole"') > 0,
+    metaInHeader: (all(html, 'agentsHeader')[0] ?? '').includes('data-audit="agentsMeta"'),
+    scopeInHeader: /data-audit="agents(Resume|Pause)All"/.test(all(html, 'agentsHeader')[0] ?? ''),
     tabs: all(html, 'agentsTab').map(
       (tab) => `${attr(tab, 'data-tab')}|${attr(tab, 'aria-pressed')}|${text(tab)}`,
     ),

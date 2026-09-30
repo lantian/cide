@@ -24,8 +24,12 @@ import { create } from 'zustand'
 
 import { requestPanel } from '@/chrome/panelRequests'
 
-/** The Agents panel's top-level tabs. Not `AgentsTab`, which is the inner Agents/History pair. */
-export type AgentsPanelTab = 'subagents' | 'waiting'
+/**
+ * The Agents panel's top-level tabs. Not `AgentsTab`, which is the inner Agents/History pair.
+ * *Sessions* (M134) sits between the two: it is about the runs and consoles the first tab shows,
+ * and *Waiting* stays last, where the eye finds its count.
+ */
+export type AgentsPanelTab = 'subagents' | 'sessions' | 'waiting'
 
 interface AgentsTabStore {
   tab: AgentsPanelTab

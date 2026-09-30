@@ -6356,6 +6356,80 @@ impl RunLog {
 }
 
 impl AgentRegistry {
+    /// Every run of `project` as the session journal records it. (M134)
+    ///
+    /// Reviews included, which `agent-runs.json` leaves out: the journal is what the user browses
+    /// to *find* a conversation, and a review's transcript outlives its checkout even when a
+    /// resume in it cannot — `cmd::sessions::sessions_open` says so rather than hiding the row.
+    /// A run whose harness has not named its conversation yet is keyed `run:<id>` and re-keyed by
+    /// run id when it has (`cide_core::sessions::Journal::upsert`).
+    pub fn journal_sightings(
+        &self,
+        project: ProjectId,
+        root: &std::path::Path,
+        now_ms: u64,
+    ) -> Vec<cide_ipc::sessions::SessionRecord> {
+        use cide_ipc::sessions::{SessionKind, SessionRecord};
+        let inner = self.inner.lock();
+        inner
+            .runs
+            .values()
+            .filter(|live| live.project == project)
+            .map(|live| {
+                let cwd = run_cwd(root, live);
+                let (id, known) = match conversation_of(live, &cwd) {
+                    Some(conversation) => (conversation.id, true),
+                    None => (format!("run:{}", live.run), false),
+                };
+                let (kind, title, prompt) = match &live.purpose {
+                    RunPurpose::Work(_) => (
+                        SessionKind::Subagent,
+                        live.agent_label.clone(),
+                        live.prompt.clone(),
+                    ),
+                    RunPurpose::MrReview { review, .. } => (
+                        SessionKind::MrReview,
+                        format!("Review {review}"),
+                        live.prompt.clone(),
+                    ),
+                    // What the user typed into the OpenSpec panel, not the brief built round it.
+                    RunPurpose::Spec(spec) => (
+                        SessionKind::OpenSpec,
+                        match &spec.change {
+                            Some(change) => format!("{:?} · {change}", spec.op),
+                            None => format!("{:?}", spec.op),
+                        },
+                        spec.text.clone(),
+                    ),
+                };
+                SessionRecord {
+                    id,
+                    known,
+                    kind,
+                    harness: live.harness,
+                    title,
+                    name: None,
+                    cwd,
+                    session: live.session,
+                    run: Some(live.run),
+                    agent: Some(live.agent_label.clone()),
+                    task: live.task.clone(),
+                    task_title: live.task_title.clone(),
+                    prompt: (!prompt.trim().is_empty())
+                        .then(|| cide_core::sessions::clip_prompt(&prompt)),
+                    branch: live.checkout.clone(),
+                    started_unix_ms: live.started_unix_ms,
+                    last_seen_unix_ms: now_ms,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the registry still holds `run` — live, or among the ended runs it keeps.
+    pub fn knows_run(&self, run: RunId) -> bool {
+        self.inner.lock().runs.contains_key(&run)
+    }
+
     /// Write the durable half of the registry to disk. Called from the coalescer's flush — so
     /// it is at most one small write per emit burst, and a crash loses at worst the last
     /// coalescing window — and once more from `lifecycle`'s teardown, where the paused set's
@@ -8344,6 +8418,10 @@ impl AgentRegistry {
                     project,
                     self.spec_runs(project),
                 );
+                // The session journal (M134): every run this flush may have moved, merged into
+                // the Sessions tab's rows. The journal decides what is news and writes on its
+                // own debounce.
+                crate::sessions_state::observe_runs(&app, self, project);
             }
             // The durable half rides the same coalescing: every burst that changed a roster
             // may have changed which runs a restart must bring back.

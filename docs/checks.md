@@ -722,6 +722,16 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 - **A release without signatures publishes no `latest.json`, and nothing says so.** Installed copies just stop hearing about versions. `release.yml` sets `CIDE_RELEASE`, which turns the preflight's warning into a refusal, and `updater-manifest.py` exits non-zero when it finds no `.sig`.
 - **A `-dev` version never checks.** The trunk between releases is older than the release it is heading for and newer than the last one, so either answer would be wrong. Testing needs a build stamped with a release version and `CIDE_UPDATE_ENDPOINT` pointed at a local manifest — see `docs/packaging.md`.
 
+### The session journal and the Sessions tab
+
+**Touches:** `cide_ipc::sessions`, `cide_core::sessions`, `cide-app`'s `sessions_state` and `cmd::sessions`, the `observe_workspace` call in `WorkspaceState::apply`, `AgentRegistry::journal_sightings` and the `observe_runs` call in its `flush`, `cide://sessions-changed`, `ui/src/sidebar/sessionsStore.ts`, `AgentsPanel/{SessionsPanel,sessionsModel,openJournalSession}.ts(x)`, `openRun.ts::showOpenPlan`
+
+`cargo test -p cide-core sessions`, `cargo test -p cide-app -- agents workspace_state lifecycle`, `check:sessions`, `check:agents-render`, `check:selectors`, `cargo --locked xtask codegen --check`, `cargo --locked xtask contract-check`, `./target/debug/cide-headless sessions <root>`. (M134) Four silent failures.
+- **The journal is keyed by conversation, not by pane or run.** Keyed any other way, a run's mirror tab and a resumed console each become a second row for one conversation. `Journal::upsert` merges by id, then by run, then by a stand-in's handle. A pane sighting never demotes a run's kind and never blanks what the run knew. `/clear` is deliberately a second row.
+- **`last_seen` alone is not news.** The tree mutates on every focus click, and `observe_workspace` runs on every accepted mutation. A merge that answered "changed" for a newer `last_seen` would write `sessions.json` on every click. It counts only after `SEEN_GRANULARITY_MS`.
+- **The listing hides rows that did nothing.** A row is dropped when it is not live, not on screen, and either was never named by its harness or has no transcript on disk. A transcript-path bug therefore empties the tab with no error. `cide-headless sessions <root>` prints the unfiltered file, which is how to tell a hidden row from a missing one.
+- **Reading a transcript is read-only and bounded, and every failure means "nothing".** `transcript_head` reads 1 MiB at most. `transcript_find` tests the raw line before parsing, which is sound only for needles JSON does not escape. Bookkeeping keys (`type`, `uuid`, `cwd`, …) are not searched, or a search for `user` would match every transcript. Open never spawns from the domain: `sessions_open` only answers, and `showOpenPlan` builds the pane, for `openRun.ts`'s ownership reason.
+
 ### Added, renamed or moved any file
 
 **Touches:** added, renamed or moved any file

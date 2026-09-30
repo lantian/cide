@@ -1,6 +1,6 @@
 /**
- * The Agents panel's top-level tabs, drawn where its header says *Agents*: **Subagents** and
- * **Waiting**. (M132)
+ * The Agents panel's top-level tabs, drawn where its header says *Agents*: **Subagents**,
+ * **Sessions** (M134) and **Waiting**. (M132)
  *
  * The Tasks panel's `TasksTabs` markup and classes, on purpose and not a lookalike: two sidebar
  * panels whose headers both carry tabs must read as one application, and a third tab look in the
@@ -19,6 +19,18 @@ import type { AgentsPanelTab } from '@/sidebar/agentsTabStore'
 
 import styles from '../TasksPanel/MilestonesPanel.module.css'
 
+const TAB_LABEL: Readonly<Record<AgentsPanelTab, string>> = {
+  subagents: 'Subagents',
+  sessions: 'Sessions',
+  waiting: 'Waiting',
+}
+
+const TAB_TITLE: Readonly<Record<AgentsPanelTab, string>> = {
+  subagents: 'Subagents, and what each is doing now',
+  sessions: 'Every agent session in this project — consoles, tabs, subagents, reviews — to find and open',
+  waiting: 'Waiting for you',
+}
+
 export function AgentsPanelTabs({
   tab,
   onTab,
@@ -31,7 +43,7 @@ export function AgentsPanelTabs({
 }) {
   return (
     <span className={styles.tabs} role="tablist" aria-label="Agents panel" data-audit="agentsPanelTabs">
-      {(['subagents', 'waiting'] as const).map((t) => (
+      {(['subagents', 'sessions', 'waiting'] as const).map((t) => (
         <button
           key={t}
           type="button"
@@ -40,10 +52,10 @@ export function AgentsPanelTabs({
           className={tab === t ? `${styles.tab} ${styles.tabOn}` : styles.tab}
           data-audit="agentsPanelTab"
           data-tab={t}
-          title={t === 'waiting' ? 'Waiting for you' : 'Subagents, and what each is doing now'}
+          title={TAB_TITLE[t]}
           onClick={() => onTab(t)}
         >
-          {t === 'subagents' ? 'Subagents' : 'Waiting'}
+          {TAB_LABEL[t]}
           {/* Only a positive count: an empty Waiting tab is the ordinary state, and a `0` pill
               beside it would be a call to action with nothing to act on. */}
           {t === 'waiting' && waiting > 0 && (

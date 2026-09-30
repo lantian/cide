@@ -16,6 +16,8 @@ pub mod pane;
 pub mod project;
 pub mod remote;
 pub mod session;
+/// The Agents panel's Sessions tab. (M134)
+pub mod sessions;
 pub mod settings;
 /// Self-update: the manual check, *Skip this version*, install, restart.
 pub mod update;
