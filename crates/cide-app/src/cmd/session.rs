@@ -591,7 +591,7 @@ fn orchestrator_paragraph(
     let agents = cide_agents::load_project(&root);
     let tracker = cide_agents::config::load_tracker(&root);
     if !agents.enabled() {
-        return Some(sessions_paragraph(tracker).to_string());
+        return Some(format!("{} {IDE_SENTENCE}", sessions_paragraph(tracker)));
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
@@ -616,10 +616,25 @@ fn orchestrator_paragraph(
     // Subagents on, but nobody can be dispatched right now — no roles, or every one refused:
     // `cide_agent_dispatch` would refuse, and `cide_session_open` is the road (M104).
     if roles.iter().all(|def| def.unavailable.is_some()) {
-        return Some(format!("{paragraph} {}", sessions_paragraph(tracker)));
+        return Some(format!(
+            "{paragraph} {} {IDE_SENTENCE}",
+            sessions_paragraph(tracker)
+        ));
     }
-    Some(paragraph)
+    Some(format!("{paragraph} {IDE_SENTENCE}"))
 }
+
+/// What every pane served the orchestration tools is told about cide itself. (M134)
+///
+/// Said because the alternative is observed: asked "how do I open the command palette", a model
+/// answers from its memory of VS Code — confidently, and wrong for cide's own bindings or for a
+/// user who rebound them. The tools are listed to it, but a deferred tool list is names only, and
+/// a name is not a reason to call it. Not for a worker, which is not served these tools.
+const IDE_SENTENCE: &str = "When the user asks about cide itself — a setting, a keyboard \
+     shortcut, how to open or do something in the IDE — answer from \
+     `mcp__cide__cide_keymap` (commands and their keys), `mcp__cide__cide_settings` and \
+     `mcp__cide__cide_extension_settings` rather than from memory; change a setting or a key, \
+     or run a command with `mcp__cide__cide_command_run`, only when they ask you to.";
 
 /// Which opening sentence a pane's roster paragraph gets. (M79)
 ///

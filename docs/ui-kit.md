@@ -212,6 +212,17 @@ Chapters are anchors on the page: `kit.html#<id>`.
 - **`FormRow`**: a settings row, with label and hint on the left and the control on the right.
   The text keeps a floor of about 260px; a control too wide to leave it that (a four-way
   `Segmented`) wraps onto its own line under the text rather than squeezing the text column.
+  Since M133:
+  - `hint` is **one line**. Everything else the row has to say is `info`, behind an `InfoTip`
+    after the label. Settings holds its hints to 90 characters (`check:settings-copy`).
+  - `status={{tone, text}}` is something about *this* setting's current state (an untested CLI,
+    a refused value): the tone as a bar down the row's left edge, a faint wash, and one line
+    under the label. It replaces a `Note` placed between rows, which the user could not tie to
+    either neighbour. A problem with the whole page is a `Banner` instead.
+  - `modified` draws the accent dot before the label; with `onReset`, a quiet undo button sits
+    before the control.
+  - `anchor` becomes `data-setting`, which Settings search scrolls to; `data-flash` washes the
+    row in the accent for a moment.
 
 ### Choices: `Choice.tsx`
 
@@ -276,7 +287,8 @@ with a dim figure beside it, never a filled chip, so it does not read as a failu
 ### Panels, cards, lists: `Surface.tsx`
 
 - **`PanelHeader`**: tops every sidebar panel, at `--h-panelheader`.
-- **`Section`**: the uppercase caption over a group.
+- **`Section`**: the uppercase caption over a group. `info` puts an `InfoTip` after the caption,
+  for what the whole group is about.
 - **`Heading`**: a title plus one lead sentence.
 - **`Tabs`**: switch what is shown, with a gradient underline on the current tab and arrow-key
   movement. A tab's label reserves its bold width, so choosing a tab never shifts its
@@ -333,6 +345,15 @@ with a dim figure beside it, never a filled chip, so it does not read as a failu
   item comes last, bold, with the black danger fill under the pointer, and a group caption appears once there are more than seven items.
 - **`Tooltip`**: inverted, short, and with the shortcut if there is one. The app has none today
   and uses the native `title` about 200 times.
+- **`InfoTip`** (`InfoTip.tsx`, M133): the (i) after a label, and the popover of prose it opens.
+  It opens on hover after 300ms, and at once on focus. Click pins it, so a paragraph can be read
+  and an env var copied. Escape or a mouse-down elsewhere closes it.
+  - It is a `--panel` card, not the inverted tooltip, because it holds paragraphs;
+    **`InfoPara`** separates them. It is safe inside a label or an `<h3>`, which a `<p>` is not.
+  - It holds **no controls**: it is portalled to `<body>`, last in the tab order.
+  - A screen reader gets the same text through `aria-describedby` on an inline hidden copy.
+  - Placement is `Select`'s: flipped upward when short of room, clamped inside the window.
+  - `FormRow info` and `Section info` draw one.
 
 These draw the surface only. Positioning, anchoring and Escape are the caller's job, as with
 `overlays/OverlayCard.tsx` today.

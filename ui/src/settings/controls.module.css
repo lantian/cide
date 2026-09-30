@@ -2,7 +2,7 @@
  * The settings form, around the UI kit's controls.
  *
  * Every control on the screen is a kit part now (`controls.tsx` says which); this stylesheet is
- * only the spacing between the kit parts — a part heading, a group — the two read-only readouts,
+ * only the spacing between the kit parts — a group — the two read-only readouts,
  * the stacked label of a text field, and the width a select and a number field take in a row.
  *
  * `.label`, `.text`, `.groupTitle`, `.fieldInput` and `.fieldArea` are kept for the sections that
@@ -10,20 +10,6 @@
  * onto the kit too; they are drawn the kit's way meanwhile — the `--bg` box, one control height,
  * the accent border and 3px halo on focus — so nothing borrowed looks older than what is new.
  */
-
-/* A heading over one part of a section that covers several subjects. (M93) */
-.part {
-  margin: var(--sp-7) 0 var(--sp-5);
-  padding-bottom: var(--sp-3);
-  border-bottom: 1px solid var(--border);
-  font-size: var(--fs-ui-14);
-  font-weight: 600;
-  color: var(--text-hi);
-}
-
-.part:first-child {
-  margin-top: 0;
-}
 
 .group {
   margin-bottom: var(--sp-7);

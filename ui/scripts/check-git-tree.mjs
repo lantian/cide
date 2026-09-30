@@ -514,6 +514,12 @@ try {
     true,
     'and only the files that moved are touched',
   )
+  eq(
+    m.ticksAfterMove(one, new Set(), APP, m.DEFAULT_CHANGELIST, ['c.rs']).has(cId),
+    true,
+    'except into `Changes`: "all changes that was moved to Changes should be automatically '
+      + 'staged", so a file filed there arrives ticked even when nothing there is',
+  )
 
   // --- Space over a multi-row selection --------------------------------------------------
   //
@@ -1677,6 +1683,22 @@ try {
     ['a.rs'],
     'and only those: a file already in the target is left out of the command rather than sent '
       + 'as a move to where it is',
+  )
+  eq(
+    d.dropOutcome(
+      { ...carried, files: [{ id: 'x', path: 'c.rs', changelist: 'fixes' }] },
+      group('Changes'),
+    ),
+    {
+      kind: 'track',
+      repo: APP,
+      changelist: m.DEFAULT_CHANGELIST,
+      list: 'Changes',
+      paths: ['c.rs'],
+      hint: 'Stage 1 file and move to “Changes”',
+    },
+    'a move INTO `Changes` stages as well, so it is a `track` — the kind whose ghost admits the '
+      + '`git add` — and not a `move` promising only a re-filing',
   )
   eq(
     d.dropOutcome(carried, group('Unversioned Files')),

@@ -151,6 +151,7 @@ try {
     scopeBadge,
     RUN_PHASES,
     WORKING_PHASES: AGENT_WORKING_PHASES,
+    SLOT_PHASES,
     ACTIVE_PHASES,
     TONES: RUN_TONES,
     ROSTER_UNKNOWN,
@@ -414,7 +415,13 @@ try {
   )
   ok(
     AGENT_WORKING_PHASES.includes('paused'),
-    'a SIGSTOPped run is frozen mid-turn and still holds its worktree and its slot',
+    'a SIGSTOPped run is frozen mid-turn and still holds its worktree and its task',
+  )
+  eq(
+    sorted(SLOT_PHASES),
+    sorted(AGENT_WORKING_PHASES.filter((p) => p !== 'paused')),
+    'a paused run gave its slot back at the freeze, so the slot count is the working list ' +
+      'less paused — counting it held a role full of frozen processes with its queue still',
   )
 
   /* == 2 ============================== every member of every vocabulary has a table entry == */
@@ -916,6 +923,14 @@ try {
   eq(queuedCount(IDLE), 0, 'and so is its queue')
   eq(rosterFigure(IDLE), '0', 'which the header prints, because something looked')
   eq(occupiedSlots(READY), 2, 'the fixture has two runs holding a slot')
+  eq(
+    occupiedSlots({
+      ...READY,
+      runs: READY.runs.map((r) => ({ ...r, phase: r.phase === 'queued' ? r.phase : 'paused' })),
+    }),
+    0,
+    'a paused run holds no slot — Pause all reads 0, and the role can take its queue',
+  )
   eq(queuedCount(READY), 1, 'and one waiting for one')
   eq(rosterFigure(READY), '2+1', 'the queue depth rides the figure — a header reading 0 while ' +
     'runs wait to start is the same quiet lie as an unchecked zero')

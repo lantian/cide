@@ -7,10 +7,10 @@
  * `ProxyScope` answers separately for `claude`, for shell panes and for cide's own Git, and
  * the headless one-shot lane — which was never proxied at all — travels with `claude`.
  *
- * What replaced it is a harder sentence, kept on screen because it is the one a user cannot
- * discover by experiment: **not adding a proxy is not the same as removing one.** cide
- * inherits its own environment, so a child cide "leaves alone" is on whatever proxy cide was
- * launched with.
+ * What replaced it is a harder sentence — the "Who gets it" group's (i) since M133 — because
+ * it is the one a user cannot discover by experiment: **not adding a proxy is not the same as
+ * removing one.** cide inherits its own environment, so a child cide "leaves alone" is on
+ * whatever proxy cide was launched with.
  *
  * Presentational like the rest of `sections.tsx`'s parts — it takes the stored value and a
  * `patch` callback and reads nothing else — so the whole screen can still be rendered from a
@@ -53,7 +53,8 @@
 import { TextInput } from '@/kit/components/Field'
 import { useState } from 'react'
 import type { ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SettingsPatch } from '@/ipc/client'
-import { Group, Note, Row, Segmented } from './controls'
+import { InfoPara } from '@/kit/components/InfoTip'
+import { Group, Row, Segmented, resetTo, useSettingsDefaults } from './controls'
 import {
   childEnvironment,
   hasUserinfo,
@@ -132,10 +133,28 @@ const TARGET_HINT: Record<keyof ProxyScope, Record<ProxyTargetName, string>> = {
   },
 }
 
+/**
+ * What each target *is*, one line under its label (M133). The sentence about the current
+ * choice — `TARGET_HINT`, nine of them — is behind the row's (i): it changes as the choice does,
+ * and a hint that rewrites itself under the pointer on every click reads as the page jumping.
+ */
+const TARGET_WHAT: Record<keyof ProxyScope, string> = {
+  claude: 'Consoles, agent runs and the one-shots — Claude Code and Codex alike.',
+  shells: 'Terminal panes running your shell.',
+  git: 'cide’s own Push and Fetch/Pull.',
+}
+
+/** One line per mode under the Mode row; the rest of `MODE_HINT` is behind its (i). (M133) */
+const MODE_SHORT: Record<ProxyMode, string> = {
+  inherit: 'Children get whatever your shell profile exports.',
+  manual: 'The addresses below win over anything your profile exports.',
+  direct: 'Every proxy variable is scrubbed from the child.',
+}
+
 export function ProxySection({ proxy, patch }: ProxySectionProps) {
   const set = (next: Partial<ProxySettings>) => patch({ proxy: { ...proxy, ...next } })
+  const def = useSettingsDefaults()?.proxy
   const manual = proxy.mode === 'manual'
-  const credentialed = manual && [proxy.http, proxy.https, proxy.all].some(hasUserinfo)
   const empty =
     manual && proxy.http.trim() === '' && proxy.https.trim() === '' && proxy.all.trim() === ''
   // What the HTTPS field will actually fall back to, shown as its placeholder: normalised,
@@ -148,131 +167,229 @@ export function ProxySection({ proxy, patch }: ProxySectionProps) {
   // fourth source of truth that can disagree with them the moment one is touched by hand.
   const claudeOnly = isClaudeOnly(proxy)
 
+  /*
+   * A URL with a password in it is a fact about *that* field (M133): the warning is the row's
+   * status, on the one address that carries the credential, where it was a note under all four
+   * of them that did not say which.
+   */
+  const credential = (url: string) =>
+    manual && hasUserinfo(url)
+      ? { tone: 'warn' as const, text: 'Contains a password, stored in plain text.' }
+      : undefined
+  const credentialInfo = (
+    <InfoPara>
+      A password in a proxy URL is stored as typed in <code>workspace.json</code>, in plain text
+      — a proxy that needs credentials cannot be used any other way until cide has a keyring. It
+      is redacted everywhere it could otherwise be read back: the log, this page’s readout, and
+      any <code>Debug</code> print of the settings. It is not redacted in the field, because you
+      have to be able to correct it.
+    </InfoPara>
+  )
+
   return (
     <>
       <Group title="Proxy">
-        <div className={styles.modeRow}>
-          <Segmented
-            label="Proxy mode"
-            value={proxy.mode}
-            options={MODES}
-            onChange={(mode) => set({ mode })}
-          />
-          <p className={styles.modeHint}>{MODE_HINT[proxy.mode]}</p>
-        </div>
+        <Row
+          label="Mode"
+          hint={MODE_SHORT[proxy.mode]}
+          info={MODE_HINT[proxy.mode]}
+          // The one state of this page that is wrong rather than merely unusual: a mode that
+          // replaces the child's proxy with nothing. It is a fact about the mode, so it sits
+          // on the Mode row.
+          status={
+            empty
+              ? { tone: 'warn', text: 'No address is set, so children run with no proxy at all.' }
+              : undefined
+          }
+          {...resetTo(proxy.mode, def?.mode, (mode) => set({ mode }))}
+          control={
+            <Segmented
+              label="Proxy mode"
+              value={proxy.mode}
+              options={MODES}
+              onChange={(mode) => set({ mode })}
+            />
+          }
+        />
       </Group>
 
       {manual && (
         <Group title="Addresses">
-          <Field
+          <Row
             label="HTTP proxy"
-            hint="HTTP_PROXY. A bare host:port is accepted — http:// is added, because Node throws on a URL without a scheme where curl would not."
-            value={proxy.http}
-            placeholder="http://proxy.example.com:3128"
-            onCommit={(http) => set({ http })}
-          />
-          <Field
-            label="HTTPS proxy"
-            hint="HTTPS_PROXY. Leave empty to use the HTTP proxy above — one CONNECT proxy for both is the usual shape, and typing it twice is how one of the two goes stale."
-            value={proxy.https}
-            placeholder={
-              httpsFallback === null
-                ? 'http://proxy.example.com:3128'
-                : redactProxyUrl(httpsFallback)
+            hint="A bare host:port is accepted; http:// is added."
+            status={credential(proxy.http)}
+            info={
+              <>
+                <InfoPara>
+                  <code>HTTP_PROXY</code>. The scheme is added because Node throws on a URL
+                  without one where curl would not.
+                </InfoPara>
+                {credential(proxy.http) !== undefined && credentialInfo}
+              </>
             }
-            onCommit={(https) => set({ https })}
+            {...resetTo(proxy.http, def?.http, (http) => set({ http }))}
+            control={
+              <UrlInput
+                label="HTTP proxy"
+                value={proxy.http}
+                placeholder="http://proxy.example.com:3128"
+                onCommit={(http) => set({ http })}
+              />
+            }
           />
-          <Field
+          <Row
+            label="HTTPS proxy"
+            hint="Empty uses the HTTP proxy above."
+            status={credential(proxy.https)}
+            info={
+              <>
+                <InfoPara>
+                  <code>HTTPS_PROXY</code>. One CONNECT proxy for both is the usual shape, and
+                  typing it twice is how one of the two goes stale.
+                </InfoPara>
+                {credential(proxy.https) !== undefined && credentialInfo}
+              </>
+            }
+            {...resetTo(proxy.https, def?.https, (https) => set({ https }))}
+            control={
+              <UrlInput
+                label="HTTPS proxy"
+                value={proxy.https}
+                placeholder={
+                  httpsFallback === null
+                    ? 'http://proxy.example.com:3128'
+                    : redactProxyUrl(httpsFallback)
+                }
+                onCommit={(https) => set({ https })}
+              />
+            }
+          />
+          <Row
             label="ALL_PROXY"
-            hint="Usually a SOCKS URL. No fallback from the HTTP proxy: this one covers protocols beyond the web, and pointing them somewhere you did not ask for is not a default worth having."
-            value={proxy.all}
-            placeholder="socks5://127.0.0.1:1080"
-            onCommit={(all) => set({ all })}
+            hint="Usually a SOCKS URL. No fallback from the HTTP proxy."
+            status={credential(proxy.all)}
+            info={
+              <>
+                <InfoPara>
+                  This one covers protocols beyond the web, and pointing them somewhere you did
+                  not ask for is not a default worth having.
+                </InfoPara>
+                {credential(proxy.all) !== undefined && credentialInfo}
+              </>
+            }
+            {...resetTo(proxy.all, def?.all, (all) => set({ all }))}
+            control={
+              <UrlInput
+                label="ALL_PROXY"
+                value={proxy.all}
+                placeholder="socks5://127.0.0.1:1080"
+                onCommit={(all) => set({ all })}
+              />
+            }
           />
-          <Field
+          <Row
             label="Bypass"
-            hint={`NO_PROXY, comma separated. ${LOOPBACK.join(', ')} are always included.`}
-            value={proxy.noProxy}
-            placeholder="corp.internal, .example.com"
-            onCommit={(noProxy) => set({ noProxy })}
+            hint="Comma separated. Loopback is always included."
+            info={
+              <>
+                <code>NO_PROXY</code>. <code>{LOOPBACK.join(', ')}</code> are always included, so
+                the IDE integration keeps working.
+              </>
+            }
+            {...resetTo(proxy.noProxy, def?.noProxy, (noProxy) => set({ noProxy }))}
+            control={
+              <UrlInput
+                label="Bypass"
+                value={proxy.noProxy}
+                placeholder="corp.internal, .example.com"
+                onCommit={(noProxy) => set({ noProxy })}
+              />
+            }
           />
         </Group>
       )}
 
-      {empty && (
-        <Note title="Nothing is configured" tone="warn">
-          This mode replaces the child's proxy variables with what is above, and above is
-          empty — so children run with no proxy and any <code>HTTP_PROXY</code> from your shell
-          profile is removed. That is the same result as <em>No proxy</em>, arrived at by
-          accident.
-        </Note>
-      )}
-
-      {credentialed && (
-        <Note title="That URL contains a password" tone="warn">
-          It is stored as typed in <code>workspace.json</code>, in plain text — a proxy that
-          needs credentials cannot be used any other way until cide has a keyring. It is
-          redacted everywhere it could otherwise be read back: the log, this screen's readout,
-          and any <code>Debug</code> print of the settings. It is not redacted in the field
-          above, because you have to be able to correct it.
-        </Note>
-      )}
-
-      <Group title="Who gets it">
+      {/* The distinction the whole group turns on, and the one a user cannot discover by
+          experiment: not-adding a proxy and removing one are the same thing only on a machine
+          that had no proxy to begin with. It is the group's (i) now rather than a note under
+          it (M133). */}
+      <Group
+        title="Who gets it"
+        info={
+          <>
+            <InfoPara>
+              “Leave alone” is not “No proxy”. cide inherits the environment it was launched
+              from: if you started cide from a shell that exports <code>HTTPS_PROXY</code>, a
+              child cide leaves alone <em>is already on that proxy</em>, and nothing on this page
+              put it there. <em>No proxy</em> is the only setting that removes it.
+            </InfoPara>
+            <InfoPara>
+              Even then, <code>git</code> still honours <code>http.proxy</code> from your{' '}
+              <code>~/.gitconfig</code>, which cide does not edit. What cide can promise is the
+              child’s environment, not everywhere the child looks.
+            </InfoPara>
+          </>
+        }
+      >
         {TARGETS.map(({ key, label }) => (
           <Row
             key={key}
             label={label}
-            hint={TARGET_HINT[key][proxy.scope[key]]}
+            hint={TARGET_WHAT[key]}
+            info={
+              <>
+                <InfoPara>{TARGET_HINT[key][proxy.scope[key]]}</InfoPara>
+                {claudeOnly && key === 'claude' && <InfoPara>{claudeOnlyNote(proxy)}</InfoPara>}
+              </>
+            }
+            // "Consoles and agents only" is a confirmation, not a problem: an `info` status on
+            // the one row it is about, rather than a blue panel under the whole group.
+            status={
+              claudeOnly && key === 'claude'
+                ? { tone: 'info', text: 'Only consoles and agents get the proxy.' }
+                : undefined
+            }
+            {...resetTo(proxy.scope[key], def?.scope[key], (next) =>
+              set({ scope: { ...proxy.scope, [key]: next } }),
+            )}
             control={
               <Segmented
                 label={`Proxy for ${label}`}
                 value={proxy.scope[key]}
                 options={TARGET_OPTIONS}
-                onChange={(target) => set({ scope: { ...proxy.scope, [key]: target } })}
+                onChange={(next) => set({ scope: { ...proxy.scope, [key]: next } })}
               />
             }
           />
         ))}
       </Group>
 
-      {/* The distinction the whole row above turns on, and the one a user cannot discover by
-          experiment: not-adding a proxy and removing one are the same thing only on a machine
-          that had no proxy to begin with. */}
-      <Note title="“Leave alone” is not “No proxy”">
-        cide inherits the environment it was launched from. If you started cide from a shell
-        that exports <code>HTTPS_PROXY</code> — a login profile on a corporate laptop, say —
-        then a child cide leaves alone <em>is already on that proxy</em>, and nothing on this
-        screen put it there. <em>No proxy</em> is the only setting that removes it.
-        <br />
-        Even then: <code>git</code> still honours <code>http.proxy</code> from your
-        <code>~/.gitconfig</code>, and cide does not edit your gitconfig. What cide can promise
-        is the child’s environment, not everywhere the child looks.
-      </Note>
-
-      {claudeOnly && (
-        <Note title="Consoles and agents only">
-          The proxy above reaches the consoles, the agent runs and the one-shots — Claude Code
-          and Codex alike — and nothing else cide starts.{' '}
-          {claudeOnlyNote(proxy)}
-        </Note>
-      )}
-
-      <Group title="What each child gets">
+      <Group
+        title="What each child gets"
+        info={
+          <>
+            <InfoPara>
+              Applied when a pane’s process starts. A running pane keeps the environment it was
+              spawned with — a process cannot be moved onto a different proxy from outside.
+              Close and reopen a pane, or relaunch cide, for a change here to reach it.
+            </InfoPara>
+            <InfoPara>
+              The Git rows take effect on the next click: Push and Fetch fork a fresh{' '}
+              <code>git</code> every time.
+            </InfoPara>
+            <InfoPara>
+              Each name is also written in lower case — <code>http_proxy</code> and the rest — to
+              the same value. curl reads only the lower-case spelling of <code>http_proxy</code>,
+              while Go and much of the Node ecosystem prefer the upper-case one.
+            </InfoPara>
+          </>
+        }
+      >
         {TARGETS.map(({ key, label }) => (
           <TargetReadout key={key} label={label} proxy={proxy} target={proxy.scope[key]} />
         ))}
       </Group>
-
-      <Note title="Applied when a pane's process starts">
-        A running pane keeps the environment it was spawned with — a process cannot be moved
-        onto a different proxy from outside, and cide does not pretend otherwise. Close and
-        reopen a pane, or relaunch cide, for a change here to reach it. Panes opened from now
-        on already have it.
-        <br />
-        The Git rows are different, and better: Push and Fetch fork a fresh <code>git</code>
-        every time, so a change there takes effect on the next click.
-      </Note>
     </>
   )
 }
@@ -301,15 +418,12 @@ function TargetReadout({
         <Readout lines={childEnvironment(proxy, target)} />
       ) : kind === 'untouched' ? (
         <p className={styles.readoutEmpty}>
-          Nothing at all. cide neither sets nor removes a proxy variable, so this child gets
-          cide’s own environment exactly as it stands — <em>including</em> a proxy your login
-          profile exported. Not even the loopback bypass is added.
+          Nothing — cide’s own environment, unaltered, <em>including</em> an inherited proxy.
         </p>
       ) : (
         <p className={styles.readoutEmpty}>
-          Nothing of cide’s own. Whatever your shell profile exports reaches the child
-          unchanged — plus <code>NO_PROXY={LOOPBACK.join(',')}</code>, but only if a proxy was
-          inherited in the first place.
+          Nothing of cide’s own — plus <code>NO_PROXY={LOOPBACK.join(',')}</code> if a proxy was
+          inherited.
         </p>
       )}
     </div>
@@ -329,54 +443,51 @@ function Readout({ lines }: { lines: EnvLine[] }) {
   if (lines.length === 0) {
     return (
       <p className={styles.readoutEmpty}>
-        Nothing of cide’s own. Whatever your shell profile exports reaches the child unchanged
-        — plus <code>NO_PROXY={LOOPBACK.join(',')}</code>, but only if a proxy was inherited in
-        the first place.
+        Nothing of cide’s own — plus <code>NO_PROXY={LOOPBACK.join(',')}</code> if a proxy was
+        inherited.
       </p>
     )
   }
+  // Each name is also written in lower case to the same value; the group's (i) says so, where a
+  // paragraph under every one of the three readouts used to.
   return (
-    <>
-      <dl className={styles.readout}>
-        {lines.map(({ name, value }) => (
-          <div key={name} className={styles.readoutRow}>
-            <dt className={styles.readoutName}>{name}</dt>
-            <dd className={value === null ? styles.readoutUnset : styles.readoutValue}>
-              {value === null ? 'removed from the child' : redactProxyUrl(value)}
-            </dd>
-          </div>
-        ))}
-      </dl>
-      <p className={styles.readoutFoot}>
-        Each name is also written in lower case — <code>http_proxy</code> and the rest — to the
-        same value. curl reads only the lower-case spelling of <code>http_proxy</code>, while
-        Go and much of the Node ecosystem prefer the upper-case one, and a pane that sets one
-        of the two proxies half the commands typed into it.
-      </p>
-    </>
+    <dl className={styles.readout}>
+      {lines.map(({ name, value }) => (
+        <div key={name} className={styles.readoutRow}>
+          <dt className={styles.readoutName}>{name}</dt>
+          <dd className={value === null ? styles.readoutUnset : styles.readoutValue}>
+            {value === null ? 'removed from the child' : redactProxyUrl(value)}
+          </dd>
+        </div>
+      ))}
+    </dl>
   )
 }
 
-interface FieldProps {
-  label: string
-  hint: string
-  value: string
-  placeholder: string
-  onCommit: (next: string) => void
-}
-
 /**
- * A full-width text field, stacked rather than in a `Row`.
+ * A URL field, as a settings row's control (M133 — it was a stacked label, field and hint, one
+ * of the four walls of prose this page was).
  *
- * `Row` puts its control hard right at its natural width, which is the correct shape for a
- * toggle and the wrong one for a URL long enough to need scrolling.
+ * Wide, because a URL long enough to need scrolling was the reason it was stacked; at this
+ * width it still shares the row with its label on the 620px page, and the kit row drops it under
+ * the label when it cannot.
  *
  * Committed on blur and on Enter, never per keystroke, for the same reason `NumberField`
  * does it: a keystroke here is a workspace write, a `workspace.json` save and a broadcast to
  * every open window. For this field it is also a partially-typed password making the trip.
  * Escape abandons the draft and re-renders what is stored.
  */
-function Field({ label, hint, value, placeholder, onCommit }: FieldProps) {
+function UrlInput({
+  label,
+  value,
+  placeholder,
+  onCommit,
+}: {
+  label: string
+  value: string
+  placeholder: string
+  onCommit: (next: string) => void
+}) {
   const [draft, setDraft] = useState<string | null>(null)
 
   const commit = (text: string) => {
@@ -387,12 +498,13 @@ function Field({ label, hint, value, placeholder, onCommit }: FieldProps) {
   }
 
   return (
-    <label className={styles.field}>
-      <span className={styles.fieldLabel}>{label}</span>
+    <span className={styles.url}>
       {/* A URL is a machine string: mono, like every path and counter in this app. */}
       <TextInput
+        size="sm"
         mono
         type="text"
+        aria-label={label}
         spellCheck={false}
         autoCapitalize="off"
         autoCorrect="off"
@@ -405,7 +517,6 @@ function Field({ label, hint, value, placeholder, onCommit }: FieldProps) {
           else if (e.key === 'Escape') setDraft(null)
         }}
       />
-      <span className={styles.fieldHint}>{hint}</span>
-    </label>
+    </span>
   )
 }

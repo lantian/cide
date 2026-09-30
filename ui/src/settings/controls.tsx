@@ -5,16 +5,16 @@
  * can be rendered from a fixture.
  *
  * Since the redesign (2026-09-24) every control here is the UI kit's — `Switch`, `Segmented`,
- * `Select`, `TextInput`, `Textarea`, `Button`, `FormRow`, `Section`, `Note` — and this file is
+ * `Select`, `TextInput`, `Textarea`, `Button`, `FormRow`, `Section` — and this file is
  * only the settings screen's names for them plus the commit rules the kit does not decide
  * (blur-commit, clamp-on-commit, Escape to revert). The names stay because six sections call
  * them; the look is the kit's so that a settings row and a dialog field are the same thing.
  */
-import { useState, type ReactNode } from 'react'
+import { createContext, useContext, useState, type ReactNode } from 'react'
 import { Button } from '@/kit/components/Button'
-import { FormRow, TextInput, Textarea } from '@/kit/components/Field'
+import { FormRow, TextInput, Textarea, type FormRowProps } from '@/kit/components/Field'
+import type { Settings } from '@/ipc/client'
 import { Segmented as KitSegmented, Switch } from '@/kit/components/Choice'
-import { Note as KitNote } from '@/kit/components/Feedback'
 import { Select as KitSelect } from '@/kit/components/Select'
 import { Section } from '@/kit/components/Surface'
 import styles from './controls.module.css'
@@ -37,15 +37,40 @@ export function Toggle({ checked, onChange, label, disabled }: ToggleProps) {
 
 export interface RowProps {
   label: string
-  /** The italic second line under the label in the mock. */
+  /**
+   * One line under the label — what the setting is, not why. Held to 90 characters by
+   * `check:settings-copy` (M133): the screen was reported hard to read because every row said
+   * everything at once, so the rest goes in `info`.
+   */
   hint?: string | undefined
+  /** The full explanation, behind an (i) after the label. */
+  info?: ReactNode
+  /** Something about this setting's current state; see the kit's `FormRow`. */
+  status?: FormRowProps['status']
+  /** Differs from its default — the dot, and with `onReset` the Reset button. See [`resetTo`]. */
+  modified?: boolean | undefined
+  onReset?: (() => void) | undefined
+  /**
+   * What Settings search looks for (`data-setting`). Defaults to the label, which is what
+   * `settingsIndex.ts` names a row by; pass one only for a row whose label is not unique on its
+   * page or is not a literal.
+   */
+  anchor?: string | undefined
   control: ReactNode
 }
 
 /** One line of the settings form: text on the left, one control hard right. */
-export function Row({ label, hint, control }: RowProps) {
+export function Row({ label, hint, info, status, modified, onReset, anchor, control }: RowProps) {
   return (
-    <FormRow label={label} hint={hint}>
+    <FormRow
+      label={label}
+      hint={hint}
+      info={info}
+      status={status}
+      modified={modified}
+      onReset={onReset}
+      anchor={anchor ?? label}
+    >
       {control}
     </FormRow>
   )
@@ -54,20 +79,48 @@ export function Row({ label, hint, control }: RowProps) {
 /** A toggle row: the pair the mock uses for every boolean. */
 export function ToggleRow({
   label,
-  hint,
   checked,
   onChange,
   disabled,
+  ...row
 }: Omit<RowProps, 'control'> & Omit<ToggleProps, 'label'>) {
   return (
     <Row
       label={label}
-      hint={hint}
+      {...row}
       control={
         <Toggle label={label} checked={checked} onChange={onChange} disabled={disabled} />
       }
     />
   )
+}
+
+/**
+ * `Settings::default()`, fetched once from Rust (`settings_defaults`). (M133)
+ *
+ * A context rather than a prop through `SectionProps` because it is read row by row, in sections
+ * and in the components they render, and a fixture that provides none simply draws no dots.
+ */
+export const SettingsDefaults = createContext<Settings | null>(null)
+
+export function useSettingsDefaults(): Settings | null {
+  return useContext(SettingsDefaults)
+}
+
+/**
+ * A row's `modified` and `onReset`, from its value and its default.
+ *
+ * Compared as JSON because a default can be an object or an array (a list of formatter rows)
+ * and `===` would call every such row modified. `def` is `undefined` before the defaults have
+ * arrived, and then nothing is marked: a dot that appears and vanishes on load is noise.
+ */
+export function resetTo<T>(
+  value: T,
+  def: T | undefined,
+  set: (next: T) => void,
+): { modified: boolean; onReset: () => void } {
+  const modified = def !== undefined && JSON.stringify(value) !== JSON.stringify(def)
+  return { modified, onReset: () => def !== undefined && set(def) }
 }
 
 export interface SegmentedProps<T extends string> {
@@ -190,40 +243,24 @@ export function NumberField({ value, min, max, step, onChange, label }: NumberFi
 }
 
 /** A titled block of rows. */
-/** A heading over one part of a section that covers several subjects. (M93) */
-export function Part({ title }: { title: string }) {
-  return <h2 className={styles.part}>{title}</h2>
-}
 
-export function Group({ title, children }: { title?: string | undefined; children: ReactNode }) {
-  if (title === undefined) return <section className={styles.group}>{children}</section>
-  return (
-    <div className={styles.group}>
-      <Section caption={title}>{children}</Section>
-    </div>
-  )
-}
-
-/**
- * A block of prose that explains something the controls cannot.
- *
- * The kit's `Note`: the tone is its left bar and its mark, the words stay `--text`, so the one
- * warning this screen carries — an unverified `claude` — is a thing to notice on the way past
- * rather than an error to stop at.
- */
-export function Note({
+export function Group({
   title,
-  tone = 'info',
+  info,
   children,
 }: {
   title?: string | undefined
-  tone?: 'info' | 'warn' | undefined
+  /** What the whole group is about, behind an (i) after the caption. */
+  info?: ReactNode
   children: ReactNode
 }) {
+  if (title === undefined) return <section className={styles.group}>{children}</section>
   return (
-    <KitNote tone={tone} title={title}>
-      {children}
-    </KitNote>
+    <div className={styles.group}>
+      <Section caption={title} info={info}>
+        {children}
+      </Section>
+    </div>
   )
 }
 

@@ -739,7 +739,7 @@ try {
     const d = a('role-paused')
     ok(d.icons?.includes('play'), 'a paused run offers Resume')
     ok(!d.icons?.includes('pause'), 'and not Pause as well — the row draws one or the other')
-    eq(d.meta, '1', 'a paused run still holds its slot, so it still counts as live')
+    eq(d.meta, '0', 'a paused run gave its slot back at the freeze, so it is not counted')
     ok(
       d.buttons?.includes(RESUME_ALL),
       'and the header offers the project-scope Resume beside it: one frozen run is something ' +
@@ -833,10 +833,9 @@ try {
     )
     eq(
       d.meta,
-      '2',
-      'the figure still counts both frozen runs — they hold their slots and their worktrees. ' +
-        'It is a slot count, not an activity count; the Resume beside it is what stops the ' +
-        'header reading as "2 agents working"',
+      '0',
+      'the figure counts neither frozen run — a freeze gives the slot back (a resume takes one ' +
+        'again, or queues the run), so a role full of paused runs does not hold its queue still',
     )
   }
 

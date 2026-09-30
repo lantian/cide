@@ -14,21 +14,21 @@
  * Two things it must not pretend:
  *
  * * **A change takes effect on the next launch, never on this one.** These variables are read
- *   while the webview is created. The `restartRequired` chip is not a nicety; without it the
- *   switch looks broken.
+ *   while the webview is created. The row's "takes effect on the next launch" status is not a
+ *   nicety; without it the switch looks broken.
  * * **Setting any rung stands the automatic ladder down.** The launcher applies its defaults
  *   with set-if-unset semantics, so there is no value this side could write that means "and
  *   do not apply the default either". Overriding one rung therefore makes the stored settings
- *   the whole ladder, and the banner says so.
+ *   the whole ladder, and the Workaround ladder row says so.
  */
-import { Badge } from '@/kit/components/Status'
 import { useCallback, useEffect, useState } from 'react'
 import {
   settings as settingsApi,
   type GraphicsSettings,
   type GraphicsStatus,
 } from '@/ipc/client'
-import { Note, Segmented } from './controls'
+import { InfoPara } from '@/kit/components/InfoTip'
+import { Readout, Row, Segmented } from './controls'
 import styles from './panels.module.css'
 
 /** Which stored field each rung's variable drives. */
@@ -80,53 +80,70 @@ export function GraphicsLadder({ graphics, onChange }: GraphicsLadderProps) {
     return <div className={styles.clean}>Reading the graphics configuration…</div>
   }
 
+  // The ladder's own state is a row of its own, where the two notes above the rungs used to
+  // be (M133): which of three things is driving it is a fact about this group, and a readout
+  // with a status says it without a coloured block the user has to tie to a row.
+  const driver = status.suppressedByEnv ? 'Disabled for this run' : status.automatic ? 'Automatic' : 'Manual'
   return (
     <>
-      {status.suppressedByEnv && (
-        <Note title="Workarounds are disabled for this run">
-          <code>CIDE_NO_GRAPHICS_WORKAROUNDS</code> is set in the environment cide was launched
-          from, which overrides everything below.
-        </Note>
-      )}
-      {!status.automatic && !status.suppressedByEnv && (
-        <Note title="You are driving the ladder">
-          One or more rungs is set explicitly, so the automatic ladder is off and only what you
-          have chosen here is applied. Set every rung back to <em>Auto</em> to hand it back.
-        </Note>
-      )}
+      <Row
+        label="Workaround ladder"
+        hint="Set a rung below to take over; set every rung to Auto to hand it back."
+        status={
+          status.suppressedByEnv
+            ? { tone: 'warn', text: 'CIDE_NO_GRAPHICS_WORKAROUNDS is set, which overrides every rung.' }
+            : undefined
+        }
+        info={
+          status.suppressedByEnv ? (
+            <>
+              <code>CIDE_NO_GRAPHICS_WORKAROUNDS</code> is set in the environment cide was
+              launched from, which overrides everything below.
+            </>
+          ) : (
+            'Automatic applies the rungs this machine is known to need. Setting any rung explicitly turns the automatic ladder off, and only what you have chosen is applied.'
+          )
+        }
+        control={<Readout text={driver} />}
+      />
 
       {status.rungs.map((rung) => {
         const field = FIELD[rung.variable]
         const restart = rung.setting !== null && rung.setting !== rung.active
+        const set = (choice: Choice) => {
+          // A rung whose variable this build does not know about cannot be stored, and
+          // silently doing nothing would be a switch that springs back.
+          if (field === undefined) return
+          onChange({ ...graphics, [field]: settingOf(choice) })
+        }
         return (
-          <div key={rung.variable} className={styles.rung}>
-            <div className={styles.rungText}>
-              <div className={styles.rungLabel}>{rung.label}</div>
-              <div className={styles.rungVar}>
-                {rung.variable}
-                {rung.active ? ' — set in this process' : ' — not set in this process'}
-              </div>
-              <div className={styles.rungCost}>{rung.cost}</div>
-              {restart && (
-                <span className={styles.restart}>
-                  <Badge tone="yellow" soft>
-                    takes effect on the next launch
-                  </Badge>
-                </span>
-              )}
-            </div>
-            <Segmented
-              label={rung.label}
-              value={choiceOf(rung.setting)}
-              options={CHOICES}
-              onChange={(choice) => {
-                // A rung whose variable this build does not know about cannot be stored, and
-                // silently doing nothing would be a switch that springs back.
-                if (field === undefined) return
-                onChange({ ...graphics, [field]: settingOf(choice) })
-              }}
-            />
-          </div>
+          <Row
+            key={rung.variable}
+            label={rung.label}
+            hint={rung.active ? 'Set in this process.' : 'Not set in this process.'}
+            info={
+              <>
+                <InfoPara>
+                  <code>{rung.variable}</code>
+                </InfoPara>
+                <InfoPara>{rung.cost}</InfoPara>
+              </>
+            }
+            // Read by WebKit while the webview is created, so a changed rung is a fact about
+            // the next launch — the row says so rather than a chip that looks like a state.
+            status={restart ? { tone: 'info', text: 'Takes effect on the next launch.' } : undefined}
+            // Auto (`null`) is every rung's default.
+            modified={rung.setting !== null}
+            onReset={() => set('auto')}
+            control={
+              <Segmented
+                label={rung.label}
+                value={choiceOf(rung.setting)}
+                options={CHOICES}
+                onChange={set}
+              />
+            }
+          />
         )
       })}
     </>

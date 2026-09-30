@@ -71,6 +71,9 @@ export function Structure(): ReactElement {
             <Section caption="Plan" aside="3 steps">
               <span style={{ fontSize: 'var(--fs-ui-12)', color: 'var(--dim)' }}>Section content.</span>
             </Section>
+            <Section caption="Proxy" info="What the whole group is about goes behind the caption's (i), not in a note under it.">
+              <span style={{ fontSize: 'var(--fs-ui-12)', color: 'var(--dim)' }}>A section with info.</span>
+            </Section>
           </div>
         </Frame>
         <Cell label="heading" grow>

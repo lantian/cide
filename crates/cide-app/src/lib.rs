@@ -620,6 +620,7 @@ pub fn run() {
             cmd::session::session_log_detail,
             cmd::session::session_resumable,
             cmd::settings::settings_get,
+            cmd::settings::settings_defaults,
             cmd::settings::settings_set,
             cmd::settings::tab_open_settings,
             cmd::settings::keymap_report,

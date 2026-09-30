@@ -1,9 +1,10 @@
 /**
  * Content mode C: the Settings tab.
  *
- * 190px nav on the left with the mock's seven sections in the mock's order, the active row on
- * `--chrome-hi`; the section on the right at 34px/44px padding under a 20px/600 title and a
- * dim description.
+ * A nav on the left — a search field over the pages in four groups (M133) — and the page on the
+ * right under a 20px/600 title (with an (i) when the page has more to say), a one-line
+ * description, the page's tabs when it is long enough to have them, and a banner when something
+ * makes the whole page moot.
  *
  * The selected section is local state seeded from the tab — and re-seeded whenever the tab is
  * re-pointed from outside, which issue #1 was about — and is *also* pushed back to Rust
@@ -15,7 +16,7 @@
  * Everything below the nav is presentational — `sections.tsx` takes settings and callbacks —
  * so this component is the only place in the screen that touches the store.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   agentDefs,
   claudeTasks,
@@ -29,8 +30,21 @@ import {
   type SettingsSection,
 } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
-import { SECTIONS, renderSection } from './sections'
-import { useSettings, useSettingsActions } from './useSettings'
+import { SearchField } from '@/kit/components/Field'
+import { InfoTip } from '@/kit/components/InfoTip'
+import { Tabs } from '@/kit/components/Surface'
+import { SettingsDefaults } from './controls'
+import {
+  SECTIONS,
+  SECTION_GROUPS,
+  SECTION_TABS,
+  renderSection,
+  sectionBanner,
+  type SectionMeta,
+  type SectionProps,
+} from './sections'
+import { searchSettings, type SettingsHit } from './settingsIndex'
+import { useSettings, useSettingsActions, useSettingsDefaultsFetch } from './useSettings'
 import styles from './SettingsTab.module.css'
 
 /**
@@ -93,6 +107,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     setActive(section)
   }
   const settings = useSettings()
+  const defaults = useSettingsDefaultsFetch()
   const version = useWorkspace((s) => s.boot?.capabilities.version ?? null)
   const claudeVersion = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)
   const { patch, setTheme, setWindowMode } = useSettingsActions()
@@ -255,66 +270,225 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     [project],
   )
 
+  /**
+   * Each tabbed page's current tab (M133), for as long as this screen is mounted. Screen state,
+   * not a setting: a relaunch lands on a page's first tab, which is where somebody who did not
+   * come here for a specific row should land anyway.
+   */
+  const [tabs, setTabs] = useState<Partial<Record<SettingsSection, string>>>({})
+  const pageTabs = SECTION_TABS[active]
+  const tab = tabs[active] ?? pageTabs?.[0]?.value ?? ''
+
+  const pane = useRef<HTMLDivElement>(null)
+  /** The row search is taking the user to, until it has been drawn and scrolled to. */
+  const [landing, setLanding] = useState<string | null>(null)
+  const jump = useCallback(
+    (hit: SettingsHit) => {
+      select(hit.section)
+      if (hit.tab !== undefined) setTabs((t) => ({ ...t, [hit.section]: hit.tab }))
+      setLanding(hit.label)
+    },
+    [select],
+  )
+  // After the page (and its tab) has rendered: scroll the row into the middle of the pane and
+  // wash it in the accent for a moment. A row that is not there — the Agents page before its
+  // roles have loaded, a row drawn only in some state — is simply not flashed; the page is
+  // still the right page.
+  useEffect(() => {
+    if (landing === null) return
+    const row = pane.current?.querySelector<HTMLElement>(`[data-setting="${CSS.escape(landing)}"]`)
+    setLanding(null)
+    if (row == null) return
+    row.scrollIntoView({ block: 'center' })
+    row.dataset.flash = ''
+    // Not cleared on cleanup, deliberately: `setLanding(null)` above re-runs this effect at
+    // once, and a cleanup that cancelled the timer would leave the row washed for good. A
+    // timer that fires on a row that has since unmounted edits a detached node, which is free.
+    window.setTimeout(() => delete row.dataset.flash, FLASH_MS)
+  }, [landing, active, tab])
+
   // `SECTIONS` is non-empty and `active` always names one of its entries, but the compiler
   // has `noUncheckedIndexedAccess` and cannot know either — and a hand-written fallback here
   // is cheaper than the assertion that would silence it.
-  const meta = SECTIONS.find((s) => s.id === active) ?? {
+  const meta: SectionMeta = SECTIONS.find((s) => s.id === active) ?? {
+    id: active,
+    group: 'general',
     title: 'Settings',
     description: '',
   }
 
-  return (
-    <div className={styles.tab}>
-      <nav
-        className={styles.nav}
-        role="tablist"
-        aria-orientation="vertical"
-        aria-label="Settings sections"
-      >
-        {SECTIONS.map((entry) => {
-          const selected = entry.id === active
-          return (
-            <button
-              key={entry.id}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              className={selected ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
-              onClick={() => select(entry.id)}
-            >
-              {entry.title}
-            </button>
-          )
-        })}
-      </nav>
+  const props: SectionProps | null =
+    settings === null
+      ? null
+      : {
+          settings,
+          tab,
+          setTab: (next: string) => setTabs((t) => ({ ...t, [active]: next })),
+          patch,
+          setTheme,
+          setWindowMode,
+          version,
+          claudeVersion,
+          cliSupport,
+          codexSupport,
+          openLogDir: revealLogDir,
+          logDir,
+          opencodeModels,
+          testModel,
+          probeLimits,
+        }
 
-      <div className={styles.pane} role="tabpanel" aria-label={meta.title}>
-        <h2 className={styles.title}>{meta.title}</h2>
-        <p className={styles.description}>{meta.description}</p>
-        <div className={styles.body}>
-          {settings === null ? (
-            // Bootstrap has not resolved. Rendering the form against defaults would show
-            // values that are not the user's and then swap them under the pointer.
-            <div className={styles.loading}>Loading settings…</div>
-          ) : (
-            renderSection(active, {
-              settings,
-              patch,
-              setTheme,
-              setWindowMode,
-              version,
-              claudeVersion,
-              cliSupport,
-              codexSupport,
-              openLogDir: revealLogDir,
-              logDir,
-              opencodeModels,
-              testModel,
-              probeLimits,
-            })
-          )}
+  return (
+    <SettingsDefaults.Provider value={defaults}>
+      <div className={styles.tab}>
+        <SettingsNav active={active} onSelect={select} onJump={jump} />
+
+        <div ref={pane} className={styles.pane} role="tabpanel" aria-label={meta.title}>
+          <header className={styles.header}>
+            <h2 className={styles.title}>
+              {meta.title}
+              {meta.about !== undefined && (
+                <InfoTip label={`About ${meta.title}`}>{meta.about}</InfoTip>
+              )}
+            </h2>
+            <p className={styles.description}>{meta.description}</p>
+            {pageTabs !== undefined && (
+              <div className={styles.pageTabs}>
+                <Tabs
+                  label={`${meta.title} pages`}
+                  value={tab}
+                  tabs={pageTabs}
+                  onChange={(next) => setTabs((t) => ({ ...t, [active]: next }))}
+                />
+              </div>
+            )}
+          </header>
+          <div className={styles.body}>
+            {props === null ? (
+              // Bootstrap has not resolved. Rendering the form against defaults would show
+              // values that are not the user's and then swap them under the pointer.
+              <div className={styles.loading}>Loading settings…</div>
+            ) : (
+              <>
+                {sectionBanner(active, props)}
+                {renderSection(active, props)}
+              </>
+            )}
+          </div>
         </div>
       </div>
-    </div>
+    </SettingsDefaults.Provider>
+  )
+}
+
+/** How long a row found by search stays washed in the accent. */
+const FLASH_MS = 1400
+
+/**
+ * The nav: a search field over the four groups of pages. (M133)
+ *
+ * With a query, the groups give way to the rows that match it — label first, then the words in
+ * `settingsIndex.ts` — each naming its page, and choosing one opens that page (and tab) on the
+ * row. The arrow keys move through the results from the field, Enter opens the current one and
+ * Escape clears the query, so a keyboard user never leaves the field to use it.
+ */
+function SettingsNav({
+  active,
+  onSelect,
+  onJump,
+}: {
+  active: SettingsSection
+  onSelect: (next: SettingsSection) => void
+  onJump: (hit: SettingsHit) => void
+}) {
+  const [query, setQuery] = useState('')
+  const [cursor, setCursor] = useState(0)
+  const hits = query.trim() === '' ? null : searchSettings(query)
+  const titleOf = (id: SettingsSection) => SECTIONS.find((s) => s.id === id)?.title ?? id
+
+  const choose = (hit: SettingsHit | undefined) => {
+    if (hit === undefined) return
+    onJump(hit)
+  }
+
+  return (
+    <nav className={styles.nav} aria-label="Settings">
+      <div className={styles.search}>
+        <SearchField
+          size="sm"
+          aria-label="Search settings"
+          placeholder="Search settings"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value)
+            setCursor(0)
+          }}
+          onKeyDown={(e) => {
+            if (hits === null) return
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+              e.preventDefault()
+              const step = e.key === 'ArrowDown' ? 1 : -1
+              setCursor((c) => Math.max(0, Math.min(hits.length - 1, c + step)))
+            } else if (e.key === 'Enter') {
+              e.preventDefault()
+              choose(hits[cursor])
+            } else if (e.key === 'Escape') {
+              e.preventDefault()
+              e.stopPropagation()
+              setQuery('')
+            }
+          }}
+        />
+      </div>
+
+      {hits !== null ? (
+        <div className={styles.results} role="listbox" aria-label="Matching settings">
+          {hits.length === 0 && <div className={styles.noResults}>No setting matches.</div>}
+          {hits.map((hit, i) => (
+            <button
+              key={`${hit.section}:${hit.label}`}
+              type="button"
+              role="option"
+              aria-selected={i === cursor}
+              className={styles.result}
+              onMouseEnter={() => setCursor(i)}
+              onClick={() => choose(hit)}
+            >
+              <span className={styles.resultLabel}>{hit.label}</span>
+              <span className={styles.resultWhere}>
+                {titleOf(hit.section)}
+                {hit.tab !== undefined &&
+                  ` › ${SECTION_TABS[hit.section]?.find((t) => t.value === hit.tab)?.label ?? hit.tab}`}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div role="tablist" aria-orientation="vertical" aria-label="Settings sections">
+          {SECTION_GROUPS.map((group) => (
+            <div key={group.id} className={styles.navGroup} role="presentation">
+              <div className={styles.navCaption} role="presentation">
+                {group.title}
+              </div>
+              {SECTIONS.filter((entry) => entry.group === group.id).map((entry) => {
+                const selected = entry.id === active
+                return (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    className={selected ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+                    onClick={() => onSelect(entry.id)}
+                  >
+                    {entry.title}
+                  </button>
+                )
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+    </nav>
   )
 }

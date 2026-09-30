@@ -832,6 +832,14 @@ struct RegistrySink {
 }
 
 impl RegistrySink {
+    /// The GitLab service, the way `agent_rpc`'s review tools reach it. (M134)
+    fn gitlab(&self) -> Result<Arc<cide_gitlab::GitLab>, String> {
+        self.app
+            .try_state::<crate::cmd::gitlab::GitLabState>()
+            .ok_or_else(|| gone().to_string())?
+            .service()
+    }
+
     /// Whether a session a task already points at is still running: a pane of this project holds
     /// it and its child is alive. (M104)
     fn live_session(&self, session: SessionId) -> bool {
@@ -1042,6 +1050,147 @@ impl AgentSink for RegistrySink {
 
     fn resolutions(&self) -> Result<Vec<(AgentId, cide_agents::overrides::Resolved)>, String> {
         crate::agents::resolutions_for(&self.app, self.project).map_err(|error| error.to_string())
+    }
+
+    // --- everything else Settings can change (M134) ----------------------------------------
+    //
+    // Each of these calls the function the Settings screen's `invoke` lands on, never the
+    // writer beneath it: `cide_agents::settings_tools`' header is the argument. Where that
+    // function does not broadcast (the extension store, the GitLab worker), this emits exactly
+    // what its `#[tauri::command]` wrapper would have.
+
+    fn caller(&self) -> tools::CallerKind {
+        self.caller
+    }
+
+    fn settings(&self) -> Result<cide_ipc::settings::Settings, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        Ok(workspace.with(|ws| ws.settings.clone()))
+    }
+
+    fn set_settings(
+        &self,
+        patch: cide_ipc::SettingsPatch,
+    ) -> Result<cide_ipc::settings::Settings, String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        crate::cmd::settings::settings_set(workspace, self.app.clone(), patch)
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_window_mode(&self, mode: cide_ipc::WindowMode) -> Result<(), String> {
+        // On the main thread, and waited for. `window_set_mode` is a synchronous command, which
+        // Tauri runs there; it opens and closes real windows, and doing that from this socket's
+        // thread would be the one caller of it that does not. Waiting cannot deadlock: nothing
+        // on the main thread waits on this connection.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let app = self.app.clone();
+        self.app
+            .run_on_main_thread(move || {
+                let result = match app.try_state::<WorkspaceState>() {
+                    Some(workspace) => {
+                        crate::cmd::window::window_set_mode(workspace, app.clone(), mode)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                    None => Err(gone().to_string()),
+                };
+                let _ = tx.send(result);
+            })
+            .map_err(|error| error.to_string())?;
+        rx.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "the window mode change did not finish".to_string())?
+    }
+
+    fn keymap(&self) -> Result<cide_ipc::KeymapReport, String> {
+        Ok(crate::cmd::settings::keymap_report())
+    }
+
+    fn keymap_edit(
+        &self,
+        edits: Vec<cide_ipc::KeymapEdit>,
+    ) -> Result<cide_ipc::KeymapReport, String> {
+        crate::cmd::settings::keymap_edit(self.app.clone(), edits)
+            .map(|result| result.report)
+            .map_err(|error| error.to_string())
+    }
+
+    fn extensions(&self) -> Result<Vec<cide_ipc::ext::InstalledExtension>, String> {
+        let state = self
+            .app
+            .try_state::<crate::ext_state::ExtState>()
+            .ok_or_else(|| gone().to_string())?;
+        Ok(state.store().snapshot().extensions)
+    }
+
+    fn set_extension_setting(
+        &self,
+        extension: &cide_ipc::ExtensionRef,
+        key: &str,
+        value: Value,
+    ) -> Result<(), String> {
+        let state = self
+            .app
+            .try_state::<crate::ext_state::ExtState>()
+            .ok_or_else(|| gone().to_string())?;
+        let snapshot = state
+            .store()
+            .set_setting(extension, key, value)
+            .map_err(|error| error.to_string())?;
+        crate::ext_state::publish(&self.app, &snapshot);
+        Ok(())
+    }
+
+    fn spec_settings(&self) -> Result<cide_ipc::spec::SpecSettings, String> {
+        let root = self.root()?;
+        Ok(cide_agents::config::load_spec_settings(&root))
+    }
+
+    fn set_spec_settings(&self, settings: cide_ipc::spec::SpecSettings) -> Result<(), String> {
+        let root = self.root()?;
+        cide_agents::config::write_spec_settings(&root, &settings)
+            .map_err(|error| error.to_string())
+    }
+
+    fn gitlab_preferences(&self) -> Result<cide_ipc::gitlab::GitLabPreferences, String> {
+        Ok(self.gitlab()?.board().preferences)
+    }
+
+    fn set_gitlab_preferences(
+        &self,
+        preferences: cide_ipc::gitlab::GitLabPreferences,
+    ) -> Result<(), String> {
+        let service = self.gitlab()?;
+        service.execute(cide_ipc::gitlab::GitLabRequest::Preferences { preferences })?;
+        crate::emit::gitlab_changed(&self.app, &service.board());
+        Ok(())
+    }
+
+    fn run_command(&self, command: &str, args: Option<Value>) -> Result<(), String> {
+        let workspace = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        // The shell window that has this project in its strip. Not a detached pane's window:
+        // those draw one pane and have no palette, no sidebar and no dispatcher to hand this to.
+        let window = workspace.with(|ws| {
+            ws.windows.iter().find_map(|(label, role)| match role {
+                cide_ipc::WindowRole::Shell { projects, .. }
+                    if projects.contains(&self.project) =>
+                {
+                    Some(label.clone())
+                }
+                _ => None,
+            })
+        });
+        let window = window.ok_or_else(|| "no open window is showing this project".to_string())?;
+        crate::emit::command_requested(&self.app, &window, self.project, command, args);
+        Ok(())
     }
 
     fn milestones_view(&self) -> Result<cide_ipc::MilestonesView, String> {
@@ -5083,13 +5232,17 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 24, "{names:?}");
+            assert_eq!(names.len(), 29, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
             // The settings four reach a product owner's pane and nowhere else. (M71)
             assert!(names.contains(&"cide_agents_config"));
             assert!(names.contains(&"cide_llm_pool"));
+            // And the M134 five: cide's own settings, keymap and commands.
+            assert!(names.contains(&"cide_settings"));
+            assert!(names.contains(&"cide_keymap"));
+            assert!(names.contains(&"cide_command_run"));
             // The three that are deliberately not tools, checked here as well as in
             // `cide_agents::tools`, because this is the list a model actually receives.
             assert!(!names.contains(&"cide_agent_pause"));

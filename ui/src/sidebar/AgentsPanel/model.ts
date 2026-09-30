@@ -362,16 +362,18 @@ export function phaseHint(phase: RunPhase): string | null {
  *
  * `paused` is **in**, and its child is doing strictly less than an idle one's — SIGSTOP, not a
  * single instruction. But it is frozen *mid-turn*: it has handed nothing back, and it still
- * holds its session, its place under the ceiling and its worktree. A pause that quietly freed a
- * slot would let a second run of the role start in the same checkout, which is the
- * file-clobbering that worktree isolation exists to prevent.
+ * holds its session, its task and its worktree. It does **not** hold its place under the
+ * ceiling — a freeze gives the slot back and a resume takes one again (see [`SLOT_PHASES`],
+ * which is this list less `paused`) — and that is safe because a checkout is per task, so the
+ * next run of the role never starts in the frozen one's.
  *
  * So the two disagree in opposite directions — `idle` is alive and not working, `paused` is
  * working and not doing anything — which is exactly how "the child exists" and "the run holds a
  * slot" turned out to be two different lists that merely coincide on `running`. **This is the
  * second list, and it is now named for the second question.** Every caller wants that one:
  *
- *   - [`occupiedSlotsFor`] feeds [`canDispatch`]'s ceiling. An idle run that counted would hold
+ *   - [`occupiedSlotsFor`] feeds [`canDispatch`]'s ceiling, over [`SLOT_PHASES`] — this list
+ *     less `paused`. An idle run that counted would hold
  *     its role's slot for as long as its child sat at a prompt, and the next queued task would
  *     never start. **That is the exact stall the wire's old `Finished { code: 0 }` mapping was
  *     written to avoid**, and dropping the fabricated exit code must not bring it back.
@@ -379,8 +381,8 @@ export function phaseHint(phase: RunPhase): string | null {
  *     badge: how much of this project's capacity is spoken for. Counting idle children would
  *     mean a figure that never returned to zero while one lingered, and a badge that never
  *     rests is a badge nobody reads. What that figure does **not** answer is "how many agents
- *     are getting work done" — see its own doc, because a paused project holds every slot it
- *     held a second ago while advancing nothing.
+ *     are getting work done" — see its own doc. It counts over [`SLOT_PHASES`] too, so a
+ *     paused project reads `0` rather than every slot it held a second ago.
  *   - `TasksPanel`'s chip asks whether a task is still *claimed*: whether some run is mid-turn
  *     on it, inside the worktree it was dispatched into. Same question, same list, second copy.
  *
@@ -415,6 +417,24 @@ export const WORKING_PHASES: readonly RunPhase[] = [
  */
 export function isWorkingPhase(phase: string): boolean {
   return WORKING_PHASES.includes(phase as RunPhase)
+}
+
+/**
+ * The phases that count against a role's `max-concurrent` and the project's cap:
+ * [`WORKING_PHASES`] **less `paused`**.
+ *
+ * A freeze gives the slot back (`cide_app::agents::Frozen::slot`) and a resume takes one again,
+ * or puts the run back in the queue when there is none. A `SIGSTOP`ped child computes nothing,
+ * and counting it held a role full of frozen processes while its queue sat still (terrastrike:
+ * `3/2 +1` on a role of three paused artists). The *checkout* stays held — Rust's
+ * `holds_its_checkout` still counts `Paused` — and so does the task's claim, which is why
+ * [`WORKING_PHASES`] keeps `paused` for the Tasks chip.
+ */
+export const SLOT_PHASES: readonly RunPhase[] = ['starting', 'running', 'awaitingPermission']
+
+/** Does a run in this phase hold one of its role's slots? See [`SLOT_PHASES`]. */
+export function holdsSlot(phase: string): boolean {
+  return SLOT_PHASES.includes(phase as RunPhase)
 }
 
 /**
@@ -851,15 +871,16 @@ export function authorColor(
 /**
  * How many of this role's slots are held right now.
  *
- * Counted over [`WORKING_PHASES`], so a queued run of the same role does not block the dispatch
- * that would start it, and a paused one does — a frozen run has not let go of the checkout, and
- * starting a second run of the role into it is the collision worktree isolation prevents.
+ * Counted over [`SLOT_PHASES`], so neither a queued run of the same role nor a paused one blocks
+ * the dispatch that would start the next: a paused run gave its slot back at the freeze. Its
+ * checkout it kept, and a checkout is per task, so a dispatch of the role onto another task
+ * never enters it.
  */
 export function occupiedSlotsFor(roster: Roster, agent: string): number {
   if (roster.kind !== 'ready') return 0
   let n = 0
   for (const run of roster.runs) {
-    if (run.agent === agent && isWorkingPhase(run.phase)) n += 1
+    if (run.agent === agent && holdsSlot(run.phase)) n += 1
   }
   return n
 }
@@ -962,27 +983,12 @@ export function canPause(run: RunView): boolean {
  * How many of this project's slots are held right now, or `null` when nobody has looked.
  *
  * **What it answers, exactly: how much of the project's capacity is spoken for** — one per run
- * in [`WORKING_PHASES`]. It is emphatically **not** "how many agents are working" in the sense
- * a user reads off a bare digit. `Pause all` freezes every run in the project, and every one of
- * them stays in `paused`, so this figure reads `2` while nothing advances by a single token.
- * That is the right answer to the question being asked — the two slots and two worktrees really
- * are still held, and a dispatch really would still be refused — and the wrong answer to the
- * question a lone number invites, so the name says slots and not work.
- *
- * # One number, two surfaces, and only one of them mitigates the paused reading
- *
- * [`metaFigure`] wants occupancy and gets it: the header prints this beside the queue depth and
- * beside the Resume control, so a frozen project reads `2 ▶ Resume` and cannot be misread — the
- * digit and the reason it is not moving are adjacent. **That mitigation is structural and it
- * holds only while the two stay side by side**; move Resume out of the header, or print the
- * figure somewhere Resume is not, and the misreading is back.
- *
- * The activity rail's ⌬ badge takes the same number through `App.tsx` and has **no Resume
- * beside it**: it draws a `2` pill whose accessible name is "2 runs", with nothing on the rail
- * saying they are frozen. So one number serves both surfaces arithmetically, and only one of
- * them says what the number means. Splitting them — the rail wants "is anything moving here",
- * the header wants "how loaded is this project" — is a change to what `App.tsx` calls, and is
- * the follow-up this rename deliberately did not reach into.
+ * in [`SLOT_PHASES`]. It is not "how many agents exist": a paused run gave its slot back at the
+ * freeze (`cide_app::agents::Frozen::slot`) and is not counted, so `Pause all` reads `0` beside
+ * the header's Resume control and the activity rail's ⌬ badge draws nothing — which is also
+ * what the rail wants to say, since nothing in the project is advancing. Until the freeze gave
+ * slots back, both surfaces read `2` over two frozen runs, and only the header had a Resume
+ * beside the digit to explain it.
  *
  * **`null` and `0` are different claims and must not be conflated**, which is `ProblemsPanel`'s
  * badge rule and the reason its `statusBarCounts` returns `null` rather than zeroes. The
@@ -1001,7 +1007,7 @@ export function canPause(run: RunView): boolean {
 export function occupiedSlots(roster: Roster): number | null {
   if (roster.kind !== 'ready') return null
   let n = 0
-  for (const run of roster.runs) if (isWorkingPhase(run.phase)) n += 1
+  for (const run of roster.runs) if (holdsSlot(run.phase)) n += 1
   return n
 }
 

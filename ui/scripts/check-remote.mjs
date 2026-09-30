@@ -145,7 +145,12 @@ const grantText = grant ? grant[1] : ''
 for (const capability of ['sessions', 'permission prompts', 'dispatch', 'tasks']) {
   ok(grantText.includes(capability), `the grant sentence names ${capability}`)
 }
-ok(section.includes('hint={GRANT}'), 'the grant sentence is attached to the switch that grants it')
+// `info={GRANT}` since M133: the full sentence is the (i) on the switch, one line of it is the
+// hint. Either way it is attached to the switch that grants it, which is what this holds.
+ok(
+  section.includes('hint={GRANT}') || section.includes('info={GRANT}'),
+  'the grant sentence is attached to the switch that grants it',
+)
 
 // --- the status readout branches on every arm ---------------------------------------------
 

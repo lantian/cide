@@ -1,0 +1,91 @@
+/*
+ * The (i) mark and the popover it opens. See `InfoTip.tsx`.
+ *
+ * The mark is `--faint` at rest, a notch quieter than a hint: a settings page carries a dozen of
+ * them and they are a place to look when a label is not enough, not a thing to read on the way
+ * past. Hover and focus lift it to `--text`; pinned wears the accent, the kit's "on" for an icon
+ * toggle, so a user who clicked one and scrolled away can see which one is holding the popover.
+ *
+ * The popover is a card, not the inverted `Tooltip`: the tooltip is for three words and a
+ * shortcut, this is for a paragraph, and a paragraph on the inverted ground is hard to read.
+ */
+
+.mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(18px * var(--ui-scale));
+  height: calc(18px * var(--ui-scale));
+  margin-left: var(--sp-2);
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--faint);
+  cursor: help;
+  vertical-align: middle;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.mark:hover,
+.mark[aria-expanded='true'] {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.mark[data-pinned] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.mark:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.popover {
+  position: fixed;
+  z-index: 90;
+  max-width: calc(340px * var(--ui-scale));
+  padding: var(--sp-4) var(--sp-5);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--panel);
+  box-shadow: var(--shadow-2);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--text);
+  white-space: normal;
+  text-align: left;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.para {
+  display: block;
+}
+
+.para + .para {
+  margin-top: var(--sp-3);
+}
+
+.popover code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-1);
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

@@ -201,7 +201,9 @@ export function ChangelistDialog({
                     <span className={styles.entryMeta}>
                       {here && 'already here · '}
                       {list.active && 'active · '}
-                      {list.id === DEFAULT_CHANGELIST && 'default · '}
+                      {/* Picking it stages as well as files (`useGitPanel::movePaths`), and
+                          the chooser is the one route to it with no ghost to say so. */}
+                      {list.id === DEFAULT_CHANGELIST && 'default · stages · '}
                       {list.count} {list.count === 1 ? 'file' : 'files'}
                     </span>
                   </PickerRow>

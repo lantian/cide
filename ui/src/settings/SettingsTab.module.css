@@ -1,6 +1,6 @@
 /*
- * Content mode C from the mock: a 190px nav down the left, the section on the right at
- * 34px/44px padding.
+ * Content mode C from the mock: a nav down the left — a search field over four groups of pages
+ * since M133 — and the page on the right at 32px/44px padding.
  */
 
 .tab {
@@ -11,14 +11,86 @@
 }
 
 .nav {
-  width: calc(200px * var(--ui-scale));
+  width: calc(220px * var(--ui-scale));
   flex: none;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-1);
+  min-height: 0;
+  overflow-y: auto;
   padding: var(--sp-5) var(--sp-3);
   background: var(--panel);
   border-right: 1px solid var(--border);
+}
+
+.search {
+  margin-bottom: var(--sp-5);
+}
+
+/* A group of pages under the kit's section caption (M133): uppercase, 11px, `--faint` — the one
+   place the kit allows uppercase, and it means exactly "a group starts here". */
+.navGroup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.navGroup + .navGroup {
+  margin-top: var(--sp-6);
+}
+
+.navCaption {
+  padding: 0 var(--sp-5) var(--sp-2);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* Search results: the kit's picker row, two lines — the row's label and the page it is on. */
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.result {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-5);
+  border: 0;
+  border-radius: var(--r-2);
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.result[aria-selected='true'] {
+  background: var(--sel);
+}
+
+.result:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
+}
+
+.resultLabel {
+  font-size: var(--fs-ui-12);
+  color: var(--text-hi);
+}
+
+.resultWhere {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.noResults {
+  padding: var(--sp-3) var(--sp-5);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
 }
 
 .navItem {
@@ -105,19 +177,32 @@
   user-select: none;
 }
 
+/* The page's head: title (with its (i) when the page has more to say), one line, and the page's
+   tabs when it has them. The tabs sit in the head, above the banner and the rows, because they
+   are *which part of the page* — the same level as the title, not one more group. */
+.header {
+  max-width: calc(620px * var(--ui-scale));
+  margin-bottom: var(--sp-7);
+}
+
 .title {
-  margin: 0 0 var(--sp-3);
+  display: flex;
+  align-items: center;
+  margin: 0 0 var(--sp-2);
   font-size: var(--fs-ui-20);
   font-weight: 600;
   color: var(--text-hi);
 }
 
 .description {
-  margin: 0 0 var(--sp-7);
-  max-width: calc(620px * var(--ui-scale));
+  margin: 0;
   font-size: var(--fs-ui-13);
   line-height: 1.5;
   color: var(--dim);
+}
+
+.pageTabs {
+  margin-top: var(--sp-6);
 }
 
 .body {

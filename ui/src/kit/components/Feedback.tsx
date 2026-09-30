@@ -13,7 +13,7 @@ import styles from './Feedback.module.css'
 
 export type Outcome = 'info' | 'ok' | 'warn' | 'bad'
 
-const OUTCOME_ICON: Record<Outcome, IconName> = {
+export const OUTCOME_ICON: Record<Outcome, IconName> = {
   info: 'info',
   ok: 'circle-check',
   warn: 'triangle-alert',

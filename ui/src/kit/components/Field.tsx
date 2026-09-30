@@ -16,7 +16,9 @@ import {
 } from 'react'
 
 import { Icon, type IconName } from '@/icons/Icon'
-import type { ControlSize } from './Button'
+import { IconButton, type ControlSize } from './Button'
+import { OUTCOME_ICON, type Outcome } from './Feedback'
+import { InfoTip } from './InfoTip'
 import { cx } from './cx'
 import styles from './Field.module.css'
 
@@ -116,19 +118,60 @@ export function Textarea(props: NativeTextarea): ReactElement {
 
 export type FormRowProps = {
   label: string
+  /** One line under the label. More than that goes in `info`. */
   hint?: ReactNode
+  /** The rest of the explanation, behind an (i) after the label. (M133) */
+  info?: ReactNode
+  /**
+   * Something wrong (or worth knowing) about **this** setting's current state: the row takes the
+   * tone as a bar down its left edge and says why in one line under the label. The replacement
+   * for a `Note` placed between two rows, which the user could not tie to either of them.
+   */
+  status?: { tone: Outcome; text: string } | undefined
+  /** The value differs from its default: an accent dot before the label. */
+  modified?: boolean | undefined
+  /** Drawn while `modified`: a quiet Reset to default beside the control. */
+  onReset?: (() => void) | undefined
+  /** `data-setting`, what Settings search scrolls to and flashes. */
+  anchor?: string | undefined
   children: ReactNode
 }
 
 /** Label and hint on the left, the control on the right — a settings row. */
-export function FormRow({ label, hint, children }: FormRowProps): ReactElement {
+export function FormRow({
+  label,
+  hint,
+  info,
+  status,
+  modified,
+  onReset,
+  anchor,
+  children,
+}: FormRowProps): ReactElement {
   return (
-    <div className={styles.row}>
+    <div className={styles.row} data-tone={status?.tone} data-setting={anchor}>
       <div className={styles.rowText}>
-        <div className={styles.rowLabel}>{label}</div>
+        <div className={styles.rowLabel}>
+          {modified === true && (
+            <span className={styles.rowModified} role="img" aria-label="Changed from the default" />
+          )}
+          {label}
+          {info !== undefined && <InfoTip label={`About ${label}`}>{info}</InfoTip>}
+        </div>
+        {status !== undefined && (
+          <div className={styles.rowStatus}>
+            <Icon name={OUTCOME_ICON[status.tone]} size={1} />
+            <span>{status.text}</span>
+          </div>
+        )}
         {hint !== undefined && <div className={styles.rowHint}>{hint}</div>}
       </div>
-      <div className={styles.rowControl}>{children}</div>
+      <div className={styles.rowControl}>
+        {modified === true && onReset !== undefined && (
+          <IconButton icon="undo-2" label={`Reset ${label} to default`} onClick={onReset} />
+        )}
+        {children}
+      </div>
     </div>
   )
 }

@@ -27,34 +27,31 @@ import { errorText } from '@/ipc/errorText'
 import { useWorkspace, type Theme } from '@/store/workspace'
 import { BUILTIN_SCHEME, schemeChoices } from '@/editor/scheme'
 import type { ColorScheme, EditorSettings, SettingsPatch } from '@/ipc/generated'
-import { ActionButton, Note, Row, Select } from './controls'
+import { InfoPara } from '@/kit/components/InfoTip'
+import { ActionButton, Row, Select, resetTo, useSettingsDefaults } from './controls'
 import styles from './panels.module.css'
 
 /**
- * What happened to the last import, in a sentence.
+ * What happened to the last import, in a sentence — or `null` when there is nothing to say.
  *
- * Its own component because there are three outcomes and inlining a nested ternary into the row's
+ * Its own function because there are three outcomes and inlining a nested ternary into the row's
  * JSX is how one of them stops being reachable without anybody noticing. They are: everything
  * matched (say nothing — the picker already moved, which is the feedback), some matched (name
  * what went to the other theme), nothing matched (say so, or the import reads as a failure).
+ *
+ * A sentence for the row's `status` since M133, rather than a `Note` under the row: it is about
+ * this row's picker, and a block below it read as being about the row after.
  */
-function ImportedNote({ imported, theme }: { imported: readonly ColorScheme[]; theme: Theme }) {
+function importedSentence(imported: readonly ColorScheme[], theme: Theme): string | null {
   const other = imported.filter((s) => s.polarity !== theme)
   if (other.length === 0) return null
   const otherName = theme === 'dark' ? 'Light' : 'Dark'
   const names = other.map((s) => s.name).join(', ')
   const matched = imported.length - other.length
-
-  return (
-    <Note title={matched > 0 ? `Also imported for ${otherName}` : 'Imported into the other theme'}>
-      {names} {other.length === 1 ? 'is a' : 'are'} {otherName.toLowerCase()} scheme
-      {other.length === 1 ? '' : 's'}, and this window is showing{' '}
-      {theme === 'dark' ? 'Dark' : 'Light'}.{' '}
-      {matched > 0
-        ? `Saved, and offered here once you switch to ${otherName}.`
-        : `Saved, and offered here once you switch to ${otherName} — nothing changed in this window.`}
-    </Note>
-  )
+  const what = `${names} ${other.length === 1 ? 'is a' : 'are'} ${otherName.toLowerCase()} scheme${other.length === 1 ? '' : 's'}`
+  return matched > 0
+    ? `Also imported: ${what}, offered here once you switch to ${otherName}.`
+    : `Imported into ${otherName}: ${what} — nothing changed in this window.`
 }
 
 export interface ColorSchemeRowProps {
@@ -126,35 +123,47 @@ export function ColorSchemeRow({ theme, editor, patch }: ColorSchemeRowProps) {
     void settingsApi.removeScheme(value).catch((e: unknown) => setFailed(errorText(e)))
   }
 
+  const sentence = imported === null ? null : importedSentence(imported, theme)
+  const def = useSettingsDefaults()?.editor
+  const defaultId = theme === 'dark' ? def?.colorSchemeDark : def?.colorSchemeLight
+
   return (
-    <>
-      <Row
-        label="Colour scheme"
-        hint={
-          'What the editor paints code — and the buffer’s own background. Per theme: this sets ' +
-          `the scheme for ${theme === 'dark' ? 'Dark' : 'Light'}, and the other keeps its own. ` +
-          'Import a VS Code theme’s .vsix straight from the marketplace, or a bare ' +
-          '-color-theme.json; cide converts its TextMate scopes to its own token roles. A .vsix ' +
-          'usually holds a light and a dark variant and both are imported at once.'
-        }
-        control={
-          <div className={styles.schemeControl}>
-            <Select label="Colour scheme" value={value} options={choices} onChange={select} />
-            <ActionButton label="Import…" onClick={doImport} />
-            <ActionButton
-              label="Remove"
-              onClick={remove}
-              disabled={value === BUILTIN_SCHEME}
-            />
-          </div>
-        }
-      />
-      {imported !== null && <ImportedNote imported={imported} theme={theme} />}
-      {failed !== null && (
-        <Note title="Could not import that file" tone="warn">
-          {failed}
-        </Note>
-      )}
-    </>
+    <Row
+      label="Colour scheme"
+      hint={`How the editor paints code, for ${theme === 'dark' ? 'Dark' : 'Light'}; the other theme keeps its own.`}
+      info={
+        <>
+          <InfoPara>
+            What the editor paints code — and the buffer’s own background. Per theme: the other
+            theme keeps its own scheme.
+          </InfoPara>
+          <InfoPara>
+            Import a VS Code theme’s <code>.vsix</code> straight from the marketplace, or a bare{' '}
+            <code>-color-theme.json</code>; cide converts its TextMate scopes to its own token
+            roles. A <code>.vsix</code> usually holds a light and a dark variant and both are
+            imported at once.
+          </InfoPara>
+        </>
+      }
+      status={
+        failed !== null
+          ? { tone: 'warn', text: `Could not import that file: ${failed}` }
+          : sentence !== null
+            ? { tone: 'info', text: sentence }
+            : undefined
+      }
+      {...resetTo(value, defaultId, select)}
+      control={
+        <div className={styles.schemeControl}>
+          <Select label="Colour scheme" value={value} options={choices} onChange={select} />
+          <ActionButton label="Import…" onClick={doImport} />
+          <ActionButton
+            label="Remove"
+            onClick={remove}
+            disabled={value === BUILTIN_SCHEME}
+          />
+        </div>
+      }
+    />
   )
 }

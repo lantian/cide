@@ -1268,6 +1268,37 @@ export function App() {
     (command: string, args: unknown) => dispatcherRef.current(command, args),
     [],
   )
+
+  /*
+   * The console's `cide_command_run` (M134): the same `runCommand` the palette calls, so a
+   * command asked for in a sentence behaves exactly as one picked from the list.
+   *
+   * A command acts on the active project, and the user typed the request into a console of
+   * `request.project` — in a stacked window that need not be the one showing. So a request for
+   * another project activates it first and is parked until the commit that makes it active:
+   * running it straight after `activateProject` would dispatch against the dispatcher of the
+   * tree still on screen, which is the stale-`activeProject` bug the ref above exists to stop.
+   */
+  const pendingCommand = useRef<{ project: string; command: string; args: unknown } | null>(null)
+  useEffect(() => {
+    const off = events.onCommandRequested((request) => {
+      if (request.project === activeProjectId) {
+        runCommand(request.command, request.args ?? null)
+        return
+      }
+      pendingCommand.current = request
+      void activateProject(request.project as ProjectId)
+    })
+    return () => {
+      void off.then((stop) => stop())
+    }
+  }, [activeProjectId, activateProject, runCommand])
+  useEffect(() => {
+    const pending = pendingCommand.current
+    if (pending === null || pending.project !== activeProjectId) return
+    pendingCommand.current = null
+    runCommand(pending.command, pending.args ?? null)
+  }, [activeProjectId, runCommand])
   const dispatcher = createDispatcher({
     fallback: (command) => {
 

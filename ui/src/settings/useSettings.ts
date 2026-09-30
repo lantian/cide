@@ -22,7 +22,7 @@
  * set the local field and stopped there, which is why the header's switch disagreed with
  * Settings → Appearance, never reached a second window, and did not survive a relaunch.
  */
-import { useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   session as sessionApi,
   settings as settingsApi,
@@ -42,6 +42,30 @@ import type { Accent, ColorScheme } from '@/ipc/generated'
 /** The settings this window currently mirrors, or `null` before bootstrap resolves. */
 export function useSettings(): Settings | null {
   return useWorkspace((s) => s.boot?.workspace.settings ?? null)
+}
+
+/**
+ * `Settings::default()`, for the changed-from-default dots and their Reset. (M133)
+ *
+ * Asked once per window and kept: the defaults are compiled into this build and cannot change
+ * under it. `null` until the answer arrives and on a build with no such command, and then the
+ * screen simply draws no dots.
+ */
+let defaultsOnce: Promise<Settings | null> | null = null
+
+export function useSettingsDefaultsFetch(): Settings | null {
+  const [defaults, setDefaults] = useState<Settings | null>(null)
+  useEffect(() => {
+    let live = true
+    defaultsOnce ??= settingsApi.defaults().catch(() => null)
+    void defaultsOnce.then((d) => {
+      if (live) setDefaults(d)
+    })
+    return () => {
+      live = false
+    }
+  }, [])
+  return defaults
 }
 
 export interface SettingsActions {

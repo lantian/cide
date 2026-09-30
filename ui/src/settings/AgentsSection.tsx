@@ -101,7 +101,6 @@ import { useActiveProject, useWorkspace } from '@/store/workspace'
 import {
   ActionButton,
   Group,
-  Note,
   NumberField,
   PathReadout,
   Row as SettingRow,
@@ -159,6 +158,8 @@ import {
   takesPool,
 } from './agentsDraft'
 import { Icon } from '@/icons/Icon'
+import { Banner, Note } from '@/kit/components/Feedback'
+import { InfoPara, InfoTip } from '@/kit/components/InfoTip'
 
 import styles from './AgentsSection.module.css'
 
@@ -184,24 +185,44 @@ const DRAFTS = new Map<string, { selection: Selection | null; saved: Draft | nul
 
 const cx = (...parts: (string | false | null | undefined)[]) => parts.filter(Boolean).join(' ')
 
-export function AgentsSection() {
+export function AgentsSection({
+  tab = 'project',
+  setTab,
+}: {
+  tab?: string
+  setTab?: (next: string) => void
+}) {
   const project = useActiveProject()
   const projectId = project?.id ?? null
   if (projectId === null) {
+    // A page-wide state, so the page's banner (M133) rather than a note among rows that are
+    // not there.
     return (
-      <Note title="No project is open">
-        Roles are defined per project — <code>.cide/agents/</code> hangs off a project root — so
-        this screen has nothing to edit until one is open. Global roles are edited here too, but
-        they are still saved through the open project.
-      </Note>
+      <Banner tone="info">
+        No project is open. Roles are defined per project — <code>.cide/agents/</code> hangs off a
+        project root — and global roles are saved through the open project too.
+      </Banner>
     )
   }
   // Keyed on the project, so switching projects rebuilds the whole screen rather than leaving one
   // project's draft sitting over another project's list.
-  return <AgentsEditor key={projectId} project={projectId} />
+  return <AgentsEditor key={projectId} project={projectId} tab={tab} setTab={setTab} />
 }
 
-function AgentsEditor({ project }: { project: ProjectId }) {
+function AgentsEditor({
+  project,
+  tab,
+  setTab,
+}: {
+  project: ProjectId
+  /**
+   * Which of the page's four tabs is drawn (M133): `project`, `spawn`, `roles`, `overrides`.
+   * The role dialog is not in any of them — it is a portal, and a restored or requested dialog
+   * must come up whichever tab the page was left on.
+   */
+  tab: string
+  setTab: ((next: string) => void) | undefined
+}) {
   /** The definition files that exist, or `null` while the listing is in flight. */
   const [entries, setEntries] = useState<Entry[] | null>(null)
   /** What the roster said, when it said something other than "here are the roles". */
@@ -384,7 +405,15 @@ function AgentsEditor({ project }: { project: ProjectId }) {
   useEffect(() => {
     if (focusRole === null) return
     const taken = useAgents.getState().takeFocusRole()
-    if (taken !== null) setFocusRequest(taken)
+    if (taken === null) return
+    setFocusRequest(taken)
+    // Configure on a role lands on the Roles tab (M133), whatever tab the page was left on:
+    // every answer to the request — the dialog, the confirm, the "no definition file" banner —
+    // is drawn there, and a request answered on a tab nobody is looking at is the silently inert
+    // Configure `focusMiss` exists to prevent.
+    setTab?.('roles')
+    // `setTab` is a fresh closure on every render of `SettingsTab`; the request is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRole])
 
   // The cache is written on every change rather than on unmount: an unmount has no hook that
@@ -942,6 +971,33 @@ function AgentsEditor({ project }: { project: ProjectId }) {
 
   const moveWarning = draft === null ? null : scopeChangeWarning(draft, taken)
 
+  /*
+   * The page is four tabs since M133 (`SECTION_TABS.agents`), where it was one page of five
+   * groups and a dozen notes:
+   *
+   *  - **This project**: the switches in `.cide/config.json` that decide whether and how much
+   *    the project runs.
+   *  - **Spawn & prompt**: the same file's switches for what cide *starts by itself* — the review
+   *    of finished work and the wake-up when the project goes quiet — and the prompts it hands
+   *    them. Split from the first tab because they are two different questions ("may it run" and
+   *    "what does it start and say"), and together they were fourteen rows.
+   *  - **Roles**: the definition files, and the dialog that edits one.
+   *  - **Local overrides**: this machine's redirections.
+   *
+   * A problem with a tab's whole subject — a config that cannot be read, a role list that cannot
+   * be listed — is that tab's `Banner`, at its top, rather than a note under the rows it broke.
+   */
+  const configBanner = configError !== null && (
+    <Banner tone="warn">
+      <strong>
+        {configError.what === 'read'
+          ? "This project's switches could not be read."
+          : 'That switch could not be written.'}
+      </strong>{' '}
+      {configError.text}
+    </Banner>
+  )
+
   return (
     <>
       {/*
@@ -956,7 +1012,8 @@ function AgentsEditor({ project }: { project: ProjectId }) {
         * switches belong instead, in as many words — "it is where the switches in *this* struct
         * will eventually be drawn too, and when they are they will still be a per-project file
         * write and still not a `SettingsPatch`". This is that, and it holds to both halves:
-        * `agents_config_set` writes `.cide/config.json`, the hint says so, and no patch is sent.
+        * `agents_config_set` writes `.cide/config.json`, the group's (i) says so, and no patch is
+        * sent.
         *
         * # Nothing at all when the config is unknown
         *
@@ -965,109 +1022,176 @@ function AgentsEditor({ project }: { project: ProjectId }) {
         * a project whose file says `6` is indistinguishable from a correct one — and the user's
         * next keystroke writes the guess back over what was there.
         */}
-      {(config !== null || configError !== null) && (
-        <Group title="This project">
-          {config !== null && (
-            /*
-             * One switch for the board and milestones together: a milestone is a task with a
-             * gate. Off hides the Tasks panel and stops agents being told about the board — the
-             * tool list and system prompt are fixed when a session starts, so it reaches the
-             * sessions started after it. The tasks on disk are kept either way.
-             */
-            <ToggleRow
-              label="Task tracker & milestones"
-              hint={
-                'Off: agents get no task tools and are not told about the board, the Tasks ' +
-                'panel is hidden, and nothing is planned or dispatched from tasks — for ' +
-                'a project that works from OpenSpec or elsewhere. Tasks already on the board ' +
-                'are kept, and come back when this is on again. Takes effect for sessions ' +
-                'started after the change. Written to .cide/config.json.'
-              }
-              checked={config.trackerEnabled}
-              onChange={(next) => patchConfig({ trackerEnabled: next })}
-            />
-          )}
-          {config !== null && (
-            <SettingRow
-              label="Concurrent runs"
-              hint={
-                'How many subagent runs may be live across this project at once, whatever a ' +
-                "role's own max-concurrent allows. Written to .cide/config.json, which your " +
-                'repository will then contain.'
-              }
-              control={
-                <NumberField
-                  label="Concurrent runs"
-                  value={config.maxConcurrent}
-                  min={1}
-                  /*
-                   * A ceiling, not a policy: the value is a `u16` and Rust only clamps the bottom
-                   * of it (0 would be a project that can never dispatch). 64 is far above any
-                   * fan-out a person means and well above anything a hand-edited file is likely
-                   * to hold — which matters, because `NumberField` commits on blur, so a maximum
-                   * *below* a hand-written number would quietly lower it the first time the field
-                   * was tabbed through.
-                   */
-                  max={64}
-                  onChange={(next) => patchConfig({ maxConcurrent: next })}
-                />
-              }
-            />
-          )}
-          {config !== null && (
+      {tab === 'project' && configBanner}
+      {tab === 'project' && config !== null && (
+        <Group
+          title="This project"
+          info={
+            <>
+              Written to <code>.cide/config.json</code>, which your repository will then contain —
+              these are the project’s switches, not your preferences.
+            </>
+          }
+        >
+          {/*
+           * One switch for the board and milestones together: a milestone is a task with a
+           * gate. Off hides the Tasks panel and stops agents being told about the board — the
+           * tool list and system prompt are fixed when a session starts, so it reaches the
+           * sessions started after it. The tasks on disk are kept either way.
+           */}
+          <ToggleRow
+            label="Task tracker & milestones"
+            hint="Off: no task tools, no Tasks panel, nothing planned from the board."
+            info={
+              <>
+                <InfoPara>
+                  Off: agents get no task tools and are not told about the board, the Tasks panel
+                  is hidden, and nothing is planned or dispatched from tasks — for a project that
+                  works from OpenSpec or elsewhere.
+                </InfoPara>
+                <InfoPara>
+                  Tasks already on the board are kept, and come back when this is on again. Takes
+                  effect for sessions started after the change.
+                </InfoPara>
+              </>
+            }
+            checked={config.trackerEnabled}
+            onChange={(next) => patchConfig({ trackerEnabled: next })}
+          />
+          <SettingRow
+            label="Concurrent runs"
+            hint="Subagent runs live across this project at once."
+            info="However many runs a role’s own max-concurrent allows, the project never has more than this live at once."
+            control={
+              <NumberField
+                label="Concurrent runs"
+                value={config.maxConcurrent}
+                min={1}
+                /*
+                 * A ceiling, not a policy: the value is a `u16` and Rust only clamps the bottom
+                 * of it (0 would be a project that can never dispatch). 64 is far above any
+                 * fan-out a person means and well above anything a hand-edited file is likely
+                 * to hold — which matters, because `NumberField` commits on blur, so a maximum
+                 * *below* a hand-written number would quietly lower it the first time the field
+                 * was tabbed through.
+                 */
+                max={64}
+                onChange={(next) => patchConfig({ maxConcurrent: next })}
+              />
+            }
+          />
+          {/*
+           * M132. A run that writes a 20 KB report into a comment makes the card unreadable
+           * and every later prompt that quotes the task longer. The cap applies only to a caller
+           * nobody is typing in (`tools.rs`, `CallerKind::reports`): the user and a console the
+           * user drives are never refused.
+           */}
+          <SettingRow
+            label="Comment limit, characters"
+            hint="The longest comment a subagent run may post. 0 turns it off."
+            info="A longer comment is refused and the run is told to shorten it. You, and a console you type in, are never limited."
+            control={
+              <NumberField
+                label="Comment limit, characters"
+                value={config.commentLimit}
+                min={0}
+                max={100000}
+                onChange={(next) => patchConfig({ commentLimit: Math.round(next) })}
+              />
+            }
+          />
+          {/*
+           * M118. On by default: a restart is cide's, not the work's, and a run it interrupted
+           * otherwise waits as an Interrupted row until somebody presses Resume.
+           */}
+          <ToggleRow
+            label="Continue interrupted runs when cide starts"
+            hint="Runs a restart or quit cut off resume at the next launch."
+            info="They go back through the queue and continue their conversations, as pressing Resume would. A run whose task has a newer run, or that is open in a pane, is left alone."
+            checked={config.resumeAfterRestart}
+            onChange={(next) => patchConfig({ resumeAfterRestart: next })}
+          />
+        </Group>
+      )}
+
+      {tab === 'spawn' && configBanner}
+      {tab === 'spawn' && config !== null && (
+        <>
+          <Group
+            title="Review"
+            info={
+              <>
+                How finished work reaches a reviewer. Written to <code>.cide/config.json</code>.
+              </>
+            }
+          >
             <ToggleRow
               label="Review finished runs in a new tab"
-              hint={
-                'When a subagent hands its turn back, open a fresh Claude tab to check the ' +
-                'work instead of typing a line into this project\u2019s console. The new ' +
-                'conversation starts empty, so it reads the task and the diff with nothing ' +
-                'else in its context \u2014 and the tab stays until you close it, which ends ' +
-                'the Claude in it. Off, the console is told instead, exactly as before.'
+              hint="A fresh Claude tab checks the work instead of this project’s console."
+              info={
+                <>
+                  <InfoPara>
+                    When a subagent hands its turn back, open a fresh Claude tab to check the work
+                    instead of typing a line into this project’s console. The new conversation
+                    starts empty, so it reads the task and the diff with nothing else in its
+                    context.
+                  </InfoPara>
+                  <InfoPara>
+                    The tab stays until you close it, which ends the Claude in it. Off, the console
+                    is told instead, exactly as before.
+                  </InfoPara>
+                </>
               }
               checked={config.finishInNewTab}
               onChange={(next) => patchConfig({ finishInNewTab: next })}
             />
-          )}
-          {config !== null && config.finishInNewTab && (
-            /*
-             * The reviewer's brief, per project (M84). A template rather than a sentence: the
-             * facts of the run being reviewed are filled in by `fill_review_prompt` in Rust, one
-             * pass, so a task title that happens to say `{branch}` stays text. `TextArea` for the
-             * spin prompt's reason below, and flattened by `AgentsConfig::apply` for its reason.
-             */
-            <TextArea
-              label="What to tell the reviewer"
-              hint={
-                'The first prompt for the review tab when a run on a task ends. Placeholders ' +
-                'are filled with the run\u2019s facts: {task_id}, {task_title}, {task} (id and ' +
-                'title), {branch}, {role} (the id dispatch and merge answer to), {agent} (its ' +
-                'label), {outcome} (how the turn ended) and {others} (other runs that ended at ' +
-                'the same moment). Leave it empty to use the one cide ships. A run with no task ' +
-                'still gets cide\u2019s own brief, since it has no task or branch to name. Line ' +
-                'breaks become spaces when it is saved.'
-              }
-              value={config.reviewPrompt}
-              placeholder="Use cide's own prompt"
-              reset="Reset to cide's prompt"
-              onCommit={(next) => patchConfig({ reviewPrompt: next })}
-            />
-          )}
-          {config !== null && (
-            /*
+            {config.finishInNewTab && (
+              /*
+               * The reviewer's brief, per project (M84). A template rather than a sentence: the
+               * facts of the run being reviewed are filled in by `fill_review_prompt` in Rust,
+               * one pass, so a task title that happens to say `{branch}` stays text. `TextArea`
+               * for the spin prompt's reason below, and flattened by `AgentsConfig::apply` for
+               * its reason.
+               */
+              <TextArea
+                label="What to tell the reviewer"
+                hint={
+                  <>
+                    The review tab’s first prompt. Empty uses cide’s own.
+                    <InfoTip label="About What to tell the reviewer">
+                      <InfoPara>
+                        Placeholders are filled with the run’s facts: <code>{'{task_id}'}</code>,{' '}
+                        <code>{'{task_title}'}</code>, <code>{'{task}'}</code> (id and title),{' '}
+                        <code>{'{branch}'}</code>, <code>{'{role}'}</code> (the id dispatch and
+                        merge answer to), <code>{'{agent}'}</code> (its label),{' '}
+                        <code>{'{outcome}'}</code> (how the turn ended) and{' '}
+                        <code>{'{others}'}</code> (other runs that ended at the same moment).
+                      </InfoPara>
+                      <InfoPara>
+                        A run with no task still gets cide’s own brief, since it has no task or
+                        branch to name. Line breaks become spaces when it is saved.
+                      </InfoPara>
+                    </InfoTip>
+                  </>
+                }
+                value={config.reviewPrompt}
+                placeholder="Use cide's own prompt"
+                reset="Reset to cide's prompt"
+                onCommit={(next) => patchConfig({ reviewPrompt: next })}
+              />
+            )}
+            {/*
              * M132: how finished work reaches a reviewer. `batch` (the default) holds finished
              * tasks until there are `reviewBatch` of them or the oldest has waited
              * `reviewAfterSecs`, then opens one review over all of them — one reviewer reading
              * three related diffs catches what three reviewers each reading one cannot, and
              * spends a third of the start-up reading. `each` is the pre-M132 road: one review per
              * run as it ends.
-             */
+             */}
             <SettingRow
               label="Review finished work"
-              hint={
-                'In batches, finished tasks wait until there are enough of them, or the oldest ' +
-                'has waited long enough, and one review looks at all of them together. One by ' +
-                'one reviews each task as its run ends.'
-              }
+              hint="In batches, or each task as its run ends."
+              info="In batches, finished tasks wait until there are enough of them, or the oldest has waited long enough, and one review looks at all of them together. One by one reviews each task as its run ends."
               control={
                 <Select
                   label="Review finished work"
@@ -1077,90 +1201,54 @@ function AgentsEditor({ project }: { project: ProjectId }) {
                 />
               }
             />
-          )}
-          {config !== null && config.review === 'batch' && (
-            <>
-              <SettingRow
-                label="Tasks per review"
-                hint="How many finished tasks open a batch review."
-                control={
-                  <NumberField
-                    label="Tasks per review"
-                    value={config.reviewBatch}
-                    min={1}
-                    max={50}
-                    onChange={(next) => patchConfig({ reviewBatch: Math.round(next) })}
-                  />
-                }
-              />
-              <SettingRow
-                label="Review after, seconds"
-                hint={
-                  'How long the oldest finished task waits before its batch is reviewed anyway, ' +
-                  'however few are in it. Between 60 and 86400.'
-                }
-                control={
-                  <NumberField
-                    label="Review after, seconds"
-                    value={config.reviewAfterSecs}
-                    /* Rust's clamp, `AgentsConfig::apply`, restated so a commit never snaps. */
-                    min={60}
-                    max={86400}
-                    onChange={(next) => patchConfig({ reviewAfterSecs: Math.round(next) })}
-                  />
-                }
-              />
-              <TextArea
-                label="What to tell the batch reviewer"
-                hint={
-                  'The first prompt for a batch review. Leave it empty to use the one cide ' +
-                  'ships. Line breaks become spaces when it is saved.'
-                }
-                value={config.batchReviewPrompt}
-                placeholder="Empty uses cide's default prompt"
-                reset="Reset to cide's prompt"
-                onCommit={(next) => patchConfig({ batchReviewPrompt: next })}
-              />
-            </>
-          )}
-          {config !== null && (
-            /*
-             * M132. A run that writes a 20 KB report into a comment makes the card unreadable
-             * and every later prompt that quotes the task longer. The cap applies only to a caller
-             * nobody is typing in (`tools.rs`, `CallerKind::reports`): the user and a console the
-             * user drives are never refused.
-             */
-            <SettingRow
-              label="Comment limit, characters"
-              hint={
-                'The longest comment a subagent run may post on a task. A longer one is refused ' +
-                'and the run is told to shorten it. You, and a console you type in, are never ' +
-                'limited. 0 turns the limit off.'
-              }
-              control={
-                <NumberField
-                  label="Comment limit, characters"
-                  value={config.commentLimit}
-                  min={0}
-                  max={100000}
-                  onChange={(next) => patchConfig({ commentLimit: Math.round(next) })}
+            {config.review === 'batch' && (
+              <>
+                <SettingRow
+                  label="Tasks per review"
+                  hint="How many finished tasks open a batch review."
+                  control={
+                    <NumberField
+                      label="Tasks per review"
+                      value={config.reviewBatch}
+                      min={1}
+                      max={50}
+                      onChange={(next) => patchConfig({ reviewBatch: Math.round(next) })}
+                    />
+                  }
                 />
-              }
-            />
-          )}
-          {config !== null && (
-            /*
+                <SettingRow
+                  label="Review after, seconds"
+                  hint="The oldest task’s longest wait, 60 to 86400."
+                  info="How long the oldest finished task waits before its batch is reviewed anyway, however few are in it."
+                  control={
+                    <NumberField
+                      label="Review after, seconds"
+                      value={config.reviewAfterSecs}
+                      /* Rust's clamp, `AgentsConfig::apply`, restated so a commit never snaps. */
+                      min={60}
+                      max={86400}
+                      onChange={(next) => patchConfig({ reviewAfterSecs: Math.round(next) })}
+                    />
+                  }
+                />
+                <TextArea
+                  label="What to tell the batch reviewer"
+                  hint="A batch review’s first prompt. Empty uses cide’s own; line breaks become spaces."
+                  value={config.batchReviewPrompt}
+                  placeholder="Empty uses cide's default prompt"
+                  reset="Reset to cide's prompt"
+                  onCommit={(next) => patchConfig({ batchReviewPrompt: next })}
+                />
+              </>
+            )}
+            {/*
              * M114. Not under `finishInNewTab`: the gate holds the reviewer whichever road the
              * announcement takes, and a red verify goes back to the run on both.
-             */
+             */}
             <SettingRow
               label="Verify failures before the orchestrator takes over"
-              hint={
-                'When a run sets its task to review, the project’s verify command runs on ' +
-                'its branch before any reviewer is told. If it fails, the output goes back to ' +
-                'the same run to fix, up to this many times in a row; the next failure goes to ' +
-                'the orchestrator instead. 0 sends every failure to the orchestrator.'
-              }
+              hint="Red verifies a run may fix itself. 0 sends every one to the orchestrator."
+              info="When a run sets its task to review, the project’s verify command runs on its branch before any reviewer is told. If it fails, the output goes back to the same run to fix, up to this many times in a row; the next failure goes to the orchestrator instead."
               control={
                 <NumberField
                   label="Verify failures before the orchestrator takes over"
@@ -1171,174 +1259,194 @@ function AgentsEditor({ project }: { project: ProjectId }) {
                 />
               }
             />
-          )}
-          {config !== null && (
-            /*
-             * M118. On by default: a restart is cide's, not the work's, and a run it interrupted
-             * otherwise waits as an Interrupted row until somebody presses Resume.
-             */
-            <ToggleRow
-              label="Continue interrupted runs when cide starts"
-              hint={
-                'Runs that a cide restart or quit interrupted go back through the queue at the ' +
-                'next launch and continue their conversations, as pressing Resume would. A run ' +
-                'whose task has a newer run, or that is open in a pane, is left alone.'
-              }
-              checked={config.resumeAfterRestart}
-              onChange={(next) => patchConfig({ resumeAfterRestart: next })}
-            />
-          )}
-          {config !== null && (
+          </Group>
+
+          <Group title="When the project goes quiet">
             <ToggleRow
               label="Wake this project when it goes quiet"
-              hint={
-                'With subagents on and tasks still open, if nothing has been running for the ' +
-                'period below, open a Claude and ask it to check what was done ' +
-                'and put the next tasks on the roles. It never fires while a run is live, ' +
-                'while a Claude pane is working, or while agents are paused.'
-              }
+              hint="Open a Claude to review progress and assign the next tasks."
+              info="With subagents on and tasks still open, if nothing has been running for the period below, open a Claude and ask it to check what was done and put the next tasks on the roles. It never fires while a run is live, while a Claude pane is working, or while agents are paused."
               checked={config.autoSpin}
               onChange={(next) => patchConfig({ autoSpin: next })}
             />
-          )}
-          {config !== null && config.autoSpin && (
-            <>
-              <SettingRow
-                label="Quiet for"
-                hint={
-                  'Minutes of nothing happening before it fires. The clock restarts whenever ' +
-                  'the project looks busy, so this is a dwell and not an interval.'
-                }
-                control={
-                  <NumberField
-                    label="Quiet for"
-                    /*
-                     * Seconds on the wire, minutes in the box. The file holds seconds because
-                     * every other duration in it does (`stopGraceSecs`), and the box holds
-                     * minutes because nobody means "nine hundred". `Math.round` on the way in
-                     * so a hand-written 90 seconds draws as 2 rather than as 1.5, which
-                     * `NumberField` would commit back as 1.
-                     */
-                    value={Math.round(config.autoSpinAfterSecs / 60)}
-                    min={1}
-                    max={1440}
-                    onChange={(next) =>
-                      patchConfig({ autoSpinAfterSecs: Math.round(next) * 60 })
-                    }
-                  />
-                }
-              />
-              {/*
-                * A `TextArea` and not a `TextField`, which reverses what M79 first shipped.
-                *
-                * The argument for one line was that the prompt is *typed at a terminal*, where a
-                * newline is a second Enter — so a control that could not hold one was the
-                * constraint expressed in the form. That reasoning was sound about the file and
-                * wrong about the person: the default prompt is some five hundred characters, and
-                * a 26px box is the wrong shape to read it in, let alone rewrite it. Reported as
-                * exactly that.
-                *
-                * Nothing about the constraint moved, because it was never this control's to
-                * keep: `AgentsConfig::apply` flattens the string before it reaches
-                * `.cide/config.json`, which is why the flattening went *there* rather than at
-                * the spawn. So the box can hold whatever somebody types, the file holds one
-                * line, and the box shows that line back after the round trip — which is also
-                * what makes the hint below true rather than a warning nobody can act on.
-                */}
-              <TextArea
-                label="What to tell it"
-                hint={
-                  'The first prompt for the new Claude. Leave it empty to use the one cide ' +
-                  'ships, which tells it to survey the board and the git log first, judge ' +
-                  'whether the work is going the right way, and only then assign. Line breaks ' +
-                  'become spaces when it is saved \u2014 it is typed into a terminal, where a ' +
-                  'newline would submit half a sentence.'
-                }
-                value={config.autoSpinPrompt}
-                placeholder="Use cide's own prompt"
-                reset="Reset to cide's prompt"
-                onCommit={(next) => patchConfig({ autoSpinPrompt: next })}
-              />
-            </>
-          )}
-          {configError !== null && (
-            <Note
-              title={
-                configError.what === 'read'
-                  ? "This project's switches could not be read"
-                  : 'That switch could not be written'
-              }
-              tone="warn"
-            >
-              {configError.text}
-            </Note>
-          )}
-        </Group>
+            {config.autoSpin && (
+              <>
+                <SettingRow
+                  label="Quiet for"
+                  hint="Minutes of nothing happening before it fires."
+                  info="The clock restarts whenever the project looks busy, so this is a dwell and not an interval."
+                  control={
+                    <NumberField
+                      label="Quiet for"
+                      /*
+                       * Seconds on the wire, minutes in the box. The file holds seconds because
+                       * every other duration in it does (`stopGraceSecs`), and the box holds
+                       * minutes because nobody means "nine hundred". `Math.round` on the way in
+                       * so a hand-written 90 seconds draws as 2 rather than as 1.5, which
+                       * `NumberField` would commit back as 1.
+                       */
+                      value={Math.round(config.autoSpinAfterSecs / 60)}
+                      min={1}
+                      max={1440}
+                      onChange={(next) =>
+                        patchConfig({ autoSpinAfterSecs: Math.round(next) * 60 })
+                      }
+                    />
+                  }
+                />
+                {/*
+                  * A `TextArea` and not a `TextField`, which reverses what M79 first shipped.
+                  *
+                  * The argument for one line was that the prompt is *typed at a terminal*, where
+                  * a newline is a second Enter — so a control that could not hold one was the
+                  * constraint expressed in the form. That reasoning was sound about the file and
+                  * wrong about the person: the default prompt is some five hundred characters,
+                  * and a 26px box is the wrong shape to read it in, let alone rewrite it.
+                  * Reported as exactly that.
+                  *
+                  * Nothing about the constraint moved, because it was never this control's to
+                  * keep: `AgentsConfig::apply` flattens the string before it reaches
+                  * `.cide/config.json`, which is why the flattening went *there* rather than at
+                  * the spawn. So the box can hold whatever somebody types, the file holds one
+                  * line, and the box shows that line back after the round trip — which is also
+                  * what makes the hint below true rather than a warning nobody can act on.
+                  */}
+                <TextArea
+                  label="What to tell it"
+                  hint={
+                    <>
+                      The new Claude’s first prompt. Empty uses cide’s own.
+                      <InfoTip label="About What to tell it">
+                        <InfoPara>
+                          cide’s own tells it to survey the board and the git log first, judge
+                          whether the work is going the right way, and only then assign.
+                        </InfoPara>
+                        <InfoPara>
+                          Line breaks become spaces when it is saved — it is typed into a terminal,
+                          where a newline would submit half a sentence.
+                        </InfoPara>
+                      </InfoTip>
+                    </>
+                  }
+                  value={config.autoSpinPrompt}
+                  placeholder="Use cide's own prompt"
+                  reset="Reset to cide's prompt"
+                  onCommit={(next) => patchConfig({ autoSpinPrompt: next })}
+                />
+              </>
+            )}
+          </Group>
+        </>
       )}
 
-      <Group title="Roles">
-        <div className={styles.split}>
-          <RoleList
-            rows={rows}
-            loading={entries === null}
-            selection={selection}
-            armedDelete={armedDelete}
-            busy={busy}
-            onEdit={open}
-            onArmDelete={setArmedDelete}
-            onDisarmDelete={() => setArmedDelete(null)}
-            onDelete={remove}
-          />
-          <div className={styles.listActions}>
-            <ActionButton label="New role" onClick={startNew} />
-          </div>
-        </div>
-        {rosterNote !== null && <Note title={rosterNote.title}>{rosterNote.body}</Note>}
-        {listError !== null && (
-          <Note title="The role list could not be read" tone="warn">
-            {listError}
-          </Note>
-        )}
-        {openError !== null && (
-          <Note title="That role could not be opened" tone="warn">
-            {openError}
-          </Note>
-        )}
-        {/*
-          * A Configure press whose role has no definition file this screen can read.
-          *
-          * Said rather than swallowed: `AgentDef.unavailable`'s doc makes the case one layer
-          * down — "we could not tell" and "it is not there" must stay distinguishable — and a
-          * Configure that opened the screen and then did nothing visible is exactly the silently
-          * inert control this project keeps a check script to prevent.
-          */}
-        {focusMiss !== null && (
-          <Note title={`No definition file for “${focusMiss}”`} tone="warn">
-            The roster lists this role, but neither <code>.cide/agents/{focusMiss}.md</code> nor
-            your global copy could be read just now — it may have been deleted, or it may be
-            declared somewhere other than a definition file. New role writes a fresh one.
-          </Note>
-        )}
-        {/* Where the last write landed. It sits with the list rather than in the dialog because
-            the dialog is gone by the time it is true: a save closes it. */}
-        {savedPath !== null && (
-          <>
-            <p className={styles.wrote}>Written. This role now lives in:</p>
-            <PathReadout path={savedPath} />
-          </>
-        )}
-      </Group>
+      {tab === 'roles' && (
+        <>
+          {/* What the roster said, when it said something other than "here are the roles", and
+              the reasons the list or a requested role could not be read: each is about the whole
+              list, so each is the tab's banner rather than a note under it. */}
+          {rosterNote !== null && (
+            <Banner tone="info">
+              <strong>{rosterNote.title}.</strong> {rosterNote.body}
+            </Banner>
+          )}
+          {listError !== null && (
+            <Banner tone="warn">
+              <strong>The role list could not be read.</strong> {listError}
+            </Banner>
+          )}
+          {openError !== null && (
+            <Banner tone="warn">
+              <strong>That role could not be opened.</strong> {openError}
+            </Banner>
+          )}
+          {/*
+            * A Configure press whose role has no definition file this screen can read.
+            *
+            * Said rather than swallowed: `AgentDef.unavailable`'s doc makes the case one layer
+            * down — "we could not tell" and "it is not there" must stay distinguishable — and a
+            * Configure that opened the screen and then did nothing visible is exactly the
+            * silently inert control this project keeps a check script to prevent.
+            */}
+          {focusMiss !== null && (
+            <Banner tone="warn">
+              <strong>No definition file for “{focusMiss}”.</strong> The roster lists this role,
+              but neither <code>.cide/agents/{focusMiss}.md</code> nor your global copy could be
+              read just now — it may have been deleted, or declared somewhere other than a
+              definition file. New role writes a fresh one.
+            </Banner>
+          )}
+          <Group
+            title="Roles"
+            info={
+              <>
+                <InfoPara>
+                  A role is a system prompt plus the switches a run is spawned with, stored as{' '}
+                  <code>&lt;name&gt;.md</code> — front matter and a body. Everything in this list
+                  writes that file.
+                </InfoPara>
+                <InfoPara>
+                  Nothing here is a cide setting, so none of it rides <code>workspace.json</code>{' '}
+                  and none of it follows you into another project unless you make it global.
+                </InfoPara>
+              </>
+            }
+          >
+            <div className={styles.split}>
+              <RoleList
+                rows={rows}
+                loading={entries === null}
+                selection={selection}
+                armedDelete={armedDelete}
+                busy={busy}
+                onEdit={open}
+                onArmDelete={setArmedDelete}
+                onDisarmDelete={() => setArmedDelete(null)}
+                onDelete={remove}
+              />
+              <div className={styles.listActions}>
+                <ActionButton label="New role" onClick={startNew} />
+              </div>
+            </div>
+            {/* Where the last write landed. It sits with the list rather than in the dialog
+                because the dialog is gone by the time it is true: a save closes it. */}
+            {savedPath !== null && (
+              <>
+                <p className={styles.wrote}>Written. This role now lives in:</p>
+                <PathReadout path={savedPath} />
+              </>
+            )}
+          </Group>
+        </>
+      )}
 
       {/*
-        * The local overrides, **after** the roles rather than beside the project's switches, and
-        * that order is the argument: an override redirects a role, so it can only be read once
-        * you know what the roles are. Its own group, too, because it means the opposite of
-        * `This project` above — that one writes `.cide/config.json`, which the repository will
-        * contain and a teammate will review; this writes the profile's own file, which nobody
-        * else ever sees.
+        * The local overrides, on a tab **after** the roles rather than beside the project's
+        * switches, and that order is the argument: an override redirects a role, so it can only
+        * be read once you know what the roles are. Its own tab, too, because it means the
+        * opposite of *This project* — that one writes `.cide/config.json`, which the repository
+        * will contain and a teammate will review; this writes the profile's own file, which
+        * nobody else ever sees. The group's (i) says "not committed" in as many words.
         */}
-      {overrides !== null && (
-        <Group title="Local overrides">
+      {tab === 'overrides' && overrideError !== null && (
+        <Banner tone="warn">
+          <strong>Those overrides could not be read or written.</strong> {overrideError}
+        </Banner>
+      )}
+      {tab === 'overrides' && overrides !== null && (
+        <Group
+          title="Local overrides"
+          info={
+            <>
+              <InfoPara>
+                Not committed. These redirect roles on <strong>this machine only</strong>. They
+                are stored in your profile’s <code>agent-overrides.json</code>, never in{' '}
+                <code>.cide/</code>, so a teammate cloning this repository gets each role’s
+                committed harness and never sees a pool they do not have.
+              </InfoPara>
+              <InfoPara>Pools themselves are defined on the Models screen in Settings.</InfoPara>
+            </>
+          }
+        >
           {profiles !== null && <OverrideProfileBar profiles={profiles} onOp={profileOp} />}
           <ProjectOverrideRows
             overrides={overrides}
@@ -1354,21 +1462,8 @@ function AgentsEditor({ project }: { project: ProjectId }) {
             pools={poolNames}
             onChange={writeOverrides}
           />
-          {overrideError !== null && (
-            <Note title="Those overrides could not be read or written" tone="warn">
-              {overrideError}
-            </Note>
-          )}
         </Group>
       )}
-
-      <Note title="A role is a file">
-        A role is a system prompt plus the switches a run is spawned with. It is stored as{' '}
-        <code>&lt;name&gt;.md</code> — front matter and a body — and everything in the list above
-        writes that file, as the row above it writes <code>.cide/config.json</code>. Nothing on
-        this screen is a cide setting, so none of it rides <code>workspace.json</code> and none of
-        it follows you into another project unless you make it global.
-      </Note>
 
       {/*
         * The dialog, written here and rendered into `document.body`.
@@ -1721,7 +1816,7 @@ function RoleDialog({
           <h2 className={styles.dialogTitle}>{creating ? 'New role' : title}</h2>
           <p className={styles.dialogSub}>
             {creating
-              ? 'A name, a system prompt, and the switches a run of this role is spawned with. Nothing is written until you press Create role.'
+              ? 'Nothing is written until you press Create role.'
               : 'Editing the definition file itself. Nothing is written until you press Save.'}
           </p>
         </div>
@@ -1743,6 +1838,9 @@ function RoleDialog({
         </div>
 
         <div className={styles.dialogFoot}>
+          {/* The kit's `Note`, kept on purpose after M133 moved Settings' notes onto rows and
+              banners: these sit in the dialog's foot beside the button that failed, and are the
+              reason nothing was written — the one place a boxed, toned sentence is the answer. */}
           {saveError !== null && (
             <Note title="Nothing was written" tone="warn">
               {saveError}
@@ -1837,6 +1935,7 @@ function RoleForm({
         <Field
           label="Scope"
           hint={scopeHint(draft.scope)}
+          status={moveWarning}
           errors={errorsFor('scope')}
           control={
             <Choice
@@ -1866,18 +1965,18 @@ function RoleForm({
             />
           }
         />
-        {moveWarning !== null && (
-          <Note title="This save moves a file" tone="warn">
-            {moveWarning}
-          </Note>
-        )}
 
         <Field
           label="Name"
           hint={
             isClaudeScope(draft.scope)
-              ? 'Lowercase letters, digits and “-”. Claude Code keys the subagent by this value and the file it lives in may be called anything, so changing it edits the key rather than renaming the file.'
-              : '1–32 characters of a–z, 0–9 and “-”. It is the file name and the word the orchestrator asks for this role by, so changing it renames the file.'
+              ? 'Lowercase letters, digits and “-”. Changing it edits the key, not the file name.'
+              : '1–32 characters of a–z, 0–9 and “-”. Changing it renames the file.'
+          }
+          info={
+            isClaudeScope(draft.scope)
+              ? 'Claude Code keys the subagent by this value, and the file it lives in may be called anything.'
+              : 'It is the file name and the word the orchestrator asks for this role by.'
           }
           errors={errorsFor('name')}
           control={
@@ -1898,7 +1997,8 @@ function RoleForm({
 
         <Field
           label="Label"
-          hint="What the roster row says. Left empty, the name is title-cased — which is right for “code-reviewer” and wrong for “qa”."
+          hint="What the roster row says. Empty title-cases the name."
+          info="Title-casing is right for “code-reviewer” and wrong for “qa”."
           errors={errorsFor('label')}
           control={
             <input
@@ -1933,7 +2033,19 @@ function RoleForm({
           */}
         <Field
           label="Colour"
-          hint="What marks this role's name in the Agents panel, on a task's chip and above its comments. Automatic derives one from the role's name — stable, the same for everybody, and never the colour reserved for the orchestrator. Stored as Claude Code's own `color:` key, so a subagent that already has one arrives with it set."
+          hint="Marks this role's name in the Agents panel, on task chips and comments."
+          info={
+            <>
+              <InfoPara>
+                Automatic derives one from the role's name — stable, the same for everybody, and
+                never the colour reserved for the orchestrator.
+              </InfoPara>
+              <InfoPara>
+                Stored as Claude Code's own <code>color:</code> key, so a subagent that already
+                has one arrives with it set.
+              </InfoPara>
+            </>
+          }
           errors={errorsFor('extras')}
           control={
             <ColorChoice
@@ -1956,7 +2068,14 @@ function RoleForm({
         {!isClaudeScope(draft.scope) && (
           <Field
             label="Harness"
-            hint="Which CLI runs this role. Left as the project default, the role follows .cide/config.json — which is a different state from naming the same harness here, because the default can change underneath a role that never named one."
+            hint="Which CLI runs this role."
+            info={
+              <>
+                Left as the project default, the role follows <code>.cide/config.json</code> —
+                a different state from naming the same harness here, because the default can
+                change underneath a role that never named one.
+              </>
+            }
             errors={errorsFor('harness')}
             control={
               <Choice
@@ -1976,7 +2095,8 @@ function RoleForm({
 
         <Field
           label="Description"
-          hint="Prompt text as much as UI text: the orchestrator is handed it verbatim when it asks what agents it has, and the Agents panel shows it when you hover the role. Saved as one line — line breaks become spaces. Empty is legal and warned about, never refused."
+          hint="What the orchestrator is told this role does. Saved as one line."
+          info="Prompt text as much as UI text: the orchestrator is handed it verbatim when it asks what agents it has, and the Agents panel shows it when you hover the role. Line breaks become spaces. Empty is legal and warned about, never refused."
           errors={errorsFor('description')}
           control={
             /* A textarea that wraps, not a one-line input (M89): a useful description is a
@@ -2003,7 +2123,8 @@ function RoleForm({
             text editor, which is what the user was objecting to. */}
         <Field
           label="Prompt"
-          hint="The body of the .md file, verbatim. Markdown; every run of this role starts with it as its system prompt."
+          hint="The body of the .md file, verbatim: every run of this role starts with it."
+          info="Markdown. It is the role's system prompt, as written."
           errors={errorsFor('systemPrompt')}
           control={
             <textarea
@@ -2022,7 +2143,9 @@ function RoleForm({
       <Group title="How a run is spawned">
         <Field
           label="Model"
-          hint={modelHint(modelHarness, models)}
+          hint="Empty means the harness’s own default."
+          info={modelHint(modelHarness)}
+          status={modelProblem(modelHarness, models)}
           errors={errorsFor('model')}
           control={
             <ModelField
@@ -2041,7 +2164,8 @@ function RoleForm({
             values are one click and anything else is still typable. */}
         <Field
           label="Effort"
-          hint="A harness-specific reasoning knob, passed through as written. cide checks it against nothing, so a value a newer CLI added works here today."
+          hint="A harness-specific reasoning knob, passed through as written."
+          info="cide checks it against nothing, so a value a newer CLI added works here today."
           errors={errorsFor('effort')}
           control={
             <Suggest
@@ -2056,7 +2180,8 @@ function RoleForm({
 
         <Field
           label="Permission mode"
-          hint="The CLI's own vocabulary, and cide's copy of it is allowed to go stale. If a release has added a mode this list does not have, leave it unset rather than guessing."
+          hint="The CLI's own vocabulary. Unset lets the harness decide."
+          info="cide's copy of the vocabulary is allowed to go stale. If a release has added a mode this list does not have, leave it unset rather than guessing."
           errors={errorsFor('permissionMode')}
           control={
             <Choice
@@ -2073,7 +2198,19 @@ function RoleForm({
 
         <Field
           label="Tools"
-          hint="--allowedTools. Empty does not mean “no tools”: it means the definition does not restrict them, which is the harness's default. Names look like Read, Bash or mcp__server__tool; one per row, because a name containing a comma or a space is read as two."
+          hint="--allowedTools, one per row. Empty means unrestricted, not “no tools”."
+          info={
+            <>
+              <InfoPara>
+                Empty means the definition does not restrict them, which is the harness's default.
+              </InfoPara>
+              <InfoPara>
+                Names look like <code>Read</code>, <code>Bash</code> or{' '}
+                <code>mcp__server__tool</code>; one per row, because a name containing a comma or
+                a space is read as two.
+              </InfoPara>
+            </>
+          }
           errors={errorsFor('tools')}
           control={
             <ToolRows
@@ -2085,7 +2222,8 @@ function RoleForm({
 
         <Field
           label="Max concurrent"
-          hint="How many runs of this role may be live at once. Empty means the file does not say, which the loader reads as 1 — and writing 1 into every definition would freeze a default a later cide may want to change. Worktree isolation pins it to 1 anyway."
+          hint="Runs of this role live at once. Empty reads as 1."
+          info="Empty means the file does not say, which the loader reads as 1 — and writing 1 into every definition would freeze a default a later cide may want to change. Worktree isolation pins it to 1 anyway."
           errors={errorsFor('maxConcurrent')}
           control={
             <input
@@ -2120,7 +2258,24 @@ function RoleForm({
           <>
             <Field
               label="Allowed commands"
-              hint="Command prefixes this role runs without being asked, as typed: blender -b, tools/ci/runners/e2e.sh. On codex a command that is wholly one of these runs outside the sandbox — so the run must call it directly, not under timeout, in a pipe or inside sh -c. On claude they join --allowedTools as Bash(<prefix>:*). Shells, launchers (env, timeout, sudo) and shell metacharacters are refused: they would allow everything."
+              hint="Command prefixes this role runs without being asked, as typed."
+              info={
+                <>
+                  <InfoPara>
+                    For example <code>blender -b</code>, <code>tools/ci/runners/e2e.sh</code>.
+                  </InfoPara>
+                  <InfoPara>
+                    On codex a command that is wholly one of these runs outside the sandbox — so
+                    the run must call it directly, not under <code>timeout</code>, in a pipe or
+                    inside <code>sh -c</code>. On claude they join <code>--allowedTools</code> as{' '}
+                    <code>Bash(&lt;prefix&gt;:*)</code>.
+                  </InfoPara>
+                  <InfoPara>
+                    Shells, launchers (<code>env</code>, <code>timeout</code>, <code>sudo</code>)
+                    and shell metacharacters are refused: they would allow everything.
+                  </InfoPara>
+                </>
+              }
               errors={errorsFor('allowCommands')}
               control={
                 <LineRows
@@ -2132,7 +2287,8 @@ function RoleForm({
             />
             <Field
               label="Needs"
-              hint="What the work needs from a sandbox. On codex any of these turns the sandbox's network on: with it off, codex refuses unix sockets, so an X server cannot listen and Blender hangs on PulseAudio."
+              hint="What the work needs from a sandbox."
+              info="On codex any of these turns the sandbox's network on: with it off, codex refuses unix sockets, so an X server cannot listen and Blender hangs on PulseAudio."
               errors={errorsFor('needs')}
               control={
                 <div className={styles.tools}>
@@ -2158,7 +2314,8 @@ function RoleForm({
             />
             <Field
               label="Writable directories"
-              hint="Directories outside the worktree this role may write — a cache, an asset store — absolute or ~/…. The worktree itself is already writable. Added to codex's sandbox as writable roots."
+              hint="Directories outside the worktree this role may write, absolute or ~/…."
+              info="A cache, an asset store. The worktree itself is already writable. Added to codex's sandbox as writable roots."
               errors={errorsFor('writableDirs')}
               control={
                 <LineRows
@@ -2191,8 +2348,13 @@ function RoleForm({
           label="Meta"
           hint={
             isClaudeScope(draft.scope)
-              ? 'Keys cide does not model — hooks, skills, mcpServers, maxTurns and anything a Claude Code release adds. cide reads none of them and writes all of them back exactly as they are, so editing a description here cannot delete them. A value may span several lines; keep a block’s indentation.'
-              : 'Keys cide does not read. They are kept in the file rather than dropped by a save, and the roster reports each one against its own line — so an entry here is either a typo to fix or a key written for a newer cide.'
+              ? 'Keys cide does not model — hooks, skills, mcpServers, maxTurns — kept as written.'
+              : 'Keys cide does not read, kept in the file rather than dropped by a save.'
+          }
+          info={
+            isClaudeScope(draft.scope)
+              ? 'cide reads none of them — nor anything a Claude Code release adds — and writes all of them back exactly as they are, so editing a description here cannot delete them. A value may span several lines; keep a block’s indentation.'
+              : 'The roster reports each one against its own line, so an entry here is either a typo to fix or a key written for a newer cide.'
           }
           errors={errorsFor('extras')}
           control={
@@ -2276,20 +2438,20 @@ function ColorChoice({
         * A value the file asked for that this build cannot use. Named in full, because the
         * *point* of the sentence is that the user can see the word they typed and correct it —
         * "not a colour cide knows" without the word would send them back to the file to find out
-        * which line it meant. It is a `Note` and not a refusal: the role runs, and it is drawn
-        * in the colour its name derives, which is the same thing that would happen if the key
-        * were absent. Nothing here rewrites it; choosing a swatch is what replaces it.
+        * which line it meant. It is a warning on the field and not a refusal: the role runs, and
+        * it is drawn in the colour its name derives, which is the same thing that would happen if
+        * the key were absent. Nothing here rewrites it; choosing a swatch is what replaces it.
+        *
+        * Drawn as the field's status line (M133) rather than a boxed note under the swatches:
+        * it is about this control, and a toned box read as a problem with the whole dialog.
         */}
       {unknown !== null && (
-        /* The hook goes on a wrapper, not on `Note`. TypeScript lets a hyphenated attribute
-           through on any component — `data-*` is exempt from JSX excess-property checking — but
-           `Note` does not spread its props, so it would be accepted here, dropped there, and the
-           render check would look for an element that never existed. */
-        <div data-audit="agentColorUnknown">
-          <Note tone="warn">
-            <code>{unknown}</code> is not one of the eight, so this role is drawn in the colour
-            its name derives. The key is kept exactly as the file has it until you choose above.
-          </Note>
+        <div className={styles.fieldStatus} data-audit="agentColorUnknown">
+          <Icon name="triangle-alert" size={1} />
+          <span>
+            <code>{unknown}</code> is not one of the eight, so this role is drawn in the colour its
+            name derives. The key is kept as the file has it until you choose above.
+          </span>
         </div>
       )}
     </div>
@@ -2379,19 +2541,39 @@ function ExtraRows({
 function Field({
   label,
   hint,
+  info,
+  status,
   control,
   errors,
 }: {
   label: string
+  /** One line (M133). The rest goes in `info`. */
   hint: string
+  /** The full explanation, behind an (i) after the label. */
+  info?: ReactNode
+  /**
+   * Something about this field's state that is not a refusal — a save that will move the file.
+   * Drawn on the field it is about, in the warn tone, where it was a note the user had to tie
+   * to a field by position.
+   */
+  status?: string | null | undefined
   control: ReactNode
   errors: readonly string[]
 }) {
   return (
     <div className={styles.field}>
-      <div className={styles.fieldLabel}>{label}</div>
+      <div className={styles.fieldLabel}>
+        {label}
+        {info !== undefined && <InfoTip label={`About ${label}`}>{info}</InfoTip>}
+      </div>
       {control}
       <div className={styles.fieldHint}>{hint}</div>
+      {status != null && (
+        <div className={styles.fieldStatus}>
+          <Icon name="triangle-alert" size={1} />
+          <span>{status}</span>
+        </div>
+      )}
       {errors.map((message) => (
         // `role="alert"`, unlike `ClaudeCliSection`'s quiet `note`: this one is the answer to a
         // button the user just pressed, and it is the reason nothing was written.
@@ -2459,7 +2641,7 @@ function Choice({
  * # The two things drawn here that are not the value
  *
  * `problem` is a fact about the **machine** — `opencode` not on `PATH`, a probe that timed out —
- * so it is a hint and never an error: nothing the user typed caused it, nothing they can type in
+ * so it is the field's status (M133; it was appended to the hint) and never an error: nothing the user typed caused it, nothing they can type in
  * this form fixes it, and the box below stays editable throughout. And the answer is used only
  * when `answer.harness` matches the harness being asked about, because a probe in flight while
  * somebody flips the Harness dropdown would otherwise paint one CLI's ids under the other's name.
@@ -2517,8 +2699,11 @@ function ModelField({
   )
 }
 
-/** The sentence under the Model box, which changes with the harness and with what a probe said. */
-function modelHint(harness: HarnessName, answer: AgentModels | null): string {
+/**
+ * The Model field's (i), which changes with the harness. What a probe said is not in it: that is
+ * the field's `status` ([`modelProblem`]), since M133 moved a field's troubles onto the field.
+ */
+function modelHint(harness: HarnessName): string {
   const base =
     harness === 'opencode' || harness === 'mimo'
       ? `An id in ${harness}’s own spelling, provider/model. The menu is what \`${harness} models\` ` +
@@ -2528,10 +2713,18 @@ function modelHint(harness: HarnessName, answer: AgentModels | null): string {
           'this machine; a slug the catalog hides can still be typed.'
         : 'An alias or a full model name. The menu is the aliases this build knows; a newer one ' +
           'can still be typed.'
-  const problem = answer !== null && answer.harness === harness ? answer.problem : null
-  // Appended rather than replacing: the field is still usable and the sentence saying how to use
-  // it is still true. Only the menu is missing.
-  return problem === null ? `${base} Empty means the harness’s own default.` : `${base} ${problem}`
+  return base
+}
+
+/**
+ * What the model probe could not do on this machine, as the Model field's status — or nothing.
+ *
+ * A status and never an error: nothing the user typed caused it, nothing they can type in this
+ * form fixes it, and the box stays editable throughout. Only the menu is missing. The answer is
+ * used only when it is for the harness being asked about — see `ModelField`'s header.
+ */
+function modelProblem(harness: HarnessName, answer: AgentModels | null): string | null {
+  return answer !== null && answer.harness === harness ? answer.problem : null
 }
 
 /**
@@ -2727,14 +2920,7 @@ function ProjectOverrideRows({
 
   return (
     <>
-      <Note title="Not committed">
-        These redirect roles on <strong>this machine only</strong>. They are stored in your
-        profile&rsquo;s <code>agent-overrides.json</code>, never in <code>.cide/</code>, so a
-        teammate cloning this repository gets each role&rsquo;s committed harness and never sees a
-        pool they do not have. Pools themselves are defined on the Models screen in Settings.
-        {poolList.length === 0 && ' You have not defined any pool yet.'}
-      </Note>
-
+      {/* "Not committed" is the group's (i) since M133 — it is about every row here. */}
       {hasAll && (
         <OverrideFields
           title="Every role in this project"
@@ -2894,8 +3080,8 @@ function OverrideProfileBar({
       </div>
       <p className={styles.overrideNote}>
         {active === null
-          ? 'Save the rows below as a profile to switch the whole set in one step — say, off a provider that is out of quota and back.'
-          : `Edits below save into “${active}”. Switching changes queued runs and runs resumed later; a run already working keeps what it started with.`}
+          ? 'Save the rows below as a profile to switch the whole set in one step.'
+          : `Edits below save into “${active}”. A switch reaches queued and resumed runs, not working ones.`}
       </p>
     </>
   )
@@ -2990,7 +3176,7 @@ function OverrideFields({
 
       <SettingRow
         label="Harness"
-        hint="Which CLI runs this here. “Leave as committed” keeps whatever the role file says."
+        hint="Which CLI runs this here. “Leave as committed” keeps the role file’s."
         control={
           <Select
             label="Harness"
@@ -3014,12 +3200,18 @@ function OverrideFields({
       <SettingRow
         label="Model choice"
         hint={
+          poolable || inertPool
+            ? 'A pool falls down its list; a single model does not.'
+            : 'Pick opencode or mimo as the harness to use a pool.'
+        }
+        info="A pool falls down its list when a provider rate-limits, cannot be reached, or refuses the credential. A single model does not. Only opencode runs use either."
+        status={
           inertPool
-            ? 'Ignored: only opencode and mimo runs use a pool. Pick one of them as the harness, ' +
-              'or choose something else here.'
-            : 'A pool falls down its list when a provider rate-limits, cannot be reached, or ' +
-              'refuses the credential. A single model does not. Only opencode runs use either.' +
-              (poolable ? '' : ' Pick opencode or mimo as the harness to use a pool.')
+            ? {
+                tone: 'warn',
+                text: 'Ignored: only opencode and mimo runs use a pool. Pick one of them as the harness, or choose something else.',
+              }
+            : undefined
         }
         control={
           <Select
@@ -3087,11 +3279,19 @@ function OverrideFields({
 
       <SettingRow
         label="Permission mode"
-        hint={
-          'How runs answer permission prompts here. Beats the role file and the project default ' +
-          '(auto). auto lets Claude’s classifier approve on your behalf; bypassPermissions lets a ' +
-          'run do anything without asking. codex and qwen map each word onto their own modes ' +
-          '(codex has nobody to ask, so it refuses manual), and opencode ignores it.'
+        hint="How runs answer permission prompts here. Beats the role file."
+        info={
+          <>
+            <InfoPara>
+              Beats the role file and the project default (<code>auto</code>). <code>auto</code>{' '}
+              lets Claude’s classifier approve on your behalf; <code>bypassPermissions</code> lets
+              a run do anything without asking.
+            </InfoPara>
+            <InfoPara>
+              codex and qwen map each word onto their own modes (codex has nobody to ask, so it
+              refuses <code>manual</code>), and opencode ignores it.
+            </InfoPara>
+          </>
         }
         control={
           <Select
@@ -3110,7 +3310,8 @@ function OverrideFields({
 
       <SettingRow
         label="Concurrent runs of this role"
-        hint="0 leaves the role's own max-concurrent alone. Useful for more parallelism against a local model that costs nothing."
+        hint="0 leaves the role's own max-concurrent alone."
+        info="Useful for more parallelism against a local model that costs nothing."
         control={
           <NumberField
             label="Concurrent runs of this role"

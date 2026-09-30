@@ -1,7 +1,16 @@
 import { GitLabSettings } from '@/gitlab/GitLabSettings'
 /**
- * The sections of the Settings tab, in `SettingsSection`'s order — which is the mock's for the
- * seven it drew, plus the ones later milestones added.
+ * The sections of the Settings tab, grouped for the nav (see [`SECTIONS`]).
+ *
+ * # How a row talks (M133)
+ *
+ * The screen was reported hard to read: every row said everything it knew under its label, and
+ * the blue and amber notes between rows could not be tied to any one of them. So a row has one
+ * line of hint (≤ 90 characters, `check:settings-copy`), and the rest is `info`, behind an (i)
+ * after the label. What the whole group is about is its caption's `info`; a problem with one
+ * setting's current state is that row's `status`; a problem that makes the page moot is
+ * [`sectionBanner`]. A row bound to a `Settings` field spreads `resetTo(value, default, set)` for
+ * its changed-from-default dot and Reset.
  *
  * Most sections are a pure function of the settings they render plus a `patch` callback:
  * `SettingsTab` does the wiring, which is what lets the whole screen be driven from a fixture and
@@ -44,14 +53,16 @@ import {
   Group,
   InlineControls,
   NumberField,
-  Note,
-  Part,
   PathReadout,
   Readout,
   Row,
   Segmented,
   ToggleRow,
+  resetTo,
+  useSettingsDefaults,
 } from './controls'
+import { Banner } from '@/kit/components/Feedback'
+import { InfoPara } from '@/kit/components/InfoTip'
 import { AgentsSection } from './AgentsSection'
 import { ExtensionSettings } from './ExtensionSettings'
 import { FormattersSection } from './FormattersSection'
@@ -73,87 +84,164 @@ import { ProxySection } from './ProxySection'
 import { RemoteSection } from './RemoteSection'
 import { WindowModeCards } from './WindowModeCards'
 
-/** Nav order and headings. The order is the mock's and is not alphabetical. */
-export const SECTIONS: readonly { id: SettingsSection; title: string; description: string }[] = [
+/** The nav's four groups, in order. (M133) */
+export const SECTION_GROUPS: readonly { id: SectionGroup; title: string }[] = [
+  { id: 'general', title: 'General' },
+  { id: 'editing', title: 'Editing' },
+  { id: 'ai', title: 'AI' },
+  { id: 'tools', title: 'Tools' },
+]
+
+export type SectionGroup = 'general' | 'editing' | 'ai' | 'tools'
+
+export interface SectionMeta {
+  id: SettingsSection
+  group: SectionGroup
+  title: string
+  /** One line under the title. */
+  description: string
+  /** What the page is, when a line was not enough — behind the title's (i). */
+  about?: ReactNode
+}
+
+/**
+ * Nav order and headings.
+ *
+ * **Not** `SettingsSection`'s order, since M133, and this comment used to claim it was while the
+ * array had already drifted from it (Models and Agents sat before Extensions here, after it in
+ * the enum). The nav is grouped now — General, Editing, AI, Tools — because thirteen rows with
+ * no structure were one of the things the user reported as making the screen hard to find
+ * anything on; the enum's ids are API and keep their order, this array decides what is drawn.
+ * `check:settings-copy` holds every id to exactly one group.
+ */
+export const SECTIONS: readonly SectionMeta[] = [
   {
     id: 'appearance',
+    group: 'general',
     title: 'Appearance',
-    description: 'Theme, and the Linux rendering workarounds this machine may need.',
+    description: 'Theme, colours, sizes, and the rendering workarounds a machine may need.',
   },
   {
     id: 'projectsAndWindows',
+    group: 'general',
     title: 'Projects & windows',
-    description: 'How projects are laid out across windows, and what happens when one closes.',
+    description: 'How projects are laid out across windows, and what closing one does.',
   },
   {
     id: 'keymap',
+    group: 'general',
     title: 'Keymap',
-    description:
-      'Defaults are compiled in; your overrides layer on top. Conflicts are reported, never resolved for you.',
+    description: 'Your overrides on top of the built-in shortcuts.',
+    about: 'Defaults are compiled in; your overrides layer on top. Conflicts are reported, never resolved for you.',
+  },
+  {
+    id: 'editor',
+    group: 'editing',
+    title: 'Editor',
+    description: 'Indentation, completion, saving and formatters for the code buffer.',
+  },
+  {
+    id: 'files',
+    group: 'editing',
+    title: 'Files',
+    description: 'What the project tree walks — and so what it draws and Ctrl+P finds.',
+  },
+  {
+    id: 'inspections',
+    group: 'editing',
+    title: 'Inspections',
+    description: 'Which analysers run, and which of their findings you see.',
   },
   {
     // The id is API and keeps its M16 spelling; the section has been about more than claude
     // since M93, when codex became a console too.
     id: 'claudeSessions',
+    group: 'ai',
     title: 'Harness',
-    description:
-      'Which CLI a console runs — Claude Code or Codex — and how each is launched: the binary, its arguments and environment.',
-  },
-  { id: 'editor', title: 'Editor', description: 'The code buffer.' },
-  {
-    id: 'files',
-    title: 'Files',
-    description: 'What the project tree walks, and therefore what it draws and what Ctrl+P finds.',
-  },
-  {
-    id: 'inspections',
-    title: 'Inspections',
-    description: 'Which analysers run, and which of their findings you see.',
+    description: 'Which CLI a console runs, and how it is launched.',
+    about: 'Claude Code or Codex: the binary, its arguments and environment, and the proxy every child process gets.',
   },
   {
     id: 'models',
+    group: 'ai',
     title: 'Models',
-    description:
-      'The providers your agents may reach, and the ordered pools a run falls down. Only opencode runs use them.',
+    description: 'Providers and the ordered model pools opencode runs fall down.',
+    about: 'The providers your agents may reach, and the ordered pools a run falls down when a model is busy or failing. Only opencode runs use them.',
   },
   {
-    // Between Inspections and Git because that is where `SettingsSection::Agents` sits in the
-    // Rust enum, and the nav is that enum's order. It is also the honest place for it: it is
-    // not a page of settings at all — nothing here rides `SettingsPatch` or `workspace.json` —
+    // Not a page of settings at all — nothing here rides `SettingsPatch` or `workspace.json` —
     // it is an editor for `.cide/agents/*.md` and their global twins, reached through the
     // Settings shell because that is where a person looks for *configure the thing*. The
-    // description says so, because a section under Settings that writes files a `git status`
-    // will show is not what the eight rows around it are.
+    // `about` says so, because a section under Settings that writes files a `git status` will
+    // show is not what the pages around it are.
     id: 'agents',
+    group: 'ai',
     title: 'Agents',
-    description:
-      'This project’s switches — the task tracker and milestones, how many runs at once — and the subagent roles this project and you define. Each one is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
-  },
-  {
-    // Between Inspections and Agents, which is where `SettingsSection::Extensions` sits in the
-    // Rust enum, and the nav is that enum's order. Like `agents` below, and unlike the eight
-    // around them, none of these rows is a cide setting: they are declared by third-party
-    // manifests and stored in `extensions.json`. The description says so.
-    id: 'extensions',
-    title: 'Extensions',
-    description:
-      'Settings the installed extensions declare. Each one belongs to the extension that declared it and is stored with your extension list, not with your cide preferences — so it follows you between projects and disappears if you remove the extension.',
+    description: 'This project’s tracker switches, and the roles its runs are spawned as.',
+    about: 'Each role is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
   },
   {
     id: 'git',
+    group: 'tools',
     title: 'Git',
-    description: 'What Update project does when your branch has diverged, and how conflicts open.',
+    description: 'GitLab, what Update project does on a diverged branch, and conflicts.',
   },
-  { id: 'terminal', title: 'Terminal', description: 'Every pane running a shell or a TUI.' },
+  {
+    id: 'terminal',
+    group: 'tools',
+    title: 'Terminal',
+    description: 'Every pane running a shell or a TUI.',
+  },
+  {
+    // Like `agents`, none of these rows is a cide setting: they are declared by third-party
+    // manifests and stored in `extensions.json`. The `about` says so.
+    id: 'extensions',
+    group: 'tools',
+    title: 'Extensions',
+    description: 'Settings the installed extensions declare.',
+    about: 'Each belongs to the extension that declared it and is stored with your extension list, not your cide preferences — so it follows you between projects and goes if you remove the extension.',
+  },
   {
     id: 'remote',
+    group: 'tools',
     title: 'Remote access',
     description: 'Whether a phone may reach this cide, and which devices have.',
   },
 ]
 
+/**
+ * The pages long enough to be split into tabs. (M133)
+ *
+ * The tab is screen state, not a setting: it lives in `SettingsTab` for as long as the tab is
+ * open and is not persisted, so a relaunch lands on a page's first tab. Search sets it when the
+ * row it found is on another one.
+ */
+export const SECTION_TABS: Partial<Record<SettingsSection, readonly { value: string; label: string }[]>> = {
+  claudeSessions: [
+    { value: 'console', label: 'Console' },
+    { value: 'launch', label: 'Launch' },
+    { value: 'proxy', label: 'Proxy' },
+  ],
+  agents: [
+    { value: 'project', label: 'This project' },
+    { value: 'roles', label: 'Roles' },
+    { value: 'overrides', label: 'Local overrides' },
+    { value: 'spawn', label: 'Review & wake' },
+  ],
+}
+
 export interface SectionProps {
   settings: Settings
+  /**
+   * The page's current tab, for a page in [`SECTION_TABS`]; the first tab's value otherwise
+   * (and `''` for a page with none).
+   */
+  tab: string
+  /**
+   * Switch this page's tab — for a page that is sent somewhere from outside: Agents → Configure
+   * on a role has to land on the Roles tab, whatever tab the page was left on.
+   */
+  setTab: (next: string) => void
   patch: (patch: SettingsPatch) => void
   setTheme: (theme: Theme) => void
   setWindowMode: (mode: WindowMode) => void
@@ -208,15 +296,18 @@ const RENDERERS: readonly { value: TerminalRenderer; label: string }[] = [
 ]
 
 function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: SectionProps) {
+  const def = useSettingsDefaults()
   return (
     <>
       <Group>
         <Row
           label="Theme"
+          hint="Applies at once, live terminals included."
           // Worth saying out loud now that it is true: the header's toggle and this control
           // are the same write. They used not to be, and the header's one reached neither
           // this screen nor a second window nor the next launch.
-          hint="Every colour in the app comes from a token, so live terminals repaint with it — no restart, no reload. The titlebar’s toggle sets the same setting."
+          info="Every colour in the app comes from a token, so live terminals repaint with it — no restart, no reload. The titlebar’s toggle sets the same setting."
+          {...resetTo(settings.theme, def?.theme, setTheme)}
           control={
             <Segmented label="Theme" value={settings.theme} options={THEMES} onChange={setTheme} />
           }
@@ -231,9 +322,11 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
         <AccentRow accent={settings.accent} />
         <Row
           label="UI font size"
+          hint="Everything but the editor and the terminal."
           // Named for what it excludes, because the screen already carries two other font
-          // sizes and "which one moves the file tree?" is the question this hint answers.
-          hint="Everything except the editor and the terminal — the file tree, the git panel, Problems, the log, tabs, menus and this screen. The two settings below stay where you put them."
+          // sizes and "which one moves the file tree?" is the question this answers.
+          info="The file tree, the git panel, Problems, the log, tabs, menus and this screen. The editor’s and the terminal’s font sizes stay where you put them."
+          {...resetTo(settings.uiFontSize, def?.uiFontSize, (uiFontSize) => patch({ uiFontSize }))}
           control={
             <NumberField
               label="UI font size"
@@ -271,7 +364,8 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
             why, where a disabled button would say nothing. */}
         <Row
           label="Version"
-          hint="This build of cide. A -dev suffix is a tree built by run.sh, not a release, and never checks for updates."
+          hint="This build of cide."
+          info="A -dev suffix is a tree built by run.sh, not a release, and never checks for updates."
           control={
             <InlineControls>
               <Readout text={version === null ? '…' : `cide ${version}`} />
@@ -286,7 +380,8 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
         />
         <Row
           label="Log directory"
-          hint="Where the app writes its own log. Opens in your file manager; the path is shown below either way."
+          hint="Where cide writes its own log."
+          info="Opens in your file manager; the path is shown under the row either way, for a machine where no file manager answers."
           control={<ActionButton label="Open" onClick={openLogDir} />}
         />
         {logDir !== null && <PathReadout path={logDir} />}
@@ -296,81 +391,109 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
 }
 
 function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
+  const def = useSettingsDefaults()
   return (
     <>
       <WindowModeCards value={settings.windowMode} onChange={setWindowMode} />
 
-      <ToggleRow
-        label="Each project keeps its own Claude tab"
-        hint="Pinned, cannot be closed — only its panes can."
-        checked={settings.eachProjectKeepsClaudeTab}
-        // Disabled rather than hidden. The mock draws the toggle, and the rest of the model
-        // does not currently allow a project without a console tab: `tabs[0]` being the
-        // pinned Claude tab is an invariant `cide-core::workspace::validate` enforces. A
-        // switch that moved and then sprang back would be worse than one that says why.
-        disabled
-        onChange={(v) => patch({ eachProjectKeepsClaudeTab: v })}
-      />
-      <ToggleRow
-        label="Reopen the last project on launch"
-        hint="Restores its tab strip and pane layout."
-        checked={settings.reopenLastProject}
-        onChange={(v) => patch({ reopenLastProject: v })}
-      />
-      {/* Here beside *Reopen the last project*: both are about what a launch does. The patch
-          sends the whole `update` group, `SettingsPatch`'s per-group rule. */}
-      <ToggleRow
-        label="Check for updates on start"
-        hint="Asks GitHub for a newer release a few seconds after launch, and offers to install it. Development builds never check."
-        checked={settings.update.checkOnStart}
-        onChange={(v) => patch({ update: { ...settings.update, checkOnStart: v } })}
-      />
-      {settings.update.skippedVersion !== null && (
+      <Group title="Projects">
+        <ToggleRow
+          label="Each project keeps its own Claude tab"
+          hint="Pinned, cannot be closed — only its panes can."
+          checked={settings.eachProjectKeepsClaudeTab}
+          // Disabled rather than hidden. The mock draws the toggle, and the rest of the model
+          // does not currently allow a project without a console tab: `tabs[0]` being the
+          // pinned Claude tab is an invariant `cide-core::workspace::validate` enforces. A
+          // switch that moved and then sprang back would be worse than one that says why.
+          disabled
+          onChange={(v) => patch({ eachProjectKeepsClaudeTab: v })}
+        />
+        <ToggleRow
+          label="Reopen the last project on launch"
+          hint="Restores its tab strip and pane layout."
+          {...resetTo(settings.reopenLastProject, def?.reopenLastProject, (v) =>
+            patch({ reopenLastProject: v }),
+          )}
+          checked={settings.reopenLastProject}
+          onChange={(v) => patch({ reopenLastProject: v })}
+        />
+        {/* Here beside *Reopen the last project*: both are about what a launch does. The patch
+            sends the whole `update` group, `SettingsPatch`'s per-group rule. */}
+        <ToggleRow
+          label="Check for updates on start"
+          hint="Offers a newer release a few seconds after launch."
+          info="Asks GitHub for a newer release a few seconds after launch, and offers to install it. Development builds never check."
+          {...resetTo(settings.update.checkOnStart, def?.update.checkOnStart, (v) =>
+            patch({ update: { ...settings.update, checkOnStart: v } }),
+          )}
+          checked={settings.update.checkOnStart}
+          onChange={(v) => patch({ update: { ...settings.update, checkOnStart: v } })}
+        />
+        {settings.update.skippedVersion !== null && (
+          <Row
+            label={`Skipping cide ${settings.update.skippedVersion}`}
+            anchor="Skipping a version"
+            hint="You chose Skip this version. Newer releases are still offered."
+            control={
+              <ActionButton
+                label="Offer it again"
+                onClick={() => patch({ update: { ...settings.update, skippedVersion: null } })}
+              />
+            }
+          />
+        )}
+      </Group>
+
+      <Group title="Closing">
+        <ToggleRow
+          // The mock says "Keep a project running when its window is closed — live Claude
+          // sessions survive in the background". That is a promise cide does not keep: there
+          // is no background daemon, and quitting the app quits its sessions. Reworded so the
+          // toggle means what it does — the window-close case, and nothing about quitting.
+          label="Keep sessions running when a project window is closed"
+          hint="Sessions still end when cide quits."
+          info="The workspace is restored on relaunch and conversations resume."
+          {...resetTo(settings.keepSessionsOnWindowClose, def?.keepSessionsOnWindowClose, (v) =>
+            patch({ keepSessionsOnWindowClose: v }),
+          )}
+          checked={settings.keepSessionsOnWindowClose}
+          onChange={(v) => patch({ keepSessionsOnWindowClose: v })}
+        />
+        <ToggleRow
+          // The info's second sentence is not decoration. This toggle governs *sessions* only:
+          // unsaved editor buffers are confirmed whatever it says, because an interrupted turn
+          // resumes and discarded edits do not come back. A user who turns this off and later
+          // loses a buffer would rightly blame this row for saying nothing about the limit —
+          // which is why that half is also the visible hint.
+          label="Confirm before closing a project with a live session"
+          hint="Unsaved files are always confirmed, whatever this says."
+          info="“Live” means a session is working or waiting for permission — not merely that a process exists."
+          {...resetTo(settings.confirmCloseWithLiveSession, def?.confirmCloseWithLiveSession, (v) =>
+            patch({ confirmCloseWithLiveSession: v }),
+          )}
+          checked={settings.confirmCloseWithLiveSession}
+          onChange={(v) => patch({ confirmCloseWithLiveSession: v })}
+        />
+      </Group>
+
+      <Group title="Agent runs">
+        {/* M108. Here rather than under Agents, whose page writes role files and no setting at
+            all: this is about where a view lands, which is this page's whole subject. */}
         <Row
-          label={`Skipping cide ${settings.update.skippedVersion}`}
-          hint="You chose Skip this version. Newer releases are still offered."
+          label="Open a run in"
+          hint="Where the Agents panel’s Open shows a subagent."
+          info="A tab of its own, or a row under the project console’s conversation. Only the button opens one — a run never opens a view by itself."
+          {...resetTo(settings.openRunIn, def?.openRunIn, (openRunIn) => patch({ openRunIn }))}
           control={
-            <ActionButton
-              label="Offer it again"
-              onClick={() => patch({ update: { ...settings.update, skippedVersion: null } })}
+            <Segmented
+              label="Open a run in"
+              value={settings.openRunIn}
+              options={OPEN_RUN_IN}
+              onChange={(openRunIn) => patch({ openRunIn })}
             />
           }
         />
-      )}
-      <ToggleRow
-        // The mock says "Keep a project running when its window is closed — live Claude
-        // sessions survive in the background". That is a promise cide does not keep: there is
-        // no background daemon, and quitting the app quits its sessions. Reworded so the
-        // toggle means what it does — the window-close case, and nothing about quitting.
-        label="Keep sessions running when a project window is closed"
-        hint="Sessions end when cide quits. The workspace is restored on relaunch and conversations resume."
-        checked={settings.keepSessionsOnWindowClose}
-        onChange={(v) => patch({ keepSessionsOnWindowClose: v })}
-      />
-      <ToggleRow
-        // The hint's second sentence is not decoration. This toggle governs *sessions* only:
-        // unsaved editor buffers are confirmed whatever it says, because an interrupted turn
-        // resumes and discarded edits do not come back. A user who turns this off and later
-        // loses a buffer would rightly blame this row for saying nothing about the limit.
-        label="Confirm before closing a project with a live session"
-        hint="“Live” means a session is working or waiting for permission — not merely that a process exists. Unsaved files are always confirmed."
-        checked={settings.confirmCloseWithLiveSession}
-        onChange={(v) => patch({ confirmCloseWithLiveSession: v })}
-      />
-      {/* M108. Here rather than under Agents, whose page writes role files and no setting at
-          all: this is about where a view lands, which is this page's whole subject. */}
-      <Row
-        label="Open a run in"
-        hint="Where the Agents panel’s Open shows a subagent: a tab of its own, or a row under the project console’s conversation. Only the button opens one — a run never opens a view by itself."
-        control={
-          <Segmented
-            label="Open a run in"
-            value={settings.openRunIn}
-            options={OPEN_RUN_IN}
-            onChange={(openRunIn) => patch({ openRunIn })}
-          />
-        }
-      />
+      </Group>
     </>
   )
 }
@@ -418,11 +541,28 @@ const HARNESSES: readonly { value: ConsoleHarness; label: string }[] = [
  * the harness its definition names.
  */
 function HarnessChoice({ settings, patch }: SectionProps) {
+  const def = useSettingsDefaults()
   return (
     <Group title="Console">
       <Row
         label="Harness"
-        hint="Which CLI a new console runs — the project’s pinned tab, a new pane, a tab cide opens by itself, and the one-shots behind Generate commit message. A console that is already running keeps its CLI and its Resume; Restart session starts the one chosen here. Agent roles are not affected: each runs the harness its definition names, Claude Code when it names none."
+        hint="The CLI a new console runs."
+        info={
+          <>
+            <InfoPara>
+              Which CLI a new console runs — the project’s pinned tab, a new pane, a tab cide
+              opens by itself, and the one-shots behind Generate commit message.
+            </InfoPara>
+            <InfoPara>
+              A console that is already running keeps its CLI and its Resume; Restart session
+              starts the one chosen here. Agent roles are not affected: each runs the harness its
+              definition names, Claude Code when it names none.
+            </InfoPara>
+          </>
+        }
+        {...resetTo(settings.consoleHarness, def?.consoleHarness, (consoleHarness) =>
+          patch({ consoleHarness }),
+        )}
         control={
           <Segmented
             label="Console harness"
@@ -436,96 +576,197 @@ function HarnessChoice({ settings, patch }: SectionProps) {
   )
 }
 
-function CodexSessionsSection({ settings, patch, codexSupport }: SectionProps) {
-  const codex = settings.codex
-  return (
-    <>
-      <Note title={codexSupport?.version ?? (codexSupport?.problem != null ? 'codex cannot be run' : 'Codex')}>
-        cide never sets OPENAI_API_KEY or CODEX_API_KEY: a key outranks a ChatGPT login and moves
-        billing to API credits. A codex console gets cide’s hooks, task tools and roster through{' '}
-        <code>-c</code> overrides on its own command line — nothing is written to your{' '}
-        <code>~/.codex/config.toml</code> or the project’s <code>.codex/</code>. What codex has
-        no equivalent for: the inline diffs and diagnostics of Claude Code’s IDE protocol, and the
-        token and cost readout of its statusline.
-      </Note>
+/** Harness → Launch: the chosen CLI's binary, arguments and environment. (M133) */
+function HarnessLaunch({ settings, patch, cliSupport, codexSupport }: SectionProps) {
+  if (settings.consoleHarness === 'codex') {
+    const codex = settings.codex
+    return (
       <CodexCliSection
         cli={codex.cli}
         onChange={(cli) => patch({ codex: { ...codex, cli } })}
         support={codexSupport}
       />
-    </>
+    )
+  }
+  const claude = settings.claude
+  // The launch configuration: which `claude`, and what beyond cide's own argv and environment.
+  // A component of its own rather than more rows here, for the same reason `ProxySection` is
+  // one — it has repeatable rows, a readout and a hard verdict.
+  //
+  // It also has to stay out of *this* file. `check-claude-env.mjs` asserts set-equality between
+  // the `CLAUDE_CODE_*` names in `child_env.rs` and the ones named here, so that a switch wired
+  // to nothing fails a gate; the refusal list names four of those variables for the opposite
+  // reason, and spelling them in this file would break that check with a message about a
+  // defect that is not there.
+  return (
+    <ClaudeCliSection
+      cli={claude.cli}
+      onChange={(cli) => patch({ claude: { ...claude, cli } })}
+      support={cliSupport}
+    />
+  )
+}
+
+/**
+ * A problem with the whole page, drawn as a `Banner` under its title. (M133)
+ *
+ * Kept to what makes the page's settings moot — a CLI that cannot run — rather than anything a
+ * single row can carry: a row-sized problem is that row's `status`, so it sits on the thing it
+ * is about instead of above everything.
+ */
+export function sectionBanner(id: SettingsSection, props: SectionProps): ReactNode {
+  if (id !== 'claudeSessions') return null
+  if (props.settings.consoleHarness === 'codex') {
+    const problem = props.codexSupport?.problem
+    return problem != null ? <Banner tone="bad">codex cannot be run: {problem}</Banner> : null
+  }
+  return props.claudeVersion === null ? (
+    <Banner tone="bad">
+      claude is not on PATH. Panes will fail to spawn until the CLI is installed and on this
+      app’s PATH.
+    </Banner>
+  ) : null
+}
+
+function CodexSessionsSection({ codexSupport }: SectionProps) {
+  return (
+    <Group
+      title="Codex"
+      info={
+        <>
+          <InfoPara>
+            cide never sets <code>OPENAI_API_KEY</code> or <code>CODEX_API_KEY</code>: a key
+            outranks a ChatGPT login and moves billing to API credits.
+          </InfoPara>
+          <InfoPara>
+            A codex console gets cide’s hooks, task tools and roster through <code>-c</code>{' '}
+            overrides on its own command line — nothing is written to your{' '}
+            <code>~/.codex/config.toml</code> or the project’s <code>.codex/</code>.
+          </InfoPara>
+          <InfoPara>
+            What codex has no equivalent for: the inline diffs and diagnostics of Claude Code’s IDE
+            protocol, and the token and cost readout of its statusline.
+          </InfoPara>
+        </>
+      }
+    >
+      <Row
+        label="Version"
+        hint="Launch options are on the Launch tab."
+        control={<Readout text={codexSupport?.version ?? (codexSupport?.problem != null ? 'cannot be run' : '…')} />}
+      />
+    </Group>
   )
 }
 
 function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: SectionProps) {
   const claude = settings.claude
   const set = (next: Partial<ClaudeSettings>) => patch({ claude: { ...claude, ...next } })
+  const def = useSettingsDefaults()?.claude
 
   return (
     <>
-      <Note title={claudeVersion ?? 'claude is not on PATH'}>
-        {claudeVersion === null
-          ? 'Panes will fail to spawn until the CLI is installed and on this app’s PATH.'
-          : 'cide never sets ANTHROPIC_API_KEY and never reads ~/.claude/.credentials.json: a key outranks subscription OAuth, so injecting one would bill a Console organisation for a Claude Max user. Children inherit their authentication by inheriting the environment.'}
-      </Note>
+      <Group
+        title="Claude Code"
+        info={
+          <>
+            <InfoPara>
+              cide never sets <code>ANTHROPIC_API_KEY</code> and never reads{' '}
+              <code>~/.claude/.credentials.json</code>: a key outranks subscription OAuth, so
+              injecting one would bill a Console organisation for a Claude Max user.
+            </InfoPara>
+            <InfoPara>Children inherit their authentication by inheriting the environment.</InfoPara>
+          </>
+        }
+      >
+        {/* The drift case is the row's status, not a note above the page: it is a fact about
+            *this* binary, and a coloured panel saying "everything is fine" on every launch is
+            one nobody reads on the launch it matters. The sentence is composed in Rust so the
+            verified range has exactly one home. */}
+        <Row
+          label="Version"
+          hint="Launch options are on the Launch tab."
+          status={
+            cliSupport?.warning != null
+              ? { tone: 'warn', text: `${cliSupport.warning}.` }
+              : undefined
+          }
+          info={
+            cliSupport?.warning != null
+              ? 'The IDE integration — inline diffs, @-mentions, the editor selection — is spoken over an undocumented protocol with no version field, so it can only be right or wrong, never negotiated. The terminal itself is unaffected.'
+              : undefined
+          }
+          control={<Readout text={claudeVersion ?? 'not found'} />}
+        />
+        {/* Readout weight, not a note, and deliberately: this is the *good* news case as often
+            as not. The wording is `cliHandshake.ts`'s, so it can be driven by a check script. */}
+        {cliSupport != null && <CliHandshakeRow support={cliSupport} />}
+      </Group>
 
-      {/* Rendered only when there is something to say. A note reading "everything is fine"
-          on every launch is a note nobody reads on the launch it matters — which is the
-          launch after the CLI updated itself out from under this build. The sentence is
-          composed in Rust so the verified range has exactly one home. */}
-      {cliSupport?.warning != null && (
-        <Note title="Untested Claude Code version" tone="warn">
-          {cliSupport.warning}. The IDE integration — inline diffs, @-mentions, the editor
-          selection — is spoken over an undocumented protocol with no version field, so it can
-          only be right or wrong, never negotiated. The terminal itself is unaffected.
-        </Note>
-      )}
-
-      {/* A `Group` of readout weight, not a `Note`, and deliberately: this is the *good* news
-          case as often as not, and a coloured panel that says "everything is fine" on every
-          launch is one nobody reads on the launch it matters. The `Note tone="warn"` above
-          stays reserved for the drift case. The wording is `cliHandshake.ts`'s, so it can be
-          driven by a check script. */}
-      {cliSupport != null && (
-        <Group title="IDE protocol">
-          <CliHandshakeRow support={cliSupport} />
-        </Group>
-      )}
-
-      <Group title="Environment">
+      <Group
+        title="Environment"
+        info="These reach a pane’s child process when it starts. A pane already running keeps the environment it was spawned with until it is restarted."
+      >
         <ToggleRow
           label="Disable mouse reporting"
-          hint="CLAUDE_CODE_DISABLE_MOUSE=1. Worth having: xterm.js has no shift-to-bypass gesture, so a TUI that grabs the mouse takes text selection with it."
+          hint="Keeps text selection working in the terminal."
+          info={
+            <>
+              <code>CLAUDE_CODE_DISABLE_MOUSE=1</code>. Worth having: xterm.js has no
+              shift-to-bypass gesture, so a TUI that grabs the mouse takes text selection with it.
+            </>
+          }
+          {...resetTo(claude.disableMouse, def?.disableMouse, (v) => set({ disableMouse: v }))}
           checked={claude.disableMouse}
           onChange={(v) => set({ disableMouse: v })}
         />
         <ToggleRow
           label="Resume every Claude pane on launch"
-          hint="On, a restored pane picks its conversation up by itself. Off, only the project's console does and the rest wait behind a Resume button. Resuming is not forking — it continues a conversation that already exists and sends no prompt — but it does start one claude process per pane. A pane whose transcript is gone always waits, either way."
+          hint="Off: only the project’s console resumes; the rest wait behind a button."
+          info="On, a restored pane picks its conversation up by itself. Resuming is not forking — it continues a conversation that already exists and sends no prompt — but it does start one claude process per pane. A pane whose transcript is gone always waits, either way."
+          {...resetTo(claude.resumeAllOnLaunch, def?.resumeAllOnLaunch, (v) => set({ resumeAllOnLaunch: v }))}
           checked={claude.resumeAllOnLaunch}
           onChange={(v) => set({ resumeAllOnLaunch: v })}
         />
         <ToggleRow
           label="Full repaint on the alternate screen"
-          hint="CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT=1. Costs bandwidth; fixes a TUI that leaves debris behind after a resize."
+          hint="Fixes debris after a resize, at the cost of bandwidth."
+          info={<code>CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT=1</code>}
+          {...resetTo(claude.altScreenFullRepaint, def?.altScreenFullRepaint, (v) => set({ altScreenFullRepaint: v }))}
           checked={claude.altScreenFullRepaint}
           onChange={(v) => set({ altScreenFullRepaint: v })}
         />
         <ToggleRow
           label="Disable the alternate screen"
-          hint="CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1. The transcript stays in the scrollback, and the fullscreen renderer the design is drawn against is off."
+          hint="Keeps the transcript in the scrollback instead of fullscreen."
+          info={
+            <>
+              <code>CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1</code>. The transcript stays in the
+              scrollback, and the fullscreen renderer the design is drawn against is off.
+            </>
+          }
+          {...resetTo(claude.disableAlternateScreen, def?.disableAlternateScreen, (v) => set({ disableAlternateScreen: v }))}
           checked={claude.disableAlternateScreen}
           onChange={(v) => set({ disableAlternateScreen: v })}
         />
         {/* A number rather than a switch because there is no right value to default to: what a
             wheel notch is worth is this figure multiplied by how many reports the mouse
             produces per notch, and the second factor is a property of the pointer and the
-            compositor that cide cannot read. Raising this is the one lever that works whichever
-            way that lands. `max` is the CLI's own clamp and `min` is 1 because 0 is a value it
-            discards — see `ClaudeSettings::SCROLL_SPEED`, which is where both come from. */}
+            compositor that cide cannot read. `max` is the CLI's own clamp and `min` is 1
+            because 0 is a value it discards — see `ClaudeSettings::SCROLL_SPEED`. */}
         <Row
           label="Scroll speed"
-          hint="CLAUDE_CODE_SCROLL_SPEED. Transcript lines a Claude pane moves per wheel report, 1 to 20. Raise it if the wheel scrolls too little; a high-resolution mouse can spend several reports on one notch. PageUp and PageDown scroll a Claude pane too, and are not affected."
+          hint="Transcript lines per wheel report, 1 to 20."
+          info={
+            <>
+              <InfoPara>
+                <code>CLAUDE_CODE_SCROLL_SPEED</code>. Raise it if the wheel scrolls too little;
+                a high-resolution mouse can spend several reports on one notch.
+              </InfoPara>
+              <InfoPara>PageUp and PageDown scroll a Claude pane too, and are not affected.</InfoPara>
+            </>
+          }
+          {...resetTo(claude.scrollSpeed, def?.scrollSpeed, (scrollSpeed) => set({ scrollSpeed }))}
           control={
             <NumberField
               label="Claude scroll speed"
@@ -537,27 +778,6 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
           }
         />
       </Group>
-
-      <Note title="Applied at spawn">
-        These reach a pane's child process when it starts. A pane already running keeps the
-        environment it was spawned with until it is restarted.
-      </Note>
-
-      {/* The launch configuration: which `claude`, and what beyond cide's own argv and
-          environment. A component of its own rather than more rows here, for the same reason
-          `ProxySection` is one — it has repeatable rows, a readout and a hard verdict, none of
-          which is this file's `Row`/`Note` vocabulary.
-
-          It also has to stay out of *this* file. `check-claude-env.mjs` asserts set-equality
-          between the `CLAUDE_CODE_*` names in `child_env.rs` and the ones named here, so that a
-          switch wired to nothing fails a gate; the refusal list names four of those variables
-          for the opposite reason, and spelling them in this file would break that check with a
-          message about a defect that is not there. */}
-      <ClaudeCliSection
-        cli={claude.cli}
-        onChange={(cli) => set({ cli })}
-        support={cliSupport}
-      />
     </>
   )
 }
@@ -565,12 +785,16 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
 function Editor({ settings, patch }: SectionProps) {
   const editor = settings.editor
   const set = (next: Partial<EditorSettings>) => patch({ editor: { ...editor, ...next } })
+  const def = useSettingsDefaults()?.editor
+  /** `resetTo` for one boolean field of the editor group. */
+  const flag = (key: EditorFlag) => resetTo(editor[key], def?.[key], (v) => set({ [key]: v }))
 
   return (
     <>
-      <Group>
+      <Group title="Text">
         <Row
           label="Font size"
+          {...resetTo(editor.fontSize, def?.fontSize, (fontSize) => set({ fontSize }))}
           control={
             <NumberField
               label="Editor font size"
@@ -584,8 +808,25 @@ function Editor({ settings, patch }: SectionProps) {
             />
           }
         />
+        <ToggleRow
+          label="Wrap long lines"
+          {...flag('wordWrap')}
+          checked={editor.wordWrap}
+          onChange={(v) => set({ wordWrap: v })}
+        />
+        <ToggleRow
+          label="Show the minimap"
+          hint="The canvas strip down the right edge of a buffer."
+          {...flag('showMinimap')}
+          checked={editor.showMinimap}
+          onChange={(v) => set({ showMinimap: v })}
+        />
+      </Group>
+
+      <Group title="Indentation">
         <Row
           label="Tab size"
+          {...resetTo(editor.tabSize, def?.tabSize, (tabSize) => set({ tabSize }))}
           control={
             <NumberField
               label="Tab size"
@@ -598,114 +839,167 @@ function Editor({ settings, patch }: SectionProps) {
         />
         <ToggleRow
           label="Insert spaces"
+          {...flag('insertSpaces')}
           checked={editor.insertSpaces}
           onChange={(v) => set({ insertSpaces: v })}
         />
         <ToggleRow
           label="Detect indentation from the file"
-          hint="A buffer that already indents with tabs, or with two spaces, keeps doing so. Tab size and Insert spaces decide only a file with no indentation of its own."
+          hint="A file that already indents keeps its own style."
+          info="A buffer that already indents with tabs, or with two spaces, keeps doing so. Tab size and Insert spaces decide only a file with no indentation of its own."
+          {...flag('detectIndentation')}
           checked={editor.detectIndentation}
           onChange={(v) => set({ detectIndentation: v })}
         />
-        <ToggleRow
-          label="Show the minimap"
-          hint="The 96px canvas strip down the right edge of a buffer."
-          checked={editor.showMinimap}
-          onChange={(v) => set({ showMinimap: v })}
-        />
-        <ToggleRow
-          label="Wrap long lines"
-          checked={editor.wordWrap}
-          onChange={(v) => set({ wordWrap: v })}
-        />
-        <ToggleRow
-          label="Trim trailing whitespace on save"
-          checked={editor.trimTrailingWhitespaceOnSave}
-          onChange={(v) => set({ trimTrailingWhitespaceOnSave: v })}
-        />
+      </Group>
+
+      <Group title="Saving">
         <ToggleRow
           label="Save automatically"
-          hint="Writes a changed file when it loses focus, and after a minute with no edits. Never over a Claude diff, a conflict, or a read-only file."
+          hint="On focus loss, and after a minute with no edits."
+          info="Never over a Claude diff, a conflict, or a read-only file."
+          {...flag('autosave')}
           checked={editor.autosave}
           onChange={(v) => set({ autosave: v })}
         />
         <ToggleRow
+          label="Trim trailing whitespace on save"
+          {...flag('trimTrailingWhitespaceOnSave')}
+          checked={editor.trimTrailingWhitespaceOnSave}
+          onChange={(v) => set({ trimTrailingWhitespaceOnSave: v })}
+        />
+      </Group>
+
+      <Group title="Completion">
+        <ToggleRow
           label="Suggest completions"
-          hint="Offers what the language server thinks can go under the caret. Tab or Enter accepts, Escape dismisses. Needs a server for the language — Rust and Go have one built in."
+          hint="What the language server offers under the caret."
+          info="Tab or Enter accepts, Escape dismisses. Needs a server for the language — Rust and Go have one built in."
+          {...flag('completion')}
           checked={editor.completion}
           onChange={(v) => set({ completion: v })}
         />
         <ToggleRow
           label="Open suggestions while typing"
-          hint="Off means the popup appears only on Ctrl+Space. The feature stays fully usable either way."
+          hint="Off: the popup opens only on Ctrl+Space."
+          {...flag('completionOnTyping')}
           checked={editor.completionOnTyping}
           onChange={(v) => set({ completionOnTyping: v })}
           disabled={!editor.completion}
         />
       </Group>
-      <Group title="Formatters">
-        <Note title="Ctrl+Alt+F asks the language server first">
-          Rust and Go format out of the box — cide ships rust-analyzer and gopls, so{' '}
-          <code>rustfmt</code> and <code>gofmt</code> need no row here. Add one for a language
-          with no server, or to override the one a server would use.
-        </Note>
+
+      {/* What were two long notes around the list — one before it, one after — are the
+          caption's (i) now: they are about the whole list, not about any one row of it. */}
+      <Group
+        title="Formatters"
+        info={
+          <>
+            <InfoPara>
+              Ctrl+Alt+F asks the language server first. Rust and Go format out of the box — cide
+              ships rust-analyzer and gopls, so <code>rustfmt</code> and <code>gofmt</code> need no
+              row here. Add one for a language with no server, or to override the one a server
+              would use.
+            </InfoPara>
+            <InfoPara>
+              One box per argument, and no shell: cide runs the program directly, so{' '}
+              <code>$HOME</code>, <code>*</code>, <code>|</code> and <code>&amp;&amp;</code> are
+              ordinary text. Only <code>{'${file}'}</code> and <code>{'${dir}'}</code> are
+              substituted.
+            </InfoPara>
+            <InfoPara>
+              The program must be a filter: it reads the buffer on standard input and writes the
+              result to standard output — <code>prettier --stdin-filepath {'${file}'}</code>,{' '}
+              <code>black -</code>, <code>gofmt</code>. A tool that rewrites files in place, such
+              as <code>cargo fmt</code>, is refused rather than allowed to empty the buffer.
+              Formatting never writes the file; the tab goes dirty like any other edit.
+            </InfoPara>
+          </>
+        }
+      >
         <FormattersSection editor={editor} patch={set} />
-        <Note title="One box per argument, and no shell">
-          cide runs the program directly, so <code>$HOME</code>, <code>*</code>, <code>|</code>{' '}
-          and <code>&amp;&amp;</code> are ordinary argument text rather than syntax — which is why
-          each argument gets its own box instead of one command line. Only{' '}
-          <code>{'${file}'}</code> and <code>{'${dir}'}</code> are substituted.
-          <br />
-          The program must be a <em>filter</em>: it reads the buffer on standard input and writes
-          the result to standard output — <code>prettier --stdin-filepath {'${file}'}</code>,{' '}
-          <code>black -</code>, <code>gofmt</code>. A tool that rewrites files in place and prints
-          nothing, <code>cargo fmt</code> among them, cannot be used here and is refused rather
-          than allowed to empty the buffer. Formatting never writes the file; the tab goes dirty
-          like any other edit.
-        </Note>
       </Group>
     </>
   )
 }
 
+/** The editor settings that are plain switches — what `Editor`'s `flag` resets. */
+type EditorFlag = {
+  [K in keyof EditorSettings]: EditorSettings[K] extends boolean ? K : never
+}[keyof EditorSettings]
+
 /**
  * What the file tree walks. (M18)
  *
- * Two toggles and a long hint each, because both of them change what *opening a project costs*
+ * Two toggles and a long explanation each, because both of them change what *opening a project costs*
  * rather than only what it looks like — flipping either one re-walks every open project, which
  * `cide_ipc::ExplorerSettings` explains and `cmd::settings::settings_set` performs. A toggle
  * with that consequence and a three-word label would be a trap.
  *
  * The wording is deliberately concrete about the cost of the second one. "Show ignored files" is
  * a reasonable-sounding request until it means `target/`, and a user who turns it on without
- * being told that has a slow Ctrl+P and no idea why.
+ * being told that has a slow Ctrl+P and no idea why — which is why "slows indexing" stayed in
+ * its visible hint when M133 moved the rest behind the (i).
  */
 function Files({ settings, patch }: SectionProps) {
   const explorer = settings.explorer
   const set = (next: Partial<ExplorerSettings>) => patch({ explorer: { ...explorer, ...next } })
+  const def = useSettingsDefaults()?.explorer
 
   return (
     <Group>
       <ToggleRow
         label="Show hidden files"
-        hint="Dot-prefixed entries — .claude, .github, .env — in the file tree and in Ctrl+P. .git itself stays hidden: it is a database of one object per version of every file ever committed, and nothing in a tree can act on one."
+        hint="Dot-prefixed entries — .claude, .github, .env — in the tree and Ctrl+P."
+        info={
+          <>
+            <InfoPara>
+              <code>.git</code> itself stays hidden: it is a database of one object per version of
+              every file ever committed, and nothing in a tree can act on one.
+            </InfoPara>
+            <InfoPara>{REWALK}</InfoPara>
+          </>
+        }
+        {...resetTo(explorer.showHiddenFiles, def?.showHiddenFiles, (v) => set({ showHiddenFiles: v }))}
         checked={explorer.showHiddenFiles}
         onChange={(v) => set({ showHiddenFiles: v })}
       />
       <ToggleRow
         label="Show ignored files"
-        hint="Everything .gitignore covers — target/, node_modules/, dist/ — drawn in a muted olive, the way IDEA draws them. On by default, the way IDEA shows them. It is the expensive setting: on a Rust project it is hundreds of thousands of extra rows to walk, hold and offer to Ctrl+P, so turn it off if indexing a large project feels slow. One ignore decision serves every surface, so this widens Find in Files and the symbol index with the tree — a find-in-files over a built project will read your object files. They are shown but not watched, so changes inside an ignored directory appear when the project is indexed again rather than as they happen — or on demand, with Refresh in the folder's context menu."
+        hint="target/, node_modules/ and the rest, drawn muted. Slows indexing a big project."
+        info={
+          <>
+            <InfoPara>
+              Everything <code>.gitignore</code> covers, drawn in a muted olive, the way IDEA draws
+              them — and on by default, the way IDEA shows them.
+            </InfoPara>
+            <InfoPara>
+              It is the expensive setting: on a Rust project it is hundreds of thousands of extra
+              rows to walk, hold and offer to Ctrl+P. One ignore decision serves every surface, so
+              this widens Find in Files and the symbol index with the tree — a find-in-files over a
+              built project will read your object files.
+            </InfoPara>
+            <InfoPara>
+              They are shown but not watched: changes inside an ignored directory appear when the
+              project is indexed again, or on demand with Refresh in the folder’s context menu.
+            </InfoPara>
+            <InfoPara>{REWALK}</InfoPara>
+          </>
+        }
+        {...resetTo(explorer.showIgnoredFiles, def?.showIgnoredFiles, (v) => set({ showIgnoredFiles: v }))}
         checked={explorer.showIgnoredFiles}
         onChange={(v) => set({ showIgnoredFiles: v })}
       />
-      <Note title="Changing either one re-walks every open project">
-        The rows are not hidden, they are <em>unwalked</em> — there is nothing in the index to
-        reveal — so the walk runs again. Large projects take a moment, and Ctrl+P fills as it
-        goes.
-      </Note>
     </Group>
   )
 }
+
+/**
+ * The cost both Files switches share, said in each one's (i) rather than in a note under the
+ * pair: the note was the thing the user could not tie to a row, and here it is about both.
+ */
+const REWALK =
+  'Changing it re-walks every open project: the rows are not hidden, they are unwalked, so there is nothing in the index to reveal. Large projects take a moment, and Ctrl+P fills as it goes.'
 
 /**
  * The Git screen. (M20)
@@ -713,13 +1007,14 @@ function Files({ settings, patch }: SectionProps) {
  * A pure function of `settings`, deliberately: `sections.tsx`'s header is explicit that
  * *"a section that reads the store is a section the fixture cannot drive"*, and every row here
  * is a plain settings value. The one thing that would need the store — what each repository's
- * own `pull.rebase` currently resolves to — is not here for that reason; the `Note` names the
- * command that clears it instead, which is what
+ * own `pull.rebase` currently resolves to — is not here for that reason; the diverged row's (i)
+ * names the command that clears it instead, which is what
  * `terminal/outsideOpen.ts`'s *"listed in Settings where it can be revoked"* rule asks for.
  */
 function Git({ settings, patch }: SectionProps) {
   const git = settings.git
   const set = (next: Partial<GitSettings>) => patch({ git: { ...git, ...next } })
+  const def = useSettingsDefaults()?.git
 
   return (
     <>
@@ -727,7 +1022,28 @@ function Git({ settings, patch }: SectionProps) {
       <Group title="Update project">
         <Row
           label="When your branch has diverged"
-          hint="cide fast-forwards whenever it can. This is what happens when it cannot — when you have commits the remote does not and the remote has commits you do not. A repository's own pull.rebase always wins over this; it is the answer for the ones that have not decided for themselves. Ask puts the choice in front of you and offers to write your answer into that repository. Fast-forward only is what cide did before this setting existed: it refuses, and says how far apart the two have got."
+          hint="What Update project does when a fast-forward is impossible."
+          info={
+            <>
+              <InfoPara>
+                cide fast-forwards whenever it can. This is what happens when it cannot — when you
+                have commits the remote does not and the remote has commits you do not.
+              </InfoPara>
+              <InfoPara>
+                Ask puts the choice in front of you and offers to write your answer into that
+                repository. Fast-forward only is what cide did before this setting existed: it
+                refuses, and says how far apart the two have got.
+              </InfoPara>
+              <InfoPara>
+                A repository’s own <code>pull.rebase</code> always wins over this. Ticking{' '}
+                <em>remember this choice</em> in the dialog writes it into that repository’s{' '}
+                <code>.git/config</code> — the key <code>git pull</code> reads in a terminal. To be
+                asked again, run <code>git config --unset pull.rebase</code> there. Your global{' '}
+                <code>~/.gitconfig</code> is never edited.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(git.pullStrategy, def?.pullStrategy, (pullStrategy) => set({ pullStrategy }))}
           control={
             <Segmented
               label="Diverged pull"
@@ -742,28 +1058,39 @@ function Git({ settings, patch }: SectionProps) {
             />
           }
         />
-        <Note title="A repository can answer for itself">
-          Ticking <em>remember this choice</em> in the dialog writes <code>pull.rebase</code> into
-          that repository&rsquo;s own <code>.git/config</code> — the same key{' '}
-          <code>git pull</code> reads in a terminal, and not a cide setting. To go back to being
-          asked, run <code>git config --unset pull.rebase</code> in that repository. Your global{' '}
-          <code>~/.gitconfig</code> is never edited.
-        </Note>
       </Group>
 
-      <Group title="Resolving a conflict">
+      <Group
+        title="Resolving a conflict"
+        info={
+          <>
+            Conflicts are git’s, not cide’s. A merge or rebase that stops leaves real git state —{' '}
+            <code>MERGE_HEAD</code>, an index with all three versions, markers in the files — so
+            the same conflict is visible to <code>git status</code> in a terminal, survives closing
+            cide, and can be abandoned with <code>git merge --abort</code>.
+          </>
+        }
+      >
         <ToggleRow
           label="Apply non-conflicting changes automatically"
-          hint="When the three-pane resolver opens a file, apply the changes only one side made without asking about them. Off by default, as it is in IDEA: the middle pane opens as the version both branches came from, and every difference either side made is a block you take or reject — applying two thirds of them before you have looked undoes the reason for showing them. The toolbar's Apply non-conflicting is the same action when you want it."
+          hint="Take the changes only one side made when the resolver opens."
+          info={
+            <>
+              <InfoPara>
+                Off by default, as it is in IDEA: the middle pane opens as the version both
+                branches came from, and every difference either side made is a block you take or
+                reject — applying two thirds of them before you have looked undoes the reason for
+                showing them.
+              </InfoPara>
+              <InfoPara>The toolbar’s Apply non-conflicting is the same action when you want it.</InfoPara>
+            </>
+          }
+          {...resetTo(git.autoApplyNonConflicting, def?.autoApplyNonConflicting, (v) =>
+            set({ autoApplyNonConflicting: v }),
+          )}
           checked={git.autoApplyNonConflicting}
           onChange={(v) => set({ autoApplyNonConflicting: v })}
         />
-        <Note title="Conflicts are git's, not cide's">
-          A merge or rebase that stops leaves real git state — <code>MERGE_HEAD</code>, an index
-          with all three versions, markers in the files — so the same conflict is visible to{' '}
-          <code>git status</code> in a terminal pane, survives closing cide, and can be abandoned
-          with <code>git merge --abort</code> if you would rather not use the resolver at all.
-        </Note>
       </Group>
     </>
   )
@@ -772,12 +1099,14 @@ function Git({ settings, patch }: SectionProps) {
 function Terminal({ settings, patch }: SectionProps) {
   const terminal = settings.terminal
   const set = (next: Partial<TerminalSettings>) => patch({ terminal: { ...terminal, ...next } })
+  const def = useSettingsDefaults()?.terminal
 
   return (
     <>
       <Group>
         <Row
           label="Font size"
+          {...resetTo(terminal.fontSize, def?.fontSize, (fontSize) => set({ fontSize }))}
           control={
             <NumberField
               label="Terminal font size"
@@ -791,7 +1120,9 @@ function Terminal({ settings, patch }: SectionProps) {
         />
         <Row
           label="Scrollback"
-          hint="Lines kept per pane, in the webview and in the Rust mirror both."
+          hint="Lines kept per pane."
+          info="Kept twice — in the webview and in the Rust mirror — so a large figure costs memory on both sides for every pane."
+          {...resetTo(terminal.scrollback, def?.scrollback, (scrollback) => set({ scrollback }))}
           control={
             <NumberField
               label="Scrollback lines"
@@ -804,7 +1135,20 @@ function Terminal({ settings, patch }: SectionProps) {
         />
         <Row
           label="Renderer"
-          hint="A setting rather than a probe: WebGL context creation succeeds even on a software rasteriser, and the debug renderer string is masked on Linux. Auto gives WebGL to the most recently focused panes and DOM to the rest, because WebKitGTK caps concurrent contexts at roughly 8-16."
+          hint="Auto: WebGL for the most recent panes, DOM for the rest."
+          info={
+            <>
+              <InfoPara>
+                A setting rather than a probe: WebGL context creation succeeds even on a software
+                rasteriser, and the debug renderer string is masked on Linux.
+              </InfoPara>
+              <InfoPara>
+                Auto gives WebGL to the most recently focused panes and DOM to the rest, because
+                WebKitGTK caps concurrent contexts at roughly 8–16.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(terminal.renderer, def?.renderer, (renderer) => set({ renderer }))}
           control={
             <Segmented
               label="Terminal renderer"
@@ -819,7 +1163,21 @@ function Terminal({ settings, patch }: SectionProps) {
       <Group title="Output">
         <ToggleRow
           label="Render JSON log lines"
-          hint="A shell pane that prints structured logs — one JSON object per line — shows them as time, level, message and fields instead of raw braces. Only lines that carry two of those three are touched; a minified file or a jq result prints exactly as it always did. The rendering replaces the line in the scrollback, so turn this off when you need to copy the original JSON back out."
+          hint="Structured log lines as time, level, message and fields."
+          info={
+            <>
+              <InfoPara>
+                A shell pane that prints one JSON object per line shows them as time, level,
+                message and fields instead of raw braces. Only lines that carry two of those three
+                are touched; a minified file or a jq result prints exactly as it always did.
+              </InfoPara>
+              <InfoPara>
+                The rendering replaces the line in the scrollback, so turn this off when you need to
+                copy the original JSON back out.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(terminal.jsonLogs, def?.jsonLogs, (jsonLogs) => set({ jsonLogs }))}
           checked={terminal.jsonLogs}
           onChange={(jsonLogs) => set({ jsonLogs })}
         />
@@ -828,7 +1186,20 @@ function Terminal({ settings, patch }: SectionProps) {
       <Group title="Notifications">
         <Row
           label="Announce a job after (seconds)"
-          hint="How long a command must run before its pane reports it — and so lights the pane dot, the tab and project badges and the window title when it finishes. Shorter jobs come and go silently: the threshold is the answer to “did I walk away from this?”, so set it around where you stop watching and switch to something else. Applies to running shells immediately, jobs already under way included."
+          hint="How long a command runs before its pane reports finishing."
+          info={
+            <>
+              <InfoPara>
+                A job past this lights the pane dot, the tab and project badges and the window title
+                when it finishes. Shorter jobs come and go silently: the threshold is the answer to
+                “did I walk away from this?”, so set it around where you stop watching.
+              </InfoPara>
+              <InfoPara>Applies to running shells immediately, jobs already under way included.</InfoPara>
+            </>
+          }
+          {...resetTo(terminal.jobNotifyAfterSecs, def?.jobNotifyAfterSecs, (jobNotifyAfterSecs) =>
+            set({ jobNotifyAfterSecs }),
+          )}
           control={
             <NumberField
               label="Job announce threshold, seconds"
@@ -856,33 +1227,29 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
     case 'keymap':
       return <KeymapSection />
     case 'claudeSessions':
+      // Three tabs since M133 — Console, Launch, Proxy — where it was one page that ran to
+      // five groups, a dozen notes and two launch configurations' worth of rows.
+      //
       // The proxy belongs to *every* child, shells included, so on the merits it wants a nav
-      // row of its own — "Network". It cannot have one yet: the nav is keyed by
-      // `SettingsSection`, a Rust enum in `cide-ipc/src/workspace.rs`, and adding a variant
-      // there is not this change's to make. It sits under the section that is already about
-      // the environment children are spawned with, and `ProxySection` says in its own words
-      // that shells get it too. Promoting it later is three lines: the enum variant, a
-      // `SECTIONS` entry, and a `case` here.
+      // row of its own — "Network". It cannot have one without a new `SettingsSection` variant
+      // in `cide-ipc/src/workspace.rs`; it sits under the section that is already about the
+      // environment children are spawned with, and `ProxySection` says in its own words that
+      // shells get it too.
+      //
+      // Only the chosen CLI's options (M93): two full launch configurations one under the
+      // other read as one long form whose half is inert. The other half is still stored and
+      // still used — a role whose harness is codex runs Settings → Harness → Codex whatever the
+      // console is — and flipping the switch shows it.
+      if (props.tab === 'proxy') return <ProxySection proxy={props.settings.proxy} patch={props.patch} />
+      if (props.tab === 'launch') return <HarnessLaunch {...props} />
       return (
         <>
           <HarnessChoice {...props} />
-          {/* Only the chosen CLI's options (M93): two full launch configurations one under the
-              other read as one long form whose half is inert, and the user asked to see the one
-              the switch names. The other half is still stored and still used — a role whose
-              harness is codex runs Settings → Harness → Codex whatever the console is — and
-              flipping the switch shows it. */}
           {props.settings.consoleHarness === 'codex' ? (
-            <>
-              <Part title="Codex" />
-              <CodexSessionsSection {...props} />
-            </>
+            <CodexSessionsSection {...props} />
           ) : (
-            <>
-              <Part title="Claude Code" />
-              <ClaudeSessionsSection {...props} />
-            </>
+            <ClaudeSessionsSection {...props} />
           )}
-          <ProxySection proxy={props.settings.proxy} patch={props.patch} />
         </>
       )
     case 'editor':
@@ -910,7 +1277,7 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       // No props: roles belong to a *project*, and `SectionProps` carries global settings.
       // The component takes the project from the store the way `KeymapSection` takes the
       // command registry — see its own header for why that is right here and nowhere else.
-      return <AgentsSection />
+      return <AgentsSection tab={props.tab} setTab={props.setTab} />
     case 'git':
       return <Git {...props} />
     case 'terminal':
@@ -963,17 +1330,31 @@ function Inspections({ settings, patch }: SectionProps) {
   const shows = (source: string) => inspections.sources[source] !== false
   const setSource = (source: string, on: boolean) =>
     set({ sources: { ...inspections.sources, [source]: on } })
+  const def = useSettingsDefaults()?.inspections
+  const sev = (key: keyof typeof inspections.severities) =>
+    resetTo(inspections.severities[key], def?.severities[key], (v) => severity({ [key]: v }))
+  const binary = (server: 'rust-analyzer' | 'gopls') =>
+    resetTo(
+      inspections.serverBinaries[server] ?? 'builtin',
+      def === undefined ? undefined : (def.serverBinaries[server] ?? 'builtin'),
+      (choice) => set({ serverBinaries: { ...inspections.serverBinaries, [server]: choice } }),
+    )
 
   return (
     <>
-      <Group title="Severities">
+      <Group
+        title="Severities"
+        info="Applied once, before the editor, the Problems panel and the status bar see the list — so all three agree."
+      >
         <ToggleRow
           label="Errors"
+          {...sev('error')}
           checked={inspections.severities.error}
           onChange={(error) => severity({ error })}
         />
         <ToggleRow
           label="Warnings"
+          {...sev('warning')}
           checked={inspections.severities.warning}
           onChange={(warning) => severity({ warning })}
         />
@@ -983,27 +1364,47 @@ function Inspections({ settings, patch }: SectionProps) {
           // thing, three names — IDEA's *weak warning*, LSP's `Information`, our `info` — and a
           // row labelled only "Info" would leave nobody able to map it to either.
           hint="IDEA’s weak warning. Language servers report these as “information”."
+          {...sev('weakWarning')}
           checked={inspections.severities.weakWarning}
           onChange={(weakWarning) => severity({ weakWarning })}
         />
         <ToggleRow
           label="Hints"
           hint="Suggestions rather than defects. Never counted in the status bar."
+          {...sev('hint')}
           checked={inspections.severities.hint}
           onChange={(hint) => severity({ hint })}
         />
       </Group>
 
-      <Group title="Sources">
+      <Group
+        title="Sources"
+        info={
+          <>
+            <InfoPara>
+              A source decides which processes run: turning rust-analyzer off turns off its indexer,
+              so nothing is computed for a severity to reveal.
+            </InfoPara>
+            <InfoPara>
+              A source not listed here is shown. The list is exceptions, not a registry: a language
+              server may attribute a finding to a tool of its own — rust-analyzer reports clippy’s
+              lints as <code>clippy</code> — and anything cide has not heard of is shown rather
+              than silently hidden. Turn one of those off and it gains a row here.
+            </InfoPara>
+          </>
+        }
+      >
         <ToggleRow
           label="rust-analyzer"
-          hint="Semantic diagnostics for Rust. Needs `rustup component add rust-analyzer`."
+          hint="Semantic diagnostics for Rust."
+          info={<code>rustup component add rust-analyzer</code>}
           checked={shows('rust-analyzer')}
           onChange={(on) => setSource('rust-analyzer', on)}
         />
         <ToggleRow
           label="gopls"
-          hint="Semantic diagnostics for Go. Needs `go install golang.org/x/tools/gopls@latest`."
+          hint="Semantic diagnostics for Go."
+          info={<code>go install golang.org/x/tools/gopls@latest</code>}
           checked={shows('gopls')}
           onChange={(on) => setSource('gopls', on)}
         />
@@ -1015,22 +1416,33 @@ function Inspections({ settings, patch }: SectionProps) {
         />
         <ToggleRow
           label="Claude inspections"
-          hint="A headless one-shot review, run only when you ask for it. Costs tokens."
+          hint="A headless one-shot review, run only when you ask. Costs tokens."
           checked={shows('claude')}
           onChange={(on) => setSource('claude', on)}
         />
-        <Note title="A source not listed here is shown">
-          The list is exceptions, not a registry. A language server may attribute a finding to a
-          tool of its own — rust-analyzer reports clippy’s lints as <code>clippy</code> — and
-          anything cide has not heard of is shown rather than silently hidden. Turn one of those
-          off and it gains a row here.
-        </Note>
       </Group>
 
-      <Group title="Language server builds">
+      <Group
+        title="Language server builds"
+        info={
+          <>
+            <InfoPara>
+              Built-in is the build cide ships: its own rust-analyzer — extended to keep its index
+              on disk instead of only in memory — and a pinned gopls, newer than most distributions
+              carry.
+            </InfoPara>
+            <InfoPara>
+              When no bundled build is present — every build run from source — Built-in quietly
+              behaves like System. System always runs whatever your PATH resolves, and is never
+              sent cide’s configuration.
+            </InfoPara>
+          </>
+        }
+      >
         <Row
           label="Which rust-analyzer runs"
-          hint="Changing this restarts rust-analyzer, which re-indexes every open project."
+          hint="Changing it restarts rust-analyzer and re-indexes open projects."
+          {...binary('rust-analyzer')}
           control={
             <Segmented
               label="Which rust-analyzer build runs"
@@ -1049,7 +1461,9 @@ function Inspections({ settings, patch }: SectionProps) {
         />
         <Row
           label="Which gopls runs"
-          hint="Changing this restarts gopls. The built-in gopls keeps its file cache inside cide’s per-profile cache directory; a System gopls keeps its own machine-global one."
+          hint="Changing it restarts gopls."
+          info="The built-in gopls keeps its file cache inside cide’s per-profile cache directory; a System gopls keeps its own machine-global one."
+          {...binary('gopls')}
           control={
             <Segmented
               label="Which gopls build runs"
@@ -1066,17 +1480,25 @@ function Inspections({ settings, patch }: SectionProps) {
             />
           }
         />
-        <Note title="Built-in is the build cide ships">
-          cide ships its own rust-analyzer — extended to keep its index on disk instead of only
-          in memory — and its own pinned gopls, newer than most distributions carry. When no
-          bundled build is present — every build run from source — Built-in quietly behaves
-          like System, so these rows cost nothing until a packaged cide ships the sidecars.
-          System always runs whatever your PATH resolves, exactly as before, and is never sent
-          cide’s configuration.
-        </Note>
         <Row
           label="Memory limit (MiB)"
-          hint="Restart a language server whose resident memory crosses this. 0 turns the watchdog off — the default, because a restart re-indexes until the disk index makes it a warm load. Values under 256 are raised to 256. The built-in gopls also gets this as a soft limit (GOMEMLIMIT, at 75%), so its GC compresses the heap before the watchdog would restart it; changing the value restarts gopls to apply that."
+          hint="Restart a language server that grows past this. 0 is off."
+          info={
+            <>
+              <InfoPara>
+                0 is the default, because a restart re-indexes until the disk index makes it a warm
+                load. Values under 256 are raised to 256.
+              </InfoPara>
+              <InfoPara>
+                The built-in gopls also gets this as a soft limit (<code>GOMEMLIMIT</code>, at
+                75%), so its GC compresses the heap before the watchdog would restart it; changing
+                the value restarts gopls to apply that.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(inspections.serverMemoryLimitMb, def?.serverMemoryLimitMb, (serverMemoryLimitMb) =>
+            set({ serverMemoryLimitMb }),
+          )}
           control={
             <NumberField
               label="Language server memory limit in MiB"
@@ -1090,7 +1512,24 @@ function Inspections({ settings, patch }: SectionProps) {
         />
         <Row
           label="Index working set (%)"
-          hint="Scale how much of the built-in rust-analyzer’s index stays in memory, as a percentage of its defaults — the rest lives on disk and reloads on demand. 0 keeps the shipped tuning. Values are kept between 25 and 400, and changing this restarts rust-analyzer (a warm load from the disk index). Only the built-in build listens; a System build has no disk index."
+          hint="How much of the built-in rust-analyzer’s index stays in memory."
+          info={
+            <>
+              <InfoPara>
+                A percentage of its defaults — the rest lives on disk and reloads on demand. 0 keeps
+                the shipped tuning; values are kept between 25 and 400.
+              </InfoPara>
+              <InfoPara>
+                Changing it restarts rust-analyzer (a warm load from the disk index). Only the
+                built-in build listens; a System build has no disk index.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(
+            inspections.serverIndexWorkingSetPct,
+            def?.serverIndexWorkingSetPct,
+            (serverIndexWorkingSetPct) => set({ serverIndexWorkingSetPct }),
+          )}
           control={
             <NumberField
               label="Index working set as a percentage of the built-in defaults"
@@ -1107,7 +1546,11 @@ function Inspections({ settings, patch }: SectionProps) {
       <Group title="Highlighting">
         <Row
           label="Default level"
-          hint="What a newly opened editor starts at. Change it per file from the editor’s context menu."
+          hint="Where a new editor starts. Change it per file from its context menu."
+          info="The level is per editor, and the panel is per project: turning highlighting down hides squiggles in that buffer only. The Problems panel and the status bar count the whole project — a per-file switch cannot coherently redefine a project-wide total. IDEA behaves the same way."
+          {...resetTo(inspections.defaultHighlightLevel, def?.defaultHighlightLevel, (defaultHighlightLevel) =>
+            set({ defaultHighlightLevel }),
+          )}
           control={
             <Segmented
               label="Default highlighting level"
@@ -1121,13 +1564,6 @@ function Inspections({ settings, patch }: SectionProps) {
             />
           }
         />
-        <Note title="The level is per editor, and the panel is per project">
-          Turning highlighting down hides squiggles in <em>that buffer</em>. It does not change
-          the Problems panel or the status bar, which count the whole project — a per-file switch
-          cannot coherently redefine a project-wide total. IDEA behaves the same way. The severity
-          and source toggles above <em>do</em> affect all three, because they are applied once,
-          before any of them sees the list.
-        </Note>
       </Group>
     </>
   )

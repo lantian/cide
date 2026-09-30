@@ -36,7 +36,12 @@ export function AccentRow({ accent }: { accent: Accent | null }) {
   return (
     <Row
       label="Accent colour"
-      hint="Buttons, focus rings, the current tab, selections and the waiting counters. It is adjusted so it stays readable in both themes. Black is reserved for destructive actions, so black and greys cannot be chosen."
+      hint="Buttons, focus rings, the current tab and selections."
+      info="Also the waiting counters. It is adjusted so it stays readable in both themes. Black is reserved for destructive actions, so black and greys cannot be chosen."
+      // The default is no stored accent at all (see the header), so "changed" is simply
+      // "something stored", and Reset is the same `reset` the shipped-red swatch sends.
+      modified={accent !== null}
+      onReset={() => choose(null)}
       control={
         <ColorSwatches
           label="Accent colour"

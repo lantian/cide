@@ -26,7 +26,7 @@
  * A masked field cannot work in this shape: a patch is per top-level field, so this screen sends
  * the whole `LlmSettings` back on every edit, and a mask would be sent back *as the mask* and
  * overwrite the real key. What survives is `ClaudeCliSection`'s rule — a value you cannot see is a
- * value you cannot correct — and a `Note` saying plainly where the bytes end up.
+ * value you cannot correct — and a line under every key box saying plainly where the bytes end up.
  */
 import { Select } from '@/kit/components/Select'
 import { IconButton } from '@/kit/components/Button'
@@ -42,7 +42,8 @@ import type {
   SettingsPatch,
 } from '@/ipc/generated'
 
-import { ActionButton, Group, Note, TextField, ToggleRow } from './controls'
+import { InfoPara } from '@/kit/components/InfoTip'
+import { ActionButton, Group, TextField, ToggleRow } from './controls'
 import controls from './controls.module.css'
 import {
   CODEX_PLUGIN_SETUP,
@@ -139,15 +140,27 @@ export function ModelsSection({
         ))}
       </datalist>
 
-      <Group title="Providers">
-        <Note title="Where a key is stored" tone="warn">
-          A key you type here is stored in plain text in <code>workspace.json</code>, which cide
-          writes <code>0600</code>, and it is passed to every opencode child in its environment.
-          cide has no keyring. <strong>Leave the box empty if the key is already in your
-          environment</strong> — a child inherits this process&rsquo;s environment wholesale, and
-          opencode reads each provider&rsquo;s own variable at highest precedence, so nothing needs
-          to be stored at all. The check below says which way worked.
-        </Note>
+      {/* The two notes this page opened its groups with are the groups' (i) since M133. The
+          key-storage one was a warning, and its warning half now sits on the field it is about:
+          every API key box says under itself where the bytes go. */}
+      <Group
+        title="Providers"
+        info={
+          <>
+            <InfoPara>
+              A key you type here is stored in plain text in <code>workspace.json</code>, which
+              cide writes <code>0600</code>, and it is passed to every opencode child in its
+              environment. cide has no keyring.
+            </InfoPara>
+            <InfoPara>
+              Leave the box empty if the key is already in your environment — a child inherits
+              this process’s environment wholesale, and opencode reads each provider’s own
+              variable at highest precedence, so nothing needs to be stored at all. The check
+              says which way worked.
+            </InfoPara>
+          </>
+        }
+      >
         {providers.map((provider, index) => (
           <ProviderCard
             key={`${provider.kind}-${index}`}
@@ -185,14 +198,22 @@ export function ModelsSection({
         </div>
       </Group>
 
-      <Group title="Pools">
-        <Note title="What a pool is">
-          An <strong>ordered</strong> list of models a run falls down. A run takes the first entry
-          and, if that provider rate-limits, cannot be reached, or refuses the credential, retries
-          on the next — and then stays there for the rest of the run. Only opencode runs use a
-          pool; a pool is chosen for a role in the Agents screen, as a local override that is never
-          committed.
-        </Note>
+      <Group
+        title="Pools"
+        info={
+          <>
+            <InfoPara>
+              An <strong>ordered</strong> list of models a run falls down. A run takes the first
+              entry and, if that provider rate-limits, cannot be reached, or refuses the
+              credential, retries on the next — and then stays there for the rest of the run.
+            </InfoPara>
+            <InfoPara>
+              Only opencode runs use a pool; a pool is chosen for a role in the Agents screen, as
+              a local override that is never committed.
+            </InfoPara>
+          </>
+        }
+      >
         {pools.map((pool, index) => (
           <PoolCard
             key={index}
@@ -416,10 +437,7 @@ function providerBody(
         <>
           <TextField
             label="API key"
-            hint={
-              'Blank is a real answer: if this key is already exported in the environment cide ' +
-              'was launched from, opencode reads it there and nothing needs storing here.'
-            }
+            hint="Stored in plain text in workspace.json. Blank uses the one in your environment."
             value={provider.apiKey}
             placeholder="leave blank to use the environment"
             // Never trimmed. Whitespace in a credential is the user's to see, and silently
@@ -451,7 +469,7 @@ function providerBody(
           />
           <TextField
             label="API key"
-            hint="Usually empty for a local endpoint."
+            hint="Usually empty for a local endpoint. Stored in plain text in workspace.json."
             value={provider.apiKey}
             placeholder="(none)"
             trim={false}
@@ -468,20 +486,18 @@ function providerBody(
     case 'external':
       return (
         <>
-          <Note title="cide does not configure this one">{provider.setup || CODEX_PLUGIN_SETUP}</Note>
+          {/* The steps were drawn twice — in a note, and in this field — and the note said
+              "shown above" about itself. One field now, whose hint says whose job they are. */}
           <TextField
             label="Setup steps"
-            hint="Shown above. Editable, because cide keeps no table of plugins to derive it from."
+            hint="cide does not configure this provider: run these yourself."
             value={provider.setup}
             placeholder={CODEX_PLUGIN_SETUP}
             onCommit={(setup) => onChange({ ...provider, setup })}
           />
           <TextField
             label="Expect"
-            hint={
-              'Comma-separated model ids whose presence proves the setup worked. Blank means any ' +
-              'id under this provider counts.'
-            }
+            hint="Model ids, comma-separated, that prove the setup worked. Blank accepts any."
             value={provider.expect.join(', ')}
             placeholder="openai/gpt-5.2"
             onCommit={(text) =>

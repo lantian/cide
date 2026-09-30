@@ -854,6 +854,17 @@ struct Frozen {
     /// machine suspended with a frozen child in it has elapsed one however little a monotonic
     /// clock moved. See [`freeze_may_have_killed_the_turn`].
     at_unix_ms: u64,
+    /// Whether the run held a concurrency slot when it was frozen. The freeze **gives the slot
+    /// back** — a `SIGSTOP`ped child computes nothing, and a paused run that went on counting
+    /// against its role's `max-concurrent` and the project's cap kept work queued behind a
+    /// process doing nothing at all (terrastrike: three paused artists holding a role of two
+    /// while its queue sat still). Resume has to take one again before the child may move,
+    /// and this is how it knows which runs need one: an `Idle` run froze holding nothing and
+    /// thaws holding nothing. See [`AgentRegistry::reclaim_slots`].
+    ///
+    /// The **checkout** is not given back: [`holds_its_checkout`] still counts `Paused`, because
+    /// the frozen child is still standing in its worktree.
+    slot: bool,
 }
 
 impl LiveRun {
@@ -1675,6 +1686,22 @@ fn entry_load(inner: &Inner, entry: &cide_ipc::PoolEntry, except: Option<RunId>)
         .count()
 }
 
+/// Whether `live` could hold a slot now: under its role's and its project's caps, and under the
+/// running limit of the pool entry it is standing on. [`admit_a_pass`]'s gates, less the queue,
+/// the checkout and the path gate — for a paused run taking back the slot its freeze gave up
+/// ([`AgentRegistry::reclaim_slots`]), which already stands in its checkout and on its entry.
+fn has_room(inner: &Inner, live: &LiveRun) -> bool {
+    let agent_held = inner.agent_slots.get(&live.key()).copied().unwrap_or(0);
+    let project_held = inner.project_slots.get(&live.project).copied().unwrap_or(0);
+    agent_held < live.agent_limit
+        && project_held < live.project_limit
+        && live.pool.get(live.pool_index).is_none_or(|entry| {
+            entry
+                .max_running
+                .is_none_or(|max| entry_load(inner, entry, Some(live.run)) < usize::from(max))
+        })
+}
+
 /// The bench standing on this target at `now`, if any. See [`Inner::benched`]. (M90)
 ///
 /// Expiry is read here rather than swept by a timer: an expired bench is simply one this answers
@@ -2263,6 +2290,11 @@ const SETTINGS_KEPT_FOR_A_PANE: &str = "settings changed, but this run's convers
 ///
 /// A const because three surfaces quote it — the panel through `AgentRun::note`, `cide_agent_runs`
 /// through `render_run`, and the tests — and a second wording of one fact reads as a second fact.
+/// The row of a run that was resumed with no slot free for it. See
+/// [`AgentRegistry::reclaim_slots`].
+const REQUEUED_ON_RESUME: &str = "resumed with no free slot; waiting in the queue — a new child \
+                                  continues the same conversation when one frees";
+
 pub(crate) const PAUSED_QUEUE_NOTE: &str =
     "this project's agents are paused; nothing starts until Resume";
 
@@ -2719,6 +2751,9 @@ enum Restarted {
     /// Its task was handed back to it after the run had ended — a reviewer's send-back, a red
     /// verify, a re-assignment. (M116) The process is new; the conversation is the earlier run's.
     HandedBack,
+    /// It was paused, and resumed when its role had no free slot, so it waited in the queue
+    /// with its process ended. See [`AgentRegistry::reclaim_slots`].
+    Requeued,
 }
 
 impl Restarted {
@@ -2728,6 +2763,10 @@ impl Restarted {
             Self::Settings => {
                 "cide restarted you on new model settings while you were paused; the \
                  conversation so far is yours, the process is new."
+            }
+            Self::Requeued => {
+                "you were paused, and when you were resumed there was no free slot for you, so \
+                 you waited in the queue; the conversation so far is yours, the process is new."
             }
             Self::HandedBack => {
                 "Your task has been handed back to you: the conversation above is your earlier \
@@ -3990,6 +4029,9 @@ fn freeze_run(live: &mut LiveRun, now_ms: u64) -> Option<SessionId> {
     live.frozen = Some(Frozen {
         state: live.state.clone(),
         at_unix_ms: now_ms,
+        // Taken off the run here and given back to the counts by [`freeze_in`], which holds
+        // the `Inner` this function deliberately does not.
+        slot: std::mem::replace(&mut live.slot, false),
     });
     move_to(
         live,
@@ -3998,6 +4040,17 @@ fn freeze_run(live: &mut LiveRun, now_ms: u64) -> Option<SessionId> {
         },
         now_ms,
     );
+    Some(session)
+}
+
+/// [`freeze_run`], and the slot it gives back. `None` when there is nothing to freeze.
+fn freeze_in(inner: &mut Inner, run: RunId, now_ms: u64) -> Option<SessionId> {
+    let live = inner.runs.get_mut(&run)?;
+    let session = freeze_run(live, now_ms)?;
+    if live.frozen.as_ref().is_some_and(|frozen| frozen.slot) {
+        let (key, project) = (live.key(), live.project);
+        release(inner, &key, project);
+    }
     Some(session)
 }
 
@@ -4063,6 +4116,9 @@ impl AgentRegistry {
             signal_session(app, *session, PauseSignal::Stop);
             crate::emit::session_state(app, &session.to_string(), SessionState::Paused);
         }
+        // The freeze gave its slots back (`Frozen::slot`), so a one-run pause may let the next
+        // queued run start. A project pause has shut the queue first and admits nothing here.
+        self.pump(app);
         self.mark_changed(app, project);
         Ok(())
     }
@@ -4105,7 +4161,7 @@ impl AgentRegistry {
                 ) {
                     return Err(CoreError::Io("this run has already ended".into()));
                 }
-                if let Some(session) = freeze_run(live, now_ms) {
+                if let Some(session) = freeze_in(&mut inner, run, now_ms) {
                     frozen.push((session, Some(run)));
                 }
             }
@@ -4121,10 +4177,7 @@ impl AgentRegistry {
                     .map(|live| live.run)
                     .collect();
                 for run in runs {
-                    let Some(live) = inner.runs.get_mut(&run) else {
-                        continue;
-                    };
-                    if let Some(session) = freeze_run(live, now_ms) {
+                    if let Some(session) = freeze_in(&mut inner, run, now_ms) {
                         frozen.push((session, Some(run)));
                     }
                 }
@@ -4179,6 +4232,12 @@ impl AgentRegistry {
         let settings_now = settings_now(app, project);
         let sessions = app.try_state::<SessionRegistry>();
 
+        // First of all, and before `plan_restarts`: a frozen run gave its slot back, so it must
+        // take one again before its child may move — and one that finds no room goes back to
+        // its role's queue instead, continuing the same conversation when a slot frees. Those
+        // are out of `thaws` from here; their frozen children are ended below.
+        let (thaws, requeued) = self.reclaim_slots(project, sessions.as_deref(), &thaws);
+
         // Decided **before** the `SIGCONT`, and the order is load-bearing: a run being restarted
         // is rebound to its successor's session under the lock, so nothing the old child prints
         // or reports between the thaw and its death can reach the run — `respawn`'s
@@ -4203,6 +4262,15 @@ impl AgentRegistry {
                 if let Some(pty) = sessions.get(*old) {
                     tracing::info!(session = %old, "winding down a paused run's child to restart it on the current settings");
                     end_tree(&pty, "a paused run restarted");
+                }
+            }
+            // Already unbound by `reclaim_slots`, so the exit that follows belongs to nobody.
+            // Continued first, because a stopped process does not act on the hang-up.
+            for old in &requeued {
+                if let Some(pty) = sessions.get(*old) {
+                    tracing::info!(session = %old, "ending a resumed run's frozen child: no free slot, so the run waits in the queue");
+                    signal_pty(&pty, PauseSignal::Cont);
+                    end_tree(&pty, "a resumed run requeued for a slot");
                 }
             }
         }
@@ -4280,6 +4348,131 @@ impl AgentRegistry {
             self.mark_changed(app, project);
         }
         self.pump(app);
+    }
+
+    /// Give each frozen run that gave up a slot at its freeze ([`Frozen::slot`]) one back — or,
+    /// when its role, the project or its pool target has no room left, **requeue it**. Answers
+    /// the thaws still to do and the sessions of the frozen children to end.
+    ///
+    /// Oldest dispatch first, so when room is short it goes to the runs that have waited
+    /// longest — admission's own order.
+    ///
+    /// # A requeued run continues its conversation, and why its child is ended rather than kept
+    ///
+    /// The run goes back to the **front** of its role's queue carrying a [`Requeued`]: the
+    /// conversation it was in, as a fork (`rebind: None`), and a continuation line saying why
+    /// the process is new. `abandon_unsubmitted`'s road, and for its reason: the session is
+    /// unbound under this lock, so the frozen child's exit — the caller ends it, after a
+    /// `SIGCONT` — finds no run to finish. Keeping the child frozen until a slot freed and
+    /// thawing it then would save the in-flight turn, but a model request frozen that long is
+    /// most likely dead anyway ([`STALE_FREEZE_MS`]), and a second road onto a child that
+    /// admission would have to thaw instead of fork is a second admission.
+    ///
+    /// A run that froze before its first turn began (`Starting`, first prompt) has nothing to
+    /// continue and is re-dispatched with its own prompt, `plan_restarts`' rule.
+    ///
+    /// # Two runs that take a slot whatever the counts say
+    ///
+    /// A run whose conversation **a pane is driving** (M42), because a successor would be a
+    /// second CLI on a transcript a person is typing into; and a run already **being stopped**,
+    /// which is about to end and must not be forked again. Both are thawed in place, and the
+    /// overshoot lasts as long as they do — `plan_restarts`' pool overshoot, for the same kind
+    /// of reason.
+    fn reclaim_slots(
+        &self,
+        project: ProjectId,
+        sessions: Option<&SessionRegistry>,
+        thaws: &[Thawing],
+    ) -> (Vec<Thawing>, Vec<SessionId>) {
+        let mut inner = self.inner.lock();
+        let mut order: Vec<(u64, usize)> = thaws
+            .iter()
+            .enumerate()
+            .map(|(at, thaw)| {
+                let seq = thaw
+                    .run
+                    .and_then(|run| inner.runs.get(&run))
+                    .map_or(0, |live| live.seq);
+                (seq, at)
+            })
+            .collect();
+        order.sort_unstable();
+
+        let mut kept = Vec::with_capacity(thaws.len());
+        let mut requeued = Vec::new();
+        for (_, at) in order {
+            let thaw = thaws[at];
+            let Some(run) = thaw.run else {
+                // The primary console session holds no slot to reclaim.
+                kept.push(thaw);
+                continue;
+            };
+            let Some(live) = inner.runs.get(&run).filter(|live| live.project == project) else {
+                kept.push(thaw);
+                continue;
+            };
+            if !live.frozen.as_ref().is_some_and(|frozen| frozen.slot) {
+                kept.push(thaw);
+                continue;
+            }
+            let must_thaw = live.stopping
+                || sessions.is_some_and(|sessions| viewed_by(&inner, sessions, live).is_some());
+            if must_thaw || has_room(&inner, live) {
+                let (key, project) = (live.key(), live.project);
+                *inner.agent_slots.entry(key).or_default() += 1;
+                *inner.project_slots.entry(project).or_default() += 1;
+                let live = inner.runs.get_mut(&run).expect("just read above");
+                live.slot = true;
+                if let Some(frozen) = live.frozen.as_mut() {
+                    frozen.slot = false;
+                }
+                kept.push(thaw);
+                continue;
+            }
+
+            let live = inner.runs.get_mut(&run).expect("just read above");
+            let Some(frozen) = live.frozen.take() else {
+                kept.push(thaw);
+                continue;
+            };
+            let never_began = matches!(frozen.state, RunState::Starting) && live.turns <= 1;
+            let resume = match never_began {
+                true => None,
+                false => resume_point(live).map(|point| ResumePoint {
+                    rebind: None,
+                    conversation: point.conversation,
+                }),
+            };
+            let prompt = match &resume {
+                Some(_) => continuation_prompt(
+                    live.task.as_ref(),
+                    live.task_title.as_deref(),
+                    cide_hook_binary().and_then(|_| cide_agents::harness::for_kind(live.harness)),
+                    Restarted::Requeued,
+                ),
+                None => {
+                    // Nothing to continue, so nothing to go on naming — `plan_restarts`' clear.
+                    live.harness_session = None;
+                    live.prompt.clone()
+                }
+            };
+            if resume.is_some() {
+                // A continuation carries real work, so a later provider failure must continue
+                // it rather than abandon it — the distinction `plan_failover` draws on this.
+                live.turns = live.turns.saturating_add(1);
+            }
+            tracing::info!(%run, agent = %live.agent, continuing = resume.is_some(), "resume: no free slot for a paused run; requeued it");
+            live.session = None;
+            live.stale_turn = false;
+            move_to(live, RunState::Queued, now_unix_ms());
+            live.requeued = Some(Requeued { resume, prompt });
+            live.note = Some(REQUEUED_ON_RESUME.to_string());
+            let key = live.key();
+            inner.frozen_sessions.remove(&thaw.session);
+            inner.queues.entry(key).or_default().push_front(run);
+            requeued.push(thaw.session);
+        }
+        (kept, requeued)
     }
 
     /// Which sessions a resume would thaw. **Reads only** — see [`Self::resume`] for why.
@@ -8083,10 +8276,21 @@ impl AgentRegistry {
     }
 
     /// Kill a run's child, if it still has one. The one spelling, for `stop`'s three callers.
+    ///
+    /// **A frozen child is continued first.** `end_tree` hangs the child up and `SIGKILL`s only
+    /// what it *started*; a `SIGSTOP`ped child leaves the hang-up pending until it is continued,
+    /// so a paused run's Stop killed its tools and left the child itself stopped for ever — no
+    /// exit, so no reaper, so a row reading Paused that no press of Stop could end (terrastrike,
+    /// four paused codex artists). Taking the freeze record off here is what the exit's `over`
+    /// arm in `set_state` would do; doing it now keeps a shutdown's `thaw_for_shutdown` from
+    /// signalling a child that is already on its way out.
     fn kill_child(&self, app: &AppHandle, session: Option<SessionId>) {
         if let (Some(session), Some(sessions)) = (session, app.try_state::<SessionRegistry>())
             && let Some(pty) = sessions.get(session)
         {
+            if self.inner.lock().frozen_sessions.remove(&session).is_some() {
+                signal_pty(&pty, PauseSignal::Cont);
+            }
             end_tree(&pty, "a stopped run");
         }
     }
@@ -13139,49 +13343,135 @@ mod tests {
         );
     }
 
-    /// **The slot is not touched by a freeze, in either direction.**
+    /// **A freeze gives the slot back, and a resume takes one again — or waits for it.**
     ///
-    /// A pause that released the slot would let the next queued run of the role start into the
-    /// worktree the frozen one is still sitting in; a resume that took a second one would let two
-    /// start once it finished. The run's claim on its role is a fact about its history, and being
-    /// stopped is not part of that history.
+    /// A `SIGSTOP`ped child computes nothing, so a paused run that went on counting against its
+    /// role's `max-concurrent` kept the role's queue still behind processes doing nothing. The
+    /// checkout is another matter and stays held (`holds_its_checkout`); these runs have none.
     #[test]
-    fn a_freeze_and_a_thaw_leave_the_slot_where_it_was() {
+    fn a_freeze_gives_the_slot_back_and_a_resume_with_no_room_requeues() {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let first = registry.enqueue(spec(project, "developer", 1, 4));
         let second = registry.enqueue(spec(project, "developer", 1, 4));
         registry.take_admissions();
-        registry.bind_session(first, SessionId::new());
+        let old = SessionId::new();
+        registry.bind_session(first, old);
         assert!(registry.set_state(None, first, RunState::Running));
 
         registry
             .take_freezes(project, Some(first), None, 1_000)
             .expect("the run is live");
-        assert!(
-            registry.take_admissions().is_empty(),
-            "a freeze released the worktree the frozen run is still sitting in"
-        );
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1, "the frozen run's slot went to the queue");
+        assert_eq!(admitted[0].run, second);
+        registry.bind_session(second, SessionId::new());
+        assert!(registry.set_state(None, second, RunState::Running));
 
+        // Resumed with the role full: back to the front of the queue, unbound, continuing.
         let thaws = registry
             .plan_thaws(project, Some(first))
             .expect("the run is frozen");
-        registry.finish_thaws(project, false, &thaws, 2_000);
-        assert_eq!(
-            state_of(&registry, first),
-            RunState::Running,
-            "a thawed run has to come back to the state it left"
-        );
+        let (thaws, requeued) = registry.reclaim_slots(project, None, &thaws);
+        assert!(thaws.is_empty(), "nothing to thaw in place");
+        assert_eq!(requeued, vec![old], "the frozen child is the one to end");
+        {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&first];
+            assert_eq!(live.state, RunState::Queued);
+            assert!(!live.slot);
+            assert!(live.frozen.is_none());
+            assert_eq!(
+                live.session, None,
+                "its dying child's exit belongs to nobody"
+            );
+            assert_eq!(live.note.as_deref(), Some(REQUEUED_ON_RESUME));
+            let requeue = live.requeued.as_ref().expect("carries the conversation");
+            let resume = requeue.resume.as_ref().expect("a conversation to continue");
+            assert_eq!(
+                resume.conversation,
+                old.to_string(),
+                "the same conversation"
+            );
+            assert!(resume.rebind.is_none(), "as a fork, not under the dying id");
+            assert!(!inner.frozen_sessions.contains_key(&old));
+        }
         assert!(
             registry.take_admissions().is_empty(),
-            "a thaw handed out a second slot for one run"
+            "the role is full; the requeued run waits"
         );
 
-        // And the ordinary release still works afterwards, exactly once.
+        // The slot frees, and the requeued run is admitted continuing its conversation.
+        assert!(registry.set_state(None, second, RunState::Idle));
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].run, first);
+        assert_eq!(
+            admitted[0]
+                .resume
+                .as_ref()
+                .map(|point| point.conversation.clone()),
+            Some(old.to_string())
+        );
+    }
+
+    /// With room, a resume takes a slot and thaws in place — once, so the ordinary release that
+    /// follows frees exactly one.
+    #[test]
+    fn a_resume_with_room_takes_one_slot_and_thaws_in_place() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        registry.bind_session(first, SessionId::new());
+        assert!(registry.set_state(None, first, RunState::Running));
+        registry
+            .take_freezes(project, None, None, 1_000)
+            .expect("a project may always be paused");
+        let second = registry.enqueue(spec(project, "developer", 1, 4));
+        assert!(
+            registry.take_admissions().is_empty(),
+            "a paused project admits nothing, freed slot or not"
+        );
+
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let (thaws, requeued) = registry.reclaim_slots(project, None, &thaws);
+        assert!(requeued.is_empty());
+        registry.finish_thaws(project, true, &thaws, 2_000);
+        assert_eq!(state_of(&registry, first), RunState::Running);
+        assert!(
+            registry.take_admissions().is_empty(),
+            "the resumed run took the role's one slot back ahead of the queue"
+        );
+
         assert!(registry.set_state(None, first, RunState::Idle));
         let admitted = registry.take_admissions();
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].run, second);
+    }
+
+    /// An idle run froze holding no slot and thaws holding none, whatever the counts say.
+    #[test]
+    fn an_idle_run_needs_no_slot_to_resume() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        registry.bind_session(first, SessionId::new());
+        assert!(registry.set_state(None, first, RunState::Running));
+        assert!(registry.set_state(None, first, RunState::Idle));
+        let second = registry.enqueue(spec(project, "developer", 1, 4));
+        assert_eq!(registry.take_admissions()[0].run, second);
+
+        registry
+            .take_freezes(project, Some(first), None, 1_000)
+            .expect("an idle run has a child");
+        let thaws = registry.plan_thaws(project, Some(first)).expect("frozen");
+        let (thaws, requeued) = registry.reclaim_slots(project, None, &thaws);
+        assert!(requeued.is_empty());
+        assert_eq!(thaws.len(), 1);
+        registry.finish_thaws(project, false, &thaws, 2_000);
+        assert_eq!(state_of(&registry, first), RunState::Idle);
     }
 
     /// **Resume reopens the queue and the next pump drains it.**
@@ -14859,6 +15149,14 @@ mod tests {
     /// A claude run forked on `model`, running, and then frozen by a project pause — with a
     /// queued sibling behind it in a one-slot role, so a slot given away shows up as an
     /// admission.
+    /// What `resume` hands `plan_restarts`: the project's thaws, each holding its slot again.
+    fn thaws_of(registry: &AgentRegistry, project: ProjectId) -> Vec<Thawing> {
+        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let (thaws, requeued) = registry.reclaim_slots(project, None, &thaws);
+        assert!(requeued.is_empty(), "the frozen run's slot is still free");
+        thaws
+    }
+
     fn a_frozen_run(
         registry: &AgentRegistry,
         project: ProjectId,
@@ -14900,7 +15198,7 @@ mod tests {
         let project = ProjectId::new();
         let (run, old) = a_frozen_run(&registry, project, "sonnet");
 
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
             Some(forked_on(Harness::Claude, "opus"))
         });
@@ -14970,7 +15268,7 @@ mod tests {
         let project = ProjectId::new();
         let (run, old) = a_frozen_run(&registry, project, "sonnet");
 
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
             Some(forked_on(Harness::Claude, "sonnet"))
         });
@@ -15013,7 +15311,7 @@ mod tests {
             .take_freezes(project, None, None, 1_000)
             .expect("paused");
 
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
             Some(forked_on(Harness::Claude, "opus"))
         });
@@ -15069,7 +15367,7 @@ mod tests {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let (run, old) = frozen_on_the_pool(&registry, project);
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         let edited = vec![pool_entry("anthropic", "claude-sonnet-4-5")];
         let restarts =
             registry.plan_restarts(project, None, &thaws, &|_| Some(forked(&edited, None)));
@@ -15095,7 +15393,7 @@ mod tests {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let (run, old) = frozen_on_the_pool(&registry, project);
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         let restarts = registry.plan_restarts(project, None, &thaws, &|_| {
             Some(forked(&pool, Some("high")))
         });
@@ -15134,7 +15432,7 @@ mod tests {
             old,
         );
 
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         let restarts = registry.plan_restarts(project, Some(&sessions), &thaws, &|_| {
             Some(forked_on(Harness::Claude, "opus"))
         });
@@ -15170,7 +15468,7 @@ mod tests {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let (run, old) = a_frozen_run(&registry, project, "sonnet");
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         registry.plan_restarts(project, None, &thaws, &|_| {
             Some(forked_on(Harness::Claude, "opus"))
         });
@@ -15213,7 +15511,7 @@ mod tests {
         let registry = Arc::new(AgentRegistry::default());
         let project = ProjectId::new();
         let (run, old) = a_frozen_run(&registry, project, "sonnet");
-        let thaws = registry.plan_thaws(project, None).expect("frozen");
+        let thaws = thaws_of(&registry, project);
         registry.plan_restarts(project, None, &thaws, &|_| {
             Some(forked_on(Harness::Claude, "opus"))
         });

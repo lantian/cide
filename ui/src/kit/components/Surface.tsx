@@ -4,6 +4,7 @@
 import type { HTMLAttributes, KeyboardEvent, ReactElement, ReactNode } from 'react'
 
 import { Icon, type IconName } from '@/icons/Icon'
+import { InfoTip } from './InfoTip'
 import styles from './Surface.module.css'
 
 export function PanelHeader({
@@ -40,16 +41,20 @@ export function Heading({ title, lead }: { title: string; lead?: ReactNode }): R
 export function Section({
   caption,
   aside,
+  info,
   children,
 }: {
   caption: string
   aside?: ReactNode
+  /** What the whole group is about, behind an (i) after the caption (M133). */
+  info?: ReactNode
   children: ReactNode
 }): ReactElement {
   return (
     <section className={styles.section}>
       <h3 className={styles.caption}>
         {caption}
+        {info !== undefined && <InfoTip label={`About ${caption}`}>{info}</InfoTip>}
         {aside !== undefined && <span className={styles.captionAside}>{aside}</span>}
       </h3>
       {children}

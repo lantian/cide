@@ -1012,6 +1012,16 @@ export function groupOf(view: StatusView, repo: RepoId, group: string): GroupVie
  * A list that does not exist yet — *New changelist…* mints one and moves in the same gesture —
  * has nothing ticked and so takes the second answer, which is the one that matches what "move
  * these somewhere else" is nearly always for.
+ *
+ * # Except `Changes`, which always ticks
+ *
+ * > *"Git tree panel - all changes that was moved to "Changes" should be automatically staged."*
+ *
+ * Filing into the default list is a statement that the change is back in the working set, so
+ * it arrives ticked whatever the list's ticks said — and `useGitPanel::movePaths` `git add`s it
+ * in the same gesture, so the tick and the index say the same thing. Reading the destination
+ * would have left a file dragged into an unticked `Changes` unticked, which is the one outcome
+ * the request rules out. Every other list keeps the destination rule above.
  */
 export function ticksAfterMove(
   view: StatusView,
@@ -1022,7 +1032,8 @@ export function ticksAfterMove(
 ): Set<string> {
   const group = groupOf(view, repo, `${CHANGELIST_PREFIX}${changelist}`)
   const joining =
-    group !== undefined && group.entries.some((e) => selected.has(fileRowId(repo, e.path)))
+    changelist === DEFAULT_CHANGELIST
+    || (group !== undefined && group.entries.some((e) => selected.has(fileRowId(repo, e.path))))
   const next = new Set(selected)
   for (const path of paths) {
     const id = fileRowId(repo, path)

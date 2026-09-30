@@ -49,7 +49,17 @@ import type {
 import { remote } from '@/ipc/client'
 import { events } from '@/ipc/client'
 import { errorText } from '@/ipc/errorText'
-import { ActionButton, Group, Note, NumberField, Row, Segmented, ToggleRow } from './controls'
+import {
+  ActionButton,
+  Group,
+  NumberField,
+  Readout,
+  Row,
+  Segmented,
+  ToggleRow,
+  resetTo,
+  useSettingsDefaults,
+} from './controls'
 import styles from './RemoteSection.module.css'
 
 /** What a paired device is allowed to do. Stated where the permission is granted. */
@@ -128,18 +138,28 @@ export function RemoteSection({
     void remote.pairingCancel()
   }
 
+  const def = useSettingsDefaults()?.remote
+  const setRemote = (next: Partial<RemoteSettings>) => patch({ remote: { ...settings, ...next } })
+
   return (
     <>
       <Group title="Remote access">
+        {/* The grant in full is the (i) on the switch that grants it — still stated where it is
+            given, which is what `check:remote` holds this to — with a line under the label that
+            says the gist, since M133 kept every hint to one line. */}
         <ToggleRow
           label="Let a phone connect to this cide"
-          hint={GRANT}
+          hint="A paired device can read and type into sessions, and act on runs and tasks."
+          info={GRANT}
+          {...resetTo(settings.enabled, def?.enabled, (enabled) => setRemote({ enabled }))}
           checked={settings.enabled}
-          onChange={(enabled) => patch({ remote: { ...settings, enabled } })}
+          onChange={(enabled) => setRemote({ enabled })}
         />
         <Row
           label="Reachable from"
-          hint="Loopback means this machine only, which is no use to a phone. This network binds every interface, which is what a laptop that moves between networks needs."
+          hint="A phone needs This network; This machine is loopback only."
+          info="Loopback means this machine only, which is no use to a phone. This network binds every interface, which is what a laptop that moves between networks needs."
+          {...resetTo(bind, def === undefined ? undefined : def.bind.kind === 'network' ? 'network' : 'loopback', setBind)}
           control={
             <Segmented
               value={bind}
@@ -154,23 +174,27 @@ export function RemoteSection({
         />
         <Row
           label="Port"
-          hint="Zero derives one from this profile, so a real instance and a [DEV] instance differ without being configured. A port you choose is refused if it is taken, rather than moved."
+          hint="0 picks one from this profile."
+          info="Zero derives one from this profile, so a real instance and a [DEV] instance differ without being configured. A port you choose is refused if it is taken, rather than moved."
+          {...resetTo(settings.port, def?.port, (port) => setRemote({ port }))}
           control={
             <NumberField
               value={settings.port}
               min={0}
               max={65535}
               step={1}
-              onChange={(port) => patch({ remote: { ...settings, port } })}
+              onChange={(port) => setRemote({ port })}
               label="Port"
             />
           }
         />
         <ToggleRow
           label="Allow a public address"
-          hint="Off, cide refuses to bind an address that is routable from the internet. Reaching this machine from outside your network is a different decision from reaching it from inside one."
+          hint="Off refuses to bind an address routable from the internet."
+          info="Reaching this machine from outside your network is a different decision from reaching it from inside one."
+          {...resetTo(settings.allowNonPrivate, def?.allowNonPrivate, (allowNonPrivate) => setRemote({ allowNonPrivate }))}
           checked={settings.allowNonPrivate}
-          onChange={(allowNonPrivate) => patch({ remote: { ...settings, allowNonPrivate } })}
+          onChange={(allowNonPrivate) => setRemote({ allowNonPrivate })}
         />
       </Group>
 
@@ -180,7 +204,9 @@ export function RemoteSection({
 
       <Group title="Paired devices">
         {devices.length === 0 ? (
-          <Note>No device is paired. Nothing is listening until one is, or until a pairing code is open.</Note>
+          <p className={styles.line}>
+            No device is paired. Nothing is listening until one is, or until a pairing code is open.
+          </p>
         ) : (
           <ul className={styles.devices}>
             {devices.map((device) => (
@@ -191,13 +217,17 @@ export function RemoteSection({
         {invite ? (
           <Invite invite={invite} attempt={attempt} onCancel={cancelPairing} />
         ) : (
-          <ActionButton
-            label="Pair a device…"
-            onClick={startPairing}
-            disabled={!settings.enabled}
+          // A row rather than a bare button, so a failure to open a pairing window is this row's
+          // status — on the act that failed — instead of a note under the device list. (M133)
+          <Row
+            label="Pair a device"
+            hint={settings.enabled ? 'Shows a code and a QR for the phone app.' : 'Turn on remote access first.'}
+            status={failure ? { tone: 'warn', text: failure } : undefined}
+            control={
+              <ActionButton label="Pair…" onClick={startPairing} disabled={!settings.enabled} />
+            }
           />
         )}
-        {failure ? <Note tone="warn">{failure}</Note> : null}
       </Group>
     </>
   )
@@ -205,27 +235,36 @@ export function RemoteSection({
 
 function StatusReadout({ status }: { status: RemoteStatus }) {
   if (status.state === 'off') {
-    return <Note>Not listening.</Note>
+    return <Row label="Listener" control={<Readout text="Not listening" />} />
   }
   if (status.state === 'refused') {
     // Named rather than shown as an empty address list, which reads as "starting…".
-    return <Note tone="warn">{status.why}</Note>
+    return (
+      <Row
+        label="Listener"
+        status={{ tone: 'warn', text: status.why }}
+        control={<Readout text="Refused" />}
+      />
+    )
   }
   return (
-    <div className={styles.status}>
-      <p className={styles.line}>
-        {status.connected === 0
-          ? 'Listening. No device is connected.'
-          : `Listening. ${status.connected} device${status.connected === 1 ? '' : 's'} connected.`}
-      </p>
-      <ul className={styles.addresses}>
-        {status.addresses.map((address) => (
-          <li key={address} className={styles.address}>
-            {address.includes(':') ? `[${address}]` : address}:{status.port}
-          </li>
-        ))}
-      </ul>
-    </div>
+    <Row
+      label="Listener"
+      hint={
+        status.connected === 0
+          ? 'No device is connected.'
+          : `${status.connected} device${status.connected === 1 ? '' : 's'} connected.`
+      }
+      control={
+        <ul className={styles.addresses}>
+          {status.addresses.map((address) => (
+            <li key={address} className={styles.address}>
+              {address.includes(':') ? `[${address}]` : address}:{status.port}
+            </li>
+          ))}
+        </ul>
+      }
+    />
   )
 }
 
@@ -348,10 +387,10 @@ function Invite({
         <p className={styles.line}>Type this into the app, with the address above:</p>
       )}
       <p className={styles.code}>{invite.grouped}</p>
-      <Note>
+      <p className={styles.line}>
         Good for two minutes, and for one device. A wrong code cancels it — type it carefully
         rather than quickly.
-      </Note>
+      </p>
       <ActionButton label="Cancel" onClick={onCancel} />
     </div>
   )

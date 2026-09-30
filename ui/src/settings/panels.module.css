@@ -155,45 +155,6 @@
   color: var(--faint);
 }
 
-/* --- the graphics ladder --- */
-
-.rung {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-6);
-  padding: var(--sp-5) 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.rungText {
-  flex: 1;
-  min-width: 0;
-}
-
-.rungLabel {
-  font-size: var(--fs-ui-13);
-  color: var(--text);
-}
-
-.rungVar {
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  color: var(--faint);
-  margin-top: var(--sp-1);
-}
-
-.rungCost {
-  font-size: var(--fs-ui-12);
-  line-height: 1.45;
-  color: var(--dim);
-  margin-top: var(--sp-2);
-}
-
-.restart {
-  display: inline-flex;
-  margin-top: var(--sp-2);
-}
-
 /*
  * The colour-scheme row's three controls on one line. (M24)
  *

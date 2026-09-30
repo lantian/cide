@@ -26,7 +26,8 @@
  * for the same reason, and `sections.tsx` says so where it renders both.
  */
 import { TextInput } from '@/kit/components/Field'
-import { Group, NumberField, Note, Row, Segmented, ToggleRow } from './controls'
+import { EmptyState } from '@/kit/components/Feedback'
+import { Group, NumberField, Row, Segmented, ToggleRow } from './controls'
 import styles from './controls.module.css'
 import { notifyFailure } from '@/chrome/notices'
 import { ext as extApi } from '@/ipc/client'
@@ -134,12 +135,13 @@ export function ExtensionSettingsView({
       && (extension.contributes.settings.length > 0 || onRail(extension)),
   )
 
+  // The kit's empty state, not a note: an empty page is the page's whole content, and a blue
+  // block sitting where the rows would be read as a notice about something else. (M133)
   if (extensions.length === 0) {
     return (
-      <Note title="No extensions are installed">
-        Extensions are installed from a marketplace, in the Extensions panel on the activity rail.
-        Anything you install that has settings will add them here.
-      </Note>
+      <EmptyState icon="puzzle" title="No extensions are installed">
+        Install them from a marketplace in the Extensions panel; their settings appear here.
+      </EmptyState>
     )
   }
   if (rows.length === 0) {
@@ -147,11 +149,10 @@ export function ExtensionSettingsView({
     // "yours have none to configure" are two different facts and only one of them suggests
     // installing something.
     return (
-      <Note title="Nothing to configure">
+      <EmptyState icon="puzzle" title="Nothing to configure">
         {extensions.length === 1 ? 'The installed extension declares' : 'The installed extensions declare'}
-        {' '}no settings and no sidebar panel. An extension adds rows here by listing settings
-        under `contributes.settings` in its manifest, or a panel under `contributes.panels`.
-      </Note>
+        {' '}no settings and no sidebar panel.
+      </EmptyState>
     )
   }
 
@@ -203,7 +204,19 @@ function SettingRow({
   onChange: (next: boolean | string | number) => void
 }): React.JSX.Element {
   const kind = setting.kind
-  const hint = setting.description
+  // A manifest's description is the extension author's prose, of any length. One that fits a
+  // line is the row's hint; a longer one goes behind the (i), on the rule every other settings
+  // row follows (M133) — the extension's words, not cide's, but the same screen.
+  const description = setting.description
+  const long = description !== undefined && description.length > 90
+  const hint = long ? undefined : description
+  const info = long ? description : undefined
+  // Every manifest kind declares its default, so the changed-from-default dot and its Reset
+  // work for an extension's rows exactly as for cide's own.
+  const reset = {
+    modified: value !== undefined && value !== kind.default,
+    onReset: () => onChange(kind.default),
+  }
 
   switch (kind.type) {
     case 'toggle':
@@ -211,6 +224,8 @@ function SettingRow({
         <ToggleRow
           label={setting.label}
           hint={hint}
+          info={info}
+          {...reset}
           // `?? kind.default` guards one real case: an extension updated to add a setting between
           // Rust resolving the snapshot and this render. Rust fills every declared key, so it is a
           // frame at most — but a `checked={undefined}` is an uncontrolled input, and React
@@ -226,6 +241,8 @@ function SettingRow({
         <Row
           label={setting.label}
           hint={hint}
+          info={info}
+          {...reset}
           control={
             <NumberField
               label={setting.label}
@@ -246,6 +263,8 @@ function SettingRow({
         <Row
           label={setting.label}
           hint={hint}
+          info={info}
+          {...reset}
           control={
             <Segmented
               label={setting.label}
@@ -266,6 +285,8 @@ function SettingRow({
         <Row
           label={setting.label}
           hint={hint}
+          info={info}
+          {...reset}
           control={
             <div className={styles.selectBox}>
             <TextInput

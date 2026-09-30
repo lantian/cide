@@ -987,6 +987,43 @@ pub fn update_check_requested(app: &AppHandle, window: &cide_ipc::WindowLabel) {
     }
 }
 
+/// The console asked for a registry command to run, as the palette would run it (M134,
+/// `cide_command_run`).
+///
+/// Addressed to the one shell window that has the project in its strip, for
+/// [`UPDATE_CHECK_REQUESTED`]'s reason: every window runs its own dispatcher, and a command
+/// broadcast to all of them would open the palette in each. `project` rides along so a window
+/// whose active project is another can switch to the caller's first — a command acts on the
+/// active project, and the user typed the request into this one.
+pub const COMMAND_REQUESTED: &str = "cide://command-requested";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandRequested<'a> {
+    window: &'a str,
+    project: cide_ipc::ProjectId,
+    command: &'a str,
+    args: Option<serde_json::Value>,
+}
+
+pub fn command_requested(
+    app: &AppHandle,
+    window: &cide_ipc::WindowLabel,
+    project: cide_ipc::ProjectId,
+    command: &str,
+    args: Option<serde_json::Value>,
+) {
+    let payload = CommandRequested {
+        window: &window.0,
+        project,
+        command,
+        args,
+    };
+    if let Err(error) = app.emit_to(window.0.as_str(), COMMAND_REQUESTED, payload) {
+        tracing::debug!(%error, window = %window.0, "command-requested reached no window");
+    }
+}
+
 /// A paired device pressed PgUp/PgDn on a session showing the normal screen. (M91)
 ///
 /// The pane host holding `session` scrolls its xterm by `pages` — the desk's view and the

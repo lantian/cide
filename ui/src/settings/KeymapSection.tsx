@@ -33,7 +33,11 @@
  */
 import { Button } from '@/kit/components/Button'
 import { SearchField } from '@/kit/components/Field'
-import { Note as KitNote } from '@/kit/components/Feedback'
+// The kit's `Note` directly, and deliberately still a note (M133, which moved every other
+// settings note onto the row it was about): a conflict or a problem is about the keymap *file*,
+// several bindings at once, and it sits above the table as a list of findings — not between two
+// rows it could be mistaken for.
+import { Banner, Note as KitNote } from '@/kit/components/Feedback'
 import { Dialog } from '@/kit/components/Overlay'
 import { Kbd } from '@/kit/components/Status'
 import { Modal } from '@/overlays/ModalShell'
@@ -68,7 +72,6 @@ import {
   type KeyClash,
   type KeymapEntry,
 } from './keymapModel'
-import { Note } from './controls'
 import styles from './panels.module.css'
 
 
@@ -174,7 +177,9 @@ export function KeymapSection() {
   )
 
   if (error !== null && report === null) {
-    return <Note title="The keymap could not be read">{error}</Note>
+    // The whole page is moot without a report, so this is the page's banner rather than a note
+    // among rows that are not there. (M133)
+    return <Banner tone="bad">The keymap could not be read: {error}</Banner>
   }
   if (report === null) {
     return <div className={styles.clean}>Reading the keymap…</div>

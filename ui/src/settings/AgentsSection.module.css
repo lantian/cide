@@ -193,7 +193,10 @@
 }
 
 .fieldLabel {
-  display: block;
+  /* Flex so the (i) that holds the rest of a field's explanation (M133) sits centred on the
+     label's line rather than on its baseline. */
+  display: flex;
+  align-items: center;
   font-size: var(--fs-ui-13);
   color: var(--text);
   margin-bottom: var(--sp-3);
@@ -205,6 +208,28 @@
   line-height: 1.45;
   color: var(--dim);
   margin-top: 5px;
+}
+
+/*
+ * Something about the field's state that is not a refusal (M133): a save that will move the file,
+ * a colour this build does not know, a model probe that could not run. The kit `FormRow`'s status
+ * line — warn icon in the tone, words in `--text` — because it replaced a boxed warn note placed
+ * under the field, which read as a problem with the whole dialog.
+ */
+.fieldStatus {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.fieldStatus > svg {
+  flex: none;
+  margin-top: calc(2px * var(--ui-scale));
+  color: var(--yellow);
 }
 
 .input {

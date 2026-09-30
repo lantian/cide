@@ -1,5 +1,5 @@
 /*
- * The proxy section's own layout: a stacked full-width field, and the environment readout.
+ * The proxy section's own layout: the URL fields' width, and the environment readout.
  *
  * Everything is a token from `styles/tokens.css`, so both themes follow without a media
  * query. Light is the default palette and it is white — `--panel-2` is #f6f6f9 there and
@@ -7,55 +7,12 @@
  * literal.
  */
 
-/* --- the mode choice --- */
-
-.modeRow {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-4);
-  padding: 4px 0 11px;
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.modeHint {
-  margin: 0;
-  font-size: var(--fs-ui-12);
-  line-height: 1.45;
-  color: var(--dim);
-  /* The three hints differ in length; a fixed floor stops the section below jumping when the
-     user tries each mode in turn. Three lines at 12px/1.45. */
-  min-height: calc(52px * var(--ui-scale));
-}
-
-/* --- a stacked text field --- */
-
-.field {
+/* The URL fields, as row controls: wide enough for a proxy URL to be read whole, narrow
+   enough to share the row with its label on the 620px page. */
+.url {
   display: block;
-  padding: 11px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.field:last-child {
-  border-bottom: 0;
-}
-
-.fieldLabel {
-  display: block;
-  font-size: var(--fs-ui-12);
-  font-weight: 500;
-  color: var(--text);
-  margin-bottom: var(--sp-3);
-}
-
-
-
-
-.fieldHint {
-  display: block;
-  font-size: var(--fs-ui-11);
-  line-height: 1.45;
-  color: var(--dim);
-  margin-top: var(--sp-3);
+  width: calc(300px * var(--ui-scale));
+  max-width: 100%;
 }
 
 /* --- the environment readout --- */
@@ -103,20 +60,14 @@
   color: var(--faint);
 }
 
-.readoutEmpty,
-.readoutFoot {
-  margin: var(--sp-4) 0 0;
+.readoutEmpty {
+  margin: 0;
   font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
 }
 
-.readoutEmpty {
-  margin-top: 0;
-}
-
-.readoutEmpty code,
-.readoutFoot code {
+.readoutEmpty code {
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   color: var(--text);

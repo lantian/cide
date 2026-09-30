@@ -2,33 +2,11 @@
  * The launch-configuration section: repeatable rows, and the resolved-argv readout.
  *
  * Every colour is a token from `styles/tokens.css`, so both themes follow with no media query
- * — the same rule `ProxySection.module.css` states at its top. The field vocabulary
- * (`.field`, `.fieldLabel`, `.input`, `.fieldHint`) is deliberately identical to that file's:
- * these two sections sit one above the other on the same screen, and a second, subtly
- * different text input is the kind of drift a reader notices and cannot name.
+ * — the same rule `ProxySection.module.css` states at its top. Every input here is `.input`,
+ * the kit field's numbers on a bare element: the page's rows carry a state the kit field does
+ * not draw, and a second, subtly different text input is the kind of drift a reader notices
+ * and cannot name.
  */
-
-/* --- a stacked text field, matching ProxySection --- */
-
-.field {
-  display: block;
-  padding: 11px 0;
-}
-
-.fieldLabel {
-  display: block;
-  font-size: var(--fs-ui-13);
-  color: var(--text);
-  margin-bottom: var(--sp-3);
-}
-
-.fieldHint {
-  display: block;
-  font-size: var(--fs-ui-12);
-  line-height: 1.45;
-  color: var(--dim);
-  margin-top: 5px;
-}
 
 /*
  * The kit `TextInput`'s look — the `--bg` box, one control height, the accent border and 3px
@@ -227,24 +205,43 @@
   min-width: 0;
 }
 
+/* The injection's name and its (i): fixed, so the flag fields beside them line up. */
+.injectionTitle {
+  flex: none;
+  display: flex;
+  align-items: center;
+  width: calc(130px * var(--ui-scale));
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
 /*
- * `--dim`, like `.why`: this is the explanation under a control, not an alarm. It is prose and
- * it is meant to be read, so it gets the line height of prose rather than of a hint.
+ * The headline of what switching it off costs (M133), one line under the row. The paragraph
+ * it heads is behind the (i); this line is the part that stops a user flipping the wrong
+ * switch, so it stays on screen. `--dim`, like `.why`: the explanation, not an alarm.
  */
-.injectionCost {
-  margin: var(--sp-3) 0 0;
-  font-size: var(--fs-ui-12);
-  line-height: 1.5;
+.injectionShort {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
   color: var(--dim);
 }
 
-.injectionCost code {
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-11);
-  color: var(--text);
+/* The Program row's control: wide enough for a wrapper's path, narrow enough to share the
+   row with its label (the kit row's text floor is 260px of a 620px page). */
+.program {
+  width: calc(260px * var(--ui-scale));
 }
 
-.injectionCost strong {
-  color: var(--text);
-  font-weight: 600;
+/* Codex's rows name their flag rather than let the user rename it: mono and dim, beside the
+   name, taking the slack a claude row gives its rename field. */
+.injectionCode {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
 }

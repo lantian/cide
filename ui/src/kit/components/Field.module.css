@@ -228,6 +228,9 @@
 }
 
 .rowLabel {
+  position: relative;
+  display: flex;
+  align-items: center;
   font-size: var(--fs-ui-13);
   color: var(--text);
 }
@@ -242,4 +245,90 @@
 .rowControl {
   flex: none;
   max-width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
 }
+
+/*
+ * A row with a status (M133): the tone as a 3px bar down the left and a faint wash, with the
+ * reason in one line under the label. It replaced the `Note` placed between two rows, which the
+ * user reported as unclear about which row it meant — the bar is *on* the row, so it cannot be
+ * about the neighbour. The row is inset by the bar's room so the label does not move sideways
+ * against the rows above and below it any more than the bar needs.
+ */
+.row[data-tone] {
+  position: relative;
+  padding-left: var(--sp-5);
+  padding-right: var(--sp-4);
+  border-radius: var(--r-2);
+  background: color-mix(in srgb, var(--tone) 6%, transparent);
+}
+
+.row[data-tone]::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: var(--sp-2);
+  bottom: var(--sp-2);
+  width: calc(3px * var(--ui-scale));
+  border-radius: var(--r-full);
+  background: var(--tone);
+}
+
+.row[data-tone='info'] {
+  --tone: var(--blue);
+}
+.row[data-tone='ok'] {
+  --tone: var(--green);
+}
+.row[data-tone='warn'] {
+  --tone: var(--yellow);
+}
+.row[data-tone='bad'] {
+  --tone: var(--red);
+}
+
+.rowStatus {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.rowStatus > svg {
+  flex: none;
+  margin-top: calc(1px * var(--ui-scale));
+  color: var(--tone);
+}
+
+/* Changed from the default: the accent's "yours" mark, before the label so a column of labels
+   stays aligned whether or not a row carries it — it hangs in the gutter left of the label. */
+.rowModified {
+  flex: none;
+  width: calc(6px * var(--ui-scale));
+  height: calc(6px * var(--ui-scale));
+  position: absolute;
+  right: 100%;
+  margin-right: calc(6px * var(--ui-scale));
+  border-radius: var(--r-full);
+  background: var(--accent);
+}
+
+/*
+ * What Settings search lands on: the caller sets `data-flash` for a moment and the row washes in
+ * the accent, then fades back as the attribute goes. A transition on a paint property, not a
+ * keyframe animation, so the one reduced-motion switch (`--dur-*` zeroed in `tokens.css`,
+ * `check:motion`) turns it into a plain on-and-off — still found, not animated.
+ */
+.row {
+  transition: background-color var(--dur-2) var(--ease-out);
+}
+
+.row[data-flash] {
+  background-color: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+

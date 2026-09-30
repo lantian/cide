@@ -2,8 +2,9 @@ import { useState, type ReactElement } from 'react'
 
 import { Button, IconButton } from '../../components/Button'
 import { Field, FormRow, SearchField, Textarea, TextInput } from '../../components/Field'
+import { InfoPara } from '../../components/InfoTip'
 import { Select } from '../../components/Select'
-import { Kbd } from '../../components/Status'
+import { Badge, Kbd } from '../../components/Status'
 import { Segmented, Switch } from '../../components/Choice'
 import { Cell, Chapter, Line, Specimen, Stack } from '../Specimen'
 
@@ -234,14 +235,27 @@ export function Fields(): ReactElement {
       <Specimen
         name="Settings row"
         source="Field.tsx › FormRow"
-        use="A setting: label and one-line hint on the left, the control on the right, a soft rule between rows. A control too wide to share the line wraps under the text."
+        use="A setting: label and one-line hint on the left, the control on the right, a soft rule between rows. The rest of the explanation goes behind `info`'s (i); a problem with this setting's state is its `status` (tone bar and one line); `modified` + `onReset` mark a changed value and offer the way back. A control too wide to share the line wraps under the text."
         ground="panel"
       >
         <div style={{ width: '100%' }}>
           <FormRow label="Format on save" hint="Runs the project formatter before writing the file.">
             <Switch label="Format on save" checked={format} onChange={setFormat} />
           </FormRow>
-          <FormRow label="Tab width" hint="Spaces a Tab inserts in files with no editorconfig.">
+          <FormRow
+            label="Tab width"
+            hint="Spaces a Tab inserts in files with no editorconfig."
+            info={
+              <>
+                <InfoPara>A file that already indents keeps its own width; this decides only a new or unindented one.</InfoPara>
+                <InfoPara>
+                  An <code>.editorconfig</code> beside the file outranks it.
+                </InfoPara>
+              </>
+            }
+            modified={tab !== '4'}
+            onReset={() => setTab('4')}
+          >
             <Select
               size="sm"
               aria-label="Tab width"
@@ -252,6 +266,14 @@ export function Fields(): ReactElement {
                 { value: '4', label: '4 spaces' },
               ]}
             />
+          </FormRow>
+          <FormRow
+            label="Claude Code"
+            hint="The CLI a new console runs."
+            status={{ tone: 'warn', text: 'Untested version 2.9.0 — inline diffs may not work.' }}
+            info="The IDE protocol has no version field, so cide can only be right or wrong about it. The terminal itself is unaffected."
+          >
+            <Badge tone="yellow">2.9.0</Badge>
           </FormRow>
           <FormRow
             label="When your branch has diverged"

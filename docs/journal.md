@@ -16608,3 +16608,138 @@ Not done:
 - The per-branch fallback after a red combined verify verifies each branch alone, the `each`
   road's guarantee, so two branches green alone and red together can still both land on that
   road. The batch answer says so when it happens.
+
+## M133 — Settings, redesigned to be read
+
+The user reported that Settings was hard to read and understand, for two reasons:
+- **Too much text on screen.** Hints of 60–130 words were drawn under every label. Harness and
+  Agents were walls of prose.
+- **Notices nobody could place.** Blue (info) and amber (warn) kit `Note`s, about fifty of them,
+  sat between rows without saying which row they meant.
+
+They asked for a full redesign on current UI practice. They chose each direction: explanations
+behind an (i) popover, notices attached to their row, search, a grouped nav, tabs in the heavy
+pages, and changed-from-default markers.
+
+**Kit first.**
+- **`InfoTip` / `InfoPara`** (`kit/components/InfoTip.tsx`):
+  - opens on hover after 300ms, and on focus at once; a click pins it;
+  - Escape or an outside mouse-down closes it;
+  - portalled and placed the way `Select` is;
+  - prose only, because the portal sits last in the tab order;
+  - a screen reader reads an inline hidden copy through `aria-describedby`;
+  - the popover mounts only while open, so the node-rendered kit page and render checks never
+    portal.
+- **`FormRow` gained:**
+  - `info`;
+  - `status` (tone bar, wash, one line under the label);
+  - `modified` + `onReset` (an accent dot in the gutter, and a quiet undo button);
+  - `anchor` → `data-setting`;
+  - `data-flash` as a `--dur-2` background transition, not a keyframe animation: `check:motion`
+    allows exactly one reduced-motion block, and this way zeroed durations make it a plain
+    on/off.
+- **`Section`** gained `info`.
+- Specimens and `docs/ui-kit.md` entries for all of them.
+
+**The shell** (`SettingsTab`, `sections.tsx`):
+- **Nav:** a search field over four groups — General, Editing, AI, Tools. `SECTIONS` no longer
+  claims the enum's order, which it had already drifted from.
+- **Page head:** title with an (i) for `about`, one line of description, kit `Tabs` for Harness
+  (Console / Launch / Proxy) and Agents (This project / Roles / Local overrides / Review & wake),
+  and `sectionBanner` for a problem that makes the page moot (claude not on PATH, codex cannot
+  run).
+- **Tabs are screen state, not a setting.** `SectionProps.setTab` lets Agents → Configure land
+  on Roles.
+- **Search** runs over `settingsIndex.ts` (98 entries: label, page, tab, keywords). A hit opens
+  the page and tab, scrolls to `[data-setting=label]` and flashes the row.
+- **Defaults** come from the new command `settings_defaults` (`Settings::default()`, so Rust
+  stays their only home) and reach rows through a context. `resetTo(value, default, set)` gives a
+  row its dot and Reset. Only `Settings` fields get one: Agents, Models providers and Keymap have
+  no default to return to.
+
+**The content pass.** Every section was rewritten to one rule set:
+- a hint is one line of at most 90 characters, and the rest goes in `info`;
+- an info note becomes the row's or group's `info`;
+- a warn note about one setting becomes that row's `status`;
+- a page-wide problem becomes a `Banner`;
+- an empty list becomes an `EmptyState`.
+
+The `controls.tsx` `Note` wrapper and the unused `Part` are gone. GitLab's settings block moved
+onto `Group`/`Row`. Two uses of the kit `Note` remain, each with a reason in
+`check-settings-copy.mjs`: Keymap's file-wide conflicts, and the role dialog's Save outcome.
+`check-remote.mjs` now accepts `info={GRANT}`.
+
+**Guard.** The new `check:settings-copy` checks three things:
+- hints are 90 characters or fewer;
+- `Note` comes neither from `./controls` nor from the kit outside the allowlist;
+- every literal `Row`/`ToggleRow` label, or its `anchor`, is in the search index.
+
+Its Settings row is in `docs/checks.md` and `CLAUDE.md`.
+
+**Verified:** `tsc`, every `check:*`, `pnpm build`, `cargo fmt --check`, `codegen --check`,
+`contract-check`, clippy on `cide-app`, and `cargo test -p cide-app settings`.
+
+**Not confirmed on a display.**
+- Nobody has looked at the redesigned screen in a window yet: popover placement near the
+  window's edges, the search flash, the status bar on a row, and both themes at UI 11 and 17.
+- Search scrolling to rows that appear only after a fetch (Agents, Models) is expected to land
+  on the page without the flash. That is untested.
+
+## M134 — The console can read and change cide's own settings, keys and commands
+
+**Why.** The console could adjust what a role runs on (M71's four tools) but nothing else in
+Settings. Asked "how do I open the command palette", it answered from its memory of VS Code.
+Asked to rebind a key or turn on word wrap, it told the user to open Settings.
+
+**What.** Five orchestration tools, in `cide_agents::settings_tools`:
+
+- **`cide_settings`** takes `describe | get | set | reset` on a dotted camelCase path
+  (`editor.wordWrap`, `terminal.fontSize`, `theme`).
+  - `set` composes the leaf's group from the stored settings and deserialises it into a
+    `SettingsPatch`, so a bad type or enum value is refused with serde's own sentence.
+  - The patch goes through `cmd::settings::settings_set`, so every clamp and side effect is the
+    same as for a click.
+  - `windowMode` goes through `window_set_mode` on the main thread, `accent` through
+    `AccentPatch`, and `llm.*` is refused with a pointer to its own tools.
+  - A group is reset whole but never set whole, because `#[serde(default)]` would reset every
+    omitted sibling.
+  - `describe` reads `settings_doc::SETTING_DOCS`, whose test walks `Settings::default()` in both
+    directions.
+- **`cide_keymap`** takes `find | lookup | rebind | unbind | reset | resetAll`.
+  - `find` is the palette's own `commands::search` plus the resolved bindings.
+  - Edits go through `cmd::settings::keymap_edit`, which holds the lock, refuses an unreadable
+    file and emits `keymap_changed`.
+  - A rebind onto a taken key is refused, naming the holder, until `onConflict` is `keep` or
+    `unbindOther` (one atomic write, like the clash dialog).
+  - A modifier-less typing key needs `allowBareKey`, and `resetAll` needs `confirm`.
+  - A missing `when` is taken from the command's single context, or the model is asked which.
+- **`cide_extension_settings`** reads the declared `SettingDef`s. A write is coerced first, so a
+  value the store would silently replace with the default is refused instead.
+- **`cide_project_settings`** covers `openspec` (`.cide/config.json`) and `gitlab` (review
+  preferences only, never accounts), one field at a time.
+- **`cide_command_run`** emits `cide://command-requested` to the shell window that has the
+  project. `App.tsx` runs it through the palette's `runCommand`, first activating the caller's
+  project if another one is showing. It answers *requested*, not *done*.
+
+**Rules.**
+- Reads are open to every orchestrator pane.
+- Every write is refused unless `AgentSink::caller()` is `Console`. `RegistrySink` returns the
+  connection's `caller_now`, so a tab cide opened by itself can read and never write.
+- Proxy userinfo and `cli.env` values render as `<hidden>`, and `<hidden>` is refused as input.
+- Every non-worker pane's paragraph gains one sentence telling it to answer questions about cide
+  from these tools rather than from memory.
+
+**Verified:**
+- `cargo test -p cide-agents` (25 new tests, over the real `keymap::resolve`/`apply_edit`) and
+  `cargo test -p cide-app` (the tool count is now 29).
+- Clippy on both crates, `codegen --check` and `contract-check` (`+ cide://command-requested`).
+- `tsc`, and `check:unlisten`/`keys`/`commands`/`switcher`/`selectors`/`attach`.
+
+**Not confirmed on a display.**
+- No console has been asked yet, through a real `claude`, to rebind a key or open the palette.
+- It is unconfirmed that Settings → Keymap redraws live after a tool rebind; it rides the same
+  `keymap_changed` the screen uses.
+- The window-mode switch from a socket thread (via `run_on_main_thread`) is untried with real
+  windows.
+- The parked-command path, where the request names a project other than the active one, is
+  untried.

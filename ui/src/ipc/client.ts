@@ -1125,6 +1125,9 @@ export const diagnostics = {
 export const settings = {
   get: () => invoke<SettingsDto>('settings_get'),
 
+  /** `Settings::default()` — what Settings' Reset puts back. (M133) */
+  defaults: () => invoke<SettingsDto>('settings_defaults'),
+
   /** Apply a partial update and get the settings as they now stand. */
   set: (patch: SettingsPatch) => invoke<SettingsDto>('settings_set', { patch }),
 
@@ -1415,6 +1418,21 @@ export const events = {
    */
   onRemoteChanged: (handler: () => void) =>
     listen<null>('cide://remote-changed', () => handler()),
+  /**
+   * `cide://command-requested`: the console's `cide_command_run` asked this window to run one
+   * registry command, as the palette would. (M134) Addressed to one shell window and filtered
+   * here by label for `onCheckRequested`'s reason — every webview hears `emit_to`, and each one
+   * that answered would open its own palette.
+   */
+  onCommandRequested: (
+    handler: (request: { project: string; command: string; args: unknown }) => void,
+  ) =>
+    listen<{ window: string; project: string; command: string; args: unknown }>(
+      'cide://command-requested',
+      (e) => {
+        if (e.payload.window === windowLabel()) handler(e.payload)
+      },
+    ),
   /** Fires in every window after any accepted mutation, whichever window caused it. */
   onWorkspaceChanged: (handler: (workspace: Workspace) => void) =>
     listen<{ rev: number; workspace: Workspace }>('cide://workspace-changed', (e) =>

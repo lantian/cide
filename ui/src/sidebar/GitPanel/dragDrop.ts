@@ -70,8 +70,18 @@
  *
  * `ignored` keeps the old refusal, verbatim. An ignored path dropped on `Changes` would be a
  * very surprising way to un-ignore something, and the sentence is still exactly true of it.
+ *
+ * # A move into `Changes` is a `track` too
+ *
+ * > *"Git tree panel - all changes that was moved to "Changes" should be automatically staged."*
+ *
+ * Filing tracked files into the default list stages them (`git add`) and ticks them
+ * (`model.ts::ticksAfterMove`). That is a write to the repository, so by the rule above it is
+ * the `track` kind — with its own sentence, `stageHint` — rather than a `move` whose ghost
+ * promises a re-filing and whose drop performs a `git add`. Every other changelist is a plain
+ * `move` as before.
  */
-import { changelistIdOf, flatFiles, type Row } from './model'
+import { changelistIdOf, DEFAULT_CHANGELIST, flatFiles, type Row } from './model'
 import type { GroupKind, RepoId, StatusView } from './types'
 
 /** One file under the pointer's care. */
@@ -268,6 +278,14 @@ export function trackHint(count: number, list: string): string {
   return `Add ${plural(count)} to git and move to “${list}”`
 }
 
+/**
+ * The ghost's sentence for tracked files dropped on `Changes`: the same admission as
+ * `trackHint`, in the word that fits a file git already knows — it is staged, not added.
+ */
+export function stageHint(count: number, list: string): string {
+  return `Stage ${plural(count)} and move to “${list}”`
+}
+
 /** The same claim, as a context-menu item. Title case, and a `…` because a chooser follows. */
 export function trackMenuLabel(count: number): string {
   return `Add ${plural(count)} to Git and Move to Changelist…`
@@ -325,6 +343,19 @@ export function dropOutcome(drag: DragSet, target: Row | null): DropOutcome {
       kind: 'noop',
       list: target.label,
       hint: `Already in “${target.label}”`,
+    }
+  }
+  // Into `Changes` a move stages too — see the header's last section. It is `track` rather
+  // than `move` so the ghost says so; `paths` keeps the move's filtering, because unlike an
+  // unversioned drag these files really are in the list `DraggedFile.changelist` names.
+  if (id === DEFAULT_CHANGELIST) {
+    return {
+      kind: 'track',
+      repo: drag.repo,
+      changelist: id,
+      list: target.label,
+      paths,
+      hint: stageHint(paths.length, target.label),
     }
   }
   return {

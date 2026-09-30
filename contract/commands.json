@@ -272,6 +272,7 @@
   "session_scrollback",
   "session_spawn",
   "session_write",
+  "settings_defaults",
   "settings_get",
   "settings_set",
   "spec_accept",

@@ -1,5 +1,6 @@
-//! The twenty-three MCP tools cide serves a `claude`: their names, their schemas, and handlers that
-//! touch nothing. (M18)
+//! The twenty-nine MCP tools cide serves a `claude`: their names, their schemas, and handlers that
+//! touch nothing. (M18) The count said twenty-three for a while after it had become twenty-four;
+//! [`tool::EVERY`] is the number, and `the_twenty_three_are_the_only_twenty_three` the check.
 //!
 //! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
 //! connection's header line, never from anything the caller says:
@@ -7,9 +8,11 @@
 //! * the nine `cide_task_*` tools ([`tool::ALL`]) — the shared tracker, served to the project's
 //!   own session **and** to every dispatched subagent run, because the tracker is the medium
 //!   they exchange state through;
-//! * the eleven orchestration tools ([`tool::ORCHESTRATION`]) — the roster, the two that author
-//!   a role, the four that decide what a role *runs on* (M71), and the dispatch — served
-//!   **only** to the project's primary session, which is the product owner.
+//! * the twenty orchestration tools ([`tool::ORCHESTRATION`]) — the roster, the two that author
+//!   a role, the ones that decide what a role *runs on* (M71), the dispatch and its watchers, the
+//!   milestones, and the five that read and change cide's own settings, keymap and commands
+//!   (M134, `crate::settings_tools`) — served **only** to a project's Claude panes, never to a
+//!   run.
 //!
 //! That split is the whole of the answer to *may an agent dispatch another agent*: a run's
 //! connection is never handed the vocabulary, so the question never reaches a model at all. See
@@ -273,6 +276,19 @@ pub mod tool {
     /// ready to apply, into a queue the user accepts or rejects from the Tasks panel. (M83)
     pub const MILESTONE_PROPOSALS: &str = "cide_milestone_proposals";
 
+    /// Any machine-wide setting, by dotted path: describe, read, change one, reset one. (M134)
+    /// See `crate::settings_tools` for why a path and never a group.
+    pub const SETTINGS: &str = "cide_settings";
+    /// Commands and their keys: find a command, say what a key does, rebind, unbind, reset.
+    /// (M134)
+    pub const KEYMAP: &str = "cide_keymap";
+    /// The settings installed extensions declare. (M134)
+    pub const EXTENSION_SETTINGS: &str = "cide_extension_settings";
+    /// This project's OpenSpec options and the GitLab review preferences. (M134)
+    pub const PROJECT_SETTINGS: &str = "cide_project_settings";
+    /// Ask the project's window to run one registry command, as the palette would. (M134)
+    pub const COMMAND_RUN: &str = "cide_command_run";
+
     /// The task vocabulary, in the order `tools/list` advertises it.
     ///
     /// Read → write, and inside each half the cheap call first: it is the order a model skims,
@@ -319,6 +335,11 @@ pub mod tool {
         AGENT_INTEGRATE,
         MILESTONES,
         MILESTONE_PROPOSALS,
+        SETTINGS,
+        KEYMAP,
+        EXTENSION_SETTINGS,
+        PROJECT_SETTINGS,
+        COMMAND_RUN,
     ];
 
     /// [`ORCHESTRATION`] for a project whose tracker is off (`config::load_tracker`): the same
@@ -340,6 +361,11 @@ pub mod tool {
         AGENT_RUNS,
         AGENT_STOP,
         AGENT_INTEGRATE,
+        SETTINGS,
+        KEYMAP,
+        EXTENSION_SETTINGS,
+        PROJECT_SETTINGS,
+        COMMAND_RUN,
     ];
 
     /// Both families, in advertised order: [`ALL`] then [`ORCHESTRATION`].
@@ -374,6 +400,11 @@ pub mod tool {
         AGENT_INTEGRATE,
         MILESTONES,
         MILESTONE_PROPOSALS,
+        SETTINGS,
+        KEYMAP,
+        EXTENSION_SETTINGS,
+        PROJECT_SETTINGS,
+        COMMAND_RUN,
     ];
 }
 
@@ -1253,6 +1284,94 @@ pub trait AgentSink: Send + Sync {
     fn proposals_withdraw(&self, _id: &str) -> Result<(), String> {
         Err("proposals are not available here".into())
     }
+
+    // --- everything else Settings can change (M134) ----------------------------------------
+    //
+    // `crate::settings_tools` is the vocabulary. Defaulted to refuse, like the milestone block
+    // above, so the test doubles that never touch a setting need not grow eleven methods; the
+    // app's `RegistrySink` implements each over the `cmd::` function the Settings screen calls.
+
+    /// Who is on the other end — the same fact [`TaskSink::caller`] carries. Every write in
+    /// `crate::settings_tools` is refused unless this is [`CallerKind::Console`]. Defaulted to
+    /// the console so a test sink is the attended case unless it says otherwise.
+    fn caller(&self) -> CallerKind {
+        CallerKind::Console
+    }
+
+    /// The machine-wide settings as they stand, credentials included — the handler redacts.
+    fn settings(&self) -> Result<cide_ipc::settings::Settings, String> {
+        Err("settings are not available here".into())
+    }
+
+    /// Apply one patch through `settings_set` and answer the settings as they now stand.
+    fn set_settings(
+        &self,
+        _patch: cide_ipc::settings_ops::SettingsPatch,
+    ) -> Result<cide_ipc::settings::Settings, String> {
+        Err("settings are not available here".into())
+    }
+
+    /// Move every open project between one window and one window each — `window_set_mode`,
+    /// which is not a patch because it opens and closes real windows.
+    fn set_window_mode(&self, _mode: cide_ipc::WindowMode) -> Result<(), String> {
+        Err("the window mode cannot be changed from here".into())
+    }
+
+    /// The resolved keymap, its conflicts, and the user's own entries.
+    fn keymap(&self) -> Result<cide_ipc::settings_ops::KeymapReport, String> {
+        Err("the keymap is not available here".into())
+    }
+
+    /// Apply edits to `keymap.json` as one write, answering the keymap as it now stands.
+    fn keymap_edit(
+        &self,
+        _edits: Vec<cide_ipc::KeymapEdit>,
+    ) -> Result<cide_ipc::settings_ops::KeymapReport, String> {
+        Err("the keymap is not available here".into())
+    }
+
+    /// Every installed extension, with its declared settings and stored values.
+    fn extensions(&self) -> Result<Vec<cide_ipc::ext::InstalledExtension>, String> {
+        Err("extensions are not available here".into())
+    }
+
+    /// Store one extension setting, already coerced by the handler.
+    fn set_extension_setting(
+        &self,
+        _extension: &cide_ipc::ext::ExtensionRef,
+        _key: &str,
+        _value: Value,
+    ) -> Result<(), String> {
+        Err("extensions are not available here".into())
+    }
+
+    /// This project's `.cide/config.json` `openspec` key.
+    fn spec_settings(&self) -> Result<cide_ipc::spec::SpecSettings, String> {
+        Err("OpenSpec settings are not available here".into())
+    }
+
+    /// Write this project's OpenSpec settings.
+    fn set_spec_settings(&self, _settings: cide_ipc::spec::SpecSettings) -> Result<(), String> {
+        Err("OpenSpec settings are not available here".into())
+    }
+
+    /// The GitLab review preferences. Never an account or a token.
+    fn gitlab_preferences(&self) -> Result<cide_ipc::gitlab::GitLabPreferences, String> {
+        Err("GitLab preferences are not available here".into())
+    }
+
+    /// Store the GitLab review preferences through the worker's own validation.
+    fn set_gitlab_preferences(
+        &self,
+        _preferences: cide_ipc::gitlab::GitLabPreferences,
+    ) -> Result<(), String> {
+        Err("GitLab preferences are not available here".into())
+    }
+
+    /// Ask the window showing this project to run one registry command. Answers once asked.
+    fn run_command(&self, _command: &str, _args: Option<Value>) -> Result<(), String> {
+        Err("commands cannot be run from here".into())
+    }
 }
 
 // --- what `tools/list` says --------------------------------------------------------------------
@@ -1264,7 +1383,7 @@ pub trait AgentSink: Send + Sync {
 /// `cide_ide_mcp::tools`'s rule, and its `every_advertised_tool_has_a_schema_and_a_description`
 /// has a twin below.
 ///
-/// **All twenty-three, always.** The per-connection filtering is `cide_app::agent_rpc`'s
+/// **All of them, always.** The per-connection filtering is `cide_app::agent_rpc`'s
 /// `descriptors_for`, which keeps this order and drops what the connection may not call: one
 /// definition of each tool, and the scope decided in exactly one place.
 pub fn descriptors() -> Vec<Value> {
@@ -1612,7 +1731,7 @@ pub fn description(name: &str) -> &'static str {
         }
         // Unreachable while `descriptors` walks `ALL`, and empty rather than a placeholder: a
         // tool advertised with a made-up sentence is worse than the test failure below.
-        _ => "",
+        _ => crate::settings_tools::description(name).unwrap_or(""),
     }
 }
 
@@ -2574,7 +2693,9 @@ pub fn input_schema(name: &str) -> Value {
         }),
         // Unreachable while `descriptors` walks `ALL`; an empty object is the answer that cannot
         // mislead a client into sending arguments we would ignore.
-        _ => json!({ "type": "object" }),
+        _ => {
+            crate::settings_tools::input_schema(name).unwrap_or_else(|| json!({ "type": "object" }))
+        }
     }
 }
 
@@ -3725,7 +3846,7 @@ pub fn dispatch_orchestration(
         tool::AGENT_INTEGRATE => Some(agent_integrate(arguments, sink)),
         tool::MILESTONES => Some(milestones(arguments, sink)),
         tool::MILESTONE_PROPOSALS => Some(proposals(arguments, sink)),
-        _ => None,
+        _ => crate::settings_tools::dispatch(name, arguments, sink),
     }
 }
 
@@ -9605,6 +9726,13 @@ mod tests {
                 "cide_milestones",
                 // The loop's frame's other half: what only the user may change, proposed to them.
                 "cide_milestone_proposals",
+                // After the loop, because they are not part of it: the user asking their console
+                // about cide itself — a setting, a key, a command. (M134)
+                "cide_settings",
+                "cide_keymap",
+                "cide_extension_settings",
+                "cide_project_settings",
+                "cide_command_run",
             ]
         );
         // `EVERY` is spelled out rather than concatenated (see its own doc), so this is what

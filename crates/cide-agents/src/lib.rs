@@ -49,6 +49,10 @@ pub mod paths;
 pub mod review;
 /// What a role may do past a harness's sandbox. (M119)
 pub mod sandbox;
+/// What every machine-wide setting means, for `cide_settings describe`. (M134)
+pub mod settings_doc;
+/// Settings, keymap, extension settings and command tools for the console. (M134)
+pub mod settings_tools;
 // No `///` summary here, deliberately: `harness.rs`'s own `//!` header is the summary, and an
 // outer doc comment on the `mod` item merges with it into one fragment that rustdoc then resolves
 // in *this* module's scope — so every `[`RunState`]` and `[`SpawnSpec`]` link inside that header

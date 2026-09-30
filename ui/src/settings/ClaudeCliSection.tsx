@@ -21,8 +21,8 @@
  * `workspace.json` cannot get past it either.
  *
  * The one exception is the **binary**, which is a hard verdict and is drawn as one: a path that
- * cannot be executed gets a warning panel naming the value and where to fix it, because unlike
- * a stray argument it kills every pane at once. The verdict comes from Rust (`ClaudeCliSupport.
+ * cannot be executed puts the Program row itself into its `bad` status, naming the problem on
+ * the field to fix, because unlike a stray argument it kills every pane at once. The verdict comes from Rust (`ClaudeCliSupport.
  * problem`), which is the only side that can `stat` a path.
  *
  * # Where the rules live
@@ -36,7 +36,8 @@
 import { Button, IconButton } from '@/kit/components/Button'
 import { useState, type ReactNode } from 'react'
 import type { ClaudeCli, ClaudeCliSupport, ClaudeEnvVar } from '@/ipc/client'
-import { Group, Note, PathReadout, Row, Toggle } from './controls'
+import { InfoTip, InfoPara } from '@/kit/components/InfoTip'
+import { Group, PathReadout, Row, Toggle, resetTo, useSettingsDefaults } from './controls'
 import {
   effectiveFlags,
   judgeArgs,
@@ -61,6 +62,7 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
   const args = judgeArgs(cli)
   const env = judgeEnv(cli)
   const summary = refusalSummary(cli)
+  const def = useSettingsDefaults()?.claude.cli
 
   // Only when the probe is about the value in the field. A verdict in flight is about the
   // *previous* binary, and drawing it beside the new one is how a screen tells a user their
@@ -70,25 +72,47 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
   return (
     <>
       <Group title="Binary">
-        <TextField
+        {/* The hard verdict is the row's status (M133), not a warning panel under it: it is a
+            fact about *this* value, and unlike a stray argument it kills every pane at once,
+            so it sits on the field the user has to correct. */}
+        <Row
           label="Program"
-          hint="What every Claude pane and the one-shots behind Generate commit message run. “claude” — the default — is passed through as a bare name and resolved by your PATH at each spawn, which matters: the CLI updates itself, and resolving it once at launch would pin panes to a version that no longer exists. An absolute path pins a version deliberately, and a wrapper (mise, asdf, a shim) works too."
-          value={cli.binary}
-          placeholder="claude"
-          onCommit={(binary) => onChange({ ...cli, binary })}
+          hint="What Claude panes and the one-shots run; found on your PATH at each spawn."
+          status={
+            current?.problem != null
+              ? { tone: 'bad', text: `${current.problem} Every Claude pane fails to start until it is corrected.` }
+              : undefined
+          }
+          info={
+            <>
+              <InfoPara>
+                What every Claude pane and the one-shots behind Generate commit message run.
+              </InfoPara>
+              <InfoPara>
+                “claude” — the default — is passed through as a bare name and resolved by your
+                PATH at each spawn, which matters: the CLI updates itself, and resolving it once
+                at launch would pin panes to a version that no longer exists. An absolute path
+                pins a version deliberately, and a wrapper (mise, asdf, a shim) works too.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(cli.binary, def?.binary, (binary) => onChange({ ...cli, binary }))}
+          control={
+            <ProgramInput
+              label="Claude program"
+              value={cli.binary}
+              placeholder="claude"
+              onCommit={(binary) => onChange({ ...cli, binary })}
+            />
+          }
         />
-        {current?.problem != null && (
-          <Note title="That binary cannot be run" tone="warn">
-            {current.problem} Until it is corrected, every Claude pane fails to start — the
-            message above is what each one prints into its own transcript.
-          </Note>
-        )}
         {current?.problem == null && current?.resolved != null && (
           <Row
             label="Resolves to"
-            hint={
+            hint={current.version ?? 'No version from --version — ordinary for a wrapper script.'}
+            info={
               current.version != null
-                ? `${current.version}. cide spawns the name above, not this path — the resolution happens afresh every time, so a self-updating CLI is picked up without relaunching.`
+                ? 'cide spawns the name above, not this path — the resolution happens afresh every time, so a self-updating CLI is picked up without relaunching.'
                 : 'Nothing parseable came back from --version. That is ordinary for a wrapper script and is not an error; cide only warns when it can read a version and that version is outside the range it was checked against.'
             }
             control={<span />}
@@ -99,7 +123,26 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
         )}
       </Group>
 
-      <Group title="Arguments">
+      <Group
+        title="Arguments"
+        info={
+          <>
+            <InfoPara>
+              One token per row: <code>--append-system-prompt</code> and <code>be terse</code>{' '}
+              are two rows, not one. cide passes these to <code>execvp</code> as they stand and
+              never through a shell, so there is no quoting to get wrong. They go{' '}
+              <em>before</em> everything cide adds, which is what stops a variadic flag like{' '}
+              <code>--add-dir</code> from swallowing cide’s own session id.
+            </InfoPara>
+            <InfoPara>
+              They reach <strong>panes only</strong>. The one-shots behind Generate commit
+              message and Explain selection keep cide’s own argv — <code>-p --output-format
+              json</code> and the rest — because a <code>--model</code> or <code>--tools</code>{' '}
+              folded into that vector breaks the parse of a reply that never arrives.
+            </InfoPara>
+          </>
+        }
+      >
         <TokenList
           rows={args}
           reasons={support?.argReasons ?? []}
@@ -108,69 +151,74 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
           onChange={(next) => onChange({ ...cli, args: next })}
           values={cli.args}
         />
-        <Note title="One token per row">
-          <code>--append-system-prompt</code> and <code>be terse</code> are two rows, not one:
-          cide passes these to <code>execvp</code> as they stand and never through a shell, so
-          there is no quoting to get wrong and no quoting parser to be surprised by. They go{' '}
-          <em>before</em> everything cide adds, which is what stops a variadic flag like{' '}
-          <code>--add-dir</code> from swallowing cide’s own session id.
-          <br />
-          They reach <strong>panes only</strong>. The one-shots behind Generate commit message
-          and Explain selection keep cide’s own argv — <code>-p --output-format json</code> and
-          the rest — because a <code>--model</code> or <code>--tools</code> folded into that
-          vector does not customise anything, it breaks the parse of a reply that never arrives.
-        </Note>
       </Group>
 
-      <Group title="Environment">
+      <Group
+        title="Environment"
+        info={
+          <>
+            <InfoPara>
+              claude panes and the one-shot lane, and nothing else — not shell panes. A{' '}
+              <code>NODE_OPTIONS</code> or a <code>PATH</code> from this list is not inert to
+              anything, and a field labelled “the environment claude is spawned with” must not
+              quietly become your shell’s.
+            </InfoPara>
+            <InfoPara>
+              Values are stored in plain text in <code>workspace.json</code>, which is written{' '}
+              <code>0600</code>. They are redacted from every log line and from any debug print
+              of the settings, but not from these fields, because you have to be able to correct
+              them. cide has no keyring yet.
+            </InfoPara>
+          </>
+        }
+      >
         <PairList
           rows={env}
           reasons={support?.envReasons ?? []}
           values={cli.env}
           onChange={(next) => onChange({ ...cli, env: next })}
         />
-        <Note title="claude panes and the one-shot lane, and nothing else">
-          Not shell panes — deliberately, and it is worth stating because the switches above{' '}
-          <em>do</em> reach them. <code>CLAUDE_CODE_*</code> means nothing to <code>bash</code>,
-          so a shell that inherits those simply ignores them; a <code>NODE_OPTIONS</code> or a{' '}
-          <code>PATH</code> from this list is not inert to anything, and a field labelled “the
-          environment claude is spawned with” must not quietly become your shell’s.
-          <br />
-          Values are stored in plain text in <code>workspace.json</code>, which is written{' '}
-          <code>0600</code>. They are redacted from every log line and from any debug print of
-          the settings, and not from the field above, because you have to be able to correct
-          them. cide has no keyring yet; a proxy password is stored the same way and for the
-          same reason.
-        </Note>
       </Group>
 
-      <Group title="What cide adds to the command line">
-        <InjectionRows cli={cli} onChange={onChange} reasons={support?.injectReasons ?? []} />
-        <Note title="These reach claude panes only">
-          The one-shots behind Generate commit message and Explain selection keep cide’s own
-          argv — <code>-p --output-format json</code> and the rest, from{' '}
-          <code>cide_claude::headless::argv</code> — and are not configurable here, because
-          those flags are not customisation but the parse of a reply. A binary that is not
-          Claude Code will fail those two features whatever is set above.
-        </Note>
+      <Group
+        title="What cide adds to the command line"
+        info={
+          <>
+            These reach claude panes only. The one-shots behind Generate commit message and
+            Explain selection keep cide’s own argv — <code>-p --output-format json</code> and
+            the rest, from <code>cide_claude::headless::argv</code> — because those flags are
+            not customisation but the parse of a reply. A binary that is not Claude Code will
+            fail those two features whatever is set here.
+          </>
+        }
+      >
+        <InjectionRows
+          cli={cli}
+          onChange={onChange}
+          reasons={support?.injectReasons ?? []}
+          defaults={def?.inject}
+        />
       </Group>
 
-      <Group title="What a pane is actually spawned with">
+      <Group
+        title="What a pane is actually spawned with"
+        info={
+          <>
+            <InfoPara>
+              Applied at spawn. A pane already running keeps the binary, the arguments — yours
+              and cide’s — and the environment it was spawned with. Close and reopen it, or
+              relaunch cide, for anything on this page to reach it.
+            </InfoPara>
+            <InfoPara>
+              Refusals are applied again when a pane starts, so editing{' '}
+              <code>workspace.json</code> by hand does not get past them.
+            </InfoPara>
+          </>
+        }
+      >
         <Argv parts={resolvedArgvParts(cli, 'fresh')} />
-        {summary !== null && (
-          <p className={styles.foot}>
-            {summary} and struck out above. Refusals are applied again when a pane starts, so
-            editing <code>workspace.json</code> by hand does not get past them.
-          </p>
-        )}
+        {summary !== null && <p className={styles.foot}>{summary} and struck out above.</p>}
       </Group>
-
-      <Note title="Applied at spawn">
-        A pane already running keeps the binary, the arguments — yours and cide’s — and the
-        environment it was spawned with. Close and reopen it, or relaunch cide, for anything on
-        this screen to reach it. A pane that was spawned with the hook settings goes on
-        reporting until it exits, and one spawned without them does not start.
-      </Note>
     </>
   )
 }
@@ -206,7 +254,10 @@ export function Argv({ parts }: { parts: { text: string; ours: boolean }[] }) {
  *
  * Every one of these silently disables a feature the user will report as broken later without
  * connecting it to this screen — "the status bar shows no tokens", "Resume does nothing" — so
- * a footnote at the bottom of the section would be read by nobody who needed it. The sentences
+ * a footnote at the bottom of the section would be read by nobody who needed it. Since M133 the
+ * row carries the headline of the cost (`short`, one line) and the full paragraph sits behind
+ * the title's (i): the page was reported unreadable with five paragraphs down it, and the
+ * headline is the part that stops someone flipping the wrong switch. The sentences
  * are here rather than in Rust (where `RefusedArg::reason` lives) because they answer a
  * different question: Rust's reasons answer *why can I not pass this myself*, and these answer
  * *what do I lose by turning cide's off*. `check-claude-cli.mjs` asserts the expensive words
@@ -220,10 +271,13 @@ function InjectionRows({
   cli,
   onChange,
   reasons,
+  defaults,
 }: {
   cli: ClaudeCli
   onChange: (next: ClaudeCli) => void
   reasons: readonly { name: string; reason: string }[]
+  /** `Settings::default()`'s injections, for each row's Reset; absent before they arrive. */
+  defaults?: ClaudeCli['inject'] | undefined
 }) {
   const rows = effectiveFlags(cli)
   /*
@@ -246,6 +300,13 @@ function InjectionRows({
       {rows.map((row) => {
         const copy = INJECTION_COPY[row.key]
         const value = stored(row.key)
+        // The row's own Reset (M133) — these are not `FormRow`s, so the dot-and-undo pair is
+        // drawn here as the undo alone, on the same "differs from the default" test.
+        const original = defaults?.[row.key]
+        const reset =
+          original !== undefined && JSON.stringify(original) !== JSON.stringify(value)
+            ? () => set(row.key, original)
+            : null
         return (
           <div key={row.key} className={styles.injection}>
             <div className={styles.injectionHead}>
@@ -254,6 +315,12 @@ function InjectionRows({
                 checked={row.enabled}
                 onChange={(enabled) => set(row.key, { enabled })}
               />
+              <span className={styles.injectionTitle}>
+                {copy.title}
+                {/* What switching it off costs, in full — the visible line under the row is
+                    the headline of it. See the table's header for why every word is kept. */}
+                <InfoTip label={`About ${copy.title}`}>{copy.cost}</InfoTip>
+              </span>
               <input
                 /*
                  * Keyed by content as well as by injection, for the reason the token rows
@@ -286,8 +353,11 @@ function InjectionRows({
                   if (e.target.value !== value.flag) set(row.key, { flag: e.target.value })
                 }}
               />
+              {reset !== null && (
+                <IconButton icon="undo-2" label={`Reset ${copy.title} to default`} onClick={reset} />
+              )}
             </div>
-            <p className={styles.injectionCost}>{copy.cost}</p>
+            <p className={styles.injectionShort}>{copy.short}</p>
             {/* Rust's sentence for a rename that was thrown away — a positional, or a spelling
                 another injection already has. Nothing at all in the ordinary case. */}
             <Why text={reasons.find((entry) => entry.name === row.key)?.reason ?? null} />
@@ -305,9 +375,10 @@ function InjectionRows({
  * injection added in Rust is a missing key here — a type error — rather than a row with no
  * explanation under it.
  */
-const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> = {
+const INJECTION_COPY: Record<InjectionKey, { title: string; short: string; cost: ReactNode }> = {
   sessionId: {
     title: 'Session id',
+    short: 'Off: Resume stops working — a restored pane starts a new conversation.',
     cost: (
       <>
         cide names the conversation, and that uuid <em>is</em> the pane’s own session id. Off,
@@ -321,6 +392,7 @@ const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> =
   },
   resume: {
     title: 'Resume',
+    short: 'Off: every restored pane starts a fresh conversation.',
     cost: (
       <>
         cide names the conversation a restored pane continues. Off, <strong>every restored pane
@@ -332,6 +404,7 @@ const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> =
   },
   forkSession: {
     title: 'Fork',
+    short: 'Off: Split → fork continues the conversation instead of branching it.',
     cost: (
       <>
         What makes <em>Split → fork</em> branch a conversation instead of continuing it. Off, a
@@ -342,6 +415,7 @@ const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> =
   },
   mcpConfig: {
     title: 'Task tools',
+    short: 'Off: no task tools, and a console cannot dispatch subagents.',
     cost: (
       <>
         cide's own MCP server — <code>cide-hook mcp</code>, a bridge to this project's tracker.
@@ -361,6 +435,7 @@ const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> =
   },
   settings: {
     title: 'Hook settings',
+    short: 'Off: no hooks — no token figures, turn notifications or instant reloads.',
     cost: (
       <>
         The inline hook payload. Off, <strong>this pane has no hooks at all</strong>: no live
@@ -572,21 +647,24 @@ export function Remove({ label, onClick }: { label: string; onClick: () => void 
 }
 
 /**
- * A stacked label + input + hint, the shape `ProxySection` uses for a URL.
+ * The program field, as a settings row's control (M133 — it was a stacked label, input and a
+ * paragraph of hint, which is what made this page a wall).
  *
- * A local copy rather than a shared export, matching what is already there: the two differ in
- * their commit rules — this one has no draft state because a program name is short enough that
- * Escape-to-abandon buys nothing, where a half-typed proxy password is worth protecting.
+ * A bare `<input>` drawn with the kit field's numbers rather than the kit `TextInput`, for the
+ * same reason as every other input on this page: `.input` is one vocabulary here, and the
+ * program sits one row above the token lists that need its refused state.
+ *
+ * No draft-and-Escape beyond what a blur-commit needs: a program name is short enough that
+ * abandoning a half-typed one buys nothing, where a half-typed proxy password is worth
+ * protecting.
  */
-export function TextField({
+export function ProgramInput({
   label,
-  hint,
   value,
   placeholder,
   onCommit,
 }: {
   label: string
-  hint: ReactNode
   value: string
   placeholder: string
   onCommit: (next: string) => void
@@ -598,24 +676,21 @@ export function TextField({
     if (text.trim() !== value) onCommit(text.trim())
   }
   return (
-    <label className={styles.field}>
-      <span className={styles.fieldLabel}>{label}</span>
-      <input
-        className={styles.input}
-        type="text"
-        spellCheck={false}
-        autoCapitalize="off"
-        autoCorrect="off"
-        placeholder={placeholder}
-        value={draft ?? value}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={(e) => commit(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commit(e.currentTarget.value)
-          else if (e.key === 'Escape') setDraft(null)
-        }}
-      />
-      <span className={styles.fieldHint}>{hint}</span>
-    </label>
+    <input
+      className={`${styles.input} ${styles.program}`}
+      type="text"
+      spellCheck={false}
+      autoCapitalize="off"
+      autoCorrect="off"
+      aria-label={label}
+      placeholder={placeholder}
+      value={draft ?? value}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') commit(e.currentTarget.value)
+        else if (e.key === 'Escape') setDraft(null)
+      }}
+    />
   )
 }

@@ -19,8 +19,10 @@
  * reason: a value you cannot see is a value you cannot correct.
  */
 import type { CodexCli, CodexCliSupport, CodexInjections, ClaudeEnvVar } from '@/ipc/client'
-import { Group, Note, PathReadout, Row, Toggle } from './controls'
-import { Add, Argv, Remove, TextField, Why } from './ClaudeCliSection'
+import { IconButton } from '@/kit/components/Button'
+import { InfoPara, InfoTip } from '@/kit/components/InfoTip'
+import { Group, PathReadout, Row, Toggle, resetTo, useSettingsDefaults } from './controls'
+import { Add, Argv, ProgramInput, Remove, Why } from './ClaudeCliSection'
 
 import styles from './ClaudeCliSection.module.css'
 
@@ -34,32 +36,53 @@ export interface CodexCliSectionProps {
 /**
  * What switching each addition off costs, on its row — `ClaudeCliSection`'s `INJECTION_COPY`
  * argument: every one of these silently disables something the user will report as broken
- * without connecting it to this screen.
+ * without connecting it to this screen. The headline is on the row (`short`), the whole of it
+ * behind the name's (i) (M133). The flag used to be the label, in parentheses after the name,
+ * which made seven two-line labels; it is its own mono cell now.
  */
-const INJECTIONS: readonly { key: keyof CodexInjections; label: string; cost: string }[] = [
+const INJECTIONS: readonly {
+  key: keyof CodexInjections
+  /** The row's name. */
+  title: string
+  /** What it writes on the command line, drawn in mono beside the name. */
+  flag: string
+  /** The headline of the cost, one line on the row (M133); `cost` is behind the (i). */
+  short: string
+  cost: string
+}[] = [
   {
     key: 'hooks',
-    label: 'Hooks (-c hooks.* and --dangerously-bypass-hook-trust)',
+    title: 'Hooks',
+    flag: '-c hooks.* --dangerously-bypass-hook-trust',
+    short: 'Off: the pane never shows busy or awaiting, and Resume cannot find it.',
     cost: 'Off: no state at all. The pane never shows busy or awaiting, its thread is never learned — so Resume and a restore after restart cannot find the conversation — and a line cide types waits for a readiness it never hears.',
   },
   {
     key: 'mcpConfig',
-    label: 'cide’s MCP server (-c mcp_servers.cide.*)',
+    title: 'cide’s MCP server',
+    flag: '-c mcp_servers.cide.*',
+    short: 'Off: no task tracker, and on a console no subagents.',
     cost: 'Off: no mcp__cide__* tools. No task tracker, and on a console no subagents.',
   },
   {
     key: 'developerInstructions',
-    label: 'The roster paragraph (-c developer_instructions)',
+    title: 'Roster paragraph',
+    flag: '-c developer_instructions',
+    short: 'Off: the console is not told what cide’s tools are for.',
     cost: 'Off: the console is not told what cide’s tools are for, and a run is not given its brief.',
   },
   {
     key: 'resume',
-    label: 'Resume (codex resume <thread>)',
+    title: 'Resume',
+    flag: 'codex resume <thread>',
+    short: 'Off: a restored or resumed pane starts a new conversation.',
     cost: 'Off: a restored or resumed pane starts a new conversation.',
   },
   {
     key: 'fork',
-    label: 'Fork (codex fork <thread>)',
+    title: 'Fork',
+    flag: 'codex fork <thread>',
+    short: 'Off: Split → fork starts fresh instead of branching.',
     cost: 'Off: Split → fork starts a fresh conversation instead of branching this one.',
   },
   {
@@ -67,12 +90,16 @@ const INJECTIONS: readonly { key: keyof CodexInjections; label: string; cost: st
     // every MR review while the console the wrapper opens worked — a console under *ask* carries
     // no policy flag, a run always did.
     key: 'permissions',
-    label: 'Sandbox and approvals for runs (-s, -a, --dangerously-bypass-approvals-and-sandbox)',
+    title: 'Run sandbox and approvals',
+    flag: '-s -a --dangerously-bypass-approvals-and-sandbox',
+    short: 'Off: your codex config or wrapper decides; a run may wait on an approval.',
     cost: 'Off: runs, reviews and tabs cide opens pass no sandbox or approval flag — your codex config, or the wrapper named above, decides. A role’s permission-mode and the project’s unattended default are no longer applied, so a run may wait on an approval nobody is watching.',
   },
   {
     key: 'reviewPermissions',
-    label: 'MR-review permissions without prompts',
+    title: 'MR-review permissions',
+    flag: 'without prompts',
+    short: 'Off: Codex uses the wrapper’s own approval policy.',
     cost: 'Off: Codex uses the wrapper’s own approval policy. On: approval requests go to Codex’s automatic reviewer, which may approve or deny them. The wrapper or Codex config controls the sandbox.',
   },
 ]
@@ -83,30 +110,47 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
   const argNote = (index: number) => current?.argNotes.find((n) => n.index === index) ?? null
   const envNote = (index: number) => current?.envNotes.find((n) => n.index === index) ?? null
   const inject = cli.inject
+  const def = useSettingsDefaults()?.codex.cli
 
   return (
     <>
       <Group title="Binary">
-        <TextField
+        {/* The hard verdict is the row's status, `ClaudeCliSection`'s shape (M133). */}
+        <Row
           label="Program"
-          hint="What every codex console, every run of a role whose harness is codex, and the one-shots behind Generate commit message run when Harness is Codex. “codex” — the default — is resolved by your PATH at each spawn: the standalone installer updates codex in place, and resolving it once would pin a release it may since have removed. An absolute path or a wrapper script works too."
-          value={cli.binary}
-          placeholder="codex"
-          onCommit={(binary) => onChange({ ...cli, binary })}
+          hint="What codex consoles, codex runs and its one-shots run; found on your PATH."
+          status={
+            current?.problem != null
+              ? { tone: 'bad', text: `${current.problem} Every codex console and run fails to start until it is corrected.` }
+              : undefined
+          }
+          info={
+            <>
+              <InfoPara>
+                What every codex console, every run of a role whose harness is codex, and the
+                one-shots behind Generate commit message run when Harness is Codex.
+              </InfoPara>
+              <InfoPara>
+                “codex” — the default — is resolved by your PATH at each spawn: the standalone
+                installer updates codex in place, and resolving it once would pin a release it
+                may since have removed. An absolute path or a wrapper script works too.
+              </InfoPara>
+            </>
+          }
+          {...resetTo(cli.binary, def?.binary, (binary) => onChange({ ...cli, binary }))}
+          control={
+            <ProgramInput
+              label="Codex program"
+              value={cli.binary}
+              placeholder="codex"
+              onCommit={(binary) => onChange({ ...cli, binary })}
+            />
+          }
         />
-        {current?.problem != null && (
-          <Note title="That binary cannot be run" tone="warn">
-            {current.problem} Until it is corrected, every codex console and codex run fails to
-            start.
-          </Note>
-        )}
         {current?.problem == null && current?.resolved != null && (
           <Row
             label="Resolves to"
-            hint={
-              current.version ??
-              'Nothing came back from --version. That is ordinary for a wrapper script and is not an error.'
-            }
+            hint={current.version ?? 'No version from --version — ordinary for a wrapper script.'}
             control={<span />}
           />
         )}
@@ -115,7 +159,18 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
         )}
       </Group>
 
-      <Group title="Arguments">
+      <Group
+        title="Arguments"
+        info={
+          <>
+            One token per row: <code>-c</code> and <code>model="o3"</code> are two rows. They go
+            right after the <code>resume</code>/<code>fork</code> subcommand and before everything
+            cide adds. An override of a key cide writes itself — <code>hooks.*</code>,{' '}
+            <code>mcp_servers.cide.*</code>, <code>developer_instructions</code> — is struck out
+            while cide is still writing it.
+          </>
+        }
+      >
         <div className={styles.list}>
           {cli.args.map((value, index) => {
             const note = argNote(index)
@@ -146,16 +201,20 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
           })}
           <Add label="Add argument" onClick={() => onChange({ ...cli, args: [...cli.args, ''] })} />
         </div>
-        <Note title="One token per row">
-          <code>-c</code> and <code>model="o3"</code> are two rows. They go right after the{' '}
-          <code>resume</code>/<code>fork</code> subcommand and before everything cide adds.
-          An override of a key cide writes itself — <code>hooks.*</code>,{' '}
-          <code>mcp_servers.cide.*</code>, <code>developer_instructions</code> — is struck out
-          while cide is still writing it.
-        </Note>
       </Group>
 
-      <Group title="Environment">
+      <Group
+        title="Environment"
+        info={
+          <>
+            codex children only: consoles, codex runs and the codex one-shot lane — never shell
+            panes. Values are stored in plain text in <code>workspace.json</code> (written{' '}
+            <code>0600</code>) and redacted from every log line. <code>CODEX_HOME</code> is
+            refused: cide reads it from its own environment to find the conversation behind a
+            pane, so export it before launching cide instead.
+          </>
+        }
+      >
         <div className={styles.list}>
           {cli.env.map((pair, index) => {
             const note = envNote(index)
@@ -201,50 +260,66 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
             onClick={() => onChange({ ...cli, env: [...cli.env, { name: '', value: '' }] })}
           />
         </div>
-        <Note title="codex children only">
-          Consoles, codex runs and the codex one-shot lane — never shell panes. Values are stored
-          in plain text in <code>workspace.json</code> (written <code>0600</code>) and redacted
-          from every log line. <code>CODEX_HOME</code> is refused: cide reads it from its own
-          environment to find the conversation behind a pane, so export it before launching cide
-          instead.
-        </Note>
       </Group>
 
-      <Group title="What cide adds to the command line">
+      <Group
+        title="What cide adds to the command line"
+        info={
+          <>
+            Always added, whatever is switched here: <code>-C &lt;directory&gt;</code>, and two
+            overrides that keep a startup modal from eating the first key cide types:{' '}
+            <code>check_for_update_on_startup=false</code> (the update chooser’s first row is
+            “Update now”) and <code>notice.hide_rate_limit_model_nudge=true</code>.
+          </>
+        }
+      >
         <div className={styles.injections}>
-          {INJECTIONS.map((row) => (
-            <div key={row.key} className={styles.injection}>
-              <div className={styles.injectionHead}>
-                <Toggle
-                  label={row.label}
-                  checked={inject?.[row.key] ?? true}
-                  onChange={(on) => onChange({ ...cli, inject: { ...inject, [row.key]: on } })}
-                />
-                <span className={styles.injectionFlag}>{row.label}</span>
+          {INJECTIONS.map((row) => {
+            const on = inject?.[row.key] ?? true
+            const original = def?.inject?.[row.key]
+            return (
+              <div key={row.key} className={styles.injection}>
+                <div className={styles.injectionHead}>
+                  <Toggle
+                    label={row.title}
+                    checked={on}
+                    onChange={(next) => onChange({ ...cli, inject: { ...inject, [row.key]: next } })}
+                  />
+                  <span className={styles.injectionTitle}>
+                    {row.title}
+                    <InfoTip label={`About ${row.title}`}>{row.cost}</InfoTip>
+                  </span>
+                  <code className={styles.injectionCode}>{row.flag}</code>
+                  {original !== undefined && original !== on && (
+                    <IconButton
+                      icon="undo-2"
+                      label={`Reset ${row.title} to default`}
+                      onClick={() => onChange({ ...cli, inject: { ...inject, [row.key]: original } })}
+                    />
+                  )}
+                </div>
+                <p className={styles.injectionShort}>{row.short}</p>
               </div>
-              <p className={styles.injectionCost}>{row.cost}</p>
-            </div>
-          ))}
+            )
+          })}
         </div>
-        <Note title="Always added">
-          <code>-C &lt;directory&gt;</code>, and two overrides that keep a startup modal from
-          eating the first key cide types: <code>check_for_update_on_startup=false</code> (the
-          update chooser’s first row is “Update now”) and{' '}
-          <code>notice.hide_rate_limit_model_nudge=true</code>.
-        </Note>
       </Group>
 
-      <Group title="What a codex console is actually spawned with">
+      <Group
+        title="What a codex console is actually spawned with"
+        info={
+          <>
+            A resume puts <code>resume</code> first and the thread last; a run adds its sandbox,
+            model and prompt. Refusals are applied again at every spawn, so editing{' '}
+            <code>workspace.json</code> by hand does not get past them.
+          </>
+        }
+      >
         {current !== null && current.argv.length > 0 ? (
           <Argv parts={current.argv.map((p, i) => ({ text: i === 0 ? p.text : ` ${p.text}`, ours: p.ours }))} />
         ) : (
           <p className={styles.foot}>Waiting for cide to compute it.</p>
         )}
-        <p className={styles.foot}>
-          A resume puts <code>resume</code> first and the thread last; a run adds its sandbox,
-          model and prompt. Refusals are applied again at every spawn, so editing{' '}
-          <code>workspace.json</code> by hand does not get past them.
-        </p>
       </Group>
     </>
   )

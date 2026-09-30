@@ -95,6 +95,7 @@ import {
   buildRows,
   changelistsOf,
   commitUnits,
+  DEFAULT_CHANGELIST,
   defaultExpanded,
   findChangelistId,
   flatFiles,
@@ -1689,34 +1690,6 @@ export function useGitPanel(
   )
 
   /**
-   * The drop half of drag and drop: file these paths, no dialog.
-   *
-   * Through `mutate`, so the tree the command answers with is adopted directly — a `refresh()`
-   * here would be a second full status walk of every root, and the frame in between shows the
-   * files back where they came from, which reads as the drop having failed.
-   */
-  const movePaths = useCallback(
-    (repo: RepoId, changelist: string, paths: string[]) => {
-      // An empty list is what `dropOutcome` returns for a drop onto the list the files are
-      // already in. Sending it would be a round trip and a busy line for a no-op.
-      if (paths.length === 0) return
-      /*
-       * The ticks follow the files. `model.ts::ticksAfterMove` carries the argument; the part
-       * that belongs here is the *timing*. It is applied before the round trip rather than
-       * after it, because `adopt` keeps every tick whose file is still live — the ids do not
-       * change under a move — so an update afterwards would land one frame late and be visible
-       * as a box that ticks itself off. Nothing in the answer can contradict it either: the
-       * command's whole effect is the assignment this is reacting to.
-       */
-      setSelected((prev) => ticksAfterMove(view, prev, repo, changelist, paths))
-      mutate('git changelist move', 'Moving…', (p) =>
-        gitApi.changelist.movePaths(p, repo, changelist, paths),
-      )
-    },
-    [mutate, view],
-  )
-
-  /**
    * The other drop: add unversioned paths to git, *then* file them.
    *
    * > *"i should be able to move files from Unversioned Files to any of change list via drag
@@ -1829,6 +1802,48 @@ export function useGitPanel(
       })()
     },
     [project, view, note, refresh, adopt, absorb],
+  )
+
+  /**
+   * The drop half of drag and drop: file these paths, no dialog.
+   *
+   * Through `mutate`, so the tree the command answers with is adopted directly — a `refresh()`
+   * here would be a second full status walk of every root, and the frame in between shows the
+   * files back where they came from, which reads as the drop having failed.
+   *
+   * Declared after `trackPaths` because a move into `Changes` *is* one:
+   *
+   * > *"Git tree panel - all changes that was moved to "Changes" should be automatically
+   * > staged."*
+   *
+   * so it stages the files and ticks them (`ticksAfterMove`'s `Changes` rule). Routed here
+   * rather than in each caller so the drop, the chooser and the group menu cannot disagree:
+   * a caller that still asked for a plain move into `Changes` gets the staging anyway.
+   * `dropOutcome` already draws the drop as `track`, so the ghost said so first.
+   */
+  const movePaths = useCallback(
+    (repo: RepoId, changelist: string, paths: string[]) => {
+      // An empty list is what `dropOutcome` returns for a drop onto the list the files are
+      // already in. Sending it would be a round trip and a busy line for a no-op.
+      if (paths.length === 0) return
+      if (changelist === DEFAULT_CHANGELIST) {
+        trackPaths(repo, changelist, paths)
+        return
+      }
+      /*
+       * The ticks follow the files. `model.ts::ticksAfterMove` carries the argument; the part
+       * that belongs here is the *timing*. It is applied before the round trip rather than
+       * after it, because `adopt` keeps every tick whose file is still live — the ids do not
+       * change under a move — so an update afterwards would land one frame late and be visible
+       * as a box that ticks itself off. Nothing in the answer can contradict it either: the
+       * command's whole effect is the assignment this is reacting to.
+       */
+      setSelected((prev) => ticksAfterMove(view, prev, repo, changelist, paths))
+      mutate('git changelist move', 'Moving…', (p) =>
+        gitApi.changelist.movePaths(p, repo, changelist, paths),
+      )
+    },
+    [mutate, view, trackPaths],
   )
 
   const dismissDialog = useCallback(() => setDialog(null), [])

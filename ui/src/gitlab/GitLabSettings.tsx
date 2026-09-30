@@ -3,6 +3,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { api, refreshBoard, startGitLab, useGitLab } from './store'
 import { message, repositoryOfMr } from './model'
 import type { GitLabReviewPrompt } from '@/ipc/generated'
+import { Button } from '@/kit/components/Button'
+import { TextInput, Textarea } from '@/kit/components/Field'
+import { Group, Row, ToggleRow } from '@/settings/controls'
 import styles from './GitLab.module.css'
 export function GitLabSettings() {
   const { board } = useGitLab()
@@ -61,173 +64,200 @@ export function GitLabSettings() {
       setBusy(false)
     }
   }
+  // On the settings screen's own vocabulary since M133 — `Group`, `Row`, `ToggleRow` and the
+  // kit's fields and buttons — where it had its own `h3`s, bare inputs and a paragraph of muted
+  // prose under each box: the one block on the Git page that did not look like the rest of
+  // Settings. The explanations are the rows' (i) now.
   return (
     <section className={styles.settings} aria-label="GitLab settings">
-      <h3>GitLab accounts</h3>
-      {board.accounts.map((a) => (
-        <div key={a.id} className={styles.row}>
-          <span>
-            <UserLink
-              user={{ id: a.userId, username: a.username, name: a.username }}
-              host={a.host}
-            />{' '}
-            · {a.host}
-          </span>
-          <button
-            disabled={busy}
-            onClick={() =>
-              void run(() => api({ kind: 'disconnect', account: a.id }))
-            }
-          >
-            Disconnect
-          </button>
-        </div>
-      ))}
-      <input
-        aria-label="GitLab host"
-        value={host}
-        onChange={(e) => setHost(e.target.value)}
-        placeholder="https://gitlab.example.com"
-      />
-      <input
-        aria-label="Personal access token"
-        type="password"
-        autoComplete="off"
-        value={token}
-        onChange={(e) => setToken(e.target.value)}
-        placeholder="Personal access token (api scope)"
-      />
-      <button
-        disabled={busy || !token.trim()}
-        onClick={() =>
-          void run(async () => {
-            await api({ kind: 'connect', host, token })
-            setToken('')
-          })
-        }
+      <Group
+        title="GitLab accounts"
+        info="Each account is a host and a personal access token with the api scope. The token is stored by cide and used for every GitLab request to that host."
       >
-        {busy ? 'Connecting…' : 'Connect account'}
-      </button>
-      <h3>Review excluded files</h3>
-      <label>
-        <input
-          type="checkbox"
+        {board.accounts.map((a) => (
+          <Row
+            key={a.id}
+            label={a.username}
+            anchor={`gitlab:${a.id}`}
+            hint={a.host}
+            control={
+              <span className={styles.row}>
+                <UserLink
+                  user={{ id: a.userId, username: a.username, name: a.username }}
+                  host={a.host}
+                />
+                <Button
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => void run(() => api({ kind: 'disconnect', account: a.id }))}
+                >
+                  Disconnect
+                </Button>
+              </span>
+            }
+          />
+        ))}
+        <Row
+          label="Connect an account"
+          hint="A GitLab host and a personal access token with the api scope."
+          control={
+            <span className={styles.connect}>
+              <TextInput
+                size="sm"
+                mono
+                aria-label="GitLab host"
+                value={host}
+                onChange={(e) => setHost(e.target.value)}
+                placeholder="https://gitlab.example.com"
+              />
+              <TextInput
+                size="sm"
+                mono
+                aria-label="Personal access token"
+                type="password"
+                autoComplete="off"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                placeholder="Personal access token"
+              />
+              <Button
+                size="sm"
+                variant="primary"
+                disabled={busy || !token.trim()}
+                onClick={() =>
+                  void run(async () => {
+                    await api({ kind: 'connect', host, token })
+                    setToken('')
+                  })
+                }
+              >
+                {busy ? 'Connecting…' : 'Connect'}
+              </Button>
+            </span>
+          }
+        />
+      </Group>
+
+      <Group title="Review excluded files">
+        <ToggleRow
+          label="Hide matching files in all MR reviews"
+          hint="Excluded from review totals. Local Git changes are unaffected."
           checked={board.preferences.excludeEnabled}
           disabled={busy}
-          onChange={(e) =>
+          onChange={(excludeEnabled) =>
             void run(() =>
               api({
                 kind: 'preferences',
-                preferences: {
-                  ...board.preferences,
-                  excludeEnabled: e.target.checked,
-                },
+                preferences: { ...board.preferences, excludeEnabled },
               }),
             )
           }
         />
-        Hide matching files in all MR reviews
-      </label>
-      <textarea
-        aria-label="Review exclusion patterns"
-        value={patterns}
-        onChange={(e) => setPatterns(e.target.value)}
-        spellCheck={false}
-      />
-      <span className={styles.muted}>
-        One repository-relative glob per line (*, **, and ?). Matching files are
-        excluded from review totals. Local Git changes are unaffected.
-      </span>
-      <button
-        disabled={busy}
-        onClick={() =>
-          void run(() =>
-            api({
-              kind: 'preferences',
-              preferences: {
-                ...board.preferences,
-                excludedFiles: patterns
-                  .split('\n')
-                  .map((p) => p.trim())
-                  .filter(Boolean),
-              },
-            }),
-          )
-        }
-      >
-        Save patterns
-      </button>
-      <h3>Agent review instructions</h3>
-      <span className={styles.muted}>
-        What the instructions box of Review with an agent starts with. A repository&apos;s own
-        entry wins over the default; you can still edit the text before starting a review. Line
-        breaks become spaces when the review starts.
-      </span>
-      <textarea
-        aria-label="Default review instructions"
-        value={reviewPrompt}
-        onChange={(e) => setReviewPrompt(e.target.value)}
-        placeholder="For every repository — e.g. focus on correctness and missing tests."
-      />
-      {reviewPrompts.map((row, i) => (
-        <div key={i} className={styles.reviewPromptRow}>
-          <div className={styles.row}>
-            <input
-              aria-label="Repository"
-              list="gitlab-review-prompt-repositories"
-              value={row.repository}
-              onChange={(e) => editPrompt(i, { repository: e.target.value })}
-              placeholder="group/repo"
-              spellCheck={false}
-            />
-            <button
+        <Row
+          label="Patterns"
+          hint="One repository-relative glob per line: *, ** and ?."
+          control={
+            <Button
+              size="sm"
               disabled={busy}
               onClick={() =>
-                setReviewPrompts((rows) => rows.filter((_, j) => j !== i))
+                void run(() =>
+                  api({
+                    kind: 'preferences',
+                    preferences: {
+                      ...board.preferences,
+                      excludedFiles: patterns
+                        .split('\n')
+                        .map((p) => p.trim())
+                        .filter(Boolean),
+                    },
+                  }),
+                )
               }
             >
-              Remove
-            </button>
+              Save patterns
+            </Button>
+          }
+        />
+        <Textarea
+          aria-label="Review exclusion patterns"
+          value={patterns}
+          onChange={(e) => setPatterns(e.target.value)}
+          spellCheck={false}
+        />
+      </Group>
+
+      <Group title="Agent review instructions">
+        <Row
+          label="Default instructions"
+          hint="What Review with an agent’s instructions box starts with."
+          info="A repository’s own entry wins over the default; you can still edit the text before starting a review. Line breaks become spaces when the review starts."
+          control={
+            <Button
+              size="sm"
+              disabled={busy}
+              onClick={() =>
+                void run(() =>
+                  api({
+                    kind: 'preferences',
+                    preferences: { ...board.preferences, reviewPrompt, reviewPrompts },
+                  }),
+                )
+              }
+            >
+              Save review instructions
+            </Button>
+          }
+        />
+        <Textarea
+          aria-label="Default review instructions"
+          value={reviewPrompt}
+          onChange={(e) => setReviewPrompt(e.target.value)}
+          placeholder="For every repository — e.g. focus on correctness and missing tests."
+        />
+        {reviewPrompts.map((row, i) => (
+          <div key={i} className={styles.reviewPromptRow}>
+            <div className={styles.row}>
+              <TextInput
+                size="sm"
+                mono
+                aria-label="Repository"
+                list="gitlab-review-prompt-repositories"
+                value={row.repository}
+                onChange={(e) => editPrompt(i, { repository: e.target.value })}
+                placeholder="group/repo"
+                spellCheck={false}
+              />
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => setReviewPrompts((rows) => rows.filter((_, j) => j !== i))}
+              >
+                Remove
+              </Button>
+            </div>
+            <Textarea
+              aria-label={`Review instructions for ${row.repository || 'this repository'}`}
+              value={row.prompt}
+              onChange={(e) => editPrompt(i, { prompt: e.target.value })}
+            />
           </div>
-          <textarea
-            aria-label={`Review instructions for ${row.repository || 'this repository'}`}
-            value={row.prompt}
-            onChange={(e) => editPrompt(i, { prompt: e.target.value })}
-          />
-        </div>
-      ))}
-      <datalist id="gitlab-review-prompt-repositories">
-        {knownRepositories.map((r) => (
-          <option key={r} value={r} />
         ))}
-      </datalist>
-      <div className={styles.row}>
-        <button
-          disabled={busy}
-          onClick={() =>
-            setReviewPrompts((rows) => [...rows, { repository: '', prompt: '' }])
-          }
-        >
-          Add repository
-        </button>
-        <button
-          disabled={busy}
-          onClick={() =>
-            void run(() =>
-              api({
-                kind: 'preferences',
-                preferences: {
-                  ...board.preferences,
-                  reviewPrompt,
-                  reviewPrompts,
-                },
-              }),
-            )
-          }
-        >
-          Save review instructions
-        </button>
-      </div>
+        <datalist id="gitlab-review-prompt-repositories">
+          {knownRepositories.map((r) => (
+            <option key={r} value={r} />
+          ))}
+        </datalist>
+        <div className={styles.row}>
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => setReviewPrompts((rows) => [...rows, { repository: '', prompt: '' }])}
+          >
+            Add repository
+          </Button>
+        </div>
+      </Group>
       {error && (
         <div role="alert" className={styles.error}>
           {error}

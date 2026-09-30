@@ -45,6 +45,17 @@ pub fn settings_get(state: State<'_, WorkspaceState>) -> Settings {
     state.with(|ws| ws.settings.clone())
 }
 
+/// What every setting is before anyone changes it. (M133)
+///
+/// For Settings' "changed from the default" dot and its Reset button. Served from Rust rather
+/// than written out a second time in TypeScript because `Settings::default()` is the one home
+/// of these values — the one a fresh profile actually starts on — and a copy in the UI would be
+/// a dot that lies the first time a default moves.
+#[tauri::command(rename_all = "camelCase")]
+pub fn settings_defaults() -> Settings {
+    Settings::default()
+}
+
 /// Apply a patch and return the settings as they now stand.
 ///
 /// Returns the whole struct rather than a revision: the caller is a form, and a form that

@@ -19,6 +19,7 @@ import {
   Tooltip,
   Wizard,
 } from '../../components/Overlay'
+import { InfoPara, InfoTip } from '../../components/InfoTip'
 import { Kbd } from '../../components/Status'
 import { Heading, PathList, PathRow } from '../../components/Surface'
 import { Icon } from '@/icons/Icon'
@@ -278,6 +279,36 @@ export function Overlays(): ReactElement {
               <Tooltip text="Refresh" />
               <Tooltip text="Command palette" shortcut="Ctrl+Shift+P" />
             </Line>
+          </Cell>
+        </Line>
+      </Specimen>
+
+      <Specimen
+        name="Explanation on demand"
+        source="InfoTip.tsx › InfoTip, InfoPara"
+        use={
+          <>
+            <strong>InfoTip</strong>: the (i) after a label, holding what the one-line hint had no
+            room for. Opens on hover (after a beat), on focus, and pins on click so a long paragraph
+            can be read and an env var copied out of it; Escape or a click elsewhere closes it. Prose
+            only — no buttons inside, because the popover sits last in the tab order. Separate
+            paragraphs with <strong>InfoPara</strong>.
+          </>
+        }
+        ground="panel"
+      >
+        <Line>
+          <Cell label="after a label">
+            <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+              Show ignored files
+              <InfoTip label="About Show ignored files">
+                <InfoPara>
+                  Everything <code>.gitignore</code> covers — <code>target/</code>,{' '}
+                  <code>node_modules/</code> — drawn muted.
+                </InfoPara>
+                <InfoPara>The expensive setting: every ignored row is walked and offered to Ctrl+P.</InfoPara>
+              </InfoTip>
+            </span>
           </Cell>
         </Line>
       </Specimen>
