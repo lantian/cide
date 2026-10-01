@@ -2000,8 +2000,16 @@ try {
         'pointer when a pane is closed in another window',
     )
     ok(
-      (t('card-spec-session-closed').text ?? '').includes('--resume'),
-      'and the hint names the mechanism rather than leaving a grey chip to be interpreted',
+      (t('card-spec-session-closed').text ?? '').includes(
+        'Resume brings the whole transcript back and hands it this task again',
+      ),
+      'and the hint says Resume restores the transcript and hands the task back',
+    )
+    ok(
+      (t('card-spec-session-closed').text ?? '').includes(
+        'Reopen brings it back without asking it for anything',
+      ),
+      'and distinguishes Reopen, which restores the conversation without dispatching work',
     )
 
     /*

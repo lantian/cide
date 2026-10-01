@@ -744,7 +744,8 @@ fn build() -> Vec<Command> {
         Command::new("claude.addRow", "Add row: new Harness session", HARNESS)
             .when("paneFocused")
             .keywords(&["panel", "full-width"]),
-        Command::new("claude.fork", "Fork session into new pane", HARNESS).when("claudePaneFocused"),
+        Command::new("claude.fork", "Fork session into new pane", HARNESS)
+            .when("claudePaneFocused"),
         Command::new("claude.mirror", "Mirror session into new pane", HARNESS)
             .when("claudePaneFocused"),
         /*
@@ -766,7 +767,8 @@ fn build() -> Vec<Command> {
          * Neither is bound by default; a restart is not a per-minute gesture, and the pane's own
          * bar is where a user with a dead terminal is actually looking.
          */
-        Command::new("claude.restart", "Restart Harness session", HARNESS).when("claudePaneFocused"),
+        Command::new("claude.restart", "Restart Harness session", HARNESS)
+            .when("claudePaneFocused"),
         // Whether a transcript still exists is a fact about the disk — a file under
         // `~/.claude/projects` — so no clause can claim it. The handler asks `session_resumable`
         // and says so when the answer is no, which is the rule this table's header states about
