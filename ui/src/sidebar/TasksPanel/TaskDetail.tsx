@@ -62,6 +62,8 @@
  * Agents write `**bold**`, fences and lists into this log all day; drawing the syntax raw was
  * the panel refusing to read what its main authors write.
  */
+import type { AnswerHandler } from './QuestionAnswer'
+import type { TaskQuestion } from './model'
 import { useRef, useState, type JSX } from 'react'
 import {
   agentColor,
@@ -774,9 +776,10 @@ export interface TaskDetailProps {
    */
   onSetTouches?: ((task: string, touches: string[]) => void) | undefined
   onSetAcceptance?: ((task: string, acceptance: 'user' | null) => void) | undefined
-  onSetQuestion?: ((task: string, question: string | null) => void) | undefined
+  onSetQuestion?: ((task: string, question: TaskQuestion | null) => void) | undefined
   /** Answer the task's open question (M132). See `QuestionField`. */
-  onAnswer?: ((task: string, text: string) => void) | undefined
+  onAnswer?: AnswerHandler | undefined
+  onRequestQuestionPreview?: ((task: string, image: string) => void) | undefined
   /**
    * A new comment — with, since M39, the files the composer had staged. The host lands text
    * alone through `TaskEdit::Comment` and text-with-files through `task_attach`'s `newComment`
@@ -1047,6 +1050,7 @@ export function TaskDetail(props: TaskDetailProps) {
     onSetAcceptance,
     onSetQuestion,
     onAnswer,
+    onRequestQuestionPreview,
   } = props
 
   const chip = agentChip(task, runs, roles)
@@ -1451,7 +1455,7 @@ export function TaskDetail(props: TaskDetailProps) {
           * it waits on first (it is why nothing is happening), then which files it may change,
           * then who judges it. Each is withheld without its handler — `TaskWaitFields.tsx`.
           */}
-        <QuestionField task={task} onSetQuestion={onSetQuestion} onAnswer={onAnswer} />
+        <QuestionField task={task} onSetQuestion={onSetQuestion} onAnswer={onAnswer} previews={previews} onRequestPreview={onRequestQuestionPreview} />
         {onSetTouches !== undefined && <TouchesField task={task} onSetTouches={onSetTouches} />}
         {onSetAcceptance !== undefined && (
           <AcceptanceField task={task} onSetAcceptance={onSetAcceptance} />
@@ -2471,7 +2475,7 @@ export function TaskDetail(props: TaskDetailProps) {
               className={styles.action}
               data-audit="specProposeForTask"
               data-write="true"
-              title="Runs OpenSpec's propose workflow in this project's Claude conversation, and asks it to link the change it writes back to this task."
+              title="Runs OpenSpec's propose workflow in this project's Harness conversation, and asks it to link the change it writes back to this task."
               onClick={() => onProposeChange(task.id)}
             >
               Make a proposal

@@ -93,7 +93,7 @@ export function confirmTitle(scope: CloseScope, risk: CloseRisk): string {
   if (risk.unsaved.length > 0) {
     return `${count(risk.unsaved.length, 'file')} with unsaved changes`
   }
-  return `${count(risk.sessions.length, 'Claude session')} still working`
+  return `${count(risk.sessions.length, 'Harness session')} still working`
 }
 
 /**

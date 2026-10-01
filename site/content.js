@@ -126,7 +126,7 @@ window.CIDE_SITE = {
           shot: 'claude',
           en: {
             title: 'A Claude tab that never closes',
-            body: 'Every project has a pinned Claude tab holding a tiling grid of Claude sessions, shells and read-only diffs. Sessions belong to cide’s core, not to a window: close a pane, close the window, quit the app, and the conversation is still there on the next launch.',
+            body: 'Every project has a pinned console tab holding a tiling grid of harness sessions, shells and read-only diffs. Sessions belong to cide’s core, not to a window: close a pane, close the window, quit the app, and the conversation is still there on the next launch.',
             points: [
               'Split, resize and drag panes between rows and columns',
               'Sessions survive closed panes, closed windows and restarts',

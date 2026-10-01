@@ -283,7 +283,7 @@ export function TasksPanelView({
         data-audit="tasksPlan"
         data-write="true"
         disabled={planning}
-        title="Open a Claude tab that surveys the board and git, then creates and assigns the next tasks"
+        title="Open a Harness tab that surveys the board and git, then creates and assigns the next tasks"
         onClick={onPlanTasks}
       >
         {planning ? 'Planning…' : 'Plan tasks'}

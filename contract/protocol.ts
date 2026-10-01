@@ -819,6 +819,16 @@ before?: string,
  */
 diff: string, };
 
+export type QuestionChoices = { text: string, selection: QuestionSelection, options: Array<QuestionOption>, };
+
+export type QuestionOption = { id: string, title: string, description?: string, 
+/**
+ * An image attachment on this task. The agent tool accepts a source path and copies it.
+ */
+image?: TaskAttachmentId, };
+
+export type QuestionSelection = "single" | "multiple";
+
 /**
  * A role, as a device lists it. (M75)
  *
@@ -1433,7 +1443,7 @@ attachments: Array<TaskAttachment>, history: Array<TaskStatusChange>, };
  * from no code path, and whose handling arm would have minted a pane showing nothing. Add it
  * with the gesture, in the same commit.
  */
-export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, } | { "kind": "detachAttachment", attachment: TaskAttachmentId, } | { "kind": "setTouches", touches: Array<string>, } | { "kind": "setAcceptance", acceptance: Acceptance | null, } | { "kind": "setQuestion", question: string | null, } | { "kind": "supersede", comment: CommentId, };
+export type TaskEdit = { "kind": "setTitle", title: string, } | { "kind": "setBody", body: string, } | { "kind": "setStatus", status: TaskStatus, } | { "kind": "assign", agent: AgentId | null, } | { "kind": "setSession", session: SessionId | null, } | { "kind": "setChange", change: ChangeName | null, } | { "kind": "link", link: LinkType, target: TaskId, } | { "kind": "unlink", link: LinkType, target: TaskId, } | { "kind": "comment", text: string, } | { "kind": "editComment", id: CommentId, text: string, } | { "kind": "deleteComment", id: CommentId, } | { "kind": "detachAttachment", attachment: TaskAttachmentId, } | { "kind": "setTouches", touches: Array<string>, } | { "kind": "setAcceptance", acceptance: Acceptance | null, } | { "kind": "setQuestion", question: TaskQuestion | null, } | { "kind": "supersede", comment: CommentId, };
 
 /**
  * One task in `.cide/tasks.json`, as a short string — `t-17`. (M18)
@@ -1571,6 +1581,11 @@ touches?: Array<string>,
 acceptance?: Acceptance, };
 
 /**
+ * A text question remains a string on disk and on the wire for older callers.
+ */
+export type TaskQuestion = string | QuestionChoices;
+
+/**
  * One task as the *board* carries it: everything except its body, its log and its files. (M68)
  *
  * # Why this is a separate type and not `Task` with three keys left out
@@ -1638,7 +1653,7 @@ acceptance?: Acceptance,
  * [`Task::question`], on the row because the planner and *Waiting for you* read it across
  * tasks. (M132)
  */
-question?: string, createdBy: TaskAuthor, createdUnixMs: bigint, 
+question?: TaskQuestion, createdBy: TaskAuthor, createdUnixMs: bigint, 
 /**
  * See [`Task::updated_unix_ms`] — the merge tiebreak and the panel's in-group sort key.
  *

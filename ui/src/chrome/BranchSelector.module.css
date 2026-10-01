@@ -210,14 +210,35 @@
   padding: var(--sp-2);
 }
 
-/* The kit's section caption. */
+/* Section captions are disclosure buttons; the chevron follows the expanded state. */
 .section {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  border: 0;
+  border-radius: var(--r-2);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
   padding: var(--sp-4) var(--sp-4) var(--sp-2);
   color: var(--faint);
   font-size: var(--fs-ui-11);
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
+}
+
+.section:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.section:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-inset);
 }
 
 .row,
@@ -240,8 +261,8 @@
  * The row the arrow keys have walked to.
  *
  * A modifier over `.row` / `.rowCurrent` rather than a third row class, because "highlighted"
- * and "is the branch you are on" are independent — the current branch is pinned first, so it is
- * the row the first Down lands on.
+ * and "is the branch you are on" are independent — the current branch is pinned first within
+ * its group.
  *
  * Both a wash and a bar: the wash alone is `--chrome-hi`, which is exactly what `:hover` paints,
  * so a mouse resting anywhere in the list would be indistinguishable from the thing ⏎ is about
@@ -258,8 +279,8 @@
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
-  align-items: baseline;
-  gap: var(--sp-4);
+  align-items: center;
+  gap: var(--sp-2);
   appearance: none;
   border: 0;
   background: transparent;
@@ -279,15 +300,14 @@
   box-shadow: var(--focus-inset);
 }
 
-/* The branch you are on, marked by weight and colour rather than by a glyph that would need
-   its own column on every other row. */
+/* The current branch has the same kind icon as its peers; weight and colour mark it current. */
 .rowCurrent .name {
   color: var(--accent);
   font-weight: 500;
 }
 
 .name {
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -311,17 +331,6 @@
   font-family: var(--font-mono);
   font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
-}
-
-/* The tip's summary. First to give way — it is context, and the name is the row. */
-.subject {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--faint);
-  font-size: var(--fs-ui-12);
 }
 
 .rowMenu {

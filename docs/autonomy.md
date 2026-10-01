@@ -228,8 +228,39 @@ you do:
 - **Questions.** A task with an open `question`, such as the planner's "the plan is done but the
   gate fails: X or Y?", or a run's "which of these two layouts?". A task with an open question is
   not dispatched (autodispatch and an explicit dispatch both refuse), is not counted as open work
-  by the planner timer, and is skipped by batch review. Type the answer in the row's box. That
-  clears the question and continues the role.
+  by the planner timer, and is skipped by batch review. Choose from the supplied answers or
+  enter custom text, then press **Answer**. A question takes priority over approval: the task
+  appears only under Questions. Answering clears the question, returns review work to doing
+  (todo without an assigned role), and continues the same role. Approval can be requested
+  later when the work is finished.
+
+Questions can include any number of choices with a title, optional description, and optional
+image. The agent specifies single-select or multi-select; custom text is always available,
+alone or alongside selections. **Compare choices** opens a wider view; **View image** shows a
+render full size without losing your selections. A failed submission keeps your answer for retry.
+
+Agents ask through `cide_task_update`. A plain string still asks a free-text question; a structured
+question supplies choices:
+
+```json
+{
+  "id": "t-17",
+  "question": {
+    "text": "Which renders do you prefer?",
+    "selection": "multiple",
+    "options": [
+      { "id": "wood", "title": "Wooden finish", "description": "Warm lighting", "image": "renders/wood.png" },
+      { "id": "metal", "title": "Metal finish", "image": "renders/metal.png" }
+    ]
+  }
+}
+```
+
+Selection defaults to `single`. Option IDs must be unique and titles nonempty. Image paths are
+relative to the calling agent's working directory (absolute paths also work); cide copies them
+into the task's attachments. An existing image attachment ID can be reused. Files use the normal
+32 MiB attachment limit; there is no limit on the number of choices. Ask a question or request
+approval in a hand-back, never both.
 
 Before M132 both of these were comments in a log. A run would ask "which of these two sprites?"
 in a card nobody had open, and the project sat idle behind it with nothing on screen saying why.
@@ -371,6 +402,7 @@ enough for batches to form.
 | --- | --- | --- |
 | `CIDE_CPUS` | runs in a worktree, their verify, sessions in a checkout | cores ÷ `agents.maxConcurrent`, at least 1 |
 
-A tracker that uses `touches`, `acceptance` or `question` is written as schema 4. An older cide
+A tracker that uses `touches`, `acceptance` or a text `question` is written as schema 4. Structured
+questions require schema 5 while present. An older cide
 refuses that board rather than silently dropping those fields when it writes the file back. The
 same happened with schema 3 for the inbox (M83). Open such a project with a build from M132 on.

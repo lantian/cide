@@ -2088,17 +2088,17 @@ mod tests {
     fn commands_are_grouped_in_registry_order() {
         let registry = vec![
             Command::new("pane.split.right", "Split pane right", "Window"),
-            Command::new("claude.new", "New Claude session", "Claude"),
+            Command::new("claude.new", "New Harness session", "Harness"),
             Command::new("pane.close", "Close pane", "Window").when("paneFocused"),
         ];
         let out = render_commands(&registry);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "Window");
-        // Both Window commands sit under the one heading, and Claude follows them.
+        // Both Window commands sit under the one heading, and Harness follows them.
         assert!(lines[1].starts_with("  pane.split.right"));
         assert!(lines[2].starts_with("  pane.close"));
         assert!(lines[2].contains("when paneFocused"));
-        assert_eq!(lines[3], "Claude");
+        assert_eq!(lines[3], "Harness");
         assert!(out.contains("3 command(s) in 2 group(s)"));
     }
 

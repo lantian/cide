@@ -454,7 +454,7 @@ export function splitAction(tracker: TrackerKind = 'ready'): ActionOffer {
   const split: ActionOffer = {
     label: 'Split work',
     title:
-      'Asks this project’s Claude conversation to turn the change’s checklist into a main task with one subtask per unit of work, say which role should take each, and ask you before anything starts.',
+      'Asks this project’s Harness conversation to turn the change’s checklist into a main task with one subtask per unit of work, say which role should take each, and ask you before anything starts.',
   }
   if (tracker === 'unknown') {
     return {
@@ -1087,7 +1087,7 @@ export const SETUP_LABEL = 'Set up OpenSpec'
  */
 export const SETUP_BUSY_LABEL = 'Setting up…'
 export const SETUP_TITLE =
-  'Runs `openspec init` here. Adds an openspec/ folder to this repository, and OpenSpec’s own workflow commands to this project’s Claude Code and Codex. The project’s Claude conversation then restarts — keeping its transcript — so those commands are known to it.'
+  'Runs `openspec init` here. Adds an openspec/ folder to this repository, and OpenSpec’s own workflow commands to this project’s Claude Code and Codex. The project’s Harness conversation then restarts — keeping its transcript — so those commands are known to it.'
 
 /**
  * What to say once Set up has landed, per how the console reload went.
@@ -1112,13 +1112,13 @@ export function setUpNotice(reload: 'resumed' | 'restarted' | 'unreachable'): st
       // The conversation is kept — `claude --resume` re-reads the skills and the transcript
       // both — and the sentence says so, because "restarted" alone reads as "your conversation
       // is gone" to the person who just watched their pane clear and redraw.
-      return 'OpenSpec is set up. The project’s Claude conversation was restarted — resuming where it was — so its commands are available.'
+      return 'OpenSpec is set up. The project’s Harness conversation was restarted — resuming where it was — so its commands are available.'
     case 'restarted':
-      return 'OpenSpec is set up. The project’s Claude conversation was restarted, so its commands are available.'
+      return 'OpenSpec is set up. The project’s Harness conversation was restarted, so its commands are available.'
     default:
       // No pane this window can respawn — a detached console, whose restarter lives in another
       // window's realm. The manual sentence is the fallback, not the feature.
-      return 'OpenSpec is set up. Restart this project’s Claude conversation before using its commands — Claude Code reads a project’s skills when it launches, so the one that is open does not have them yet.'
+      return 'OpenSpec is set up. Restart this project’s Harness conversation before using its commands — The harness reads a project’s skills when it launches, so the one that is open does not have them yet.'
   }
 }
 
@@ -1127,7 +1127,7 @@ export function setUpNotice(reload: 'resumed' | 'restarted' | 'unreachable'): st
  * up" alone would leave the next *Propose* refusing for a reason the user was never told.
  */
 export const SETUP_RELOAD_FAILED =
-  'OpenSpec is set up, but restarting the project’s Claude conversation failed — restart it yourself (the pane’s Restart, or *Resume Claude session* in the palette) before using its commands.'
+  'OpenSpec is set up, but restarting the project’s Harness conversation failed — restart it yourself (the pane’s Restart, or *Resume Harness session* in the palette) before using its commands.'
 /**
  * The two entry points an empty board offers, and the commands behind them.
  *

@@ -1127,17 +1127,17 @@ function AgentsEditor({
           >
             <ToggleRow
               label="Review finished runs in a new tab"
-              hint="A fresh Claude tab checks the work instead of this project’s console."
+              hint="A fresh Harness tab checks the work instead of this project’s console."
               info={
                 <>
                   <InfoPara>
-                    When a subagent hands its turn back, open a fresh Claude tab to check the work
+                    When a subagent hands its turn back, open a fresh Harness tab to check the work
                     instead of typing a line into this project’s console. The new conversation
                     starts empty, so it reads the task and the diff with nothing else in its
                     context.
                   </InfoPara>
                   <InfoPara>
-                    The tab stays until you close it, which ends the Claude in it. Off, the console
+                    The tab stays until you close it, which ends the session in it. Off, the console
                     is told instead, exactly as before.
                   </InfoPara>
                 </>
@@ -1264,8 +1264,8 @@ function AgentsEditor({
           <Group title="When the project goes quiet">
             <ToggleRow
               label="Wake this project when it goes quiet"
-              hint="Open a Claude to review progress and assign the next tasks."
-              info="With subagents on and tasks still open, if nothing has been running for the period below, open a Claude and ask it to check what was done and put the next tasks on the roles. It never fires while a run is live, while a Claude pane is working, or while agents are paused."
+              hint="Open a Harness session to review progress and assign the next tasks."
+              info="With subagents on and tasks still open, if nothing has been running for the period below, open a Harness session and ask it to check what was done and put the next tasks on the roles. It never fires while a run is live, while a Harness pane is working, or while agents are paused."
               checked={config.autoSpin}
               onChange={(next) => patchConfig({ autoSpin: next })}
             />
@@ -1315,7 +1315,7 @@ function AgentsEditor({
                   label="What to tell it"
                   hint={
                     <>
-                      The new Claude’s first prompt. Empty uses cide’s own.
+                      The new Harness session’s first prompt. Empty uses cide’s own.
                       <InfoTip label="About What to tell it">
                         <InfoPara>
                           cide’s own tells it to survey the board and the git log first, judge

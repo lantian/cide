@@ -348,7 +348,7 @@ export interface TaskView {
    */
   acceptance: 'user' | null
   /** An open question to the user, or `null`. The task is not dispatched while it is set. (M132) */
-  question: string | null
+  question: TaskQuestion | null
   /**
    * Who asked for this task. Structural restatement of `Task::createdBy`.
    *
@@ -2335,20 +2335,41 @@ export function dropZoneAt(
  *
  * Two lists and not one sorted list, because the two ask for different answers — a verdict on
  * work, or a sentence — and a row that mixed them would put an Accept button beside a question.
- * A task can be in both (a question asked about work already in review) and is listed in both;
- * [`waitingCount`] counts it once, because the badge is a number of tasks, not of rows.
+ * An open question takes priority over review, so a task is listed once and asks for one
+ * response. Answering resumes work; a later review can request approval.
  *
  * `inbox` and `done` never qualify for review: a `user` task in review is the only state in which
  * the user's Accept is what moves it (`task_respond`); anywhere else Accept would be a status
  * change the status segment already offers.
  */
+export type TaskQuestion = string | {
+  text: string
+  selection: 'single' | 'multiple'
+  options: { id: string; title: string; description?: string; image?: string }[]
+}
+
+export type QuestionAnswer = {
+  kind: 'answer'
+  text: string
+  selectedIds: string[]
+  expectedQuestion: TaskQuestion
+}
+
+export function questionText(question: TaskQuestion): string {
+  return typeof question === 'string' ? question : question.text
+}
+
+export function hasQuestion(task: TaskView): boolean {
+  return task.question !== null && questionText(task.question).trim() !== ''
+}
+
 export function waitingFor(tasks: readonly TaskView[]): {
   review: TaskView[]
   questions: TaskView[]
 } {
   return {
-    review: tasks.filter((t) => t.acceptance === 'user' && t.status === 'review'),
-    questions: tasks.filter((t) => t.question !== null && t.question.trim() !== ''),
+    review: tasks.filter((t) => t.acceptance === 'user' && t.status === 'review' && !hasQuestion(t)),
+    questions: tasks.filter(hasQuestion),
   }
 }
 

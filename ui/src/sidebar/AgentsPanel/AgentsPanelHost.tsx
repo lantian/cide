@@ -109,7 +109,7 @@
  * Waiting row is the run row's own gesture, `revealTask`, so the card opens over this panel by
  * the one road with the refusals written down.
  */
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { fsReveal, tasks as tasksApi, type ProjectId, type TaskResponse } from '@/ipc/client'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
@@ -119,10 +119,11 @@ import { followMilestones, useMilestones } from '@/sidebar/milestonesStore'
 import { openTaskSession } from '@/sidebar/TasksPanel/openSession'
 import { useAgentsTab } from '@/sidebar/agentsTabStore'
 import { adaptDetail } from '@/sidebar/TasksPanel/adapt'
-import { latestReport, waitingCount, waitingFor, type TaskView } from '@/sidebar/TasksPanel/model'
+import { latestReport, questionText, waitingCount, waitingFor, type TaskView } from '@/sidebar/TasksPanel/model'
 import { AgentsPanelView, type AgentsTab } from './AgentsPanel'
 import { AgentsPanelTabs } from './PanelTabs'
 import { WaitingPanel } from './WaitingPanel'
+import { previewsSnapshot, subscribePreviews, requestPreview } from '@/sidebar/TasksPanel/attachmentPreviews'
 import { SessionsPanel } from './SessionsPanel'
 import { filterSessions, type SessionView } from './sessionsModel'
 import { useSessions } from '@/sidebar/sessionsStore'
@@ -183,7 +184,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
   const taskQuestions = useMemo(() => {
     const questions: Record<string, string> = {}
     if (board.kind === 'ready')
-      for (const task of board.tasks) if (task.question) questions[task.id] = task.question
+      for (const task of board.tasks) if (task.question) questions[task.id] = questionText(task.question)
     return questions
   }, [board])
 
@@ -208,6 +209,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
    * showing, and again when the board moves (a run that reported again is a board change). Few
    * rows by nature: these are tasks the user alone can finish.
    */
+  const previews = useSyncExternalStore(subscribePreviews, previewsSnapshot, previewsSnapshot)
   const [reports, setReports] = useState<Readonly<Record<string, string | null>>>({})
   const reviewIds = waiting.review.map((t) => t.id).join(' ')
   useEffect(() => {
@@ -473,7 +475,9 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
         onOpenTask={(task) => revealTask(task, project)}
         onAccept={(task) => respond(task, { kind: 'accept' })}
         onSendBack={(task, note) => respond(task, { kind: 'sendBack', note })}
-        onAnswer={(task, text) => respond(task, { kind: 'answer', text })}
+        onAnswer={(task, response) => respondTask(task, response)}
+        previews={previews}
+        onRequestPreview={(task, image) => { if (project !== null) requestPreview(project, task, image) }}
       />
     )
   }

@@ -167,7 +167,7 @@ try {
   eq(d.plain.addRow, 1, 'the `+ row` strip renders once')
   eq(
     d.plain.buttons,
-    ['Add a row with a shell', 'Add a row with a Claude session'],
+    ['Add a row with a shell', 'Add a row with a Harness session'],
     'both rows a new row can hold are one click each, and both carry an accessible name',
   )
   eq(d.noStrip.addRow, 0, 'and nothing renders when the host offers no such gesture')

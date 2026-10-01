@@ -22,6 +22,41 @@ export type CheckboxProps = {
   indeterminate?: boolean | undefined
 }
 
+/** Image/paragraph choices with native radios or checkboxes and a separate preview target. */
+export function VisualChoices({ label, name, multiple, values, options, disabled, onChange }: {
+  label: string
+  name: string
+  multiple: boolean
+  values: readonly string[]
+  options: readonly { id: string; title: string; description?: string; art?: ReactNode }[]
+  disabled?: boolean | undefined
+  onChange: (values: string[]) => void
+}): ReactElement {
+  return (
+    <fieldset className={styles.visualChoices} aria-label={label}>
+      <legend className={styles.legend}>{label}</legend>
+      <div className={styles.visualGrid}>
+        {options.map((option) => (
+          <div key={option.id} className={styles.visualCard} data-selected={values.includes(option.id)}>
+            {option.art !== undefined && <div className={styles.visualArt}>{option.art}</div>}
+            <label className={styles.check}>
+              <input type={multiple ? 'checkbox' : 'radio'} name={name} value={option.id}
+                checked={values.includes(option.id)} disabled={disabled}
+                onChange={(e) => onChange(multiple
+                  ? e.target.checked ? [...values, option.id] : values.filter((id) => id !== option.id)
+                  : [option.id])} />
+              <span className={styles.checkText}>
+                <strong>{option.title}</strong>
+                {option.description !== undefined && <span className={styles.checkHint}>{option.description}</span>}
+              </span>
+            </label>
+          </div>
+        ))}
+      </div>
+    </fieldset>
+  )
+}
+
 export function Checkbox({
   label,
   hint,

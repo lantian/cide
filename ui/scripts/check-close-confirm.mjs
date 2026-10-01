@@ -100,7 +100,7 @@ try {
     '3 files with unsaved changes',
     'several files are counted in the heading and listed in the body',
   )
-  eq(confirmTitle('app', busyOnly), '1 Claude session still working', 'singular, not "1 sessions"')
+  eq(confirmTitle('app', busyOnly), '1 Harness session still working', 'singular, not "1 sessions"')
   eq(count(1, 'file'), '1 file', 'the singular is written out')
   eq(count(3, 'file'), '3 files', 'the plural is written out')
 

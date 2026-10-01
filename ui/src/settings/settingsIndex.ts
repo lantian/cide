@@ -38,7 +38,7 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'appearance', label: 'Version', keywords: 'about build release check for updates' },
   { section: 'appearance', label: 'Log directory', keywords: 'logs diagnostics debug report' },
   // Projects & windows
-  { section: 'projectsAndWindows', label: 'Each project keeps its own Claude tab', keywords: 'pinned console' },
+  { section: 'projectsAndWindows', label: 'Each project keeps its own console tab', keywords: 'pinned console' },
   { section: 'projectsAndWindows', label: 'Reopen the last project on launch', keywords: 'restore startup session' },
   { section: 'projectsAndWindows', label: 'Check for updates on start', keywords: 'update release github auto' },
   { section: 'projectsAndWindows', label: 'Skipping a version', keywords: 'skip update release offer again' },
@@ -49,7 +49,7 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'claudeSessions', tab: 'console', label: 'Harness', keywords: 'claude codex cli console which' },
   { section: 'claudeSessions', tab: 'console', label: 'Last handshake', keywords: 'ide protocol claude verified' },
   { section: 'claudeSessions', tab: 'console', label: 'Disable mouse reporting', keywords: 'CLAUDE_CODE_DISABLE_MOUSE selection' },
-  { section: 'claudeSessions', tab: 'console', label: 'Resume every Claude pane on launch', keywords: 'restore conversation startup' },
+  { section: 'claudeSessions', tab: 'console', label: 'Resume every Harness pane on launch', keywords: 'restore conversation startup' },
   { section: 'claudeSessions', tab: 'console', label: 'Full repaint on the alternate screen', keywords: 'CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT debris resize' },
   { section: 'claudeSessions', tab: 'console', label: 'Disable the alternate screen', keywords: 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN fullscreen scrollback' },
   { section: 'claudeSessions', tab: 'console', label: 'Scroll speed', keywords: 'CLAUDE_CODE_SCROLL_SPEED wheel mouse' },

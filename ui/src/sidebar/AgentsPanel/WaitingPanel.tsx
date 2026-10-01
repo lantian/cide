@@ -28,22 +28,20 @@
  * why in the conversation that made it. A status segment click would move the task and leave
  * that run to find out from a fresh dispatch.
  *
- * The drafts are `useState` here, the gesture state ADR 0002 leaves to the webview. A question's
- * answer box is always open — answering is the only thing to do with a question, so a button
- * that opens the box would be a click spent on nothing — and each question keeps its own draft.
+ * Send-back drafts are local gesture state; question drafts live in the shared QuestionAnswer
+ * component, which keeps selections and custom text while comparing images or retrying a write.
  * Send back opens its box on demand, one row at a time: it sits beside Accept, and a box open
  * under every row would make the list read as a form to fill in rather than work to judge.
  */
 import { useState, type ReactNode } from 'react'
 
 import { Button } from '@/kit/components/Button'
-import { TextInput, Textarea } from '@/kit/components/Field'
-import { Dialog } from '@/kit/components/Overlay'
-import { Modal } from '@/overlays/ModalShell'
-import { List, ListItem, Section } from '@/kit/components/Surface'
+import { TextInput } from '@/kit/components/Field'
+import { Disclosure, List, ListItem } from '@/kit/components/Surface'
 import { Code } from '@/kit/components/Status'
 
-import type { TaskView } from '@/sidebar/TasksPanel/model'
+import type { TaskView, AttachmentPreview } from '@/sidebar/TasksPanel/model'
+import { QuestionAnswer, type AnswerHandler } from '@/sidebar/TasksPanel/QuestionAnswer'
 import panelStyles from '../TasksPanel/TasksPanel.module.css'
 
 export interface WaitingPanelProps {
@@ -65,7 +63,9 @@ export interface WaitingPanelProps {
   onOpenTask: (task: string) => void
   onAccept: (task: string) => void
   onSendBack: (task: string, note: string) => void
-  onAnswer: (task: string, text: string) => void
+  onAnswer: AnswerHandler
+  previews?: Readonly<Record<string, AttachmentPreview>> | undefined
+  onRequestPreview?: ((task: string, image: string) => void) | undefined
 }
 
 type Draft = { task: string; text: string }
@@ -81,18 +81,10 @@ export function WaitingPanel({
   onAccept,
   onSendBack,
   onAnswer,
+  previews,
+  onRequestPreview,
 }: WaitingPanelProps) {
   const [draft, setDraft] = useState<Draft | null>(null)
-  const [answers, setAnswers] = useState<Readonly<Record<string, string>>>({})
-  /*
-   * The question being read in full, by task id. The row shows three lines: a run's question
-   * names files and payloads and can run to a paragraph, and a sidebar that grows to fit it
-   * pushes every other question off screen — so the row is a preview and the dialog is where it
-   * is read and answered. The draft is shared with the row's box, so nothing typed is lost by
-   * opening or closing it.
-   */
-  const [reading, setReading] = useState<string | null>(null)
-  const open = reading === null ? undefined : questions.find((t) => t.id === reading)
   const total = new Set([...review, ...questions].map((t) => t.id)).size
 
   // A send back with no reason is a status change that tells the run nothing, and an empty
@@ -102,13 +94,6 @@ export function WaitingPanel({
     onSendBack(draft.task, draft.text.trim())
     setDraft(null)
   }
-  const answer = (task: string) => {
-    const text = (answers[task] ?? '').trim()
-    if (text === '') return
-    onAnswer(task, text)
-    setAnswers(({ [task]: _sent, ...rest }) => rest)
-  }
-
   const titleButton = (t: TaskView) => (
     <Button variant="link" size="sm" data-audit="waitingOpen" onClick={() => onOpenTask(t.id)}>
       {t.title || t.id}
@@ -131,7 +116,7 @@ export function WaitingPanel({
         ) : (
           <>
             {review.length > 0 && (
-              <Section caption="To accept" aside={review.length}>
+              <Disclosure title="To accept" aside={review.length} defaultOpen>
                 <List label="Tasks to accept">
                   {review.map((t) => {
                     const report = reports[t.id]
@@ -204,140 +189,30 @@ export function WaitingPanel({
                     )
                   })}
                 </List>
-              </Section>
+              </Disclosure>
             )}
             {questions.length > 0 && (
-              <Section caption="Questions" aside={questions.length}>
+              <Disclosure title="Questions" aside={questions.length} defaultOpen>
                 <List label="Open questions">
                   {questions.map((t) => (
                     <ListItem
                       key={t.id}
                       top={<Code>{t.id}</Code>}
                       title={titleButton(t)}
-                      meta={
-                        <span className={panelStyles.waitQuestionWrap}>
-                          <span className={panelStyles.waitQuestion} data-audit="waitingQuestion">
-                            {t.question}
-                          </span>
-                          <Button
-                            variant="link"
-                            size="sm"
-                            data-audit="waitingReadAll"
-                            onClick={() => setReading(t.id)}
-                          >
-                            Read in full
-                          </Button>
-                        </span>
-                      }
-                      foot={
-                        <span className={panelStyles.waitDraft}>
-                          <TextInput
-                            size="sm"
-                            aria-label={`Your answer to ${t.id}`}
-                            placeholder="Your answer"
-                            value={answers[t.id] ?? ''}
-                            onChange={(e) => {
-                              const text = e.target.value
-                              setAnswers((all) => ({ ...all, [t.id]: text }))
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault()
-                                answer(t.id)
-                              }
-                            }}
-                          />
-                          <Button
-                            size="sm"
-                            variant="primary"
-                            data-audit="waitingAnswer"
-                            busy={busy.has(t.id)}
-                            disabled={(answers[t.id] ?? '').trim() === ''}
-                            onClick={() => answer(t.id)}
-                          >
-                            Answer
-                          </Button>
-                        </span>
-                      }
+                      foot={t.question === null ? undefined : (
+                        <QuestionAnswer key={`${project}:${t.id}:${JSON.stringify(t.question)}`} task={t.id} title={t.title || t.id} question={t.question}
+                          compact busy={busy.has(t.id)} previews={previews}
+                          onRequestPreview={onRequestPreview} onAnswer={onAnswer} onOpenTask={onOpenTask} />
+                      )}
                     />
                   ))}
                 </List>
-              </Section>
+              </Disclosure>
             )}
           </>
         )}
       </div>
-      {open !== undefined && (
-        <Modal onDismiss={() => setReading(null)}>
-          <Dialog
-            title={open.title || open.id}
-            titleAside={
-              /* The id opens the task's card, over this dialog's place: the card has the
-                 whole story (body, reports, attachments) a question is usually about. */
-              <Button
-                variant="link"
-                size="sm"
-                data-audit="waitingDialogOpenTask"
-                title="Open this task"
-                onClick={() => {
-                  setReading(null)
-                  onOpenTask(open.id)
-                }}
-              >
-                <Code>{open.id}</Code>
-              </Button>
-            }
-            width="picker"
-            data-audit="waitingQuestionDialog"
-            onClose={() => setReading(null)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                e.stopPropagation()
-                setReading(null)
-              }
-            }}
-            actions={
-              <>
-                <Button size="sm" onClick={() => setReading(null)}>
-                  Close
-                </Button>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  busy={busy.has(open.id)}
-                  disabled={(answers[open.id] ?? '').trim() === ''}
-                  onClick={() => {
-                    answer(open.id)
-                    setReading(null)
-                  }}
-                >
-                  Answer
-                </Button>
-              </>
-            }
-          >
-            <p className={panelStyles.waitQuestionFull}>{open.question}</p>
-            <Textarea
-              aria-label={`Your answer to ${open.id}`}
-              placeholder="Your answer"
-              rows={4}
-              autoFocus
-              value={answers[open.id] ?? ''}
-              onChange={(e) => {
-                const text = e.target.value
-                setAnswers((all) => ({ ...all, [open.id]: text }))
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                  e.preventDefault()
-                  answer(open.id)
-                  setReading(null)
-                }
-              }}
-            />
-          </Dialog>
-        </Modal>
-      )}
+
     </aside>
   )
 }

@@ -181,7 +181,7 @@ try {
   {
     const problem = {
       kind: 'noClaudeBinary',
-      message: '“cluade” is not on this app\'s PATH. Settings → Claude sessions → Binary.',
+      message: '“cluade” is not on this app\'s PATH. Settings → Harness → Claude Code → Binary.',
     }
     eq(
       isRecoverableSessionError(problem),

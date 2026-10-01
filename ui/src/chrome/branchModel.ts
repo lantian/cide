@@ -32,7 +32,7 @@
  * click and a mode switch to learn nothing. When one of these lands it arrives with its
  * surface, not before it.
  */
-import type { BranchInfo, BranchList, BranchRef, RepoId } from '@/ipc/generated'
+import type { BranchInfo, BranchList, BranchRef, RepoId, WorktreeInfo } from '@/ipc/generated'
 
 // --- the status bar's one slot ------------------------------------------------------------
 
@@ -103,11 +103,38 @@ export function listFor(lists: readonly BranchList[], repo: RepoId | null): Bran
 
 // --- the rows -----------------------------------------------------------------------------
 
+export type BranchGroup = 'Local branches' | 'Remote branches' | 'Worktrees'
+
+export type BranchRow = BranchRef & {
+  group: BranchGroup
+  worktree: WorktreeInfo | null
+}
+
+/** Collapsed groups retain their heading, but contribute no keyboard-selectable rows. */
+export function branchSections(rows: readonly BranchRow[], collapsed: ReadonlySet<BranchGroup>): {
+  name: BranchGroup
+  expanded: boolean
+  rows: BranchRow[]
+}[] {
+  const groups = new Map<BranchGroup, BranchRow[]>()
+  for (const row of rows) {
+    const group = groups.get(row.group)
+    if (group === undefined) groups.set(row.group, [row])
+    else group.push(row)
+  }
+  return [...groups].map(([name, entries]) => ({
+    name,
+    expanded: !collapsed.has(name),
+    rows: collapsed.has(name) ? [] : entries,
+  }))
+}
+
 /**
  * The rows the popup draws, in order, filtered by `query`.
  *
- * **Current branch first, then locals, then remote-tracking.** Rust already sorted each side
- * by recency (see `cide_git::branch::collect`); pinning the current one is a display decision
+ * **Local, remote-tracking, then worktree branches; current first within its group.**
+ * Rust already sorted each side by recency (see `cide_git::branch::collect`);
+ * pinning the current one is a display decision
  * and it is here so it can be asserted without a repository. It matters because the current
  * branch is the row every other action is relative to — *new branch from here* and *delete*
  * both mean something different depending on where you are standing.
@@ -117,12 +144,42 @@ export function listFor(lists: readonly BranchList[], repo: RepoId | null): Bran
  * names, where it also matches `maintenance`, `mono-nightly` and `demand`. Substring is what
  * IDEA's own branch filter does.
  */
-export function visibleBranches(list: BranchList | null, query: string): BranchRef[] {
+export function visibleBranches(
+  list: BranchList | null,
+  query: string,
+  worktrees: readonly WorktreeInfo[] = [],
+): BranchRow[] {
   if (list === null) return []
-  const ordered = [...list.local, ...list.remote]
-  const current = ordered.filter((entry) => entry.current)
-  const rest = ordered.filter((entry) => !entry.current)
-  return [...current, ...rest].filter((entry) => matches(entry, query))
+  // Worktree metadata spans the project: equal branch names in another root are unrelated.
+  const path = (root: string) => root.replace(/\\/g, '/').replace(/\/$/, '')
+  const prefix = `${path(list.repo.root)}/.cide/worktrees/`
+  const checkouts = new Map(
+    worktrees.filter((wt) => path(wt.repo.root).startsWith(prefix)).map((wt) => [wt.branch, wt]),
+  )
+  const groups: Record<BranchGroup, BranchRow[]> = {
+    'Local branches': [],
+    'Remote branches': [],
+    Worktrees: [],
+  }
+  for (const entry of [...list.local, ...list.remote]) {
+    if (!matches(entry, query)) continue
+    const worktree = entry.remote ? null : (checkouts.get(entry.name) ?? null)
+    const group = entry.remote ? 'Remote branches' : worktree === null ? 'Local branches' : 'Worktrees'
+    groups[group].push({ ...entry, group, worktree })
+  }
+  return Object.values(groups).flatMap((rows) => [
+    ...rows.filter((entry) => entry.current),
+    ...rows.filter((entry) => !entry.current),
+  ])
+}
+
+/** The full name and tip belong on the row, including when its checkout button is disabled. */
+export function branchRowTitle(entry: BranchRow): string {
+  return [
+    entry.current ? `${entry.name} (current branch)` : entry.name,
+    entry.subject === '' ? '' : `Latest commit: ${entry.subject}`,
+    entry.worktree?.repo.root ?? '',
+  ].filter(Boolean).join('\n')
 }
 
 /** Whether one row survives the filter. An empty or blank query keeps everything. */

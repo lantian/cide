@@ -552,7 +552,7 @@ const SPEC_CARD = {
  * `action.id` is `none` because `primaryAction` refuses the approve road once a session is set —
  * so this story is also the assertion that the two move together. A card that kept the button
  * *and* drew this row would be offering to dispatch work that is already being done, which is
- * exactly what shipped: choosing *New Claude session* started the session, typed the task in, and
+ * exactly what shipped: choosing *New Harness session* started the session, typed the task in, and
  * left **Approve & dispatch** sitting over it.
  */
 const SPEC_CARD_SESSION = {
@@ -582,7 +582,7 @@ const TARGETS = [
     label: 'Conversation 1',
     detail: 'Already open — the task is typed into it.',
   },
-  { kind: 'fresh' as const, id: '', label: 'New Claude session', detail: 'Adds a pane.' },
+  { kind: 'fresh' as const, id: '', label: 'New Harness session', detail: 'Adds a pane.' },
 ]
 
 const SPEC_TASK = detail({

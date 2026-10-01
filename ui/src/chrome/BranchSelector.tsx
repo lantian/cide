@@ -36,7 +36,7 @@
  * which has no React in it and is driven directly by `ui/scripts/check-branches.mjs`.
  */
 import { Button, IconButton } from '@/kit/components/Button'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { notify } from '@/chrome/notices'
 import { openPushDialog } from '@/chrome/pushRun'
@@ -44,14 +44,15 @@ import { trackGitOp } from '@/chrome/gitOpStore'
 import { create } from 'zustand'
 import {
   branch as branchApi,
+  git as gitApi,
   events,
   pendingCommand,
   type BranchInfo,
   type BranchList,
-  type BranchRef,
   type CheckoutMode,
   type ProjectId,
   type RepoId,
+  type WorktreeInfo,
 } from '@/ipc/client'
 import { activeProjectIdOf } from '@/keys/target'
 import { showOverlay } from '@/overlays/store'
@@ -73,6 +74,10 @@ import {
   primaryRepo,
   refusalOf,
   visibleBranches,
+  branchRowTitle,
+  branchSections,
+  type BranchGroup,
+  type BranchRow,
   alreadyOn,
   type BranchFocus,
   clampFocus,
@@ -94,6 +99,7 @@ import styles from './BranchSelector.module.css'
 interface BranchStore {
   project: ProjectId | null
   lists: BranchList[]
+  worktrees: WorktreeInfo[]
   /** False until the first answer lands, so the label can say `…` rather than `no repo`. */
   loaded: boolean
   /** Which repository the popup is browsing. `null` means the primary one. */
@@ -144,10 +150,12 @@ interface BranchStore {
  * re-read. A stale branch list is the bug this whole component exists to end.
  */
 let inFlight: { project: ProjectId; walk: Promise<void> } | null = null
+let loadGeneration = 0
 
 export const useBranches = create<BranchStore>((set, get) => ({
   project: null,
   lists: [],
+  worktrees: [],
   loaded: false,
   repo: null,
   note: null,
@@ -157,20 +165,30 @@ export const useBranches = create<BranchStore>((set, get) => ({
   async load(project, force = false) {
     // Switching projects clears the rows first: the previous project's branch names over the
     // new project's repository is a wrong answer, and an empty list is a true one.
-    if (project !== get().project) set({ project, lists: [], loaded: false, repo: null, note: null })
+    if (project !== get().project) {
+      inFlight = null
+      loadGeneration += 1
+      set({ project, lists: [], worktrees: [], loaded: false, repo: null, note: null })
+    }
     if (project === null) {
+      loadGeneration += 1
       set({ loaded: true })
       return
     }
     if (!force && inFlight !== null && inFlight.project === project) return inFlight.walk
+    const generation = ++loadGeneration
 
     const walk = (async () => {
       // Degrades rather than throws: a build without `git_branch_list` should show `no repo`,
       // not an unhandled rejection out of an effect. Mutations do the opposite on purpose —
       // their rejections are the answer the user needs.
-      const lists = await pendingCommand('git_branch_list', () => branchApi.list(project), [])
-      // The project may have changed while the walk ran.
-      if (get().project === project) set({ lists, loaded: true })
+      const [lists, worktrees] = await Promise.all([
+        pendingCommand('git_branch_list', () => branchApi.list(project), []),
+        pendingCommand('git_worktrees', () => gitApi.worktrees(project), []),
+      ])
+      // A forced reload or project change may have superseded this snapshot.
+      if (get().project === project && generation === loadGeneration)
+        set({ lists, worktrees, loaded: true })
     })()
     inFlight = { project, walk }
     try {
@@ -329,8 +347,10 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
   const chosen = useBranches((s) => s.repo)
   const note = useBranches((s) => s.note)
   const busy = useBranches((s) => s.busy)
+  const worktrees = useBranches((s) => s.worktrees)
 
   const [query, setQuery] = useState('')
+  const [collapsed, setCollapsed] = useState<ReadonlySet<BranchGroup>>(() => new Set())
   // Read once, from the store, so `git.branch.new` in the palette lands on the name field.
   // The lazy initialiser is what keeps it a *starting* mode rather than one that snaps back
   // every time the store notifies.
@@ -349,13 +369,39 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
   const rowsEl = useRef<HTMLDivElement>(null)
 
   const list = listFor(lists, chosen)
-  const rows = visibleBranches(list, query)
+  const groups = branchSections(visibleBranches(list, query, worktrees), collapsed)
+  const rows = groups.flatMap((group) => group.rows)
+  const rowIndexes = new Map(rows.map((entry, index) => [entry, index]))
   const repo = list?.repo.id ?? null
 
   useEffect(() => {
     // Consumed: reopening from the widget starts on the list again.
     useBranches.setState({ intent: 'list' })
   }, [])
+
+  // Worktree removal can arrive without a ref write. Refresh while the popup is open,
+  // coalescing filesystem bursts; useBranchData already handles Git changes.
+  useEffect(() => {
+    let pending: number | null = null
+    let gone = false
+    let unlisten: (() => void) | null = null
+    const stop = events.onFsChanged((changed, change) => {
+      if (change.git || changed !== project || pending !== null) return
+      pending = window.setTimeout(() => {
+        pending = null
+        void useBranches.getState().load(project)
+      }, 400)
+    })
+    void stop.then((off) => {
+      if (gone) off()
+      else unlisten = off
+    })
+    return () => {
+      gone = true
+      if (pending !== null) window.clearTimeout(pending)
+      unlisten?.()
+    }
+  }, [project])
 
   /*
    * Focus follows the panel, and it has to.
@@ -387,7 +433,8 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
    * which the popup draws a highlight on a row that is not there, and a keystroke arriving in
    * that frame reads the stale index. Two live routes shorten the list — typing into the
    * filter, and `cide://git-status`, which fires whenever anything touches the refs, so a
-   * `git branch -d` in a terminal pane re-renders this popup with fewer rows.
+   * `git branch -d` in a terminal pane re-renders this popup with fewer rows. Collapsing a
+   * group resets the highlight to the filter before its rows leave this sequence.
    */
   const at = clampFocus(focus, rows.length)
   const rowId = (index: number) => `branch-row-${index}`
@@ -678,9 +725,8 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   if (e.key === 'Enter') {
                     const action = enterAction(rows, at)
                     if (action.kind === 'checkout') tryCheckout(action.name)
-                    // Said rather than silent: the current branch is pinned first, so it is
-                    // the row the first Down always lands on, and an ⏎ that did nothing at
-                    // all there is how a user concludes the keyboard is not wired up.
+                    // Say when the highlighted row is already current, so Enter does not
+                    // appear to be unresponsive.
                     else if (action.kind === 'already') useBranches.getState().say(alreadyOn(action.name))
                     return
                   }
@@ -757,31 +803,61 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
               ref={rowsEl}
             >
               {!loaded && <div className={styles.empty}>Reading branches…</div>}
-              {loaded && rows.length === 0 && (
+              {loaded && groups.length === 0 && (
                 <div className={styles.empty}>
                   {query.trim() === '' ? 'No branches yet' : `No branch matches “${query.trim()}”`}
                 </div>
               )}
-              {rows.map((entry, index) => (
-                <Row
-                  key={`${entry.remote ? 'r' : 'l'}:${entry.name}`}
-                  entry={entry}
-                  head={list?.head ?? null}
-                  // The section headings are drawn from the transition rather than by
-                  // splitting the array: one flat list is one keyboard sequence, and the
-                  // heading is a property of the boundary.
-                  heading={sectionOf(entry, rows[index - 1])}
-                  id={rowId(index)}
-                  active={at.kind === 'row' && at.index === index}
-                  open={openRow === entry.name}
-                  busy={busy}
-                  onToggleMenu={() => setOpenRow(openRow === entry.name ? null : entry.name)}
-                  onCheckout={() => tryCheckout(entry.name)}
-                  onNewFrom={() => setMode({ kind: 'new', from: entry.name })}
-                  onMerge={() => setMode({ kind: 'merge', name: entry.name })}
-                  onRename={() => setMode({ kind: 'rename', from: entry.name })}
-                  onDelete={() => setMode({ kind: 'delete', name: entry.name, force: false })}
-                />
+              {groups.map((group) => (
+                <Fragment key={group.name}>
+                  <button
+                    type="button"
+                    className={styles.section}
+                    aria-expanded={group.expanded}
+                    aria-controls={`branch-group-${group.name.replaceAll(' ', '-')}`}
+                    onClick={() => {
+                      setCollapsed((previous) => {
+                        const next = new Set(previous)
+                        if (next.has(group.name)) next.delete(group.name)
+                        else next.add(group.name)
+                        return next
+                      })
+                      setOpenRow(null)
+                      setFocus(FILTER)
+                      search.current?.focus()
+                    }}
+                  >
+                    <Icon name={group.expanded ? 'chevron-down' : 'chevron-right'} size={0} />
+                    {group.name}
+                  </button>
+                  <div
+                    id={`branch-group-${group.name.replaceAll(' ', '-')}`}
+                    role="group"
+                    aria-label={group.name}
+                    hidden={!group.expanded}
+                  >
+                    {group.rows.map((entry) => {
+                      const index = rowIndexes.get(entry)!
+                      return (
+                        <Row
+                          key={`${entry.remote ? 'r' : 'l'}:${entry.name}`}
+                          entry={entry}
+                          head={list?.head ?? null}
+                          id={rowId(index)}
+                          active={at.kind === 'row' && at.index === index}
+                          open={openRow === entry.name}
+                          busy={busy}
+                          onToggleMenu={() => setOpenRow(openRow === entry.name ? null : entry.name)}
+                          onCheckout={() => tryCheckout(entry.name)}
+                          onNewFrom={() => setMode({ kind: 'new', from: entry.name })}
+                          onMerge={() => setMode({ kind: 'merge', name: entry.name })}
+                          onRename={() => setMode({ kind: 'rename', from: entry.name })}
+                          onDelete={() => setMode({ kind: 'delete', name: entry.name, force: false })}
+                        />
+                      )
+                    })}
+                  </div>
+                </Fragment>
               ))}
             </div>
           </>
@@ -946,18 +1022,10 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
   )
 }
 
-/** `Local` / `Remote`, on the row where the section changes. */
-function sectionOf(entry: BranchRef, previous: BranchRef | undefined): string | null {
-  if (previous === undefined) return entry.remote ? 'Remote' : 'Local'
-  if (previous.remote === entry.remote) return null
-  return entry.remote ? 'Remote' : 'Local'
-}
-
 interface RowProps {
-  entry: BranchRef
+  entry: BranchRow
   /** The repository's HEAD — what a merge would merge *into*. `actionsFor` gates on it. */
   head: BranchInfo | null
-  heading: string | null
   /** Stable per index, so the field's `aria-activedescendant` can name it. */
   id: string
   /** The arrows have walked here. Drawn, but never focused — see the field's comment. */
@@ -972,7 +1040,7 @@ interface RowProps {
   onDelete: () => void
 }
 
-function Row({ entry, head, heading, id, active, open, busy, ...on }: RowProps) {
+function Row({ entry, head, id, active, open, busy, ...on }: RowProps) {
   const actions = actionsFor(entry, head)
   /*
    * `null` rather than `''` when the count is zero, and the distinction is the whole point: an
@@ -996,9 +1064,9 @@ function Row({ entry, head, heading, id, active, open, busy, ...on }: RowProps) 
 
   return (
     <>
-      {heading !== null && <div className={styles.section}>{heading}</div>}
       <div
         id={id}
+        title={branchRowTitle(entry)}
         className={`${entry.current ? styles.rowCurrent : styles.row}${active ? ` ${styles.rowOn}` : ''}`}
       >
         <button
@@ -1015,14 +1083,13 @@ function Row({ entry, head, heading, id, active, open, busy, ...on }: RowProps) 
           // than clickable-and-silent.
           disabled={busy || entry.current}
           onClick={on.onCheckout}
-          title={entry.current ? 'You are on this branch' : `Switch to ${entry.name}`}
         >
+          <Icon name={entry.worktree === null ? 'git-branch' : 'folder'} size={0} />
           <span className={styles.name}>{entry.name}</span>
           <span className={styles.counts}>
             {ahead}
             {behind}
           </span>
-          <span className={styles.subject}>{entry.subject}</span>
         </button>
         <IconButton
           icon="ellipsis"

@@ -44,7 +44,7 @@ export interface StoryDigest {
    * The header's worktree selector: the value it holds (`''` for the project's own checkout) and
    * the label its trigger shows, or `null` when the header draws the plain branch readout.
    */
-  worktree: { value: string; label: string } | null
+  worktree: { value: string; label: string; icon: string | null } | null
 }
 
 const STORIES: GitStoryName[] = ['mock', 'guard', 'multi', 'empty', 'conflict']
@@ -133,7 +133,11 @@ const digests = runs.map(([story, fixture, worktree]) => {
     summary: /data-audit="gitSummary"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
     commitEnabled: !/data-audit="gitCommit"[^>]*disabled/.test(html),
     worktree:
-      selector === null ? null : { value: selector[1] ?? '', label: text(selector[2] ?? '') },
+      selector === null ? null : {
+        value: selector[1] ?? '',
+        label: text(selector[2] ?? ''),
+        icon: /data-icon="([^"]+)"/.exec(selector[2] ?? '')?.[1] ?? null,
+      },
   } satisfies Omit<StoryDigest, 'story'> & { story: string }
 })
 

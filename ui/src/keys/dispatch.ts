@@ -884,8 +884,8 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return split(on, 'col', { kind: 'newClaude' })
 
       // The chord spellings of the two mouse gestures: a tile beside the focused pane — the
-      // same `('row', intent)` call the pane title bar's `⊞ claude pane` makes — and the
-      // header's full-width `⊞ claude row`, anchored on the focused pane so the row lands
+      // same `('row', intent)` call the pane title bar's `⊞ harness pane` makes — and the
+      // header's full-width `⊞ harness row`, anchored on the focused pane so the row lands
       // under the one the user is working in.
       case 'claude.split.right':
         if (on === null) return unmet(command, 'no focused pane')
@@ -930,7 +930,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (target === null || on === null) return unmet(command, 'no focused pane')
         // The clause is `claudePaneFocused` and a clause does not gate the keyboard, so the
         // same fact is checked here — the rule this file's header states.
-        if (target.pane.kind !== 'claude') return unmet(command, 'the focused pane is not Claude')
+        if (target.pane.kind !== 'claude') return unmet(command, 'the focused pane is not a Harness session')
         const restarter = paneRestarter(on.pane)
         if (restarter === null) {
           // A pane this window is not showing — the detached-pane case, where `focusTarget`
@@ -965,7 +965,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // missing IDE server look exactly like a control wired to nothing.
         const to = claudeTargetOf(boot())
         const path = pathArg(args) ?? focusedFilePath(boot())
-        if (to === null) return unmet(command, 'no Claude pane to mention into')
+        if (to === null) return unmet(command, 'no Harness pane to mention into')
         if (path === null) return unmet(command, 'no file tab focused and no path argument')
         // `sent.pane`, not `to.pane`: Rust reroutes when the pane named here has no `claude`
         // on the IDE server — which is the ordinary state of a Claude pane sitting at a
@@ -1226,7 +1226,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (path === null) {
           notify('No file tab is active, so there is nothing to select.', {
             kind: 'warn',
-            hint: 'Open a file — the Claude console and the settings tab are not files.',
+            hint: 'Open a file — the Harness console and the settings tab are not files.',
           })
           return
         }

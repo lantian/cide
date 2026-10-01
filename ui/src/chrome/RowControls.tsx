@@ -1,5 +1,5 @@
 /**
- * `⊞ bash row` and `⊞ claude row`, moved out of the pane tree and into the header.
+ * `⊞ bash row` and `⊞ harness row`, moved out of the pane tree and into the header.
  *
  * The user asked for them "on top". They used to be a strip along the bottom of `SplitTree`,
  * which put the two most-used layout gestures in the app at the far edge of the window, below
@@ -46,7 +46,7 @@ export const PANE_KINDS: ReadonlyArray<{
   intent: SplitIntent
 }> = [
   { id: 'bash', word: 'bash', what: 'a shell', intent: { kind: 'shell' } },
-  { id: 'claude', word: 'claude', what: 'a new Claude session', intent: { kind: 'newClaude' } },
+  { id: 'claude', word: 'harness', what: 'a new Harness session', intent: { kind: 'newClaude' } },
 ]
 
 /** What the two buttons ask for. Exported so a check script can assert on the pair. */

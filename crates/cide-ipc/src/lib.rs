@@ -150,9 +150,10 @@ pub use agents::{
 };
 pub use tasks::{
     ATTACHMENTS_DIR, ATTACHMENTS_LEAF, Acceptance, AttachTarget, AttachmentKind, LinkType,
-    StagedFile, TASKS_DIR_RELATIVE, Task, TaskAttachment, TaskAuthor, TaskBoard, TaskComment,
-    TaskContent, TaskDetail, TaskEdit, TaskFile, TaskLink, TaskLinkSpec, TaskNew, TaskResponse,
-    TaskRow, TaskStatus, TaskStatusChange,
+    QuestionChoices, QuestionOption, QuestionSelection, StagedFile, TASKS_DIR_RELATIVE, Task,
+    TaskAttachment, TaskAuthor, TaskBoard, TaskComment, TaskContent, TaskDetail, TaskEdit,
+    TaskFile, TaskLink, TaskLinkSpec, TaskNew, TaskQuestion, TaskResponse, TaskRow, TaskStatus,
+    TaskStatusChange,
 };
 
 // --- M22: extensions, and the marketplaces they come from ---

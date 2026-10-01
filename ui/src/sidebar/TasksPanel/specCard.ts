@@ -192,7 +192,7 @@ export function sessionHint(session: SpecSessionRef, archived: boolean): string 
     return 'The work is finished and archived. Open reads what this conversation did.'
   }
   if (!session.open) {
-    return 'No pane is showing it. Resume brings the whole transcript back with `claude --resume` and hands it this task again; Reopen brings it back without asking it for anything.'
+    return 'No pane is showing it. Resume brings the whole transcript back and hands it this task again; Reopen brings it back without asking it for anything.'
   }
   return session.awaiting
     ? 'It has finished a turn and is waiting for you.'
@@ -414,8 +414,8 @@ export interface DispatchTarget {
 }
 
 /** The label for the option that makes a new conversation. */
-export const FRESH_TARGET_LABEL = 'New Claude session'
-export const FRESH_TARGET_DETAIL = 'Adds a pane to this project’s Claude tab and sends the task to it.'
+export const FRESH_TARGET_LABEL = 'New Harness session'
+export const FRESH_TARGET_DETAIL = 'Adds a pane to this project’s console tab and sends the task to it.'
 
 /**
  * Everything the picker offers, in the order it offers them.

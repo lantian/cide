@@ -885,6 +885,24 @@ fn new_comment(
     }
 }
 
+/// An answer returns review work to the agent before the question disappears.
+fn resume_after_question(task: &mut Task, now: u64, by: TaskAuthor) {
+    if task.status == TaskStatus::Review {
+        let status = if task.agent.is_some() {
+            TaskStatus::Doing
+        } else {
+            TaskStatus::Todo
+        };
+        task.history.push(TaskStatusChange {
+            from: task.status,
+            to: status,
+            by,
+            at_unix_ms: now,
+        });
+        task.status = status;
+    }
+}
+
 /// One attachment record, wherever it is on the task — the body, or any comment, deleted or not.
 pub fn attachment_record<'a>(task: &'a Task, id: &TaskAttachmentId) -> Option<&'a TaskAttachment> {
     task.attachments
@@ -2857,6 +2875,109 @@ impl TaskStore {
         })
     }
 
+    /// Approval is a review response, and may never race past an open question.
+    pub fn respond_to_review(&self, id: &TaskId, note: Option<&str>) -> Result<Task> {
+        let now = persist::now_ms();
+        self.update(|file, cache| {
+            let mut task = self.compose(file, cache, id)?;
+            if task.question.is_some() {
+                return Err(CoreError::Io(
+                    "answer the open question before reviewing this task".into(),
+                ));
+            }
+            if task.status != TaskStatus::Review {
+                return Err(CoreError::Io(
+                    "this task is no longer awaiting review".into(),
+                ));
+            }
+            let status = if let Some(note) = note {
+                if note.trim().is_empty() {
+                    return Err(CoreError::Io(
+                        "say in a line what is wrong, so the role knows what to change".into(),
+                    ));
+                }
+                task.comments.push(new_comment(
+                    format!("**Sent back by the user:** {}", note.trim()),
+                    Vec::new(),
+                    TaskAuthor::User,
+                    now,
+                ));
+                if task.agent.is_some() {
+                    TaskStatus::Doing
+                } else {
+                    TaskStatus::Todo
+                }
+            } else {
+                TaskStatus::Done
+            };
+            task.history.push(TaskStatusChange {
+                from: task.status,
+                to: status,
+                by: TaskAuthor::User,
+                at_unix_ms: now,
+            });
+            task.status = status;
+            task.updated_unix_ms = now;
+            validate_content(id, &content_of(&task))?;
+            self.put(file, cache, &task);
+            Ok(task)
+        })
+    }
+
+    /// Record an answer and release its question in one mutation. The displayed snapshot
+    /// prevents a second window from answering a replaced question or resuming a run twice.
+    pub fn answer_question(
+        &self,
+        id: &TaskId,
+        text: &str,
+        selected_ids: &[String],
+        expected: Option<&cide_ipc::TaskQuestion>,
+    ) -> Result<Task> {
+        let now = persist::now_ms();
+        self.update(|file, cache| {
+            let mut task = self.compose(file, cache, id)?;
+            let question = task.question.as_ref().ok_or_else(|| {
+                CoreError::Io("this question has already been answered or cleared".into())
+            })?;
+            if expected.is_some_and(|shown| shown != question) {
+                return Err(CoreError::Io(
+                    "the question changed; review it before answering".into(),
+                ));
+            }
+            question
+                .validate_answer(selected_ids, text)
+                .map_err(CoreError::Io)?;
+            let mut answer = format!("**The user answered:**\n\n{}", question.text());
+            for option in question
+                .options()
+                .iter()
+                .filter(|o| selected_ids.contains(&o.id))
+            {
+                answer.push_str(&format!("\n\n- {} [{}]", option.title, option.id));
+                if let Some(description) = &option.description {
+                    answer.push_str(&format!("\n  {description}"));
+                }
+                if let Some(image) = &option.image {
+                    answer.push_str(&format!("\n  Image attachment: {image}"));
+                    if let Some(record) = attachment_record(&task, image) {
+                        answer.push_str(&format!(" ({})", record.relative_path(id).display()));
+                    }
+                }
+            }
+            if !text.trim().is_empty() {
+                answer.push_str(&format!("\n\n{}", text.trim()));
+            }
+            task.comments
+                .push(new_comment(answer, Vec::new(), TaskAuthor::User, now));
+            task.question = None;
+            resume_after_question(&mut task, now, TaskAuthor::User);
+            task.updated_unix_ms = now;
+            validate_content(id, &content_of(&task))?;
+            self.put(file, cache, &task);
+            Ok(task)
+        })
+    }
+
     /// Apply one change to one task.
     ///
     /// `author` is used by exactly one variant — [`TaskEdit::Comment`] — and it is a parameter
@@ -3023,9 +3144,39 @@ impl TaskStore {
                 TaskEdit::SetTouches { touches } => task.touches = clean_touches(&touches),
                 TaskEdit::SetAcceptance { acceptance } => task.acceptance = acceptance,
                 TaskEdit::SetQuestion { question } => {
-                    task.question = question
-                        .map(|q| q.trim().to_string())
-                        .filter(|q| !q.is_empty());
+                    // Legacy blank strings clear a question; a structured question must validate.
+                    let question = question.filter(|q| {
+                        !matches!(q,
+                        cide_ipc::TaskQuestion::Text(text) if text.trim().is_empty())
+                    });
+                    if let Some(question) = &question {
+                        question.validate().map_err(CoreError::Io)?;
+                        for option in question.options() {
+                            if let Some(image) = &option.image {
+                                let valid = attachment_record(task, image).is_some_and(|a| {
+                                    !a.deleted && a.kind == cide_ipc::AttachmentKind::Image
+                                });
+                                if !valid {
+                                    return Err(CoreError::Io(format!(
+                                        "answer option {} needs an image attachment on this task",
+                                        option.id
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    if task.question.is_some() && question.is_none() {
+                        resume_after_question(task, now, author.clone());
+                    }
+                    task.question = question.map(|mut q| {
+                        match &mut q {
+                            cide_ipc::TaskQuestion::Text(text) => *text = text.trim().into(),
+                            cide_ipc::TaskQuestion::Choices(choices) => {
+                                choices.text = choices.text.trim().into()
+                            }
+                        }
+                        q
+                    });
                 }
                 /*
                  * One report per turn (M132), and still append-only: the new line was appended by an
@@ -4786,6 +4937,241 @@ mod tests {
             store.write_now();
             assert_eq!(schema(&dir), 2, "nothing uses it any more");
         }
+    }
+
+    #[test]
+    fn visual_questions_persist_images_and_resume_review_with_one_answer() {
+        let dir = TempDir::new("visual-question");
+        let (store, id) = a_store_with_one_task(&dir);
+        let source = write_source(dir.root(), "render.png", &png_bytes());
+        let attached = store
+            .attach(
+                &id,
+                AttachTarget::Task,
+                std::slice::from_ref(&source),
+                TaskAuthor::User,
+            )
+            .unwrap();
+        let image = &attached.attachments[0];
+        let question: cide_ipc::TaskQuestion = serde_json::from_value(serde_json::json!({
+            "text": "Which renders do you prefer?", "selection": "multiple",
+            "options": (0..10).map(|i| serde_json::json!({
+                "id": format!("render-{i}"), "title": format!("Render {i}"),
+                "description": "Warm lighting", "image": image.id,
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        store
+            .edit(
+                &id,
+                TaskEdit::Assign {
+                    agent: Some(AgentId("artist".into())),
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        store
+            .edit(
+                &id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Review,
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        store
+            .edit(
+                &id,
+                TaskEdit::SetQuestion {
+                    question: Some(question.clone()),
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        store.write_now();
+        let disk: Value = serde_json::from_str(&fs::read_to_string(dir.tasks()).unwrap()).unwrap();
+        assert_eq!(disk["schemaVersion"], 5);
+        fs::remove_file(source).unwrap();
+        assert!(dir.root().join(image.relative_path(&id)).exists());
+        drop(store);
+        let store = TaskStore::open(dir.root());
+        assert_eq!(store.get(&id).unwrap().question.as_ref(), Some(&question));
+        let before = store.snapshot().rev;
+        let answered = store
+            .answer_question(
+                &id,
+                "Use a darker background",
+                &["render-0".into(), "render-9".into()],
+                Some(&question),
+            )
+            .unwrap();
+        assert_eq!(store.snapshot().rev, before + 1);
+        assert_eq!(answered.status, TaskStatus::Doing);
+        assert!(answered.question.is_none());
+        let comment = answered.comments.last().unwrap();
+        assert_eq!(comment.author, TaskAuthor::User);
+        for expected in [
+            "Render 0 [render-0]",
+            "Render 9 [render-9]",
+            "Warm lighting",
+            "Use a darker background",
+            image.id.as_str(),
+        ] {
+            assert!(comment.text.contains(expected), "missing {expected}");
+        }
+        assert!(
+            store
+                .answer_question(&id, "again", &[], Some(&question))
+                .is_err()
+        );
+        assert_eq!(store.get(&id).unwrap().comments.len(), 1);
+        assert!(
+            store.respond_to_review(&id, None).is_err(),
+            "approval does not reappear after answering"
+        );
+        store.write_now();
+        let disk: Value = serde_json::from_str(&fs::read_to_string(dir.tasks()).unwrap()).unwrap();
+        assert_eq!(disk["schemaVersion"], 2);
+    }
+
+    #[test]
+    fn invalid_questions_and_stale_answers_leave_the_task_unchanged() {
+        let dir = TempDir::new("question-validation");
+        let (store, id) = a_store_with_one_task(&dir);
+        let question: cide_ipc::TaskQuestion = serde_json::from_value(serde_json::json!({
+            "text": "Pick a render", "options": [{"id":"one", "title":"One"}, {"id":"two", "title":"Two"}]
+        })).unwrap();
+        store
+            .edit(
+                &id,
+                TaskEdit::SetQuestion {
+                    question: Some(question.clone()),
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        let before = store.snapshot();
+        for (selected, text, expected) in [
+            (vec![], "", Some(question.clone())),
+            (vec!["missing".into()], "", Some(question.clone())),
+            (vec!["one".into(), "two".into()], "", Some(question.clone())),
+            (vec!["one".into(), "one".into()], "", Some(question.clone())),
+            (vec![], "custom", Some("Old question".into())),
+        ] {
+            assert!(
+                store
+                    .answer_question(&id, text, &selected, expected.as_ref())
+                    .is_err()
+            );
+            assert_eq!(store.snapshot(), before);
+        }
+        for options in [
+            serde_json::json!([{"id":"same", "title":"A"}, {"id":"same", "title":"B"}]),
+            serde_json::json!([{"id":"", "title":"A"}]),
+            serde_json::json!([{"id":"a", "title":" "}]),
+            serde_json::json!([{"id":"a", "title":"A", "image":"missing"}]),
+        ] {
+            let invalid =
+                serde_json::from_value(serde_json::json!({"text":"Pick", "options":options}))
+                    .unwrap();
+            assert!(
+                store
+                    .edit(
+                        &id,
+                        TaskEdit::SetQuestion {
+                            question: Some(invalid)
+                        },
+                        TaskAuthor::User
+                    )
+                    .is_err()
+            );
+            assert_eq!(store.snapshot(), before);
+        }
+        assert!(
+            store
+                .answer_question(&id, "custom only", &[], Some(&question))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_question_blocks_approval_and_send_back_until_work_returns_to_review() {
+        let dir = TempDir::new("question-review");
+        let (store, id) = a_store_with_one_task(&dir);
+        store
+            .edit(
+                &id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Review,
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        store
+            .edit(
+                &id,
+                TaskEdit::SetQuestion {
+                    question: Some("Which color?".into()),
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        let before = store.snapshot();
+        assert!(store.respond_to_review(&id, None).is_err());
+        assert!(
+            store
+                .respond_to_review(&id, Some("change the color"))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), before);
+        let answered = store.answer_question(&id, "blue", &[], None).unwrap();
+        assert_eq!(answered.status, TaskStatus::Todo);
+        store
+            .edit(
+                &id,
+                TaskEdit::SetStatus {
+                    status: TaskStatus::Review,
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        assert_eq!(
+            store.respond_to_review(&id, None).unwrap().status,
+            TaskStatus::Done
+        );
+    }
+
+    #[test]
+    fn concurrent_question_answers_record_only_one_response() {
+        let dir = TempDir::new("question-race");
+        let (store, id) = a_store_with_one_task(&dir);
+        store
+            .edit(
+                &id,
+                TaskEdit::SetQuestion {
+                    question: Some("Pick".into()),
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        let store = std::sync::Arc::new(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let runs = (0..2)
+            .map(|_| {
+                let (store, id, barrier) = (store.clone(), id.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.answer_question(&id, "one", &[], None).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runs.into_iter()
+                .filter_map(|run| run.join().unwrap().then_some(()))
+                .count(),
+            1
+        );
+        assert_eq!(store.get(&id).unwrap().comments.len(), 1);
     }
 
     /// (M132) Touches are stored trimmed, without blanks, `./` or duplicates, in order.

@@ -22,7 +22,8 @@ import { Switch } from '@/kit/components/Choice'
 import { Textarea, TextInput } from '@/kit/components/Field'
 import { Tag } from '@/kit/components/Status'
 
-import { parseTouches, type TaskView } from './model'
+import { parseTouches, questionText, type TaskView, type TaskQuestion, type AttachmentPreview } from './model'
+import { QuestionAnswer, type AnswerHandler } from './QuestionAnswer'
 import styles from './TasksPanel.module.css'
 
 /**
@@ -147,32 +148,29 @@ export function QuestionField({
   task,
   onSetQuestion,
   onAnswer,
+  previews,
+  onRequestPreview,
 }: {
   task: TaskView
-  onSetQuestion?: ((task: string, question: string | null) => void) | undefined
+  onSetQuestion?: ((task: string, question: TaskQuestion | null) => void) | undefined
   /**
    * Answer the question from the card (M132): the same `task_respond` the Waiting list sends —
    * the answer is written on the task, the question cleared, and the role on it continues.
    * Absent draws no box, so older stories are unchanged.
    */
-  onAnswer?: ((task: string, text: string) => void) | undefined
+  onAnswer?: AnswerHandler | undefined
+  previews?: Readonly<Record<string, AttachmentPreview>> | undefined
+  onRequestPreview?: ((task: string, image: string) => void) | undefined
 }) {
   const [draft, setDraft] = useState<string | null>(null)
-  const [answer, setAnswer] = useState('')
   if (task.question === null) return null
-  const send = () => {
-    const text = answer.trim()
-    if (text === '') return
-    onAnswer?.(task.id, text)
-    setAnswer('')
-  }
   const save = () => {
     if (draft === null) return
     const next = draft.trim()
     setDraft(null)
-    if (next === task.question) return
+    if (next === questionText(task.question!)) return
     // An emptied question is a clear, said the long way round — the same answer Clear gives.
-    onSetQuestion?.(task.id, next === '' ? null : next)
+    onSetQuestion?.(task.id, next === '' ? null : typeof task.question === 'string' ? next : { ...task.question!, text: next })
   }
   return (
     <div className={styles.field} data-audit="taskQuestion">
@@ -184,7 +182,7 @@ export function QuestionField({
               type="button"
               className={styles.fieldEdit}
               data-audit="taskQuestionEdit"
-              onClick={() => setDraft(task.question ?? '')}
+              onClick={() => setDraft(questionText(task.question!))}
             >
               Edit
             </button>
@@ -203,33 +201,10 @@ export function QuestionField({
       </div>
       {draft === null ? (
         <>
-          <p className={styles.fieldValue}>{task.question}</p>
-          {onAnswer !== undefined && (
-            <div className={styles.questionAnswer} data-audit="taskQuestionAnswer">
-              <Textarea
-                aria-label={`Your answer to ${task.id}`}
-                placeholder="Your answer — Ctrl+Enter sends"
-                rows={3}
-                value={answer}
-                onChange={(e) => setAnswer(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                    e.preventDefault()
-                    send()
-                  }
-                }}
-              />
-              <Button
-                size="sm"
-                variant="primary"
-                data-write="true"
-                disabled={answer.trim() === ''}
-                onClick={send}
-              >
-                Answer
-              </Button>
-            </div>
-          )}
+          <div className={styles.questionAnswer} data-audit="taskQuestionAnswer">
+            <QuestionAnswer key={JSON.stringify(task.question)} task={task.id} title={task.title || task.id} question={task.question}
+              previews={previews} onRequestPreview={onRequestPreview} onAnswer={onAnswer} />
+          </div>
         </>
       ) : (
         <div className={styles.inlineEdit}>

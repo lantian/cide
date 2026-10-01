@@ -190,7 +190,7 @@ export const KINDS: readonly {
     pitch: 'A folder and a console. Add structure whenever you want it.',
     points: [
       'Creates the folder, and a git repository if you like',
-      'Opens straight onto the Claude console',
+      'Opens straight onto the Harness console',
       'OpenSpec and subagents stay one click away',
     ],
   },

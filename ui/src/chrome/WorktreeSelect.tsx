@@ -48,7 +48,7 @@ export function worktreeOptions(
     ...worktrees.map((wt) => ({
       value: wt.repo.root,
       label: wt.branch,
-      icon: 'git-branch' as const,
+      icon: 'folder' as const,
       detail: wt.repo.name,
     })),
   ]

@@ -346,6 +346,95 @@ try {
   eq(m.matches(ref('main'), ''), true, 'an empty query keeps everything')
   eq(m.matches(ref('main'), 'x'), false, 'a miss is a miss')
 
+  const worktree = (branch, root) => ({
+    branch,
+    head: 'a1b2c3d4',
+    repo: { id: root, root, name: root.split('/').at(-1), parent: null, isSubmodule: false },
+  })
+  const checkouts = [
+    worktree('feature/login', '/w/.cide/worktrees/developer'),
+    worktree('maintenance', '/other/.cide/worktrees/developer'),
+    worktree('main', '/wrong-prefix/w/.cide/worktrees/developer'),
+    worktree('origin/main', '/w/.cide/worktrees/remote-namesake'),
+  ]
+  const grouped = m.visibleBranches(list, '', checkouts)
+  eq(
+    grouped.map((entry) => [entry.name, entry.group, entry.worktree?.repo.name ?? null]),
+    [
+      ['main', 'Local branches', null],
+      ['maintenance', 'Local branches', null],
+      ['origin/main', 'Remote branches', null],
+      ['origin/feature/login', 'Remote branches', null],
+      ['feature/login', 'Worktrees', 'developer'],
+    ],
+    'worktree branches occur once in their own group; other roots and remote namesakes do not match',
+  )
+  eq(
+    m.visibleBranches(list, 'LOGIN', checkouts).map((entry) => [entry.name, entry.group]),
+    [['origin/feature/login', 'Remote branches'], ['feature/login', 'Worktrees']],
+    'filtering preserves group order and omits empty groups',
+  )
+  eq(m.visibleBranches(list, 'missing', checkouts), [], 'no matches produces no group rows')
+  const allWorktrees = [
+    ...checkouts,
+    worktree('main', '/w/.cide/worktrees/current'),
+    worktree('maintenance', '/w/.cide/worktrees/older'),
+  ]
+  eq(
+    m.visibleBranches(list, '', allWorktrees).map((entry) => [entry.name, entry.group]),
+    [
+      ['origin/main', 'Remote branches'],
+      ['origin/feature/login', 'Remote branches'],
+      ['main', 'Worktrees'],
+      ['feature/login', 'Worktrees'],
+      ['maintenance', 'Worktrees'],
+    ],
+    'the current branch stays first within its own group; other branches keep recency order',
+  )
+  eq(
+    m.visibleBranches({ ...list, repo: { ...list.repo, root: 'C:\\w\\' } }, '', [
+      worktree('feature/login', 'C:\\w\\.cide\\worktrees\\developer'),
+    ]).at(-1).group,
+    'Worktrees',
+    'repository/worktree matching handles Windows path separators and trailing slashes',
+  )
+  eq(m.branchRowTitle(grouped[0]), 'main (current branch)\nLatest commit: a commit',
+    'current branch hover retains the commit message')
+  eq(m.branchRowTitle(grouped.at(-1)),
+    'feature/login\nLatest commit: a commit\n/w/.cide/worktrees/developer',
+    'worktree hover includes the full branch name, commit message and checkout path')
+  eq(m.branchRowTitle({ ...grouped[0], subject: '' }), 'main (current branch)',
+    'an empty commit subject does not leave an empty tooltip line')
+  const afterBoundary = m.navigate('ArrowDown', { kind: 'row', index: 3 }, grouped.length)
+  eq(afterBoundary, { kind: 'row', index: 4 }, 'navigation crosses group headings without a stop')
+  eq(m.enterAction(grouped, afterBoundary), { kind: 'checkout', name: 'feature/login' },
+    'Enter acts on the displayed worktree branch after crossing a heading')
+
+  const collapsed = new Set(['Local branches'])
+  const sections = m.branchSections(grouped, collapsed)
+  eq(sections.map((group) => [group.name, group.expanded, group.rows.length]), [
+    ['Local branches', false, 0],
+    ['Remote branches', true, 2],
+    ['Worktrees', true, 1],
+  ], 'collapsed groups keep a clickable heading but hide their branches')
+  const expandedRows = sections.flatMap((group) => group.rows)
+  eq(m.enterAction(expandedRows, m.navigate('ArrowDown', m.FILTER, expandedRows.length)),
+    { kind: 'checkout', name: 'origin/main' },
+    'keyboard navigation starts at the first expanded group, skipping collapsed branches')
+  collapsed.add('Remote branches')
+  collapsed.add('Worktrees')
+  const allCollapsed = m.branchSections(grouped, collapsed)
+  eq(allCollapsed.length, 3, 'collapsing every group preserves all three headings')
+  eq(m.enterAction(allCollapsed.flatMap((group) => group.rows), m.FILTER), { kind: 'none' },
+    'Enter cannot check out a hidden branch when every group is collapsed')
+  eq(m.branchSections(grouped, new Set()).flatMap((group) => group.rows), grouped,
+    'expanding groups restores their original ordering and branch metadata')
+  eq(m.branchSections(m.visibleBranches(list, 'LOGIN', checkouts), new Set(['Worktrees']))
+    .map((group) => [group.name, group.expanded, group.rows.length]),
+    [['Remote branches', true, 1], ['Worktrees', false, 0]],
+    'search retains a collapsed matching heading and omits groups with no matches')
+  eq(m.branchSections([], collapsed), [], 'an unmatched query produces no headings')
+
   eq(m.remoteOf(ref('origin/feature/login', { remote: true })), 'origin', 'the remote is the first segment')
   eq(m.remoteOf(ref('main')), null, 'a local branch has no remote')
 

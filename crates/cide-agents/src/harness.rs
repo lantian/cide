@@ -171,8 +171,9 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      branch's commits are the record if the run dies. When you stop (done, blocked or out of \
      time) leave one short comment of at most ten lines: the result, what changed (paths), how \
      you verified it (the command and pass or fail, no pasted output), what is left, anything \
-     you noticed. A later comment in the same turn supersedes the earlier one. Then set the \
-     task's status to review; done is the reviewer's call, or the user's. The task's touches \
+     you noticed. A later comment supersedes the earlier one. Ask a question with \
+     {cide_task_update}, or set status to review for approval; never ask both. Done is the \
+     reviewer's or user's call. The task's touches \
      is what cide holds for you so parallel runs do not collide, not a permission: if the work \
      needs another file, add it with {cide_task_update} and carry on. Something wrong that is not \
      this task: do not fix it here — file it with {cide_task_create} (it lands in the inbox, \
@@ -1322,7 +1323,7 @@ impl std::fmt::Display for HarnessError {
                 harness_name(*harness)
             ),
             Self::NoBinary => f.write_str(
-                "Settings → Claude sessions names no binary to run. Put “claude” back, or the \
+                "Settings → Harness → Claude Code names no binary to run. Put “claude” back, or the \
                  path to the CLI you want subagents to use.",
             ),
             Self::NoPrompt => f.write_str(

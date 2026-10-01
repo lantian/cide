@@ -8,6 +8,7 @@ import type { TaskAuthor } from "./TaskAuthor";
 import type { TaskComment } from "./TaskComment";
 import type { TaskId } from "./TaskId";
 import type { TaskLink } from "./TaskLink";
+import type { TaskQuestion } from "./TaskQuestion";
 import type { TaskStatus } from "./TaskStatus";
 import type { TaskStatusChange } from "./TaskStatusChange";
 
@@ -157,7 +158,7 @@ acceptance?: Acceptance,
  * itself. A task with an open question is not dispatched and not planned; the user answers
  * in *Waiting for you*, which records the answer as a comment and clears this.
  */
-question?: string, 
+question?: TaskQuestion, 
 /**
  * Oldest first, which is the order the panel renders and the order an agent reads.
  */

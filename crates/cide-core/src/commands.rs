@@ -393,7 +393,7 @@ fn all_words_match(command: &Command, title: &str, needle: &str) -> bool {
 /// Offset of `needle` where it starts a word in `haystack`.
 ///
 /// Words break on anything non-alphanumeric, which covers the spaces and the colon in
-/// titles like `Split: new Claude session` — typing `new` should find it.
+/// titles like `Split: new Harness session` — typing `new` should find it.
 fn word_prefix(haystack: &str, needle: &str) -> Option<usize> {
     let mut prev: Option<char> = None;
     for (offset, ch) in haystack.char_indices() {
@@ -462,7 +462,7 @@ fn validate_table(table: &[Command]) -> Result<()> {
 /// Group names, as constants so a typo cannot split one group into two.
 const WINDOW: &str = "Window";
 const PROJECT: &str = "Project";
-const CLAUDE: &str = "Claude";
+const HARNESS: &str = "Harness";
 const TERMINAL: &str = "Terminal";
 const FILE: &str = "File";
 const GIT: &str = "Git";
@@ -471,7 +471,7 @@ const NAVIGATE: &str = "Navigate";
 const VIEW: &str = "View";
 /// Subagents and the project's task tracker. (M18)
 ///
-/// Its own group rather than rows under [`CLAUDE`], which is about the pane in front of you —
+/// Its own group rather than rows under [`HARNESS`], which is about the pane in front of you —
 /// "Pause subagents" sitting beside "Fork session into new pane" would read as two ways of
 /// doing one thing.
 const AGENTS: &str = "Agents";
@@ -582,7 +582,7 @@ fn build() -> Vec<Command> {
          * held-modifier walk in most-recently-used order (these two). Ctrl+Tab is the second
          * one, which is what every browser and every IDE means by that chord.
          *
-         * It walks **tabs**, not files, and the title says so. The pinned Claude console, a
+         * It walks **tabs**, not files, and the title says so. The pinned Harness console, a
          * `ClaudeFull` tab, a file tab, a diff tab and the settings tab all live in one `Vec`,
          * and excluding the console would make the most common return trip in this app — from
          * the file you were reading back to the conversation about it — the one thing Ctrl+Tab
@@ -615,7 +615,7 @@ fn build() -> Vec<Command> {
          * The id is `tab.console` and not `tab.select.1`, because **ids are API**: a user's
          * `keymap.json` names them and they are never renamed. `tabs[0]` is a stable identity
          * that Rust enforces — `open_tab` refuses a second `ClaudeHome` and `close_tab` refuses
-         * index 0 — so "the Claude console" is a thing this command can honestly promise, where
+         * index 0 — so "the Harness console" is a thing this command can honestly promise, where
          * "tab 1" would be a position. If Ctrl+2..9 ever ship they arrive as `tab.select.2..9`
          * beside this, with nothing renamed.
          *
@@ -624,7 +624,7 @@ fn build() -> Vec<Command> {
          * and never the keyboard — and it goes through `revealPane`, so the gesture ends with
          * the caret in the prompt rather than in whatever the user was typing in.
          */
-        Command::new("tab.console", "Go to Claude console", WINDOW)
+        Command::new("tab.console", "Go to Harness console", WINDOW)
             .when("shellWindow && projectOpen")
             .keywords(&["home", "chat", "prompt", "agent", "first"]),
         // Project. Opening one, then two families for moving between the ones already open —
@@ -710,8 +710,8 @@ fn build() -> Vec<Command> {
             .when("multipleProjects"),
         Command::new("project.prev", "Previous project (header order)", PROJECT)
             .when("multipleProjects"),
-        // Claude. `fork`, `mirror` and `restart` act on the focused *session*, so none of
-        // them mean anything without a Claude pane to act on.
+        // Harness. `fork`, `mirror` and `restart` act on the focused *session*, so none of
+        // them mean anything without a Harness pane to act on.
         //
         // `claude.split.newSession` is not one of those: it creates the session it splits to,
         // exactly as `terminal.splitBelow` creates its shell, and `ctrl+shift+n` has always
@@ -720,32 +720,32 @@ fn build() -> Vec<Command> {
         // worked, which is the palette and the keyboard disagreeing about one command.
         Command::new(
             "claude.split.newSession",
-            "Split: new Claude session",
-            CLAUDE,
+            "Split: new Harness session",
+            HARNESS,
         )
         .when("paneFocused"),
         /*
          * The chord spellings of the two mouse gestures beside it, asked for by name: "CTRL+(
          * - new claude panel, CTRL+) - new claude row" (and the bash pair under Terminal
-         * below). `claude.split.right` is the pane title bar's `⊞ claude pane` — a tile beside
+         * below). `claude.split.right` is the pane title bar's `⊞ harness pane` — a tile beside
          * the focused pane, `PaneTitleBar.tsx`'s exact call — and `claude.addRow` is the
-         * header's `⊞ claude row`, the full-width row `RowControls.tsx` adds. Both create the
+         * header's `⊞ harness row`, the full-width row `RowControls.tsx` adds. Both create the
          * session they split to, so they carry `claude.split.newSession`'s clause and not
          * `claudePaneFocused`, for the reason its comment above walks through. "panel" is the
          * user's own word for a tile, so it is a keyword rather than lost.
          */
         Command::new(
             "claude.split.right",
-            "Split right: new Claude session",
-            CLAUDE,
+            "Split right: new Harness session",
+            HARNESS,
         )
         .when("paneFocused")
         .keywords(&["panel", "tile", "beside"]),
-        Command::new("claude.addRow", "Add row: new Claude session", CLAUDE)
+        Command::new("claude.addRow", "Add row: new Harness session", HARNESS)
             .when("paneFocused")
             .keywords(&["panel", "full-width"]),
-        Command::new("claude.fork", "Fork session into new pane", CLAUDE).when("claudePaneFocused"),
-        Command::new("claude.mirror", "Mirror session into new pane", CLAUDE)
+        Command::new("claude.fork", "Fork session into new pane", HARNESS).when("claudePaneFocused"),
+        Command::new("claude.mirror", "Mirror session into new pane", HARNESS)
             .when("claudePaneFocused"),
         /*
          * Restart and resume, and why there are two of them.
@@ -766,22 +766,22 @@ fn build() -> Vec<Command> {
          * Neither is bound by default; a restart is not a per-minute gesture, and the pane's own
          * bar is where a user with a dead terminal is actually looking.
          */
-        Command::new("claude.restart", "Restart Claude session", CLAUDE).when("claudePaneFocused"),
+        Command::new("claude.restart", "Restart Harness session", HARNESS).when("claudePaneFocused"),
         // Whether a transcript still exists is a fact about the disk — a file under
         // `~/.claude/projects` — so no clause can claim it. The handler asks `session_resumable`
         // and says so when the answer is no, which is the rule this table's header states about
         // preconditions the webview cannot evaluate.
         Command::new(
             "claude.resume",
-            "Resume Claude session in this pane",
-            CLAUDE,
+            "Resume Harness session in this pane",
+            HARNESS,
         )
         .when("claudePaneFocused"),
         // The exception to the rule above, and the reason the rule is not a blanket one: you
         // mention the file you are *looking at*, which means an editor has focus and a Claude
         // pane by definition does not. `claudeTarget` is "this project has a Claude pane to
         // mention into" — the focused one, or the console.
-        Command::new("claude.mention.file", "Mention file in Claude", CLAUDE)
+        Command::new("claude.mention.file", "Mention file in Harness", HARNESS)
             .when("editorFocused && claudeTarget"),
         /*
          * Agents. (M18)
@@ -878,7 +878,7 @@ fn build() -> Vec<Command> {
          *   `tab.tree.focused` rather than from the caret. It stays true while the user is typing
          *   in a rename field, the commit message box or the Explorer's search input, so the
          *   binding would take Ctrl+F from all of them in any window whose focused pane happens
-         *   to be a terminal — which, in an app with a pinned Claude console, is most windows
+         *   to be a terminal — which, in an app with a pinned Harness console, is most windows
          *   most of the time.
          * * `ui/src/editor/EditorSurface.tsx` says it about this exact chord: binding `ctrl+f`
          *   here "fights a written rule", because CodeMirror's `Mod-f` opens the *editor's* find
@@ -1656,7 +1656,7 @@ fn build() -> Vec<Command> {
          * Propose a change, and explore before proposing. (M28)
          *
          * Both open the composer — the same one the OpenSpec panel's two buttons open — and both
-         * end in the project's pinned Claude session being typed at. They are here because that
+         * end in the project's pinned Harness session being typed at. They are here because that
          * is where a gesture with no home on screen goes: the panel is one click away when the
          * sidebar happens to be showing OpenSpec, and behind two otherwise, and *propose a
          * change* is the single most common thing a user of this feature does.
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_reason_names_what_is_missing() {
-        // Read as a whole sentence in the palette: "Restart Claude session — needs a respawn
+        // Read as a whole sentence in the palette: "Restart Harness session — needs a respawn
         // path in the pane host". A reason that just says "not implemented" tells a user
         // nothing they had not already worked out from the row being grey.
         for command in registry() {
@@ -1970,7 +1970,7 @@ mod tests {
         for (id, title) in [
             ("pane.split.right", "Split pane right (adds a tile)"),
             ("pane.split.down", "Split pane down (adds a row)"),
-            ("claude.split.newSession", "Split: new Claude session"),
+            ("claude.split.newSession", "Split: new Harness session"),
             ("pane.promoteToTab", "Promote pane to full tab"),
             ("pane.detachToWindow", "Detach pane into window"),
             ("terminal.splitBelow", "Split terminal below"),
@@ -1985,14 +1985,14 @@ mod tests {
         // `groups()` derives its order from first appearance in `build()`, so this pins the
         // *table's* order as much as the list — and "Navigate" sits between Git and View because
         // that is where the M12 block was inserted, not because anything sorted it. "Agents"
-        // follows "Claude" for the opposite reason: it was put there on purpose, next to the
+        // follows "Harness" for the opposite reason: it was put there on purpose, next to the
         // group it deliberately is not part of, because a user who has just read "Fork session
         // into new pane" is one row away from the subagents that are the other way to get work
         // done in this app.
         assert_eq!(
             groups(),
             vec![
-                "Window", "Project", "Claude", "Agents", "Terminal", "File", "Git", "Docker",
+                "Window", "Project", "Harness", "Agents", "Terminal", "File", "Git", "Docker",
                 "Navigate", "View",
             ]
         );
@@ -2261,12 +2261,12 @@ mod tests {
 
     #[test]
     fn a_title_match_outranks_a_match_on_the_id_alone() {
-        // `Fork session into new pane` matches only through its id, `claude.fork`.
-        let found = ids(&search("claude"));
-        let restart = found.iter().position(|id| *id == "claude.restart");
-        let fork = found.iter().position(|id| *id == "claude.fork");
+        // `Expand all folders` matches only through its id, `file.expandAll`.
+        let found = ids(&search("file"));
+        let save = found.iter().position(|id| *id == "file.save").unwrap();
+        let expand = found.iter().position(|id| *id == "file.expandAll").unwrap();
         assert!(
-            restart < fork,
+            save < expand,
             "a title hit should beat an id-only hit: {found:?}"
         );
     }

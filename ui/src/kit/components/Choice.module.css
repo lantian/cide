@@ -28,6 +28,37 @@
   cursor: pointer;
 }
 
+.visualChoices {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.visualGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, calc(220px * var(--ui-scale))), 1fr));
+  gap: var(--sp-4);
+}
+
+.visualCard {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  padding: var(--sp-5);
+  background: var(--panel);
+  overflow-wrap: anywhere;
+}
+
+.visualCard[data-selected='true'] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.visualArt {
+  margin-bottom: var(--sp-4);
+}
+
 .check input {
   flex: none;
   width: calc(14px * var(--ui-scale));

@@ -243,7 +243,7 @@ function ProblemsPanelImpl({
               <ul className={styles.list}>
                 {/* Named concretely so the answer is actionable rather than reassuring. */}
                 <li>The terminal — <code>cargo check</code>, <code>tsc --noEmit</code>, your test run.</li>
-                <li>Claude, which reads compiler output from the panes it is given.</li>
+                <li>The harness, which reads compiler output from the panes it is given.</li>
                 <li>Git, for what changed; the Git panel, not this one.</li>
               </ul>
               <p className={styles.noteHead}>What would fill this panel</p>

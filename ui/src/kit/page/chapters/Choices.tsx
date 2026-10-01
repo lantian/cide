@@ -9,6 +9,7 @@ import {
   Segmented,
   Switch,
   ToggleCard,
+  VisualChoices,
 } from '../../components/Choice'
 import { Cell, Chapter, Specimen, Stack } from '../Specimen'
 
@@ -21,6 +22,7 @@ export function Choices(): ReactElement {
   const [view, setView] = useState<'unified' | 'split'>('unified')
   const [kind, setKind] = useState<'empty' | 'clone' | 'template'>('clone')
   const [git, setGit] = useState(true)
+  const [renders, setRenders] = useState<string[]>([])
   const [colour, setColour] = useState<string | null>(null)
   const [tone, setTone] = useState<string | null>('#7c3aed')
   return (
@@ -193,6 +195,15 @@ export function Choices(): ReactElement {
             onChange={setGit}
           />
         </Stack>
+      </Specimen>
+
+      <Specimen name="Visual choices" source="Choice.tsx › VisualChoices"
+        use="Any number of image or text choices, using radios for one answer and checkboxes for several. Preview actions stay separate from selection." ground="panel">
+        <VisualChoices label="Choose renders" name="render-specimen" multiple values={renders} onChange={setRenders}
+          options={[
+            { id: 'wood', title: 'Wooden finish', description: 'Warm tones', art: <Icon name="image" size={3} /> },
+            { id: 'metal', title: 'Metal finish', description: 'Cool tones', art: <Icon name="image" size={3} /> },
+          ]} />
       </Specimen>
 
       <Specimen

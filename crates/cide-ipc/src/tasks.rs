@@ -547,6 +547,124 @@ pub enum Acceptance {
     User,
 }
 
+/// A text question remains a string on disk and on the wire for older callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(untagged)]
+#[ts(export)]
+pub enum TaskQuestion {
+    Text(String),
+    Choices(QuestionChoices),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum QuestionSelection {
+    #[default]
+    Single,
+    Multiple,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct QuestionChoices {
+    pub text: String,
+    #[serde(default)]
+    pub selection: QuestionSelection,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct QuestionOption {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+    /// An image attachment on this task. The agent tool accepts a source path and copies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub image: Option<TaskAttachmentId>,
+}
+
+impl TaskQuestion {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Choices(choices) => &choices.text,
+        }
+    }
+
+    pub fn options(&self) -> &[QuestionOption] {
+        match self {
+            Self::Text(_) => &[],
+            Self::Choices(choices) => &choices.options,
+        }
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.text().trim().is_empty() {
+            return Err("the question is empty".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for option in self.options() {
+            if option.id.trim().is_empty() || option.title.trim().is_empty() {
+                return Err("each answer option needs a nonempty id and title".into());
+            }
+            if !ids.insert(&option.id) {
+                return Err(format!("duplicate answer option id: {}", option.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate selections against the question the user actually saw.
+    pub fn validate_answer(
+        &self,
+        selected: &[String],
+        text: &str,
+    ) -> std::result::Result<(), String> {
+        if selected.is_empty() && text.trim().is_empty() {
+            return Err("the answer is empty".into());
+        }
+        let multiple =
+            matches!(self, Self::Choices(q) if q.selection == QuestionSelection::Multiple);
+        if !multiple && selected.len() > 1 {
+            return Err("this question allows one selection".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for id in selected {
+            if !ids.insert(id) || !self.options().iter().any(|o| &o.id == id) {
+                return Err(format!("unknown or duplicate answer option: {id}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for TaskQuestion {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.text()
+    }
+}
+
+impl From<String> for TaskQuestion {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for TaskQuestion {
+    fn from(text: &str) -> Self {
+        Self::Text(text.into())
+    }
+}
+
 /// The user's answer to a task waiting for them — the Waiting-for-you list's three buttons.
 /// (M132) One command rather than three task edits, because each is several writes that must land
 /// together and one of them starts a run: "send back" is a comment, a status and a dispatch into
@@ -567,7 +685,18 @@ pub enum TaskResponse {
     SendBack { note: String },
     /// The answer to the task's `question`: written on the task, the question cleared, and the
     /// role on it (if any) continues.
-    Answer { text: String },
+    Answer {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        #[ts(as = "Option<Vec<String>>", optional)]
+        selected_ids: Vec<String>,
+        /// The displayed question, checked under the store lock before writing an answer.
+        /// Omitted by legacy text-only callers.
+        #[serde(default)]
+        #[ts(optional)]
+        expected_question: Option<TaskQuestion>,
+    },
 }
 
 /// One task.
@@ -709,7 +838,7 @@ pub struct Task {
     /// in *Waiting for you*, which records the answer as a comment and clears this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub question: Option<String>,
+    pub question: Option<TaskQuestion>,
     /// Oldest first, which is the order the panel renders and the order an agent reads.
     pub comments: Vec<TaskComment>,
     /// Files attached to the body, oldest first. (M39)
@@ -829,7 +958,7 @@ pub struct TaskRow {
     /// tasks. (M132)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub question: Option<String>,
+    pub question: Option<TaskQuestion>,
     #[serde(default = "TaskAuthor::user")]
     pub created_by: TaskAuthor,
     pub created_unix_ms: u64,
@@ -1077,7 +1206,8 @@ impl TaskFile {
     /// [`TaskRow::touches`], [`TaskRow::acceptance`] or [`TaskRow::question`]. A build before M132
     /// would read those rows, drop the keys it does not know and write the board back without
     /// them — a declaration silently lost, which is worse than a board it refuses.
-    pub const CURRENT_SCHEMA: u32 = 4;
+    /// Schema 5 protects structured questions from older builds that only read strings.
+    pub const CURRENT_SCHEMA: u32 = 5;
 
     /// The schema a tracker with an inbox row, and nothing newer, is written as. (M83)
     pub const SCHEMA_WITH_INBOX: u32 = 3;
@@ -1105,9 +1235,15 @@ impl TaskFile {
         if self
             .tasks
             .iter()
-            .any(|t| !t.touches.is_empty() || t.acceptance.is_some() || t.question.is_some())
+            .any(|t| matches!(t.question, Some(TaskQuestion::Choices(_))))
         {
             Self::CURRENT_SCHEMA
+        } else if self
+            .tasks
+            .iter()
+            .any(|t| !t.touches.is_empty() || t.acceptance.is_some() || t.question.is_some())
+        {
+            4
         } else if self.tasks.iter().any(|t| t.status == TaskStatus::Inbox) {
             Self::SCHEMA_WITH_INBOX
         } else {
@@ -1393,7 +1529,7 @@ pub enum TaskEdit {
     },
     /// Ask the user something, or `question: null` to withdraw it. (M132)
     SetQuestion {
-        question: Option<String>,
+        question: Option<TaskQuestion>,
     },
     /// Mark one comment superseded — the one-report-per-turn rule. (M132)
     ///

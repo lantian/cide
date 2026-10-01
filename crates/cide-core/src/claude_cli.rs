@@ -416,7 +416,7 @@ pub const REFUSED_ARGS: &[RefusedArg] = &[
                  report against it. A second one makes every hook frame name a session this \
                  process has never heard of — no token figures, no busy-versus-idle close \
                  confirm — and writes an id into workspace.json with no transcript behind it. \
-                 Settings → Claude sessions → What cide adds to the command line can switch \
+                 Settings → Harness → Claude Code → What cide adds to the command line can switch \
                  cide's own off, and this refusal lifts with it.",
         because: Some(Injection::SessionId),
     },
@@ -437,7 +437,7 @@ pub const REFUSED_ARGS: &[RefusedArg] = &[
         takes_value: false,
         reason: "Only legal beside a session id or a resume, both of which cide owns. A stray \
                  one changes which conversation the pane *is*, and cide's Split and fork \
-                 gesture is what passes it deliberately. Settings → Claude sessions → What \
+                 gesture is what passes it deliberately. Settings → Harness → Claude Code → What \
                  cide adds to the command line can switch cide's own off, and this refusal \
                  lifts with it.",
         because: Some(Injection::ForkSession),
@@ -1288,17 +1288,17 @@ impl BinaryProblem {
     /// second wording of it that leaves them wondering whether it is a second problem.
     pub fn message(&self) -> String {
         match self {
-            Self::Blank => "No Claude binary is configured. Settings → Claude sessions → \
+            Self::Blank => "No Claude binary is configured. Settings → Harness → Claude Code → \
                             Binary; “claude” is the default and lets PATH resolve it."
                 .to_string(),
             Self::NotOnPath { name } => format!(
                 "“{name}” is not on this app's PATH, nor in ~/.cargo/bin or ~/go/bin. A cide \
                  started from a desktop launcher has a different PATH from one started in a \
-                 terminal, so give an absolute path in Settings → Claude sessions → Binary if \
+                 terminal, so give an absolute path in Settings → Harness → Claude Code → Binary if \
                  it works in your shell."
             ),
             Self::NotExecutable { path } => format!(
-                "“{}” is not an executable file. Settings → Claude sessions → Binary.",
+                "“{}” is not an executable file. Settings → Harness → Claude Code → Binary.",
                 path.display()
             ),
         }

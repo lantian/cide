@@ -99,7 +99,7 @@ try {
     // and every one of them was absent from the screen before rows were built from commands.
     { id: 'file.saveAll', title: 'Save all', group: 'File' },
     { id: 'git.pull', title: 'Pull', group: 'Git' },
-    { id: 'tab.console', title: 'Go to Claude console', group: 'Project' },
+    { id: 'tab.console', title: 'Go to Harness console', group: 'Project' },
     {
       id: 'pane.promoteToTab',
       title: 'Promote pane to tab',

@@ -501,65 +501,37 @@ pub async fn task_respond(
     let (store, continue_with) = blocking(move || {
         let task = for_thread;
         let store = tracker(&stores, project, root);
-        let current = store
-            .get(&task)
-            .ok_or_else(|| CoreError::Io(format!("{task} no longer exists")))?;
-        let comment = |store: &TaskStore, text: String| {
-            store.edit(&task, TaskEdit::Comment { text }, TaskAuthor::User)
-        };
         let continue_with = match response {
             cide_ipc::TaskResponse::Accept => {
-                store.edit(
-                    &task,
-                    TaskEdit::SetStatus {
-                        status: cide_ipc::TaskStatus::Done,
-                    },
-                    TaskAuthor::User,
-                )?;
+                store.respond_to_review(&task, None)?;
                 None
             }
             cide_ipc::TaskResponse::SendBack { note } => {
-                let note = note.trim().to_string();
-                if note.is_empty() {
-                    return Err(CoreError::Io(
-                        "say in a line what is wrong, so the role knows what to change".into(),
-                    ));
-                }
-                comment(&store, format!("**Sent back by the user:** {note}"))?;
-                match current.agent.clone() {
-                    Some(agent) => Some((
+                let current = store.respond_to_review(&task, Some(&note))?;
+                current.agent.map(|agent| {
+                    (
                         agent,
                         format!(
                             "The user looked at {task} and sent it back: {note} — fix that in \
                              your branch, commit, and set {task} to review again."
                         ),
-                    )),
-                    None => {
-                        store.edit(
-                            &task,
-                            TaskEdit::SetStatus {
-                                status: cide_ipc::TaskStatus::Todo,
-                            },
-                            TaskAuthor::User,
-                        )?;
-                        None
-                    }
-                }
+                    )
+                })
             }
-            cide_ipc::TaskResponse::Answer { text } => {
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return Err(CoreError::Io("the answer is empty".into()));
-                }
-                comment(&store, format!("**The user answered:** {text}"))?;
-                store.edit(
+            cide_ipc::TaskResponse::Answer {
+                text,
+                selected_ids,
+                expected_question,
+            } => {
+                let answered = store.answer_question(
                     &task,
-                    TaskEdit::SetQuestion { question: None },
-                    TaskAuthor::User,
+                    &text,
+                    &selected_ids,
+                    expected_question.as_ref(),
                 )?;
                 // Only a task that is work continues a role; a question on a milestone's goal is
                 // the planner's, which reads the answer on its next wake.
-                match (current.agent.clone(), current.status) {
+                match (answered.agent.clone(), answered.status) {
                     (
                         Some(agent),
                         cide_ipc::TaskStatus::Todo
@@ -568,8 +540,9 @@ pub async fn task_respond(
                     ) => Some((
                         agent,
                         format!(
-                            "The user answered the question on {task}: {text} — carry on with \
-                             {task} on that basis."
+                            "The user answered the question on {task}. Read the newest comment \
+                             with cide_task_get for the selected options and custom text, and \
+                             carry on with {task} on that basis."
                         ),
                     )),
                     _ => None,

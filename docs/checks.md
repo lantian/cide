@@ -675,6 +675,21 @@ Not built: a "drift" note when a live run edits outside its touches.
 - **A report, not a log.** A comment over `commentLimit` from a run, a worker or a tab cide opened is refused with the recipe. A run's second comment in a turn marks its first `superseded`: the file stays append-only, `cide_task_get` hides superseded comments and counts them, and the card collapses them. The console is never capped. A limit enforced only in the prompt did not work: the boards still filled (6 MB of comments on selfcraft).
 - **A live run's body and title are not rewritten over MCP.** The run implements the brief it was started on, and a new body is a correction nobody receives (terrastrike's t-1266). Comment the correction, or re-dispatch.
 
+### Visual task questions and one response per task
+
+**Touches:** structured `TaskQuestion`, `TaskResponse::Answer`, `TaskStore::{answer_question,
+respond_to_review}`, `cide_task_update` option images, `QuestionAnswer`, and the Waiting panel.
+
+Run `cargo test --locked -p cide-ipc -p cide-tasks -p cide-agents --lib`, the relevant
+`cide-app` task/agent tests, `check:task-questions`, `check:agents`, `check:agents-render`,
+`check:kit`, `check:selectors`, `check:ui-scale`, `check:motion`, TypeScript and codegen checks.
+Questions take priority over review in the UI and under the store lock. An answer records its
+selected option snapshots and custom text, clears the question and leaves review in one revision;
+concurrent answers may resume the role only once. The displayed question is checked before
+accepting selections, and failed writes must retain the draft. Source images are copied into
+task attachments before the question is published; paths resolve against the caller's worktree.
+Schema 5 is written only while a structured question is present; text questions keep schema 4.
+
 ### What a local override actually changes, or when the workspace reaches the disk
 
 **Touches:** what a local override actually changes, or when the workspace reaches the disk — `cide_agents::effective_max_concurrent`, `overrides::row_for`, `plan_dispatch`'s `agent_limit`, `WorkspaceState::{start_flusher,flush_if_due}`

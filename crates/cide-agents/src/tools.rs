@@ -1473,7 +1473,10 @@ pub fn description(name: &str) -> &'static str {
              `attachments` puts files on the task's body by path — the same as cide_task_attach; \
              files already attached stay. `touches`, `acceptance` and `question` set those fields \
              (null clears); only the user moves a task out of the inbox or accepts a task marked \
-             `acceptance: user`. The answer is the task's summary line plus any comments \
+             `acceptance: user`. An open question takes priority over approval. Ask with a text \
+             string or {text, selection: single|multiple, options: [{id, title, description?, \
+             image?}]}; images are file paths or existing image attachment ids. There is no \
+             option-count limit and the user can always add custom text. The answer is the task's summary line plus any comments \
              others added since your last one, not the whole task; that is cide_task_get."
         }
         tool::TASK_COMMENT => {
@@ -2008,11 +2011,38 @@ pub fn input_schema(name: &str) -> Value {
                          eye; no reviewer sets it done.",
                 },
                 "question": {
-                    "type": ["string", "null"],
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "null" },
+                        {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["text"],
+                            "properties": {
+                                "text": { "type": "string" },
+                                "selection": { "type": "string", "enum": ["single", "multiple"], "default": "single" },
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object", "additionalProperties": false,
+                                        "required": ["id", "title"],
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "title": { "type": "string" },
+                                            "description": { "type": "string" },
+                                            "image": { "type": "string", "description": "Local image path (relative to your working directory), or an image attachment id on this task. Copied into task storage." }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ],
                     "description":
                         "A question for the user — a decision about taste, scope or design that \
                          is not yours. The task is not started or planned until the user \
-                         answers; null clears it.",
+                         answers; null clears it. A string is a free-text question; an object \
+                         offers any number of visual choices and single (default) or multiple \
+                         selection. Custom text is always available. Ask a question or request \
+                         approval, never both in the same hand-back.",
                 },
                 "attachments": {
                     "type": "array",
@@ -3359,13 +3389,28 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
             acceptance: Some(*value),
         }),
     }
-    match nullable_string(arguments, "question") {
-        Ok(Field::Absent) => {}
-        Ok(Field::Null) => edits.push(TaskEdit::SetQuestion { question: None }),
-        Ok(Field::Value(question)) => edits.push(TaskEdit::SetQuestion {
-            question: Some(question),
-        }),
-        Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+    match arguments.get("question") {
+        None => {}
+        Some(Value::Null) => edits.push(TaskEdit::SetQuestion { question: None }),
+        Some(value) => match serde_json::from_value::<cide_ipc::TaskQuestion>(value.clone()) {
+            Ok(question) => {
+                if (!question.text().trim().is_empty()
+                    || matches!(question, cide_ipc::TaskQuestion::Choices(_)))
+                    && let Err(why) = question.validate()
+                {
+                    return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE));
+                }
+                edits.push(TaskEdit::SetQuestion {
+                    question: Some(question),
+                });
+            }
+            Err(why) => {
+                return ToolResult::error(format!(
+                    "{}: invalid question: {why}",
+                    tool::TASK_UPDATE
+                ));
+            }
+        },
     }
     // Files onto the body, last in the sequence: the same road as `cide_task_attach`, here
     // because a run that has just written a file and moves the task to `review` in one breath
@@ -3494,6 +3539,84 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
         }
     }
 
+    // Preflight all option images before changing the task. Existing attachments can be reused;
+    // source paths are resolved against the caller's worktree, never the project's checkout.
+    let mut question_images = Vec::new();
+    for edit in &edits {
+        if let TaskEdit::SetQuestion {
+            question: Some(question),
+        } = edit
+        {
+            for option in question.options() {
+                let Some(image) = &option.image else { continue };
+                if current
+                    .attachments
+                    .iter()
+                    .chain(current.comments.iter().flat_map(|c| &c.attachments))
+                    .any(|a| {
+                        &a.id == image && !a.deleted && a.kind == cide_ipc::AttachmentKind::Image
+                    })
+                {
+                    continue;
+                }
+                let source = Path::new(image.as_str());
+                let path = if source.is_absolute() {
+                    source.to_path_buf()
+                } else {
+                    sink.cwd().join(source)
+                };
+                match cide_core::image::read(&path) {
+                    Ok(doc) if doc.bytes <= 32 * 1024 * 1024 => {
+                        question_images.push((option.id.clone(), path))
+                    }
+                    Ok(_) => {
+                        return ToolResult::error(format!(
+                            "{}: answer image exceeds 32 MiB: {}",
+                            tool::TASK_UPDATE,
+                            path.display()
+                        ));
+                    }
+                    Err(why) => {
+                        return ToolResult::error(format!(
+                            "{}: answer image {}: {why}",
+                            tool::TASK_UPDATE,
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !question_images.is_empty() {
+        let sources = question_images
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        let attached = match sink.attach(&id, AttachTarget::Task, &sources) {
+            Ok(task) => task,
+            Err(why) => return ToolResult::error(format!("{}: {why}", tool::TASK_UPDATE)),
+        };
+        if attached.attachments.len() < question_images.len() {
+            return ToolResult::error(format!(
+                "{}: could not resolve the copied answer images",
+                tool::TASK_UPDATE
+            ));
+        }
+        let new_images =
+            &attached.attachments[attached.attachments.len() - question_images.len()..];
+        for edit in &mut edits {
+            if let TaskEdit::SetQuestion {
+                question: Some(cide_ipc::TaskQuestion::Choices(question)),
+            } = edit
+            {
+                for ((option_id, _), image) in question_images.iter().zip(new_images) {
+                    if let Some(option) = question.options.iter_mut().find(|o| &o.id == option_id) {
+                        option.image = Some(image.id.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut last = None;
     for edit in edits {
         match sink.edit(&id, edit) {
@@ -7737,6 +7860,32 @@ fn render_full(task: &Task, all: &[TaskRow], root: &Path, recent: Option<usize>)
     // task's line in `cide_task_list`.
     let row = TaskRow::of(task);
     let mut out = render_summary(&row, all);
+    if let Some(question) = &task.question {
+        out.push_str("  question:\n");
+        out.push_str(&indented(question.text()));
+        if let cide_ipc::TaskQuestion::Choices(choices) = question {
+            out.push_str(&format!(
+                "    selection: {}\n",
+                match choices.selection {
+                    cide_ipc::QuestionSelection::Single => "single",
+                    cide_ipc::QuestionSelection::Multiple => "multiple",
+                }
+            ));
+            for option in &choices.options {
+                out.push_str(&format!(
+                    "    - {}: {}\n",
+                    one_line(&option.id),
+                    one_line(&option.title)
+                ));
+                if let Some(description) = &option.description {
+                    out.push_str(&indented(description));
+                }
+                if let Some(image) = &option.image {
+                    out.push_str(&format!("      image attachment: {image}\n"));
+                }
+            }
+        }
+    }
     /*
      * Who asked for this, on its own line. (M21)
      *
@@ -7879,6 +8028,7 @@ mod tests {
         live: Vec<(TaskId, String)>,
         /// The turn's report per task, as [`TaskSink::turn_report`]/`note_report` keep it. (M132)
         reports: Mutex<Vec<(TaskId, cide_ipc::CommentId)>>,
+        working_directory: Option<PathBuf>,
     }
 
     impl FakeSink {
@@ -7892,6 +8042,7 @@ mod tests {
                 caller: None,
                 live: Vec::new(),
                 reports: Mutex::new(Vec::new()),
+                working_directory: None,
             }
         }
 
@@ -8161,7 +8312,9 @@ mod tests {
 
         // A run's cwd is its worktree, not the root — the case `TaskSink::cwd` exists for.
         fn cwd(&self) -> &Path {
-            Path::new("/repo/.cide/worktrees/developer")
+            self.working_directory
+                .as_deref()
+                .unwrap_or_else(|| Path::new("/repo/.cide/worktrees/developer"))
         }
 
         fn attach(
@@ -10672,6 +10825,80 @@ mod tests {
         assert_eq!(tasks[0].touches.len(), 2);
         assert_eq!(tasks[0].acceptance, Some(cide_ipc::Acceptance::User));
         assert_eq!(tasks[0].question.as_deref(), Some("Arrow or hand?"));
+    }
+
+    #[test]
+    fn visual_questions_accept_many_options_and_copy_image_paths_to_attachment_ids() {
+        let mut sink = FakeSink::new(vec![task("t-1", "Renders", TaskStatus::Doing, None)]);
+        sink.working_directory = Some(std::env::temp_dir());
+        let source = std::env::temp_dir().join(format!(
+            "cide-tools-question-{}.png",
+            cide_ipc::TaskAttachmentId::new()
+        ));
+        std::fs::write(
+            &source,
+            cide_core::image::encode_png(&[255, 0, 0, 255], 1, 1).unwrap(),
+        )
+        .unwrap();
+        let result = call(
+            tool::TASK_UPDATE,
+            json!({
+                "id": "t-1", "question": {
+                    "text": "Choose renders", "selection": "multiple",
+                "options": (0..10).map(|i| json!({"id":format!("r{i}"), "title":format!("Render {i}"), "description":"Warm lighting", "image":source.file_name().unwrap().to_string_lossy()})).collect::<Vec<_>>()
+                }
+            }),
+            &sink,
+        );
+        std::fs::remove_file(source).unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let current = sink.get(&TaskId("t-1".into())).unwrap().unwrap();
+        let question = current.question.as_ref().unwrap();
+        assert_eq!(question.options().len(), 10);
+        for option in question.options() {
+            assert!(
+                current
+                    .attachments
+                    .iter()
+                    .any(|a| Some(&a.id) == option.image.as_ref())
+            );
+        }
+        // The same attached images can be reused without their original source files.
+        let reused = call(
+            tool::TASK_UPDATE,
+            json!({"id":"t-1", "question":question}),
+            &sink,
+        );
+        assert!(!reused.is_error, "{}", text_of(&reused));
+        assert_eq!(
+            sink.get(&current.id).unwrap().unwrap().attachments.len(),
+            10
+        );
+        let full = call(tool::TASK_GET, json!({"id":"t-1"}), &sink);
+        assert!(text_of(&full).contains("Render 9"));
+        assert!(text_of(&full).contains("selection: multiple"));
+    }
+
+    #[test]
+    fn invalid_visual_question_inputs_are_refused_before_other_edits() {
+        let sink = FakeSink::new(vec![task("t-1", "Original", TaskStatus::Doing, None)]);
+        for question in [
+            json!({"text":"Pick", "options":[{"id":"x", "title":"A"}, {"id":"x", "title":"B"}]}),
+            json!({"text":"Pick", "selection":"invalid"}),
+            json!({"text":" ", "options":[]}),
+            json!({"text":"Pick", "options":[{"id":"x", "title":"A", "image":"missing-render.png"}]}),
+        ] {
+            let result = call(
+                tool::TASK_UPDATE,
+                json!({"id":"t-1", "title":"Changed", "question":question}),
+                &sink,
+            );
+            assert!(result.is_error, "{}", text_of(&result));
+            let current = sink.get(&TaskId("t-1".into())).unwrap().unwrap();
+            assert_eq!(current.title, "Original");
+            assert!(current.question.is_none());
+            assert!(current.attachments.is_empty());
+        }
     }
 
     #[test]

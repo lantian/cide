@@ -143,14 +143,14 @@ try {
   eq(byName.mock.worktree, null, 'no agent checkouts: the plain branch readout, no selector')
   eq(
     byName['worktree-project'].worktree,
-    { value: '', label: 'hub-provider-config' },
+    { value: '', label: 'hub-provider-config', icon: 'git-branch' },
     "agent checkouts listed, project shown: the selector, on the project's own branch — read "
       + "from the tree it is showing (the mock's), not the host's `projectBranch` copy, which "
       + 'can lag a checkout by one reload',
   )
   eq(
     byName['worktree-chosen'].worktree,
-    { value: '/work/demo/.cide/worktrees/developer-t-7', label: 'cide/developer-t-7' },
+    { value: '/work/demo/.cide/worktrees/developer-t-7', label: 'cide/developer-t-7', icon: 'folder' },
     "a checkout chosen: the selector holds its path and names the branch it is on",
   )
   eq(

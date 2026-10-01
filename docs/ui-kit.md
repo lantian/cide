@@ -239,6 +239,8 @@ Chapters are anchors on the page: `kit.html#<id>`.
 - **`ChoiceCards`**: one of 2–4 options that each need a picture or a paragraph (the wizard's
   project type).
 - **`ToggleCard`**: a checkbox that needs a sentence of why.
+- **`VisualChoices`**: any number of cards with titles, optional descriptions and optional art.
+  Native radios select one answer; checkboxes select several. Preview actions sit outside labels.
 - **`ColorSwatches`**: one colour. Hand-picked preset swatches (one may be `null`, a default), a
   Custom swatch over the native colour dialog, and a hex field. It commits when the dialog
   closes or the field is left, never on every drag, because its caller is usually a settings

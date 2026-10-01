@@ -3935,7 +3935,7 @@ impl AgentRegistry {
                                       it, and this child ended before printing one."
                         .to_string()
                 }
-                Harness::Claude if !resume_enabled => "Settings → Claude sessions has the \
+                Harness::Claude if !resume_enabled => "Settings → Harness → Claude Code has the \
                                                        `--resume` injection switched off, so \
                                                        cide will not name a conversation on the \
                                                        command line and cannot re-open this one."

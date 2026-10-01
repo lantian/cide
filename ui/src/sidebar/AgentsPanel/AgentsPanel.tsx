@@ -175,7 +175,7 @@ const CONFIGURE_ALL_LABEL = 'Configure subagents in Settings'
  * it. So the sentence names the console before the click rather than after it.
  */
 const PAUSE_ALL_TITLE =
-  "Pause every subagent, and this project's own Claude session, until you resume"
+  "Pause every subagent, and this project's own Harness session, until you resume"
 
 /**
  * What the header's Resume says. Three clauses, because a project-scope Resume does three things.
@@ -463,7 +463,7 @@ export function AgentsPanelView({
             {OFF_FOR_THIS_PROJECT}
           </p>
           <p className={styles.detail}>
-            A subagent is a second Claude (or opencode) run under a role you define —
+            A subagent is another coding agent run under a role you define —
             developer, qa, artist — dispatched by the session in your console tab. They run
             headless; nothing opens a pane unless you ask it to.
           </p>

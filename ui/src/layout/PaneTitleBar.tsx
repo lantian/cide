@@ -376,7 +376,7 @@ export function PaneFrame({
    * and the two kinds below come from that file so the two surfaces cannot drift.
    *
    * **A menu under one button, not two buttons**, and that is the whole of the interaction
-   * decision. The header can afford `⊞ bash row  ⊞ claude row` because it has a whole window's
+   * decision. The header can afford `⊞ bash row  ⊞ harness row` because it has a whole window's
    * width; this cluster floats over live content and every glyph in it is a glyph over a
    * terminal, so a second unlabelled `⊞` beside the first would be two identical marks meaning
    * different things and 22 more pixels of transcript covered. Two items in the right-click
@@ -447,7 +447,7 @@ export function PaneFrame({
     items: () =>
       PANE_KINDS.map(({ id, word, intent }) => ({
         id,
-        // "bash pane" / "claude pane", the header's "bash row" / "claude row" with the one noun
+        // "bash pane" / "harness pane", the header's "bash row" / "harness row" with the one noun
         // that differs swapped. Both words come from the same record, so they cannot drift apart
         // into "shell" here and "bash" there.
         label: `${word} pane`,

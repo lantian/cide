@@ -422,7 +422,7 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
 
       <Group title="Projects">
         <ToggleRow
-          label="Each project keeps its own Claude tab"
+          label="Each project keeps its own console tab"
           hint="Pinned, cannot be closed — only its panes can."
           checked={settings.eachProjectKeepsClaudeTab}
           // Disabled rather than hidden. The mock draws the toggle, and the rest of the model
@@ -764,9 +764,9 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
           onChange={(v) => set({ disableMouse: v })}
         />
         <ToggleRow
-          label="Resume every Claude pane on launch"
+          label="Resume every Harness pane on launch"
           hint="Off: only the project’s console resumes; the rest wait behind a button."
-          info="On, a restored pane picks its conversation up by itself. Resuming is not forking — it continues a conversation that already exists and sends no prompt — but it does start one claude process per pane. A pane whose transcript is gone always waits, either way."
+          info="On, a restored pane picks its conversation up by itself. Resuming is not forking — it continues a conversation that already exists and sends no prompt — but it does start one harness process per pane. A pane whose transcript is gone always waits, either way."
           {...resetTo(claude.resumeAllOnLaunch, def?.resumeAllOnLaunch, (v) => set({ resumeAllOnLaunch: v }))}
           checked={claude.resumeAllOnLaunch}
           onChange={(v) => set({ resumeAllOnLaunch: v })}

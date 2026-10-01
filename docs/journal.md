@@ -17208,3 +17208,41 @@ only while waiting; clearing the state restores their original position exactly.
 **Not confirmed in a native GUI:** the updated setting was not exercised across two live cide
 windows. The browser preview used the real UI with the demo backend; the running IDE was not
 restarted.
+
+## M148 — Visual task questions and one response per task
+
+A task in review with an open question previously appeared under both Questions and To accept.
+Questions now take priority in the waiting list, and the store refuses approval or send-back
+while a question is open. Answering records the response, clears the question and returns review
+work to doing (todo without a role) in one revision, before continuing the same conversation.
+Concurrent answers are rejected after the first response; a displayed-question snapshot also
+rejects answers to changed questions.
+
+Agents can supply structured questions with any number of options, stable IDs, required titles,
+optional descriptions and optional images. Single-select is the default; multiple selection and
+custom text, alone or alongside selections, are supported. Image paths resolve from the caller's
+worktree and are copied into task attachments; existing attachment IDs can be reused. String
+questions and text-only responses remain compatible. Structured questions use schema 5 only
+while present; legacy tracker formats remain unchanged.
+
+The shared answer component serves task details and the waiting list, with a wider comparison
+dialog, full-size image viewing, lazy previews, missing-image placeholders and clear selection.
+Failed submissions preserve drafts and selections, and repeated clicks submit once. The kit's
+VisualChoices component uses native radios and checkboxes, with preview actions outside labels.
+
+The waiting list's To accept and Questions groups now toggle by clicking their titles. Both
+start expanded, keep their counts visible when collapsed, and preserve collapsed state across
+board refreshes. Native kit disclosures keep answer and send-back drafts mounted while hidden.
+The mounted UI check verifies independent toggles, reopening, refreshes and draft retention;
+TypeScript and kit checks also pass for this follow-up.
+
+**Verified:** 1,204 IPC/tracker/agent tests and 230 selected app tests pass. App socket tests were
+rerun outside the sandbox after its local-bind restriction. The mounted question UI check covers
+ten renders, 120 choices, single/multiple/custom answers, editing, retries, previews and duplicate
+submission. TypeScript, production UI build, contract/codegen, affected-crate clippy, affected-file
+formatting, agents, kit, selectors, scale, motion, theme, sidebar and command checks pass.
+
+**Remaining checks outside this feature:** the existing agents render check expects `--resume`
+in wording concurrently changed to be harness-neutral; workspace formatting flags concurrent
+command-registry edits. Those edits were left intact. Not visually confirmed in a running IDE
+or on macOS; the running backend was not restarted.

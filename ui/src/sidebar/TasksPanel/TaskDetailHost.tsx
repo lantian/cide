@@ -704,11 +704,10 @@ function TaskDetailHostImpl() {
     <>
     <TaskDetailModal
       /*
-       * Keyed on the task id. Nothing in the card is uncontrolled any more except the comment
-       * composer — and that is precisely what the key is for: half a comment aimed at `t-14`
-       * must not still be in the box when `t-15` opens.
+       * Keyed on project and task. Comment and answer drafts must not carry into a different
+       * task, including a task with the same id in another project.
        */
-      key={open.id}
+      key={`${project}:${open.id}`}
       task={detail}
       milestone={milestone}
       milestoneChoices={milestoneChoices}
@@ -1023,7 +1022,8 @@ function TaskDetailHostImpl() {
       onSetQuestion={(task, question) =>
         guarded(editTask(task, { kind: 'setQuestion', question }))
       }
-      onAnswer={(task, text) => guarded(respondTask(task, { kind: 'answer', text }))}
+      onAnswer={(task, response) => respondTask(task, response)}
+      onRequestQuestionPreview={(task, image) => { if (project !== null) requestPreview(project, task, image) }}
       onAddComment={(task, text, attachments) =>
         // Text alone is a `TaskEdit::Comment`; text with files is one `task_attach` on the
         // `newComment` target, so the comment and its screenshots land together or not at all.

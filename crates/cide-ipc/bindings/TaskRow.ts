@@ -6,6 +6,7 @@ import type { SessionId } from "./SessionId";
 import type { TaskAuthor } from "./TaskAuthor";
 import type { TaskId } from "./TaskId";
 import type { TaskLink } from "./TaskLink";
+import type { TaskQuestion } from "./TaskQuestion";
 import type { TaskStatus } from "./TaskStatus";
 
 /**
@@ -76,7 +77,7 @@ acceptance?: Acceptance,
  * [`Task::question`], on the row because the planner and *Waiting for you* read it across
  * tasks. (M132)
  */
-question?: string, createdBy: TaskAuthor, createdUnixMs: bigint, 
+question?: TaskQuestion, createdBy: TaskAuthor, createdUnixMs: bigint, 
 /**
  * See [`Task::updated_unix_ms`] — the merge tiebreak and the panel's in-group sort key.
  *

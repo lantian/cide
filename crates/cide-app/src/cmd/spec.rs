@@ -414,7 +414,7 @@ pub async fn spec_run_command(
             cide_core::workspace::project(ws, project).map(|project| project.primary_session)
         })
         .map_err(|_| {
-            CoreError::Io("this project has no Claude session to send the command to".into())
+            CoreError::Io("this project has no Harness session to send the command to".into())
         })?;
 
     let registry = app.try_state::<crate::state::SessionRegistry>();
@@ -458,7 +458,7 @@ pub async fn spec_run_command(
             "`{invocation}` was installed into this project after this conversation started, so \
              Claude does not know it yet — Claude Code reads a project's skills once, when it \
              launches. Restart the Claude pane (its bar's Restart, or the palette's *Resume \
-             Claude session*, which keeps the transcript) and press this again."
+             Harness session*, which keeps the transcript) and press this again."
         )));
     }
 
@@ -484,8 +484,8 @@ pub async fn spec_run_command(
 
     let Some(pty) = registry.and_then(|sessions| sessions.get(session)) else {
         return Err(CoreError::Io(format!(
-            "this project's Claude session is not running, so `{line}` has nowhere to go. Open \
-             the project's Claude tab and try again."
+            "this project's Harness session is not running, so `{line}` has nowhere to go. Open \
+             the project's console tab and try again."
         )));
     };
 
@@ -688,7 +688,7 @@ pub async fn spec_propose_for_task(
             cide_core::workspace::project(ws, project).map(|project| project.primary_session)
         })
         .map_err(|_| {
-            CoreError::Io("this project has no Claude session to send the command to".into())
+            CoreError::Io("this project has no Harness session to send the command to".into())
         })?;
     let session = row
         .session
@@ -732,7 +732,7 @@ pub async fn spec_propose_for_task(
             "`{invocation}` was installed into this project after this conversation started, so \
              Claude does not know it yet — Claude Code reads a project's skills once, when it \
              launches. Restart the Claude pane (its bar's Restart, or the palette's *Resume \
-             Claude session*, which keeps the transcript) and press this again."
+             Harness session*, which keeps the transcript) and press this again."
         )));
     }
 
@@ -760,8 +760,8 @@ pub async fn spec_propose_for_task(
     };
     let Some(pty) = registry.and_then(|registry| registry.get(session)) else {
         return Err(CoreError::Io(
-            "this project's Claude session is not running, so the proposal has nowhere to go. \
-             Open the project's Claude tab and try again."
+            "this project's Harness session is not running, so the proposal has nowhere to go. \
+             Open the project's console tab and try again."
                 .into(),
         ));
     };
@@ -906,7 +906,7 @@ pub async fn spec_split_work(
             cide_core::workspace::project(ws, project).map(|project| project.primary_session)
         })
         .map_err(|_| {
-            CoreError::Io("this project has no Claude session to send the split to".into())
+            CoreError::Io("this project has no Harness session to send the split to".into())
         })?;
 
     // The resolved binary, for the same reason `harness::spec_preamble` carries one: `openspec` is
@@ -929,8 +929,8 @@ pub async fn spec_split_work(
         .and_then(|registry| registry.get(session))
     else {
         return Err(CoreError::Io(
-            "this project's Claude tab is not running, so the split has nowhere to go. Open the \
-             project's Claude tab and try again."
+            "this project's console tab is not running, so the split has nowhere to go. Open the \
+             project's console tab and try again."
                 .into(),
         ));
     };

@@ -219,5 +219,5 @@ export function planReveal(boot: BootLike, project: string, pane: string): Revea
     }
   }
 
-  return nothing('that Claude pane has since closed')
+  return nothing('that Harness pane has since closed')
 }

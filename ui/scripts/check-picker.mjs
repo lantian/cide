@@ -108,14 +108,14 @@ try {
   const TABLE = [
     { id: 'pane.split.right', title: 'Split pane right', group: 'Window', keywords: [] },
     { id: 'pane.split.down', title: 'Split pane down', group: 'Window', keywords: [] },
-    { id: 'claude.split.newSession', title: 'Split: new Claude session', group: 'Claude', keywords: [] },
+    { id: 'claude.split.newSession', title: 'Split: new Harness session', group: 'Harness', keywords: [] },
     { id: 'pane.promoteToTab', title: 'Promote pane to full tab', group: 'Window', keywords: [] },
     { id: 'pane.detachToWindow', title: 'Detach pane into window', group: 'Window', keywords: [] },
     { id: 'terminal.splitBelow', title: 'Split terminal below', group: 'Terminal', keywords: [] },
     { id: 'theme.toggle', title: 'Toggle light/dark theme', group: 'View', keywords: [] },
     // Not a seed command. It is here so `new` has a mid-word competitor — without one, the
     // word-start assertion below is satisfied by any implementation that matches at all.
-    { id: 'session.renew', title: 'Renew session', group: 'Claude', keywords: [] },
+    { id: 'session.renew', title: 'Renew session', group: 'Harness', keywords: [] },
   ]
   const ids = (query) => searchCommands(TABLE, query).map((c) => c.id)
 
@@ -125,7 +125,7 @@ try {
 
   // A title prefix must outrank everything else — the criterion `commands.rs` names.
   eq(ids('split')[0], 'pane.split.right', 'a title prefix ranks first')
-  // `Split: new Claude session` also starts with `split`, so both prefix hits come before
+  // `Split: new Harness session` also starts with `split`, so both prefix hits come before
   // `Split terminal below`... which also starts with it. Table order breaks the tie.
   eq(
     ids('split'),
@@ -138,7 +138,7 @@ try {
     'equal scores keep table order',
   )
 
-  // A word-start match beats a mid-word substring. `Split: new Claude session` matches `new`
+  // A word-start match beats a mid-word substring. `Split: new Harness session` matches `new`
   // at a word start (tier 4); `Renew session` matches it inside `Renew` (tier 3).
   // The tail is the subsequence tier — `new` reads out of `Split pa*ne* do*w*n` too — so only
   // the first two positions are the claim being made.
@@ -150,9 +150,10 @@ try {
 
   // Earlier offsets rank first within a tier: `pane` starts at 6 in both `Split pane …`
   // titles, at 7 in `Detach pane into window` and at 8 in `Promote pane to full tab`.
+  // `Split: new Harness session` also matches `pane` as a subsequence, below those title hits.
   eq(
     ids('pane'),
-    ['pane.split.right', 'pane.split.down', 'pane.detachToWindow', 'pane.promoteToTab'],
+    ['pane.split.right', 'pane.split.down', 'pane.detachToWindow', 'pane.promoteToTab', 'claude.split.newSession'],
     'offset orders within a tier',
   )
 
