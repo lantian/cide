@@ -58,7 +58,10 @@ impl Fixture {
         for arg in shell_history::BASH_ARGS {
             spec = spec.arg(arg);
         }
-        for (key, value) in history.env(Some("original env value")) {
+        for (key, value) in history.env(
+            Some("original env value"),
+            Some("printf 'inherited=%s\\n' \"$?\" >> \"$HOME/status\""),
+        ) {
             spec = spec.env(key, value);
         }
         spec
@@ -230,18 +233,19 @@ fn bash_history_preserves_prompt_status_filters_and_login_environment() {
 #[test]
 fn bash_history_preserves_prompt_command_arrays() {
     // Bash 3.2 supports indexed arrays but executes only element zero as PROMPT_COMMAND.
-    // The fixture therefore creates an array only on versions that execute the whole array.
+    // On older versions, the second element must stay unexecuted, including the first prompt.
     let fixture = Fixture::new(
         "if [ \"${BASH_VERSINFO[0]}\" -gt 5 ] || { [ \"${BASH_VERSINFO[0]}\" -eq 5 ] && [ \"${BASH_VERSINFO[1]}\" -ge 1 ]; }; then\n\
            PROMPT_COMMAND=('printf \"first=%s\\n\" \"$?\" >> \"$HOME/status\"' 'printf \"second\\n\" >> \"$HOME/status\"')\n\
            export PROMPT_COMMAND\n\
          else\n\
-           PROMPT_COMMAND='printf \"first=%s\\nsecond\\n\" \"$?\" >> \"$HOME/status\"'\n\
+           PROMPT_COMMAND=('printf \"first=%s\\nsecond\\n\" \"$?\" >> \"$HOME/status\"' 'printf \"UNSUPPORTED_ELEMENT\\n\" >> \"$HOME/status\"')\n\
          fi",
     );
     let history = fixture.history(PaneId::new());
     let mut shell = fixture.spawn(&history);
     shell.command("false");
+    assert!(!read(fixture.0.join("status")).contains("UNSUPPORTED_ELEMENT"));
     assert!(read(fixture.0.join("status")).ends_with("first=1\nsecond\n"));
     assert_eq!(read(&history.history), "false\n");
     shell.session.write(b"exit\n".to_vec());
@@ -251,6 +255,18 @@ fn bash_history_preserves_prompt_command_arrays() {
     }
     assert!(shell.session.exit_status().is_some());
     assert_eq!(read(&history.history), "false\nexit\n");
+}
+
+#[test]
+fn bash_history_preserves_an_inherited_prompt_hook_from_the_first_prompt() {
+    let fixture = Fixture::new("");
+    let history = fixture.history(PaneId::new());
+    let mut shell = fixture.spawn(&history);
+    assert_eq!(read(fixture.0.join("status")), "inherited=0\n");
+    shell.command("false");
+    assert_eq!(read(fixture.0.join("status")), "inherited=0\ninherited=1\n");
+    assert_eq!(read(&history.history), "false\n");
+    shell.terminate();
 }
 
 #[test]

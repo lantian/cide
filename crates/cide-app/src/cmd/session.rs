@@ -1849,11 +1849,20 @@ pub(crate) async fn spawn_session(
                 .find(|(key, _)| key == "ENV")
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("ENV").ok());
+            let original_prompt_command = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PROMPT_COMMAND")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PROMPT_COMMAND").ok());
             spec.args = cide_core::shell_history::BASH_ARGS
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            for (key, value) in history.env(original_env.as_deref()) {
+            for (key, value) in
+                history.env(original_env.as_deref(), original_prompt_command.as_deref())
+            {
                 spec = spec.env(key, value);
             }
         }

@@ -17089,25 +17089,29 @@ stable pane ID into session spawn and use a private history file under the profi
 directory. New panels start empty; restarting a shell, restoring the app or detaching a panel
 keeps the same history identity. Closing a panel does not delete its file.
 
-A Cide-owned initializer runs through Bash's POSIX ENV startup entry, immediately restores
-ordinary Bash mode and the original ENV, and sources the normal login profiles once. It then
-selects the panel history before Bash's automatic load, clearing any global list imported by
-profiles. Existing prompt commands, exit status and history filters are preserved. Modern Bash
-appends before each prompt. Real Bash 3.2.57 testing exposed its strict history -a counter check:
+A Cide-owned initializer runs through the first PROMPT_COMMAND in a login shell with automatic
+profile loading disabled, restores ordinary Bash mode and the original ENV, and sources the
+normal login profiles once. It then reloads the panel history, clearing any global list imported
+by profiles. Existing prompt commands, including inherited hooks and the first prompt, exit
+status and history filters are preserved. Modern Bash appends before each prompt. Real Bash
+3.2.57 testing exposed its strict history -a counter check:
 an entirely new panel's entries were never appended. That version instead rewrites its bounded
 history list and synchronizes the history-file cursor without importing its own snapshot, with
 normal exit also using overwrite mode. A readonly global HISTFILE is refused without clearing
 or overwriting the global file. Direct programs, agent consoles and container sessions keep
 their existing launch paths; callers without pane identity remain compatible.
 
-**Verified:** four real-PTY regressions pass on both system Bash and GNU Bash 3.2.57 built in
+**Verified:** five real-PTY regressions pass on both system Bash and GNU Bash 3.2.57 built in
 /tmp on Linux: independent Up-arrow recall after forced termination, persistence before exit,
 repeated commands without snapshot duplication, scalar/exported-array prompt hooks, filters,
 login profiles, original ENV, nested-shell cleanup, normal exit and readonly-file refusal.
 Private storage/reuse tests, 48 session-command tests, 74 PTY tests, TypeScript, terminal input,
 exit/awaiting/attach/key/format checks, contract and generated bindings pass. Core clippy and
-formatting of the affected Rust sources pass. The existing settings launch preview also needed
-its missing default resume-picker field to allow the app test runner to compile.
+formatting of the affected Rust sources pass. macOS CI exposed Apple's startup change that
+shadows POSIX mode and bypasses ENV; a Linux Bash 3.2 build with that source change reproduced
+all four failures before the fix and passes the history regressions afterward. The existing
+settings launch preview also needed its missing default resume-picker field to allow the app
+test runner to compile.
 
 **Not confirmed in a running GUI or on macOS:** no live IDE was restarted. Previously lost
 panel commands cannot be recovered; panels without a saved file begin empty.

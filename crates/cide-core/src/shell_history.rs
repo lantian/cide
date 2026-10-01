@@ -1,9 +1,10 @@
 //! A shell pane's command history survives its child. Screen replay cannot restore Readline's
 //! history, and a new Bash otherwise reads the shared `~/.bash_history` on every app launch.
 //!
-//! The initializer uses Bash's POSIX `ENV` startup entry to run in a real interactive login
-//! shell. It turns POSIX mode off before sourcing the normal login profiles, then selects the
-//! pane file before Bash's automatic history load. No user startup file is edited.
+//! The initializer runs through the first `PROMPT_COMMAND` in an interactive login shell whose
+//! automatic profile loading is disabled. It sources the normal login profiles, then reloads
+//! the pane history. Apple's Bash bypasses the POSIX `ENV` startup entry, so that entry cannot
+//! be used to install the hook. No user startup file is edited.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use cide_ipc::PaneId;
 
 use crate::{Result, persist};
 
-pub const BASH_ARGS: [&str; 3] = ["--login", "--posix", "-i"];
+pub const BASH_ARGS: [&str; 3] = ["--login", "--noprofile", "-i"];
 const INIT: &str = include_str!("bash_history.sh");
 
 pub struct HistoryFiles {
@@ -67,12 +68,23 @@ pub fn prepare_in(dir: &Path, pane: PaneId) -> Result<HistoryFiles> {
 }
 
 impl HistoryFiles {
-    /// Save `ENV` before using it for this one startup; it is restored before user profiles run.
-    pub fn env(&self, original_env: Option<&str>) -> Vec<(String, String)> {
+    /// Bootstrap before the first prompt; user profiles install the subsequent prompt hooks.
+    pub fn env(
+        &self,
+        original_env: Option<&str>,
+        original_prompt_command: Option<&str>,
+    ) -> Vec<(String, String)> {
         vec![
-            // ENV itself is shell-expanded at startup. Expand a variable once so a directory
-            // containing `$`, backticks or quotes remains a literal path.
-            ("ENV".into(), "${_CIDE_BASH_INIT_FILE}".into()),
+            // Expand a quoted variable once so special characters in the path stay literal.
+            (
+                "PROMPT_COMMAND".into(),
+                "builtin source \"$_CIDE_BASH_INIT_FILE\"".into(),
+            ),
+            // Bash loads history before the first prompt, before our initializer runs.
+            (
+                "HISTFILE".into(),
+                self.history.to_string_lossy().into_owned(),
+            ),
             (
                 "_CIDE_BASH_INIT_FILE".into(),
                 self.init.to_string_lossy().into_owned(),
@@ -88,6 +100,19 @@ impl HistoryFiles {
             (
                 "_CIDE_BASH_ORIGINAL_ENV".into(),
                 original_env.unwrap_or_default().into(),
+            ),
+            (
+                "_CIDE_BASH_PROMPT_COMMAND_WAS_SET".into(),
+                if original_prompt_command.is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
+            (
+                "_CIDE_BASH_ORIGINAL_PROMPT_COMMAND".into(),
+                original_prompt_command.unwrap_or_default().into(),
             ),
         ]
     }

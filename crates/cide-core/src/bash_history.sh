@@ -1,6 +1,14 @@
-# Sourced by Bash's ENV startup entry. Bash is interactive and a login shell, but POSIX mode
-# must be off before any normal profile sees it. This script stays compatible with Bash 3.2.
+# Sourced by the first PROMPT_COMMAND with automatic login profiles disabled. Apple's Bash
+# bypasses the POSIX ENV entry. Run profiles ourselves before installing their prompt hooks.
+# This script stays compatible with Bash 3.2.
 set +o posix
+# Replace the bootstrap with the inherited hook before profiles inspect or extend it.
+if [ "$_CIDE_BASH_PROMPT_COMMAND_WAS_SET" = 1 ]; then
+    PROMPT_COMMAND=$_CIDE_BASH_ORIGINAL_PROMPT_COMMAND
+else
+    unset PROMPT_COMMAND
+fi
+unset _CIDE_BASH_PROMPT_COMMAND_WAS_SET _CIDE_BASH_ORIGINAL_PROMPT_COMMAND
 _cide_bash_history_path=$_CIDE_BASH_HISTORY_FILE
 export -n _cide_bash_history_path
 if [ "$_CIDE_BASH_ENV_WAS_SET" = 1 ]; then
@@ -23,8 +31,8 @@ for _cide_bash_profile in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.prof
 done
 unset _cide_bash_profile
 
-# Profiles may reset HISTFILE or read shared history. Discard that list; Bash automatically
-# loads the selected pane file after this startup script returns, so do not history -r here.
+# Bash already loaded history before the first prompt. Profiles may reset HISTFILE or import
+# shared history, so discard that list and reload only the selected pane file.
 builtin history -c
 if ! builtin export "HISTFILE=$_cide_bash_history_path"; then
     printf '%s\n' 'cide: cannot select this panel history file (HISTFILE is readonly)' >&2
@@ -32,6 +40,7 @@ if ! builtin export "HISTFILE=$_cide_bash_history_path"; then
     set +o history
     exit 1
 fi
+builtin history -r "$_cide_bash_history_path"
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
     shopt -u histappend
 else
@@ -83,3 +92,18 @@ _cide_bash_history_flush'
 fi
 # Nested shells must not inherit Cide hook calls without their unexported helper functions.
 export -n HISTFILE PROMPT_COMMAND
+
+# The first prompt called the bootstrap instead of the user's hooks. Run the installed hooks
+# now too, respecting the version's array behavior, so the first prompt is ready for input.
+if [ "${BASH_VERSINFO[0]}" -gt 5 ] || {
+    [ "${BASH_VERSINFO[0]}" -eq 5 ] && [ "${BASH_VERSINFO[1]}" -ge 1 ];
+}; then
+    for _cide_bash_prompt_command in "${PROMPT_COMMAND[@]}"; do
+        builtin eval "$_cide_bash_prompt_command"
+    done
+    unset _cide_bash_prompt_command
+else
+    # The failed version test is not a command the user ran; start the first prompt at zero.
+    :
+    builtin eval "${PROMPT_COMMAND-}"
+fi
