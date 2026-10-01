@@ -45,19 +45,17 @@ pnpm --dir ui install     # once
 
 ## Checking it
 
-Everything CI runs, in CI's order:
+Run the full shared CI suite before pushing code changes:
 
 ```sh
-cargo fmt --all --check
-cargo --locked xtask contract-check
-cargo build --locked --workspace
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo --locked xtask codegen --check
-pnpm --dir ui exec tsc --noEmit
-pnpm --dir ui run check:<name>          # every check:* script in ui/package.json
-pnpm --dir ui build
+./test.sh                    # every CI check for this host, reporting all failures
+./test.sh --list             # command inventory without running checks
+./test.sh --only rust        # quick iteration; other groups: ui, no-tauri, shell, fork-pins, macos
 ```
+
+CI invokes this same runner. It keeps full logs in `target/ci-checks/`, enumerates UI checks,
+and runs Rust tests with `--no-fail-fast`. A scoped run is useful while editing; report any
+remaining failures before pushing. A Linux run does not validate macOS-specific behavior.
 
 - One Rust test: `cargo test -p cide-git branches`. Keep `--locked`; global flags lead the
   `xtask` alias: `cargo --locked xtask codegen`.

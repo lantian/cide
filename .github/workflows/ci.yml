@@ -65,65 +65,17 @@ jobs:
         with:
           cache: "false"
 
-      - name: Assert only cide-app links tauri
-        run: |
-          set -euo pipefail
+      - name: Run shared no-tauri checks
+        run: ./test.sh --only no-tauri
 
-          # Crate names only. `--prefix none` drops the tree glyphs and awk keeps the name
-          # field, so the pattern never sees the checkout path — the earlier version of
-          # this job grepped the raw tree, which also contains every crate's directory, and
-          # a clone into a path with "tauri" in it would have failed the whole workspace.
-          # --no-dedupe because a deduplicated tree prints "(*)" in place of a repeated
-          # subtree, and the elided listing can be the one that names tauri.
-          # dev edges are included on purpose: a tauri dev-dependency still means the
-          # crate's tests only run where the webview stack is installed.
-          #
-          # `cargo tree` runs on its own line, not as the head of the piped grep: the
-          # trailing `|| true` (there so "no match" is not a failure) would otherwise also
-          # swallow a cargo that failed outright — a stale Cargo.lock under --locked, a
-          # renamed package — and hand back an empty result that reads as "clean".
-          webview_deps() {
-            local tree
-            tree="$(cargo tree --locked -p "$1" --edges normal,build,dev --prefix none --no-dedupe)"
-            awk '{print $1}' <<<"$tree" | sort -u | grep -E '^(tauri|wry|tao)(-|$)' || true
-          }
-
-          # Positive control, and the reason this job is not vacuous. Every assertion below
-          # is a grep for something that must NOT be there, so a detector that has quietly
-          # stopped detecting — a cargo tree flag that changed meaning, an output shape that
-          # no longer parses — reports every crate as clean and goes green forever. cide-app
-          # is the one crate that MUST match. If it does not, the detector is broken, and
-          # that is a failure rather than a pass.
-          if [ -z "$(webview_deps cide-app)" ]; then
-            echo '::error file=.github/workflows/ci.yml::the webview detector matched nothing in cide-app, the one crate that links tauri by definition. cargo tree output no longer parses this way, so every other crate would come back clean and this job would assert nothing. Fix the detector before trusting a green run.'
-            exit 1
-          fi
-
-          # Enumerated from cargo metadata rather than listed here, for the same reason the
-          # ui job enumerates its check:* scripts: a hardcoded list stops covering a crate
-          # the moment someone adds one, and does it silently.
-          members="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,os,sys; md=json.load(sys.stdin); print("\n".join(p["name"] + " " + os.path.relpath(p["manifest_path"], md["workspace_root"]) for p in md["packages"]))')"
-
-          checked=0
-          violations=""
-          while read -r name manifest; do
-            [ -n "$name" ] || continue
-            if [ "$name" = cide-app ]; then
-              continue
-            fi
-            checked=$((checked + 1))
-            found="$(webview_deps "$name")"
-            if [ -n "$found" ]; then
-              violations="$violations $name"
-              echo "::error file=$manifest::$name pulls in the webview stack: $(tr '\n' ' ' <<<"$found")"
-            fi
-          done <<<"$members"
-
-          if [ -n "$violations" ]; then
-            echo "::error::Only cide-app may depend on tauri. Offenders:$violations. Move the logic into a domain crate instead of reaching for an app handle."
-            exit 1
-          fi
-          echo "ok: $checked workspace members checked, tauri confined to cide-app"
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-no-tauri
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------------
   # Every shell script still runs on macOS's bash.
@@ -146,8 +98,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: No script needs a bash newer than macOS ships
-        run: ./scripts/check-bash32.sh
+      - name: Run shared shell checks
+        run: ./test.sh --only shell
+
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-shell
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------------
   # Rust: build, test, lint, format, and the two xtask gates.
@@ -185,59 +146,19 @@ jobs:
         with:
           cache-key: rust
 
-      # First, because it needs no compilation at all: a run that is going to fail on
-      # formatting should say so in thirty seconds rather than after the webview stack.
-      - name: cargo fmt --all --check
-        run: cargo fmt --all --check
+      # The same commands as a local full run, including --no-fail-fast so a failed test
+      # binary does not conceal the failures in other packages. Ignored tests stay ignored.
+      - name: Run shared rust checks
+        run: ./test.sh --only rust
 
-      # `--locked` on every cargo invocation below, for the reason `--frozen-lockfile` is
-      # on the pnpm install: without it a Cargo.toml requirement that never reached
-      # Cargo.lock is not an error, it is a silent re-resolution, and CI reports green for
-      # a dependency graph no developer has. This is the same drift class the whole file
-      # exists to catch, and the frontend half was already guarded against it.
-      #
-      # `cargo --locked xtask ...` rather than `cargo xtask --locked ...`: xtask is a cargo
-      # alias for `run --quiet --package xtask --`, so a flag after `xtask` is an argument
-      # to the xtask binary. The global flag has to lead.
-      #
-      # `contract-check` only parses crates/cide-app/src/{lib,emit}.rs and diffs the
-      # command and event surface against contract/*.json, so it is nearly free and runs
-      # before the expensive steps.
-      - name: cargo --locked xtask contract-check
-        run: cargo --locked xtask contract-check
-
-      # No ui/dist is built for this. tauri-codegen only embeds frontendDist when the
-      # `custom-protocol` feature is on (that is `tauri build`); a plain cargo build sees
-      # dev_url instead and embeds nothing. Building the frontend here to satisfy a
-      # requirement that does not apply would put a pnpm install in front of every Rust
-      # step. The ui job builds ui/dist and proves it builds.
-      - name: cargo build --locked --workspace
-        run: cargo build --locked --workspace
-
-      # `--ignored` is deliberately NOT passed, and must not be added.
-      #
-      # Most of the ignored set — cide-claude's real_headless and real_hooks, cide-ide-mcp's
-      # real_cli and its one in-crate server test — spawns the real `claude` binary. They
-      # need it installed on PATH, a logged-in Anthropic account, network access, and they
-      # consume the developer's own API quota. A CI runner has none of the first three and
-      # has no business spending the last.
-      #
-      # The remainder is cide-pty's throughput soak, ignored because it moves 1 GiB through
-      # the mirror; it needs nothing CI lacks, only minutes CI should not spend on every
-      # push. Run any of them by hand: `cargo test --workspace -- --ignored`.
-      - name: cargo test --locked --workspace
-        run: cargo test --locked --workspace
-
-      - name: cargo clippy --locked --workspace --all-targets -- -D warnings
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      # Last of the Rust steps because it shells out to `cargo test -p cide-ipc` to
-      # regenerate the ts-rs bindings before diffing them against ui/src/ipc/generated.ts —
-      # cheap only once the test binaries above are already built. A Rust field rename that
-      # never reached the generated TypeScript fails here instead of surfacing as an
-      # `undefined` in the webview at runtime.
-      - name: cargo --locked xtask codegen --check
-        run: cargo --locked xtask codegen --check
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-rust
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------------
   # Frontend: typecheck, the project's own check:* harness, and the production build.
@@ -265,55 +186,18 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
 
-      # --frozen-lockfile so a dependency that drifted from the lockfile is a failure and
-      # not a silent resolution. Nearly every version in ui/package.json is pinned exactly
-      # to make that determinism cheap; `@tauri-apps/plugin-dialog` is the one caret left,
-      # and the lockfile is what holds it still.
-      - name: pnpm install
-        working-directory: ui
-        run: pnpm install --frozen-lockfile
+      # Installs with --frozen-lockfile, enumerates every check:* in package.json, and builds.
+      - name: Run shared ui checks
+        run: ./test.sh --only ui
 
-      # `pnpm build` runs `tsc --noEmit` itself. This step is separate anyway so that a
-      # type error is reported as a type error, in its own annotation, rather than as a
-      # failed build several minutes into vite.
-      - name: pnpm exec tsc --noEmit
-        run: pnpm --dir ui exec tsc --noEmit
-
-      # This project has no JS test runner — the check:* scripts are the frontend's test
-      # suite. They compile the modules under test with the TypeScript already in
-      # node_modules and exercise the output, so they need `pnpm install` but not a build.
-      #
-      # Enumerated from package.json instead of listed here. A hardcoded list stops
-      # covering a check the moment someone adds `check:whatever`, and does it silently —
-      # the exact failure mode this whole file exists to end.
-      - name: Run every ui check:* script
-        shell: bash
-        run: |
-          set -euo pipefail
-          scripts="$(node -p "Object.keys(require('./ui/package.json').scripts ?? {}).filter(s => s.startsWith('check:')).join(' ')")"
-          if [ -z "$scripts" ]; then
-            echo "::error file=ui/package.json::no check:* scripts found. They are the frontend's only test suite — if they were renamed, this enumeration needs to follow them; if they were deleted, that should be a deliberate commit."
-            exit 1
-          fi
-          echo "found $(wc -w <<<"$scripts") check scripts: $scripts"
-          failed=""
-          for s in $scripts; do
-            echo "::group::pnpm --dir ui run $s"
-            # Every check runs even after one fails: they cover unrelated subsystems
-            # (key gate, git render, picker scoring) and stopping at the first hides the
-            # rest of the damage for a whole round trip.
-            if ! pnpm --dir ui run "$s"; then
-              failed="$failed $s"
-            fi
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then
-            echo "::error::failing ui checks:$failed"
-            exit 1
-          fi
-
-      - name: pnpm build
-        run: pnpm --dir ui build
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-ui
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------------
   # macOS: does the workspace still compile, pass its tests and lint clean on a Mac?
@@ -371,29 +255,19 @@ jobs:
         with:
           cache-key: macos
 
-      # Formatting is host independent and the rust job already gates it, but it costs
-      # seconds here and a `cfg`-gated block that only this job compiles is exactly the kind
-      # of code that gets committed unformatted.
-      - name: cargo fmt --all --check
-        run: cargo fmt --all --check
+      # Native macOS formatting, build, all tests and clippy. The platform-independent
+      # contract and codegen gates are covered by the rust job.
+      - name: Run shared macos checks
+        run: ./test.sh --only macos
 
-      - name: cargo build --locked --workspace
-        run: cargo build --locked --workspace
-
-      # `--ignored` is deliberately not passed, for the reasons the rust job spells out.
-      #
-      # Expect failures here that are about the *test*, not about the product: several assert
-      # against `/bin/sh` behaviour, `/proc`, or a Linux path layout. Each one is a decision to
-      # make — gate the test on the platform, or fix what it found — and neither should be
-      # made by deleting the assertion.
-      - name: cargo test --locked --workspace
-        run: cargo test --locked --workspace
-
-      # The step most likely to find something real. Every `#[cfg(not(target_os = "linux"))]`
-      # arm in this workspace is compiled for the first time here, and an unused import or an
-      # unreachable branch inside one is invisible on Linux.
-      - name: cargo clippy --locked --workspace --all-targets -- -D warnings
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-macos
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------------
   # The fork pins, checked for reachability and nothing else.
@@ -418,39 +292,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Every pin resolves in the repository its lock names
-        run: |
-          set -euo pipefail
+      - name: Run shared fork-pins checks
+        run: ./test.sh --only fork-pins
 
-          # Sourced, not parsed: these files are the shell-sourceable subset on purpose, and
-          # release.yml reads them exactly this way. Each lock uses its own key names so one
-          # shell can hold all three without a later source clobbering an earlier pin.
-          . packaging/rust-analyzer.lock
-          . packaging/salsa.lock
-          . packaging/gopls.lock
-
-          failed=""
-          check() {
-            local what="$1" url="$2" rev="$3"
-            # One line for a tag, one for a branch; zero is the answer that matters. Not two:
-            # `ls-remote <url> <pattern>` tail-matches ref *names*, and an annotated tag's
-            # peeled `refs/tags/X^{}` line does not match the pattern `X` — so this sees the
-            # tag object and never its commit, which is all a reachability check needs.
-            # A bare commit id matches only when the server advertises it, which is why the
-            # locks prefer tags: a 40-hex pin that resolves locally can be unreachable here.
-            if [ -z "$(git ls-remote "$url" "$rev" 2>/dev/null)" ]; then
-              echo "::error file=packaging/$what.lock::$rev does not resolve in $url. A release run fetches exactly this revision with a depth-1 fetch and would fail there instead."
-              failed="$failed $what"
-            else
-              echo "ok: $what -> $url @ $rev"
-            fi
-          }
-
-          check rust-analyzer "$CIDE_RA_URL" "$CIDE_RA_REV"
-          check salsa "$CIDE_SALSA_URL" "$CIDE_SALSA_REV"
-          check gopls "$CIDE_GOPLS_URL" "$CIDE_GOPLS_REV"
-
-          if [ -n "$failed" ]; then
-            echo "::error::unreachable fork pins:$failed. Push the tag the lock names, or move the lock to a revision that exists."
-            exit 1
-          fi
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-fork-pins
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -8,7 +8,8 @@ Everything needed to build, run and check cide. For what cide *is*, see
 ## Prerequisites
 
 - **Rust 1.92.0** — pinned in `rust-toolchain.toml`, so `rustup` picks it up automatically.
-- **Node and pnpm** for the frontend.
+- **Node 22 and pnpm 9.15.4** for the frontend, matching CI.
+- **Python 3** and **Git** for the structural and runner checks.
 - **WebKitGTK 4.1 and GTK 3.** On Debian/Ubuntu:
 
   ```sh
@@ -164,19 +165,25 @@ problem.
 
 ## Checking it
 
-Everything CI runs, in CI's order:
+Run the full CI suite before pushing:
 
 ```sh
-cargo fmt --all --check
-cargo --locked xtask contract-check
-cargo build --locked --workspace
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo --locked xtask codegen --check
-pnpm --dir ui exec tsc --noEmit
-pnpm --dir ui run check:<name>          # every check:* script in ui/package.json
-pnpm --dir ui build
+./test.sh                    # all CI checks for this host
+./test.sh --list             # print the commands without running them
+./test.sh --only rust        # one CI job; also ui, no-tauri, shell, fork-pins, macos
 ```
+
+CI calls the same script, so its command list cannot drift from the local one. A full run
+includes shell portability, the Tauri dependency boundary, Rust formatting/build/tests/clippy,
+contract and generated bindings, frozen UI dependency installation, TypeScript, every
+`check:*` script, the UI build, and remote fork-pin checks. It continues after independent
+failures and summarizes them all, with complete output and `results.tsv` under
+`target/ci-checks/run-*/`. Rust tests use `--no-fail-fast`, so one failed test binary does not
+hide the rest of the workspace. CI uploads these logs as job artifacts.
+
+This runs the native host's tests. Run it on macOS to exercise macOS's system Bash, Git,
+filesystem and target-specific Rust code; a green Linux run cannot establish that those pass.
+The script does not install OS packages or change the machine's default Rust toolchain.
 
 - **One Rust test:** `cargo test -p cide-git branches`. `--locked` matters — a re-resolved
   lockfile is the drift class CI exists to catch. `cargo xtask` is a `.cargo/config.toml` alias,
