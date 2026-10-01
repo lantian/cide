@@ -334,41 +334,46 @@
 }
 
 /*
- * "This session has finished and is waiting for you."
- *
- * The pane-level surface, and until now there was none: `data-awaiting` was set on the
- * *cluster*, so nothing could paint the panel and the whole signal was the 7px dot at the end
- * of that cluster. The request was for the console to be **highlighted**. A dot in the corner
- * of a full-screen terminal is not a highlight, and it is invisible at the distance a user is
- * standing when the point of the feature is that they walked away.
- *
- * This is a colour change on a border that is already there, in both focus states, precisely
- * so it can change colour without resizing the content box (see the note at the top of this
- * file). No reflow, no terminal refit, no extra element — which is also why the border, and
- * not a background tint or a glow: a tint would sit under an opaque terminal and be invisible,
- * and an `inset` box-shadow paints on the frame's own background layer and would be covered by
- * the same terminal. This is the same reason `.frameFocused::after` is a pseudo-element.
- *
- * `--yellow`, not `--accent`. The accent is this app's *here you are* and is spoken for; amber
- * means *come back here*, and a mark that used the same colour as the focus ring would be
- * unreadable in the state that matters most.
- *
- * # Both states at once is the common case, not the edge case
- *
- * A pane is `focused` because the *domain* says so — `tree.focused` — which has nothing to do
- * with whether anyone is at the machine. The situation this feature exists for is precisely
- * "the user walked away with a Claude pane focused and its turn has now ended", so focused and
- * awaiting together is the normal shape of a waiting pane, not a collision to resolve.
- *
- * It resolves itself, and pleasantly. This selector is a class *and* an attribute, so it
- * outranks `.frameFocused` and takes the outer border amber — while `.frameFocused::after`
- * is untouched and keeps drawing its 1px accent ring immediately inside. The user gets an
- * amber edge that says come back and, within it, the ring that says this is where you were.
- * Nothing was traded away, which is why there is no `:not()` here and must not be one: adding
- * it would make a focused pane silently stop reporting.
+ * The global attention style paints above the opaque terminal without changing its box.
+ * Keep the existing focus ring: waiting and focused are independent states. The badge
+ * supplies the meaning even when both marks use the user's chosen accent.
  */
-.frame[data-awaiting='true'] {
-  border-color: var(--yellow);
+.frame[data-awaiting='true']::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.frame[data-awaiting='true'][data-awaiting-highlight='accentRail']::before {
+  border-left: calc(3px * var(--ui-scale)) solid var(--accent);
+}
+
+.frame[data-awaiting='true'][data-awaiting-highlight='tintedHeader']::before {
+  bottom: auto;
+  height: min(var(--h-panetitle), 100%);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.frame[data-awaiting='true'][data-awaiting-highlight='paneOutline']::before {
+  border: calc(3px * var(--ui-scale)) solid var(--accent);
+}
+
+/* The badge lives in the cluster after its controls, outside their hover reveal. Its flex
+ * slot exists only while waiting, so the controls move left for it and return to the corner
+ * when it disappears. It reserves no terminal rows and cannot intercept input.
+ */
+.attentionLabel {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: var(--sp-2);
+  font-family: var(--font-ui);
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .body {
@@ -683,21 +688,9 @@
 
 
 /*
- * "This session has finished and is waiting for you."
- *
- * The one thing in the cluster that does **not** hide with the rest, and the reason is the
- * whole point of it: it says a pane you are *not* looking at wants you back, so a marker that
- * appeared only when you hovered that pane would be a notification you can see only after you
- * have already gone to look.
- *
- * Last in the flex row, so it is the child anchored to the corner. The cluster is
- * right-aligned and out of flow, so the box that grows and shrinks in front of it — a title
- * of any length, four buttons or three — moves leftwards and never moves the dot.
- *
- * The space is still reserved when the marker is off. Nothing reflows any more (this box is
- * out of flow entirely, which is what the old bar's version of this comment was defending
- * against), but a marker that arrived mid-hover would shift every button 17px right — 7px of
- * dot plus its 6px and 4px margins — under a pointer already aiming at one.
+ * The corner dot, outside the controls' hover reveal and beside the Waiting badge.
+ * Its 17px slot remains reserved while off; only the badge's slot is conditional.
+ * Both marks read the same state, and the dot supplies the accessible status and tooltip.
  */
 .marker {
   flex: none;
@@ -710,30 +703,12 @@
   pointer-events: none;
 }
 
-/*
- * `--yellow` rather than `--accent`, and it carries both themes without a second rule.
- *
- * The accent is this app's "here you are" colour — the focus ring, the active tab, the
- * pressed toggle — and it is already on the frame of the pane the user is looking at. A
- * marker meaning "come back to *this* one" has to read as different from that at a glance in
- * a window holding six panes, or it is one more accent dot in a bar full of them.
- *
- * `--yellow` is one of the six tokens `tokens.css` pitches per theme *as a text colour*: a
- * dark amber (#8a5a00) on the light theme's near-white chrome, a light amber (#dfae68) on
- * dark. Both are legible against their own `--panel` without this file knowing which theme
- * it is in, which is exactly what a token is for. The 1px halo is in `--panel` — the pane's
- * background, not the vanished bar's — because what this dot now sits on is whatever the
- * terminal last painted, and the halo is what keeps its edge crisp against it. The soft outer
- * glow is what makes a 7px dot findable across a wide window without making it large enough
- * to have to reserve more space.
- *
- * Live to the pointer, unlike the empty marker, so its tooltip can explain itself.
- */
+/* The corner marker follows the same user-selected accent as the pane-wide mark. */
 .markerOn {
-  background: var(--yellow);
+  background: var(--accent);
   box-shadow:
     0 0 0 1px var(--panel),
-    0 0 4px var(--yellow);
+    0 0 4px var(--accent);
   pointer-events: auto;
 }
 

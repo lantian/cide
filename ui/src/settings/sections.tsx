@@ -33,6 +33,7 @@ import type {
   ClaudeSettings,
   CodexCliSupport,
   ConsoleHarness,
+  AwaitingHighlight,
   EditorSettings,
   ExplorerSettings,
   GitSettings,
@@ -296,6 +297,12 @@ const RENDERERS: readonly { value: TerminalRenderer; label: string }[] = [
   { value: 'dom', label: 'DOM' },
 ]
 
+const AWAITING_HIGHLIGHTS: readonly { value: AwaitingHighlight; label: string }[] = [
+  { value: 'accentRail', label: 'Accent rail' },
+  { value: 'tintedHeader', label: 'Tinted header' },
+  { value: 'paneOutline', label: 'Pane outline' },
+]
+
 function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: SectionProps) {
   const def = useSettingsDefaults()
   return (
@@ -321,6 +328,22 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
         <ColorSchemeRow theme={settings.theme} editor={settings.editor} patch={patch} />
         {/* After the scheme rather than between it and Theme, which are a pair (above). */}
         <AccentRow accent={settings.accent} />
+        <Row
+          label="Waiting pane highlight"
+          hint="Use the accent colour to show which pane is waiting for you. Applies to all projects."
+          info="Accent rail marks the left edge; tinted header adds a wash across the top; pane outline marks every edge. Each style includes a Waiting badge and applies immediately in every window. The highlight clears when you interact with the pane."
+          {...resetTo(settings.awaitingHighlight, def?.awaitingHighlight, (awaitingHighlight) =>
+            patch({ awaitingHighlight }),
+          )}
+          control={
+            <Segmented
+              label="Waiting pane highlight"
+              value={settings.awaitingHighlight}
+              options={AWAITING_HIGHLIGHTS}
+              onChange={(awaitingHighlight) => patch({ awaitingHighlight })}
+            />
+          }
+        />
         <Row
           label="UI font size"
           hint="Everything but the editor and the terminal."

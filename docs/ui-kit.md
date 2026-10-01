@@ -255,6 +255,11 @@ you" (an awaiting-input counter, an unsaved dot). **One exception, the user's ca
 project tab, wears `--accent`, so it matches the colour chosen in Settings. It is a bare glyph
 with a dim figure beside it, never a filled chip, so it does not read as a failure badge.
 
+Waiting session panes also use the chosen accent (2026-10-01): Settings → Appearance →
+Waiting pane highlight selects an accent rail, tinted header or pane outline globally.
+Each pairs its pane-wide mark with an accent `Badge` saying **Waiting**, independently
+of keyboard focus and the floating controls' hover state.
+
 - **`Badge`**: a state someone else named, filled with the tone's gradient. Use `dot` for a state
   (pipeline, job) and `squared` for a kind (MR state, severity). `soft` draws the quiet form (the
   hue on a 12% wash) for a badge repeated down a long list.

@@ -269,6 +269,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         theme,
         ui_font_size,
         accent,
+        awaiting_highlight,
         each_project_keeps_claude_tab,
         reopen_last_project,
         keep_sessions_on_window_close,
@@ -296,6 +297,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // springs back on the next snapshot. This way the compiler names the omission.
     if let Some(v) = theme {
         settings.theme = v;
+    }
+    if let Some(v) = awaiting_highlight {
+        settings.awaiting_highlight = v;
     }
     // Clamped for the two code sizes' reason below, and one more of its own: this number is a
     // *divisor* by the time CSS sees it, so a `NaN` does not merely paint something odd — it
@@ -1908,6 +1912,38 @@ mod tests {
         assert_eq!(
             serde_json::to_value(settings.open_run_in).expect("json"),
             serde_json::json!("split")
+        );
+    }
+
+    #[test]
+    fn waiting_highlight_loads_legacy_settings_and_persists_every_style() {
+        use cide_ipc::AwaitingHighlight;
+
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"theme":"dark","terminal":{"fontSize":17}}"#)
+                .expect("legacy settings");
+        assert_eq!(settings.awaiting_highlight, AwaitingHighlight::AccentRail);
+        for style in [
+            AwaitingHighlight::AccentRail,
+            AwaitingHighlight::TintedHeader,
+            AwaitingHighlight::PaneOutline,
+        ] {
+            apply_patch(
+                &mut settings,
+                SettingsPatch {
+                    awaiting_highlight: Some(style),
+                    ..SettingsPatch::default()
+                },
+            );
+            apply_patch(&mut settings, SettingsPatch::default());
+            let saved = serde_json::to_string(&settings).expect("save");
+            settings = serde_json::from_str(&saved).expect("reload");
+            assert_eq!(settings.awaiting_highlight, style);
+            assert_eq!(settings.theme, cide_ipc::Theme::Dark);
+            assert_eq!(settings.terminal.font_size, 17.0);
+        }
+        assert!(
+            serde_json::from_str::<SettingsPatch>(r#"{"awaitingHighlight":"unknown"}"#).is_err()
         );
     }
 

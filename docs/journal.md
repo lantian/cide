@@ -17180,3 +17180,31 @@ DOM clicks on both recovery choices. The application executable was rebuilt.
 **Not confirmed in a running GUI:** a native close/relaunch and live Codex session selection
 were not exercised. Recovery cannot infer the historical thread of a pane that already lost
 its id; the user must select it once.
+
+## M147 — Global waiting-pane highlight styles
+
+The corner's amber dot was difficult to locate among several console panes and did not follow
+the chosen accent. Settings → Appearance → **Waiting pane highlight** now offers **Accent rail**
+(the default), **Tinted header**, and **Pane outline**. The preference is stored with the global
+workspace settings, broadcast to every window, searchable in Settings, resettable, and exposed
+through `cide_settings` as `awaitingHighlight`.
+
+Every style uses the user's accent and includes a visible **Waiting** kit badge to the right
+of the floating controls. Its slot exists only while waiting: the controls move left for the
+badge, then return to the corner when it disappears. The corner dot follows the same accent.
+The marks overlay the terminal without resizing it, remain visible independently of hover
+and keyboard focus, and follow the
+existing acknowledgment rule. The badge clips inside narrow panes; attention overlays retain
+their shape on chrome-flush edges. Legacy settings default to the rail.
+
+**Verified:** 35 app settings tests, 33 agent settings tests, legacy loading and persistence of
+all three choices, TypeScript, production frontend build, application build, contract/codegen,
+and the affected pane, appearance, Settings and kit checks. A temporary headless Chromium
+preview exercised all three styles in both themes, a custom accent, a tiny pane, and clicks
+through every setting option using the demo backend's settings round trip.
+The badge placement follow-up verified that it sits after the controls and moves them left
+only while waiting; clearing the state restores their original position exactly.
+
+**Not confirmed in a native GUI:** the updated setting was not exercised across two live cide
+windows. The browser preview used the real UI with the demo backend; the running IDE was not
+restarted.

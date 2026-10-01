@@ -71,6 +71,11 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "Each project keeps its own pinned, non-closable Claude tab. Read-only true today.",
     ),
     doc(
+        "awaitingHighlight",
+        "enum accentRail | tintedHeader | paneOutline",
+        "How panes waiting for you are highlighted in the accent colour. Applies across projects and windows.",
+    ),
+    doc(
         "reopenLastProject",
         "bool",
         "Reopen the last project on launch, with its tab strip and pane layout.",

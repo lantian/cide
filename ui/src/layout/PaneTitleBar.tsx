@@ -81,6 +81,7 @@ import { focusPaneDom } from '@/panes/paneFocus'
 import { acknowledge, useAwaiting } from '@/panes/awaiting'
 import { acknowledgesButton } from '@/panes/awaitingRule'
 import { Icon } from '@/icons/Icon'
+import { Badge } from '@/kit/components/Status'
 
 import styles from './PaneTitleBar.module.css'
 
@@ -240,6 +241,9 @@ export function PaneFrame({
   const session = paneSessionId(pane.id) ?? pane.session
 
   const awaiting = useAwaiting(session)
+  const awaitingHighlight = useWorkspace(
+    (s) => s.boot?.workspace.settings.awaitingHighlight ?? 'accentRail',
+  )
   const detachedWindow = useMemo(inDetachedPaneWindow, [])
   // See `bare` on the props: never in a detached window, whose cluster is its window controls.
   const noControls = bare === true && !detachedWindow
@@ -629,21 +633,9 @@ export function PaneFrame({
       data-bare={noControls ? 'true' : undefined}
       data-pane-id={pane.id}
       data-focused={focused ? 'true' : 'false'}
-      /*
-       * On the **frame**, not only on the cluster.
-       *
-       * It was on the cluster alone, which meant no CSS anywhere could reach the panel: the
-       * whole on-screen signal for "this session finished and is waiting for you" was a 7px
-       * dot in the corner of a terminal that may be filling the window. The request was for
-       * the console to be *highlighted*, and a dot is not that.
-       *
-       * The frame already carries a 1px border in both focus states, deliberately, so that
-       * its colour can change without resizing the content box — see the stylesheet. So this
-       * costs no reflow, no terminal refit and no second element. The dot stays: the border
-       * says *this pane*, the dot survives being read at the edge of vision, and neither can
-       * disagree with the other because both come from `awaiting` above.
-       */
+      // The global style and the badge read the same awaiting state as the corner marker.
       data-awaiting={awaiting ? 'true' : 'false'}
+      data-awaiting-highlight={awaitingHighlight}
       /*
        * What this pane should draw for a drag in flight: `source` while it is the one being
        * carried, or the edge the drop would land on. An attribute the stylesheet reads, rather
@@ -921,11 +913,16 @@ export function PaneFrame({
         </span>
         )}
 
+        {awaiting && (
+          <span className={styles.attentionLabel} aria-hidden="true">
+            <Badge tone="accent">Waiting</Badge>
+          </span>
+        )}
+
         {/*
          * Outside the reveal, and last in the row, so it keeps the corner and never hides:
-         * it is the only mark here that reports on a pane the user is *not* looking at. The
-         * box is reserved either way — see the stylesheet for why an empty one still takes
-         * its 17px.
+         * the dot reports the same state as the Waiting badge. Its own box remains reserved
+         * either way; only the badge's slot is added and removed.
          */}
         <span
           className={awaiting ? `${styles.marker} ${styles.markerOn}` : styles.marker}

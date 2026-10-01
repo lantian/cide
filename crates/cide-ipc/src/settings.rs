@@ -56,6 +56,8 @@ pub struct Settings {
     /// Written only by `cmd::settings` through `cide_core::accent::fit`, never from the patch
     /// verbatim — see [`Accent`].
     pub accent: Option<Accent>,
+    /// How panes waiting for the user are highlighted. Global across projects and windows.
+    pub awaiting_highlight: AwaitingHighlight,
 
     /// "Each project keeps its own Claude tab — pinned, cannot be closed, only its panes
     /// can." Off would mean a project with no console tab, which the rest of the model
@@ -152,6 +154,7 @@ impl Default for Settings {
             theme: Theme::default(),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             accent: None,
+            awaiting_highlight: AwaitingHighlight::default(),
             each_project_keeps_claude_tab: true,
             reopen_last_project: true,
             keep_sessions_on_window_close: true,
@@ -174,6 +177,17 @@ impl Default for Settings {
             update: UpdateSettings::default(),
         }
     }
+}
+
+/// The pane-wide attention mark, paired with a visible waiting badge in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AwaitingHighlight {
+    #[default]
+    AccentRail,
+    TintedHeader,
+    PaneOutline,
 }
 
 /// Whether creating a task with a proposal also opens a view onto the proposal run.

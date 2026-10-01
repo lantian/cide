@@ -33,6 +33,7 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   // --- Pages drawn in sections.tsx ---
   // Appearance
   { section: 'appearance', label: 'Theme', keywords: 'dark light mode colours' },
+  { section: 'appearance', label: 'Waiting pane highlight', keywords: 'awaiting attention notification finished ready accent rail tinted header outline harness session' },
   { section: 'appearance', label: 'UI font size', keywords: 'zoom scale text size interface' },
   { section: 'appearance', label: 'Version', keywords: 'about build release check for updates' },
   { section: 'appearance', label: 'Log directory', keywords: 'logs diagnostics debug report' },

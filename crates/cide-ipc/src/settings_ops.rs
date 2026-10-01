@@ -68,6 +68,8 @@ pub struct SettingsPatch {
     #[ts(optional)]
     pub accent: Option<AccentPatch>,
     #[ts(optional)]
+    pub awaiting_highlight: Option<crate::settings::AwaitingHighlight>,
+    #[ts(optional)]
     pub each_project_keeps_claude_tab: Option<bool>,
     #[ts(optional)]
     pub reopen_last_project: Option<bool>,
