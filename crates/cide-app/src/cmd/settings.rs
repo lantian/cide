@@ -2289,6 +2289,9 @@ mod tests {
                 std::env::temp_dir().join(format!("cide-claude-task-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("temp repo");
+            // macOS's temp directory can be under `/var`, a symlink to `/private/var`.
+            // Git resolves it, so the fixture must use the same spelling when comparing cwd.
+            let root = std::fs::canonicalize(&root).expect("canonical temp repo");
             let repo = Self { root };
             repo.git(&["init", "-q", "-b", "main"]);
             repo.write("kept.txt", "one\ntwo\nthree\n");
