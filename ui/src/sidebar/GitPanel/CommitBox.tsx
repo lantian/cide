@@ -1,5 +1,5 @@
 /**
- * The footer: `Amend`, the selection summary, the 104px message box, and the two buttons.
+ * The commit footer, including the one-shot message generator.
  *
  * Ticking `Amend` does **not** prefill the message box. It used to say here that it did, from
  * a `headMessage` field the panel had invented; `cide_ipc::git::RepoChanges` carries no such
@@ -13,10 +13,16 @@
  */
 import { useEffect, useId, useRef } from 'react'
 import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
+import { IconButton } from '@/kit/components/Button'
+import { Note } from '@/kit/components/Feedback'
 import styles from './CommitBox.module.css'
 
 export interface CommitBoxProps {
   message: string
+  generating: boolean
+  generateDisabledReason: string | null
+  generationError: string | null
+  onGenerate: () => void
   amend: boolean
   /** `2 modified`, already formatted by `summarize`. */
   summary: string
@@ -52,7 +58,7 @@ export function CommitBox(props: CommitBoxProps) {
    * The caret, when *Commit changes…* asked for it.
    *
    * That command does not commit — the message and the ticked paths are this panel's own React
-   * state and do not exist while the sidebar is elsewhere, and a palette row that committed
+   * state retained per project/worktree, and a palette row that committed
    * whatever happened to be ticked would be a foot-gun in a build with no revert surface. What
    * it does instead is reveal this panel and ask for this box, which is the part a user can
    * finish. `commands.rs` carries the full argument.
@@ -103,6 +109,19 @@ export function CommitBox(props: CommitBoxProps) {
         <span className={styles.summary} id={summaryId} data-audit="gitSummary">
           {props.busy ?? props.summary}
         </span>
+        <IconButton
+          icon={props.generating ? 'loader-circle' : 'pencil'}
+          label={props.generating
+            ? 'Generating commit message…'
+            : props.generateDisabledReason !== null
+              ? `Generate commit message — ${props.generateDisabledReason}`
+              : 'Generate commit message'}
+          data-audit="gitGenerateMessage"
+          aria-describedby={summaryId}
+          aria-busy={props.generating || undefined}
+          disabled={props.generateDisabledReason !== null}
+          onClick={props.onGenerate}
+        />
       </div>
 
       <label className={styles.srOnly} htmlFor={messageId}>
@@ -118,6 +137,12 @@ export function CommitBox(props: CommitBoxProps) {
         spellCheck={true}
         onChange={(e) => props.onMessage(e.currentTarget.value)}
       />
+
+      {props.generationError !== null && (
+        <Note tone="bad" title="Could not generate commit message">
+          {props.generationError} Your draft is kept; try Generate again.
+        </Note>
+      )}
 
       <div className={styles.actions}>
         <button

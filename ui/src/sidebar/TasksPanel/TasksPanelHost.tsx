@@ -86,7 +86,9 @@ import { notify, notifyFailure } from '@/chrome/notices'
 import { onFileDrop, useDropHot } from './fileDrop'
 import { basename, type StagedAttachment } from './model'
 import { useTasks } from '@/sidebar/tasksStore'
+import { useWorkspace } from '@/store/workspace'
 import { useSpec } from '../specStore'
+import { followSpecRuns, useSpecRuns } from '../OpenSpecPanel/specRuns'
 import { useAgents } from '@/sidebar/agentsStore'
 import { rosterColors, rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TasksPanelView } from './TasksPanel'
@@ -111,6 +113,10 @@ export interface TasksPanelProps {
 export const TasksPanel = memo(TasksPanelImpl)
 
 function TasksPanelImpl({ project }: TasksPanelProps) {
+  const proposalRunMode = useWorkspace((s) => s.boot?.workspace.settings.taskProposalRunMode ?? 'background')
+  const specRuns = useSpecRuns((s) => s.runs)
+  const specRunsProject = useSpecRuns((s) => s.project)
+  useEffect(() => followSpecRuns(project, false), [project])
   const board = useTasks((s) => s.board)
   const selected = useTasks((s) => s.selected)
   const compose = useTasks((s) => s.compose)
@@ -404,6 +410,7 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
         project={project}
         board={board}
         runs={runs}
+        specRuns={specRunsProject === project ? specRuns : undefined}
         roles={roles}
         roleColors={roleColors}
         selected={selected}
@@ -488,6 +495,8 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
            * dialog exactly as it was before M28.
            */
           changes={specBoard.kind === 'ready' ? changeNames : undefined}
+          canPropose={specBoard.kind === 'ready' && specBoard.commands.some((c) => c.name === 'propose')}
+          proposalRunMode={proposalRunMode}
           /*
            * Same structural optionality for links. (M30) Only a `ready` board has rows to link
            * to; withheld otherwise, so the dialog draws exactly as it did before M30.

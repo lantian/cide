@@ -58,7 +58,12 @@ pnpm --dir ui build
 
 **Touches:** `sidebar/GitPanel/`, `cide-git`
 
-`check:git`, `check:render`, `check:diff`, `check:diff-render`, `check:branches`
+`check:git`, `check:render`, `check:diff`, `check:diff-render`, `check:branches`,
+`check:commit-message`, plus `cargo test --locked -p cide-git --test commit_message` and
+`cargo test --locked -p cide-app --lib cmd::settings::tests` for message generation. The
+message check mounts the panel with deferred IPC: drafts survive full unmounts, late results
+cannot overwrite edits, and selection payloads match Commit. Backend tests cover read-only
+diff collection and both console harnesses using fake CLIs, without paid model calls.
 
 ### The diff surface
 
@@ -118,7 +123,7 @@ pnpm --dir ui build
 
 **Touches:** the task tracker, `.cide/`, agent definitions — `cide-tasks`, `cide-agents`, `sidebar/TasksPanel/`, `sidebar/AgentsPanel/`
 
-`check:agents`, `check:agents-render`, `check:sidebar`, `check:commands`
+`check:agents`, `check:agents-render`, `check:task-proposals`, `check:sidebar`, `check:commands`
 
 **A mutation answers short, and a read answers recent (M124).** `cide_task_comment`, `cide_task_update`, `cide_task_link`, `cide_task_unlink` and `cide_task_attach` answer with `tools.rs`'s `render_ack` — the summary line, the attachments, the links only for link/unlink, and only the comments *other* authors added since the caller's own last one — and never `render_full`. `cide_task_get` sends the last `RECENT_COMMENTS` (ten) live comments with a line naming how many it left out, and all of them under `all: true`; a deleted comment is never drawn. The whole task after every comment was 11.5k characters a call on selfcraft's codex runs, each copy re-sent with every later request of the conversation; `cide_task_get` is the road to the whole task. Two silent failures. **The caller is `TaskSink::author`**, the connection's identity: a sink that did not answer it would default to the orchestrator and show an agent its own comments as news. **`commented` must be true only for `cide_task_comment`**, whose last comment is the one just written: "since your last" then means the one *before* it, and passing false shows nothing new ever — the reason the whole task used to come back, gone without a failing line.
 
@@ -413,6 +418,12 @@ pnpm --dir ui build
 
 `check:input`, `check:exit`, `check:awaiting`, `check:format`
 
+### Bash panel command history
+
+**Touches:** `cide_core::shell_history`, its Bash initializer, and the pane identity in `session_spawn` / `TerminalPane`.
+
+`cargo test --locked -p cide-core shell_history`, `cargo test --locked -p cide-app --test bash_history`, `cargo test --locked -p cide-app --lib cmd::session`, `cargo test --locked -p cide-pty`, `check:input`, `check:exit`, `check:awaiting`, `check:attach`, `check:terminal-keys`, and `./scripts/check-bash32.sh`. The history tests use real PTYs and Up-arrow recall after forced termination: replaying a screen must not masquerade as restoring Readline history. They also pin global-file isolation, prompt hooks (scalar and exported indexed array), exit status, filters, login startup and paths with spaces/quotes. Set `CIDE_TEST_BASH` to an older Bash executable to run the same tests on it.
+
 ### Rewriting a session's output
 
 **Touches:** rewriting a session's output — `cide_pty::LineRender`/`Rendered`, `render_lines`, `cide_core::jsonlog`, `lifecycle::json_log_render`, and the click-to-expand road — `logring`, `session_log_detail`, `terminal/logLink.ts`, `chrome/LogDetailCard`, `chrome/logDetailModel`
@@ -691,6 +702,7 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 `cargo test -p cide-core -- codex_cli workspace`, `cargo test -p cide-claude`, `cargo test -p cide-agents`, `cargo test -p cide-app -- cmd::session agents spec`, `check:awaiting`, `check:claude-cli`, `check:menu-model`, `check:ext`, `cargo --locked xtask codegen --check`, and — free, against the real binary — `cargo test -p cide-agents --test real_codex -- --ignored --skip a_real_turn`. M93. The failures here are silent:
 - **The setting reaches a pane only on a fresh spawn.** `ConsoleSpawn::decide` must send a resume or fork to the CLI of the pane that holds the conversation. If it reads the setting instead, switching Harness makes every Resume hand a claude transcript to codex (or the reverse), which fails and starts fresh under a button that promised otherwise.
 - **A codex console's `session` is never its conversation.** Resume, restore and the Resume button go through `codex_thread_of`/`pane.conversation`. Passing the pane's `session` to `codex resume` names a thread that does not exist.
+- **Startup hooks can precede pane binding.** Keep their latest thread in the session registry and replay it inside the binding's workspace update, after stamping the harness. Resuming a continued pane prefers its latest conversation, falling back to the continuation's thread; cide's routing id never names a Codex thread. Missing identities wait for a session-picker choice. Run `check:restore` (launch decisions, rendered labels and both recovery buttons), `cargo test -p cide-app -- cmd::pane lifecycle hooks cmd::session`, and `cargo test -p cide-core -- workspace codex_cli persist`.
 - **The trust bypass travels with the hook table and only with it.** Drop `--dangerously-bypass-hook-trust` and codex silently ignores every hook: no state, no thread, and a typed line that waits for a readiness it never hears.
 - **The MCP server's environment is spelled into `mcp_servers.cide.env.*`.** Codex whitelists a server's environment, so `CIDE_SESSION` in the process environment alone leaves the bridge scoped to nothing.
 - **`QUIET_START` is not cosmetic.** Without it, the update chooser's first row, *Update now*, takes the first Enter cide types.

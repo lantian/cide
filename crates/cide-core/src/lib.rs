@@ -58,6 +58,8 @@ pub mod scheme;
 pub mod scratch;
 pub mod sessions;
 pub mod shell;
+/// Bash command history owned by a durable pane rather than a transient PTY session.
+pub mod shell_history;
 pub mod toolchain;
 pub mod toolwindow;
 pub mod workspace;

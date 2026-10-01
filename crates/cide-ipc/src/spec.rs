@@ -766,6 +766,18 @@ pub struct SpecSessionStart {
     pub launcher: SpecLauncher,
 }
 
+/// A task was saved even if its subsequent proposal could not be launched. A launch refusal
+/// must not turn a successful creation into a rejected request that mints a second task on retry.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskProposalCreated {
+    pub board: crate::TaskBoard,
+    pub task: crate::TaskId,
+    pub proposal: Option<crate::RunId>,
+    pub proposal_error: Option<String>,
+}
+
 /// One OpenSpec session the registry knows about, for the panel's status chip and its buttons.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -773,6 +785,10 @@ pub struct SpecSessionStart {
 pub struct SpecRunRow {
     pub run: crate::RunId,
     pub op: SpecOp,
+    /// The task this workflow was requested for. Association only, not an assignment.
+    #[serde(default)]
+    #[ts(optional)]
+    pub task: Option<crate::TaskId>,
     /// The change it works on — `None` for a Propose or an Explore, which have not named one.
     #[ts(optional)]
     pub change: Option<ChangeName>,
@@ -781,6 +797,10 @@ pub struct SpecRunRow {
     /// Who runs it, as a person reads it: the role's label or the harness's name.
     pub label: String,
     pub state: crate::RunState,
+    /// The latest turn handed back normally. Separate from the child's lifetime: a TUI stays
+    /// idle at its prompt, and after a restart its child is gone without interrupting that turn.
+    #[serde(default)]
+    pub turn_complete: bool,
     /// The live child, when there is one.
     #[ts(optional)]
     pub session: Option<crate::SessionId>,

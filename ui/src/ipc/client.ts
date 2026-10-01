@@ -1184,7 +1184,7 @@ export const settings = {
 }
 
 /**
- * The non-interactive Claude lane: one prompt in, one answer out.
+ * The non-interactive console lane: one prompt in, one answer out (Claude or Codex).
  *
  * Not a session — no pane, no PTY, no hooks, and no entry in the user's `/resume` picker.
  * Used for commit-message generation, "explain this selection" and palette one-shots.
@@ -1239,6 +1239,8 @@ export const session = {
     project?: string | undefined
     /** Continue an existing conversation. With `fork`, the parent to branch from. */
     resume?: SessionId | undefined
+    /** Open Codex's session picker when a saved pane lost its thread id. */
+    resumePicker?: boolean | undefined
     /**
      * Branch instead of continuing: the new session shares history up to this point and
      * then diverges, leaving the parent's transcript intact. Verified against the real CLI
@@ -1255,6 +1257,8 @@ export const session = {
      * See `SplitIntent::Continue` and `Pane::continues`.
      */
     continues?: HarnessSession | undefined
+    /** Stable shell panel identity, so Bash history survives a new PTY process. */
+    pane?: string | undefined
   }) => invoke<SessionId>('session_spawn', opts),
 
   /**
@@ -2334,7 +2338,7 @@ export interface ClaudeCliSupport {
 }
 
 /**
- * One-shot Claude tasks that build their own prompt in Rust.
+ * One-shot console tasks that build their own prompt in Rust.
  *
  * Deliberately not `headless.run` with a prompt assembled here. The prompts have rules in
  * them — no preamble, a bounded diff, "say when you cannot see the rest of the file" — and
@@ -2343,13 +2347,13 @@ export interface ClaudeCliSupport {
  */
 export const claudeTasks = {
   /**
-   * Draft a commit message from what a commit would record.
+   * Draft one commit message covering the same repository selections as Commit.
    *
    * Rejects with `{kind: 'nothingToDescribe'}` when there is no diff, which is a disabled
    * button rather than an error toast.
    */
-  commitMessage: (projectId: ProjectId, repo: RepoId) =>
-    invoke<HeadlessResult>('claude_commit_message', { project: projectId, repo }),
+  commitMessage: (projectId: ProjectId, scopes: import('./generated').CommitMessageScope[]) =>
+    invoke<HeadlessResult>('claude_commit_message', { project: projectId, scopes }),
 
   /**
    * Explain a selection. The *text* travels, not a path and a range: the buffer on screen may
@@ -3409,7 +3413,7 @@ export const history = {
  * happened, and the frame in between shows a list that is visibly wrong. It also means a
  * mutation needs no `hydrate()` follow-up and no wait for the broadcast to come back round.
  * --------------------------------------------------------------------------------------- */
-import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew, TaskResponse } from './generated'
+import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew, TaskResponse, TaskProposalCreated } from './generated'
 
 export const tasks = {
   /**
@@ -3475,6 +3479,7 @@ export const tasks = {
 
   /** Create a task, and with it `.cide/tasks.json` if the project has none. */
   create: (req: TaskNew) => invoke<TaskBoard>('task_new', { req }),
+  createWithProposal: (req: TaskNew) => invoke<TaskProposalCreated>('task_new_with_proposal', { req }),
 
   /** One mutation of one task. `TaskEdit` is an enum, not a patch — see its Rust doc. */
   edit: (project: ProjectId, task: TaskId, edit: TaskEdit) =>
@@ -3506,6 +3511,10 @@ export const tasks = {
  * A standalone object rather than a member of `events`, per the block header.
  */
 export const taskEvents = {
+  onApplyStarted: (handler: (project: ProjectId, change: string, run: import('./generated').RunId | null, error: string | null) => void) =>
+    listen<{ project: ProjectId; change: string; run: import('./generated').RunId | null; error: string | null }>('cide://task-apply-started', (e) =>
+      handler(e.payload.project, e.payload.change, e.payload.run, e.payload.error),
+    ),
   onChanged: (handler: (project: ProjectId, board: TaskBoard, rev: bigint) => void) =>
     listen<{ project: ProjectId; rev: bigint; board: TaskBoard }>('cide://tasks-changed', (e) =>
       handler(e.payload.project, e.payload.board, e.payload.rev),

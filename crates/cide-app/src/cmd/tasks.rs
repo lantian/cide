@@ -165,9 +165,76 @@ pub async fn task_new(
     stores: State<'_, Arc<TasksStores>>,
     req: TaskNew,
 ) -> Result<TaskBoard> {
+    create_task(&app, &state, &stores, req)
+        .await
+        .map(|(board, _)| board)
+}
+
+/// Save first, then propose. A failed launch is returned alongside the saved task, never as a
+/// failed create: the draft can close and a second press cannot accidentally mint another task.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_new_with_proposal(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    agents: State<'_, Arc<crate::agents::AgentRegistry>>,
+    req: TaskNew,
+) -> Result<cide_ipc::TaskProposalCreated> {
+    if req.change.is_some() {
+        return Err(CoreError::Io(
+            "Choose an existing change or propose this task, not both".into(),
+        ));
+    }
     let project = req.project;
     let root = tasks_state::project_root(&state, project)?;
-    let stores = Arc::clone(&stores);
+    let (harness, background) = state.with(|ws| {
+        let harness = match ws.settings.console_harness {
+            cide_ipc::ConsoleHarness::Codex => cide_ipc::Harness::Codex,
+            cide_ipc::ConsoleHarness::Claude => cide_ipc::Harness::Claude,
+        };
+        (
+            harness,
+            ws.settings.task_proposal_run_mode == cide_ipc::TaskProposalRunMode::Background,
+        )
+    });
+    let (board, task) = create_task(&app, &state, &stores, req).await?;
+    let saved = task.clone();
+    let outcome =
+        blocking(move || super::spec_sessions::plan_task_proposal(&root, project, &saved, harness))
+            .await
+            .and_then(|mut spec| {
+                if let crate::agents::RunPurpose::Spec(purpose) = &mut spec.purpose {
+                    purpose.suppress_reveal = background;
+                }
+                agents.enqueue_unique(spec).map_err(|held| {
+                    CoreError::Io(format!("run {} already holds this proposal", held.run))
+                })
+            });
+    let (proposal, proposal_error) = match outcome {
+        Ok(run) => {
+            agents.mark_changed(&app, project);
+            agents.pump(&app);
+            (Some(run), None)
+        }
+        Err(error) => (None, Some(error.to_string())),
+    };
+    Ok(cide_ipc::TaskProposalCreated {
+        board,
+        task: task.id,
+        proposal,
+        proposal_error,
+    })
+}
+
+async fn create_task(
+    app: &tauri::AppHandle,
+    state: &WorkspaceState,
+    stores: &Arc<TasksStores>,
+    req: TaskNew,
+) -> Result<(TaskBoard, cide_ipc::Task)> {
+    let project = req.project;
+    let root = tasks_state::project_root(state, project)?;
+    let stores = Arc::clone(stores);
     let (store, mutation) = blocking(move || {
         let store = tracker(&stores, project, root.clone());
         // An inbox task is never part of a milestone (M132): created straight into the inbox
@@ -220,12 +287,13 @@ pub async fn task_new(
         Ok((store, mutation))
     })
     .await?;
-    let board = answer(&app, project, &store);
+    let board = answer(app, project, &store);
+    let created = mutation.after.clone();
     // After `answer`: the caller's board and the other windows' broadcast never wait on the
     // trigger, which does its own disk read on the blocking pool.
     // From the panel, so no session to name: the primary pane hears about any run this starts.
-    task_triggers::consider(&app, project, vec![mutation], cide_ipc::RunNotify::Primary);
-    Ok(board)
+    task_triggers::consider(app, project, vec![mutation], cide_ipc::RunNotify::Primary);
+    Ok((board, created))
 }
 
 /// Apply one change to one task.
@@ -378,7 +446,25 @@ pub async fn task_edit(
         // The same road `task_respond` takes; `consider` is skipped so the answered edge in
         // `autodispatch::trigger` cannot start a second dispatch beside this one.
         Some((agent, line)) => {
-            crate::agent_rpc::hand_back_to_run(&app, project, &agent, &task_for_handback, &line);
+            if mutation.after.status == cide_ipc::TaskStatus::Doing
+                && mutation.after.change.is_some()
+            {
+                crate::agent_rpc::hand_back_to_spec_run(
+                    &app,
+                    project,
+                    &agent,
+                    &task_for_handback,
+                    &line,
+                );
+            } else {
+                crate::agent_rpc::hand_back_to_run(
+                    &app,
+                    project,
+                    &agent,
+                    &task_for_handback,
+                    &line,
+                );
+            }
         }
         // From the panel, so no session to name: the primary pane hears about any run this
         // starts.

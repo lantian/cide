@@ -71,6 +71,7 @@ import {
   elapsed,
   glyphSpins,
   phaseGlyph,
+  phaseLabel,
   type RunPhase,
   type RunView,
 } from '@/sidebar/AgentsPanel/model'
@@ -145,6 +146,7 @@ import {
 } from './specCard'
 
 import styles from './TasksPanel.module.css'
+import { Button } from '@/kit/components/Button'
 
 /**
  * One CSS class per `Tone`.
@@ -579,6 +581,15 @@ export interface TaskMilestone {
 }
 
 export interface TaskDetailProps {
+  /** OpenSpec workflow conversations, independently of the implementation assignee. */
+  workflowSessions?: readonly {
+    run: string
+    op: 'propose' | 'apply'
+    label: string
+    phase: RunPhase
+    failure: string | null
+  }[] | undefined
+  onOpenWorkflowSession?: ((run: string) => void) | undefined
   /**
    * Which milestone this task belongs to, or absent for none. (M83) Optional, so every story
    * that predates milestones draws the head it always drew.
@@ -660,7 +671,7 @@ export interface TaskDetailProps {
   /** Press the one prominent action. Absent leaves it drawn but inert with its reason. */
   onSpecPrimary?: ((task: string, action: 'approve' | 'accept') => void) | undefined
   /**
-   * `Integrate & Archive` is running. (M28)
+   * Approval or `Integrate & Archive` is running. (M28)
    *
    * The button goes inert and says so. It is one press that merges a branch, runs
    * `openspec archive`, re-validates and closes the task — four subprocesses and a git merge, so
@@ -680,6 +691,8 @@ export interface TaskDetailProps {
   onProposeChange?: ((task: string) => void) | undefined
   /** Open one of the change's files in an editor pane. */
   onOpenSpecFile?: ((path: string) => void) | undefined
+  /** Close the task card and focus its OpenSpec change tab. */
+  onOpenSpec?: (() => void) | undefined
   /**
    * Get back to the conversation this task's work went to, and close the card. (M28)
    *
@@ -993,6 +1006,8 @@ export function TaskDetail(props: TaskDetailProps) {
     onDeleteArm,
     onDelete,
     onOpenRun,
+    workflowSessions = [],
+    onOpenWorkflowSession,
     onPauseRun,
     onResumeRun,
     spec,
@@ -1001,6 +1016,7 @@ export function TaskDetail(props: TaskDetailProps) {
     specBusy,
     onProposeChange,
     onOpenSpecFile,
+    onOpenSpec,
     onOpenSession,
     specEdit,
     onSpecEditOpen,
@@ -1056,6 +1072,8 @@ export function TaskDetail(props: TaskDetailProps) {
    * saying OpenSpec was being read, and then a whole section appeared out of nowhere.
    */
   const specChange = spec === undefined ? null : (spec?.change ?? task.change)
+  // The task status is live while spec.action is an asynchronous read's snapshot.
+  const canApprove = specChange === null || task.status === 'todo' || task.status === 'inbox'
   const comments = commentOrder(task)
   /**
    * Which comment is open in its editor, by id.
@@ -1180,7 +1198,11 @@ export function TaskDetail(props: TaskDetailProps) {
           */}
         {specChange !== null && (
           <span className={styles.specChip} data-audit="taskSpecChip" data-change={specChange}>
-            openspec: {specChange}
+            {onOpenSpec ? (
+              <Button variant="link" size="sm" onClick={onOpenSpec} data-audit="taskSpecHeaderLink" title={`Open OpenSpec change ${specChange}`}>
+                <span>openspec: {specChange}</span>
+              </Button>
+            ) : <>openspec: {specChange}</>}
           </span>
         )}
         {/*
@@ -1415,11 +1437,8 @@ export function TaskDetail(props: TaskDetailProps) {
         {/*
           * Hidden on an unapproved OpenSpec task. (M28)
           *
-          * There the assignee is not a field somebody fills in — it is what Approve & dispatch
-          * *sets*, and leaving the row here would be a second road to the same fact that skips
-          * the one choice that matters: whether this work goes to a role, to a conversation
-          * already open, or to a new one. Once something is assigned the row returns, so it can
-          * still be changed the ordinary way. An ordinary task has no Approve button and is
+          * Approval starts Apply using the default harness. An existing assignee keeps its
+          * ordinary editor. An ordinary task has no Approve button and is
           * unaffected — `showsAssignee` is the whole rule.
           */}
         {showsAssignee(spec, task.agent !== null) && (
@@ -1661,6 +1680,11 @@ export function TaskDetail(props: TaskDetailProps) {
               <span className={styles.specProgressLabel} data-audit="specProgressLabel">
                 {progressLabel(spec)}
               </span>
+              {onOpenSpec && (
+                <span className={styles.specOpen}>
+                  <Button variant="quiet" size="sm" onClick={onOpenSpec} data-audit="taskOpenSpec">Open spec</Button>
+                </span>
+              )}
             </div>
             {/*
               * A real `progressbar`, because a bar that is only a coloured div tells a screen
@@ -1785,7 +1809,7 @@ export function TaskDetail(props: TaskDetailProps) {
                 )}
                 {/*
                   * The way back out, and the reason removing the button does not trap anybody:
-                  * the same picker Approve opens, reachable from the row that replaced it. It
+                  * a target picker for moving this conversation's work elsewhere. It
                   * matters most in the `closed` state, where there is no conversation left to
                   * carry on in.
                   */}
@@ -1952,6 +1976,27 @@ export function TaskDetail(props: TaskDetailProps) {
             </details>
           </div>
         )}
+        {workflowSessions.map((session) => (
+          <div className={styles.runStrip} data-audit={session.op === 'apply' ? 'taskApplySession' : 'taskProposalSession'} data-run={session.run} key={session.run}>
+            <span className={cx(styles.chipDot, glyphSpins(phaseGlyph(session.phase)) && styles.chipSpin)} aria-hidden="true">
+              <Icon name={asIcon(phaseGlyph(session.phase))} size={0} />
+            </span>
+            <span className={styles.runStripText} title={session.failure ?? undefined}>
+              {session.op === 'apply' ? 'Apply' : 'Proposal'} · {session.label} · {phaseLabel(session.phase)}
+            </span>
+            {onOpenWorkflowSession !== undefined && (
+              <button
+                type="button"
+                className={styles.action}
+                data-audit={session.op === 'apply' ? 'taskOpenApplySession' : 'taskOpenProposalSession'}
+                disabled={session.phase === 'queued' || session.phase === 'starting'}
+                onClick={() => onOpenWorkflowSession(session.run)}
+              >
+                {session.op === 'apply' ? 'Open Apply session' : 'Open proposal session'}
+              </button>
+            )}
+          </div>
+        ))}
         {chip !== null && chip.lit && (
           <div className={styles.runStrip} data-audit="tasksRunStrip">
             <span className={chipClass(chip)} data-audit="tasksStripChip" data-lit="true">
@@ -2366,7 +2411,7 @@ export function TaskDetail(props: TaskDetailProps) {
           * else is what this card refuses.
           */}
         <div className={styles.detailActions} data-audit="tasksDetailActions">
-          {spec != null && spec.action.id !== 'none' && (
+          {spec != null && spec.action.id !== 'none' && (spec.action.id !== 'approve' || canApprove) && (
             <button
               type="button"
               className={cx(
@@ -2380,16 +2425,11 @@ export function TaskDetail(props: TaskDetailProps) {
               disabled={!spec.action.enabled || specBusy === true}
               data-busy={specBusy === true ? 'true' : undefined}
               aria-busy={specBusy === true ? true : undefined}
-              aria-expanded={spec.action.id === 'approve' ? dispatchOpen === true : undefined}
               title={spec.action.enabled ? spec.action.hint : spec.action.reason}
               onClick={() => {
-                // Approve opens the picker rather than assigning: *where* the run happens is the
-                // choice this gesture exists to make. Accept has nothing to choose.
-                if (spec.action.id === 'approve') {
-                  onDispatchOpen?.(dispatchOpen !== true)
-                  return
+                if (spec.action.id === 'approve' || spec.action.id === 'accept') {
+                  onSpecPrimary?.(task.id, spec.action.id)
                 }
-                if (spec.action.id === 'accept') onSpecPrimary?.(task.id, 'accept')
               }}
             >
               {/*
@@ -2455,7 +2495,7 @@ export function TaskDetail(props: TaskDetailProps) {
           * Each option says what choosing it *does*, because that is the whole of the choice — a
           * role runs unattended in its own worktree, a conversation already open is typed into.
           */}
-        {dispatchOpen === true && dispatchTargets !== undefined && (
+        {dispatchOpen === true && dispatchTargets !== undefined && spec?.session != null && (
           <ul className={styles.targets} data-audit="taskDispatchTargets">
             {dispatchTargets.map((target) => (
               <li key={targetKey(target)}>

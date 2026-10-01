@@ -113,6 +113,7 @@ export interface TasksDigest {
    * it did not land on the tone.
    */
   chipLabelColors: string[]
+  specStatuses: { task: string | null; op: string | null; phase: string | null; label: string; spins: boolean; tone: string | null }[]
   /** Comment log lines, in the order drawn: `<author kind>|<text>`. The text is the rendered
    *  markdown flattened back to prose, so `**bold**` digests as `bold` — which is itself the
    *  assertion that the syntax was consumed rather than printed. */
@@ -208,6 +209,9 @@ export interface TasksDigest {
   composeStatuses: string[]
   composeCreate: string
   composeCancel: boolean
+  composeSpecOptions: string[]
+  composeSpecSelection: string | null
+  composeProposalNote: string
   /**
    * The card's creator line, and the author arm it was drawn from: `<kind>|<text>`.
    *
@@ -222,6 +226,10 @@ export interface TasksDigest {
   openRows: string[]
   /** Whether the live-run strip is drawn. */
   runStrip: boolean
+  proposalSessions: string[]
+  proposalOpen: string[]
+  applySessions: string[]
+  applyOpen: string[]
   runStripSpin: boolean | null
   /** The status filter's toggles, in the order drawn: `<label>|<on>`. Empty when not drawn. */
   filters: string[]
@@ -301,6 +309,7 @@ export interface TasksDigest {
   deleteDanger: boolean
   /** The `openspec: <change>` chip's change, or `null`. */
   specChip: string | null
+  specNavigation: string[]
   /** The session row's `data-state`, or `null` when there is no row. (M28) */
   specSession: string | null
   /** Its two controls, by hook, in document order. */
@@ -400,6 +409,14 @@ function digest(
   })
   return {
     story,
+    specStatuses: all(html, 'tasksRow').flatMap((row) => all(row, 'tasksSpecStatus').map((badge) => ({
+      task: attr(row, 'data-task'),
+      op: attr(badge, 'data-op'),
+      phase: attr(badge, 'data-phase'),
+      label: text(badge),
+      spins: /class="[^"]*chipSpin/.test(badge),
+      tone: attr(badge.match(/<span[^>]*data-tone=[^>]+>/)?.[0] ?? '', 'data-tone'),
+    }))),
     meta: text(/data-audit="tasksMeta"[^>]*>([^<]*)</.exec(html)?.[1] ?? ''),
     claim: text(/data-audit="tasksClaim"[^>]*>([^<]*)</.exec(html)?.[1] ?? '') || null,
     buttons: [...html.matchAll(/<button\b[^>]*>([\s\S]*?)<\/button>/g)].map((m) => text(m[1] ?? '')),
@@ -493,6 +510,9 @@ function digest(
       return / disabled(?:=|\s|\/|>)/.test(button) ? 'off' : 'on'
     })(),
     composeCancel: html.includes('data-audit="taskComposeCancel"'),
+    composeSpecOptions: all(html, 'taskComposeSpecPicker').flatMap((select) => [...select.matchAll(/<option[^>]*>(.*?)<\/option>/g)].map((option) => text(option[1] ?? ''))),
+    composeSpecSelection: all(html, 'taskComposeSpecPicker').map((select) => select.match(/<option value="([^"]*)" selected=""/)?.[1] ?? null)[0] ?? null,
+    composeProposalNote: all(html, 'taskComposeProposalNote').map(text).join(''),
     creatorColor: inlineColor(html, 'tasksCreatorName'),
     creator: all(html, 'tasksCreator')
       .map((span) => `${attr(span, 'data-creator')}|${text(span)}`)
@@ -559,6 +579,10 @@ function digest(
     ),
     /** Whether the card offers to start a proposal — see `TaskDetailProps::onProposeChange`. */
     specPropose: html.includes('data-audit="specProposeForTask"'),
+    proposalSessions: all(html, 'taskProposalSession').map((row) => text(row)),
+    proposalOpen: all(html, 'taskOpenProposalSession').map((button) => button.includes('disabled') ? 'disabled' : 'enabled'),
+    applySessions: all(html, 'taskApplySession').map((row) => text(row)),
+    applyOpen: all(html, 'taskOpenApplySession').map((button) => button.includes('disabled') ? 'disabled' : 'enabled'),
     /**
      * The mark inside the primary button while it works, by its **class**, not just its name.
      *
@@ -610,6 +634,7 @@ function digest(
     specChip: ((f) => (f === undefined ? null : attr(f, 'data-change')))(
       all(html, 'taskSpecChip')[0],
     ),
+    specNavigation: ['taskSpecHeaderLink', 'taskOpenSpec'].filter((hook) => all(html, hook).length > 0),
     specSession: ((f) => (f === undefined ? null : attr(f, 'data-state')))(
       all(html, 'specSession')[0],
     ),

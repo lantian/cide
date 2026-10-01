@@ -47,6 +47,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
   branch as branchApi,
+  claudeTasks,
   diag,
   events,
   file as fileApi,
@@ -125,6 +126,13 @@ import {
   type SelectMods,
 } from './rowSelection'
 import { storyFromQuery, type GitStory } from './fixture'
+import {
+  commitDraftKey as cacheKey,
+  commitDrafts,
+  CommitDraftStore,
+  EMPTY_DRAFT,
+  type CommitDraft,
+} from './commitDraftStore'
 import type { ConfirmState } from '@/chrome/ConfirmDestructive'
 import type {
   ChangeEntry,
@@ -191,20 +199,6 @@ const lastMerges = new Map<string, Record<string, MergeState>>()
  * tree that has since moved.
  */
 const lastTicks = new Map<string, ReadonlySet<string>>()
-
-/**
- * The key the three caches above are filed under: the project, or the project *and* the agent
- * worktree the panel is looking at.
- *
- * A worktree is a different working tree with its own index and its own half-composed commit, so
- * sharing the project's slot would seed a worktree view with the project's tree and — worse —
- * with the project's ticks, which the next Commit there would try to apply to files that are
- * not in that checkout. `null` for no project, so every `.get`/`.set` site keeps its guard.
- */
-function cacheKey(project: ProjectId | null, worktree: string | null): string | null {
-  if (project === null) return null
-  return worktree === null ? project : `${project}\u0000${worktree}`
-}
 
 /**
  * The empty tick set, as one instance.
@@ -327,6 +321,8 @@ export interface GitPanelModel {
    */
   merges: Readonly<Record<string, MergeState>>
   message: string
+  draft: CommitDraft
+  generateDisabledReason: string | null
   amend: boolean
   /**
    * The commit the *log* asked to amend, or `null` for the checkbox's own meaning.
@@ -433,6 +429,9 @@ export interface GitPanelActions {
   toggleExpand: (row: Row) => void
   setAllExpanded: (open: boolean) => void
   setMessage: (text: string) => void
+  generateMessage: () => void
+  discardGeneratedMessage: () => void
+  replaceGeneratedMessage: (revision: number) => void
   setAmend: (on: boolean) => void
   setStagingArea: (on: boolean) => void
   commit: (push: boolean) => void
@@ -678,7 +677,19 @@ export function useGitPanel(
     // mount effect's conflict probe revalidates it.
     () => (story ? storyMerges(story) : ((scope !== null ? lastMerges.get(scope) : undefined) ?? {})),
   )
-  const [message, setMessage] = useState('')
+  const [draftStore] = useState(() => story ? new CommitDraftStore() : commitDrafts)
+  const draftScope = story !== null ? 'fixture' : scope
+  const subscribeDraft = useCallback(
+    (listener: () => void) => draftStore.subscribe(draftScope, listener),
+    [draftStore, draftScope],
+  )
+  const getDraft = useCallback(() => draftStore.get(draftScope), [draftStore, draftScope])
+  const draft = useSyncExternalStore(subscribeDraft, getDraft, () => EMPTY_DRAFT)
+  const message = draft.message
+  const setMessage = useCallback(
+    (text: string) => draftStore.setMessage(draftScope, text),
+    [draftStore, draftScope],
+  )
   const [amend, setAmendFlag] = useState(false)
   const [amendOf, setAmendOf] = useState<AmendTarget | null>(null)
   const [dialog, setDialog] = useState<ChangelistDialogState | null>(null)
@@ -1390,6 +1401,36 @@ export function useGitPanel(
     [view, selected, rewordRepo],
   )
 
+  const hasChangesToDescribe = units.some((unit) => {
+    const repo = repoOf(view, unit.repo)
+    if (repo === undefined) return false
+    const staged = repo.useStagingArea
+      || ['merge', 'cherry-pick', 'revert'].includes(repo.branch.operation ?? '')
+    return staged
+      ? repo.groups.some((group) => group.entries.some((entry) => entry.staged))
+      : unit.paths.length > 0
+  })
+  const hasConflicts = units.some((unit) =>
+    repoOf(view, unit.repo)?.groups.some((group) => group.kind === 'conflicts') === true,
+  )
+  const generateDisabledReason = draft.generating ? 'Generating a commit message…'
+    : draft.generated !== null ? 'Accept or cancel the generated message first.'
+    : busy !== null ? 'Wait for the Git operation to finish.'
+    : hasConflicts ? 'Resolve conflicts before generating a commit message.'
+    : !hasChangesToDescribe ? 'Select changes to describe. A message-only amend has no changes.'
+    : story !== null ? 'Message generation is unavailable in the demo.'
+    : project === null ? 'Open a project first.'
+    : null
+
+  const generateMessage = useCallback(() => {
+    if (project === null || generateDisabledReason !== null || story !== null) return
+    const scopes = units.map((unit) => ({
+      repo: unit.repo,
+      selections: commitSelections(unit.repo, unit.paths),
+    }))
+    void draftStore.generate(draftScope, () => claudeTasks.commitMessage(project, scopes))
+  }, [project, generateDisabledReason, story, units, draftStore, draftScope])
+
   /** Repos whose index moved under us and whose bar has not been answered yet. */
   const diverged = useMemo(
     () =>
@@ -1401,7 +1442,11 @@ export function useGitPanel(
 
   const commit = useCallback(
     (push: boolean) => {
-      if (project === null || units.length === 0) return
+      const submitted = draftStore.get(draftScope)
+      if (project === null || units.length === 0 || submitted.generating || submitted.generated !== null) {
+        return
+      }
+      const submittedRevision = submitted.revision
       void (async () => {
         setBusy(push ? 'Committing and pushing…' : 'Committing…')
         let allOk = true
@@ -1428,7 +1473,7 @@ export function useGitPanel(
           }
           const outcome = await guarded('git commit', () =>
             gitApi.commit(project, unit.repo, {
-              message,
+              message: submitted.message,
               amend,
               /*
                * The commit the log named, for the repository it named it in — and `null`
@@ -1477,7 +1522,7 @@ export function useGitPanel(
         // The box is cleared only on success. A failed commit that also loses the message
         // is two problems, and the message is the one the user cannot reconstruct.
         if (allOk) {
-          setMessage('')
+          draftStore.clearAfterCommit(draftScope, submittedRevision)
           setAmendFlag(false)
           // With the tick. The commit the log named no longer exists under that oid — an amend
           // writes a new object — so keeping it would arm the *next* commit against a target
@@ -1508,7 +1553,7 @@ export function useGitPanel(
         if (allOk && committed.length > 0) openPushDialog(project, committed)
       })()
     },
-    [project, units, view, diverged, message, amend, amendOf, guarded, note, refresh],
+    [project, units, view, diverged, amend, amendOf, guarded, note, refresh, draftStore, draftScope],
   )
 
   const unstage = useCallback(() => {
@@ -2414,10 +2459,12 @@ export function useGitPanel(
     picked,
     loading,
     unavailable,
-    busy,
+    busy: draft.generating ? 'Generating commit message…' : busy,
     diverged,
     merges,
     message,
+    draft,
+    generateDisabledReason,
     amend,
     /** Non-null exactly when Commit would reword — see the `useMemo` that computes it. */
     rewordRepo,
@@ -2534,6 +2581,9 @@ export function useGitPanel(
     toggleExpand,
     setAllExpanded,
     setMessage,
+    generateMessage,
+    discardGeneratedMessage: () => draftStore.discardGenerated(draftScope),
+    replaceGeneratedMessage: (revision: number) => draftStore.replaceGenerated(draftScope, revision),
     setAmend,
     setStagingArea,
     commit,

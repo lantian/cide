@@ -198,10 +198,20 @@ fn line_in(surfaces: &[Surface], root: &Path, name: &str) -> Option<String> {
 /// For a console that cannot type a Claude Code command: a codex console is handed the file
 /// to follow instead, since the skill *is* its instructions, written as prose for a model.
 pub fn file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    file_in(SURFACES, root, name)
+}
+
+/// Codex's instructions file, for a continuation whose worktree cannot discover the root's
+/// `$` skill. The table owns the directory spelling, just as it owns the invocation spelling.
+pub fn codex_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    file_in(CODEX_SURFACES, root, name)
+}
+
+fn file_in(surfaces: &[Surface], root: &Path, name: &str) -> Option<std::path::PathBuf> {
     if !valid_name(name) {
         return None;
     }
-    SURFACES.iter().find_map(|surface| {
+    surfaces.iter().find_map(|surface| {
         let path = entry_path(root, surface, &surface.spelling(name));
         path.is_file().then(|| {
             path.strip_prefix(root)
@@ -239,14 +249,15 @@ fn entry_path(root: &Path, surface: &Surface, local: &str) -> std::path::PathBuf
         .join(surface.entry.replace("{name}", local))
 }
 
-/// Every OpenSpec command this project has, sorted by name, newest surface winning a tie.
+/// Every OpenSpec command this project has, sorted by name, newest Claude surface winning a
+/// tie. Codex-only skills are also listed so a ready board does not hide supported workflows.
 ///
 /// Two callers, and they want it for opposite reasons: the board carries it so the panel can
 /// preview exactly what it is about to send, and the refusal path prints it because *"that
 /// command is not here"* is only useful next to the ones that are.
 pub fn installed(root: &Path) -> Vec<SpecCommand> {
     let mut found: Vec<SpecCommand> = Vec::new();
-    for surface in SURFACES {
+    for surface in SURFACES.iter().chain(CODEX_SURFACES) {
         let Ok(entries) = std::fs::read_dir(root.join(surface.dir)) else {
             continue;
         };
@@ -515,6 +526,34 @@ mod tests {
             codex_line(&root, "propose").as_deref(),
             Some("$openspec-propose")
         );
+    }
+
+    #[test]
+    fn a_codex_only_project_advertises_propose_and_exposes_its_instruction_file() {
+        let root = scratch("codex-only-propose");
+        touch(&root, ".agents/skills/openspec-propose/SKILL.md");
+        assert_eq!(
+            installed(&root),
+            vec![SpecCommand {
+                name: "propose".into(),
+                line: "$openspec-propose".into()
+            }]
+        );
+        assert_eq!(
+            codex_file(&root, "propose"),
+            Some(std::path::PathBuf::from(
+                ".agents/skills/openspec-propose/SKILL.md"
+            ))
+        );
+        touch(&root, ".claude/skills/openspec-propose/SKILL.md");
+        assert_eq!(installed(&root).len(), 1, "one option per workflow");
+        assert_eq!(
+            installed(&root)[0].line,
+            "/openspec-propose",
+            "Claude spelling wins a tie"
+        );
+        assert!(codex_file(&root, "../bad").is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

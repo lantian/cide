@@ -62,8 +62,16 @@ use crate::workspace_state::WorkspaceState;
 /// the caller's thread because taking the workspace lock is not something an RPC connection
 /// thread should do while an agent waits on the answer.
 pub fn consider(app: &AppHandle, project: ProjectId, mutations: &[TaskMutation]) {
-    for linked in mutations.iter().filter_map(newly_linked) {
-        reveal(app, project, linked);
+    for mutation in mutations {
+        if let TaskAuthor::Agent { agent, .. } = &mutation.author
+            && let Some(registry) = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>()
+            && registry.background_proposal_for(project, &mutation.after.id, agent)
+        {
+            continue;
+        }
+        if let Some(linked) = newly_linked(mutation) {
+            reveal(app, project, linked);
+        }
     }
 }
 

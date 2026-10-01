@@ -26,6 +26,8 @@ pub struct SessionRegistry {
     started: DashMap<SessionId, std::time::SystemTime>,
     /// Which CLI each **console** session runs. (M93) See [`Self::harness_of`].
     harnesses: DashMap<SessionId, cide_ipc::Harness>,
+    /// Latest hook identity, retained even when its pane has not bound yet.
+    conversations: DashMap<SessionId, (SessionId, u64)>,
 }
 
 /// Who minted a write sequence number.
@@ -141,6 +143,21 @@ impl SessionRegistry {
         self.harnesses.get(&id).map(|h| *h)
     }
 
+    pub fn note_conversation(&self, id: SessionId, conversation: SessionId, since: u64) {
+        self.conversations.insert(id, (conversation, since));
+    }
+
+    /// A resume already knows its thread; never overwrite a newer startup hook.
+    pub fn seed_conversation(&self, id: SessionId, conversation: SessionId, since: u64) {
+        self.conversations
+            .entry(id)
+            .or_insert((conversation, since));
+    }
+
+    pub fn conversation_of(&self, id: SessionId) -> Option<(SessionId, u64)> {
+        self.conversations.get(&id).map(|c| *c)
+    }
+
     pub fn get(&self, id: SessionId) -> Option<Arc<PtySession>> {
         self.sessions.get(&id).map(|r| Arc::clone(r.value()))
     }
@@ -195,6 +212,7 @@ impl SessionRegistry {
         self.applied_write.retain(|k, _| k.session != id);
         self.started.remove(&id);
         self.harnesses.remove(&id);
+        self.conversations.remove(&id);
         self.sessions.remove(&id).map(|(_, v)| v)
     }
 

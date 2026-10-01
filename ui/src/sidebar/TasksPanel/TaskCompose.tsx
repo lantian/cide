@@ -73,8 +73,7 @@ import styles from './TasksPanel.module.css'
  * assigning is what starts the agent, which is the single most surprising thing about this
  * feature if nobody says it.
  *
- * It said one thing more — the directory a proposed change would take — until the option that
- * proposed one was removed. See the picker below for why.
+ * Proposal selection has its own sentence: it saves first and runs the installed workflow.
  */
 function specNote(draft: TaskDraft): string {
   const assigned = draft.assignee.trim() !== ''
@@ -102,6 +101,8 @@ export interface TaskComposeProps {
    * claim, made structurally rather than by a flag somebody could forget to check.
    */
   changes?: readonly string[] | undefined
+  canPropose?: boolean | undefined
+  proposalRunMode?: 'background' | 'tab' | undefined
   /**
    * The tasks a link may point at — the board's rows, in panel order. (M30)
    *
@@ -168,6 +169,8 @@ export function TaskCompose({
   roles,
   assigneeHint = null,
   changes,
+  canPropose = false,
+  proposalRunMode = 'background',
   tasks,
   onDraft,
   onCreate,
@@ -363,24 +366,27 @@ export function TaskCompose({
               className={styles.select}
               data-audit="taskComposeSpecPicker"
               data-write="true"
-              value={draft.change}
-              onChange={(event) => onDraft({ ...draft, change: event.target.value })}
+              value={draft.propose === true ? '*propose*' : draft.change}
+              onChange={(event) => onDraft({ ...draft,
+                change: event.target.value === '*propose*' ? '' : event.target.value,
+                propose: event.target.value === '*propose*',
+              })}
             >
               <option value="">Not a spec change</option>
+              {canPropose && <option value="*propose*">Propose this task</option>}
               {/*
-                * **There is no "new change from this task" option, and there must not be.**
+                * Proposing uses a real agent workflow after saving, never the stub-scaffolding
+                * command the old picker used. Existing options still only link existing changes.
                 *
-                * There was. It called `spec_propose`, which scaffolds the directory and writes a
+                * The old option called `spec_propose`, which scaffolds the directory and writes a
                 * stub proposal — no delta specs, no task checklist. So pressing Create produced
                 * a change that `openspec validate` refuses and whose board row reads `0/0` for
                 * ever: cide manufacturing a broken artefact out of a title, at the one moment
                 * the user has told it least about the work.
                 *
                 * Writing a proposal *is* work — it needs the codebase and the existing specs —
-                * so the gesture moved to after the task exists, where a conversation can do it:
-                * the card offers *Make a proposal*, which runs `/openspec-propose` and tells it
-                * to link the change back. This picker only ever links to a change that is
-                * already there.
+                * so both this option and the card's *Make a proposal* run the installed
+                * workflow after the task exists, and ask it to link the resulting change back.
                 */}
               {changes.map((change) => (
                 <option key={change} value={change}>
@@ -388,6 +394,14 @@ export function TaskCompose({
                 </option>
               ))}
             </select>
+            {draft.propose === true && (
+              <p className={styles.assigneeHint} data-audit="taskComposeProposalNote">
+                {proposalRunMode === 'tab'
+                  ? 'Saves the task, then starts its proposal in a new tab.'
+                  : 'Saves the task, then starts its proposal in the background. Open it from OpenSpec.'}
+                {draft.assignee !== '' && ' The assigned role may start implementation at the same time.'}
+              </p>
+            )}
             {draft.change !== '' && (
               <p className={styles.assigneeHint} data-audit="taskComposeSpecNote">
                 {specNote(draft)}

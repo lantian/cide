@@ -253,6 +253,7 @@ pub(crate) struct CodexConsole {
     pub(crate) inject: cide_core::codex_cli::Injected,
     /// The thread a resume or fork continues.
     pub(crate) thread: Option<SessionId>,
+    pub(crate) resume_picker: bool,
     pub(crate) fork: bool,
     /// The roster paragraph, when this project has subagents.
     pub(crate) paragraph: Option<String>,
@@ -295,6 +296,8 @@ pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
     let mut args = Vec::new();
     if let Some((subcommand, _)) = continues {
         args.push(subcommand.to_string());
+    } else if c.resume_picker && c.inject.resume {
+        args.push("resume".into());
     }
     let mut user_args = c.user_args.clone();
     let wrapper_separator = codex_cli::remove_wrapper_separator(&mut user_args);
@@ -328,6 +331,8 @@ pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
             args.push("--include-non-interactive".into());
         }
         args.push(thread.to_string());
+    } else if c.resume_picker && c.inject.resume {
+        args.push("--include-non-interactive".into());
     }
     if wrapper_separator {
         args.push("--".into());
@@ -1059,11 +1064,14 @@ pub async fn session_spawn(
     geometry: Geometry,
     project: Option<cide_ipc::ProjectId>,
     resume: Option<SessionId>,
+    resume_picker: Option<bool>,
     // Optional on the wire, and it has to be: see [`wants_fork`].
     fork: Option<bool>,
     // A conversation to put the real harness back on. Optional on the wire like `fork`, and
     // for the same reason; see below.
     continues: Option<cide_ipc::HarnessSession>,
+    // Stable identity for shell history; optional for callers that do not own a pane.
+    pane: Option<PaneId>,
 ) -> Result<SessionId, SessionError> {
     // The command is a **shape**, and the work is below it. The split exists because M79 needs
     // this exact machinery — the user's `claude_cli` arguments, the folded system prompt, the
@@ -1082,10 +1090,12 @@ pub async fn session_spawn(
             geometry,
             project,
             resume,
+            resume_picker: resume_picker.unwrap_or(false),
             fork,
             continues,
-            // Inferred from the tree, as it always was: a webview cannot tell cide which pane
-            // it is, and `is_primary_console_spawn` is the answer to that question.
+            pane,
+            // Voice remains inferred from the tree by `is_primary_console_spawn`; the
+            // optional pane identity above only selects a shell history file.
             voice: None,
             // No caller on the wire can ask for extra environment, deliberately: a webview able
             // to set arbitrary variables on a `claude` sets them on a process that inherits
@@ -1112,8 +1122,11 @@ pub(crate) struct SpawnRequest {
     pub geometry: Geometry,
     pub project: Option<cide_ipc::ProjectId>,
     pub resume: Option<SessionId>,
+    /// Open Codex's conversation picker for a pane whose saved thread is unavailable.
+    pub resume_picker: bool,
     pub fork: Option<bool>,
     pub continues: Option<cide_ipc::HarnessSession>,
+    pub pane: Option<PaneId>,
     /// Which opening sentence the roster paragraph gets, when the caller knows better than the
     /// tree does. `None` infers it, which is every spawn the webview asks for. (M79)
     pub voice: Option<Voice>,
@@ -1160,8 +1173,10 @@ pub(crate) async fn spawn_session(
         geometry,
         project,
         resume,
+        resume_picker,
         fork,
         continues,
+        pane,
         voice,
         env: extra_env,
         prompt: opening,
@@ -1252,6 +1267,7 @@ pub(crate) async fn spawn_session(
 
     // Only for an empty string. A pane that names a program gets that program, so this cannot
     // reach a Claude pane, a test harness, or anything else that knows what it wants.
+    let local_login_shell = program.trim().is_empty() && continues.is_none();
     let (program, args) = if program.trim().is_empty() {
         let (shell, login) = cide_core::shell::login_shell();
         (shell.to_string_lossy().into_owned(), login)
@@ -1284,6 +1300,16 @@ pub(crate) async fn spawn_session(
     // and the tree are in hand. `codex` is recognised as asked-for by name for the same reason
     // `claude` is: a continuation's `ContinueSpec` spells it.
     let asked = console_program(&spec.program);
+    let asked = if resume_picker {
+        if resume.is_some() || wants_fork(fork) || continues.is_some() {
+            return Err(SessionError::Pty(
+                "Session selection cannot be combined with a resume, fork or continuation.".into(),
+            ));
+        }
+        Some(cide_ipc::ConsoleHarness::Codex)
+    } else {
+        asked
+    };
 
     // Read once, here, rather than inside the proxy pass: this is the only place that knows
     // both the app handle and that a child is about to exist, and `WorkspaceState::with` runs
@@ -1332,6 +1358,11 @@ pub(crate) async fn spawn_session(
     // the proxy scope, `CIDE_SESSION`, the task tools' socket, *not* watching jobs or rewriting
     // output — keys on this.
     let is_console = console.is_some();
+    if resume_picker && !codex_settings.cli.inject.resume {
+        return Err(SessionError::Pty(
+            "Codex session restoration is disabled in Settings → Harness → Codex.".into(),
+        ));
+    }
 
     // The New project wizard's brief (M97), if one is waiting for *this* project's console. Only
     // for a spawn the webview asked for (`voice: None` — a tab cide opened by itself has its own
@@ -1513,6 +1544,7 @@ pub(crate) async fn spawn_session(
             cwd: spec.cwd.to_string_lossy().to_string(),
             inject,
             thread: console.thread,
+            resume_picker,
             fork: wants_fork(fork),
             paragraph,
             hook,
@@ -1803,6 +1835,28 @@ pub(crate) async fn spawn_session(
     }
 
     let session = blocking(move || {
+        if local_login_shell
+            && let Some(pane) = pane
+            && cide_core::shell_history::is_bash(&spec.program)
+        {
+            let history = cide_core::shell_history::prepare(pane).map_err(|error| {
+                SessionError::Pty(format!("cannot prepare this panel's Bash history: {error}"))
+            })?;
+            let original_env = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "ENV")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("ENV").ok());
+            spec.args = cide_core::shell_history::BASH_ARGS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            for (key, value) in history.env(original_env.as_deref()) {
+                spec = spec.env(key, value);
+            }
+        }
         // Inside the blocking closure, not outside it: the first call reads `screens.json`
         // off disk, and every Tauri command that touches a filesystem in this app does it
         // here rather than on the webview's thread.
@@ -1829,6 +1883,13 @@ pub(crate) async fn spawn_session(
     // Which CLI this console session runs, for `pane_bind_session` to stamp on the pane. (M93)
     if let Some(console) = console {
         registry.note_harness(id, console.harness.harness());
+        if is_codex
+            && !wants_fork(fork)
+            && codex_plan.inject.resume
+            && let Some(thread) = console.thread
+        {
+            registry.seed_conversation(id, thread, cide_core::persist::now_ms());
+        }
     }
 
     // After the insert, for `claude_tab::open_with_prompt`'s reason: the typed line waits on this
@@ -2684,6 +2745,7 @@ mod tests {
             cwd: "/repo".into(),
             inject: cide_core::codex_cli::Injected::from(&cide_ipc::CodexInjections::default()),
             thread,
+            resume_picker: false,
             fork,
             paragraph: Some("roster".into()),
             hook: Some("/opt/cide/cide-hook".into()),
@@ -2691,6 +2753,23 @@ mod tests {
             agent_sock: Some("/run/cide-agents.sock".into()),
             prompt: None,
         }
+    }
+
+    #[test]
+    fn codex_recovery_opens_a_picker_with_the_console_integration() {
+        let mut c = codex_console(None, false);
+        c.resume_picker = true;
+        let args = codex_console_argv(&c);
+        assert_eq!(args[0], "resume");
+        assert!(args.iter().any(|a| a == "--include-non-interactive"));
+        assert!(!args.iter().any(|a| a == "--last"));
+        assert!(args.windows(2).any(|w| w == ["-C", "/repo"]));
+        assert!(args.iter().any(|a| a.contains("hooks.SessionStart=")));
+        assert!(
+            args.iter()
+                .any(|a| a.contains("mcp_servers.cide.env.CIDE_SESSION="))
+        );
+        assert!(!args.iter().any(|a| a == &c.session.to_string()));
     }
 
     /// (M93) A fresh codex console: the user's arguments first, then cide's — the directory, the

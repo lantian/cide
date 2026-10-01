@@ -90,6 +90,8 @@ pub struct SettingsPatch {
     /// [`crate::settings::Settings::open_run_in`].
     #[ts(optional)]
     pub open_run_in: Option<crate::settings::OpenRunIn>,
+    #[ts(optional)]
+    pub task_proposal_run_mode: Option<crate::settings::TaskProposalRunMode>,
     /// How `codex` is launched. (M93)
     #[ts(optional)]
     pub codex: Option<crate::settings::CodexSettings>,

@@ -776,6 +776,31 @@ try {
     eq(t('tab').editFields, 0, 'and a page at rest has no live fields at all')
   }
 
+  /* --------------------------------------------------------------- scenario display and find */
+
+  {
+    eq(t('tab').tabClauses, ['WHEN the user selects dark', 'THEN it repaints'],
+      'canonical Markdown markers are replaced with readable clause labels')
+    const mixed = t('tab-scenarios')
+    eq(mixed.tabClauses, [
+      'WHEN the user submits &lt;img src=x onerror="evil()"&gt;',
+      'THEN it saves', 'AND it closes', 'THEN the user submits again',
+    ], 'plain, bold, repeated, and AND clauses render in order')
+    ok(mixed.tabScenarioBodies[0].includes('continuation'), 'continuation text is still visible')
+    ok(mixed.tabScenarioBodies[0].includes('This mentions WHEN inside prose'), 'inline keyword text is preserved')
+    ok(mixed.tabScenarioBodies[0].includes('- **WHEN** this is code'), 'fenced code retains its raw markers')
+    eq(mixed.tabScenarioUnsafeHtml, false, 'HTML in scenario text never becomes an element')
+    for (const story of ['tab-scenario-keyword', 'tab-scenario-text']) {
+      const found = t(story)
+      eq(found.tabMarks, 2, `${story}: search finds both visible matches`)
+      eq(found.tabHitIndices, [0, 1], `${story}: hit indices follow reading order`)
+      eq(found.tabCurrentMark, 1, `${story}: one current hit is highlighted`)
+      eq(found.tabFindCount, '2/2', `${story}: the displayed count matches rendered hits`)
+    }
+    eq(t('tab-scenario-markers').tabMarks, 0, 'hidden Markdown markers are not searchable')
+    eq(t('tab-editing').tabClauses, [], 'editing replaces the formatted scenario with its original text fields')
+  }
+
   /* ------------------------------------------------------------------ classes really exist */
 
   {

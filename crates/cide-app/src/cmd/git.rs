@@ -84,7 +84,7 @@ fn roots(state: &WorkspaceState, project: ProjectId) -> Result<Vec<PathBuf>> {
 /// answers `NoSuchRepo`, because discovery walks roots and submodules and a linked worktree is
 /// neither. The fallback matches only what `cide_git::worktree::list` reports, so the ids this
 /// resolves are exactly the checkouts cide made, never an arbitrary directory.
-fn repo_root(roots: &[PathBuf], repo: RepoId) -> Result<PathBuf> {
+pub(super) fn repo_root(roots: &[PathBuf], repo: RepoId) -> Result<PathBuf> {
     match cide_git::repo::find(roots, repo) {
         Ok(info) => Ok(info.root),
         Err(error) => cide_git::worktree::find(roots, repo)

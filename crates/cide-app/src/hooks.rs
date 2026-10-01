@@ -514,6 +514,9 @@ fn apply(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
+                    registry.note_conversation(session, conversation, now_ms);
+                }
                 if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
                     let _ = state.update(|ws| {
                         cide_core::workspace::note_conversation(ws, session, conversation, now_ms);

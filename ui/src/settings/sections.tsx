@@ -37,6 +37,7 @@ import type {
   ExplorerSettings,
   GitSettings,
   OpenRunIn,
+  TaskProposalRunMode,
   Settings,
   SettingsPatch,
   SettingsSection,
@@ -477,6 +478,20 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
       </Group>
 
       <Group title="Agent runs">
+        <Row
+          label="New-task proposals"
+          hint="Where a proposal requested during task creation runs. Applies to all projects."
+          info="Background keeps your focus. New tab opens the proposal run when it starts. You can open background proposals from OpenSpec."
+          {...resetTo(settings.taskProposalRunMode, def?.taskProposalRunMode, (taskProposalRunMode) => patch({ taskProposalRunMode }))}
+          control={
+            <Segmented
+              label="New-task proposals"
+              value={settings.taskProposalRunMode}
+              options={TASK_PROPOSAL_RUN_MODES}
+              onChange={(taskProposalRunMode) => patch({ taskProposalRunMode })}
+            />
+          }
+        />
         {/* M108. Here rather than under Agents, whose page writes role files and no setting at
             all: this is about where a view lands, which is this page's whole subject. */}
         <Row
@@ -501,6 +516,11 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
 const OPEN_RUN_IN: readonly { value: OpenRunIn; label: string }[] = [
   { value: 'tab', label: 'Tab' },
   { value: 'split', label: 'Split' },
+]
+
+const TASK_PROPOSAL_RUN_MODES: readonly { value: TaskProposalRunMode; label: string }[] = [
+  { value: 'background', label: 'Background' },
+  { value: 'tab', label: 'New tab' },
 ]
 
 /**

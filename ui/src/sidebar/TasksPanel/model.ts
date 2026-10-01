@@ -2008,9 +2008,11 @@ export interface TaskDraft {
    * There was a `NEW_CHANGE` sentinel here, and the picker offered *New change from this task*.
    * It called `spec_propose`, which scaffolds a stub — no delta specs, no checklist — so the
    * task was born linked to a change `openspec validate` refuses. Proposing is work and needs a
-   * conversation; it is `spec_propose_for_task` now, offered on the card. See `TaskCompose`.
+   * conversation. The card and `propose` below request that real workflow. See `TaskCompose`.
    */
   change: string
+  /** Request the real propose workflow only after this task has been saved. */
+  propose?: boolean
   /**
    * Edges to record with the creation. (M30)
    *
@@ -2093,6 +2095,7 @@ export function draftDirty(draft: TaskDraft): boolean {
     draft.title.trim() !== '' ||
     draft.body.trim() !== '' ||
     draft.assignee !== '' ||
+    draft.propose === true ||
     draft.status !== EMPTY_DRAFT.status ||
     // A picked link is work worth protecting from the scrim, exactly as a typed word is. (M30)
     draft.links.length > 0

@@ -4,4 +4,4 @@ import type { SessionId } from "./SessionId";
 /**
  * Whether a pane's conversation can be picked up where it left off.
  */
-export type SessionRestore = { "kind": "resumable", session: SessionId, } | { "kind": "fresh" };
+export type SessionRestore = { "kind": "resumable", session: SessionId, } | { "kind": "missingConversation" } | { "kind": "fresh" };

@@ -339,9 +339,8 @@ enum Scope {
         /// The run's working directory — its worktree — which is what a relative path in
         /// `cide_task_attach` is read against. From the registry, never from the child. (M39)
         cwd: PathBuf,
-        /// Whether the run works the board at all. False for an OpenSpec session
-        /// (`RunPurpose::Spec`), which has no task and is served no task tool whatever the
-        /// project's tracker switch says.
+        /// Whether the run works the board at all. False for standalone OpenSpec sessions;
+        /// task-origin proposals can read and link their saved task.
         board: bool,
     },
     /// A run started from the GitLab MR panel to review one merge request. (M85) Served the
@@ -2025,12 +2024,12 @@ fn run_scope_of(runs: &[crate::agents::RunScope], run: RunId) -> Option<Scope> {
                 cwd: live.cwd.clone(),
                 board: true,
             },
-            crate::agents::RunPurpose::Spec(_) => Scope::Run {
+            crate::agents::RunPurpose::Spec(spec) => Scope::Run {
                 project: live.project,
                 agent: live.agent.clone(),
                 label: live.label.clone(),
                 cwd: live.cwd.clone(),
-                board: false,
+                board: spec.task.is_some(),
             },
             // Decided by what the registry says the run was started as, never by its role id:
             // a real role could be called `mr-review` too. See `RunPurpose`.
@@ -3222,6 +3221,29 @@ pub(crate) fn hand_back_to_run(
     task: &TaskId,
     line: &str,
 ) {
+    hand_back_to_run_with_view(app, project, agent, task, line, false);
+}
+
+/// Returning a linked task from review is still a continuation of its own conversation, but
+/// also an Apply gesture. Do not fork a standalone session next to the returning role.
+pub(crate) fn hand_back_to_spec_run(
+    app: &AppHandle,
+    project: ProjectId,
+    agent: &AgentId,
+    task: &TaskId,
+    line: &str,
+) {
+    hand_back_to_run_with_view(app, project, agent, task, line, true);
+}
+
+fn hand_back_to_run_with_view(
+    app: &AppHandle,
+    project: ProjectId,
+    agent: &AgentId,
+    task: &TaskId,
+    line: &str,
+    reveal_apply: bool,
+) {
     if let Some(stores) = app.try_state::<Arc<TasksStores>>()
         && let Some(store) = stores.get(project)
     {
@@ -3259,6 +3281,35 @@ pub(crate) fn hand_back_to_run(
         ) else {
             return;
         };
+        let change = reveal_apply
+            .then(|| {
+                tasks
+                    .get(project)
+                    .and_then(|store| store.get(&task))
+                    .and_then(|task| task.change)
+            })
+            .flatten();
+        let line = match &change {
+            Some(change) => {
+                let root = crate::tasks_state::project_root(&workspace, project).ok();
+                let workflow = root
+                    .as_ref()
+                    .and_then(|root| {
+                        cide_spec::claude::file(root, "apply-change")
+                            .or_else(|| cide_spec::claude::codex_file(root, "apply-change"))
+                            .map(|file| root.join(file))
+                    })
+                    .map(|file| {
+                        format!(
+                            "Follow the OpenSpec apply instructions in `{}` for {change}.",
+                            file.display()
+                        )
+                    })
+                    .unwrap_or_else(|| format!("Follow the OpenSpec apply workflow for {change}."));
+                format!("{workflow} {line}")
+            }
+            None => line,
+        };
         let request = DispatchRequest {
             project,
             agent: agent.clone(),
@@ -3270,15 +3321,51 @@ pub(crate) fn hand_back_to_run(
             model: None,
             fresh: false,
         };
-        match crate::cmd::agents::dispatch_or_duplicate(
+        let outcome = crate::cmd::agents::dispatch_or_duplicate(
             app.clone(),
             workspace,
             agents,
             tasks,
             request,
         )
-        .await
-        {
+        .await;
+        if let Some(change) = change {
+            let (run, mut error) = match &outcome {
+                Ok(
+                    crate::cmd::agents::DispatchOutcome::Told(run)
+                    | crate::cmd::agents::DispatchOutcome::Continued { run, .. }
+                    | crate::cmd::agents::DispatchOutcome::Started { run, .. },
+                ) => (Some(*run), None),
+                Ok(crate::cmd::agents::DispatchOutcome::Duplicate { held, .. }) => {
+                    (Some(held.run), None)
+                }
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "Task {task} is Doing, but OpenSpec Apply could not continue: {error}"
+                    )),
+                ),
+            };
+            if run.is_some()
+                && let Some(stores) = app.try_state::<Arc<TasksStores>>()
+                && let Some(store) = stores.get(project)
+                && store.list().iter().any(|task| {
+                    task.change.as_ref() == Some(&change)
+                        && task.status == cide_ipc::TaskStatus::Todo
+                })
+            {
+                match store.mark_change_doing(&change, TaskAuthor::User) {
+                    Ok(_) => crate::tasks_state::broadcast(&app, project, &store),
+                    Err(why) => {
+                        error = Some(format!(
+                            "Apply continued, but linked task statuses could not be updated: {why}"
+                        ))
+                    }
+                }
+            }
+            crate::emit::task_apply_started(&app, project, change, run, error);
+        }
+        match outcome {
             Ok(crate::cmd::agents::DispatchOutcome::Told(run)) => {
                 tracing::info!(%run, %task, "a red verify went back to the run");
             }
@@ -4825,6 +4912,34 @@ mod tests {
         // the call site and therefore no tools at all.
         assert_eq!(run_scope_of(&runs, RunId::new()), None);
         assert_eq!(run_scope_of(&[], runs[0].run), None);
+    }
+
+    #[test]
+    fn a_task_proposal_can_link_its_task_but_standalone_proposals_have_no_board() {
+        let project = ProjectId::new();
+        let mut run = a_run(project, "openspec");
+        let mut purpose: crate::agents::SpecPurpose = serde_json::from_value(serde_json::json!({
+            "op": "propose", "cwd": "/repo", "launcher": {"kind": "harness", "harness": "claude"},
+            "brief": "Write a proposal"
+        }))
+        .expect("old persisted standalone purpose");
+        run.purpose = crate::agents::RunPurpose::Spec(purpose.clone());
+        assert!(matches!(
+            run_scope_of(&[run.clone()], run.run),
+            Some(Scope::Run { board: false, .. })
+        ));
+        purpose.task = Some(TaskId("t-1".into()));
+        purpose.suppress_reveal = true;
+        run.purpose = crate::agents::RunPurpose::Spec(purpose.clone());
+        assert!(matches!(
+            run_scope_of(&[run.clone()], run.run),
+            Some(Scope::Run { board: true, .. })
+        ));
+        let saved = serde_json::to_string(&purpose).expect("persist");
+        assert_eq!(
+            serde_json::from_str::<crate::agents::SpecPurpose>(&saved).expect("restore"),
+            purpose
+        );
     }
 
     #[test]

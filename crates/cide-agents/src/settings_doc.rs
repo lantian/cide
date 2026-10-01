@@ -95,6 +95,11 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "enum tab | split",
         "Where the Agents panel's Open shows a run: its own tab, or a split beside the console.",
     ),
+    doc(
+        "taskProposalRunMode",
+        "enum background | tab",
+        "How proposals requested during task creation are shown. Background keeps focus; tab opens the proposal run. Applies across projects.",
+    ),
     // --- editor --------------------------------------------------------------------------
     doc("editor.fontSize", "number 6–40", "Editor font size."),
     doc("editor.tabSize", "number", "Columns per indentation level."),

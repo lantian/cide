@@ -5,6 +5,7 @@
 # Frontend
 /ui/node_modules/
 /ui/dist/
+/dist/
 /ui/.vite/
 /ui/*.tsbuildinfo
 

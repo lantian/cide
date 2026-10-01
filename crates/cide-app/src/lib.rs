@@ -727,6 +727,7 @@ pub fn run() {
             cmd::tasks::task_get,
             cmd::tasks::task_search,
             cmd::tasks::task_new,
+            cmd::tasks::task_new_with_proposal,
             cmd::tasks::task_edit,
             cmd::tasks::task_respond,
             cmd::tasks::task_delete,

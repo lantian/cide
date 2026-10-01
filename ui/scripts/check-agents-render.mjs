@@ -1136,6 +1136,21 @@ try {
   {
     const idle = t('list')
     const live = t('list-with-live-run')
+    const combined = t('list-with-live-run-and-spec')
+    for (const field of ['chipClasses', 'chipLit', 'chipTone', 'chipLabels', 'chipLabelColors']) {
+      eq(combined[field], live[field], `OpenSpec status is additive: the existing subagent ${field} stays unchanged`)
+    }
+    eq(combined.specStatuses.map((badge) => `${badge.op}|${badge.phase}`), ['propose|running', 'apply|running'], 'the list shows concurrent proposal and Apply independently of the subagent')
+    ok(combined.specStatuses.every((badge) => badge.spins), 'both working OpenSpec indicators animate')
+    eq(t('list-with-spec-no-role').chipLit, [], 'OpenSpec does not fabricate a subagent chip')
+    eq(t('list-with-spec-no-role').specStatuses.map((badge) => badge.phase), ['queued', 'awaitingPermission'], 'OpenSpec statuses work without an assignee or role roster')
+    eq(t('list-spec-states').specStatuses.length, 9, 'every OpenSpec phase is visible in the task list')
+    for (const badge of t('list-spec-states').specStatuses) {
+      eq(badge.spins, badge.phase === 'running', `animation matches the existing phase glyph for ${badge.phase}`)
+      ok(badge.label.startsWith('Apply · '), 'the status names its workflow as well as its phase')
+    }
+    eq(t('list-with-live-run').specStatuses, [], 'tasks without OpenSpec retain their original row')
+    eq(t('list-proposal-finished').specStatuses.map((badge) => [badge.phase, badge.label, badge.spins, badge.tone]), [['finished', 'Proposal · Finished', false, 'green']], 'a completed proposal remains Finished after its idle child is lost on restart')
     ok(idle.chipClasses?.length > 0, 'the idle list draws chips at all')
     ok(live.chipClasses?.length > 0, 'and so does the live one')
     ok(
@@ -1682,6 +1697,13 @@ try {
         'half of the markdown report that names this dialog',
     )
 
+    eq(t('compose-spec').composeSpecOptions, ['Not a spec change', 'Propose this task', 'add-dark-mode'], 'creation offers the workflow beside existing changes')
+    eq(t('compose-spec').composeSpecSelection, '', 'proposing is off by default')
+    eq(t('compose-empty').composeSpecOptions, [], 'no OpenSpec means no proposal choice')
+    eq(t('compose-proposal-background').composeSpecSelection, '*propose*', 'proposal selection is separate from a change name')
+    ok(t('compose-proposal-background').composeProposalNote.includes('background'), 'background behavior is explained before Create')
+    ok(t('compose-proposal-background').composeProposalNote.includes('assigned role may start'), 'assignment remains available and its concurrent behavior is explained')
+    ok(t('compose-proposal-tab').composeProposalNote.includes('new tab'), 'tab preference is explained before Create')
     for (const [name, d] of [['compose-empty', empty], ['compose-filled', filled], ['compose-busy', busy]]) {
       eq(d.unclassed, 0, `${name}: names only classes its stylesheet defines`)
     }
@@ -1901,6 +1923,16 @@ try {
      */
     eq(t('card').specBlock, null, 'a task with no change draws no OpenSpec block at all')
     eq(t('card').specChip, null, 'and no chip')
+    eq(t('card').specNavigation, [], 'an unlinked task offers no spec navigation')
+    eq(t('card-spec-ready').specNavigation, ['taskSpecHeaderLink', 'taskOpenSpec'], 'both header link and change section open the spec tab')
+    eq(t('card-spec-doing').specPrimary, null, 'Doing removes Approve & dispatch even while the spec action snapshot is stale')
+    eq(t('card-spec-doing').dispatchKinds, [], 'moving to Doing also removes an already-open approval picker')
+    eq(t('card-spec-doing').specNavigation, ['taskSpecHeaderLink', 'taskOpenSpec'], 'the in-progress task keeps both navigation controls')
+    ok(t('card-spec-long-name').text.includes('add-sidebar-task-openspec-workflow-navigation-and-session-links'), 'the header contains the full linked change name')
+    const taskStyles = src('../src/sidebar/TasksPanel/TasksPanel.module.css')
+    const specChipStyles = /\.specChip\s*\{([^}]+)\}/.exec(taskStyles)?.[1] ?? ''
+    ok(/overflow-wrap:\s*anywhere/.test(specChipStyles) && /white-space:\s*normal/.test(specChipStyles), 'long OpenSpec change names wrap in the header')
+    ok(!/text-overflow:\s*ellipsis|max-width:\s*18ch/.test(specChipStyles), 'the header no longer clips the spec link to 18 characters')
 
     /* ------------------------------- handed to a conversation, and the button that must go (M28) */
 
@@ -2597,12 +2629,13 @@ try {
       'Approve sits beside Delete in the same row, with nothing between them',
     )
 
-    // Approve opens the picker; it does not assign on the spot. That is the whole gesture.
-    eq(ready.dispatchKinds, [], 'the picker is closed until asked for')
+    eq(ready.dispatchKinds, [], 'approval offers one direct action, without a target picker')
+    eq(tasks['card-spec-approving'].specPrimary, 'approve|off|busy', 'approval is disabled while the session is being launched')
+    ok(tasks['card-spec-approving'].buttons.includes('Dispatching…'), 'approval gives feedback during launch')
     eq(
       tasks['card-spec-picking'].dispatchKinds,
       ['role', 'session', 'fresh'],
-      'and offers all three kinds — a role dispatches through the queue, a conversation already ' +
+      'Hand it elsewhere still offers all three kinds — a role dispatches through the queue, a conversation already ' +
         'open is typed into, and the last one makes a pane first',
     )
 
@@ -2685,6 +2718,18 @@ try {
      * saw before M28.
      */
     eq(tasks['card-propose'].specPropose, true, 'a task with no change can start a proposal')
+    ok(tasks['card-proposal-session'].proposalSessions[0]?.includes('Proposal · OpenSpec · Codex'), 'the task links its background proposal without a role roster')
+    eq(tasks['card-proposal-session'].proposalOpen, ['enabled'], 'a running proposal has an Open session action')
+    eq(tasks['card-proposal-queued'].proposalOpen, ['disabled'], 'a queued proposal remains visible before its session starts')
+    ok(tasks['card-proposal-finished'].proposalSessions[0]?.includes('Proposal · OpenSpec · Codex · Finished'), 'the task card names normal proposal completion')
+    eq(tasks['card-proposal-finished'].proposalOpen, ['enabled'], 'a completed proposal keeps its Open session action')
+    eq(tasks['card'].proposalSessions, [], 'unrelated tasks have no proposal session link')
+    ok(tasks['card-proposal-with-assignment'].proposalSessions.length === 1, 'proposal links coexist with implementation assignment')
+    eq(tasks['card-proposal-and-apply'].proposalSessions.length, 1, 'proposal history stays visible alongside Apply')
+    ok(tasks['card-proposal-and-apply'].applySessions[0]?.includes('Apply · OpenSpec · Codex'), 'the task shows its Apply session with no role roster')
+    eq(tasks['card-proposal-and-apply'].applyOpen, ['enabled'], 'running Apply has its own Open action')
+    eq(tasks['card-apply-queued'].applyOpen, ['disabled'], 'queued Apply remains visible until its child starts')
+    eq(tasks['card'].applySessions, [], 'unrelated tasks have no Apply link')
     ok(
       tasks['card-propose'].buttons.includes('Make a proposal'),
       `with words that say what it does: ${JSON.stringify(tasks['card-propose'].buttons)}`,

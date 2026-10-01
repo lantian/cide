@@ -84,7 +84,7 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
       <Dialog
         data-audit="openspecApplyDialog"
         title={`Apply ${change}`}
-        lead="Implement this change in a new tab. You can close the tab — the work goes on, its state shows on the OpenSpec panel, and Open session brings it back. No task is created."
+        lead="Implement this change in a new tab. Linked Todo tasks move to Doing. You can close the tab and open the session again from OpenSpec."
         onClose={dismiss}
         footNote={
           'why' in resolved && choice.mode === 'role'

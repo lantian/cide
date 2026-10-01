@@ -34,7 +34,7 @@ use cide_ipc::{
     ChangeName, Harness, ProjectId, RunId, RunState, SpecCheckout, SpecIntegrated, SpecLauncher,
     SpecOp, SpecPublished, SpecRunRow, SpecSessionStart, SpecSettings,
 };
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use super::spec::{apply_invocation, blocking, follow_file, for_harness, resolve_command};
 use crate::agents::{AgentRegistry, DispatchSpec, RunPurpose, SpecPurpose};
@@ -111,38 +111,179 @@ pub async fn spec_session_start(
     let root = tasks_state::project_root(&state, project)?;
     let registry = Arc::clone(&agents);
 
-    // One live Apply per change: two runs editing one checklist is the clobbering worktrees
-    // exist to prevent, and the second press is almost always "where did my session go" —
-    // which Open session answers.
-    if request.op == SpecOp::Apply {
-        let change = request
-            .change
-            .as_ref()
-            .ok_or_else(|| CoreError::Io("Apply needs the change it implements".into()))?;
-        if let Some(live) = registry.spec_runs(project).into_iter().find(|row| {
-            row.op == SpecOp::Apply && row.change.as_ref() == Some(change) && is_live(&row.state)
-        }) {
+    blocking(move || {
+        start_session(
+            &app,
+            &registry,
+            &root,
+            project,
+            request,
+            cide_ipc::TaskAuthor::User,
+        )
+    })
+    .await
+}
+
+/// Both gestures enter here. Status synchronization writes straight to the store and broadcasts
+/// once, rather than passing through task_triggers and reflecting into a second Apply.
+fn start_session(
+    app: &AppHandle,
+    registry: &Arc<AgentRegistry>,
+    root: &Path,
+    project: ProjectId,
+    request: SpecSessionStart,
+    author: cide_ipc::TaskAuthor,
+) -> Result<RunId> {
+    let change = (request.op == SpecOp::Apply)
+        .then(|| request.change.clone())
+        .flatten();
+    let held = change
+        .as_ref()
+        .and_then(|change| registry.change_holding(project, change.as_str()));
+    // Plan before changing statuses: a missing change or workflow must leave the board alone.
+    let spec = if held.is_none() {
+        Some(plan_session(root, project, request.clone())?)
+    } else {
+        None
+    };
+    if let Some(change) = change.as_ref() {
+        checked_change(change.as_str())?;
+        if !root.join("openspec/changes").join(change.as_str()).is_dir() {
             return Err(CoreError::Io(format!(
-                "{} is already applying {change} — press Open session to see it, or stop it first",
-                live.label
+                "there is no change `{change}` in openspec/changes/"
             )));
         }
+        if cide_agents::config::load_tracker(root)
+            && let Some(stores) = app.try_state::<Arc<crate::tasks_state::TasksStores>>()
+        {
+            let store = stores.ensure(project, root);
+            if !matches!(store.board(), cide_ipc::TaskBoard::Unreadable { .. }) {
+                if store.list().iter().any(|task| {
+                    task.change.as_ref() == Some(change)
+                        && task.status == cide_ipc::TaskStatus::Todo
+                }) {
+                    store.mark_change_doing(change, author)?;
+                    crate::tasks_state::broadcast(app, project, &store);
+                }
+            } else {
+                return Err(CoreError::Io(
+                    "The task board is unreadable; repair it before starting Apply".into(),
+                ));
+            }
+        }
     }
-
-    let spec = blocking(move || plan_session(&root, project, request)).await?;
-    let run = registry
-        .enqueue_unique(spec)
-        .map_err(|held| CoreError::Io(format!("run {} already holds this work", held.run)))?;
-    registry.mark_changed(&app, project);
-    registry.pump(&app);
+    let run = if let Some(held) = held {
+        continue_apply(app, registry, root, project, held, &request)?
+    } else {
+        match registry.enqueue_unique(spec.expect("planned without a holder")) {
+            Ok(run) => run,
+            Err(held) if change.is_some() => {
+                continue_apply(app, registry, root, project, held, &request)?
+            }
+            Err(held) => {
+                return Err(CoreError::Io(format!(
+                    "run {} already holds this work",
+                    held.run
+                )));
+            }
+        }
+    };
+    registry.mark_changed(app, project);
+    registry.pump(app);
     Ok(run)
 }
 
-/// Queued, working, or holding its turn: a second Apply of the change would double it.
-fn is_live(state: &RunState) -> bool {
-    !matches!(
-        state,
-        RunState::Interrupted | RunState::Finished { .. } | RunState::Failed { .. }
+fn continue_apply(
+    app: &AppHandle,
+    registry: &Arc<AgentRegistry>,
+    root: &Path,
+    project: ProjectId,
+    held: crate::agents::HeldPair,
+    request: &SpecSessionStart,
+) -> Result<RunId> {
+    // Do not type into a busy run or queue another turn on every status echo. Idle is the
+    // deliberate continuation; a paused run remains under the user's brake.
+    if held.state == RunState::Idle
+        && let Some(scope) = registry
+            .run_scopes_for(project)
+            .into_iter()
+            .find(|scope| scope.run == held.run)
+    {
+        let change = request.change.as_ref().expect("Apply has a change");
+        // A live conversation may predate the skill, and its worktree may not contain it.
+        // Reading an absolute instruction file works in both cases and on every harness.
+        let file = (scope.harness == Harness::Codex)
+            .then(|| cide_spec::claude::codex_file(root, "apply-change"))
+            .flatten()
+            .or_else(|| cide_spec::claude::file(root, "apply-change"));
+        let line = file
+            .map(|file| {
+                format!(
+                    "Follow the OpenSpec apply instructions in `{}` for {change}.",
+                    root.join(file).display()
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "Continue implementing OpenSpec change {change} using its apply instructions."
+                )
+            });
+        if scope.cwd != root
+            && let Some(name) = scope.cwd.file_name().and_then(|name| name.to_str())
+            && scope.cwd == cide_git::worktree::path_of(root, name)
+        {
+            carry_change(root, &scope.cwd, change.as_str(), &carried_dir(root, name))?;
+        }
+        let line = match request
+            .text
+            .as_deref()
+            .map(super::agents::one_line)
+            .filter(|text| !text.is_empty())
+        {
+            Some(text) => format!("{line} {text}"),
+            None => line,
+        };
+        registry.follow_up(app, project, held.run, &line)?;
+    }
+    Ok(held.run)
+}
+
+/// A Doing gesture opts into OpenSpec even in projects with ordinary auto-dispatch disabled.
+pub(crate) fn apply_task(
+    app: &AppHandle,
+    project: ProjectId,
+    task: &cide_ipc::Task,
+    author: cide_ipc::TaskAuthor,
+) -> Result<RunId> {
+    let state = app.state::<WorkspaceState>();
+    let root = tasks_state::project_root(&state, project)?;
+    let registry = app.state::<Arc<AgentRegistry>>();
+    let stores = app.state::<Arc<crate::tasks_state::TasksStores>>();
+    let store = stores.ensure(project, &root);
+    if let Some(why) = super::agents::task_refusal(&root, &store, task) {
+        return Err(CoreError::Io(why));
+    }
+    let launcher = match task.agent.clone() {
+        Some(agent) => SpecLauncher::Role { agent },
+        None => SpecLauncher::Harness {
+            harness: state.with(|ws| match ws.settings.console_harness {
+                cide_ipc::ConsoleHarness::Claude => Harness::Claude,
+                cide_ipc::ConsoleHarness::Codex => Harness::Codex,
+            }),
+        },
+    };
+    start_session(
+        app,
+        &registry,
+        &root,
+        project,
+        SpecSessionStart {
+            op: SpecOp::Apply,
+            change: task.change.clone(),
+            text: None,
+            launcher,
+        },
+        author,
     )
 }
 
@@ -313,6 +454,8 @@ fn plan_session(
         notify: cide_ipc::RunNotify::Silent,
         purpose: RunPurpose::Spec(SpecPurpose {
             op: request.op,
+            task: None,
+            suppress_reveal: false,
             change,
             text,
             cwd,
@@ -324,6 +467,50 @@ fn plan_session(
         // Resolved at the fork, like a review's.
         pool: Vec::new(),
     })
+}
+
+/// The same real workflow as a standalone proposal, with access to the task it will link.
+pub(super) fn plan_task_proposal(
+    root: &Path,
+    project: ProjectId,
+    task: &cide_ipc::Task,
+    harness: Harness,
+) -> Result<DispatchSpec> {
+    let mut spec = plan_session(
+        root,
+        project,
+        SpecSessionStart {
+            op: SpecOp::Propose,
+            change: None,
+            text: Some(format!("{} {}", task.title, task.body)),
+            launcher: SpecLauncher::Harness { harness },
+        },
+    )?;
+    // Tool spellings belong to the harness. A prose instruction naming Claude's tool under
+    // opencode used to leave an agent hunting for a function it had never been served.
+    let tools = cide_agents::harness::for_kind(harness)
+        .ok_or_else(|| CoreError::Io("This harness cannot run an OpenSpec proposal".into()))?;
+    spec.prompt.push_str(&format!(
+        " (This proposal is for cide task {id}. Read it with {get}, including its attachments. \
+         When the change exists, call {update} with task \"{id}\" and change set to the new \
+         change's folder name under openspec/changes/, then leave one comment with {comment} \
+         saying what you proposed. Do not implement the change or change the task's status.)",
+        id = task.id,
+        get = tools.tool_name("cide_task_get"),
+        update = tools.tool_name("cide_task_update"),
+        comment = tools.tool_name("cide_task_comment"),
+    ));
+    if let RunPurpose::Spec(purpose) = &mut spec.purpose {
+        purpose.task = Some(task.id.clone());
+        purpose.brief = format!(
+            "Write an OpenSpec proposal for cide task {} using the installed propose workflow. \
+             Work in the project root and leave the proposal uncommitted for the user to review. \
+             Use the task tools to read the task and link the resulting change back to it. \
+             Do not create tasks, implement the change, change task status, or archive it.",
+            task.id
+        );
+    }
+    Ok(spec)
 }
 
 fn harness_label(harness: Harness) -> &'static str {
@@ -700,6 +887,62 @@ pub(crate) fn archive_dir(root: &Path, change: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_proposals_use_the_installed_workflow_and_keep_implementation_separate() {
+        let root =
+            std::env::temp_dir().join(format!("cide-task-proposal-{}", uuid::Uuid::new_v4()));
+        let skill = root.join(".claude/skills/openspec-propose/SKILL.md");
+        std::fs::create_dir_all(skill.parent().expect("parent")).expect("scratch");
+        std::fs::create_dir_all(root.join("openspec")).expect("spec root");
+        std::fs::write(
+            &skill,
+            "---\nname: openspec-propose\n---\nWrite a proposal.",
+        )
+        .expect("skill");
+        let store = cide_tasks::TaskStore::open(&root);
+        let project = ProjectId::new();
+        let req: cide_ipc::TaskNew = serde_json::from_value(serde_json::json!({
+            "project": project, "title": "Dark mode", "body": "Follow system\npreferences"
+        }))
+        .expect("request");
+        let task = store
+            .create(&req, cide_ipc::TaskAuthor::User)
+            .expect("task");
+        for harness in [Harness::Claude, Harness::Codex] {
+            let planned = plan_task_proposal(&root, project, &task, harness).expect("proposal");
+            assert!(
+                planned.task.is_none(),
+                "no implementation binding or status lifecycle"
+            );
+            assert!(
+                planned.checkout.is_none(),
+                "proposal is visible in the project root"
+            );
+            assert!(!planned.prompt.contains('\n'), "one submitted turn");
+            assert!(planned.prompt.contains("Follow system preferences"));
+            assert!(planned.prompt.contains("mcp__cide__cide_task_update"));
+            let RunPurpose::Spec(purpose) = planned.purpose else {
+                panic!("OpenSpec purpose")
+            };
+            assert_eq!(purpose.task.as_ref(), Some(&task.id));
+            assert!(purpose.brief.contains("link the resulting change"));
+            assert!(
+                !purpose
+                    .brief
+                    .contains("Do not create tasks or look for a task board")
+            );
+            let reloaded: SpecPurpose =
+                serde_json::from_str(&serde_json::to_string(&purpose).expect("persist"))
+                    .expect("restore");
+            assert_eq!(reloaded.task, purpose.task, "task tools survive restart");
+        }
+        assert!(
+            store.get(&task.id).expect("task").change.is_none(),
+            "planning did not scaffold a stub or invent a link"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn a_change_name_that_is_not_kebab_is_refused_before_it_names_a_path() {

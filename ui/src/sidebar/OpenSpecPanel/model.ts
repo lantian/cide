@@ -862,6 +862,15 @@ export function primaryAction(
     }
   }
 
+  if (taskStatus === 'doing' || taskStatus === 'review') {
+    return {
+      id: 'none',
+      label: '',
+      hint: 'This task is already in progress. Open its spec or session to follow the work.',
+      gate: { ok: false, reason: 'This task has already moved into implementation.' },
+    }
+  }
+
   if (done > 0) {
     return {
       id: 'none',
@@ -872,18 +881,8 @@ export function primaryAction(
   }
 
   /*
-   * Nothing ticked yet: the gesture is to approve it, and approving *is* assigning.
-   *
-   * **Which is why there is no precondition here.** This gate used to refuse until an assignee
-   * had been picked — correct while the assignee row was the only way to start work, and exactly
-   * backwards once the button became the thing that picks one. Together with the row being
-   * hidden on an unapproved change it made a deadlock: a greyed button reading "pick an assignee
-   * first", above no way to pick one. The button opens the picker; the picker is where the
-   * choice between a role, an open conversation and a new one is made.
-   *
-   * `assignee` stays a parameter because the *hint* still reads differently once something is
-   * assigned — a change that already has a role can be re-approved onto another target, and the
-   * line should not go on saying nothing has been chosen.
+   * Nothing ticked yet: approval starts Apply using the default harness and moves the task to
+   * Doing. It needs no assignee or target picker. The task card opens the resulting run's tab.
    */
   /*
    * Already handed to a conversation: there is nothing prominent left to press.
@@ -922,9 +921,7 @@ export function primaryAction(
   return {
     id: 'approve',
     label: assigned ? 'Dispatch again' : 'Approve & dispatch',
-    hint: assigned
-      ? 'Sends this change’s work somewhere — a role, a conversation already open, or a new one.'
-      : 'Choose where the work happens. Approving a change is assigning it — the specs stay untouched until it is archived.',
+    hint: 'Move this task to Doing and open an OpenSpec Apply session using the default harness. The specs stay untouched until the change is archived.',
     gate: { ok: true },
   }
 }
@@ -1307,10 +1304,18 @@ export interface SessionStateView {
  * The chip for a session's run state. Takes the wire's `{ state }` object and nothing else.
  *
  * `idle` is **done for now**, not finished: the child is alive and holding its conversation, the
- * ordinary state when the user decides whether the change is ready. `interrupted` is a run a cide
- * restart cut off — *Open session* continues it.
+ * ordinary state when the user decides whether the change is ready. `turnComplete` records a
+ * normal hand-back separately, so a restart ending its idle child cannot turn completed work
+ * into an interruption. It says nothing about checklist completion or acceptance.
  */
-export function sessionState(state: { state: string }): SessionStateView {
+export function sessionPhase<T extends string>(state: { state: T }, turnComplete = false): T | 'finished' {
+  return turnComplete && (state.state === 'idle' || state.state === 'interrupted') ? 'finished' : state.state
+}
+
+export function sessionState(state: { state: string }, turnComplete = false): SessionStateView {
+  if (turnComplete && sessionPhase(state, turnComplete) === 'finished') {
+    return { label: 'Finished', tone: 'green', live: state.state === 'idle', working: false }
+  }
   switch (state.state) {
     case 'queued':
       return { label: 'Queued', tone: 'neutral', live: true, working: false }
@@ -1448,6 +1453,7 @@ export function sessionViews(
     text: string
     label: string
     state: { state: string }
+    turnComplete?: boolean | undefined
   }[],
 ): { byChange: Readonly<Record<string, SessionView>>; loose: readonly SessionView[] } {
   const byChange: Record<string, SessionView> = {}
@@ -1461,7 +1467,7 @@ export function sessionViews(
       change,
       caption: change ?? sessionCaption(row.op, row.text),
       who: row.label,
-      state: sessionState(row.state),
+      state: sessionState(row.state, row.turnComplete),
     }
     if (change !== null) {
       if (!Object.hasOwn(byChange, change)) byChange[change] = view

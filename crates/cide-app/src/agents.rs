@@ -787,6 +787,32 @@ fn holder_in(
         })
 }
 
+/// An implementation belongs to the change, even when two different tasks or launchers name
+/// it. Proposal and Explore runs do not hold this key. Checked under the queue's insertion lock.
+fn implementation_change(purpose: &RunPurpose, change: Option<&str>) -> Option<String> {
+    match purpose {
+        RunPurpose::Spec(spec) if spec.op == cide_ipc::SpecOp::Apply => spec.change.clone(),
+        RunPurpose::Work(_) => change.map(str::to_string),
+        _ => None,
+    }
+}
+
+fn change_holder_in(inner: &Inner, project: ProjectId, change: &str) -> Option<HeldPair> {
+    inner
+        .runs
+        .values()
+        .find(|run| {
+            run.project == project
+                && holds_a_pair(&run.state)
+                && implementation_change(&run.purpose, run.change.as_deref()).as_deref()
+                    == Some(change)
+        })
+        .map(|run| HeldPair {
+            run: run.run,
+            state: run.state.clone(),
+        })
+}
+
 /// [`AgentRegistry::last_conversation`]'s rule over the table, so a test can drive it. (M116)
 fn last_conversation_in(
     inner: &Inner,
@@ -1043,9 +1069,8 @@ pub enum RunPurpose {
         /// travel together.
         harness: Harness,
     },
-    /// A session started from the OpenSpec panel — Propose, Explore or Apply — with no task.
-    /// Served no tracker tool (`agent_rpc`'s `Scope::Run { board: false }`) and told none of the
-    /// tracker's paragraphs; its brief is `cide_agents::harness::spec_session_brief`.
+    /// An OpenSpec session. Standalone runs have no tracker tools or tracker paragraphs;
+    /// proposals originating from a saved task get task tools and their own task-aware brief.
     ///
     /// Unlike a review this **is** persisted ([`SavedSpec`]): its worktree and branch outlive the
     /// process, and the panel finds a change's session by this purpose after a restart.
@@ -1066,6 +1091,13 @@ pub enum Dismissed {
 #[serde(rename_all = "camelCase")]
 pub struct SpecPurpose {
     pub op: cide_ipc::SpecOp,
+    /// A proposal requested while creating an existing task. Kept in the purpose, rather than
+    /// the implementation run's task slot: proposing must not change assignment or task status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<cide_ipc::TaskId>,
+    /// A background proposal must not reveal its result over the user's current tab either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suppress_reveal: bool,
     #[serde(default)]
     pub change: Option<String>,
     /// What the user typed to start it.
@@ -1421,10 +1453,15 @@ impl AgentRegistry {
     /// role — genuinely can both pass a check before either reaches here. That is the pair that
     /// produced the report.
     ///
-    /// A spec with `task: None` never duplicates: such a run stands in the project root with no
-    /// worktree to contend for (M40), and N of them is what that road says on its face.
+    /// Runs with neither a task nor an implementation change key remain independent: Propose
+    /// and Explore can coexist in the project root. Apply also claims its change across roles.
     pub fn enqueue_unique(&self, spec: DispatchSpec) -> std::result::Result<RunId, HeldPair> {
         let mut inner = self.inner.lock();
+        if let Some(change) = implementation_change(&spec.purpose, spec.change.as_deref())
+            && let Some(held) = change_holder_in(&inner, spec.project, &change)
+        {
+            return Err(held);
+        }
         if let Some(task) = spec.task.as_ref()
             && let Some(held) = holder_in(&inner, spec.project, &spec.agent, task)
         {
@@ -3066,6 +3103,11 @@ impl AgentRegistry {
     ) -> std::result::Result<RunId, HeldPair> {
         let prompt = spec.prompt.clone();
         let mut inner = self.inner.lock();
+        if let Some(change) = implementation_change(&spec.purpose, spec.change.as_deref())
+            && let Some(held) = change_holder_in(&inner, spec.project, &change)
+        {
+            return Err(held);
+        }
         if let Some(task) = spec.task.as_ref()
             && let Some(held) = holder_in(&inner, spec.project, &spec.agent, task)
         {
@@ -3103,31 +3145,51 @@ impl AgentRegistry {
     /// Every OpenSpec session of a project, newest first, for the panel. (OpenSpec sessions)
     pub fn spec_runs(&self, project: ProjectId) -> Vec<cide_ipc::SpecRunRow> {
         let inner = self.inner.lock();
-        let mut rows: Vec<(u64, cide_ipc::SpecRunRow)> = inner
-            .runs
-            .values()
-            .filter(|run| run.project == project)
-            .filter_map(|run| match &run.purpose {
-                RunPurpose::Spec(spec) if !spec.dismissed => Some((
-                    run.seq,
-                    cide_ipc::SpecRunRow {
-                        run: run.run,
-                        op: spec.op,
-                        change: spec.change.clone().map(cide_ipc::ChangeName),
-                        text: spec.text.clone(),
-                        label: run.agent_label.clone(),
-                        state: run.state.clone(),
-                        session: run.session,
-                        branch: spec
-                            .checkout
-                            .as_ref()
-                            .map(|name| format!("{}/{name}", cide_git::worktree::BRANCH_PREFIX)),
-                        started_unix_ms: run.started_unix_ms,
-                    },
-                )),
-                _ => None,
-            })
-            .collect();
+        let mut rows: Vec<(u64, cide_ipc::SpecRunRow)> =
+            inner
+                .runs
+                .values()
+                .filter(|run| run.project == project)
+                .filter_map(|run| match &run.purpose {
+                    RunPurpose::Spec(spec) if !spec.dismissed => Some((
+                        run.seq,
+                        cide_ipc::SpecRunRow {
+                            run: run.run,
+                            op: spec.op,
+                            task: spec.task.clone(),
+                            change: spec.change.clone().map(cide_ipc::ChangeName),
+                            text: spec.text.clone(),
+                            label: run.agent_label.clone(),
+                            state: run.state.clone(),
+                            turn_complete: spec_turn_complete(run),
+                            session: run.session,
+                            branch: spec.checkout.as_ref().map(|name| {
+                                format!("{}/{name}", cide_git::worktree::BRANCH_PREFIX)
+                            }),
+                            started_unix_ms: run.started_unix_ms,
+                        },
+                    )),
+                    RunPurpose::Work(_) if run.change.is_some() => Some((
+                        run.seq,
+                        cide_ipc::SpecRunRow {
+                            run: run.run,
+                            op: cide_ipc::SpecOp::Apply,
+                            task: run.task.clone(),
+                            change: run.change.clone().map(cide_ipc::ChangeName),
+                            text: run.task_title.clone().unwrap_or_default(),
+                            label: run.agent_label.clone(),
+                            state: run.state.clone(),
+                            turn_complete: spec_turn_complete(run),
+                            session: run.session,
+                            branch: run.checkout.as_ref().map(|name| {
+                                format!("{}/{name}", cide_git::worktree::BRANCH_PREFIX)
+                            }),
+                            started_unix_ms: run.started_unix_ms,
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect();
         rows.sort_by(|a, b| b.0.cmp(&a.0));
         rows.into_iter().map(|(_, row)| row).collect()
     }
@@ -3228,6 +3290,11 @@ impl AgentRegistry {
         let parked_now = !matches!(live.state, RunState::AwaitingPermission)
             && matches!(next, RunState::AwaitingPermission);
         let now = now_unix_ms();
+        // The shutdown reaper can see a hung-up TUI before restore does. Keep the same waiting
+        // fact the snapshot keeps, so losing an idle child does not lose its completed turn.
+        if next == RunState::Interrupted && self.going_down() {
+            live.parked_at_quit = ParkedAtQuit::of(&live.state);
+        }
         live.parked_since_unix_ms = match (parked_now, &next) {
             (true, _) => Some(now),
             (false, RunState::AwaitingPermission) => live.parked_since_unix_ms,
@@ -3520,6 +3587,43 @@ impl AgentRegistry {
         task: &TaskId,
     ) -> Option<HeldPair> {
         holder_in(&self.inner.lock(), project, agent, task)
+    }
+
+    pub fn change_holding(&self, project: ProjectId, change: &str) -> Option<HeldPair> {
+        change_holder_in(&self.inner.lock(), project, change)
+    }
+
+    /// A proposal may link a task after its assigned implementation run already started.
+    /// Keep that run's change key current so Apply reuses it rather than starting a rival.
+    pub fn note_task_change(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        task: &TaskId,
+        change: Option<&cide_ipc::ChangeName>,
+    ) {
+        let mut inner = self.inner.lock();
+        for run in inner.runs.values_mut().filter(|run| {
+            run.project == project
+                && run.task.as_ref() == Some(task)
+                && matches!(run.purpose, RunPurpose::Work(_))
+        }) {
+            run.change = change.map(|change| change.as_str().to_string());
+        }
+        drop(inner);
+        self.mark_changed(app, project);
+    }
+
+    pub fn background_proposal_for(
+        &self,
+        project: ProjectId,
+        task: &TaskId,
+        agent: &AgentId,
+    ) -> bool {
+        self.inner.lock().runs.values().any(|run| {
+            run.project == project && &run.agent == agent
+                && matches!(&run.purpose, RunPurpose::Spec(spec) if spec.task.as_ref() == Some(task) && spec.suppress_reveal)
+        })
     }
 
     /// Whether `session` belongs to a run that has not ended — the guard `session_kill` asks.
@@ -4106,6 +4210,18 @@ fn move_to(live: &mut LiveRun, next: RunState, now_ms: u64) {
         (true, true) | (false, false) => {}
     }
     live.state = next;
+}
+
+/// A completed turn is independent of its TUI's lifetime. The slot distinguishes the initial
+/// SessionStart → Idle window from an actual hand-back; the saved park distinguishes an idle
+/// child's loss at restart from a turn cut off while working. Never infer completion from files.
+fn spec_turn_complete(live: &LiveRun) -> bool {
+    match live.state {
+        RunState::Idle => !live.slot,
+        RunState::Interrupted => live.parked_at_quit == Some(ParkedAtQuit::Idle),
+        RunState::Finished { code: 0 } => true,
+        _ => false,
+    }
 }
 
 /// What this run's worked figure is **right now**, closing the open interval if there is one.
@@ -10226,6 +10342,280 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_admission_is_unique_across_launchers_tasks_and_projects() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut assigned = spec(project, "developer", 2, 4);
+        assigned.task = Some(TaskId("t-1".into()));
+        assigned.change = Some("add-dark-mode".into());
+        let original = registry
+            .enqueue_unique(assigned)
+            .expect("task implementation");
+        let mut apply = spec(project, "openspec", 2, 4);
+        apply.purpose = RunPurpose::Spec(SpecPurpose {
+            op: cide_ipc::SpecOp::Apply,
+            task: None,
+            suppress_reveal: false,
+            change: Some("add-dark-mode".into()),
+            text: String::new(),
+            cwd: std::env::temp_dir(),
+            checkout: None,
+            launcher: cide_ipc::SpecLauncher::Harness {
+                harness: Harness::Codex,
+            },
+            brief: String::new(),
+            dismissed: false,
+        });
+        assert_eq!(
+            registry
+                .enqueue_unique(apply.clone())
+                .expect_err("same change")
+                .run,
+            original
+        );
+        assert_eq!(
+            registry.spec_runs(project).len(),
+            1,
+            "task implementation is visible from OpenSpec"
+        );
+        let mut second_task = spec(project, "qa", 2, 4);
+        second_task.task = Some(TaskId("t-2".into()));
+        second_task.change = Some("add-dark-mode".into());
+        assert_eq!(
+            registry
+                .enqueue_unique(second_task)
+                .expect_err("same change, another task")
+                .run,
+            original
+        );
+        apply.project = ProjectId::new();
+        assert!(
+            registry.enqueue_unique(apply.clone()).is_ok(),
+            "another project is independent"
+        );
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&original)
+            .expect("run")
+            .state = RunState::Finished { code: 0 };
+        apply.project = project;
+        assert!(
+            registry.enqueue_unique(apply).is_ok(),
+            "completed work does not hold Apply"
+        );
+    }
+
+    #[test]
+    fn concurrent_apply_admission_creates_one_run_for_a_change() {
+        let registry = Arc::new(AgentRegistry::default());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let project = ProjectId::new();
+        let threads: Vec<_> = (0..4)
+            .map(|index| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut work = spec(project, &format!("role-{index}"), 4, 4);
+                    work.task = Some(TaskId(format!("t-{index}")));
+                    work.change = Some("add-dark-mode".into());
+                    barrier.wait();
+                    registry.enqueue_unique(work)
+                })
+            })
+            .collect();
+        let answers: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("worker"))
+            .collect();
+        assert_eq!(answers.iter().filter(|answer| answer.is_ok()).count(), 1);
+        let winner = answers
+            .iter()
+            .find_map(|answer| answer.as_ref().ok())
+            .expect("winner");
+        assert!(
+            answers
+                .iter()
+                .filter_map(|answer| answer.as_ref().err())
+                .all(|held| held.run == *winner)
+        );
+        assert_eq!(registry.spec_runs(project).len(), 1);
+    }
+
+    #[test]
+    fn a_proposal_session_keeps_its_task_link_through_restart_without_claiming_implementation() {
+        let dir = std::env::temp_dir().join(format!("cide-proposal-link-{}", RunId::new()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let task = TaskId("t-42".into());
+        let mut session = spec(project, "openspec", 4, 4);
+        session.purpose = RunPurpose::Spec(SpecPurpose {
+            op: cide_ipc::SpecOp::Propose,
+            task: Some(task.clone()),
+            suppress_reveal: true,
+            change: None,
+            text: "Dark mode".into(),
+            cwd: dir.clone(),
+            checkout: None,
+            launcher: cide_ipc::SpecLauncher::Harness {
+                harness: Harness::Codex,
+            },
+            brief: String::new(),
+            dismissed: false,
+        });
+        let run = registry.enqueue(session);
+        assert_eq!(registry.spec_runs(project)[0].task.as_ref(), Some(&task));
+        assert_eq!(
+            registry.runs_for(project)[0].task,
+            None,
+            "proposal does not own task lifecycle"
+        );
+        let child = SessionId::new();
+        registry.take_admissions();
+        registry.bind_session(run, child);
+        registry.set_state(None, run, RunState::Running);
+        assert_eq!(registry.spec_runs(project)[0].session, Some(child));
+        registry.write_snapshot_now(&path);
+        let after = Arc::new(AgentRegistry::default());
+        after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        let restored = after.spec_runs(project);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].run, run);
+        assert_eq!(restored[0].task.as_ref(), Some(&task));
+        assert_eq!(after.runs_for(project)[0].task, None);
+        std::fs::remove_dir_all(dir).expect("clean scratch");
+    }
+
+    #[test]
+    fn a_completed_spec_turn_stays_complete_when_its_idle_child_ends_with_cide() {
+        let dir = std::env::temp_dir().join(format!("cide-spec-completion-{}", RunId::new()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+        let project = ProjectId::new();
+        let before = Arc::new(AgentRegistry::default());
+        let mut proposal = spec(project, "openspec", 4, 4);
+        proposal.harness = Harness::Codex;
+        proposal.purpose = RunPurpose::Spec(SpecPurpose {
+            op: cide_ipc::SpecOp::Propose,
+            task: Some(TaskId("t-1".into())),
+            suppress_reveal: true,
+            change: None,
+            text: "Initial task".into(),
+            cwd: dir.clone(),
+            checkout: None,
+            launcher: cide_ipc::SpecLauncher::Harness {
+                harness: Harness::Codex,
+            },
+            brief: String::new(),
+            dismissed: false,
+        });
+        let run = before.enqueue(proposal);
+        let child = SessionId::new();
+        before.take_admissions();
+        before.bind_session(run, child);
+        before.note_harness_session(run, SessionId::new().to_string());
+        before.set_state(None, run, RunState::Idle);
+        assert!(
+            !before.spec_runs(project)[0].turn_complete,
+            "SessionStart is not a completed turn"
+        );
+        before.set_state(None, run, RunState::Running);
+        assert!(!before.spec_runs(project)[0].turn_complete);
+        before.set_state(None, run, RunState::Idle);
+        assert!(
+            before.spec_runs(project)[0].turn_complete,
+            "normal hand-back completes the turn"
+        );
+        assert_eq!(
+            state_of(&before, run),
+            RunState::Idle,
+            "the live TUI stays available"
+        );
+
+        // The user's old snapshot: an idle turn, then Interrupted + parkedAtQuit=idle after
+        // restore. No new persisted field is required to recover its correct presentation.
+        before.write_snapshot_to(&path);
+        for _ in 0..2 {
+            let restored = Arc::new(AgentRegistry::default());
+            restored.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+            let row = &restored.spec_runs(project)[0];
+            assert_eq!(
+                row.state,
+                RunState::Interrupted,
+                "child lifecycle still reflects restart"
+            );
+            assert!(
+                row.turn_complete,
+                "restart did not interrupt the already completed turn"
+            );
+            assert_eq!(row.task, Some(TaskId("t-1".into())));
+            assert!(
+                matches!(
+                    restored
+                        .open_plan_with(
+                            project,
+                            run,
+                            &SessionRegistry::default(),
+                            &dir,
+                            true,
+                            |_, _, _| true
+                        )
+                        .unwrap(),
+                    RunOpen::Continue { .. }
+                ),
+                "the finished turn's conversation can still be opened"
+            );
+            restored.write_snapshot_to(&path);
+        }
+
+        // Immediate shutdown reporting agrees with restoration.
+        before.begin_going_down();
+        assert_eq!(before.external_stop(child, 129), Some(project));
+        assert!(before.spec_runs(project)[0].turn_complete);
+        std::fs::remove_dir_all(dir).expect("clean scratch");
+    }
+
+    #[test]
+    fn a_spec_turn_cut_off_mid_work_or_at_permission_is_not_complete() {
+        let dir = std::env::temp_dir().join(format!("cide-spec-interrupted-{}", RunId::new()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("agent-runs.json");
+        for state in [
+            RunState::Running,
+            RunState::AwaitingPermission,
+            RunState::Paused { since_unix_ms: 0 },
+            RunState::Finished { code: 1 },
+        ] {
+            let before = Arc::new(AgentRegistry::default());
+            let project = ProjectId::new();
+            let run = before.enqueue(spec(project, "developer", 4, 4));
+            {
+                let mut inner = before.inner.lock();
+                let live = inner.runs.get_mut(&run).unwrap();
+                live.change = Some("add-static-todo-page".into());
+                live.state = state.clone();
+            }
+            assert!(!before.spec_runs(project)[0].turn_complete, "{state:?}");
+            before.write_snapshot_to(&path);
+            let after = Arc::new(AgentRegistry::default());
+            after.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+            // A role's change is re-read at admission; its lifecycle must stay untouched too.
+            assert!(matches!(
+                state_of(&after, run),
+                RunState::Interrupted | RunState::Finished { code: 1 }
+            ));
+            assert!(
+                !spec_turn_complete(&after.inner.lock().runs[&run]),
+                "{state:?}"
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("clean scratch");
+    }
+
     /// The OpenSpec panel's dismiss forgets an ended session, and only an ended OpenSpec one.
     #[test]
     fn a_spec_session_is_dismissed_unless_it_is_mid_turn() {
@@ -10234,6 +10624,8 @@ mod tests {
         let mut session = spec(project, "openspec", 4, 4);
         session.purpose = RunPurpose::Spec(SpecPurpose {
             op: cide_ipc::SpecOp::Propose,
+            task: None,
+            suppress_reveal: false,
             change: None,
             text: "an idea".into(),
             cwd: std::env::temp_dir(),

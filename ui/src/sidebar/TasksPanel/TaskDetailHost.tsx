@@ -111,6 +111,9 @@ import {
 } from './model'
 import type { ArmedDelete, FieldEdit, LinkChip, LinkTargetOption, RunRef } from './model'
 import type { LinkAdd } from './TaskDetail'
+import { openTaskSpec, approveTaskSpec } from './openSpec'
+import { taskSpecSessions, taskSpecPhase } from './specSessions'
+import { followSpecRuns, openSession as openSpecSession, useSpecRuns } from '../OpenSpecPanel/specRuns'
 
 /** How often the comment log's ages are recomputed. See the header for why it is not 1 s. */
 const TICK_MS = 30_000
@@ -130,6 +133,11 @@ function TaskDetailHostImpl() {
   const editTask = useTasks((s) => s.edit)
   const respondTask = useTasks((s) => s.respond)
   const removeTask = useTasks((s) => s.remove)
+  // These runs are available even when the subagent roster is disabled or empty. Following
+  // their events also preserves the link after the user switches away from OpenSpec.
+  const specRuns = useSpecRuns((s) => s.runs)
+  const specRunsProject = useSpecRuns((s) => s.project)
+  useEffect(() => followSpecRuns(project, false), [project])
 
   /*
    * The join with the agents store — see the header. All four selectors return stored values
@@ -399,7 +407,7 @@ function TaskDetailHostImpl() {
    */
   const [specProblem, setSpecProblem] = useState<string | null>(null)
   /**
-   * `Integrate & Archive` is in flight. See `TaskDetailProps::specBusy`.
+   * Approval or `Integrate & Archive` is in flight. See `TaskDetailProps::specBusy`.
    *
    * Local to the host and not in a store: it is transient gesture state about *this card*, which
    * is the webview's half of the state loop — `ui/src/store/workspace.ts`'s header draws the
@@ -438,6 +446,15 @@ function TaskDetailHostImpl() {
     { kind: 'regressed' | 'conflicted'; messages: readonly string[] } | null
   >(null)
   const change = open?.change ?? null
+  const workflowSessions = useMemo(() => specRunsProject === project
+    ? taskSpecSessions(specRuns, selected, change).map((run) => ({
+      run: String(run.run),
+      op: run.op === 'apply' ? 'apply' as const : 'propose' as const,
+      label: run.label,
+      phase: taskSpecPhase(run),
+      failure: run.state.state === 'failed' ? run.state.reason : null,
+    }))
+    : [], [specRuns, specRunsProject, project, selected, change])
   /*
    * Does this task's role run in its own checkout? `null` for a task with no role, or a roster
    * nobody has read yet.
@@ -732,6 +749,11 @@ function TaskDetailHostImpl() {
         useMilestones.getState().reveal(id)
       }}
       runs={runs}
+      workflowSessions={workflowSessions}
+      onOpenWorkflowSession={(run) => {
+        const row = taskSpecSessions(specRuns, selected, change).find((candidate) => candidate.run === run)
+        if (project !== null && row) guarded(openSpecSession(project, row).then(() => select(null)))
+      }}
       roles={roles}
       roleColors={roleColors}
       assigneeHint={hint}
@@ -834,11 +856,14 @@ function TaskDetailHostImpl() {
       onOpenSpecFile={(path) => {
         if (project !== null) guarded(file.open(project, path).then(() => undefined))
       }}
+      onOpenSpec={project !== null && change !== null ? () => guarded(openTaskSpec(project, change)) : undefined}
       specBusy={specBusy}
       onSpecPrimary={(task, action) => {
-        // `approve` is *assigning*, which the assignee row already does and which the trigger in
-        // Rust turns into a dispatch — so the button focuses that decision rather than making it
-        // for the user. `accept` is the one gesture that belongs here.
+        if (action === 'approve' && project !== null && change !== null) {
+          setSpecBusy(true)
+          guarded(approveTaskSpec(project, task, change).finally(() => setSpecBusy(false)))
+          return
+        }
         if (action === 'accept' && project !== null) {
           /*
            * The board refreshes itself: `spec_accept` broadcasts both `tasks-changed` and

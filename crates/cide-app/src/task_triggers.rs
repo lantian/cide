@@ -128,9 +128,86 @@ pub fn consider(
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if let Some(registry) = app.try_state::<Arc<AgentRegistry>>() {
+            for mutation in &mutations {
+                if mutation
+                    .before
+                    .as_ref()
+                    .and_then(|task| task.change.as_ref())
+                    != mutation.after.change.as_ref()
+                {
+                    // Bursts can reach the blocking pool out of order. Reflect the saved
+                    // task, so an older link event cannot reclaim a change just unlinked.
+                    if let Some(current) = app
+                        .try_state::<Arc<TasksStores>>()
+                        .and_then(|stores| stores.get(project))
+                        .and_then(|store| store.get(&mutation.after.id))
+                    {
+                        registry.note_task_change(
+                            &app,
+                            project,
+                            &current.id,
+                            current.change.as_ref(),
+                        );
+                    }
+                }
+            }
+        }
         crate::spec_reveal::consider(&app, project, &mutations);
-        consider_blocking(&app, project, mutations, notify);
+        let ordinary = mutations
+            .into_iter()
+            .filter(|mutation| {
+                if !starts_apply(mutation) {
+                    return true;
+                }
+                // The user may have moved it back or unlinked it before this blocking worker ran.
+                let current = app
+                    .try_state::<Arc<TasksStores>>()
+                    .and_then(|stores| stores.get(project))
+                    .and_then(|store| store.get(&mutation.after.id));
+                let Some(current) = current.filter(|task| {
+                    task.status == TaskStatus::Doing && task.change == mutation.after.change
+                }) else {
+                    return false;
+                };
+                let change = mutation
+                    .after
+                    .change
+                    .clone()
+                    .expect("linked Doing transition");
+                let outcome = crate::cmd::spec_sessions::apply_task(
+                    &app,
+                    project,
+                    &current,
+                    mutation.author.clone(),
+                );
+                let (run, error) = match outcome {
+                    Ok(run) => (Some(run), None),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "Task {} is Doing, but OpenSpec Apply could not start: {error}",
+                            mutation.after.id
+                        )),
+                    ),
+                };
+                crate::emit::task_apply_started(&app, project, change, run, error);
+                // Even a failed Apply must not fall through into a second ordinary assignment run.
+                false
+            })
+            .collect();
+        consider_blocking(&app, project, ordinary, notify);
     });
+}
+
+fn starts_apply(mutation: &TaskMutation) -> bool {
+    !matches!(mutation.author, TaskAuthor::Agent { .. })
+        && mutation.after.change.is_some()
+        && mutation.after.status == TaskStatus::Doing
+        && mutation
+            .before
+            .as_ref()
+            .is_none_or(|before| before.status != TaskStatus::Doing)
 }
 
 fn consider_blocking(
@@ -345,5 +422,68 @@ pub fn note_run_started(app: &AppHandle, project: ProjectId, task: &TaskId) {
             crate::tasks_state::broadcast(app, project, &store);
         }
         Err(error) => tracing::debug!(%task, %error, "could not move the run's task to doing"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn linked(status: TaskStatus) -> Task {
+        Task {
+            id: TaskId("t-1".into()),
+            title: "Add dark mode".into(),
+            body: String::new(),
+            status,
+            agent: None,
+            session: None,
+            change: Some(cide_ipc::ChangeName("add-dark-mode".into())),
+            links: Vec::new(),
+            comments: Vec::new(),
+            history: Vec::new(),
+            created_by: TaskAuthor::User,
+            created_unix_ms: 0,
+            updated_unix_ms: 0,
+            attachments: Vec::new(),
+            acceptance: None,
+            question: None,
+            touches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_linked_doing_edge_from_a_user_or_orchestrator_starts_apply() {
+        let mut mutation = TaskMutation {
+            before: Some(linked(TaskStatus::Todo)),
+            after: linked(TaskStatus::Doing),
+            author: TaskAuthor::User,
+            assign_gesture: false,
+            fresh_text: Vec::new(),
+        };
+        assert!(starts_apply(&mutation));
+        mutation.author = TaskAuthor::Orchestrator;
+        assert!(starts_apply(&mutation));
+        mutation.author = TaskAuthor::Agent {
+            agent: AgentId("developer".into()),
+            label: "Developer".into(),
+        };
+        assert!(
+            !starts_apply(&mutation),
+            "a worker's status update must not spawn work"
+        );
+        mutation.author = TaskAuthor::User;
+        mutation.before = Some(linked(TaskStatus::Doing));
+        assert!(
+            !starts_apply(&mutation),
+            "same status and proposal-link echoes are inert"
+        );
+        mutation.before = Some(linked(TaskStatus::Todo));
+        mutation.after.change = None;
+        assert!(
+            !starts_apply(&mutation),
+            "ordinary tasks keep their workflow"
+        );
+        mutation.after = linked(TaskStatus::Review);
+        assert!(!starts_apply(&mutation));
     }
 }

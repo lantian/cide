@@ -4,11 +4,16 @@ import type { RunId } from "./RunId";
 import type { RunState } from "./RunState";
 import type { SessionId } from "./SessionId";
 import type { SpecOp } from "./SpecOp";
+import type { TaskId } from "./TaskId";
 
 /**
  * One OpenSpec session the registry knows about, for the panel's status chip and its buttons.
  */
 export type SpecRunRow = { run: RunId, op: SpecOp, 
+/**
+ * The task this workflow was requested for. Association only, not an assignment.
+ */
+task?: TaskId, 
 /**
  * The change it works on — `None` for a Propose or an Explore, which have not named one.
  */
@@ -21,6 +26,11 @@ text: string,
  * Who runs it, as a person reads it: the role's label or the harness's name.
  */
 label: string, state: RunState, 
+/**
+ * The latest turn handed back normally. Separate from the child's lifetime: a TUI stays
+ * idle at its prompt, and after a restart its child is gone without interrupting that turn.
+ */
+turnComplete: boolean, 
 /**
  * The live child, when there is one.
  */

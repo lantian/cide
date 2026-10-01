@@ -493,6 +493,32 @@ const TAB_HANDLERS = {
 
 const NO_EDIT = { target: null, draft: null, busy: false, problem: null }
 
+/** Mixed scenario content verifies clause rendering never owns the source Markdown. */
+const SCENARIO_CHANGE: ChangeView = {
+  ...CHANGE,
+  deltas: [{
+    ...CHANGE.deltas[0]!,
+    requirements: [{
+      ...CHANGE.deltas[0]!.requirements[0]!,
+      scenarios: [{
+        title: 'Mixed scenario content',
+        body: [
+          '- **WHEN** the user submits <img src=x onerror="evil()">',
+          '  continuation',
+          '',
+          'THEN it saves',
+          '+ **AND** it closes',
+          'This mentions WHEN inside prose',
+          '```text',
+          '- **WHEN** this is code',
+          '```',
+          '- **THEN** the user submits again',
+        ].join('\n'),
+      }],
+    }],
+  }],
+}
+
 function tab(over: Partial<SpecTabViewProps> = {}): SpecTabViewProps {
   return {
     view: CHANGE,
@@ -514,6 +540,10 @@ function tab(over: Partial<SpecTabViewProps> = {}): SpecTabViewProps {
 }
 
 export type TabStoryName =
+  | 'tab-scenarios'
+  | 'tab-scenario-keyword'
+  | 'tab-scenario-text'
+  | 'tab-scenario-markers'
   | 'tab-reading'
   | 'tab-failed'
   | 'tab'
@@ -561,6 +591,11 @@ export const TAB_STORIES: Record<TabStoryName, SpecTabViewProps> = {
 
   /** Nobody is working it: the page offers to start, which creates the task. */
   tab: tab(),
+
+  'tab-scenarios': tab({ view: SCENARIO_CHANGE }),
+  'tab-scenario-keyword': tab({ view: SCENARIO_CHANGE, find: { query: 'THEN', index: 1 }, matches: 2 }),
+  'tab-scenario-text': tab({ view: SCENARIO_CHANGE, find: { query: 'submits', index: 1 }, matches: 2 }),
+  'tab-scenario-markers': tab({ find: { query: '**WHEN**', index: 0 }, matches: 0 }),
 
   'tab-with-task': tab({ task: { id: 't-14', agent: 'developer', status: 'doing', session: null } }),
 

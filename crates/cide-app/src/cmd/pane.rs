@@ -456,9 +456,8 @@ pub fn pane_bind_session(
 ) -> Result<Mutated, CoreError> {
     // Which CLI the spawn ran, when it was a console's (M93): the registry heard it from
     // `spawn_session`, and this is the first moment the pane is known to stamp it on.
-    let harness = registry.harness_of(session);
     let out = state
-        .update(|ws| workspace::bind_session(ws, project, tab, pane, session, harness))
+        .update(|ws| bind_recorded_session(ws, &registry, project, tab, pane, session))
         .map(|()| Mutated { rev: state.rev() })?;
 
     // This is the only point at which a pid and a pane are both known, which is what the IDE
@@ -476,11 +475,80 @@ pub fn pane_bind_session(
     Ok(out)
 }
 
+/// Replay startup hooks under the workspace lock, after stamping the harness. A hook that
+/// arrives later takes this same lock and updates the now-bound pane normally.
+pub(crate) fn bind_recorded_session(
+    ws: &mut cide_ipc::Workspace,
+    registry: &crate::state::SessionRegistry,
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    session: SessionId,
+) -> Result<(), CoreError> {
+    workspace::bind_session(
+        ws,
+        project,
+        tab,
+        pane,
+        session,
+        registry.harness_of(session),
+    )?;
+    if let Some((conversation, since)) = registry.conversation_of(session) {
+        workspace::note_conversation(ws, session, conversation, since);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cide_core::layout::{MIN_TILE, add_row, add_tile, leaves, new_tree, validate};
     use cide_ipc::{LayoutNode, PaneTree};
+
+    #[test]
+    fn a_startup_thread_is_replayed_after_binding_and_survives_a_restart() {
+        let mut ws = cide_ipc::Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec!["/tmp/codex-binding".into()], None).unwrap();
+        let tab = ws.projects[&project].tabs[0].id;
+        let pane = ws.projects[&project].tabs[0].tree.focused;
+        let registry = crate::state::SessionRegistry::default();
+        let session = SessionId::new();
+        let thread = SessionId::new();
+        registry.note_harness(session, cide_ipc::Harness::Codex);
+        // This is the startup hook's ordering: the pane still holds its previous routing id.
+        assert!(!workspace::note_conversation(&mut ws, session, thread, 123));
+        registry.note_conversation(session, thread, 123);
+        bind_recorded_session(&mut ws, &registry, project, tab, pane, session).unwrap();
+        let saved = serde_json::to_vec(&ws).unwrap();
+        let mut restored: cide_ipc::Workspace = serde_json::from_slice(&saved).unwrap();
+        let held = &restored.projects[&project].tabs[0].tree.panes[&pane];
+        assert_eq!(held.harness, Some(cide_ipc::Harness::Codex));
+        assert_eq!(held.conversation, Some(thread));
+        assert_eq!(held.conversation_since, Some(123));
+        assert_eq!(restored.projects[&project].primary_session, session);
+
+        let newer = SessionId::new();
+        registry.note_conversation(session, newer, 456);
+        workspace::note_conversation(&mut restored, session, newer, 456);
+        // Re-binding a live pane must keep the latest hook identity and its original timestamp.
+        bind_recorded_session(&mut restored, &registry, project, tab, pane, session).unwrap();
+        assert_eq!(workspace::codex_thread_of(&restored, session), Some(newer));
+        // A resume seed cannot overwrite a newer startup hook.
+        registry.seed_conversation(session, thread, 999);
+        assert_eq!(registry.conversation_of(session), Some((newer, 456)));
+
+        let fresh = SessionId::new();
+        registry.note_harness(fresh, cide_ipc::Harness::Codex);
+        bind_recorded_session(&mut restored, &registry, project, tab, pane, fresh).unwrap();
+        assert_eq!(workspace::codex_thread_of(&restored, fresh), None);
+        // A known resume retains its thread even with hooks disabled.
+        let resumed = SessionId::new();
+        registry.note_harness(resumed, cide_ipc::Harness::Codex);
+        registry.seed_conversation(resumed, newer, 789);
+        bind_recorded_session(&mut restored, &registry, project, tab, pane, resumed).unwrap();
+        assert_eq!(workspace::codex_thread_of(&restored, resumed), Some(newer));
+    }
 
     fn fresh() -> Pane {
         pane_for(&SplitIntent::Shell, "cide")

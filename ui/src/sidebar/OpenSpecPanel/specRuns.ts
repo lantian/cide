@@ -28,12 +28,14 @@ import type {
   SplitIntent,
 } from '@/ipc/generated'
 import { sessionTitle } from './model'
+import { activeProjectIdOf } from '@/keys/target'
+import { notifyFailure } from '@/chrome/notices'
 
 interface SpecRunsState {
   project: ProjectId | null
   runs: readonly SpecRunRow[]
   checkouts: readonly SpecCheckout[]
-  attach: (project: ProjectId | null) => void
+  attach: (project: ProjectId | null, withCheckouts?: boolean) => void
   refreshRuns: () => Promise<void>
   /** Take the rows a `cide://spec-runs-changed` carried, for the project this panel shows. */
   adoptRuns: (project: ProjectId, runs: readonly SpecRunRow[]) => void
@@ -47,7 +49,7 @@ export const useSpecRuns = create<SpecRunsState>((set, get) => ({
   runs: [],
   checkouts: [],
 
-  attach: (project) => {
+  attach: (project, withCheckouts = true) => {
     if (get().project === project) return
     generation += 1
     // Cleared before the reads: another project's sessions under this one's changes would be a
@@ -55,7 +57,7 @@ export const useSpecRuns = create<SpecRunsState>((set, get) => ({
     set({ project, runs: [], checkouts: [] })
     if (project === null) return
     void get().refreshRuns()
-    void get().refreshCheckouts()
+    if (withCheckouts) void get().refreshCheckouts()
   },
 
   refreshRuns: async () => {
@@ -88,13 +90,14 @@ export const useSpecRuns = create<SpecRunsState>((set, get) => ({
  * Start a session, then open its tab as soon as it has a child.
  *
  * The run is queued first and forks when the project has room, so the tab cannot be built at
- * once; the MR reviewer's follow loop polls for the same moment. Gives up quietly after a while —
- * a run still queued then is on the panel with its chip, and *Open session* opens it later.
+ * once. Follow the registry's events until admission, including a run queued behind a long turn.
+ * Switching projects cancels opening the tab while the admitted work continues.
  */
-export async function startSession(project: ProjectId, request: SpecSessionStart): Promise<RunId> {
+export async function startSession(project: ProjectId, request: SpecSessionStart, onStarted?: () => void): Promise<RunId> {
   const run = await specSessions.start(project, request)
   void useSpecRuns.getState().refreshRuns()
-  void openWhenReady(project, run, sessionTitle(request.op, request.change ?? null, labelOf(request)))
+  onStarted?.()
+  followRunTab(project, run, sessionTitle(request.op, request.change ?? null, labelOf(request)))
   return run
 }
 
@@ -102,21 +105,69 @@ function labelOf(request: SpecSessionStart): string {
   return request.launcher.kind === 'role' ? request.launcher.agent : request.launcher.harness
 }
 
-const READY_TRIES = 90
-const READY_EVERY_MS = 1000
+const opening = new Set<RunId>()
 
-async function openWhenReady(project: ProjectId, run: RunId, title: string): Promise<void> {
-  for (let tries = 0; tries < READY_TRIES; tries += 1) {
-    if (await openRunTab(project, run, title).catch(() => false)) return
-    await new Promise((resolve) => setTimeout(resolve, READY_EVERY_MS))
-  }
+/** Follow admission events, including runs queued longer than a polling timeout. A project
+ * switch cancels presentation, not the run. Only a shell window opens automatic run views. */
+export function followRunTab(project: ProjectId, run: RunId, title: string): void {
+  if (opening.has(run)) return
+  opening.add(run)
+  let cleanup = () => { opening.delete(run) }
+  void (async () => {
+    const { useWorkspace } = await import('@/store/workspace')
+    const current = () => {
+      const boot = useWorkspace.getState().boot
+      return boot?.role.kind === 'shell' && activeProjectIdOf(boot) === project
+    }
+    let ended = false
+    let checking = false
+    let offRuns: (() => void) | undefined
+    let offWorkspace: (() => void) | undefined
+    const finish = () => {
+      ended = true
+      opening.delete(run)
+      offRuns?.()
+      offWorkspace?.()
+    }
+    cleanup = finish
+    const check = async (rows: readonly SpecRunRow[]) => {
+      if (ended || checking) return
+      if (!current()) { finish(); return }
+      const row = rows.find((r) => r.run === run)
+      if (!row || row.state.state === 'queued' || row.state.state === 'starting') return
+      if (row.state.state === 'failed' && !row.session) {
+        finish()
+        notifyFailure(row.state.reason, { project })
+        return
+      }
+      checking = true
+      try {
+        if (!current()) { finish(); return }
+        await openRunTab(project, run, title, current)
+        finish()
+      } catch (error) {
+        finish()
+        notifyFailure(error, { project })
+      } finally { checking = false }
+    }
+    if (!current()) { finish(); return }
+    offWorkspace = useWorkspace.subscribe(() => { if (!current()) finish() })
+    offRuns = await specSessions.onChanged((changed, rows) => {
+      if (changed === project) void check(rows)
+    })
+    if (ended) { offRuns(); return }
+    await check(await specSessions.runs(project))
+  })().catch((error: unknown) => {
+    cleanup()
+    notifyFailure(error, { project })
+  })
 }
 
 /**
  * Open a tab onto a session's run. Answers whether one was opened: `false` while the run has no
  * child and no conversation to continue — queued, or never started.
  */
-export async function openRunTab(project: ProjectId, run: RunId, title: string): Promise<boolean> {
+export async function openRunTab(project: ProjectId, run: RunId, title: string, shouldOpen?: () => boolean): Promise<boolean> {
   const plan = await agentRuns.open(project, run)
   if (plan.kind === 'unavailable') return false
   const intent: SplitIntent =
@@ -126,6 +177,7 @@ export async function openRunTab(project: ProjectId, run: RunId, title: string):
         ? { kind: 'mirror', session: plan.session, continues: plan.continues }
         : { kind: 'mirror', session: plan.session }
   const { useWorkspace } = await import('@/store/workspace')
+  if (shouldOpen && !shouldOpen()) return false
   await useWorkspace.getState().newRunTab(project, title, intent)
   return true
 }
@@ -140,23 +192,25 @@ export async function openSession(project: ProjectId, row: SpecRunRow): Promise<
  * Follow a project's sessions and worktrees: attach, read both, and keep them live — the rows on
  * `cide://spec-runs-changed`, the worktrees when the spec board moves. Answers the cleanup.
  *
- * Called by the panel **and** the change page, because the page can be open with the panel shut,
+ * Called by the panel, the change page and task cards. A task card sets `withCheckouts` false
+ * because linking its proposal needs only runs, without reading worktree checklists.
+ * The page can be open with the panel shut,
  * and it has to know a change has a session (Open session, not a second Apply) and whether it was
  * applied in a worktree (which acts a finished change offers). Two followers of one project hear
  * the same events twice and set the same rows; that costs nothing.
  */
-export function followSpecRuns(project: ProjectId | null): () => void {
+export function followSpecRuns(project: ProjectId | null, withCheckouts = true): () => void {
   const store = useSpecRuns.getState()
-  store.attach(project)
+  store.attach(project, withCheckouts)
   if (project === null) return () => {}
   void store.refreshRuns()
-  void store.refreshCheckouts()
+  if (withCheckouts) void store.refreshCheckouts()
   const offRuns = specSessions.onChanged((changed, rows) => {
     useSpecRuns.getState().adoptRuns(changed, rows)
   })
-  const offBoard = specEvents.onChanged((changed) => {
+  const offBoard = withCheckouts ? specEvents.onChanged((changed) => {
     if (changed === project) void useSpecRuns.getState().refreshCheckouts()
-  })
+  }) : Promise.resolve(() => {})
   return () => {
     void offRuns.then((stop) => stop())
     void offBoard.then((stop) => stop())

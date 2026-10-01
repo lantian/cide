@@ -217,9 +217,8 @@ export interface SpecCardAction {
  * `openspec archive`, a re-validate and a status write ran — seconds in which the only available
  * reading was that the click had missed.
  *
- * Total over the three ids so a caller cannot reach a state with no label. `approve` opens a
- * picker and never waits, but a function that answers for two of three arms is one somebody
- * later calls with the third.
+ * Total over the three ids so a caller cannot reach a state with no label. Approval starts
+ * Apply on the default harness and waits for the launcher before closing the task card.
  */
 export function busyLabel(action: 'approve' | 'accept' | 'none'): string {
   if (action === 'accept') return 'Integrating…'

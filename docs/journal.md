@@ -16908,3 +16908,275 @@ a `TaskNew` whose `attachments` is non-empty (`refuse_device_attachments`).
 - SAF saving (including the `shot.png.png` extension rule);
 - the share sheet.
 The viewer has no pinch-zoom.
+
+## M137 — Task creation can propose, and Doing starts Apply
+
+- With OpenSpec's propose workflow installed, New task offers **Propose this task**, off by
+  default. Creation saves the task and attachments first, then queues the actual installed
+  workflow using the configured console harness. It reads the saved task, writes the proposal,
+  and links the resulting change back; cide creates no stub change. Assignment remains available,
+  so the assigned role can start implementation alongside the proposal.
+- **Settings → Projects & windows → Agent runs → New-task proposals** chooses Background
+  (default) or New tab for these creation-time proposals only. Background suppresses automatic
+  tabs both at launch and when the proposal links its change. A tab follows registry events
+  through an arbitrarily long queue and stops following on a project switch. The task card's
+  existing Make a proposal action keeps its behavior.
+- Moving a linked task to Doing launches OpenSpec Apply in a tab, using its assigned role or
+  the configured console harness. Unlinked tasks retain their existing dispatch behavior.
+  Explicit Apply synchronizes every linked Todo task to Doing in one store update; Inbox,
+  Review and Done stay where they are. Direct synchronization bypasses dispatch triggers.
+- Admission claims a project/change across both standalone Apply and task implementation runs,
+  including concurrent requests. An existing implementation is reused, with an idle conversation
+  receiving the Apply instructions and a busy or paused run continuing without another turn.
+  Returning a reviewed task to Doing preserves its role conversation. Link updates also refresh
+  an existing task run's change claim, using the current saved task rather than an older event.
+- A saved task whose proposal cannot launch returns a separate launch error and closes the
+  draft; retrying presentation cannot create another task. A failed save keeps the draft.
+  Codex-only OpenSpec installations now advertise the installed workflows to the task picker.
+
+**Verified:** IPC tests (670); task, spec and agent library tests (72, 64 and 450); affected
+app tests (252), plus task/session/lifecycle/event/spinner tests (110). The new UI regression
+check exercises saving, failed launch, assignment, background mode, queued tabs, project switches
+and listener cleanup. The affected UI checks, TypeScript and production build pass. Formatting,
+contract/codegen checks and clippy on the touched crates pass. Real OpenSpec CLI tests (12),
+quota-free Codex CLI tests (3), and opencode/MiMo served-run tests against a local fake model
+provider (2) pass. Socket and CLI checks needed execution outside the filesystem sandbox.
+
+**Not confirmed on a display:** the task dialog and setting have not been clicked in a running
+GUI. No live proposal or Apply model turn was run; quota-spending tests remain ignored.
+
+## M138 — The created task links its proposal session
+
+The new-task proposal already persisted its originating task in the run, but the task card
+could not read that association: the ordinary role roster excludes these workflows when
+subagents are disabled, and a proposal does not own the task's implementation assignment.
+OpenSpec run rows now carry their task association, and task cards subscribe to those rows
+without reading worktree checklists. A **Proposal** row shows the run and its state, with
+**Open proposal session** once it starts. Queued proposals remain visible. The link works for
+background runs and alongside an assigned implementation role, and follows the persisted run
+through restart. Opening the session uses the existing run mirror/continuation path.
+
+**Verified:** the new backend regression checks the task association before launch, after the
+child starts and after snapshot restoration, while confirming the proposal never claims the
+implementation task. UI regression checks cover task-link updates and subscription cleanup
+without opening background tabs; render stories cover running and queued sessions with no
+role roster and a proposal alongside assignment. TypeScript, production build, affected
+OpenSpec/task/selector/subscription/style checks, clippy and generated contract checks pass.
+
+**Not confirmed on a display:** the new task-card row has not been clicked in a running GUI.
+
+## M139 — Open the linked spec from its task, and stop offering approval after Doing
+
+The task card's linked OpenSpec section has an **Open spec** action, and its header change
+label is a link to the same action. Both close the task modal, open or reuse the change's
+OpenSpec tab, and synchronize focus to it. The full change name wraps onto its own header
+line instead of being clipped to 18 characters.
+
+Doing or Review tasks no longer offer **Approve & dispatch** before the first checklist item
+is ticked. The shared OpenSpec action rule handles both the spec tab and the task card; the
+card also checks the current task status so an older asynchronous spec snapshot cannot keep
+the approval button or its already-open picker visible. Finished work still offers its
+integration/archive action, and Todo tasks retain approval.
+
+**Verified:** regression checks cover closing the modal before tab opening completes and
+explicitly focusing the returned tab; both navigation controls, long-name wrapping, a stale
+approval snapshot after Doing, and the queued/session cases. Shared action checks cover Doing
+and Review with and without an assignee, Todo approval, and accepting completed work.
+TypeScript, production build, task/OpenSpec render and model checks, UI kit, selectors and
+theme/scale/motion/icon checks pass.
+
+**Not confirmed on a display:** these controls have not been clicked in a running GUI.
+
+## M140 — The task's session section also shows Apply
+
+Task cards now list both Proposal and Apply workflows in their session section, with separate
+labels, state indicators and **Open Apply session** / **Open proposal session** actions.
+Proposal links remain tied to their originating task. Apply links also follow the task's
+OpenSpec change, because Apply can be launched from OpenSpec without an originating task or
+shared by multiple linked tasks, including an existing role implementation. The session list
+still works with subagents disabled, retains proposal history alongside Apply, and shows queued
+Apply before a child exists. Opening uses the existing run mirror/continuation path and closes
+the task card after success.
+
+**Verified:** regressions cover standalone and role Apply association, unrelated runs and
+proposals, missing selections/changes, and opening Apply through the run mirror path. Render
+stories cover an interrupted proposal alongside running Apply and a queued Apply session.
+TypeScript, production build, task/OpenSpec model and render checks, and selectors pass.
+
+**Not confirmed on a display:** the Apply session link has not been clicked in a running GUI.
+
+## M141 — OpenSpec workflow status also appears in the task list
+
+Task rows now show separate **Proposal** and **Apply** status badges below their existing
+summary line. Running workflows animate, and queued, starting, idle, waiting for permission,
+paused and ended sessions retain their distinct states. These indicators follow OpenSpec run
+events even when subagents are disabled. Proposal belongs to its originating task; Apply also
+follows the linked change, including sessions launched directly from OpenSpec.
+
+The subagent chip still uses its existing assignment, roster, tone and animation rules. A task
+can show all three indicators together. Each workflow shows one current session: live work
+wins over history, waiting for permission takes priority among live runs, and the latest ended
+session remains visible when nothing is live. Rows without OpenSpec sessions keep their
+original structure.
+
+**Verified:** selection regressions cover concurrent work, older interrupted/finished history,
+unrelated sessions and unchanged input rows. Render checks cover all nine phases, operation
+labels, running animation, sessions without roles, and unchanged subagent chip output alongside
+both workflows. TypeScript, production build, task/OpenSpec model, subscription, selector,
+UI kit and theme/scale/motion/icon checks pass.
+
+**Not confirmed on a display:** the new task-list indicators have not been viewed in a running GUI.
+
+## M142 — A completed OpenSpec turn stays Finished after restart
+
+The user's `test9` log showed a normal Codex Stop at 09:40:33, followed by cide ending its
+idle child at 09:41:02. The restored run correctly had no child, but task indicators displayed
+the child's **Interrupted** state as though its proposal had been cut off. Its existing snapshot
+still held `parkedAtQuit: idle`, recording that the turn had already ended.
+
+OpenSpec run rows now carry a derived `turnComplete` fact separately from child state. Task
+cards, task-list badges and OpenSpec session chips show **Finished** for those completed turns,
+both while the TUI waits at its prompt and after restart. Existing saved idle records recover
+without rerunning their workflow or rewriting the user's project. SessionStart's initial idle
+window is not presented as complete; working, permission, paused and abnormal-exit states do
+not acquire the completion flag. A newer queued workflow also wins over an older completed
+TUI turn in the task list. The shutdown reaper preserves the waiting fact for immediate status
+updates as well as snapshots. The actual registry state and the native subagent indicator stay
+separate, and Open session still opens or continues the conversation. Turn completion does not
+change task status, checklist completion or acceptance.
+
+**Verified:** restart regressions exercise normal hand-back, two snapshot restorations, opening
+the retained Codex conversation, immediate shutdown reporting, and incomplete/abnormal states.
+Affected app tests pass (323, one ignored); four local socket tests required execution outside
+the sandbox after their binds were refused. Task/OpenSpec model and render checks, TypeScript,
+production build, clippy, formatting, contract and generated-binding checks pass.
+
+**Not confirmed on a display:** the updated status has not been viewed in a running GUI; no
+live model turn was launched and the user's `test9` files were only read.
+
+## M143 — Approve & dispatch directly starts the default Apply session
+
+The task card's **Approve & dispatch** still toggled the old target picker. A project without
+available targets drew its empty list as a line and started nothing. The primary button now
+launches OpenSpec Apply using the configured default console harness, through the existing
+session launcher. That launcher moves linked Todo tasks to Doing without reflecting the status
+write into a second Apply run. Approving an inbox task first promotes it to Todo.
+
+The card shows **Dispatching…** and disables the button while launch is pending. After a
+successful launch, it closes the selected task card before following the run to its new tab;
+a queued run opens when admitted. This explicit approval always presents the tab regardless
+of the background-proposal preference. A refused launch leaves the card open and reports its
+error through the existing notice guard. Existing conversations retain their **Hand it
+elsewhere** picker; approval no longer opens it. Acceptance and archival keep their existing
+path.
+
+**Verified:** a DOM click regression presses the primary button with no dispatch targets,
+checks one default-Codex Apply request, modal closure, queued admission and tab opening even
+with background proposals enabled. It also checks default Claude, pending launch and refused
+launch. Render checks cover the busy button and retained conversation picker. The backend's
+linked-Todo Doing synchronization regression, task/OpenSpec model and render checks, TypeScript,
+production build, selectors, subscription cleanup and UI kit checks pass.
+
+**Not confirmed in a running GUI:** no live Apply model turn was launched; the click regression
+uses a DOM with mocked IPC and workspace boundaries.
+
+
+## M144 — Bash panels retain their own command history
+
+Bash panels restored their previous screen but restarted against the shared global history
+file, so Up recalled unrelated commands after quitting cide. Local Bash panels now pass their
+stable pane ID into session spawn and use a private history file under the profile's state
+directory. New panels start empty; restarting a shell, restoring the app or detaching a panel
+keeps the same history identity. Closing a panel does not delete its file.
+
+A Cide-owned initializer runs through Bash's POSIX ENV startup entry, immediately restores
+ordinary Bash mode and the original ENV, and sources the normal login profiles once. It then
+selects the panel history before Bash's automatic load, clearing any global list imported by
+profiles. Existing prompt commands, exit status and history filters are preserved. Modern Bash
+appends before each prompt. Real Bash 3.2.57 testing exposed its strict history -a counter check:
+an entirely new panel's entries were never appended. That version instead rewrites its bounded
+history list and synchronizes the history-file cursor without importing its own snapshot, with
+normal exit also using overwrite mode. A readonly global HISTFILE is refused without clearing
+or overwriting the global file. Direct programs, agent consoles and container sessions keep
+their existing launch paths; callers without pane identity remain compatible.
+
+**Verified:** four real-PTY regressions pass on both system Bash and GNU Bash 3.2.57 built in
+/tmp on Linux: independent Up-arrow recall after forced termination, persistence before exit,
+repeated commands without snapshot duplication, scalar/exported-array prompt hooks, filters,
+login profiles, original ENV, nested-shell cleanup, normal exit and readonly-file refusal.
+Private storage/reuse tests, 48 session-command tests, 74 PTY tests, TypeScript, terminal input,
+exit/awaiting/attach/key/format checks, contract and generated bindings pass. Core clippy and
+formatting of the affected Rust sources pass. The existing settings launch preview also needed
+its missing default resume-picker field to allow the app test runner to compile.
+
+**Not confirmed in a running GUI or on macOS:** no live IDE was restarted. Previously lost
+panel commands cannot be recovered; panels without a saved file begin empty.
+
+
+## M145 — Generate commit messages and retain commit drafts across panel switches
+
+The Git commit footer has a pencil icon beside the change summary, with a **Generate commit
+message** tooltip, using the configured Claude or Codex console. Normal mode describes only
+checked files and the same hunk/line selections Commit
+uses. Staging-area mode and merge/cherry-pick/revert conclusions describe the targeted
+repositories' full staged index. Multiple targeted repositories share one generated message.
+The backend resolves agent worktrees through the same resolver as the other Git actions,
+reads diffs off the UI thread, and retains the bounded one-shot prompt and CLI configuration.
+Generation does not stage, commit, or change working files.
+
+Typed messages, amend prefills, pending generation, errors and generated results live in a
+window-level store scoped by project and worktree. Switching panels or closing/reopening Git
+retains the draft; quitting the window discards it. Results insert directly into an unchanged
+empty draft. Existing text or edits made while waiting require a preview dialog with Cancel
+and Replace. Stale confirmations cannot replace newer text. Generation disables duplicate
+requests and Commit while leaving the textarea editable. Successful commits clear only their
+submitted draft revision, and failed commits retain text. Demo fixtures use an isolated store.
+
+**Verified:** the mounted React check drives typing, Commit/Shelf switches, full panel unmount,
+completion after closure, partial-selection IPC, replacement/cancellation, scoped drafts,
+generation failures, message-only amend and successful/failed commit clearing. Eight Git
+regressions cover selected whole files, hunks and lines, stale selections, index/working-tree
+mismatches, new and binary files, renames, executable modes, unborn branches and merge
+conclusions, checking index/HEAD/working-file preservation. App tests cover multiple roots,
+agent worktrees and both configured harnesses with fake CLIs; no paid model turn is used.
+TypeScript/production build, Git model/render/diff/branch checks, CLI configuration, UI kit,
+theme/scale/motion/icon checks, affected-crate clippy, source formatting, contract and
+generated-binding checks pass. `docs/checks.md` records the new `check:commit-message` gate.
+
+**Not confirmed in a running GUI:** the controls have not been clicked in the native IDE and
+no live model response was requested.
+
+## M146 — Codex panes restore their saved conversations
+
+The reported workspace had a primary Codex pane with no conversation id and an auxiliary pane
+with a valid Codex thread only in its continuation. The primary opened fresh, while the
+auxiliary stopped at a splash labeled Claude Code. A startup hook could arrive before the
+frontend bound its pane: the workspace update found no holder, and the hook dedupe suppressed
+subsequent frames carrying the same thread.
+
+The session registry now retains hook identities before applying them to the workspace. Pane
+binding replays the latest identity after stamping the harness, inside the workspace update.
+Known resumes seed their thread without overwriting a newer hook. Tabs opened by cide and
+reinserted closed tabs use the same binding path. Codex thread resolution prefers the recorded
+conversation, falls back to its Codex continuation, and refuses a continuation that only names
+the routing id. A fresh binding clears the previous thread while keeping its worktree directory;
+a harness switch updates the continuation too. Restore-all now resumes continued Codex panes,
+including detached panes, while respecting disabled resume injection and cautious launch mode.
+
+Saved Codex panes with an unavailable thread wait for a recovery choice, including the primary
+console. **Choose a Codex session** launches the installed CLI's resume picker in the pane's
+working directory with the normal hooks and MCP environment. **Start a new session** explicitly
+starts fresh. The chosen thread is captured for the next restart. The IPC adds
+`SessionRestore::MissingConversation` and an optional `resumePicker` spawn argument; existing
+workspace files need no migration. Resume splashes display Codex for Codex panes.
+
+**Verified:** focused app pane/session/project/hook/lifecycle tests and core
+workspace/Codex/persistence tests, free installed-Codex compatibility probes (excluding model
+turns), TypeScript, frontend production build, attachment/detach/restart/awaiting/CLI/session
+checks, UI kit and scale checks, affected-crate clippy, and contract/codegen checks. The new
+`check:restore` gate checks launch decisions, latest-thread precedence, recovery labels, and
+DOM clicks on both recovery choices. The application executable was rebuilt.
+
+**Not confirmed in a running GUI:** a native close/relaunch and live Codex session selection
+were not exercised. Recovery cannot infer the historical thread of a pane that already lost
+its id; the user must select it once.

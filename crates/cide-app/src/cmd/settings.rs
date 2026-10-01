@@ -21,12 +21,11 @@ use std::path::{Path, PathBuf};
 
 use cide_core::keymap::{self, KeymapDiagnostic};
 use cide_core::{CoreError, persist, workspace};
-use cide_ipc::git::DiffSide;
 use cide_ipc::{
     AccentPatch, GraphicsRung, GraphicsSettings, GraphicsStatus, HeadlessError, HeadlessRequest,
     HeadlessResult, KeymapConflict, KeymapEdit, KeymapEditResult, KeymapProblem, KeymapReport,
-    Pane, PaneId, PaneKind, PaneRole, ProjectId, RepoId, Settings, SettingsPatch, SettingsSection,
-    TabId, TabKind, Workspace,
+    Pane, PaneId, PaneKind, PaneRole, ProjectId, Settings, SettingsPatch, SettingsSection, TabId,
+    TabKind, Workspace,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -280,6 +279,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         claude,
         console_harness,
         open_run_in,
+        task_proposal_run_mode,
         codex,
         proxy,
         sidebar,
@@ -355,6 +355,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // Read by the Agents panel's Open, at the press; nothing open moves.
     if let Some(v) = open_run_in {
         settings.open_run_in = v;
+    }
+    if let Some(v) = task_proposal_run_mode {
+        settings.task_proposal_run_mode = v;
     }
     if let Some(v) = codex {
         settings.codex = v;
@@ -867,14 +870,27 @@ pub async fn claude_headless(
     request: HeadlessRequest,
 ) -> Result<HeadlessResult, HeadlessError> {
     let cwd = project_root(&state, project)?;
+    run_console_headless(state.with(|ws| ws.settings.clone()), cwd, request).await
+}
+
+/// All console one-shots follow the configured harness, including commit generation.
+async fn run_console_headless(
+    settings: Settings,
+    cwd: PathBuf,
+    request: HeadlessRequest,
+) -> Result<HeadlessResult, HeadlessError> {
     // The lane follows Settings → Harness (M93): a user who chose codex for their console gets a
     // codex one-shot, and does not need claude installed for a commit message.
-    let (harness, codex) =
-        state.with(|ws| (ws.settings.console_harness, ws.settings.codex.cli.clone()));
-    if harness == cide_ipc::ConsoleHarness::Codex {
-        return run_headless_codex(cwd, request, claude_proxy(&state), codex).await;
+    let proxy =
+        cide_core::proxy::ProxyEnv::for_target(&settings.proxy, settings.proxy.scope.claude);
+    match settings.console_harness {
+        cide_ipc::ConsoleHarness::Codex => {
+            run_headless_codex(cwd, request, proxy, settings.codex.cli).await
+        }
+        cide_ipc::ConsoleHarness::Claude => {
+            run_headless(cwd, request, proxy, settings.claude.cli).await
+        }
     }
-    run_headless(cwd, request, claude_proxy(&state), claude_cli(&state)).await
 }
 
 /// [`run_headless`] on codex: the configured binary and environment, cide's own argv. (M93)
@@ -1019,7 +1035,7 @@ pub enum ClaudeTaskError {
     Git { message: String },
     /// The commit would be empty. Not an error the user should see as a toast — it is a
     /// disabled button — which is why it is its own variant rather than a `Git` message.
-    #[error("there is nothing staged to describe")]
+    #[error("there are no commit changes to describe")]
     NothingToDescribe,
 }
 
@@ -1046,29 +1062,13 @@ impl From<cide_ipc::git::GitError> for ClaudeTaskError {
     }
 }
 
-/// Draft a commit message for what is staged, for the git panel's commit box.
-///
-/// # Why the diff is read here and not passed in
-///
-/// The panel has a tree of changed *files*; it has never held the patch text, and having it
-/// fetch one diff per file to concatenate them would be a round trip per file and a different
-/// answer from what `git commit` would actually record. Reading it in one pass through
-/// `cide-git` is both cheaper and the same diff the commit itself will contain.
-///
-/// # Staged, with a deliberate fallback
-///
-/// Staging-area mode commits the index, so `Staged` is the right diff. Changelist mode — this
-/// app's default — commits from the working tree and may have nothing in the index at all, so
-/// an empty staged diff falls back to `Combined` rather than refusing. Refusing would make the
-/// button dead for the majority of this app's users while looking like a model failure.
-///
-/// `async` for the same reason as [`claude_headless`]: this waits on a model turn, and a
-/// synchronous command would hold the GTK loop for the duration.
+/// Draft one message covering exactly the changes the panel's commit would record.
+/// Git reads run on the blocking pool; generation never stages or commits anything.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn claude_commit_message(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
-    repo: RepoId,
+    scopes: Vec<cide_ipc::headless::CommitMessageScope>,
 ) -> Result<HeadlessResult, ClaudeTaskError> {
     let roots: Vec<PathBuf> = state.with(|ws| {
         workspace::project(ws, project)
@@ -1080,55 +1080,50 @@ pub async fn claude_commit_message(
             project: project.to_string(),
         }));
     }
-    let root = cide_git::repo::find(&roots, repo)
-        .map_err(ClaudeTaskError::from)?
-        .root;
-
-    let (diff, branch) = staged_diff(&root)?;
-    if diff.trim().is_empty() {
-        return Err(ClaudeTaskError::NothingToDescribe);
-    }
-
-    let request = cide_claude::prompt::commit_message(&diff, branch.as_deref());
-    Ok(run_headless(root, request, claude_proxy(&state), claude_cli(&state)).await?)
+    let (root, request) =
+        tauri::async_runtime::spawn_blocking(move || commit_message_request(&roots, &scopes))
+            .await
+            .map_err(|e| ClaudeTaskError::Git {
+                message: format!("could not read commit changes: {e}"),
+            })??;
+    Ok(run_console_headless(state.with(|ws| ws.settings.clone()), root, request).await?)
 }
 
-/// The patch text a commit would record, and the branch it would land on.
-///
-/// Split out from the command so the fallback rule above is one readable function rather than
-/// a nested match inside a handler. Everything it touches is `cide-git`'s; nothing here knows
-/// what a hunk is.
-fn staged_diff(root: &Path) -> Result<(String, Option<String>), ClaudeTaskError> {
-    let repo = cide_git::repo::open(root)?;
-
-    // A closure rather than a free function because its parameter would have to be named, and
-    // its type is `git2::Repository` — which `cide-git` does not re-export and this crate must
-    // not depend on. Adding `git2` to the app crate to spell one signature would put a git
-    // implementation inside the glue layer for the sake of tidiness.
-    let render = |side: DiffSide| -> Result<String, cide_ipc::git::GitError> {
-        let diff = cide_git::diff::build(&repo, cide_git::diff::DiffRequest::new(side), None)?;
-        let mut out = String::new();
-        for file in cide_git::diff::raw_files(&diff)? {
-            // Lossy, and that is the right call: a diff containing one file with invalid
-            // UTF-8 should still produce a commit message about the other twelve.
-            out.push_str(&String::from_utf8_lossy(&file.render()));
+fn commit_message_request(
+    roots: &[PathBuf],
+    scopes: &[cide_ipc::headless::CommitMessageScope],
+) -> Result<(PathBuf, HeadlessRequest), ClaudeTaskError> {
+    let mut text = String::new();
+    let mut cwd = None;
+    let mut branch_hint = None;
+    for scope in scopes {
+        let root = super::git::repo_root(roots, scope.repo)?;
+        let diff = cide_git::message::commit_diff(&root, &scope.selections)?;
+        if diff.trim().is_empty() {
+            continue;
         }
-        Ok(out)
-    };
-
-    let mut text = render(DiffSide::Staged)?;
-    if text.trim().is_empty() {
-        text = render(DiffSide::Combined)?;
+        let repo = cide_git::repo::open(&root)?;
+        let branch = cide_git::status::branch_info(&repo)
+            .ok()
+            .filter(|info| !info.detached)
+            .map(|info| info.head);
+        if scopes.len() > 1 {
+            text.push_str(&format!(
+                "\nRepository: {} (branch: {})\n",
+                root.file_name().unwrap_or_default().to_string_lossy(),
+                branch.as_deref().unwrap_or("detached HEAD"),
+            ));
+        } else {
+            branch_hint = branch;
+        }
+        text.push_str(&diff);
+        cwd.get_or_insert(root);
     }
-
-    // Best-effort: a detached HEAD or an unborn branch is a perfectly ordinary state to
-    // commit from, and losing the branch hint is not worth failing the whole call for.
-    let branch = cide_git::status::branch_info(&repo)
-        .ok()
-        .filter(|info| !info.detached && !info.unborn)
-        .map(|info| info.head);
-
-    Ok((text, branch))
+    let root = cwd.ok_or(ClaudeTaskError::NothingToDescribe)?;
+    Ok((
+        root,
+        cide_claude::prompt::commit_message(&text, branch_hint.as_deref()),
+    ))
 }
 
 /// Explain a selected region of a file, for the editor's context menu.
@@ -1345,6 +1340,7 @@ fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
         cwd: "<project>".into(),
         inject: plan.inject,
         thread: None,
+        resume_picker: false,
         fork: false,
         paragraph: Some("<roster paragraph>".into()),
         hook: Some("<cide-hook>".into()),
@@ -1713,7 +1709,7 @@ pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cide_ipc::{SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
+    use cide_ipc::{RepoId, SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
 
     /// The section a project's one Settings tab is showing, and how many Settings tabs it has.
     fn settings_tabs(ws: &Workspace, project: ProjectId) -> Vec<SettingsSection> {
@@ -1912,6 +1908,34 @@ mod tests {
         assert_eq!(
             serde_json::to_value(settings.open_run_in).expect("json"),
             serde_json::json!("split")
+        );
+    }
+
+    #[test]
+    fn task_proposals_default_to_background_and_patch_without_changing_run_views() {
+        let mut settings: Settings = serde_json::from_str("{}").expect("old settings");
+        assert_eq!(
+            settings.task_proposal_run_mode,
+            cide_ipc::TaskProposalRunMode::Background
+        );
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                task_proposal_run_mode: Some(cide_ipc::TaskProposalRunMode::Tab),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(
+            settings.task_proposal_run_mode,
+            cide_ipc::TaskProposalRunMode::Tab
+        );
+        assert_eq!(settings.open_run_in, cide_ipc::OpenRunIn::Tab);
+        let saved = serde_json::to_string(&settings).expect("save");
+        assert_eq!(
+            serde_json::from_str::<Settings>(&saved)
+                .expect("reload")
+                .task_proposal_run_mode,
+            cide_ipc::TaskProposalRunMode::Tab
         );
     }
 
@@ -2210,7 +2234,7 @@ mod tests {
 
     /// A throwaway repository with one commit, for the diff tests below.
     ///
-    /// Driven through the `git` binary rather than `git2`, for the reason `staged_diff` gives
+    /// Driven through the `git` binary rather than `git2`, for the reason `commit_message_request` gives
     /// for not naming a `git2` type: this crate must not depend on a git implementation. It is
     /// also the right reference — the question these tests ask is "does this produce what a
     /// commit would record", and only git can answer that authoritatively.
@@ -2271,70 +2295,172 @@ mod tests {
         }
     }
 
+    fn message_scope(repo: &TempRepo) -> cide_ipc::headless::CommitMessageScope {
+        cide_ipc::headless::CommitMessageScope {
+            repo: cide_git::repo::repo_id(&repo.root),
+            selections: vec![cide_ipc::git::PathSelection::whole("kept.txt")],
+        }
+    }
+
     #[test]
-    fn a_staged_change_becomes_the_patch_text_a_commit_would_record() {
-        // The end-to-end question, and the one nothing else here asks: `claude_commit_message`
-        // is only worth anything if what reaches the prompt is a real unified diff. Every
-        // piece between the command and the model — `repo::open`, `diff::build`,
-        // `raw_files`, `RawFile::render` — is exercised by this and by nothing else, and a
-        // silent empty string here is `NothingToDescribe` on a repository with staged work.
-        let repo = TempRepo::new("staged");
-        repo.write("kept.txt", "one\nTWO\nthree\n");
+    fn a_commit_message_contains_selected_working_tree_changes_and_branch_context() {
+        let repo = TempRepo::new("message-selected");
+        repo.write("kept.txt", "one\nSTAGED\nthree\n");
         repo.git(&["add", "kept.txt"]);
-
-        let (diff, branch) = staged_diff(&repo.root).expect("a staged change");
-
-        assert!(diff.contains("diff --git"), "no patch header:\n{diff}");
-        assert!(diff.contains("+++ b/kept.txt"), "no file header:\n{diff}");
-        assert!(diff.contains("+TWO"), "the addition is missing:\n{diff}");
-        assert!(diff.contains("-two"), "the deletion is missing:\n{diff}");
-        assert_eq!(branch.as_deref(), Some("main"));
+        repo.write("kept.txt", "one\nWORKTREE\nthree\n");
+        repo.write("unchecked.txt", "UNSELECTED\n");
+        let (cwd, request) =
+            commit_message_request(std::slice::from_ref(&repo.root), &[message_scope(&repo)])
+                .expect("selected commit changes");
+        assert_eq!(cwd, repo.root);
+        assert!(request.prompt.contains("+WORKTREE"));
+        assert!(request.prompt.contains("-two"));
+        assert!(request.prompt.contains("current branch is `main`"));
+        assert!(!request.prompt.contains("STAGED"));
+        assert!(!request.prompt.contains("UNSELECTED"));
     }
 
     #[test]
-    fn an_empty_index_falls_back_to_the_working_tree_instead_of_refusing() {
-        // Changelist mode is this app's default and commits from the working tree, so for most
-        // users the index is empty at the moment they press the button. Without the fallback
-        // the staged diff is empty, the command answers `NothingToDescribe`, and the feature
-        // is dead for the majority of this application's users while looking like a model that
-        // declined to answer.
-        let repo = TempRepo::new("unstaged");
-        repo.write("kept.txt", "one\ntwo\nCHANGED\n");
-
-        let (diff, _) = staged_diff(&repo.root).expect("a working-tree change");
-
-        assert!(
-            diff.contains("+CHANGED"),
-            "an unstaged change produced no diff, so the button is dead in changelist mode:\n{diff}"
-        );
+    fn a_multi_repository_commit_message_contains_both_scopes() {
+        let first = TempRepo::new("message-first");
+        let second = TempRepo::new("message-second");
+        first.write("kept.txt", "FIRST\n");
+        second.write("kept.txt", "SECOND\n");
+        let (cwd, request) = commit_message_request(
+            &[first.root.clone(), second.root.clone()],
+            &[message_scope(&first), message_scope(&second)],
+        )
+        .expect("both repositories");
+        assert_eq!(cwd, first.root);
+        assert!(request.prompt.contains("+FIRST"));
+        assert!(request.prompt.contains("+SECOND"));
+        assert_eq!(request.prompt.matches("Repository:").count(), 2);
+        assert!(request.prompt.contains("branch: main"));
     }
 
     #[test]
-    fn a_clean_repository_produces_nothing_to_describe_rather_than_an_empty_prompt() {
-        // The other half of the fallback: it must not be so eager that a clean tree yields a
-        // whitespace-only diff, which would send the model a prompt with no diff in it and
-        // bill for whatever it invented.
-        let repo = TempRepo::new("clean");
+    fn a_commit_message_resolves_the_selected_agent_worktree() {
+        let repo = TempRepo::new("message-worktree");
+        let checkout = cide_git::worktree::ensure(&repo.root, "message-test").unwrap();
+        std::fs::write(checkout.path.join("kept.txt"), "WORKTREE_ONLY\n").unwrap();
+        repo.write("kept.txt", "PROJECT_ONLY\n");
+        let scope = cide_ipc::headless::CommitMessageScope {
+            repo: cide_git::repo::repo_id(&checkout.path),
+            selections: vec![cide_ipc::git::PathSelection::whole("kept.txt")],
+        };
+        let (cwd, request) = commit_message_request(std::slice::from_ref(&repo.root), &[scope])
+            .expect("a project agent checkout resolves like the Git panel's other commands");
+        assert_eq!(cwd, checkout.path);
+        assert!(request.prompt.contains("+WORKTREE_ONLY"));
+        assert!(!request.prompt.contains("PROJECT_ONLY"));
+    }
 
-        let (diff, _) = staged_diff(&repo.root).expect("a clean work tree is not an error");
+    #[cfg(unix)]
+    #[test]
+    fn commit_generation_routes_to_the_configured_cli_without_a_live_model() {
+        use std::os::unix::fs::PermissionsExt;
 
-        assert!(
-            diff.trim().is_empty(),
-            "a clean repository diffed as:\n{diff}"
-        );
+        for harness in [
+            cide_ipc::ConsoleHarness::Claude,
+            cide_ipc::ConsoleHarness::Codex,
+        ] {
+            let repo = TempRepo::new(match harness {
+                cide_ipc::ConsoleHarness::Claude => "message-fake-claude",
+                cide_ipc::ConsoleHarness::Codex => "message-fake-codex",
+            });
+            let binary = repo.root.join("fake-console");
+            let (env_key, frames) = match harness {
+                cide_ipc::ConsoleHarness::Claude => (
+                    "ANTHROPIC_BASE_URL",
+                    r#"{"type":"result","result":"Fake Claude draft","is_error":false,"subtype":"success"}"#,
+                ),
+                cide_ipc::ConsoleHarness::Codex => (
+                    "OPENAI_BASE_URL",
+                    "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Fake Codex draft\"}}\n{\"type\":\"turn.completed\"}",
+                ),
+            };
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.226'; exit 0; fi\n\
+                 cat > received-prompt.txt\n\
+                 printf '%s\\n' \"$@\" > received-args.txt\n\
+                 printf '%s' \"${env_key}\" > received-env.txt\n\
+                 printf '%s\\n' '{frames}'\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut settings = Settings {
+                console_harness: harness,
+                ..Settings::default()
+            };
+            settings.claude.cli.binary = "/nonexistent/claude-for-message-test".into();
+            settings.codex.cli.binary = "/nonexistent/codex-for-message-test".into();
+            let env = vec![cide_ipc::ClaudeEnvVar {
+                name: env_key.into(),
+                value: "https://example.invalid".into(),
+            }];
+            match harness {
+                cide_ipc::ConsoleHarness::Claude => {
+                    settings.claude.cli.binary = binary.to_string_lossy().into_owned();
+                    settings.claude.cli.env = env;
+                }
+                cide_ipc::ConsoleHarness::Codex => {
+                    settings.codex.cli.binary = binary.to_string_lossy().into_owned();
+                    settings.codex.cli.env = env;
+                }
+            }
+            let request = cide_claude::prompt::commit_message("+selected change\n", None);
+            let prompt = request.prompt.clone();
+            let result = tauri::async_runtime::block_on(run_console_headless(
+                settings,
+                repo.root.clone(),
+                request,
+            ))
+            .expect("the configured fake CLI returns a one-shot result");
+            assert!(!result.is_error);
+            assert!(result.text.starts_with("Fake "));
+            assert_eq!(
+                std::fs::read_to_string(repo.root.join("received-prompt.txt")).unwrap(),
+                prompt
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.root.join("received-env.txt")).unwrap(),
+                "https://example.invalid"
+            );
+            let args = std::fs::read_to_string(repo.root.join("received-args.txt")).unwrap();
+            assert!(!args.contains("selected change"));
+            match harness {
+                cide_ipc::ConsoleHarness::Claude => assert!(args.contains("--tools\n\n")),
+                cide_ipc::ConsoleHarness::Codex => assert!(args.contains("read-only")),
+            }
+        }
     }
 
     #[test]
-    fn a_commit_message_over_something_that_is_not_a_repository_is_a_git_error() {
-        // Rather than a panic or a `NoProject`. The project's root is perfectly real here —
-        // it is simply not a work tree, which is an ordinary state for a project opened on a
-        // scratch directory.
-        let outside = std::env::temp_dir();
-        let error = staged_diff(&outside).expect_err("a temp dir is not a work tree");
-        assert!(
-            matches!(error, ClaudeTaskError::Git { .. }),
-            "{error:?} is not the variant the panel branches on"
-        );
+    fn an_empty_commit_scope_is_refused_before_a_model_is_run() {
+        let repo = TempRepo::new("message-empty");
+        let mut scope = message_scope(&repo);
+        scope.selections.clear();
+        let error = commit_message_request(std::slice::from_ref(&repo.root), &[scope])
+            .expect_err("a reword has no changes to describe");
+        assert!(matches!(error, ClaudeTaskError::NothingToDescribe));
+        assert!(matches!(
+            commit_message_request(std::slice::from_ref(&repo.root), &[]),
+            Err(ClaudeTaskError::NothingToDescribe)
+        ));
+    }
+
+    #[test]
+    fn a_commit_message_for_a_missing_repository_is_a_git_error() {
+        let scope = cide_ipc::headless::CommitMessageScope {
+            repo: RepoId::new(),
+            selections: vec![],
+        };
+        let error = commit_message_request(&[std::env::temp_dir()], &[scope])
+            .expect_err("the scope does not name a project repository");
+        assert!(matches!(error, ClaudeTaskError::Git { .. }));
     }
 
     /// **This replaces a test that could not fail.**

@@ -822,6 +822,39 @@ pub fn agents_changed_unless_repeat(
 /// coalescer flush, unless the rows are the ones already sent.
 pub const SPEC_RUNS_CHANGED: &str = "cide://spec-runs-changed";
 
+/// A status gesture started (or reused) Apply. The shell showing this project opens its run;
+/// failures are reported separately from the status edit that already succeeded.
+pub const TASK_APPLY_STARTED: &str = "cide://task-apply-started";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskApplyStarted {
+    project: cide_ipc::ProjectId,
+    change: cide_ipc::ChangeName,
+    run: Option<cide_ipc::RunId>,
+    error: Option<String>,
+}
+
+pub fn task_apply_started(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    change: cide_ipc::ChangeName,
+    run: Option<cide_ipc::RunId>,
+    error: Option<String>,
+) {
+    if let Err(error) = app.emit(
+        TASK_APPLY_STARTED,
+        TaskApplyStarted {
+            project,
+            change,
+            run,
+            error,
+        },
+    ) {
+        tracing::debug!(%error, "task-apply-started reached no window");
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SpecRunsChanged {

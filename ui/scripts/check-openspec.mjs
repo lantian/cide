@@ -119,6 +119,7 @@ try {
       'node_modules/typescript/bin/tsc',
       'src/sidebar/OpenSpecPanel/model.ts',
       'src/sidebar/OpenSpecPanel/editModel.ts',
+      'src/sidebar/OpenSpecPanel/scenario.ts',
       'src/sidebar/TasksPanel/specCard.ts',
       '--outDir', out,
       '--module', 'esnext',
@@ -135,7 +136,47 @@ try {
   // own directory in `out` — which is what keeps two modules called `model.ts` apart.
   const M = await import(`file://${join(out, 'OpenSpecPanel', 'model.js')}`)
   const E = await import(`file://${join(out, 'OpenSpecPanel', 'editModel.js')}`)
+  const S = await import(`file://${join(out, 'OpenSpecPanel', 'scenario.js')}`)
   const C = await import(`file://${join(out, 'TasksPanel', 'specCard.js')}`)
+
+  /* ------------------------------------------------------- presentation-only scenario clauses */
+
+  {
+    const clause = (keyword, text) => ({ kind: 'clause', keyword, text })
+    const raw = (text) => ({ kind: 'text', text })
+    eq(
+      S.scenarioLines('- **WHEN** the user submits\n- **THEN** it saves\n- **AND** it closes'),
+      [clause('WHEN', 'the user submits'), clause('THEN', 'it saves'), clause('AND', 'it closes')],
+      'canonical scenario prefixes become clauses in source order',
+    )
+    eq(
+      S.scenarioLines('WHEN first\r\nTHEN second\r\nTHEN third'),
+      [clause('WHEN', 'first'), clause('THEN', 'second'), clause('THEN', 'third')],
+      'plain clauses, CRLF, and repeated clauses are supported',
+    )
+    for (const prefix of ['- ', '* ', '+ ', '  - ', '']) {
+      eq(S.scenarioLines(`${prefix}**WHEN** a`), [clause('WHEN', 'a')], `${prefix}: bold keyword`)
+      eq(S.scenarioLines(`${prefix}THEN\tb`), [clause('THEN', 'b')], `${prefix}: plain keyword`)
+    }
+    const free = ['This says WHEN it happens', '', 'WHENEVER it happens', '**WHEN* bad markup',
+      'when lowercase', 'GIVEN something', '    WHEN indented code', '  continuation', '| a | b |']
+    eq(S.scenarioLines(free.join('\n')), free.map(raw), 'free text, blanks, and code indentation survive')
+    eq(S.scenarioLines('WHEN'), [clause('WHEN', '')], 'an unfinished clause keeps its label')
+    eq(S.scenarioLines('WHEN <img onerror="evil()">'), [clause('WHEN', '<img onerror="evil()">')],
+      'the parser returns text rather than interpreting HTML')
+    for (const fence of ['```', '~~~', '````']) {
+      const lines = [`${fence}example`, '- **WHEN** code', '', fence, 'THEN prose']
+      eq(S.scenarioLines(lines.join('\n')), [...lines.slice(0, 4).map(raw), clause('THEN', 'prose')],
+        `${fence}: fenced examples remain untouched and parsing resumes after the close`)
+    }
+    const unclosed = ['````', 'WHEN code', '```', 'THEN still code']
+    eq(S.scenarioLines(unclosed.join('\n')), unclosed.map(raw), 'a shorter fence does not end the code block')
+    eq(S.scenarioLines('~~~\nWHEN code\n~~~ info\nTHEN code'),
+      ['~~~', 'WHEN code', '~~~ info', 'THEN code'].map(raw), 'a fence with trailing prose is not a close')
+    eq(S.scenarioLines('WHEN first\n  continued\n\nTHEN last\n'),
+      [clause('WHEN', 'first'), raw('  continued'), raw(''), clause('THEN', 'last'), raw('')],
+      'continuations and blank lines retain their source order')
+  }
 
   /* ------------------------------------------------------- what the card says while it works */
 
@@ -550,8 +591,7 @@ try {
     eq(
       unassigned.gate.ok,
       true,
-      'with nothing assigned, because approving is what assigns it — the picker behind this ' +
-        'button is where a role, an open conversation or a new one is chosen',
+      'approval can launch the default Apply session without a role or target selection',
     )
     ok(
       unassigned.hint.includes('archived'),
@@ -649,18 +689,14 @@ try {
     )
     eq(handed.gate.ok, false, 'and the reason says where the work went')
 
-    /*
-     * **The role path is untouched**, which is the other half of the claim. Assigning a role is
-     * `cide_agents::autodispatch`'s trigger edge and a session is read by no trigger at all;
-     * Rust keeps them in different fields so a task cannot claim both. A rule that had keyed off
-     * "anything assigned" would have taken the re-dispatch road away from every subagent task.
-     */
-    eq(
-      M.primaryAction(change(), 'developer', 'doing', null, true).id,
-      'approve',
-      'a task assigned to a role can still be dispatched again — the session rule must not ' +
-        'reach the role road',
-    )
+    for (const status of ['doing', 'review']) {
+      for (const assignee of [null, 'developer']) {
+        eq(M.primaryAction(change(), assignee, status, null, true).id, 'none',
+          'implementation already entered: no approval even before the first checklist item is ticked')
+      }
+    }
+    eq(M.primaryAction(change(), 'developer', 'todo', null, true).id, 'approve', 'a Todo task may still be dispatched')
+    eq(M.primaryAction(change({ completed: 9, total: 9 }), 'developer', 'doing', null, true).id, 'accept', 'finished work still offers integration and archive')
 
     /*
      * A blank session is not a session. The field crosses the wire as `Option<SessionId>` and
@@ -1010,6 +1046,10 @@ try {
     eq(M.sessionState({ state: 'finished', code: 0 }).live, false, 'a finished one is not')
     eq(M.sessionState({ state: 'failed', reason: 'x' }).tone, 'red', 'a failed one is red')
     eq(M.sessionState({ state: 'somethingNew' }).label, 'somethingNew', 'an unknown state reads as itself')
+    eq(M.sessionState({ state: 'idle' }, true), { label: 'Finished', tone: 'green', live: true, working: false }, 'a completed turn retains its live session')
+    eq(M.sessionState({ state: 'interrupted' }, true), { label: 'Finished', tone: 'green', live: false, working: false }, 'restart does not interrupt a turn that already completed')
+    eq(M.sessionState({ state: 'interrupted' }).label, 'Interrupted', 'an actual interrupted turn is still shown as Interrupted')
+    eq(M.sessionPhase({ state: 'running' }, true), 'running', 'a new turn stays working even if an older completion flag were present')
 
     eq(
       M.sessionTitle('apply', 'add-dark-mode', 'developer'),

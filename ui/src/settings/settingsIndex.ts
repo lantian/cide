@@ -29,6 +29,7 @@ export interface SettingsHit {
 }
 
 export const SETTINGS_INDEX: readonly SettingsHit[] = [
+  { section: 'projectsAndWindows', label: 'New-task proposals', keywords: 'openspec propose task background tab run' },
   // --- Pages drawn in sections.tsx ---
   // Appearance
   { section: 'appearance', label: 'Theme', keywords: 'dark light mode colours' },

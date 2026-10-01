@@ -16,6 +16,7 @@
  * second stylesheet for four boxes buys nothing. If this grows, it wants a module.
  */
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
+import { Button } from '@/kit/components/Button'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
@@ -99,6 +100,9 @@ const pathStyle: CSSProperties = {
 export interface ResumeSplashProps {
   /** The session's title, shown in the control so the user knows what they are resuming. */
   title: string
+  harness?: string | undefined
+  missingConversation?: boolean | undefined
+  onFresh?: (() => void) | undefined
   /** Epoch milliseconds of the session's last activity; null when nothing recorded it. */
   lastActive: number | null
   onResume: () => void
@@ -112,6 +116,9 @@ export interface ResumeSplashProps {
 
 export function ResumeSplash({
   title,
+  harness = 'claude',
+  missingConversation = false,
+  onFresh,
   lastActive,
   onResume,
   version,
@@ -127,7 +134,9 @@ export function ResumeSplash({
   useMinuteTick(lastActive !== null)
 
   const when = lastActive === null ? null : relativeTime(lastActive)
-  const label = when === null ? `Resume "${title}"` : `Resume "${title}" · ${when}`
+  const label = missingConversation
+    ? 'Choose a Codex session'
+    : when === null ? `Resume "${title}"` : `Resume "${title}" · ${when}`
 
   const controlStyle: CSSProperties = {
     alignSelf: 'stretch',
@@ -155,7 +164,7 @@ export function ResumeSplash({
 
       <div style={linesStyle}>
         <div style={nameStyle}>
-          Claude Code
+          {harness === 'codex' ? 'Codex' : 'Claude Code'}
           {version !== undefined && <span style={versionStyle}>v{version}</span>}
         </div>
         {model !== undefined && <div>{model}</div>}
@@ -177,6 +186,12 @@ export function ResumeSplash({
       >
         {label}
       </button>
+      {missingConversation && (
+        <>
+          <div>Select the conversation to restore.</div>
+          <Button onClick={onFresh}>Start a new session</Button>
+        </>
+      )}
     </div>
   )
 }

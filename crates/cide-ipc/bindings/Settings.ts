@@ -13,6 +13,7 @@ import type { OpenRunIn } from "./OpenRunIn";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
+import type { TaskProposalRunMode } from "./TaskProposalRunMode";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
 import type { UpdateSettings } from "./UpdateSettings";
@@ -120,6 +121,11 @@ consoleHarness: ConsoleHarness,
  * console. (M108) Only that button reads it — nothing opens a run's view by itself.
  */
 openRunIn: OpenRunIn, 
+/**
+ * Presentation of proposals requested while creating a task. Existing proposal and Apply
+ * buttons keep their own behavior; background runs can still be opened from OpenSpec.
+ */
+taskProposalRunMode: TaskProposalRunMode, 
 /**
  * Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
  */

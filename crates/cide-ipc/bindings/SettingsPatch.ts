@@ -13,6 +13,7 @@ import type { OpenRunIn } from "./OpenRunIn";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
+import type { TaskProposalRunMode } from "./TaskProposalRunMode";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
 import type { UpdateSettings } from "./UpdateSettings";
@@ -57,7 +58,7 @@ consoleHarness?: ConsoleHarness,
  * Where the Agents panel's Open shows a run. (M108) See
  * [`crate::settings::Settings::open_run_in`].
  */
-openRunIn?: OpenRunIn, 
+openRunIn?: OpenRunIn, taskProposalRunMode?: TaskProposalRunMode, 
 /**
  * How `codex` is launched. (M93)
  */

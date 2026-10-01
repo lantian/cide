@@ -80,8 +80,9 @@ pub use settings::{
     InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MAX_UI_FONT_SIZE,
     MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, OpenRunIn, ProxyMode, ProxyScope,
     ProxySettings, ProxyTarget, RemoteBind, RemoteSettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    Settings, SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, UpdateSettings,
-    clamp_font_size, clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
+    Settings, SeverityFilter, SidebarSettings, TaskProposalRunMode, TerminalRenderer,
+    TerminalSettings, UpdateSettings, clamp_font_size, clamp_ui_font_size, normalize_proxy_url,
+    redact_proxy_url,
 };
 pub use settings_ops::{
     AccentPatch, GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem,
@@ -203,7 +204,7 @@ pub use spec::{
 };
 pub use spec::{
     SpecCheckout, SpecIntegrated, SpecLauncher, SpecOp, SpecPublished, SpecRunRow,
-    SpecSessionStart, SpecSettings,
+    SpecSessionStart, SpecSettings, TaskProposalCreated,
 };
 
 use serde::{Deserialize, Serialize};
@@ -250,8 +251,10 @@ pub struct Bootstrap {
 #[serde(rename_all = "camelCase", tag = "kind")]
 #[ts(export)]
 pub enum SessionRestore {
-    /// Claude Code still holds a transcript for this id: spawn with `--resume`.
+    /// The harness still holds this conversation: spawn with its resume command.
     Resumable { session: SessionId },
+    /// A saved Codex pane has no available thread. Let the user choose a conversation.
+    MissingConversation,
     /// Spawn clean. Every shell, and every Claude pane whose transcript is gone.
     Fresh,
 }
@@ -279,9 +282,8 @@ pub struct PaneRestore {
     pub restore: SessionRestore,
     /// Whether to spawn on launch rather than waiting to be asked.
     ///
-    /// True for exactly one pane per project: the one bound to its primary session. Every
-    /// other Claude pane renders a splash with a resume affordance, because reopening a
-    /// six-pane project must not silently start six agents at once.
+    /// True for the primary console and, when resume-all is enabled, resumable conversations.
+    /// Missing Codex conversations always wait for the user's recovery choice.
     pub eager: bool,
 }
 

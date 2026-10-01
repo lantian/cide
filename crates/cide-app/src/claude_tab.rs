@@ -309,8 +309,10 @@ pub(crate) fn open(
         geometry: Geometry::default(),
         project: Some(project),
         resume: None,
+        resume_picker: false,
         fork: None,
         continues: None,
+        pane: None,
         // **This tab is acting as the product owner, and has to be told so.** Inferring it from
         // the tree answers `Pane`, whose sentence is deliberately hedged — *you may act as one*
         // — for a case that is not this one: a conversation pane the user opened onto a task has
@@ -366,7 +368,7 @@ pub(crate) fn open(
         } else {
             cide_core::workspace::open_tab
         };
-        open(
+        let tab = open(
             ws,
             project,
             TabKind::ClaudeFull {
@@ -414,7 +416,9 @@ pub(crate) fn open(
                 docker: None,
                 origin,
             },
-        )
+        )?;
+        crate::cmd::pane::bind_recorded_session(ws, &registry, project, tab, pane, session)?;
+        Ok(tab)
     });
 
     let tab = match opened {
@@ -611,8 +615,15 @@ pub(crate) async fn resume_closed(
             geometry: Geometry::default(),
             project: Some(project),
             resume: Some(resume),
+            resume_picker: false,
             fork: None,
-            continues: pane.continues.clone(),
+            continues: pane.continues.clone().map(|mut continuation| {
+                if continuation.harness == cide_ipc::Harness::Codex {
+                    continuation.id = resume.to_string();
+                }
+                continuation
+            }),
+            pane: None,
             // Told explicitly: `spawn_session` infers a worker from the tree, and the tab is not
             // back in the tree yet — session first, tab second.
             voice: Some(if pane.origin == Some(cide_ipc::PaneOrigin::Worker) {
@@ -637,6 +648,10 @@ pub(crate) async fn resume_closed(
                 // record's, so it is written before the reinsert makes it anybody's.
                 if let Some(held) = record.tree.panes.get_mut(&pane.id) {
                     held.session = Some(id);
+                    if let Some((conversation, since)) = registry.conversation_of(id) {
+                        held.conversation = Some(conversation);
+                        held.conversation_since = Some(since);
+                    }
                 }
                 started.push(id);
             }

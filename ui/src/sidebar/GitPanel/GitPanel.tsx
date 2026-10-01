@@ -39,6 +39,7 @@ import type { IconTheme } from '@/icons/iconFor'
 import { ChangelistDialog } from './ChangelistDialog'
 import { ChangesTree } from './ChangesTree'
 import { CommitBox } from './CommitBox'
+import { ReplaceMessageDialog } from './ReplaceMessageDialog'
 import { ConfirmDestructive } from '@/chrome/ConfirmDestructive'
 import { useFocusRequested } from '@/chrome/focusRequests'
 import { GuardBar } from './GuardBar'
@@ -348,15 +349,19 @@ export function GitPanelView({
       {tab === 'commit' && (
         <CommitBox
           message={git.message}
+          generating={git.draft.generating}
+          generateDisabledReason={git.generateDisabledReason}
+          generationError={git.draft.error}
+          onGenerate={git.generateMessage}
           amend={git.amend}
           /* The log's abbreviation, straight through — `null` for the checkbox's own meaning.
              See `CommitBoxProps.amendOf` for why it is on the label rather than hidden. */
           amendOf={git.amendOf?.shortOid ?? null}
           summary={summary}
           canAmend={canAmend}
-/* The rule is in `model.ts` so `check:git` can compile and run it — including
+          /* The rule is in `model.ts` so `check:git` can compile and run it — including
              the reword case, which is the one place Commit is live on an empty selection. */
-          canCommit={canCommit({
+          canCommit={git.draft.generated === null && canCommit({
             picked: git.picked.length,
             reword: git.rewordRepo !== null,
             busy: git.busy,
@@ -366,6 +371,16 @@ export function GitPanelView({
           onAmend={git.setAmend}
           onCommit={() => git.commit(false)}
           onCommitAndPush={() => git.commit(true)}
+        />
+      )}
+
+      {tab === 'commit' && git.draft.generated !== null && git.confirm === null && git.dialog === null && (
+        <ReplaceMessageDialog
+          existing={git.message}
+          generated={git.draft.generated}
+          revision={git.draft.revision}
+          onCancel={git.discardGeneratedMessage}
+          onReplace={git.replaceGeneratedMessage}
         />
       )}
 

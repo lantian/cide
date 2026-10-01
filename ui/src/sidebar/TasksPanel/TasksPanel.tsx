@@ -73,11 +73,14 @@ import {
   type StatusFilter,
   type TaskView,
 } from './model'
-import { agentColor, glyphSpins, phaseGlyph, type RunPhase } from '@/sidebar/AgentsPanel/model'
+import { agentColor, glyphSpins, phaseGlyph, phaseLabel, phaseTone, type RunPhase, type Tone as RunTone } from '@/sidebar/AgentsPanel/model'
 import { DeleteControl, TONE_CLASS, chipClass, cx } from './TaskDetail'
 import type { ReactNode } from 'react'
 import type { ProjectId } from '@/ipc/client'
 import { Icon, asIcon } from '@/icons/Icon'
+import { Badge, type Tone as BadgeTone } from '@/kit/components/Status'
+import type { SpecRunRow } from '@/ipc/generated'
+import { taskSpecStatuses, taskSpecPhase } from './specSessions'
 
 import styles from './TasksPanel.module.css'
 
@@ -98,6 +101,8 @@ export interface TasksPanelViewProps {
    * draws a dim chip and a task without draws nothing, which is exactly right.
    */
   runs?: readonly RunRef[] | undefined
+  /** Additional OpenSpec status, independent of the role-run join above. */
+  specRuns?: readonly SpecRunRow[] | undefined
   /** Agent id → label. */
   roles?: Readonly<Record<string, string>> | undefined
   /**
@@ -207,6 +212,7 @@ export function TasksPanelView({
   project,
   board = BOARD_UNKNOWN,
   runs = [],
+  specRuns = [],
   roles = {},
   roleColors = {},
   selected = null,
@@ -611,6 +617,7 @@ export function TasksPanelView({
                       key={task.id}
                       task={task}
                       runs={runs}
+                      specRuns={specRuns}
                       roles={roles}
                       roleColors={roleColors}
                       verify={verifies?.[task.id]}
@@ -698,6 +705,7 @@ export function TasksPanelView({
 function TaskLine({
   task,
   runs,
+  specRuns,
   roles,
   roleColors,
   onSelect,
@@ -710,6 +718,7 @@ function TaskLine({
   task: TaskView
   verify?: 'running' | 'passed' | 'failed' | undefined
   runs: readonly RunRef[]
+  specRuns: readonly SpecRunRow[]
   roles: Readonly<Record<string, string>>
   roleColors: Readonly<Record<string, string>>
   onSelect?: ((task: string | null) => void) | undefined
@@ -721,6 +730,7 @@ function TaskLine({
   onDelete?: ((task: string) => void) | undefined
 }) {
   const chip = agentChip(task, runs, roles)
+  const workflows = taskSpecStatuses(specRuns, task.id, task.change)
   const body = (
     <>
       <span
@@ -775,7 +785,9 @@ function TaskLine({
             chip.lit
               ? `${chip.label} is working on this now`
               : chip.tone === 'attention'
-                ? `Assigned to ${chip.label}, but no run is on it — the task says doing and nobody is working`
+                ? workflows.length > 0
+                  ? `Assigned to ${chip.label}, but no subagent run is working on this Doing task. OpenSpec status is shown separately.`
+                  : `Assigned to ${chip.label}, but no run is on it — the task says doing and nobody is working`
                 : `Assigned to ${chip.label}`
           }
         >
@@ -834,7 +846,7 @@ function TaskLine({
       data-open={open ? 'true' : 'false'}
     >
       {onSelect === undefined ? (
-        <span className={styles.rowMain}>{body}</span>
+        <span className={styles.rowMain}><TaskRowContent workflows={workflows}>{body}</TaskRowContent></span>
       ) : (
         <button
           type="button"
@@ -842,7 +854,7 @@ function TaskLine({
           data-audit="tasksOpenTask"
           onClick={() => onSelect(task.id)}
         >
-          {body}
+          <TaskRowContent workflows={workflows}>{body}</TaskRowContent>
         </button>
       )}
       <DeleteControl
@@ -854,5 +866,44 @@ function TaskLine({
         onDelete={onDelete}
       />
     </div>
+  )
+}
+
+const WORKFLOW_TONES: Record<RunTone, BadgeTone> = {
+  idle: 'neutral', busy: 'blue', attention: 'yellow', paused: 'yellow', done: 'green', error: 'red',
+}
+
+/** Keep the task and subagent line intact; OpenSpec gets its own wrapping status line. */
+function TaskRowContent({ workflows, children }: { workflows: readonly SpecRunRow[]; children: ReactNode }) {
+  if (workflows.length === 0) return children
+  return (
+    <span className={styles.taskRowContent}>
+      <span className={styles.taskRowSummary}>{children}</span>
+      <span className={styles.taskRowWorkflows}>
+        {workflows.map((run) => {
+          const label = run.op === 'apply' ? 'Apply' : 'Proposal'
+          const phase = taskSpecPhase(run)
+          const glyph = phaseGlyph(phase)
+          return (
+            <span
+              key={run.run}
+              className={styles.taskWorkflowStatus}
+              data-audit="tasksSpecStatus"
+              data-run={run.run}
+              data-op={run.op}
+              data-phase={phase}
+              title={`OpenSpec ${label} · ${run.label} · ${phaseLabel(phase)}${run.state.state === 'failed' ? `: ${run.state.reason}` : ''}`}
+            >
+              <Badge soft tone={WORKFLOW_TONES[phaseTone(phase)]}>
+                <span className={cx(styles.chipDot, glyphSpins(glyph) && styles.chipSpin)} aria-hidden="true">
+                  <Icon name={asIcon(glyph)} size={0} />
+                </span>
+                {label} · {phaseLabel(phase)}
+              </Badge>
+            </span>
+          )
+        })}
+      </span>
+    </span>
   )
 }

@@ -213,6 +213,7 @@ export function PaneBody({
     () => restore !== undefined && !restore.eager && paneSessionId(pane.id) === undefined,
   )
   const [resumed, setResumed] = useState(false)
+  const [recovery, setRecovery] = useState<'picker' | 'fresh'>('picker')
 
   /*
    * What this pane's tab makes of it — revision document, merge resolver, or neither. (M18)
@@ -413,9 +414,15 @@ export function PaneBody({
     return (
       <ResumeSplash
         title={pane.title}
+        harness={pane.harness ?? pane.continues?.harness ?? 'claude'}
         lastActive={null}
         cwd={cwd}
         onResume={() => setResumed(true)}
+        missingConversation={restore?.restore.kind === 'missingConversation'}
+        onFresh={() => {
+          setRecovery('fresh')
+          setResumed(true)
+        }}
       />
     )
   }
@@ -429,6 +436,7 @@ export function PaneBody({
       project={project}
       primarySession={primarySession}
       restore={restore}
+      recovery={recovery}
       roots={roots}
       onOpenPath={onOpenPath}
       onRevealPath={onRevealPath}

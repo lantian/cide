@@ -98,6 +98,7 @@ import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
 import { openCount, waitingCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
+import { followRunTab } from '@/sidebar/OpenSpecPanel/specRuns'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
@@ -957,8 +958,13 @@ export function App() {
     const off = taskEvents.onChanged((project, board) => {
       adoptTasks(project, board)
     })
+    const offApply = taskEvents.onApplyStarted((project, change, run, error) => {
+      if (error) notifyFailure(error, { project })
+      if (run) followRunTab(project, run, `Apply · ${change}`)
+    })
     return () => {
       void off.then((stop) => stop())
+      void offApply.then((stop) => stop())
     }
   }, [adoptTasks])
 

@@ -47,6 +47,8 @@ import {
   type TaskResponse,
 } from '@/ipc/client'
 import { adaptBoard } from './TasksPanel/adapt'
+import { notifyFailure } from '@/chrome/notices'
+import { followRunTab } from './OpenSpecPanel/specRuns'
 import {
   BOARD_UNKNOWN,
   EMPTY_DRAFT,
@@ -279,12 +281,9 @@ export const useTasks = create<TasksStore>((set, get) => ({
      * `openspec validate` refuses and a board row stuck at `0/0`. The link was correct and the
      * thing it linked to was broken.
      *
-     * Proposing moved to `spec_propose_for_task`, which runs `/openspec-propose` in a
-     * conversation and tells it to link the change back with `cide_task_update`. That inverts the
-     * ordering argument this comment used to make, and the inversion is safe for the reason the
-     * original was not: nothing is dispatched from a task with no change, so there is no run to
-     * mislead — where a task born linked to an empty change would have dispatched a run at a
-     * checklist that did not exist.
+     * Proposing now saves the task first, then runs the installed workflow in a conversation
+     * that links the real change back. An assigned role may already be working at that point;
+     * no task or run is ever pointed at a fabricated change folder or empty checklist.
      */
     const change = changeFromDraft(draft)
 
@@ -319,25 +318,24 @@ export const useTasks = create<TasksStore>((set, get) => ({
      */
     set({ creating: true })
     try {
-      const wire = await tasksApi.create(req)
-      // The user left for another project mid-write. The task was still created — in the project
-      // it was composed for — so this is not a failure; there is simply nothing here to paint,
-      // and `attach` has already cleared the dialog.
-      if (get().project !== project) return
-      get().adopt(project, wire)
-      /*
-       * Closed **only once the write landed**, and the card is deliberately *not* opened on top.
-       *
-       * *New task* used to create a row and open its card, because the card was where the task
-       * got its title. The dialog is that surface now, so opening a second modal for a task
-       * whose four fields the user has just filled in would be answering a finished gesture with
-       * another one. The confirmation is the row appearing in the list, which is what
-       * `filterAfterCreate` is for — a create the user cannot see reads as a create that did not
-       * happen.
-       */
-      set({ compose: null })
+      const { useWorkspace } = await import('@/store/workspace')
+      const proposalRunMode = useWorkspace.getState().boot?.workspace.settings.taskProposalRunMode ?? 'background'
+      const proposed = draft.propose === true ? await tasksApi.createWithProposal(req) : null
+      const wire = proposed === null ? await tasksApi.create(req) : proposed.board
+      if (get().project === project) {
+        get().adopt(project, wire)
+        // Close as soon as saving succeeds. Presentation cannot leave a successfully saved
+        // task's draft open, where retrying Create would mint another task.
+        set({ compose: null })
+      }
+      if (proposed?.proposalError) {
+        notifyFailure(`Task ${proposed.task} was saved, but its proposal could not start: ${proposed.proposalError}`, { project })
+      }
+      if (proposed?.proposal && proposalRunMode === 'tab') {
+        followRunTab(project, proposed.proposal, `Propose · ${draft.title.trim()}`)
+      }
     } finally {
-      set({ creating: false })
+      if (get().project === project) set({ creating: false })
     }
   },
 

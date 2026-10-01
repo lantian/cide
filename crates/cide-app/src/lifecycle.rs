@@ -1519,6 +1519,20 @@ fn plan_restore_in(
     projects_dir: Option<&Path>,
     only: Option<ProjectId>,
 ) -> Vec<PaneRestore> {
+    plan_restore_with_homes(
+        ws,
+        projects_dir,
+        cide_core::codex_cli::codex_home().as_deref(),
+        only,
+    )
+}
+
+fn plan_restore_with_homes(
+    ws: &Workspace,
+    projects_dir: Option<&Path>,
+    codex_home: Option<&Path>,
+    only: Option<ProjectId>,
+) -> Vec<PaneRestore> {
     let mut plan = Vec::new();
     // Read once for the whole plan: it is one bool for the launch, not a per-pane decision.
     let resume_all = ws.settings.claude.resume_all_on_launch;
@@ -1556,6 +1570,7 @@ fn plan_restore_in(
                     tab.id,
                     &root.path,
                     projects_dir,
+                    codex_home,
                     resume_all,
                     resume_enabled,
                 ) {
@@ -1577,6 +1592,7 @@ fn plan_restore_in(
                 tab,
                 &root.path,
                 projects_dir,
+                codex_home,
                 resume_all,
                 resume_enabled,
             ) {
@@ -1597,6 +1613,7 @@ fn entry_for(
     tab: TabId,
     cwd: &Path,
     projects_dir: Option<&Path>,
+    codex_home: Option<&Path>,
     resume_all: bool,
     resume_enabled: Resume,
 ) -> Option<PaneRestore> {
@@ -1613,7 +1630,7 @@ fn entry_for(
         .continues
         .as_ref()
         .map_or(cwd, |conversation| conversation.cwd.as_path());
-    let restore = restore_for(pane, cwd, projects_dir, resume_enabled);
+    let restore = restore_for(pane, cwd, projects_dir, codex_home, resume_enabled);
     Some(PaneRestore {
         window,
         project: project.id,
@@ -1630,8 +1647,9 @@ fn entry_for(
         // returns the user to what they left; spawning one whose transcript is gone starts a
         // *new* conversation they did not ask for, in a pane that looks identical. So an
         // unresumable pane keeps its splash however this is set.
-        eager: pane.session == Some(project.primary_session)
-            || (resume_all && matches!(restore, SessionRestore::Resumable { .. })),
+        eager: restore != SessionRestore::MissingConversation
+            && (pane.session == Some(project.primary_session)
+                || (resume_all && matches!(restore, SessionRestore::Resumable { .. }))),
     })
 }
 
@@ -1658,13 +1676,20 @@ pub(crate) fn resumable_on_reopen(ws: &Workspace, pane: &Pane, root: &Path) -> S
         claude: ws.settings.claude.cli.inject.resume.enabled,
         codex: ws.settings.codex.cli.inject.resume,
     };
-    restore_for(pane, cwd, claude_projects_dir().as_deref(), resume_enabled)
+    restore_for(
+        pane,
+        cwd,
+        claude_projects_dir().as_deref(),
+        cide_core::codex_cli::codex_home().as_deref(),
+        resume_enabled,
+    )
 }
 
 fn restore_for(
     pane: &Pane,
     cwd: &Path,
     projects_dir: Option<&Path>,
+    codex_home: Option<&Path>,
     resume_enabled: Resume,
 ) -> SessionRestore {
     // A shell's scrollback died with its process. There is nothing to resume and nothing to
@@ -1677,13 +1702,18 @@ fn restore_for(
     // by id alone, from any directory: codex does not file a thread under its cwd. Its own
     // resume switch, not claude's.
     if cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Codex {
-        return match pane.conversation {
+        if !resume_enabled.codex {
+            return SessionRestore::Fresh;
+        }
+        return match cide_core::workspace::pane_codex_thread(pane) {
             Some(thread)
-                if cide_core::codex_cli::resumable(&thread.to_string(), resume_enabled.codex) =>
+                if codex_home.is_some_and(|home| {
+                    cide_core::codex_cli::rollout_of(home, &thread.to_string()).is_some()
+                }) =>
             {
                 SessionRestore::Resumable { session: thread }
             }
-            _ => SessionRestore::Fresh,
+            _ => SessionRestore::MissingConversation,
         };
     }
     // cide has been told not to pass `--resume`. The transcript may well still be there, and
@@ -2765,6 +2795,109 @@ mod tests {
         let dir = projects_dir.join(encoded);
         std::fs::create_dir_all(&dir).expect("create the transcript dir");
         std::fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").expect("write a transcript");
+    }
+
+    #[test]
+    fn codex_consoles_and_continuations_restore_the_thread_saved_on_disk() {
+        let root = temp_dir("codex-restore");
+        let home = root.join("codex");
+        let day = home.join("sessions/2026/10/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let thread = SessionId::new();
+        std::fs::write(day.join(format!("rollout-test-{thread}.jsonl")), b"{}\n").unwrap();
+        let mut ws = fixture(&root);
+        let project = *ws.projects.keys().next().unwrap();
+        let panes = &mut ws.projects.get_mut(&project).unwrap().tabs[0].tree.panes;
+        let primary = panes
+            .values_mut()
+            .find(|p| p.role == cide_ipc::PaneRole::Primary)
+            .unwrap();
+        primary.harness = Some(cide_ipc::Harness::Codex);
+        primary.conversation = Some(thread);
+        let primary_id = primary.id;
+        let auxiliary = panes
+            .values_mut()
+            .find(|p| p.kind == PaneKind::Claude && p.role == cide_ipc::PaneRole::Auxiliary)
+            .unwrap();
+        auxiliary.continues = Some(cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: thread.to_string(),
+            cwd: root.join("worktree"),
+        });
+        let auxiliary_id = auxiliary.id;
+        let saved = root.join("workspace.json");
+        cide_core::persist::save_atomic(&saved, &ws).unwrap();
+        let mut ws = cide_core::persist::load(&saved);
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        for id in [primary_id, auxiliary_id] {
+            let entry = plan.iter().find(|e| e.pane == id).unwrap();
+            assert_eq!(entry.restore, SessionRestore::Resumable { session: thread });
+            assert!(entry.eager);
+        }
+        assert_eq!(
+            plan.iter().find(|e| e.pane == auxiliary_id).unwrap().cwd,
+            root.join("worktree")
+        );
+        ws.settings.claude.resume_all_on_launch = false;
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        assert!(plan.iter().find(|e| e.pane == primary_id).unwrap().eager);
+        assert!(!plan.iter().find(|e| e.pane == auxiliary_id).unwrap().eager);
+
+        let newer = SessionId::new();
+        std::fs::write(day.join(format!("rollout-test-{newer}.jsonl")), b"{}\n").unwrap();
+        ws.projects.get_mut(&project).unwrap().tabs[0]
+            .tree
+            .panes
+            .get_mut(&auxiliary_id)
+            .unwrap()
+            .conversation = Some(newer);
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        assert_eq!(
+            plan.iter()
+                .find(|e| e.pane == auxiliary_id)
+                .unwrap()
+                .restore,
+            SessionRestore::Resumable { session: newer }
+        );
+        // A primary pane with a lost id must wait for a recovery choice, rather than open fresh.
+        ws.projects.get_mut(&project).unwrap().tabs[0]
+            .tree
+            .panes
+            .get_mut(&primary_id)
+            .unwrap()
+            .conversation = None;
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        let primary = plan.iter().find(|e| e.pane == primary_id).unwrap();
+        assert_eq!(primary.restore, SessionRestore::MissingConversation);
+        assert!(!primary.eager);
+        let plan = plan_restore_with_homes(&ws, None, None, None);
+        assert_eq!(
+            plan.iter()
+                .find(|e| e.pane == auxiliary_id)
+                .unwrap()
+                .restore,
+            SessionRestore::MissingConversation
+        );
+        ws.settings.codex.cli.inject.resume = false;
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        assert_eq!(
+            plan.iter().find(|e| e.pane == primary_id).unwrap().restore,
+            SessionRestore::Fresh
+        );
+        assert!(plan.iter().find(|e| e.pane == primary_id).unwrap().eager);
+        ws.settings.codex.cli.inject.resume = true;
+        ws.settings.claude.resume_all_on_launch = true;
+        let tab = ws.projects[&project].tabs[0].id;
+        let window = workspace::detach_pane(&mut ws, project, tab, auxiliary_id).unwrap();
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        let detached = plan.iter().find(|e| e.pane == auxiliary_id).unwrap();
+        assert_eq!(detached.window, window);
+        assert_eq!(
+            detached.restore,
+            SessionRestore::Resumable { session: newer }
+        );
+        assert!(detached.eager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A pane opened onto an agent run's conversation was started in the run's worktree, and

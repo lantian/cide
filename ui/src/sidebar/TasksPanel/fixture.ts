@@ -38,6 +38,7 @@
  * this wrong is a blank window rather than a wrong date.
  */
 import type { ProjectId } from '@/ipc/client'
+import type { SpecRunRow } from '@/ipc/generated'
 import {
   EMPTY_DRAFT,
   assigneeHint,
@@ -634,6 +635,10 @@ export type TasksStoryName =
   | 'empty'
   | 'list'
   | 'list-with-live-run'
+  | 'list-with-live-run-and-spec'
+  | 'list-with-spec-no-role'
+  | 'list-spec-states'
+  | 'list-proposal-finished'
   | 'list-selected'
   | 'rogue-status'
   | 'list-recent-first'
@@ -677,6 +682,10 @@ export const PENDING_STORIES: Record<PendingStoryName, TaskDetailPendingProps> =
   },
 }
 
+function specRun(over: Partial<SpecRunRow> & Pick<SpecRunRow, 'run' | 'op'>): SpecRunRow {
+  return { text: '', label: 'OpenSpec · Codex', state: { state: 'running' }, turnComplete: false, startedUnixMs: 0n, ...over }
+}
+
 export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
   'no-project': story({ project: null, board: ready([T14]) }),
 
@@ -709,6 +718,38 @@ export const TASKS_STORIES: Record<TasksStoryName, TasksPanelViewProps> = {
 
   /* The same board, one run. See the file header. */
   'list-with-live-run': story({ board: ready([T14, T15, T16, T17]), runs: LIVE }),
+  'list-with-live-run-and-spec': story({
+    board: ready([{ ...T14, change: 'add-dark-mode' }, T15, T16, T17]),
+    runs: LIVE,
+    specRuns: [
+      specRun({ run: 'proposal-new', op: 'propose', task: T14.id }),
+      specRun({ run: 'proposal-old', op: 'propose', task: T14.id, state: { state: 'finished', code: 0 } }),
+      specRun({ run: 'apply', op: 'apply', change: 'add-dark-mode' }),
+      specRun({ run: 'unrelated', op: 'apply', change: 'other-change' }),
+    ],
+  }),
+  'list-with-spec-no-role': story({
+    board: ready([task({ id: 't-41', title: 'Implement dark mode', status: 'doing', change: 'add-dark-mode' })]),
+    roles: {},
+    specRuns: [
+      specRun({ run: 'proposal', op: 'propose', task: 't-41', state: { state: 'queued' } }),
+      specRun({ run: 'apply', op: 'apply', change: 'add-dark-mode', state: { state: 'awaitingPermission' } }),
+    ],
+  }),
+  'list-spec-states': story({
+    board: ready(['queued', 'starting', 'running', 'idle', 'awaitingPermission', 'paused', 'interrupted', 'finished', 'failed'].map((phase) =>
+      task({ id: `task-${phase}`, title: phase, change: `change-${phase}`, status: 'doing' }))),
+    specRuns: ([
+      { state: 'queued' }, { state: 'starting' }, { state: 'running' }, { state: 'idle' },
+      { state: 'awaitingPermission' }, { state: 'paused', sinceUnixMs: 0n },
+      { state: 'interrupted' }, { state: 'finished', code: 0 }, { state: 'failed', reason: 'Harness unavailable' },
+    ] satisfies SpecRunRow['state'][]).map((state) => specRun({ run: `run-${state.state}`, op: 'apply', change: `change-${state.state}`, state })),
+  }),
+  'list-proposal-finished': story({
+    board: ready([task({ id: 't-41', title: 'Initial task' })]),
+    roles: {},
+    specRuns: [specRun({ run: 'proposal', op: 'propose', task: 't-41', state: { state: 'interrupted' }, turnComplete: true })],
+  }),
 
   /*
    * The same board as `list`, with `t-14`'s card open.
@@ -862,12 +903,21 @@ export type CardStoryName =
   | 'card-spec-session-awaiting'
   | 'card-spec-session-closed'
   | 'card-spec-ready'
+  | 'card-spec-doing'
+  | 'card-spec-approving'
+  | 'card-spec-long-name'
   | 'card-spec-picking'
   | 'card-spec-accepting'
   | 'card-spec-archive-only'
   | 'card-spec-archived'
   | 'card-spec-archived-session'
   | 'card-propose'
+  | 'card-proposal-session'
+  | 'card-proposal-queued'
+  | 'card-proposal-finished'
+  | 'card-proposal-with-assignment'
+  | 'card-proposal-and-apply'
+  | 'card-apply-queued'
   | 'card-bare'
   | 'card-with-live-run'
   | 'card-editing-title'
@@ -983,6 +1033,43 @@ const WAITING = detail({
 })
 
 export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
+  'card-proposal-session': card({
+    task: detail({ id: 't-42', title: 'Dark mode', agent: null }),
+    roles: {},
+    workflowSessions: [{ run: 'proposal-42', op: 'propose', label: 'OpenSpec · Codex', phase: 'running', failure: null }],
+    onOpenWorkflowSession: () => {},
+  }),
+  'card-proposal-queued': card({
+    task: detail({ id: 't-42', title: 'Dark mode', agent: null }),
+    roles: {},
+    workflowSessions: [{ run: 'proposal-42', op: 'propose', label: 'OpenSpec · Codex', phase: 'queued', failure: null }],
+    onOpenWorkflowSession: () => {},
+  }),
+  'card-proposal-finished': card({
+    task: detail({ id: 't-42', title: 'Initial task', agent: null }),
+    roles: {},
+    workflowSessions: [{ run: 'proposal-42', op: 'propose', label: 'OpenSpec · Codex', phase: 'finished', failure: null }],
+    onOpenWorkflowSession: () => {},
+  }),
+  'card-proposal-with-assignment': card({
+    task: detail({ id: 't-42', title: 'Dark mode', agent: 'developer' }),
+    workflowSessions: [{ run: 'proposal-42', op: 'propose', label: 'OpenSpec · Claude Code', phase: 'idle', failure: null }],
+    onOpenWorkflowSession: () => {},
+  }),
+  'card-proposal-and-apply': card({
+    task: detail({ id: 't-42', title: 'Dark mode', status: 'doing', change: 'add-dark-mode' }),
+    roles: {},
+    workflowSessions: [
+      { run: 'proposal-42', op: 'propose', label: 'OpenSpec · Codex', phase: 'interrupted', failure: null },
+      { run: 'apply-42', op: 'apply', label: 'OpenSpec · Codex', phase: 'running', failure: null },
+    ],
+    onOpenWorkflowSession: () => {},
+  }),
+  'card-apply-queued': card({
+    task: detail({ id: 't-42', title: 'Dark mode', status: 'doing', change: 'add-dark-mode' }),
+    workflowSessions: [{ run: 'apply-42', op: 'apply', label: 'Developer', phase: 'queued', failure: null }],
+    onOpenWorkflowSession: () => {},
+  }),
   /*
    * At rest. Every field read-only, three pencils, one live status segment, and the log — from
    * the same scrambled `COMMENTS` the panel has always been asked to print straight.
@@ -1021,10 +1108,29 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
    * every check.
    */
   'card-spec-ready': card({
-    task: SPEC_TASK,
+    task: { ...SPEC_TASK, status: 'todo' },
     spec: SPEC_CARD,
     dispatchTargets: TARGETS,
     dispatchOpen: false,
+    onOpenSpec: () => {},
+  }),
+  'card-spec-doing': card({
+    task: { ...SPEC_TASK, status: 'doing' },
+    // Deliberately old action: a task-status event can precede the async spec read.
+    spec: SPEC_CARD,
+    dispatchTargets: TARGETS,
+    dispatchOpen: true,
+    onOpenSpec: () => {},
+  }),
+  'card-spec-approving': card({
+    task: { ...SPEC_TASK, status: 'todo' },
+    spec: SPEC_CARD,
+    specBusy: true,
+  }),
+  'card-spec-long-name': card({
+    task: { ...SPEC_TASK, status: 'todo', change: 'add-sidebar-task-openspec-workflow-navigation-and-session-links' },
+    spec: { ...SPEC_CARD, change: 'add-sidebar-task-openspec-workflow-navigation-and-session-links' },
+    onOpenSpec: () => {},
   }),
 
   /*
@@ -1057,10 +1163,10 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
     dispatchOpen: false,
   }),
 
-  /* The picker open, which is what Approve does rather than assigning on the spot. */
+  /* The existing conversation's Hand it elsewhere picker. Approval starts the default session. */
   'card-spec-picking': card({
-    task: SPEC_TASK,
-    spec: SPEC_CARD,
+    task: { ...SPEC_TASK, session: '11111111-2222-4333-8444-555555555555' },
+    spec: SPEC_CARD_SESSION,
     dispatchTargets: TARGETS,
     dispatchOpen: true,
   }),
@@ -1355,6 +1461,9 @@ export type ComposeStoryName =
   | 'compose-no-roles'
   | 'compose-linking'
   | 'compose-attachments'
+  | 'compose-spec'
+  | 'compose-proposal-background'
+  | 'compose-proposal-tab'
 
 /** A draft with something in every field, including a status that is not the default. */
 const FILLED_DRAFT: TaskDraft = {
@@ -1368,6 +1477,9 @@ const FILLED_DRAFT: TaskDraft = {
 }
 
 export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
+  'compose-spec': compose(EMPTY_DRAFT, { changes: ['add-dark-mode'], canPropose: true }),
+  'compose-proposal-background': compose({ ...FILLED_DRAFT, propose: true }, { changes: [], canPropose: true }),
+  'compose-proposal-tab': compose({ ...FILLED_DRAFT, propose: true, assignee: '' }, { changes: [], canPropose: true, proposalRunMode: 'tab' }),
   /* Nothing typed. Four controls, and a Create that is drawn and refuses. */
   'compose-empty': compose(EMPTY_DRAFT),
 

@@ -1826,6 +1826,7 @@ pub fn bind_session(
         && let Some(p) = t.tree.panes.get_mut(&pane)
     {
         stamp_harness(p, harness);
+        prepare_session_binding(p, session, harness);
         p.session = Some(session);
         let primary = p.role == PaneRole::Primary;
         if primary {
@@ -1839,6 +1840,7 @@ pub fn bind_session(
         return Err(CoreError::NoSuchPane(pane));
     };
     stamp_harness(p, harness);
+    prepare_session_binding(p, session, harness);
     p.session = Some(session);
     // The console keeps its claim while detached — it is still the project's primary pane, it
     // is merely being shown somewhere else, and re-docking must not find the field stale.
@@ -1846,6 +1848,30 @@ pub fn bind_session(
         proj.primary_session = session;
     }
     Ok(())
+}
+
+fn prepare_session_binding(
+    pane: &mut Pane,
+    session: SessionId,
+    harness: Option<cide_ipc::Harness>,
+) {
+    let next = harness.unwrap_or_else(|| pane_harness(pane));
+    if pane.session != Some(session) && next == cide_ipc::Harness::Codex {
+        pane.conversation = None;
+        pane.conversation_since = None;
+        if let Some(continuation) = &mut pane.continues
+            && continuation.harness == cide_ipc::Harness::Codex
+        {
+            // Keep the working directory, but do not let a fresh child inherit the old thread.
+            continuation.id = session.to_string();
+        }
+    }
+    if let Some(continuation) = &mut pane.continues
+        && continuation.harness != next
+    {
+        continuation.harness = next;
+        continuation.id = session.to_string();
+    }
 }
 
 /// Record which CLI a console pane now runs, as a spawn that just bound to it reported. (M93)
@@ -1860,7 +1886,7 @@ fn stamp_harness(pane: &mut Pane, harness: Option<cide_ipc::Harness>) {
     let Some(harness) = harness else {
         return;
     };
-    let was = pane.harness.unwrap_or(cide_ipc::Harness::Claude);
+    let was = pane_harness(pane);
     if was != harness {
         pane.conversation = None;
         pane.conversation_since = None;
@@ -1882,9 +1908,26 @@ fn stamp_harness(pane: &mut Pane, harness: Option<cide_ipc::Harness>) {
     }
 }
 
-/// The CLI a console pane runs. `None` in the field is Claude — see [`Pane::harness`].
+/// The CLI a console pane runs, falling back to its continuation and then to Claude.
 pub fn pane_harness(pane: &Pane) -> cide_ipc::Harness {
-    pane.harness.unwrap_or(cide_ipc::Harness::Claude)
+    pane.harness
+        .or_else(|| pane.continues.as_ref().map(|c| c.harness))
+        .unwrap_or(cide_ipc::Harness::Claude)
+}
+
+/// Codex chooses its own thread id. A continuation can name it before hooks arrive.
+pub fn pane_codex_thread(pane: &Pane) -> Option<SessionId> {
+    if pane_harness(pane) != cide_ipc::Harness::Codex {
+        return None;
+    }
+    pane.conversation.or_else(|| {
+        pane.continues.as_ref().and_then(|c| {
+            (c.harness == cide_ipc::Harness::Codex)
+                .then(|| c.id.trim().parse().ok())
+                .flatten()
+                .filter(|id| Some(*id) != pane.session)
+        })
+    })
 }
 
 /// The console harness of whichever pane holds `id`, as its session or as the conversation its
@@ -1894,6 +1937,7 @@ pub fn pane_harness(pane: &Pane) -> cide_ipc::Harness {
 /// pane that holds it is where that fact is recorded. `None` when no pane holds the id — a
 /// caller then keeps whatever program it was asked for.
 pub fn harness_holding(ws: &Workspace, id: SessionId) -> Option<cide_ipc::Harness> {
+    let text = id.to_string();
     ws.projects
         .values()
         .flat_map(|project| {
@@ -1905,7 +1949,9 @@ pub fn harness_holding(ws: &Workspace, id: SessionId) -> Option<cide_ipc::Harnes
         })
         .find(|pane| {
             pane.kind == PaneKind::Claude
-                && (pane.session == Some(id) || pane.conversation == Some(id))
+                && (pane.session == Some(id)
+                    || pane.conversation == Some(id)
+                    || pane.continues.as_ref().is_some_and(|c| c.id.trim() == text))
         })
         .map(pane_harness)
 }
@@ -1938,8 +1984,7 @@ pub fn codex_thread_of(ws: &Workspace, id: SessionId) -> Option<SessionId> {
                 || pane.continues.as_ref().is_some_and(|c| c.id.trim() == text)
         });
     match holder {
-        Some(pane) if pane.session == Some(id) => pane.conversation,
-        Some(pane) if pane.conversation != Some(id) => pane.conversation.or(Some(id)),
+        Some(pane) => pane_codex_thread(pane),
         _ => Some(id),
     }
 }
@@ -2698,6 +2743,62 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_continuations_use_the_latest_thread_and_never_the_routing_id() {
+        let mut ws = Workspace::default();
+        let project = open_project(&mut ws, vec!["/tmp/codex-continuation".into()], None).unwrap();
+        let tab = ws.projects[&project].tabs[0].id;
+        let pane_id = ws.projects[&project].tabs[0].tree.focused;
+        let session = ws.projects[&project].primary_session;
+        let thread = SessionId::new();
+        let pane = ws.projects.get_mut(&project).unwrap().tabs[0]
+            .tree
+            .panes
+            .get_mut(&pane_id)
+            .unwrap();
+        pane.continues = Some(cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: thread.to_string(),
+            cwd: "/tmp/worktree".into(),
+        });
+        assert_eq!(pane_codex_thread(pane), Some(thread));
+        assert_eq!(harness_holding(&ws, thread), Some(cide_ipc::Harness::Codex));
+        assert_eq!(codex_thread_of(&ws, session), Some(thread));
+        let newer = SessionId::new();
+        note_conversation(&mut ws, session, newer, 1);
+        assert_eq!(codex_thread_of(&ws, thread), Some(newer));
+        let fresh = SessionId::new();
+        bind_session(
+            &mut ws,
+            project,
+            tab,
+            pane_id,
+            fresh,
+            Some(cide_ipc::Harness::Codex),
+        )
+        .unwrap();
+        let pane = &ws.projects[&project].tabs[0].tree.panes[&pane_id];
+        assert_eq!(
+            pane.continues.as_ref().unwrap().cwd,
+            PathBuf::from("/tmp/worktree")
+        );
+        assert_eq!(pane_codex_thread(pane), None);
+        assert_eq!(codex_thread_of(&ws, fresh), None);
+        let claude = SessionId::new();
+        bind_session(
+            &mut ws,
+            project,
+            tab,
+            pane_id,
+            claude,
+            Some(cide_ipc::Harness::Claude),
+        )
+        .unwrap();
+        let pane = &ws.projects[&project].tabs[0].tree.panes[&pane_id];
+        assert_eq!(pane_harness(pane), cide_ipc::Harness::Claude);
+        assert_eq!(pane.continues.as_ref().unwrap().id, claude.to_string());
+    }
+
     use super::*;
     use cide_ipc::{LayoutNode, SplitId};
 

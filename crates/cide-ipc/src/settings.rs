@@ -113,6 +113,9 @@ pub struct Settings {
     /// Where the Agents panel's *Open* shows a run: a tab of its own, or a row in the project
     /// console. (M108) Only that button reads it — nothing opens a run's view by itself.
     pub open_run_in: OpenRunIn,
+    /// Presentation of proposals requested while creating a task. Existing proposal and Apply
+    /// buttons keep their own behavior; background runs can still be opened from OpenSpec.
+    pub task_proposal_run_mode: TaskProposalRunMode,
     /// Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
     pub codex: CodexSettings,
     pub proxy: ProxySettings,
@@ -159,6 +162,7 @@ impl Default for Settings {
             claude: ClaudeSettings::default(),
             console_harness: ConsoleHarness::default(),
             open_run_in: OpenRunIn::default(),
+            task_proposal_run_mode: TaskProposalRunMode::default(),
             codex: CodexSettings::default(),
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
@@ -170,6 +174,16 @@ impl Default for Settings {
             update: UpdateSettings::default(),
         }
     }
+}
+
+/// Whether creating a task with a proposal also opens a view onto the proposal run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TaskProposalRunMode {
+    #[default]
+    Background,
+    Tab,
 }
 
 /// A user-chosen accent, as `cide_core::accent::fit` left it: the colour picked and the two

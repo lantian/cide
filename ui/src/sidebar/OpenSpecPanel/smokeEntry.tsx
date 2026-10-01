@@ -206,6 +206,10 @@ export interface SpecDigest {
   tabProseBlocks: number
   tabMarks: number
   tabCurrentMark: number
+  tabHitIndices: number[]
+  tabClauses: string[]
+  tabScenarioBodies: string[]
+  tabScenarioUnsafeHtml: boolean
   /** Is the header's configuration gear drawn? (M28) */
   configure: boolean
   /** Elements carrying a hook but no class, plus any class list holding `undefined`. */
@@ -311,6 +315,10 @@ function digest(story: string, html: string): SpecDigest {
     tabProseBlocks: [...html.matchAll(/ data-line="/g)].length,
     tabMarks: hits(html, 'specTabMark'),
     tabCurrentMark: [...html.matchAll(/data-current="true"/g)].length,
+    tabHitIndices: [...html.matchAll(/data-hit="(\d+)"/g)].map((m) => Number(m[1])),
+    tabClauses: all(html, 'specTabClause').map((f) => text(f)),
+    tabScenarioBodies: all(html, 'specTabScenario').map((f) => text(f)),
+    tabScenarioUnsafeHtml: all(html, 'specTabScenario').some((f) => /<img\b/.test(f)),
     meta: (all(html, 'openspecMeta')[0] ?? null) && text(all(html, 'openspecMeta')[0] ?? ''),
     claim: (all(html, 'openspecClaim')[0] ?? null) && text(all(html, 'openspecClaim')[0] ?? ''),
     detail: (all(html, 'openspecDetail')[0] ?? null) && text(all(html, 'openspecDetail')[0] ?? ''),

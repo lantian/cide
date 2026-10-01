@@ -44,6 +44,7 @@ import { followSpecRuns, openSession, useSpecRuns } from './specRuns'
 import { runReadyAct } from './specActs'
 import { adaptChange } from './adapt'
 import { RequirementEditor } from './RequirementEditor'
+import { scenarioLines } from './scenario'
 import styles from './SpecTab.module.css'
 import { isWebUrl, openWebLink } from '@/chrome/webLinks'
 import {
@@ -728,9 +729,24 @@ export function SpecTabView(props: SpecTabViewProps) {
                         <p className={styles.scenarioTitle}>
                           <Marked text={scenario.title} query={query} counter={counter} current={current} />
                         </p>
-                        <pre className={styles.scenarioBody}>
-                          <Marked text={scenario.body} query={query} counter={counter} current={current} />
-                        </pre>
+                        <div className={styles.scenarioBody}>
+                          {scenarioLines(scenario.body).map((line, index) =>
+                            line.kind === 'clause' ? (
+                              <div key={index} className={styles.clause} data-audit="specTabClause">
+                                <span className={styles.clauseLabel} data-clause={line.keyword}>
+                                  <Marked text={line.keyword} query={query} counter={counter} current={current} />
+                                </span>{' '}
+                                <span className={styles.clauseText}>
+                                  <Marked text={line.text} query={query} counter={counter} current={current} />
+                                </span>
+                              </div>
+                            ) : (
+                              <div key={index} className={styles.scenarioLine}>
+                                <Marked text={line.text} query={query} counter={counter} current={current} />
+                              </div>
+                            ),
+                          )}
+                        </div>
                       </div>
                     ))}
                     {issues.map((issue, at) => (

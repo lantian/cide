@@ -30,8 +30,7 @@ cwd: string, restore: SessionRestore,
 /**
  * Whether to spawn on launch rather than waiting to be asked.
  *
- * True for exactly one pane per project: the one bound to its primary session. Every
- * other Claude pane renders a splash with a resume affordance, because reopening a
- * six-pane project must not silently start six agents at once.
+ * True for the primary console and, when resume-all is enabled, resumable conversations.
+ * Missing Codex conversations always wait for the user's recovery choice.
  */
 eager: boolean, };

@@ -59,7 +59,7 @@ use cide_core::{CoreError, Result, document};
 use cide_ipc::{
     AttachTarget, ChangeName, CommentId, FileStamp, LinkType, Task, TaskAttachment,
     TaskAttachmentId, TaskAuthor, TaskBoard, TaskComment, TaskContent, TaskDetail, TaskEdit,
-    TaskFile, TaskId, TaskLink, TaskLinkSpec, TaskNew, TaskRow, TaskStatusChange,
+    TaskFile, TaskId, TaskLink, TaskLinkSpec, TaskNew, TaskRow, TaskStatus, TaskStatusChange,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -2826,6 +2826,37 @@ impl TaskStore {
         })
     }
 
+    /// Apply starts the change as a whole. Synchronize all linked Todo tasks in one mutation,
+    /// with one revision and rollback, without treating these status writes as dispatch gestures.
+    pub fn mark_change_doing(
+        &self,
+        change: &cide_ipc::ChangeName,
+        author: TaskAuthor,
+    ) -> Result<usize> {
+        let now = persist::now_ms();
+        self.update(|file, cache| {
+            let ids: Vec<TaskId> = file
+                .tasks
+                .iter()
+                .filter(|row| row.change.as_ref() == Some(change) && row.status == TaskStatus::Todo)
+                .map(|row| row.id.clone())
+                .collect();
+            for id in &ids {
+                let mut task = self.compose(file, cache, id)?;
+                task.history.push(TaskStatusChange {
+                    from: task.status,
+                    to: TaskStatus::Doing,
+                    by: author.clone(),
+                    at_unix_ms: now,
+                });
+                task.status = TaskStatus::Doing;
+                task.updated_unix_ms = now;
+                self.put(file, cache, &task);
+            }
+            Ok(ids.len())
+        })
+    }
+
     /// Apply one change to one task.
     ///
     /// `author` is used by exactly one variant — [`TaskEdit::Comment`] — and it is a parameter
@@ -5505,6 +5536,71 @@ mod tests {
             acceptance: None,
             touches: None,
         }
+    }
+
+    #[test]
+    fn apply_moves_only_linked_todo_tasks_in_one_revision() {
+        let dir = TempDir::new("apply-statuses");
+        let store = TaskStore::open(dir.root());
+        let change = ChangeName("add-dark-mode".into());
+        let statuses = [
+            TaskStatus::Todo,
+            TaskStatus::Todo,
+            TaskStatus::Doing,
+            TaskStatus::Inbox,
+            TaskStatus::Review,
+            TaskStatus::Done,
+        ];
+        let mut tasks = Vec::new();
+        for status in statuses {
+            let mut req = new_task("Linked work");
+            req.status = Some(status);
+            req.change = Some(change.clone());
+            tasks.push(store.create(&req, TaskAuthor::User).expect("create"));
+        }
+        let unrelated = store
+            .create(&new_task("Other work"), TaskAuthor::User)
+            .expect("create");
+        let rev = store.snapshot().rev;
+        assert_eq!(
+            store
+                .mark_change_doing(&change, TaskAuthor::User)
+                .expect("sync"),
+            2
+        );
+        assert_eq!(
+            store.snapshot().rev,
+            rev + 1,
+            "one atomic status synchronization"
+        );
+        for (index, before) in tasks.iter().enumerate() {
+            let after = store.get(&before.id).expect("task");
+            if index < 2 {
+                assert_eq!(after.status, TaskStatus::Doing);
+                assert_eq!(
+                    after.history.last().expect("history").from,
+                    TaskStatus::Todo
+                );
+            } else {
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.history, before.history);
+            }
+        }
+        assert_eq!(
+            store.get(&unrelated.id).expect("other").status,
+            TaskStatus::Todo
+        );
+        assert_eq!(
+            store
+                .mark_change_doing(&change, TaskAuthor::User)
+                .expect("repeat"),
+            0
+        );
+        assert_eq!(
+            store.get(&tasks[0].id).expect("task").history.len(),
+            1,
+            "no echoed history"
+        );
     }
 
     #[test]

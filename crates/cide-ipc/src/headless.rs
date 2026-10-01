@@ -26,6 +26,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use ts_rs::TS;
 
+/// One repository's share of the commit being described. Selections use the same
+/// HEAD-to-worktree positions as `CommitRequest`; staging-area mode reads the index instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct CommitMessageScope {
+    pub repo: crate::RepoId,
+    pub selections: Vec<crate::git::PathSelection>,
+}
+
 /// One non-interactive request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -1536,7 +1536,32 @@ pub async fn tab_reopen_closed(
                     Vec::new()
                 };
                 let reinserted = state.update(|ws| {
-                    workspace::reinsert_tab(ws, project, record.index, record.kind, record.tree)
+                    let tab = workspace::reinsert_tab(
+                        ws,
+                        project,
+                        record.index,
+                        record.kind,
+                        record.tree,
+                    )?;
+                    if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
+                        let bindings: Vec<_> = workspace::tab(ws, project, tab)?
+                            .tree
+                            .panes
+                            .values()
+                            .filter_map(|pane| {
+                                pane.session
+                                    .filter(|id| resumed.contains(id))
+                                    .map(|id| (pane.id, id))
+                            })
+                            .collect();
+                        // Startup hooks can arrive while the reopened tab is still outside the tree.
+                        for (pane, session) in bindings {
+                            crate::cmd::pane::bind_recorded_session(
+                                ws, &registry, project, tab, pane, session,
+                            )?;
+                        }
+                    }
+                    Ok(tab)
                 });
                 if reinserted.is_err()
                     && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
