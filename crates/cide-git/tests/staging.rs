@@ -257,7 +257,8 @@ fn a_binary_file_refuses_partial_staging_and_stages_whole() {
     repo.commit_all("base");
     let mut changed = binary_blob(&mut rng, 512);
     changed[9] = 0;
-    repo.write("b.bin", &changed);
+    // Same-size edits need a new mtime when Git compares only whole seconds (macOS CI).
+    repo.rewrite("b.bin", &changed);
 
     let file = raw(&repo, "b.bin", DiffSide::Unstaged);
     assert!(file.binary, "libgit2 did not call it binary");
