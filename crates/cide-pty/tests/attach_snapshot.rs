@@ -268,3 +268,32 @@ fn a_child_gets_its_own_directory_as_pwd() {
         String::from_utf8_lossy(&session.screen_state())
     );
 }
+
+/// Codex shades its composer only after receiving OSC 10/11 replies. Queries issued
+/// before the renderer attaches have no cells and disappear from a vt100 snapshot.
+#[test]
+fn first_snapshot_preserves_startup_color_queries_once() {
+    let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+        .arg("-c")
+        .arg(format!(
+            "printf '\\033]10;?\\033\\\\\\033]11;?\\007{SENTINEL}'; read done"
+        ));
+    let session = PtySession::spawn(spec).expect("spawn color-query child");
+    assert!(wait_for_mirror(&session), "startup output never arrived");
+
+    let (sink, rx) = recording_sink();
+    let (id, snapshot) = session.attach_with_snapshot(sink, false);
+    assert!(contains(&snapshot, SENTINEL));
+    assert!(contains(&snapshot, "\x1b]10;?\x1b\\"));
+    assert!(contains(&snapshot, "\x1b]11;?\x1b\\"));
+    // Neither a pending flush nor another pane may ask xterm to answer again.
+    let live = collected_for(&rx, Duration::from_millis(25));
+    assert!(!contains(&live, "\x1b]10;?"));
+    assert!(!contains(&live, "\x1b]11;?"));
+    session.detach(id);
+    let (sink, _rx) = recording_sink();
+    let (_, snapshot) = session.attach_with_snapshot(sink, true);
+    assert!(!contains(&snapshot, "\x1b]10;?"));
+    assert!(!contains(&snapshot, "\x1b]11;?"));
+    session.kill();
+}

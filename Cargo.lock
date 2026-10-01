@@ -988,6 +988,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "vt100",
+ "vte",
 ]
 
 [[package]]

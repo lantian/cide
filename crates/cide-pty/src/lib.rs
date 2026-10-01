@@ -43,6 +43,7 @@ use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 pub mod screen;
+mod startup_colors;
 
 pub mod jobs;
 pub use jobs::{JobEvent, JobWatch};
@@ -1537,6 +1538,7 @@ fn history_bytes(mirror: &Mutex<vt100::Parser>) -> Vec<u8> {
 ///
 /// Nothing can run between them: this thread is the only one that broadcasts, and the mirror
 /// only advances from this thread's output arm.
+#[allow(clippy::too_many_arguments)] // coalescer-owned state, one private call site
 fn serve_control(
     request: Control,
     sinks: &Arc<Mutex<Vec<Registered>>>,
@@ -1545,6 +1547,7 @@ fn serve_control(
     pending: &mut Vec<u8>,
     first_byte_at: &mut Option<Instant>,
     probe: &mut Option<JobProbe>,
+    startup_colors: &mut Option<startup_colors::StartupColors>,
 ) {
     match request {
         Control::Attach {
@@ -1561,11 +1564,19 @@ fn serve_control(
             // A caller that has given up (see `ATTACH_TIMEOUT`) leaves nobody on the other
             // end. The sink stays attached regardless — it is registered and will receive
             // output; only the atomicity of its first frame was lost.
-            let _ = reply.send(if history {
+            let mut snapshot = if history {
                 history_bytes(vt)
             } else {
                 reattach_bytes(vt)
-            });
+            };
+            // The mirror retains cells, not OSC queries. A fast child can ask for colors
+            // before this first attach and Codex then caches an unknown palette, leaving
+            // its composer unshaded. Let xterm answer using the theme it actually draws.
+            // Take once: later mirrors must not send duplicate replies to the child.
+            if let Some(colors) = startup_colors.take() {
+                colors.append_to(&mut snapshot);
+            }
+            let _ = reply.send(snapshot);
         }
         Control::JobThreshold(after) => {
             // Absent for every session that watches no jobs — a Claude pane — where the
@@ -1726,6 +1737,7 @@ fn spawn_coalescer(
             let mut pending: Vec<u8> = Vec::with_capacity(FLUSH_BYTES * 2);
             let mut first_byte_at: Option<Instant> = None;
             let mut render_state = RenderState::default();
+            let mut startup_colors = Some(startup_colors::StartupColors::default());
 
             loop {
                 // Wait indefinitely when idle; once bytes are pending, only wait out the
@@ -1765,6 +1777,7 @@ fn spawn_coalescer(
                             &mut pending,
                             &mut first_byte_at,
                             &mut probe,
+                            &mut startup_colors,
                         );
                     }
                     Event::Output(chunk) => {
@@ -1779,6 +1792,15 @@ fn spawn_coalescer(
                         };
                         if chunk.is_empty() {
                             continue;
+                        }
+                        if let Some(colors) = startup_colors.as_mut() {
+                            // `attach()` callers already receive raw queries. Only the
+                            // first attachment through the snapshot needs this handoff.
+                            if sinks.lock().is_empty() {
+                                colors.process(&chunk);
+                            } else {
+                                startup_colors = None;
+                            }
                         }
                         // The mirror is fed unconditionally, attached or not — that is what
                         // makes a reattaching pane able to paint the current screen.

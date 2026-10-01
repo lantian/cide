@@ -14,6 +14,7 @@ license.workspace = true
 cide-ipc = { workspace = true }
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
+vte = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
