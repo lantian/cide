@@ -152,8 +152,8 @@ export function useTabDrag(options: UseTabDragOptions): TabDrag {
       wasDrag.current = false
       /*
        * Left button only, and never from a modified press. A modified click on a tab is not a
-       * reorder gesture — and the middle button is a close in most editors, so claiming it here
-       * would pre-empt a control this strip may yet grow.
+       * reorder gesture — and the middle button closes tabs, so claiming it here would
+       * pre-empt the strip's close handler.
        */
       if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
       /*

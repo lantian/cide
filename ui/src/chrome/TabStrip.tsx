@@ -513,6 +513,16 @@ function TabItem({
       // grab anywhere in the tab's box starts it — the same "one box the pointer can hit
       // anywhere" contract the label's negative margins exist to preserve.
       onPointerDown={(e) => onPick(e, tab)}
+      // Prevent middle-button scrolling and focus changes; close only when the click ends.
+      onMouseDown={(e) => {
+        if (e.button === 1) e.preventDefault()
+      }}
+      onAuxClick={(e) => {
+        if (e.button !== 1) return
+        e.preventDefault()
+        e.stopPropagation()
+        if (view.closable && !inFlight && !dragged()) onClose?.(tab.id)
+      }}
       {...(inFlight ? { 'data-drag': '' } : {})}
     >
       <button

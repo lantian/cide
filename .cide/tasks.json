@@ -1,6 +1,35 @@
 {
   "schemaVersion": 2,
   "rev": 0,
-  "nextId": 47,
-  "tasks": []
+  "nextId": 49,
+  "tasks": [
+    {
+      "id": "t-47",
+      "title": "Close workspace tabs with middle click",
+      "status": "done",
+      "agent": null,
+      "links": [],
+      "createdBy": {
+        "kind": "orchestrator"
+      },
+      "createdUnixMs": 1790841124522,
+      "updatedUnixMs": 1790841234769,
+      "commentCount": 1,
+      "attachmentCount": 0
+    },
+    {
+      "id": "t-48",
+      "title": "Make Push the primary focused action in the push popup",
+      "status": "done",
+      "agent": null,
+      "links": [],
+      "createdBy": {
+        "kind": "orchestrator"
+      },
+      "createdUnixMs": 1790841133169,
+      "updatedUnixMs": 1790841315439,
+      "commentCount": 1,
+      "attachmentCount": 0
+    }
+  ]
 }

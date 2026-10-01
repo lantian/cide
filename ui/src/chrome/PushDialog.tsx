@@ -11,8 +11,7 @@
  *
  * # The three things this component must keep doing
  *
- * **Cancel is focused and accented.** `ConfirmDestructive`'s rule 3, and this dialog is opened by
- * a keystroke — the Enter that was already in flight has to back out.
+ * **Push is focused and accented.** Enter confirms the selected commits when the dialog opens.
  *
  * **Force starts unticked on every open**, including a reopen after a dismissal. Carrying it
  * would mean somebody who ticked it, cancelled, and pushed again overwriting a remote they never
@@ -48,30 +47,33 @@ export function PushDialog() {
   const [checked, setChecked] = useState<readonly string[]>([])
   const [collapsed, setCollapsed] = useState<readonly string[]>([])
   const [force, setForce] = useState(false)
+  const confirmBtn = useRef<HTMLButtonElement>(null)
   const cancel = useRef<HTMLButtonElement>(null)
+  const focusedPending = useRef<typeof pending>(null)
+  const total = outgoingTotal(pending?.previews ?? [], checked)
 
   // Reset on every new question, force above all — see the header.
   useEffect(() => {
+    focusedPending.current = null
     setChecked(pending === null ? [] : defaultChecked(pending.previews))
     setCollapsed([])
     setForce(false)
   }, [pending])
 
   /*
-   * Focus lands on Cancel once per question, and never again.
-   *
-   * A `ref` callback calling `focus()` would look equivalent and is not: React runs it on every
-   * render, so ticking the Force checkbox would move focus back to Cancel and the next space
-   * would dismiss the dialog. `ConfirmDestructive` uses the same effect for the same reason.
+   * Focus Push once the initial selection enables it. Do not move focus again when a checkbox
+   * changes. If no repository can be pushed, focus Cancel instead of the disabled button.
    */
   useEffect(() => {
-    cancel.current?.focus()
-  }, [pending])
+    if (pending === null || focusedPending.current === pending) return
+    if (total === 0 && defaultChecked(pending.previews).length > 0) return
+    ;(total > 0 ? confirmBtn : cancel).current?.focus()
+    focusedPending.current = pending
+  }, [pending, total])
 
   if (pending === null) return null
   const { previews } = pending
 
-  const total = outgoingTotal(previews, checked)
   const canForce = forceApplies(previews, checked)
   // Ticked and then made irrelevant by unticking the diverged row: the flag stays in state so
   // re-ticking that row restores the user's answer, but it must not travel on the wire.
@@ -117,25 +119,24 @@ export function PushDialog() {
         }
         actions={
           <>
-            {/* The kit's black `danger` only while forcing: an ordinary push loses nothing, and a
-                forced one overwrites history on a machine that is not the user's. */}
             <Button
-              variant={forcing ? 'danger' : 'secondary'}
-              disabled={total === 0}
-              data-audit="pushConfirm"
-              onClick={() => usePush.getState().confirm(checked, forcing)}
-            >
-              {confirmLabel(total, forcing)}
-            </Button>
-            {/* Rule 3: this dialog is opened by a keystroke, so the prominent, focused answer is
-                the one that does nothing. */}
-            <Button
-              variant="primary"
+              variant="secondary"
               data-audit="pushCancel"
               ref={cancel}
               onClick={() => usePush.getState().dismiss()}
             >
               Cancel
+            </Button>
+            {/* The kit's black `danger` only while forcing: an ordinary push loses nothing, and a
+                forced one overwrites history on a machine that is not the user's. */}
+            <Button
+              variant={forcing ? 'danger' : 'primary'}
+              disabled={total === 0}
+              data-audit="pushConfirm"
+              ref={confirmBtn}
+              onClick={() => usePush.getState().confirm(checked, forcing)}
+            >
+              {confirmLabel(total, forcing)}
             </Button>
           </>
         }

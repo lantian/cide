@@ -365,17 +365,18 @@ try {
       'act irreversible on a machine that is not the user’s',
   )
   ok(
-    /variant="primary"\s+data-audit="pushCancel"/.test(dialog),
-    'the accent is on Cancel — rule 3, and this dialog is opened by a keystroke',
+    /variant="secondary"\s+data-audit="pushCancel"/.test(dialog),
+    'Cancel is the secondary action',
   )
   ok(
-    /ref=\{cancel\}/.test(dialog) && /cancel\.current\?\.focus\(\)/.test(dialog),
-    'and so is the focus, placed once in an effect rather than in a ref callback that would ' +
-      'run on every render and yank focus back off the force checkbox',
+    /ref=\{confirmBtn\}/.test(dialog)
+      && /\(total > 0 \? confirmBtn : cancel\)\.current\?\.focus\(\)/.test(dialog)
+      && /focusedPending\.current === pending/.test(dialog),
+    'Push receives initial focus once enabled, without stealing focus on selection changes',
   )
   ok(
-    /variant=\{forcing \? 'danger' : 'secondary'\}/.test(dialog),
-    'the danger fill is on the confirm button only while forcing — it means one thing in this app',
+    /variant=\{forcing \? 'danger' : 'primary'\}/.test(dialog),
+    'Push is primary, with the danger fill only while forcing',
   )
   ok(
     /disabled=\{total === 0\}/.test(dialog),
