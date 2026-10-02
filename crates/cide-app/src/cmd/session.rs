@@ -194,8 +194,11 @@ fn console_program(program: &str) -> Option<cide_ipc::ConsoleHarness> {
     }
     std::path::Path::new(program)
         .file_name()
-        .is_some_and(|n| n == "codex")
-        .then_some(cide_ipc::ConsoleHarness::Codex)
+        .and_then(|n| match n.to_str()? {
+            "codex" => Some(cide_ipc::ConsoleHarness::Codex),
+            "opencode" => Some(cide_ipc::ConsoleHarness::Opencode),
+            _ => None,
+        })
 }
 
 /// Which CLI a console spawn runs, and — for codex — the thread it resumes. (M93)
@@ -223,6 +226,8 @@ impl ConsoleSpawn {
         asked: cide_ipc::ConsoleHarness,
         continues: &Option<cide_ipc::HarnessSession>,
         resume: Option<SessionId>,
+        default_harness: cide_ipc::ConsoleHarness,
+        explicit_harness: Option<cide_ipc::ConsoleHarness>,
     ) -> Self {
         let harness = if continues.is_some() {
             asked
@@ -230,16 +235,21 @@ impl ConsoleSpawn {
             cide_core::workspace::harness_holding(ws, id)
                 .and_then(cide_ipc::ConsoleHarness::of)
                 .unwrap_or(asked)
-        } else if asked == cide_ipc::ConsoleHarness::Claude {
-            ws.settings.console_harness
         } else {
-            asked
+            explicit_harness.unwrap_or_else(|| {
+                if asked == cide_ipc::ConsoleHarness::Claude {
+                    default_harness
+                } else {
+                    asked
+                }
+            })
         };
         let thread = match harness {
             cide_ipc::ConsoleHarness::Codex => {
                 resume.and_then(|id| cide_core::workspace::codex_thread_of(ws, id))
             }
             cide_ipc::ConsoleHarness::Claude => resume,
+            cide_ipc::ConsoleHarness::Opencode => None,
         };
         Self { harness, thread }
     }
@@ -1072,6 +1082,7 @@ pub async fn session_spawn(
     continues: Option<cide_ipc::HarnessSession>,
     // Stable identity for shell history; optional for callers that do not own a pane.
     pane: Option<PaneId>,
+    harness: Option<cide_ipc::ConsoleHarness>,
 ) -> Result<SessionId, SessionError> {
     // The command is a **shape**, and the work is below it. The split exists because M79 needs
     // this exact machinery — the user's `claude_cli` arguments, the folded system prompt, the
@@ -1085,6 +1096,7 @@ pub async fn session_spawn(
         &registry,
         SpawnRequest {
             program,
+            harness,
             args,
             cwd,
             geometry,
@@ -1117,6 +1129,7 @@ pub async fn session_spawn(
 /// this is an internal call where the `too_many_arguments` allow would be buying nothing.
 pub(crate) struct SpawnRequest {
     pub program: String,
+    pub harness: Option<cide_ipc::ConsoleHarness>,
     pub args: Vec<String>,
     pub cwd: String,
     pub geometry: Geometry,
@@ -1168,6 +1181,7 @@ pub(crate) async fn spawn_session(
 ) -> Result<SessionId, SessionError> {
     let SpawnRequest {
         program,
+        harness: explicit_harness,
         args,
         cwd,
         geometry,
@@ -1299,7 +1313,9 @@ pub(crate) async fn spawn_session(
     // or which CLI owns the conversation a restore names; Rust decides, below, once the settings
     // and the tree are in hand. `codex` is recognised as asked-for by name for the same reason
     // `claude` is: a continuation's `ContinueSpec` spells it.
-    let asked = console_program(&spec.program);
+    let asked = (!is_attached)
+        .then(|| console_program(&spec.program))
+        .flatten();
     let asked = if resume_picker {
         if resume.is_some() || wants_fork(fork) || continues.is_some() {
             return Err(SessionError::Pty(
@@ -1327,31 +1343,50 @@ pub(crate) async fn spawn_session(
     // The console harness rides the same read (M93), with the two facts about the tree a resume
     // needs: which CLI holds the conversation being resumed, and — for codex — which thread that
     // is. Read here, under the one lock this function takes, and never again below.
-    let (proxy, claude_settings, codex_settings, job_notify_after, console) = app
+    let (settings, console, native) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
         .map(|state| {
             state.with(|ws| {
-                (
-                    ws.settings.proxy.clone(),
-                    ws.settings.claude.clone(),
-                    ws.settings.codex.clone(),
-                    crate::lifecycle::job_notify_after(&ws.settings),
-                    asked.map(|asked| ConsoleSpawn::decide(ws, asked, &continues, resume)),
-                )
+                let settings = cide_core::harness_settings::effective(ws, project);
+                let console = asked.map(|asked| {
+                    ConsoleSpawn::decide(
+                        ws,
+                        asked,
+                        &continues,
+                        resume,
+                        settings.console_harness,
+                        explicit_harness,
+                    )
+                });
+                let native = continues
+                    .clone()
+                    .filter(|c| c.harness == cide_ipc::Harness::Opencode)
+                    .or_else(|| {
+                        resume.and_then(|id| {
+                            cide_core::workspace::native_conversation_holding(ws, id)
+                        })
+                    });
+                (settings, console, native)
             })
         })
         .unwrap_or_else(|| {
             (
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                crate::lifecycle::job_notify_after(&cide_ipc::Settings::default()),
+                cide_ipc::Settings::default(),
                 asked.map(|asked| ConsoleSpawn {
-                    harness: asked,
+                    harness: explicit_harness.unwrap_or(asked),
                     thread: resume,
                 }),
+                continues.clone(),
             )
         });
+    let proxy = settings.proxy.clone();
+    let claude_settings = settings.claude.clone();
+    let codex_settings = settings.codex.clone();
+    let job_notify_after = crate::lifecycle::job_notify_after(&settings);
+    let is_opencode = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Opencode);
+    if is_opencode && let Some(native) = &native {
+        spec.cwd = native.cwd.clone();
+    }
     let is_claude = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Claude);
     let is_codex = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Codex);
     // Either CLI. Everything that is about "a console" rather than about claude's own argv —
@@ -1391,7 +1426,7 @@ pub(crate) async fn spawn_session(
     };
     // Codex takes an opening prompt in its argv, which is sturdier than typing; claude's is typed
     // after the insert below.
-    let opening = match (&seed, is_codex) {
+    let opening = match (&seed, is_codex || is_opencode) {
         (Some(seed), true) if opening.is_none() => Some(seed.clone()),
         _ => opening,
     };
@@ -1550,7 +1585,7 @@ pub(crate) async fn spawn_session(
             hook,
             session: minted,
             agent_sock,
-            prompt: opening.filter(|p| !p.trim().is_empty()),
+            prompt: opening.clone().filter(|p| !p.trim().is_empty()),
         }) {
             spec = spec.arg(a);
         }
@@ -1654,7 +1689,7 @@ pub(crate) async fn spawn_session(
 
         // Both console CLIs get the routing key; a codex hook command inherits it from the TUI
         // exactly as claude's does (measured, M93). Its hook table is already in the argv.
-        if is_codex {
+        if is_codex || is_opencode {
             spec = spec.env("CIDE_SESSION", id.to_string());
         }
         if is_claude {
@@ -1834,6 +1869,47 @@ pub(crate) async fn spawn_session(
         ));
     }
 
+    if is_opencode
+        && !wants_fork(fork)
+        && settings.opencode.cli.inject.resume
+        && let Some(native) = &native
+        && let Some(held) = registry.native_in_use(native)
+    {
+        return Err(SessionError::AlreadyOpen(held));
+    }
+    let opencode = if is_opencode {
+        let instructions = project
+            .and_then(|project| {
+                orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+            })
+            .map(|text| text.replace("mcp__cide__", "cide_"));
+        let model = spec
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--model" || pair[0] == "-m")
+            .map(|pair| pair[1].clone());
+        let unattended = spec.args.iter().any(|arg| arg == "--auto");
+        let start = crate::opencode_console::Start {
+            settings,
+            spec,
+            routing: id,
+            resume: native,
+            fork: wants_fork(fork),
+            prompt: opening,
+            instructions,
+            model,
+            unattended,
+        };
+        let (prepared, observer) = blocking(move || {
+            crate::opencode_console::Console::start(start).map_err(SessionError::Pty)
+        })
+        .await?;
+        spec = prepared;
+        Some(observer)
+    } else {
+        None
+    };
+
     let session = blocking(move || {
         if local_login_shell
             && let Some(pane) = pane
@@ -1888,7 +1964,11 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_for_exit(app.clone(), id, &session);
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
-    registry.insert(id, session);
+    registry.insert(id, Arc::clone(&session));
+    if let Some(observer) = opencode {
+        registry.note_native_conversation(id, observer.conversation());
+        observer.observe(app.clone(), id, &session);
+    }
     // Which CLI this console session runs, for `pane_bind_session` to stamp on the pane. (M93)
     if let Some(console) = console {
         registry.note_harness(id, console.harness.harness());
@@ -2470,21 +2550,63 @@ pub async fn session_resumable(app: tauri::AppHandle, cwd: String, session: Sess
 }
 
 fn resumable_now(app: &tauri::AppHandle, cwd: &str, session: SessionId) -> bool {
+    if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
+        let native = state.with(|ws| {
+            let owner = ws
+                .projects
+                .iter()
+                .find(|(_, p)| {
+                    p.tabs
+                        .iter()
+                        .flat_map(|t| t.tree.panes.values())
+                        .chain(p.detached.values())
+                        .any(|pane| pane.session == Some(session))
+                })
+                .map(|(id, _)| *id);
+            let settings = cide_core::harness_settings::effective(ws, owner);
+            let harness = cide_core::workspace::harness_holding(ws, session);
+            (
+                harness,
+                cide_core::workspace::native_conversation_holding(ws, session),
+                settings,
+            )
+        });
+        if native.0 == Some(cide_ipc::Harness::Opencode) {
+            return native.2.opencode.cli.inject.resume
+                && native.1.is_some_and(|c| {
+                    cide_agents::harness::opencode_console::validate_id(&c.id).is_ok()
+                });
+        }
+    }
     // A codex console (M93) answers by the thread its hooks named, found by id under
     // `$CODEX_HOME/sessions`; `session` is cide's routing id and names no codex conversation.
     let (resume_enabled, codex) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
         .map(|state| {
             state.with(|ws| {
+                let owner = ws
+                    .projects
+                    .iter()
+                    .find(|(_, p)| {
+                        p.tabs
+                            .iter()
+                            .flat_map(|t| t.tree.panes.values())
+                            .chain(p.detached.values())
+                            .any(|pane| {
+                                pane.session == Some(session) || pane.conversation == Some(session)
+                            })
+                    })
+                    .map(|(id, _)| *id);
+                let settings = cide_core::harness_settings::effective(ws, owner);
                 let codex = (cide_core::workspace::harness_holding(ws, session)
                     == Some(cide_ipc::Harness::Codex))
                 .then(|| {
                     (
                         cide_core::workspace::codex_thread_of(ws, session),
-                        ws.settings.codex.cli.inject.resume,
+                        settings.codex.cli.inject.resume,
                     )
                 });
-                (ws.settings.claude.cli.inject.resume.enabled, codex)
+                (settings.claude.cli.inject.resume.enabled, codex)
             })
         })
         .unwrap_or((true, None));
@@ -2889,12 +3011,21 @@ mod tests {
         ws.settings.console_harness = cide_ipc::ConsoleHarness::Codex;
         let claude = cide_ipc::ConsoleHarness::Claude;
         assert_eq!(
-            ConsoleSpawn::decide(&ws, claude, &None, None).harness,
+            ConsoleSpawn::decide(&ws, claude, &None, None, ws.settings.console_harness, None)
+                .harness,
             cide_ipc::ConsoleHarness::Codex,
             "a fresh console is whatever Settings → Harness says"
         );
         assert_eq!(
-            ConsoleSpawn::decide(&ws, claude, &None, Some(session)).harness,
+            ConsoleSpawn::decide(
+                &ws,
+                claude,
+                &None,
+                Some(session),
+                ws.settings.console_harness,
+                None
+            )
+            .harness,
             cide_ipc::ConsoleHarness::Claude,
             "a claude conversation is resumed by claude, whatever the setting says now"
         );
@@ -2913,7 +3044,14 @@ mod tests {
         let thread = SessionId::new();
         cide_core::workspace::note_conversation(&mut ws, codex_session, thread, 1);
         ws.settings.console_harness = cide_ipc::ConsoleHarness::Claude;
-        let resumed = ConsoleSpawn::decide(&ws, claude, &None, Some(codex_session));
+        let resumed = ConsoleSpawn::decide(
+            &ws,
+            claude,
+            &None,
+            Some(codex_session),
+            ws.settings.console_harness,
+            None,
+        );
         assert_eq!(resumed.harness, cide_ipc::ConsoleHarness::Codex);
         assert_eq!(
             resumed.thread,

@@ -205,6 +205,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            harness_conversation: None,
             continues: None,
             harness: None,
             title: "x".into(),

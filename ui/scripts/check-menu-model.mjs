@@ -55,6 +55,7 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/chrome/menuModel.ts',
+      'src/chrome/consoleName.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -89,6 +90,7 @@ try {
     rowTarget,
     tabMenuEntries,
   } = await import(`file://${join(out, 'chrome/menuModel.js')}`)
+  const { consoleName } = await import(`file://${join(out, 'chrome/consoleName.js')}`)
 
   const NOTHING = { browse() {}, create() {}, reopen() {}, forgetMissing() {}, clear() {} }
   const recent = (path, exists) => ({
@@ -458,6 +460,22 @@ try {
   // `check:tab-overflow`. What is checked here is the half that decides what a user reads and
   // what they may do: the list is reachability only, it never offers to close anything, and it
   // does not lie about which file a line names.
+
+  {
+    for (const [harness, name] of [['claude', 'Claude'], ['codex', 'Codex'], ['opencode', 'OpenCode'], [undefined, 'Claude']]) {
+      const consoleTab = {
+        ...console_,
+        tree: { panes: {
+          auxiliary: { role: 'auxiliary', kind: 'claude', harness: 'codex' },
+          primary: { role: 'primary', kind: 'claude', harness },
+        } },
+      }
+      eq(consoleName(consoleTab), name, 'console chrome follows the primary pane’s recorded harness')
+      eq(item(overflowEntries([consoleTab], ['t0'], {}), 'overflow:t0').label, name,
+        'the overflow menu names the console the same way as its tab')
+    }
+    eq(consoleName(null), 'Claude', 'no console retains the legacy fallback')
+  }
 
   {
     const modRs = tab('t3', { kind: 'file', path: '/repo/src/lib/mod.rs', dirty: false })

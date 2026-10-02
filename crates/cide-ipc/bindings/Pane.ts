@@ -47,6 +47,10 @@ conversation: SessionId | null,
  */
 conversationSince: bigint | null, 
 /**
+ * Native conversation identity for console CLIs whose ids are not UUIDs.
+ */
+harnessConversation?: HarnessSession, 
+/**
  * The harness conversation this pane was opened onto, when it was opened onto one. (M42)
  *
  * Set for a pane the Agents panel opened on a run — a mirror of the run's live child, or

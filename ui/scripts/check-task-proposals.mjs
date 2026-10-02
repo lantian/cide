@@ -69,6 +69,7 @@ try {
         if (id === '\0client') return `
           const t = globalThis.__taskProposalChecks;
           export const tasks = t.tasks, attachments = {}, specEvents = {};
+          export const settings = { effective: async (project) => ({ consoleHarness: t.projectHarness?.[project] ?? t.consoleHarness ?? 'codex' }) };
           export const specSessions = t.specSessions, agentRuns = t.agentRuns, spec = t.spec;`
         if (id === '\0workspace') return `
           import { create } from 'zustand';
@@ -82,9 +83,9 @@ try {
     build: { ssr: 'virtual:task-proposals', outDir: out, rollupOptions: { output: { entryFileNames: 'checks.mjs' } } },
   })
   const { useTasks, useWorkspace, EMPTY_DRAFT, followRunTab, followSpecRuns, useSpecRuns, openTaskSpec, approveTaskSpec, TaskDetail, CARD_STORIES, taskSpecSessions, taskSpecStatuses, taskSpecPhase, openSession } = await import(pathToFileURL(join(out, 'checks.mjs')).href)
-  const workspace = (active = 'project-1', mode = 'background', harness = 'codex') => useWorkspace.setState({
+  const workspace = (active = 'project-1', mode = 'background', harness = 'codex') => { globalThis.__taskProposalChecks.consoleHarness = harness; return useWorkspace.setState({
     boot: { role: { kind: 'shell', active }, workspace: { settings: { taskProposalRunMode: mode, consoleHarness: harness } } },
-  })
+  }) }
   const draft = { ...EMPTY_DRAFT, title: ' Dark mode ', propose: true, assignee: 'developer' }
   const reset = (mode = 'background') => {
     workspace('project-1', mode)

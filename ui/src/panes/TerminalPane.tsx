@@ -33,7 +33,7 @@ import { openTerminalFind } from '@/terminal/findStore'
 import findStyles from './TerminalFindBar.module.css'
 import buttonStyles from '@/styles/buttons.module.css'
 import { registerRestarter } from './paneRestart'
-import { specFor, type TerminalSpec } from './terminalSpec'
+import { restartSpec, specFor, type TerminalSpec } from './terminalSpec'
 import { acknowledge } from './awaiting'
 import { acknowledgesKey } from './awaitingRule'
 import {
@@ -780,7 +780,7 @@ export function TerminalPane({
       clearWriteFailure(paneId)
 
       await startOrRecover(
-        { ...spec, resume: mode === 'resume' ? old : undefined, resumePicker: false, fork: false },
+        restartSpec(spec, kindRef.current, mode, old),
         false,
       )
     }

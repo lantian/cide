@@ -97,6 +97,8 @@ pub struct SettingsPatch {
     /// How `codex` is launched. (M93)
     #[ts(optional)]
     pub codex: Option<crate::settings::CodexSettings>,
+    #[ts(optional)]
+    pub opencode: Option<crate::OpencodeSettings>,
     /// Proxy configuration. Sent whole like every other group, which for this one also means
     /// the URLs — credentials included — cross the IPC boundary on every keystroke-debounced
     /// save. That is the same trip `settings.get` already makes in the other direction, and

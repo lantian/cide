@@ -356,7 +356,10 @@ impl Flavor {
     /// when it misses: a role this build would grey as uninstalled must not also grow a second,
     /// differently worded complaint about the same absence.
     fn binary(&self) -> Result<std::path::PathBuf, String> {
-        cide_core::toolchain::which(self.program()).ok_or_else(|| {
+        cide_core::toolchain::which(
+            &crate::defs::configured_binary(self.kind).unwrap_or_else(|| self.program().into()),
+        )
+        .ok_or_else(|| {
             crate::defs::installed(self.kind)
                 .unwrap_or_else(|| format!("`{}` could not be found", self.program()))
         })
@@ -565,6 +568,57 @@ impl Flavor {
         flags
     }
 
+    /// Probe the effective launch configuration, including wrappers and project overrides.
+    pub fn probe_with_cli(&self, cli: &cide_ipc::OpencodeCli) -> CliFlags {
+        static CACHE: std::sync::Mutex<Vec<(String, Option<std::time::SystemTime>, CliFlags)>> =
+            std::sync::Mutex::new(Vec::new());
+        let key = serde_json::to_string(cli).unwrap_or_default();
+        let modified = cide_core::claude_cli::resolve(&cli.binary)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+        if let Some((_, _, flags)) = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(config, stamp, _)| config == &key && stamp == &modified)
+        {
+            return *flags;
+        }
+        let plan = cide_core::opencode_cli::plan(cli);
+        let help = |args: &[&str]| {
+            let mut command = std::process::Command::new(cli.binary.trim());
+            command.args(&plan.args).args(args).env("NO_COLOR", "1");
+            for (name, value) in &plan.env {
+                if let Some(value) = value {
+                    command.env(name, value);
+                }
+            }
+            cide_core::child_env::run_filter_with(
+                command,
+                None,
+                std::time::Duration::from_secs(20),
+                &[],
+            )
+            .ok()
+            .map(|out| format!("{}\n{}", String::from_utf8_lossy(&out.stdout), out.stderr))
+        };
+        let flags = match (help(&["run", "--help"]), help(&["--help"])) {
+            (Some(run), Some(tui)) if run.contains("--format") => {
+                CliFlags::from_help(self.skip_permissions, &run, &tui)
+            }
+            _ => self.default_flags(),
+        };
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= 64 {
+            cache.remove(0);
+        }
+        cache.push((key, modified, flags));
+        flags
+    }
+
     /// The flags the last probe found for this flavour, or the current CLI's when none has run.
     pub fn cli_flags(&self) -> CliFlags {
         CLI_FLAGS
@@ -698,7 +752,7 @@ impl Flavor {
     /// The tab's configuration document: providers and cide's MCP server. `None` when there is
     /// nothing to say, so the variable is not set at all and the user's own configuration is all
     /// the CLI reads.
-    fn tab_config(
+    pub fn tab_config(
         &self,
         llm: &cide_ipc::LlmSettings,
         hook_bin: Option<&std::path::Path>,
@@ -1028,9 +1082,22 @@ impl Flavor {
         cwd: Option<&std::path::Path>,
         llm: &cide_ipc::LlmSettings,
     ) -> Result<Vec<String>, String> {
-        let binary = self.binary()?;
-
+        self.models_with_cli(cwd, llm, None)
+    }
+    pub fn models_with_cli(
+        &self,
+        cwd: Option<&std::path::Path>,
+        llm: &cide_ipc::LlmSettings,
+        cli: Option<&cide_ipc::OpencodeCli>,
+    ) -> Result<Vec<String>, String> {
+        let binary = match cli {
+            Some(cli) => cide_core::claude_cli::resolve(&cli.binary).map_err(|e| e.message())?,
+            None => self.binary()?,
+        };
         let mut command = std::process::Command::new(&binary);
+        if let Some(cli) = cli {
+            apply_command_launch(&mut command, cli);
+        }
         command.arg("models");
         // Colour would put escape sequences inside the ids themselves, which would then be
         // written into a role file and handed to `--model`. `cide_spec::cli::run` sets it for
@@ -1050,7 +1117,12 @@ impl Flavor {
         // configuration declares and not cide's providers, and the field is free text, so a
         // provider cide knows about can still be typed. The way out is the run's own private
         // server plus `opencode api`, once its routes have been measured; it is not this call.
-        if let Some(document) = provider_config_content(self, llm, self.cli_flags().generation) {
+        if let Some(document) = provider_config_content(
+            self,
+            llm,
+            cli.map_or_else(|| self.cli_flags(), |cli| self.probe_with_cli(cli))
+                .generation,
+        ) {
             command.env(self.config_env(), document);
         }
         if let Some(cwd) = cwd {
@@ -1978,8 +2050,21 @@ impl std::fmt::Debug for UserConfig {
 /// committed copy would be seen — the project root sees the same file plus any uncommitted edit
 /// to it, which is the reading a person editing that file expects.
 pub fn user_config(flavor: &Flavor, cwd: &std::path::Path) -> Result<UserConfig, String> {
-    let binary = flavor.binary()?;
+    user_config_with_cli(flavor, cwd, None)
+}
+pub fn user_config_with_cli(
+    flavor: &Flavor,
+    cwd: &std::path::Path,
+    cli: Option<&cide_ipc::OpencodeCli>,
+) -> Result<UserConfig, String> {
+    let binary = match cli {
+        Some(cli) => cide_core::claude_cli::resolve(&cli.binary).map_err(|e| e.message())?,
+        None => flavor.binary()?,
+    };
     let mut command = std::process::Command::new(&binary);
+    if let Some(cli) = cli {
+        apply_command_launch(&mut command, cli);
+    }
     command.args(["debug", "config"]);
     command.env("NO_COLOR", "1");
     command.current_dir(cwd);
@@ -2434,7 +2519,16 @@ fn child(
     plan: &RunPlan<'_>,
     resume: Option<&str>,
 ) -> Result<HarnessSpawn, HarnessError> {
-    child_with(flavor, plan, resume, flavor.cli_flags())
+    let mut spawned = child_with(
+        flavor,
+        plan,
+        resume,
+        plan.opencode_flags.unwrap_or_else(|| flavor.cli_flags()),
+    )?;
+    if flavor.kind == cide_ipc::Harness::Opencode {
+        apply_launch(&mut spawned.spec, &plan.opencode_cli);
+    }
+    Ok(spawned)
 }
 
 /// The half of [`child`] a test can drive: the whole spec, for a stated [`CliFlags`].
@@ -2784,7 +2878,18 @@ impl Flavor {
         port: u16,
         password: &str,
     ) -> Result<SpawnSpec, HarnessError> {
-        self.serve_spec_with(plan, port, password, self.cli_flags().generation)
+        let mut spec = self.serve_spec_with(
+            plan,
+            port,
+            password,
+            plan.opencode_flags
+                .unwrap_or_else(|| self.cli_flags())
+                .generation,
+        )?;
+        if self.kind == cide_ipc::Harness::Opencode {
+            apply_launch(&mut spec, &plan.opencode_cli);
+        }
+        Ok(spec)
     }
 
     /// The half of [`Self::serve_spec`] a test can drive. See [`child_with`]. The argv is the
@@ -2871,6 +2976,34 @@ impl Flavor {
             program: self.program().to_string(),
             args,
             resume: None,
+        }
+    }
+}
+
+fn apply_command_launch(command: &mut std::process::Command, cli: &cide_ipc::OpencodeCli) {
+    let launch = cide_core::opencode_cli::plan(cli);
+    command.args(launch.args);
+    for (name, value) in launch.env {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn apply_launch(spec: &mut SpawnSpec, cli: &cide_ipc::OpencodeCli) {
+    let launch = cide_core::opencode_cli::plan(cli);
+    spec.program = cli.binary.trim().to_string();
+    let mut args = std::mem::take(&mut spec.args);
+    args.splice(0..0, launch.args);
+    spec.args = args;
+    // Reserved cide variables have already been filtered from the user environment.
+    for (name, value) in launch.env {
+        if let Some(value) = value {
+            spec.env.push((name, value));
+        } else {
+            spec.env_remove.push(name);
         }
     }
 }
@@ -3234,6 +3367,40 @@ mod tests {
 
     use crate::harness::render::{ERASE_MARKER, MARKER};
 
+    #[test]
+    fn project_wrapper_arguments_precede_the_native_command_in_every_launch() {
+        let agent = role();
+        let mut plan = plan_for(&agent);
+        plan.opencode_cli = cide_ipc::OpencodeCli {
+            binary: "project-wrapper".into(),
+            args: vec!["wrapped-opencode".into(), "--session=ses_wrong".into()],
+            env: vec![cide_ipc::ClaudeEnvVar {
+                name: "PROJECT_TOKEN".into(),
+                value: "test".into(),
+            }],
+            ..Default::default()
+        };
+        plan.opencode_flags = Some(v1());
+        let turn = child(&OPENCODE_CLI, &plan, None).unwrap().spec;
+        let server = OPENCODE_CLI.serve_spec(&plan, 47000, "pw").unwrap();
+        for (spec, command) in [(turn, "run"), (server, "serve")] {
+            assert_eq!(spec.program, "project-wrapper");
+            assert_eq!(&spec.args[..2], &["wrapped-opencode", command]);
+            assert!(!spec.args.iter().any(|arg| arg == "--session=ses_wrong"));
+            assert_eq!(env_value(&spec, "PROJECT_TOKEN"), Some("test"));
+        }
+        let mut command = std::process::Command::new("project-wrapper");
+        apply_command_launch(&mut command, &plan.opencode_cli);
+        command.arg("models");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|a| a.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["wrapped-opencode", "models"]
+        );
+    }
+
     /// The tracker paragraph as *this* harness renders it — `cide_cide_task_get`, not
     /// `mcp__cide__cide_task_get`. Derived from the one definition, never quoted.
     fn tracker() -> String {
@@ -3491,6 +3658,8 @@ mod tests {
             geometry: Geometry::default(),
             claude: cide_ipc::ClaudeSettings::default(),
             codex: cide_ipc::CodexSettings::default(),
+            opencode_cli: cide_ipc::OpencodeCli::default(),
+            opencode_flags: None,
             // Empty in the fixture, so every existing assertion is about the document as it was
             // before providers existed. The provider tests build their own.
             llm: cide_ipc::LlmSettings::default(),

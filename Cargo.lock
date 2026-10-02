@@ -735,6 +735,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "signal-hook",

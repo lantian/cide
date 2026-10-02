@@ -29,6 +29,7 @@ pub mod document;
 pub mod error;
 pub mod format;
 pub mod handshake;
+pub mod harness_settings;
 /// Images: what a file is, from its own bytes. The sibling of [`document`], never its pixels.
 pub mod image;
 /// A worktree's own copies of the per-user XDG directories, for a run and its verify alike.
@@ -41,6 +42,7 @@ pub mod login_path;
 /// whose shell rc, not its desktop launcher, put that directory on `PATH`.
 pub mod node_dirs;
 pub mod notes;
+pub mod opencode_cli;
 pub mod persist;
 /// Process ancestry: whose child a pid is. The join key when a `claude` is not the process
 /// cide forked — a wrapper, a shell, a re-exec through a proxy.

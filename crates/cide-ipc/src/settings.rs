@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::git::PullDefault;
-use crate::{Theme, WindowMode};
+use crate::{OpencodeSettings, Theme, WindowMode};
 
 // No `Eq`: `EditorSettings`/`TerminalSettings` carry an `f32` font size now, and a float has
 // no total equality — which is the honest answer rather than an obstacle. Nothing compares
@@ -120,6 +120,9 @@ pub struct Settings {
     pub task_proposal_run_mode: TaskProposalRunMode,
     /// Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
     pub codex: CodexSettings,
+    /// OpenCode launch configuration, shared by consoles, runs and one-shots.
+    #[serde(default)]
+    pub opencode: OpencodeSettings,
     pub proxy: ProxySettings,
     pub sidebar: SidebarSettings,
     pub explorer: ExplorerSettings,
@@ -164,6 +167,7 @@ impl Default for Settings {
             graphics: GraphicsSettings::default(),
             claude: ClaudeSettings::default(),
             console_harness: ConsoleHarness::default(),
+            opencode: OpencodeSettings::default(),
             open_run_in: OpenRunIn::default(),
             task_proposal_run_mode: TaskProposalRunMode::default(),
             codex: CodexSettings::default(),
@@ -1128,11 +1132,7 @@ impl Default for ClaudeSettings {
 
 /// The CLI a project's console runs. (M93)
 ///
-/// Two, and deliberately not [`crate::Harness`]: a console is an interactive TUI that cide
-/// installs hooks into from the command line, types into, resumes and restores, and only these
-/// two CLIs take all of that on the command line (claude through `--settings`, codex through
-/// `-c hooks.*` plus `--dangerously-bypass-hook-trust`). Offering opencode here would be a
-/// switch whose other positions spawn a console with no state, no task tools and no resume.
+/// Interactive console CLIs. Their adapters provide cide session identity and lifecycle events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -1142,6 +1142,8 @@ pub enum ConsoleHarness {
     Claude,
     /// OpenAI's Codex CLI, as an interactive TUI.
     Codex,
+    /// OpenCode's interactive console.
+    Opencode,
 }
 
 impl ConsoleHarness {
@@ -1151,6 +1153,7 @@ impl ConsoleHarness {
         match self {
             Self::Claude => crate::Harness::Claude,
             Self::Codex => crate::Harness::Codex,
+            Self::Opencode => crate::Harness::Opencode,
         }
     }
 
@@ -1161,7 +1164,8 @@ impl ConsoleHarness {
         match harness {
             crate::Harness::Claude => Some(Self::Claude),
             crate::Harness::Codex => Some(Self::Codex),
-            crate::Harness::Opencode | crate::Harness::Qwen | crate::Harness::Mimo => None,
+            crate::Harness::Opencode => Some(Self::Opencode),
+            crate::Harness::Qwen | crate::Harness::Mimo => None,
         }
     }
 
@@ -1171,6 +1175,7 @@ impl ConsoleHarness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
         }
     }
 }

@@ -104,9 +104,10 @@ pub struct Headless {
     ///
     /// It reaches this lane and not only panes because `ProxyScope::claude` already settled the
     /// question for its own field: a one-shot **is a claude**, and a user who points `claude` at
-    /// a gateway or a cloud provider means the commit-message generation too. The *arguments*
-    /// deliberately do not travel; see `cide_app::cmd::settings::run_headless`.
+    /// a gateway or a cloud provider means the commit-message generation too.
     pub env: Vec<(String, Option<String>)>,
+    /// Launch arguments filtered by the caller to preserve the one-shot protocol.
+    pub args: Vec<String>,
 }
 
 impl Headless {
@@ -122,11 +123,17 @@ impl Headless {
             // rather than silently direct.
             proxy: ProxyEnv::default(),
             env: Vec::new(),
+            args: Vec::new(),
         }
     }
 
     pub fn env(mut self, env: Vec<(String, Option<String>)>) -> Self {
         self.env = env;
+        self
+    }
+
+    pub fn args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
         self
     }
 
@@ -210,6 +217,7 @@ pub fn argv(run: &Headless) -> Vec<String> {
 pub fn run(program: &Path, run: &Headless) -> Result<HeadlessResult, HeadlessError> {
     let mut command = Command::new(program);
     command
+        .args(&run.args)
         .args(argv(run))
         .current_dir(&run.cwd)
         .stdin(Stdio::piped())
@@ -691,6 +699,7 @@ fn run_codex_with(
 ) -> Result<HeadlessResult, HeadlessError> {
     let mut command = Command::new(program);
     command
+        .args(&run.args)
         .args(codex_argv(run, schema_file))
         .current_dir(&run.cwd)
         .stdin(Stdio::piped())

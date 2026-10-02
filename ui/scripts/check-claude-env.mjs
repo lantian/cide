@@ -111,7 +111,7 @@ const vars = (src) =>
 const settingsRs = read('../../crates/cide-ipc/src/settings.rs')
 const childEnvRs = read('../../crates/cide-core/src/child_env.rs')
 const sessionRs = read('../../crates/cide-app/src/cmd/session.rs')
-const sectionsTsx = read('../src/settings/sections.tsx')
+const sectionsTsx = read('../src/settings/sections.tsx') + read('../src/settings/HarnessSection.tsx')
 
 // --- 1. the two sets of variable names agree ---------------------------------------------
 

@@ -108,7 +108,9 @@ pub(crate) fn description(name: &str) -> Option<&'static str> {
              OpenSpec options in .cide/config.json) and `section: \"gitlab\"` (GitLab review \
              preferences: excluded files and review prompts; accounts are connected from the GitLab \
              panel, never here). `action: get` shows the section; `set` with `field` and `value` \
-             changes one field. How roles run is cide_agents_config and cide_agent_override."
+             changes one field. `section: \"harness\"` reads local project overrides: consoleHarness, \
+             claude, codex or opencode launch configuration; set overrides one field, reset removes \
+             that field to inherit global settings. How roles run is cide_agents_config and cide_agent_override."
         }
         tool::COMMAND_RUN => {
             "Run one of cide's commands in the window showing this project, exactly as if the user \
@@ -208,8 +210,8 @@ pub(crate) fn input_schema(name: &str) -> Option<Value> {
         tool::PROJECT_SETTINGS => json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["get", "set"] },
-                "section": { "type": "string", "enum": ["openspec", "gitlab"] },
+                "action": { "type": "string", "enum": ["get", "set", "reset"] },
+                "section": { "type": "string", "enum": ["openspec", "gitlab", "harness"] },
                 "field": {
                     "type": "string",
                     "description": "For set: the camelCase field name, as get prints it.",
@@ -348,7 +350,7 @@ fn redacted(settings: &Settings) -> Value {
             }
         }
     }
-    for harness in ["claude", "codex"] {
+    for harness in ["claude", "codex", "opencode"] {
         if let Some(Value::Array(env)) = value
             .get_mut(harness)
             .and_then(|group| group.get_mut("cli"))
@@ -1292,6 +1294,60 @@ fn project_settings(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         (Ok(action), Ok(section)) => (action, section),
         (Err(why), _) | (_, Err(why)) => return fail(name, why),
     };
+    if section == "harness" {
+        let result = if action == "get" {
+            sink.project_harness()
+        } else if matches!(action.as_str(), "set" | "reset") {
+            if let Some(refused) = write_refusal(name, sink) {
+                return refused;
+            }
+            let field = match required(arguments, "field") {
+                Ok(field) => field,
+                Err(why) => return fail(name, why),
+            };
+            let value = if action == "reset" {
+                Value::Null
+            } else {
+                match arguments.get("value") {
+                    Some(value) => value.clone(),
+                    None => return fail(name, "value is required for set"),
+                }
+            };
+            if contains_hidden(&value) {
+                return fail(
+                    name,
+                    format!("`{HIDDEN}` is a secret placeholder, not a launch setting value"),
+                );
+            }
+            let edit = match serde_json::from_value::<cide_ipc::ProjectHarnessEdit>(
+                json!({ "field": field, "value": value }),
+            ) {
+                Ok(edit) => edit,
+                Err(error) => return fail(name, error.to_string()),
+            };
+            sink.set_project_harness(edit)
+        } else {
+            return fail(name, "action must be get, set or reset");
+        };
+        return match result {
+            Ok(settings) => {
+                let mut value = serde_json::to_value(settings).unwrap_or_default();
+                for harness in ["claude", "codex", "opencode"] {
+                    if let Some(env) = value
+                        .get_mut(harness)
+                        .and_then(|v| v.get_mut("env"))
+                        .and_then(Value::as_array_mut)
+                    {
+                        for variable in env {
+                            variable["value"] = json!(HIDDEN);
+                        }
+                    }
+                }
+                ToolResult::text(value.to_string())
+            }
+            Err(error) => fail(name, error),
+        };
+    }
     let current = match section.as_str() {
         "openspec" => sink
             .spec_settings()

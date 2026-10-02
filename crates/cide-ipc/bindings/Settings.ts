@@ -11,6 +11,7 @@ import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
 import type { OpenRunIn } from "./OpenRunIn";
+import type { OpencodeSettings } from "./OpencodeSettings";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
@@ -134,7 +135,11 @@ taskProposalRunMode: TaskProposalRunMode,
 /**
  * Which `codex` is launched, and with what: Settings → Harness → Codex. (M93)
  */
-codex: CodexSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, 
+codex: CodexSettings, 
+/**
+ * OpenCode launch configuration, shared by consoles, runs and one-shots.
+ */
+opencode: OpencodeSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, 
 /**
  * Which models an opencode run may use, and in what order. (M45) See [`crate::llm`].
  *

@@ -136,12 +136,12 @@ function resolveAction(project: ProjectId, change: string): NoticeAction {
     label: 'Resolve in a new session',
     run: () => {
       void (async () => {
-        const { useWorkspace } = await import('@/store/workspace')
-        const setting = useWorkspace.getState().boot?.workspace.settings.consoleHarness
+        const { settings } = await import('@/ipc/client')
+        const setting = (await settings.effective(project)).consoleHarness
         await startSession(project, {
           op: 'merge',
           change,
-          launcher: { kind: 'harness', harness: setting === 'codex' ? 'codex' : 'claude' },
+          launcher: { kind: 'harness', harness: setting },
         })
       })().catch(notifyFailure)
     },

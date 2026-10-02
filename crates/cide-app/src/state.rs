@@ -28,6 +28,7 @@ pub struct SessionRegistry {
     harnesses: DashMap<SessionId, cide_ipc::Harness>,
     /// Latest hook identity, retained even when its pane has not bound yet.
     conversations: DashMap<SessionId, (SessionId, u64)>,
+    native_conversations: DashMap<SessionId, cide_ipc::HarnessSession>,
 }
 
 /// Who minted a write sequence number.
@@ -158,6 +159,23 @@ impl SessionRegistry {
         self.conversations.get(&id).map(|c| *c)
     }
 
+    pub fn note_native_conversation(&self, id: SessionId, conversation: cide_ipc::HarnessSession) {
+        self.native_conversations.insert(id, conversation);
+    }
+    pub fn native_in_use(&self, conversation: &cide_ipc::HarnessSession) -> Option<SessionId> {
+        self.native_conversations.iter().find_map(|row| {
+            (row.value().harness == conversation.harness
+                && row.value().id == conversation.id
+                && self
+                    .get(*row.key())
+                    .is_some_and(|session| !session.has_exited()))
+            .then_some(*row.key())
+        })
+    }
+    pub fn native_conversation(&self, id: SessionId) -> Option<cide_ipc::HarnessSession> {
+        self.native_conversations.get(&id).map(|v| v.clone())
+    }
+
     pub fn get(&self, id: SessionId) -> Option<Arc<PtySession>> {
         self.sessions.get(&id).map(|r| Arc::clone(r.value()))
     }
@@ -213,6 +231,7 @@ impl SessionRegistry {
         self.started.remove(&id);
         self.harnesses.remove(&id);
         self.conversations.remove(&id);
+        self.native_conversations.remove(&id);
         self.sessions.remove(&id).map(|(_, v)| v)
     }
 

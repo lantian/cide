@@ -30,6 +30,9 @@ import {
   type SettingsSection,
 } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
+import { notifyFailure } from '@/chrome/notices'
+import { Segmented } from './controls'
+import type { Settings, SettingsPatch, ProjectHarnessSettings, ProjectHarnessEdit } from '@/ipc/generated'
 import { SearchField } from '@/kit/components/Field'
 import { InfoTip } from '@/kit/components/InfoTip'
 import { Tabs } from '@/kit/components/Surface'
@@ -106,11 +109,37 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     setSeeded(section)
     setActive(section)
   }
-  const settings = useSettings()
+  const globalSettings = useSettings()
+  const [harnessScope, setHarnessScope] = useState<'global' | 'project'>('global')
+  const [tabs, setTabs] = useState<Partial<Record<SettingsSection, string>>>({})
+  const scopedProject = active === 'claudeSessions' && tabs.claudeSessions !== 'proxy' && harnessScope === 'project' ? project : null
+  const projectName = useWorkspace((s) => project === null ? null : s.boot?.workspace.projects[project]?.name ?? null)
+  const overridesKey = useWorkspace((s) => JSON.stringify(s.boot?.workspace.projectHarness ?? {}))
+  const [projectValues, setProjectValues] = useState<{ project: ProjectId; settings: Settings; overrides: ProjectHarnessSettings } | null>(null)
+  const globalsKey = JSON.stringify(globalSettings)
+  useEffect(() => {
+    if (scopedProject === null) return
+    let live = true
+    void Promise.all([settingsApi.effective(scopedProject), settingsApi.projectHarness(scopedProject)]).then(([settings, overrides]) => {
+      if (live) setProjectValues({ project: scopedProject, settings, overrides })
+    }).catch(notifyFailure)
+    return () => { live = false }
+  }, [scopedProject, overridesKey, globalsKey])
+  const settings = scopedProject === null ? globalSettings : projectValues?.project === scopedProject ? projectValues.settings : null
+  const editProjectHarness = useCallback((edit: ProjectHarnessEdit) => {
+    if (scopedProject !== null) void settingsApi.setProjectHarness(scopedProject, edit).catch(notifyFailure)
+  }, [scopedProject])
   const defaults = useSettingsDefaultsFetch()
   const version = useWorkspace((s) => s.boot?.capabilities.version ?? null)
   const claudeVersion = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)
-  const { patch, setTheme, setWindowMode } = useSettingsActions()
+  const { patch: globalPatch, setTheme, setWindowMode } = useSettingsActions()
+  const patch = useCallback((next: SettingsPatch) => {
+    if (scopedProject === null || next.proxy !== undefined) { globalPatch(next); return }
+    if (next.claude) editProjectHarness({ field: 'claude', value: next.claude.cli })
+    if (next.codex) editProjectHarness({ field: 'codex', value: next.codex.cli })
+    if (next.opencode) editProjectHarness({ field: 'opencode', value: next.opencode.cli })
+    if (next.consoleHarness) editProjectHarness({ field: 'consoleHarness', value: next.consoleHarness })
+  }, [scopedProject, globalPatch, editProjectHarness])
 
   /**
    * The CLI verdict — can the configured binary be run, and is its version one this build's
@@ -156,13 +185,13 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   useEffect(() => {
     if (configuredBinary === undefined) return
     let live = true
-    void claudeTasks.cliSupport().then((support) => {
+    void claudeTasks.cliSupport(scopedProject).then((support) => {
       if (live) setCliSupport(support)
     })
     return () => {
       live = false
     }
-  }, [configuredBinary, configuredInjections])
+  }, [scopedProject, configuredBinary, configuredInjections])
 
   /**
    * Settings → Harness → Codex's readout (M93), re-asked whenever the stored codex launch
@@ -175,13 +204,22 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   useEffect(() => {
     if (configuredCodex === undefined) return
     let live = true
-    void codexCli.support().then((support) => {
+    void codexCli.support(scopedProject).then((support) => {
       if (live) setCodexSupport(support)
     })
     return () => {
       live = false
     }
-  }, [configuredCodex])
+  }, [scopedProject, configuredCodex])
+
+  const configuredOpencode = JSON.stringify(settings?.opencode.cli)
+  const [opencodeSupport, setOpencodeSupport] = useState<CodexCliSupport | null>(null)
+  useEffect(() => {
+    if (configuredOpencode === undefined) return
+    let live = true
+    void settingsApi.opencodeSupport(scopedProject).then((support) => { if (live) setOpencodeSupport(support) }).catch(notifyFailure)
+    return () => { live = false }
+  }, [scopedProject, configuredOpencode])
 
   /**
    * What `opencode models` reports, with cide's provider document injected. (M45)
@@ -275,7 +313,6 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
    * not a setting: a relaunch lands on a page's first tab, which is where somebody who did not
    * come here for a specific row should land anyway.
    */
-  const [tabs, setTabs] = useState<Partial<Record<SettingsSection, string>>>({})
   const pageTabs = SECTION_TABS[active]
   const tab = tabs[active] ?? pageTabs?.[0]?.value ?? ''
 
@@ -322,6 +359,8 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
       ? null
       : {
           settings,
+          ...(scopedProject !== null && projectValues?.project === scopedProject ? { projectHarness: projectValues.overrides, editProjectHarness } : {}),
+          opencodeSupport,
           tab,
           setTab: (next: string) => setTabs((t) => ({ ...t, [active]: next })),
           patch,
@@ -339,7 +378,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
         }
 
   return (
-    <SettingsDefaults.Provider value={defaults}>
+    <SettingsDefaults.Provider value={scopedProject === null ? defaults : globalSettings}>
       <div className={styles.tab}>
         <SettingsNav active={active} onSelect={select} onJump={jump} />
 
@@ -352,6 +391,11 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               )}
             </h2>
             <p className={styles.description}>{meta.description}</p>
+            {active === 'claudeSessions' && tab !== 'proxy' && project !== null && (
+              <Segmented label="Harness settings scope" value={harnessScope}
+                options={[{ value: 'global', label: 'Global' }, { value: 'project', label: `Project: ${projectName ?? 'current project'}` }]}
+                onChange={setHarnessScope} />
+            )}
             {pageTabs !== undefined && (
               <div className={styles.pageTabs}>
                 <Tabs

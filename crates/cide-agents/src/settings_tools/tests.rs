@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use super::HIDDEN;
 use serde_json::{Value, json};
 
 use cide_ipc::settings::Settings;
@@ -22,6 +23,7 @@ use crate::tools::{AgentSink, CallerKind, Integrated, Notify, Stopped, ToolResul
 struct Fake {
     caller: CallerKind,
     settings: Mutex<Settings>,
+    project_harness: Mutex<cide_ipc::ProjectHarnessSettings>,
     window_mode: Mutex<Option<cide_ipc::WindowMode>>,
     user_keymap: Mutex<Vec<Binding>>,
     edits: Mutex<Vec<Vec<KeymapEdit>>>,
@@ -40,6 +42,7 @@ impl Fake {
         Self {
             caller,
             settings: Mutex::new(Settings::default()),
+            project_harness: Mutex::new(Default::default()),
             window_mode: Mutex::new(None),
             user_keymap: Mutex::new(Vec::new()),
             edits: Mutex::new(Vec::new()),
@@ -136,6 +139,17 @@ impl AgentSink for Fake {
     }
     fn settings(&self) -> Result<Settings, String> {
         Ok(self.settings.lock().unwrap().clone())
+    }
+    fn project_harness(&self) -> Result<cide_ipc::ProjectHarnessSettings, String> {
+        Ok(self.project_harness.lock().unwrap().clone())
+    }
+    fn set_project_harness(
+        &self,
+        edit: cide_ipc::ProjectHarnessEdit,
+    ) -> Result<cide_ipc::ProjectHarnessSettings, String> {
+        let mut value = self.project_harness.lock().unwrap();
+        value.apply(edit);
+        Ok(value.clone())
     }
     /// Group-wise, as `apply_patch` is: every group the patch names replaces the stored one.
     /// The accent is stored unfitted — fitting is `cide_core::accent`'s, tested there.
@@ -809,4 +823,69 @@ fn extension_settings_are_listed_and_a_bad_choice_is_refused() {
         sink.extensions.lock().unwrap()[0].settings.get("mode"),
         Some(&json!("slow"))
     );
+}
+
+#[test]
+fn local_harness_overrides_reset_and_redact_launch_secrets() {
+    let sink = Fake::new();
+    ok(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"set", "section":"harness", "field":"consoleHarness", "value":"opencode"}),
+        &sink,
+    ));
+    assert_eq!(
+        sink.project_harness.lock().unwrap().console_harness,
+        Some(cide_ipc::ConsoleHarness::Opencode)
+    );
+    assert_eq!(
+        sink.settings.lock().unwrap().console_harness,
+        cide_ipc::ConsoleHarness::Claude
+    );
+    let mut cli = cide_ipc::OpencodeCli::default();
+    cli.env.push(cide_ipc::ClaudeEnvVar {
+        name: "TOKEN".into(),
+        value: "launch-secret".into(),
+    });
+    let reply = ok(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"set", "section":"harness", "field":"opencode", "value":cli}),
+        &sink,
+    ));
+    assert!(!format!("{reply:?}").contains("launch-secret"));
+    assert!(reply.contains(HIDDEN));
+    let hidden: Value = serde_json::from_str(&reply).unwrap();
+    refused(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"set", "section":"harness", "field":"opencode", "value":hidden["opencode"]}),
+        &sink,
+    ));
+    assert_eq!(
+        sink.project_harness
+            .lock()
+            .unwrap()
+            .opencode
+            .as_ref()
+            .unwrap()
+            .env[0]
+            .value,
+        "launch-secret"
+    );
+    ok(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"reset", "section":"harness", "field":"consoleHarness"}),
+        &sink,
+    ));
+    assert!(
+        sink.project_harness
+            .lock()
+            .unwrap()
+            .console_harness
+            .is_none()
+    );
+    assert!(sink.project_harness.lock().unwrap().opencode.is_some());
+    refused(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"set", "section":"harness", "field":"consoleHarness", "value":"opencode"}),
+        &Fake::as_caller(CallerKind::Worker),
+    ));
 }

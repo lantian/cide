@@ -1070,6 +1070,25 @@ impl AgentSink for RegistrySink {
         Ok(workspace.with(|ws| ws.settings.clone()))
     }
 
+    fn project_harness(&self) -> Result<cide_ipc::ProjectHarnessSettings, String> {
+        let state = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        crate::cmd::settings::project_harness_get(state, self.project).map_err(|e| e.to_string())
+    }
+    fn set_project_harness(
+        &self,
+        edit: cide_ipc::ProjectHarnessEdit,
+    ) -> Result<cide_ipc::ProjectHarnessSettings, String> {
+        let state = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        crate::cmd::settings::project_harness_set(state, self.project, edit)
+            .map_err(|e| e.to_string())
+    }
+
     fn set_settings(
         &self,
         patch: cide_ipc::SettingsPatch,
@@ -1437,7 +1456,9 @@ impl AgentSink for RegistrySink {
             .ok_or_else(|| gone().to_string())?;
         let root = crate::tasks_state::project_root(&workspace, self.project)
             .map_err(|error| error.to_string())?;
-        let setting = workspace.with(|ws| ws.settings.console_harness);
+        let setting = workspace.with(|ws| {
+            cide_core::harness_settings::effective(ws, Some(self.project)).console_harness
+        });
         let chosen = request.harness.unwrap_or(setting.harness());
         let tab_harness = match chosen {
             Harness::Claude => {
@@ -4584,6 +4605,7 @@ mod tests {
             session: Some(session),
             conversation: None,
             conversation_since: None,
+            harness_conversation: None,
             continues: None,
             harness: None,
             title: "cide : claude".into(),

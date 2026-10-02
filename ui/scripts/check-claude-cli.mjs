@@ -681,7 +681,7 @@ try {
     // figures, no fast buffer reload, no busy-versus-idle close confirm. Nothing fails.
     // Since M93 the decision is "which console did the caller ask for", by the same file-name
     // match (`console_program` calls `program_is_claude`) and under the same ordering rule.
-    const decides = session.indexOf('let asked = console_program(&spec.program)')
+    const decides = session.indexOf('console_program(&spec.program)')
     const substitutes = session.indexOf('spec.program =')
     ok(decides >= 0 && substitutes >= 0, 'both halves of the substitution are readable')
     ok(
@@ -924,13 +924,14 @@ try {
   )
 
   const sections = strip(uiFile('src/settings/sections.tsx'))
+  const harnessSection = strip(uiFile('src/settings/HarnessSection.tsx'))
   ok(
-    /<ClaudeCliSection/.test(sections),
+    /<HarnessLaunch/.test(sections) && /from ['"]\.\/HarnessSection['"]/.test(sections) && /<ClaudeCliSection/.test(harnessSection),
     'and the Settings screen actually mounts it. Complete, correct and reachable from nothing '
       + 'is this project’s most-repeated defect',
   )
   ok(
-    /claude\.cli/.test(sections),
+    /claude\.cli/.test(harnessSection),
     'bound to `claude.cli`, which is also what `check-claude-env.mjs`’s field scan looks for',
   )
   // The neighbouring gate's trap, asserted from this side so the failure names the cause.

@@ -9,7 +9,7 @@ import {
 import { OverlayCard } from '@/overlays/ModalShell'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { data, openReview, showInbox, showReviewInfo, useGitLab } from './store'
-import { gitlab } from '@/ipc/client'
+import { gitlab, settings } from '@/ipc/client'
 import type { GitLabReviewHarness, Harness } from '@/ipc/generated'
 import { Drafts } from './Drafts'
 import { HARNESS_LABEL, startAgentReview } from './agentReview'
@@ -312,11 +312,14 @@ export function LaunchReviewDialog() {
       },
       (e) => alive && setError(message(e)),
     )
-    // Dynamically, like every other read of the workspace store in this directory.
-    void import('@/store/workspace').then(({ useWorkspace }) => {
-      const setting = useWorkspace.getState().boot?.workspace.settings.consoleHarness
-      if (alive) setConsoleHarness(setting === 'codex' ? 'codex' : 'claude')
-    })
+    void import('@/store/workspace').then(async ({ useWorkspace }) => {
+      const { activeProjectIdOf } = await import('@/keys/target')
+      const project = activeProjectIdOf(useWorkspace.getState().boot)
+      if (project) return settings.effective(project)
+      return settings.get()
+    }).then((settings) => {
+      if (alive) setConsoleHarness(settings.consoleHarness)
+    }).catch((e) => { if (alive) setError(message(e)) })
     return () => {
       alive = false
     }

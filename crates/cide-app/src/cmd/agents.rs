@@ -463,7 +463,8 @@ pub async fn llm_test_model(
     let root = project.and_then(|id| project_root(&state, id).ok());
     // Read on the caller's thread, like `agents_models` beside it, so no workspace guard crosses
     // the await. The document handed to the test is the one a run gets.
-    let llm = state.with(|ws| Ok::<_, CoreError>(ws.settings.llm.clone()))?;
+    let settings = state.with(|ws| cide_core::harness_settings::effective(ws, project));
+    let llm = settings.llm.clone();
     blocking(move || {
         // Whichever opencode-shaped CLI is installed: the provider document is the same for
         // both, and this tests the provider. (M81)
@@ -612,13 +613,21 @@ pub async fn agents_models(
     // `crate::agents::facts` takes the same lock for the same reason. Without it the probe would
     // list only the providers the user configured by hand, and cide's own would be invisible in
     // the very dialog where a model is chosen. (M45)
-    let llm = state.with(|ws| Ok::<_, CoreError>(ws.settings.llm.clone()))?;
+    let settings = state.with(|ws| cide_core::harness_settings::effective(ws, project));
+    let llm = settings.llm.clone();
     blocking(move || {
         // The registry is the same lookup the dispatch makes, so this cannot answer for a
         // harness the fork would refuse — `defs::implemented` makes the identical argument
         // against matching on the enum in a second place.
-        let variant_in_model = cide_agents::harness::opencode::Flavor::of(harness)
-            .is_some_and(cide_agents::harness::opencode::Flavor::variant_in_model);
+        let variant_in_model = if harness == cide_ipc::Harness::Opencode {
+            cide_agents::harness::opencode::OPENCODE_CLI
+                .probe_with_cli(&settings.opencode.cli)
+                .generation
+                == cide_agents::harness::opencode::Generation::V2
+        } else {
+            cide_agents::harness::opencode::Flavor::of(harness)
+                .is_some_and(cide_agents::harness::opencode::Flavor::variant_in_model)
+        };
         let Some(implementation) = cide_agents::harness::for_kind(harness) else {
             return Ok(cide_ipc::agents::AgentModels {
                 harness,
@@ -630,7 +639,16 @@ pub async fn agents_models(
                 problem: defs::implemented(harness),
             });
         };
-        Ok(match implementation.models(root.as_deref(), &llm) {
+        let models = if harness == cide_ipc::Harness::Opencode {
+            cide_agents::harness::opencode::OPENCODE_CLI.models_with_cli(
+                root.as_deref(),
+                &llm,
+                Some(&settings.opencode.cli),
+            )
+        } else {
+            implementation.models(root.as_deref(), &llm)
+        };
+        Ok(match models {
             Ok(models) => cide_ipc::agents::AgentModels {
                 harness,
                 variant_in_model,
@@ -1290,7 +1308,15 @@ pub async fn agents_run_open(
             .first()
             .map(|root| root.path.clone())
             .ok_or(CoreError::NoRoots)?;
-        Ok::<_, CoreError>((root, ws.settings.claude.cli.inject.resume.enabled))
+        Ok::<_, CoreError>((
+            root,
+            cide_core::harness_settings::effective(ws, Some(project))
+                .claude
+                .cli
+                .inject
+                .resume
+                .enabled,
+        ))
     })?;
     agents.open_plan(project, run, &sessions, &root, resume_enabled)
 }

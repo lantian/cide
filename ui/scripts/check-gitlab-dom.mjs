@@ -112,6 +112,7 @@ let drafts = [
 window.__TAURI_INTERNALS__ = {
   transformCallback: () => 1,
   invoke: async (command, args) => {
+    if (command === 'settings_get' || command === 'project_harness_effective') return { consoleHarness: 'claude' }
     calls.push({ command, args })
     if (command === 'gitlab_open_url') return
     // The agent review's harness list (M85): one runnable, one not installed.

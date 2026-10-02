@@ -73,6 +73,11 @@ pub use properties::{
     DirSummary, FileProperties, FilePropertiesGit, LineEnding, Owner, PathKind, TextFacts,
 };
 pub use proposals::{Proposal, ProposalChange, ProposedFile};
+pub mod harness_settings;
+pub use harness_settings::{
+    OpencodeCli, OpencodeInjections, OpencodeSettings, ProjectHarnessEdit, ProjectHarnessSettings,
+};
+
 pub use settings::{
     Accent, AwaitingHighlight, ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections,
     ClaudeSettings, CodexCli, CodexInjections, CodexSettings, ConsoleHarness,

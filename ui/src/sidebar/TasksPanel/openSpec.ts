@@ -1,4 +1,4 @@
-import { spec, type ProjectId } from '@/ipc/client'
+import { settings, spec, type ProjectId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { useTasks } from '../tasksStore'
 import { startSession } from '../OpenSpecPanel/specRuns'
@@ -14,7 +14,7 @@ export async function openTaskSpec(project: ProjectId, change: string): Promise<
  * Rust starts/reuses the change's run and marks linked Todo tasks Doing without a status echo
  * launching a second Apply. Close this card only after launch succeeds, before opening its tab. */
 export async function approveTaskSpec(project: ProjectId, task: string, change: string): Promise<void> {
-  const harness = useWorkspace.getState().boot?.workspace.settings.consoleHarness ?? 'claude'
+  const harness = (await settings.effective(project)).consoleHarness
   const store = useTasks.getState()
   if (store.project === project && store.board.kind === 'ready' &&
       store.board.tasks.some((row) => row.id === task && row.status === 'inbox')) {

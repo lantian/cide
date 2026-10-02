@@ -32,7 +32,6 @@ import type {
   ClaudeCliSupport,
   ClaudeSettings,
   CodexCliSupport,
-  ConsoleHarness,
   AwaitingHighlight,
   EditorSettings,
   ExplorerSettings,
@@ -75,8 +74,8 @@ import { FormattersSection } from './FormattersSection'
 // shape rather than the better one.
 import { MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE } from './fontScale'
 import { badge, handshakeNote, sentence } from './cliHandshake'
-import { ClaudeCliSection } from './ClaudeCliSection'
-import { CodexCliSection } from './CodexCliSection'
+import { HarnessChoice, HarnessLaunch, HARNESSES } from './HarnessSection'
+import type { ProjectHarnessSettings, ProjectHarnessEdit } from '@/ipc/generated'
 import { ModelsSection } from './ModelsSection'
 import { AccentRow } from './AccentRow'
 import { ColorSchemeRow } from './ColorSchemeRow'
@@ -234,6 +233,9 @@ export const SECTION_TABS: Partial<Record<SettingsSection, readonly { value: str
 
 export interface SectionProps {
   settings: Settings
+  projectHarness?: ProjectHarnessSettings
+  editProjectHarness?: (edit: ProjectHarnessEdit) => void
+  opencodeSupport?: CodexCliSupport | null
   /**
    * The page's current tab, for a page in [`SECTION_TABS`]; the first tab's value otherwise
    * (and `''` for a page with none).
@@ -570,86 +572,6 @@ function CliHandshakeRow({ support }: { support: ClaudeCliSupport }) {
   )
 }
 
-const HARNESSES: readonly { value: ConsoleHarness; label: string }[] = [
-  { value: 'claude', label: 'Claude Code' },
-  { value: 'codex', label: 'Codex' },
-]
-
-/**
- * Which CLI a console runs. (M93)
- *
- * Read at one moment only — when a console spawns a *fresh* conversation — so the hint says
- * exactly that: an open console keeps the CLI it was started with, and so does its Resume, and
- * Restart session is how a user moves one over. Agent runs are not governed by it: a role runs
- * the harness its definition names.
- */
-function HarnessChoice({ settings, patch }: SectionProps) {
-  const def = useSettingsDefaults()
-  return (
-    <Group title="Console">
-      <Row
-        label="Harness"
-        hint="The CLI a new console runs."
-        info={
-          <>
-            <InfoPara>
-              Which CLI a new console runs — the project’s pinned tab, a new pane, a tab cide
-              opens by itself, and the one-shots behind Generate commit message.
-            </InfoPara>
-            <InfoPara>
-              A console that is already running keeps its CLI and its Resume; Restart session
-              starts the one chosen here. Agent roles are not affected: each runs the harness its
-              definition names, Claude Code when it names none.
-            </InfoPara>
-          </>
-        }
-        {...resetTo(settings.consoleHarness, def?.consoleHarness, (consoleHarness) =>
-          patch({ consoleHarness }),
-        )}
-        control={
-          <Segmented
-            label="Console harness"
-            value={settings.consoleHarness}
-            options={HARNESSES}
-            onChange={(consoleHarness) => patch({ consoleHarness })}
-          />
-        }
-      />
-    </Group>
-  )
-}
-
-/** Harness → Launch: the chosen CLI's binary, arguments and environment. (M133) */
-function HarnessLaunch({ settings, patch, cliSupport, codexSupport }: SectionProps) {
-  if (settings.consoleHarness === 'codex') {
-    const codex = settings.codex
-    return (
-      <CodexCliSection
-        cli={codex.cli}
-        onChange={(cli) => patch({ codex: { ...codex, cli } })}
-        support={codexSupport}
-      />
-    )
-  }
-  const claude = settings.claude
-  // The launch configuration: which `claude`, and what beyond cide's own argv and environment.
-  // A component of its own rather than more rows here, for the same reason `ProxySection` is
-  // one — it has repeatable rows, a readout and a hard verdict.
-  //
-  // It also has to stay out of *this* file. `check-claude-env.mjs` asserts set-equality between
-  // the `CLAUDE_CODE_*` names in `child_env.rs` and the ones named here, so that a switch wired
-  // to nothing fails a gate; the refusal list names four of those variables for the opposite
-  // reason, and spelling them in this file would break that check with a message about a
-  // defect that is not there.
-  return (
-    <ClaudeCliSection
-      cli={claude.cli}
-      onChange={(cli) => patch({ claude: { ...claude, cli } })}
-      support={cliSupport}
-    />
-  )
-}
-
 /**
  * A problem with the whole page, drawn as a `Banner` under its title. (M133)
  *
@@ -659,11 +581,15 @@ function HarnessLaunch({ settings, patch, cliSupport, codexSupport }: SectionPro
  */
 export function sectionBanner(id: SettingsSection, props: SectionProps): ReactNode {
   if (id !== 'claudeSessions') return null
+  if (props.settings.consoleHarness === 'opencode') {
+    const problem = props.opencodeSupport?.problem
+    return problem ? <Banner tone="bad">OpenCode cannot be run: {problem}</Banner> : null
+  }
   if (props.settings.consoleHarness === 'codex') {
     const problem = props.codexSupport?.problem
     return problem != null ? <Banner tone="bad">codex cannot be run: {problem}</Banner> : null
   }
-  return props.claudeVersion === null ? (
+  return (props.projectHarness === undefined ? props.claudeVersion === null : props.cliSupport?.problem != null) ? (
     <Banner tone="bad">
       claude is not on PATH. Panes will fail to spawn until the CLI is installed and on this
       app’s PATH.
@@ -1288,7 +1214,9 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       return (
         <>
           <HarnessChoice {...props} />
-          {props.settings.consoleHarness === 'codex' ? (
+          {props.settings.consoleHarness === 'opencode' || props.projectHarness !== undefined ? (
+            <Group title={HARNESSES.find((h) => h.value === props.settings.consoleHarness)?.label}><Row label="Version" hint="Launch settings apply to new processes." control={<Readout text={props.settings.consoleHarness === 'opencode' ? props.opencodeSupport?.version ?? '…' : props.settings.consoleHarness === 'codex' ? props.codexSupport?.version ?? '…' : props.cliSupport?.version ?? props.claudeVersion ?? '…'} />} /></Group>
+          ) : props.settings.consoleHarness === 'codex' ? (
             <CodexSessionsSection {...props} />
           ) : (
             <ClaudeSessionsSection {...props} />

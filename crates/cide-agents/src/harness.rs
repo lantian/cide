@@ -67,6 +67,7 @@ use crate::defs::{LoadedAgent, harness_name};
 pub mod claude;
 pub mod codex;
 pub mod opencode;
+pub mod opencode_console;
 pub mod qwen;
 mod render;
 
@@ -844,6 +845,8 @@ pub struct RunPlan<'a> {
     /// harness only, as [`Self::claude`] is read by the claude one — so a wrapper configured
     /// for the console is the codex every run of a `harness: codex` role runs too.
     pub codex: cide_ipc::CodexSettings,
+    pub opencode_cli: cide_ipc::OpencodeCli,
+    pub opencode_flags: Option<opencode::CliFlags>,
     /// The provider configuration this child is given, resolved by the caller for
     /// [`Self::claude`]'s reason — nothing in this crate reads a workspace. Emitted into
     /// `OPENCODE_CONFIG_CONTENT`; inert for every other harness. (M45)
@@ -1468,6 +1471,8 @@ mod tests {
                     geometry: Geometry::default(),
                     claude: cide_ipc::ClaudeSettings::default(),
                     codex: cide_ipc::CodexSettings::default(),
+                    opencode_cli: cide_ipc::OpencodeCli::default(),
+                    opencode_flags: None,
                     llm: cide_ipc::LlmSettings::default(),
                     choice: None,
                     harness: kind,
@@ -1863,6 +1868,8 @@ mod tests {
                 geometry: Geometry::default(),
                 claude: cide_ipc::ClaudeSettings::default(),
                 codex: cide_ipc::CodexSettings::default(),
+                opencode_cli: cide_ipc::OpencodeCli::default(),
+                opencode_flags: None,
                 llm: cide_ipc::LlmSettings::default(),
                 choice: None,
                 harness: agent.def.harness,

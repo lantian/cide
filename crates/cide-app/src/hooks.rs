@@ -238,6 +238,22 @@ impl HookServer {
         &self.path
     }
 
+    /// State reported by a console adapter that has no Claude-shaped hooks.
+    pub fn external_state(&self, app: &AppHandle, id: SessionId, state: SessionState) {
+        if app
+            .try_state::<crate::state::SessionRegistry>()
+            .and_then(|registry| registry.get(id))
+            .is_none_or(|pty| pty.has_exited())
+        {
+            return;
+        }
+        let old = self.states.insert(id, state);
+        if old != Some(state) {
+            crate::emit::session_state(app, &id.to_string(), state);
+            crate::agent_rpc::note_session_ready(app, state);
+        }
+    }
+
     pub fn state(&self, session: SessionId) -> SessionState {
         self.states
             .get(&session)

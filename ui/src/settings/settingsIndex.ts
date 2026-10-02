@@ -46,7 +46,9 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'projectsAndWindows', label: 'Confirm before closing a project with a live session', keywords: 'close prompt warning dialog' },
   { section: 'projectsAndWindows', label: 'Open a run in', keywords: 'agent subagent run tab split view' },
   // Harness
-  { section: 'claudeSessions', tab: 'console', label: 'Harness', keywords: 'claude codex cli console which' },
+  { section: 'claudeSessions', tab: 'launch', label: 'Override global launch', keywords: 'project local binary arguments environment inheritance' },
+  { section: 'claudeSessions', tab: 'launch', label: 'Inherited launch', keywords: 'project global default binary' },
+  { section: 'claudeSessions', tab: 'console', label: 'Harness', keywords: 'claude codex opencode cli console which default global project override' },
   { section: 'claudeSessions', tab: 'console', label: 'Last handshake', keywords: 'ide protocol claude verified' },
   { section: 'claudeSessions', tab: 'console', label: 'Disable mouse reporting', keywords: 'CLAUDE_CODE_DISABLE_MOUSE selection' },
   { section: 'claudeSessions', tab: 'console', label: 'Resume every Harness pane on launch', keywords: 'restore conversation startup' },

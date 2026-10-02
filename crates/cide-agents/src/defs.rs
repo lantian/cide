@@ -1447,7 +1447,7 @@ pub fn set_configured_binary(harness: Harness, binary: &str) {
     }
 }
 
-fn configured_binary(harness: Harness) -> Option<String> {
+pub fn configured_binary(harness: Harness) -> Option<String> {
     CONFIGURED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1503,6 +1503,27 @@ pub fn installed(harness: Harness) -> Option<String> {
         "“{binary}” is not on this app's PATH, nor in ~/.cargo/bin or ~/go/bin. A cide started \
          from a desktop launcher has a different PATH from one started in a terminal."
     ))
+}
+
+/// Availability of the binary this project will actually launch.
+pub fn installed_in(root: &Path, harness: Harness) -> Option<String> {
+    let overrides = cide_core::harness_settings::load(
+        &cide_core::persist::config_dir().join("harness-settings.json"),
+    )
+    .ok();
+    let binary = overrides
+        .as_ref()
+        .and_then(|all| all.get(&cide_core::harness_settings::root_key(root)))
+        .and_then(|settings| match harness {
+            Harness::Claude => settings.claude.as_ref().map(|cli| cli.binary.as_str()),
+            Harness::Codex => settings.codex.as_ref().map(|cli| cli.binary.as_str()),
+            Harness::Opencode => settings.opencode.as_ref().map(|cli| cli.binary.as_str()),
+            _ => None,
+        });
+    match binary {
+        Some(binary) => configured_missing(binary),
+        None => installed(harness),
+    }
 }
 
 /// Does this build of cide have an implementation for this harness at all?
@@ -1821,7 +1842,9 @@ pub fn load_from(
 /// `default_harness` comes from `.cide/config.json`; see `crate::config::AgentsConfig::harness`
 /// for why a project gets to choose it and a definition gets to override it.
 pub fn load(project_root: &Path, default_harness: Harness) -> Catalog {
-    load_from(&scopes(project_root), default_harness, installed)
+    load_from(&scopes(project_root), default_harness, |harness| {
+        installed_in(project_root, harness)
+    })
 }
 
 // ==========================================================================================

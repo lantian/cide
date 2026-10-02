@@ -188,10 +188,9 @@ pub async fn task_new_with_proposal(
     let project = req.project;
     let root = tasks_state::project_root(&state, project)?;
     let (harness, background) = state.with(|ws| {
-        let harness = match ws.settings.console_harness {
-            cide_ipc::ConsoleHarness::Codex => cide_ipc::Harness::Codex,
-            cide_ipc::ConsoleHarness::Claude => cide_ipc::Harness::Claude,
-        };
+        let harness = cide_core::harness_settings::effective(ws, Some(project))
+            .console_harness
+            .harness();
         (
             harness,
             ws.settings.task_proposal_run_mode == cide_ipc::TaskProposalRunMode::Background,

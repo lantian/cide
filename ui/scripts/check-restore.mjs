@@ -15,7 +15,7 @@ try {
     import { renderToStaticMarkup } from 'react-dom/server'
     import { ResumeSplash } from '${join(UI, 'src/windows/ResumeSplash.tsx')}'
     export { ResumeSplash }
-    export { specFor } from '${join(UI, 'src/panes/terminalSpec.ts')}'
+    export { specFor, restartSpec } from '${join(UI, 'src/panes/terminalSpec.ts')}'
     export const splash = (props) => renderToStaticMarkup(createElement(ResumeSplash, props))
   `)
   await build({
@@ -23,7 +23,7 @@ try {
     logLevel: 'error',
     build: { ssr: entry, outDir: join(out, 'bundle'), emptyOutDir: true },
   })
-  const { specFor, splash, ResumeSplash } = await import(pathToFileURL(join(out, 'bundle/restore.js')))
+  const { specFor, restartSpec, splash, ResumeSplash } = await import(pathToFileURL(join(out, 'bundle/restore.js')))
   const pane = {
     id: 'pane', kind: 'claude', role: 'primary', title: 'test9 : codex',
     session: 'routing-id', harness: 'codex', conversation: null, continues: null,
@@ -46,6 +46,17 @@ try {
   assert.equal(fresh.resumePicker, false)
   assert.equal(fresh.resume, undefined)
   assert.equal(fresh.continues, undefined)
+  const openCode = { ...pane, harness: 'opencode', harnessConversation: { harness: 'opencode', id: 'ses_native', cwd: '/worktree' } }
+  assert.equal(specFor(openCode, '/worktree', 'project', plan({ kind: 'resumable', session: 'routing-id' })).resume, 'routing-id')
+  assert.equal(specFor(openCode, '/worktree', 'project', missing).resumePicker, undefined)
+  const restarted = restartSpec({ ...launch, program: 'opencode', args: ['--session', 'ses_native'] }, 'claude', 'fresh', 'routing-id')
+  assert.equal(restarted.program, 'claude', 'a fresh console restart resolves the current project default')
+  assert.deepEqual(restarted.args, [])
+  assert.equal(restarted.continues, undefined)
+  assert.equal(restarted.resume, undefined)
+  const resumedNative = restartSpec({ ...launch, program: 'claude' }, 'claude', 'resume', 'routing-id')
+  assert.equal(resumedNative.resume, 'routing-id', 'the backend resolves the native conversation from the pane')
+  assert.equal(resumedNative.continues, undefined)
   assert.equal(specFor(pane, '/project').resume, undefined)
   assert.equal(specFor({ ...pane, kind: 'editor' }, '/project'), null)
   const shell = specFor({ ...pane, kind: 'shell' }, '/project', 'project', plan({ kind: 'fresh' }))

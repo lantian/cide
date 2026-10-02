@@ -1541,11 +1541,6 @@ fn plan_restore_with_homes(
     // **Resume this conversation** and then silently start a *new* one — a button that lies
     // about what it does is worse than a pane that opens fresh and says so. A transcript that
     // still exists is not the question here; whether cide will name it is.
-    let resume_enabled = Resume {
-        claude: ws.settings.claude.cli.inject.resume.enabled,
-        codex: ws.settings.codex.cli.inject.resume,
-    };
-
     for (id, project) in &ws.projects {
         if only.is_some_and(|wanted| wanted != *id) {
             continue;
@@ -1555,6 +1550,12 @@ fn plan_restore_with_homes(
         let Some(root) = project.roots.first() else {
             tracing::warn!(project = %id, "project has no root; skipping it in the restore plan");
             continue;
+        };
+        let settings = cide_core::harness_settings::effective(ws, Some(*id));
+        let resume_enabled = Resume {
+            claude: settings.claude.cli.inject.resume.enabled,
+            codex: settings.codex.cli.inject.resume,
+            opencode: settings.opencode.cli.inject.resume,
         };
         let shell = shell_window(ws, *id);
 
@@ -1627,8 +1628,9 @@ fn entry_for(
     // root, which every other pane spawns in, would answer `Fresh` for it and the pane would
     // come back as a new conversation in the wrong directory.
     let cwd = pane
-        .continues
+        .harness_conversation
         .as_ref()
+        .or(pane.continues.as_ref())
         .map_or(cwd, |conversation| conversation.cwd.as_path());
     let restore = restore_for(pane, cwd, projects_dir, codex_home, resume_enabled);
     Some(PaneRestore {
@@ -1658,6 +1660,7 @@ fn entry_for(
 struct Resume {
     claude: bool,
     codex: bool,
+    opencode: bool,
 }
 
 /// What one pane of a tab Ctrl+Shift+T is about to put back could resume, right now.
@@ -1669,12 +1672,20 @@ struct Resume {
 /// is gone.
 pub(crate) fn resumable_on_reopen(ws: &Workspace, pane: &Pane, root: &Path) -> SessionRestore {
     let cwd = pane
-        .continues
+        .harness_conversation
         .as_ref()
+        .or(pane.continues.as_ref())
         .map_or(root, |conversation| conversation.cwd.as_path());
+    let project = ws
+        .projects
+        .iter()
+        .find(|(_, project)| project.roots.first().is_some_and(|r| r.path == root))
+        .map(|(id, _)| *id);
+    let settings = cide_core::harness_settings::effective(ws, project);
     let resume_enabled = Resume {
-        claude: ws.settings.claude.cli.inject.resume.enabled,
-        codex: ws.settings.codex.cli.inject.resume,
+        claude: settings.claude.cli.inject.resume.enabled,
+        codex: settings.codex.cli.inject.resume,
+        opencode: settings.opencode.cli.inject.resume,
     };
     restore_for(
         pane,
@@ -1696,6 +1707,20 @@ fn restore_for(
     // replay, and the frontend says so rather than showing a stale screen.
     if pane.kind != PaneKind::Claude {
         return SessionRestore::Fresh;
+    }
+    if cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Opencode {
+        if !resume_enabled.opencode {
+            return SessionRestore::Fresh;
+        }
+        return match (pane.session, &pane.harness_conversation) {
+            (Some(session), Some(native))
+                if native.harness == cide_ipc::Harness::Opencode
+                    && cide_agents::harness::opencode_console::validate_id(&native.id).is_ok() =>
+            {
+                SessionRestore::Resumable { session }
+            }
+            _ => SessionRestore::MissingConversation,
+        };
     }
     // A codex console (M93) is resumable by its **thread**, which only its hooks ever named —
     // `pane.session` is cide's routing id and no codex conversation has it. The rollout is found
@@ -2748,6 +2773,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                harness_conversation: None,
                 continues: None,
                 harness: None,
                 title: "secondary : claude".into(),
@@ -2768,6 +2794,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                harness_conversation: None,
                 continues: None,
                 harness: None,
                 title: "fixture : bash".into(),

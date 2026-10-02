@@ -3,10 +3,6 @@
 /**
  * The CLI a project's console runs. (M93)
  *
- * Two, and deliberately not [`crate::Harness`]: a console is an interactive TUI that cide
- * installs hooks into from the command line, types into, resumes and restores, and only these
- * two CLIs take all of that on the command line (claude through `--settings`, codex through
- * `-c hooks.*` plus `--dangerously-bypass-hook-trust`). Offering opencode here would be a
- * switch whose other positions spawn a console with no state, no task tools and no resume.
+ * Interactive console CLIs. Their adapters provide cide session identity and lifecycle events.
  */
-export type ConsoleHarness = "claude" | "codex";
+export type ConsoleHarness = "claude" | "codex" | "opencode";

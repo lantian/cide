@@ -1124,6 +1124,10 @@ export const diagnostics = {
  */
 export const settings = {
   get: () => invoke<SettingsDto>('settings_get'),
+  projectHarness: (project: ProjectId) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_get', { project }),
+  setProjectHarness: (project: ProjectId, edit: import('./generated').ProjectHarnessEdit) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_set', { project, edit }),
+  effective: (project: ProjectId) => invoke<SettingsDto>('project_harness_effective', { project }),
+  opencodeSupport: (project: ProjectId | null = null) => invoke<CodexCliSupport>('opencode_cli_support', { project }),
 
   /** `Settings::default()` — what Settings' Reset puts back. (M133) */
   defaults: () => invoke<SettingsDto>('settings_defaults'),
@@ -2381,10 +2385,10 @@ export const claudeTasks = {
    * The CLI-version verdict. Degrades to "nothing to report" rather than throwing, because
    * it renders inside a settings section that must still draw without it.
    */
-  cliSupport: (): Promise<ClaudeCliSupport> =>
+  cliSupport: (project: ProjectId | null = null): Promise<ClaudeCliSupport> =>
     pendingCommand<ClaudeCliSupport>(
       'claude_cli_support',
-      () => invoke<ClaudeCliSupport>('claude_cli_support'),
+      () => invoke<ClaudeCliSupport>('claude_cli_support', { project }),
       {
         version: null,
         verifiedRange: 'unknown',
@@ -5479,10 +5483,10 @@ export interface CodexCliSupport {
 
 export const codexCli = {
   /** Degrades to an empty readout rather than throwing: it renders inside a settings section. */
-  support: (): Promise<CodexCliSupport> =>
+  support: (project: ProjectId | null = null): Promise<CodexCliSupport> =>
     pendingCommand<CodexCliSupport>(
       'codex_cli_support',
-      () => invoke<CodexCliSupport>('codex_cli_support'),
+      () => invoke<CodexCliSupport>('codex_cli_support', { project }),
       {
         binary: '',
         resolved: null,

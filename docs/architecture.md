@@ -154,7 +154,10 @@ Claude is hosted three ways at once (ADR 0005): a real PTY, the IDE-integration 
   `on_spawn_thread` is for, and why a language server is never spawned from a Tauri command
   worker. A new `Command::new`/`SpawnSpec` anywhere in the workspace needs both lines.
 
-**The console may be codex (M93).** Settings → Harness picks the CLI a *fresh* console runs.
+**The console may be Claude, Codex or OpenCode.** Settings → Harness picks the CLI a *fresh*
+console runs, with optional machine-local project overrides of the default and each CLI's
+launch configuration. The same resolution supplies matching roles, automated tabs, probes and
+one-shots; roles still choose their own harness.
 Each console pane records the CLI it actually runs (`Pane::harness`, stamped by
 `bind_session` from `SessionRegistry::note_harness`), and a resume or fork goes to that CLI
 whatever the setting says now (`cmd::session::ConsoleSpawn::decide`).
@@ -168,6 +171,14 @@ It has no IDE MCP client, so `openDiff`, diagnostics and the selection stream ar
 Its thread id is never cide's `SessionId`: it arrives by hook into `Pane::conversation`.
 `cide_core::codex_cli` holds the launch rules; codex agent runs use the same TUI hosting
 (`harness/codex.rs`).
+
+OpenCode consoles attach a real TUI to a private authenticated loopback server. The adapter in
+`cide-app/src/opencode_console.rs` creates or resumes a native `ses_…` conversation and records
+it in `Pane::harness_conversation`, separately from cide's routing UUID. The API adapter in
+`cide-agents/src/harness/opencode_console.rs` handles v1/v2 routes, instructions, forks,
+permission/question state and events. Closing the TUI stops its server and children; losing the
+server ends the TUI. Native APIs supply the common console lifecycle; Claude's IDE MCP remains
+specific to Claude.
 
 A `SessionId` *is* the value passed to `claude --session-id`, which is what makes resume free.
 Shutdown is a ladder — SIGHUP, SIGTERM, SIGKILL — so a `claude` finishes writing the transcript
@@ -185,6 +196,11 @@ none of it does. Inspect a profile's with `CIDE_PROFILE=<name> ./target/debug/ci
   `./target/debug/cide-headless tree`.
 - `$XDG_CONFIG_HOME/cide/keymap.json` — user binding overrides only (diffs; defaults are
   compiled in).
+- `$XDG_CONFIG_HOME/cide/harness-settings.json` — local project defaults and CLI launch
+  overrides, keyed by canonical primary project root. Missing fields inherit global settings;
+  resetting removes an override. Written atomically with mode 0600, never into the project.
+  The workspace carries a mirror for UI updates; this file is authoritative on startup and
+  survives closing or reopening projects under new IDs.
 - `$XDG_CONFIG_HOME/cide/schemes/<id>.json` — imported editor colour schemes, one file each.
   The *converted* scheme, not the source VS Code theme: re-converting at launch would let a
   change to `cide_core::scheme::SCOPES` repaint a buffer somebody was happy with. `cide` is

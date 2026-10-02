@@ -266,9 +266,10 @@ pub(crate) fn apply_task(
     let launcher = match task.agent.clone() {
         Some(agent) => SpecLauncher::Role { agent },
         None => SpecLauncher::Harness {
-            harness: state.with(|ws| match ws.settings.console_harness {
-                cide_ipc::ConsoleHarness::Claude => Harness::Claude,
-                cide_ipc::ConsoleHarness::Codex => Harness::Codex,
+            harness: state.with(|ws| {
+                cide_core::harness_settings::effective(ws, Some(project))
+                    .console_harness
+                    .harness()
             }),
         },
     };

@@ -446,11 +446,13 @@ function overflowLabel(tab: Tab): string {
       // `chrome/consoleName.ts`'s rule, restated for this file's reason above: a check compiles
       // it alone and runs it under Node, where a value import does not resolve. (M93)
       // Read through `?.`: the check's fixtures build tabs without a tree.
-      return Object.values(tab.tree?.panes ?? {}).some(
-        (pane) => pane?.role === 'primary' && pane.harness === 'codex',
-      )
-        ? 'Codex'
-        : 'Claude'
+      for (const pane of Object.values(tab.tree?.panes ?? {})) {
+        if (pane?.role === 'primary' && pane.kind === 'claude') {
+          if (pane.harness === 'opencode') return 'OpenCode'
+          return pane.harness === 'codex' ? 'Codex' : 'Claude'
+        }
+      }
+      return 'Claude'
     case 'claudeFull':
       return tab.kind.title
     case 'file':

@@ -61,6 +61,10 @@ fn publish_binaries(settings: &cide_ipc::Settings) {
         &settings.claude.cli.binary,
     );
     cide_agents::defs::set_configured_binary(cide_ipc::Harness::Codex, &settings.codex.cli.binary);
+    cide_agents::defs::set_configured_binary(
+        cide_ipc::Harness::Opencode,
+        &settings.opencode.cli.binary,
+    );
 }
 
 impl WorkspaceState {
@@ -84,6 +88,12 @@ impl WorkspaceState {
             tracing::warn!(%error, "loaded workspace failed validation; starting from defaults");
             workspace = Workspace::default();
             backup_before_save = true;
+        }
+        match cide_core::harness_settings::load(
+            &persist::config_dir().join("harness-settings.json"),
+        ) {
+            Ok(projects) => workspace.project_harness = projects,
+            Err(error) => tracing::warn!(%error, "could not load project harness settings"),
         }
         publish_binaries(&workspace.settings);
 
@@ -264,6 +274,7 @@ impl WorkspaceState {
         // Settings → Harness's binaries, handed to the harness probe whenever they move. (M107)
         if content_before.settings.claude.cli.binary != guard.settings.claude.cli.binary
             || content_before.settings.codex.cli.binary != guard.settings.codex.cli.binary
+            || content_before.settings.opencode.cli.binary != guard.settings.opencode.cli.binary
         {
             publish_binaries(&guard.settings);
         }

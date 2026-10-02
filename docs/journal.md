@@ -17250,3 +17250,42 @@ formatting, agents, kit, selectors, scale, motion, theme, sidebar and command ch
 in wording concurrently changed to be harness-neutral; workspace formatting flags concurrent
 command-registry edits. Those edits were left intact. Not visually confirmed in a running IDE
 or on macOS; the running backend was not restarted.
+
+## M149 — Project harness settings and OpenCode consoles
+
+Settings → Harness now has a Global / Project scope switch. Each project can inherit or
+override the default console harness and each CLI's complete launch configuration independently.
+Overrides live in the profile's local `harness-settings.json`, keyed by the canonical primary
+project root, with atomic writes and mode 0600. They survive closing and reopening a project;
+resetting restores inheritance. No project file is written. Matching roles, automated tabs,
+CLI probes and one-shots resolve the same project launch settings, while roles retain their
+explicit harness. MCP project settings expose the same field edits and reject secret placeholders.
+
+OpenCode is available as a global or project default, with binary, arguments, environment and
+integration controls. Interactive consoles attach their TUI to a private authenticated loopback
+server. The v1/v2 adapter stores native conversation IDs separately from cide routing IDs,
+supports resume and fork, injects cide's tools and instructions, and reports busy, permissions,
+questions, model usage and edited files through the existing console surfaces. Duplicate live
+writers are refused and closing the TUI stops its server. Fresh restart follows the current
+project default; resume preserves the recorded harness. Continued and automated OpenCode panes
+now share console chrome. Prompt-only one-shots use the effective launch settings and providers;
+explicit hard spending caps report OpenCode's lack of support.
+
+**Verified:** the full Rust workspace suite passes 4,372 tests (91 intentionally ignored).
+All 119 UI checks pass across the full run and focused reruns, including the mounted scoped
+harness controls, TypeScript and production build. Affected-crate clippy, formatting,
+contract and codegen checks pass. Native API fixtures cover both protocol generations and
+event-stream EOF. The installed OpenCode v2 passes the free private-server authentication and
+TUI attachment test against a local hanging provider; manual native session creation and
+instruction updates also pass. The wrapper-prefix regression and fake-CLI one-shot routing
+check pass after the final argument ordering change. No paid model turn was run.
+
+**Not confirmed in a running IDE or on macOS:** full interactive restore/fork and permission
+gestures across live windows. Selecting an existing idle conversation in OpenCode's own resume
+picker is recorded when it begins work; newly created conversations are recorded immediately.
+
+The console-caption follow-up adds OpenCode to the shared name helper and the overflow menu.
+The main tab, switcher and detached header now name the primary pane's recorded harness.
+The menu regression check covers all three harnesses, legacy snapshots and an auxiliary pane
+running another harness. TypeScript, menu-model, tab-overflow and detached-window checks pass;
+the caption change was not visually confirmed in the live IDE.

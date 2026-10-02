@@ -36,6 +36,9 @@ pub struct Workspace {
     /// snapshot that arrived out of order.
     pub rev: u64,
     pub settings: Settings,
+    /// Mirror of the machine-local harness-settings file, keyed by primary root.
+    #[serde(default)]
+    pub project_harness: std::collections::BTreeMap<String, crate::ProjectHarnessSettings>,
     /// Insertion order **is** the header tab order.
     pub projects: IndexMap<ProjectId, Project>,
     pub windows: IndexMap<WindowLabel, WindowRole>,
@@ -135,6 +138,7 @@ impl Default for Workspace {
             schema_version: Self::CURRENT_SCHEMA,
             rev: 0,
             settings: Settings::default(),
+            project_harness: Default::default(),
             projects: IndexMap::new(),
             windows: IndexMap::new(),
             tool_window: ToolWindowState::default(),
@@ -1283,6 +1287,10 @@ pub struct Pane {
     /// `cide_core::workspace::claude_name_cutoffs` is the one reader.
     #[serde(default)]
     pub conversation_since: Option<u64>,
+    /// Native conversation identity for console CLIs whose ids are not UUIDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness_conversation: Option<crate::HarnessSession>,
     /// The harness conversation this pane was opened onto, when it was opened onto one. (M42)
     ///
     /// Set for a pane the Agents panel opened on a run — a mirror of the run's live child, or

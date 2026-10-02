@@ -89,7 +89,9 @@ export function specFor(
    * opencode's own answer is the honest one.
    */
   if (restore?.restore.kind === 'missingConversation') {
-    return { program: 'codex', args: [], cwd, project, resumePicker: recovery !== 'fresh' }
+    return pane.harness === 'opencode'
+      ? { program: 'claude', args: [], cwd, project }
+      : { program: 'codex', args: [], cwd, project, resumePicker: recovery !== 'fresh' }
   }
   const continues = pane.continues == null ? undefined : (
     restore?.restore.kind === 'resumable' && pane.continues.harness === 'codex'
@@ -131,3 +133,17 @@ export function specFor(
   }
 }
 
+
+/** Fresh console restarts resolve the current project default; resume resolves its saved owner. */
+export function restartSpec(spec: TerminalSpec, kind: Pane['kind'], mode: 'fresh' | 'resume', session: string | undefined): TerminalSpec {
+  const console = kind === 'claude'
+  return {
+    ...spec,
+    program: console && mode === 'fresh' ? 'claude' : spec.program,
+    args: console && mode === 'fresh' ? [] : spec.args,
+    continues: console ? undefined : spec.continues,
+    resume: mode === 'resume' ? session : undefined,
+    resumePicker: false,
+    fork: false,
+  }
+}

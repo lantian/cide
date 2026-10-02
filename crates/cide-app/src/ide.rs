@@ -757,6 +757,7 @@ fn open_diff_tab(app: &AppHandle, project: ProjectId, broker: &DiffBroker, reque
         session: None,
         conversation: None,
         conversation_since: None,
+        harness_conversation: None,
         continues: None,
         harness: None,
         title,

@@ -44,6 +44,7 @@
     "check:git": "node scripts/check-git-tree.mjs",
     "check:commit-message": "node scripts/check-commit-message.mjs",
     "check:groups": "node scripts/check-groups.mjs",
+    "check:harness-settings": "node scripts/check-harness-settings.mjs",
     "check:handshake": "node scripts/check-handshake.mjs",
     "check:icons": "node scripts/check-icons.mjs",
     "check:image": "node scripts/check-image.mjs",

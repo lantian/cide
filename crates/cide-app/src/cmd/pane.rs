@@ -57,15 +57,13 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         SplitIntent::NewClaude | SplitIntent::ForkPrimary => (PaneKind::Claude, "claude"),
         SplitIntent::Mirror { .. } | SplitIntent::Resume { .. } => (PaneKind::Claude, "claude"),
         // The kind follows the harness, and there is deliberately no `PaneKind` for an agent
-        // (see `AgentsPanel/openRun.ts` for the six-module argument). A `claude` conversation
-        // re-opened is a Claude pane in every respect — hooks, the awaiting model, `claude.fork`
-        // and friends. An opencode TUI is a program in a terminal, which is what a Shell pane
-        // is: no hooks, the job watch (suppressed for a fullscreen TUI), a plain restart bar.
+        // (see `AgentsPanel/openRun.ts` for the six-module argument). Claude, Codex and OpenCode
+        // continuations share console chrome; their adapters supply the lifecycle events.
         SplitIntent::Continue { conversation } => match conversation.harness {
             cide_ipc::Harness::Claude => (PaneKind::Claude, "claude"),
-            cide_ipc::Harness::Opencode => (PaneKind::Shell, "opencode"),
+            cide_ipc::Harness::Opencode => (PaneKind::Claude, "opencode"),
             // A Qwen Code TUI is `claude`'s shape without cide's hooks: a program in a
-            // terminal, so a Shell-kind pane like opencode's. (M43)
+            // terminal, so a Shell-kind pane. (M43)
             cide_ipc::Harness::Qwen => (PaneKind::Shell, "qwen"),
             // A codex conversation re-opened is a codex **console** since M93: the TUI with
             // cide's hooks and task tools, exactly as a claude conversation re-opened is a
@@ -123,6 +121,7 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // frame rather than copying a value that may be a turn out of date.
         conversation: None,
         conversation_since: None,
+        harness_conversation: None,
         // What the pane keeps for later — see `Pane::continues`. A mirror of a run carries
         // the run's conversation so the pane can re-open it once the child ends; a
         // continuation *is* one.
@@ -493,6 +492,9 @@ pub(crate) fn bind_recorded_session(
         session,
         registry.harness_of(session),
     )?;
+    if let Some(conversation) = registry.native_conversation(session) {
+        workspace::note_native_conversation(ws, session, &conversation);
+    }
     if let Some((conversation, since)) = registry.conversation_of(session) {
         workspace::note_conversation(ws, session, conversation, since);
     }
@@ -648,6 +650,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            harness_conversation: None,
             continues: None,
             harness: None,
             title: "cide : claude".into(),
@@ -812,8 +815,8 @@ mod tests {
         );
         assert_eq!(
             pane.kind,
-            PaneKind::Shell,
-            "an opencode TUI is a program in a terminal"
+            PaneKind::Claude,
+            "OpenCode shares the console lifecycle and chrome"
         );
         assert!(
             pane.session.is_none(),

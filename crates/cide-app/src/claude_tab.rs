@@ -91,13 +91,7 @@ pub(crate) struct TabMode {
     pub behind: bool,
 }
 
-/// Which CLI a tab cide opens runs. (M104)
-///
-/// Until M104 this was always Settings → Harness, read inside [`open`]. `cide_session_open` lets
-/// the orchestrator choose per tab, and adds the one CLI that is not a console: opencode, whose
-/// TUI runs as a program in a `Shell`-kind pane — `cmd::pane::pane_for` makes the same call for a
-/// re-opened opencode conversation, and `cide_ipc::ConsoleHarness`' doc is why opencode is not
-/// made a console to get here.
+/// The console harness of an automated tab. Explicit requests override the project default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabHarness {
     Console(cide_ipc::ConsoleHarness),
@@ -198,7 +192,7 @@ pub(crate) fn open(
     // forking one into whatever directory cide happens to be in.
     // Settings → Harness decides which CLI a tab cide opens runs (M93), exactly as it decides a
     // fresh console: these tabs *are* consoles, doing the product owner's job.
-    let (root, name, setting, llm, codex_policy) = state.with(|ws| {
+    let (root, name, setting, codex_policy) = state.with(|ws| {
         let project = cide_core::workspace::project(ws, project)?;
         let root = project
             .roots
@@ -208,30 +202,41 @@ pub(crate) fn open(
         Ok::<_, CoreError>((
             root,
             project.name.clone(),
-            ws.settings.console_harness,
-            ws.settings.llm.clone(),
-            ws.settings.codex.cli.inject.permissions,
+            cide_core::harness_settings::effective(ws, Some(project.id)).console_harness,
+            cide_core::harness_settings::effective(ws, Some(project.id))
+                .codex
+                .cli
+                .inject
+                .permissions,
         ))
     })?;
-    let tab_harness = chosen.unwrap_or(TabHarness::Console(setting));
-    let codex = tab_harness == TabHarness::Console(cide_ipc::ConsoleHarness::Codex);
-    let opencode = tab_harness == TabHarness::Opencode;
-    // The console identity where there is one; opencode borrows claude's only for the argv arm
-    // below that it never reaches.
-    let harness = match tab_harness {
+    let harness = match chosen.unwrap_or(TabHarness::Console(setting)) {
         TabHarness::Console(console) => console,
-        TabHarness::Opencode => cide_ipc::ConsoleHarness::Claude,
+        TabHarness::Opencode => cide_ipc::ConsoleHarness::Opencode,
     };
+    let codex = harness == cide_ipc::ConsoleHarness::Codex;
+    let opencode = harness == cide_ipc::ConsoleHarness::Opencode;
     let model = model.map(str::trim).filter(|m| !m.is_empty());
 
-    let mut args = stance_args(codex, mode.unattended, codex_policy);
+    let mut args = if opencode {
+        if mode.unattended != cide_agents::Unattended::Ask {
+            vec!["--auto".into()]
+        } else {
+            Vec::new()
+        }
+    } else {
+        stance_args(codex, mode.unattended, codex_policy)
+    };
     // Codex has no `--name`, and names a thread by itself.
-    if !codex && let Some(name) = session_name {
+    if !codex
+        && !opencode
+        && let Some(name) = session_name
+    {
         args.push("--name".into());
         args.push(name.into());
     }
-    // Both consoles spell it the same. Opencode's goes through `tab_launch` below.
-    if !opencode && let Some(model) = model {
+    // The console adapters accept the same model flag.
+    if let Some(model) = model {
         args.push("--model".into());
         args.push(model.into());
     }
@@ -285,25 +290,11 @@ pub(crate) fn open(
     // newline would be harmless; flattened anyway, so the two CLIs are told the same thing.)
     let line = crate::agent_rpc::one_line(prompt);
 
-    // Opencode is not a console, so none of the above applies to it: the TUI, the line in
-    // `--prompt`, and cide's server in its configuration document (M104).
-    let (program, args, env) = if opencode {
-        let launch = cide_agents::harness::opencode::OPENCODE_CLI
-            .tab_launch(
-                &line,
-                model,
-                mode.unattended != cide_agents::Unattended::Ask,
-                &llm,
-                crate::agents::cide_hook_binary().as_deref(),
-            )
-            .map_err(CoreError::Io)?;
-        (launch.program, launch.args, launch.env)
-    } else {
-        (harness.program().to_string(), args, Vec::new())
-    };
+    let (program, args, env) = (harness.program().to_string(), args, Vec::new());
 
     let request = crate::cmd::session::SpawnRequest {
         program,
+        harness: Some(harness),
         args,
         cwd: cwd.to_string_lossy().into_owned(),
         geometry: Geometry::default(),
@@ -322,11 +313,11 @@ pub(crate) fn open(
         // system prompt calling it a bystander who could orchestrate left it arguing with itself
         // about whether it was allowed to. Reported as exactly that.
         voice: Some(voice),
-        // Opencode's configuration document; nothing for a console.
+        // Console integration and provider configuration are added by the spawn adapter.
         env,
         // Codex takes its opening line in the argv; claude's is typed below.
-        prompt: codex.then(|| line.clone()),
-        // A console has the task tools by being one; opencode's bridge needs the id handed down.
+        prompt: (codex || opencode).then(|| line.clone()),
+        // Carry the automated tab's identity into OpenCode's MCP server.
         task_tools: opencode,
     };
 
@@ -379,32 +370,23 @@ pub(crate) fn open(
             },
             Pane {
                 id: pane,
-                // A console is a Claude pane; the opencode TUI is a program in a terminal, which
-                // is what `pane_for` makes a re-opened opencode conversation too.
-                kind: if opencode {
-                    PaneKind::Shell
-                } else {
-                    PaneKind::Claude
-                },
+                // Every console adapter shares the console pane's lifecycle and chrome.
+                kind: PaneKind::Claude,
                 // Auxiliary like every pane in a `ClaudeFull` tab: closing the last one closes
                 // the tab. Only the pinned console has a pane that cannot go.
                 role: PaneRole::Auxiliary,
                 session: Some(session),
                 conversation: None,
                 conversation_since: None,
-                // The id is the one `--session-id` was handed, which is what `--resume` takes.
-                //
-                // Not for opencode: its conversation is a `ses_…` the TUI mints and never tells
-                // anybody, so there is no id to continue — and a `continues` naming cide's own
-                // session id would make a restart run `opencode --session <uuid>`, which opens
-                // nothing. Restored, the pane is a shell in the worktree. (M104's stated gap.)
+                harness_conversation: None,
+                // OpenCode's native conversation (and worktree directory) is recorded by the adapter.
                 continues: (in_worktree && !opencode).then(|| cide_ipc::HarnessSession {
                     harness: harness.harness(),
                     id: session.to_string(),
                     cwd: cwd.clone(),
                 }),
                 // Written directly, as `session` is: this road never passes `pane_bind_session`.
-                harness: codex.then_some(cide_ipc::Harness::Codex),
+                harness: Some(harness.harness()),
                 title: format!(
                     "{name} : {}",
                     if opencode {
@@ -573,7 +555,14 @@ pub(crate) async fn resume_closed(
             .first()
             .map(|root| root.path.clone())
             .ok_or(CoreError::NoRoots)?;
-        Ok::<_, CoreError>((root, ws.settings.codex.cli.inject.permissions))
+        Ok::<_, CoreError>((
+            root,
+            cide_core::harness_settings::effective(ws, Some(project))
+                .codex
+                .cli
+                .inject
+                .permissions,
+        ))
     }) else {
         return Vec::new();
     };
@@ -597,32 +586,38 @@ pub(crate) async fn resume_closed(
             continue;
         };
         let codex = cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Codex;
-        let console = if codex {
-            cide_ipc::ConsoleHarness::Codex
-        } else {
-            cide_ipc::ConsoleHarness::Claude
-        };
+        let console = cide_ipc::ConsoleHarness::of(cide_core::workspace::pane_harness(pane))
+            .unwrap_or_default();
         let cwd = pane
             .continues
             .as_ref()
             .map_or(root.clone(), |conversation| conversation.cwd.clone());
         let request = crate::cmd::session::SpawnRequest {
             program: console.program().to_string(),
+            harness: Some(console),
             // A `continues` pane's argv is its harness's `continue_spec`, which replaces these;
             // for every other pane they are the stance the tab was opened under.
-            args: stance_args(codex, unattended, codex_policy),
+            args: if console == cide_ipc::ConsoleHarness::Opencode {
+                Vec::new()
+            } else {
+                stance_args(codex, unattended, codex_policy)
+            },
             cwd: cwd.to_string_lossy().into_owned(),
             geometry: Geometry::default(),
             project: Some(project),
             resume: Some(resume),
             resume_picker: false,
             fork: None,
-            continues: pane.continues.clone().map(|mut continuation| {
-                if continuation.harness == cide_ipc::Harness::Codex {
-                    continuation.id = resume.to_string();
-                }
-                continuation
-            }),
+            continues: pane
+                .harness_conversation
+                .clone()
+                .or_else(|| pane.continues.clone())
+                .map(|mut continuation| {
+                    if continuation.harness == cide_ipc::Harness::Codex {
+                        continuation.id = resume.to_string();
+                    }
+                    continuation
+                }),
             pane: None,
             // Told explicitly: `spawn_session` infers a worker from the tree, and the tab is not
             // back in the tree yet — session first, tab second.
@@ -648,6 +643,7 @@ pub(crate) async fn resume_closed(
                 // record's, so it is written before the reinsert makes it anybody's.
                 if let Some(held) = record.tree.panes.get_mut(&pane.id) {
                     held.session = Some(id);
+                    held.harness_conversation = registry.native_conversation(id);
                     if let Some((conversation, since)) = registry.conversation_of(id) {
                         held.conversation = Some(conversation);
                         held.conversation_since = Some(since);

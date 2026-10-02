@@ -11,6 +11,7 @@ import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
 import type { OpenRunIn } from "./OpenRunIn";
+import type { OpencodeSettings } from "./OpencodeSettings";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
 import type { SidebarSettings } from "./SidebarSettings";
@@ -63,7 +64,7 @@ openRunIn?: OpenRunIn, taskProposalRunMode?: TaskProposalRunMode,
 /**
  * How `codex` is launched. (M93)
  */
-codex?: CodexSettings, 
+codex?: CodexSettings, opencode?: OpencodeSettings, 
 /**
  * Proxy configuration. Sent whole like every other group, which for this one also means
  * the URLs — credentials included — cross the IPC boundary on every keystroke-debounced

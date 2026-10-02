@@ -83,6 +83,8 @@ fn a_real_turn_ends_in_a_result_event_and_the_child_stays_interactive() {
         geometry: Geometry::default(),
         claude: cide_ipc::ClaudeSettings::default(),
         codex: cide_ipc::CodexSettings::default(),
+        opencode_cli: cide_ipc::OpencodeCli::default(),
+        opencode_flags: None,
         llm: cide_ipc::LlmSettings::default(),
         choice: None,
         harness: agent.def.harness,

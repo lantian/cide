@@ -92,7 +92,7 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
     ),
     doc(
         "consoleHarness",
-        "enum claude | codex",
+        "enum claude | codex | opencode",
         "Which CLI a new project console runs.",
     ),
     doc(
@@ -294,6 +294,43 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "claude.cli.inject.mcpConfig.flag",
         "string",
         "Spelling to use instead of --mcp-config; empty is the default.",
+    ),
+    // --- opencode ---
+    doc("opencode.cli.binary", "string", "The OpenCode executable."),
+    doc(
+        "opencode.cli.args",
+        "list of strings",
+        "Extra arguments every OpenCode child gets.",
+    ),
+    doc(
+        "opencode.cli.env",
+        "list of {name, value}",
+        "Extra environment for OpenCode children; values are never shown back.",
+    ),
+    doc(
+        "opencode.cli.inject.events",
+        "bool",
+        "Track native OpenCode state and conversation changes.",
+    ),
+    doc(
+        "opencode.cli.inject.mcpConfig",
+        "bool",
+        "Give OpenCode cide’s MCP tools.",
+    ),
+    doc(
+        "opencode.cli.inject.instructions",
+        "bool",
+        "Attach the console instructions.",
+    ),
+    doc(
+        "opencode.cli.inject.resume",
+        "bool",
+        "Resume saved OpenCode conversations.",
+    ),
+    doc(
+        "opencode.cli.inject.fork",
+        "bool",
+        "Fork OpenCode conversations when splitting.",
     ),
     // --- codex ---------------------------------------------------------------------------
     doc(

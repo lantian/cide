@@ -14,9 +14,10 @@ import { useEffect, useState } from 'react'
 import { Field } from '@/kit/components/Field'
 import { Select } from '@/kit/components/Select'
 import { Segmented } from '@/kit/components/Choice'
-import { specSessions } from '@/ipc/client'
+import { settings, specSessions } from '@/ipc/client'
 import type { GitLabReviewHarness, Harness, SpecLauncher } from '@/ipc/generated'
 import { useAgents } from '../agentsStore'
+import { notifyFailure } from '@/chrome/notices'
 import { HARNESS_NAME } from './model'
 
 export type LauncherMode = 'main' | 'role'
@@ -31,18 +32,19 @@ export const DEFAULT_CHOICE: LauncherChoice = { mode: 'main', harness: 'default'
 
 /** The console harness Settings names — `Default` resolves to this. */
 function useConsoleHarness(): Harness | null {
+  const project = useAgents((s) => s.project)
   const [harness, setHarness] = useState<Harness | null>(null)
   useEffect(() => {
     let alive = true
-    // Dynamically, like every other read of the workspace store from a dialog.
-    void import('@/store/workspace').then(({ useWorkspace }) => {
-      const setting = useWorkspace.getState().boot?.workspace.settings.consoleHarness
-      if (alive) setHarness(setting === 'codex' ? 'codex' : 'claude')
-    })
+    setHarness(null)
+    if (project === null) return
+    void settings.effective(project).then((settings) => {
+      if (alive) setHarness(settings.consoleHarness)
+    }).catch(notifyFailure)
     return () => {
       alive = false
     }
-  }, [])
+  }, [project])
   return harness
 }
 

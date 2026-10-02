@@ -135,7 +135,7 @@ export function ResumeSplash({
 
   const when = lastActive === null ? null : relativeTime(lastActive)
   const label = missingConversation
-    ? 'Choose a Codex session'
+    ? (harness === 'opencode' ? 'Start a new OpenCode session' : 'Choose a Codex session')
     : when === null ? `Resume "${title}"` : `Resume "${title}" · ${when}`
 
   const controlStyle: CSSProperties = {
@@ -188,7 +188,7 @@ export function ResumeSplash({
       </button>
       {missingConversation && (
         <>
-          <div>Select the conversation to restore.</div>
+          <div>{harness === 'opencode' ? 'The saved OpenCode conversation is unavailable.' : 'Select the conversation to restore.'}</div>
           <Button onClick={onFresh}>Start a new session</Button>
         </>
       )}

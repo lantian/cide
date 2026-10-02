@@ -7229,6 +7229,7 @@ struct Facts {
     claude: ClaudeSettings,
     /// Settings → Harness → Codex, for a role whose harness is codex. (M93)
     codex: cide_ipc::CodexSettings,
+    opencode_cli: cide_ipc::OpencodeCli,
     /// The providers and pools this fork's child is configured with. (M45)
     ///
     /// Read here with everything else, on the thread that already holds the lock, because a
@@ -7280,7 +7281,8 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
     let state = app
         .try_state::<crate::workspace_state::WorkspaceState>()
         .ok_or_else(|| CoreError::Io("the workspace is not available".into()))?;
-    let (root, theme, proxy, claude, codex, llm) = state.with(|ws| {
+    let (root, theme, proxy, claude, codex, opencode_cli, llm) = state.with(|ws| {
+        let settings = cide_core::harness_settings::effective(ws, Some(project));
         let root = cide_core::workspace::project(ws, project)?
             .roots
             .first()
@@ -7290,8 +7292,9 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
             root,
             ws.settings.theme,
             ws.settings.proxy.clone(),
-            ws.settings.claude.clone(),
-            ws.settings.codex.clone(),
+            settings.claude.clone(),
+            settings.codex.clone(),
+            settings.opencode.cli.clone(),
             ws.settings.llm.clone(),
         ))
     })?;
@@ -7308,6 +7311,7 @@ fn facts(app: &AppHandle, project: ProjectId) -> Result<Facts> {
         proxy,
         claude,
         codex,
+        opencode_cli,
         // Read after the workspace lock is released — it is a file, and `facts` holds that lock
         // for as short a time as it can.
         overrides: cide_core::persist::load_agent_overrides(
@@ -7341,8 +7345,12 @@ impl Facts {
             Harness::Mimo => &self.mimo,
             _ => &self.opencode,
         };
-        cell.get_or_init(
-            || match cide_agents::harness::opencode::user_config(flavor, &self.root) {
+        cell.get_or_init(|| {
+            match cide_agents::harness::opencode::user_config_with_cli(
+                flavor,
+                &self.root,
+                (harness == Harness::Opencode).then_some(&self.opencode_cli),
+            ) {
                 Ok(config) => Some(config),
                 Err(error) => {
                     tracing::warn!(
@@ -7354,8 +7362,8 @@ impl Facts {
                     );
                     None
                 }
-            },
-        )
+            }
+        })
         .as_ref()
     }
 
@@ -7687,7 +7695,9 @@ impl AgentRegistry {
         // service among them — and a run whose turns went into somebody else's conversation is the
         // one failure here that would look like success. See `server_owned`. (M110)
         if matches!(
-            flavor.cli_flags().generation,
+            plan.opencode_flags
+                .unwrap_or_else(|| flavor.cli_flags())
+                .generation,
             cide_agents::harness::opencode::Generation::V2
         ) && !server_owned(port, &user, &password)
         {
@@ -9030,6 +9040,8 @@ fn start_child(
         geometry: Geometry::default(),
         claude: facts.claude.clone(),
         codex: facts.codex.clone(),
+        opencode_cli: facts.opencode_cli.clone(),
+        opencode_flags: None,
         // From the same `facts` read as everything else above, so the providers a child is
         // configured with are the ones that stood at this fork. See `Facts::llm`.
         llm: facts.llm.clone(),
@@ -9171,7 +9183,12 @@ fn start_child(
         // Asked of the installed binary before the first spec is built (M108): which of cide's
         // flags it has. Forks once per binary version, here on the blocking pool, so the spec
         // below reads the answer without forking. See `CliFlags`.
-        let flags = flavor.probe_cli_flags();
+        let flags = if resolved.harness == Harness::Opencode {
+            flavor.probe_with_cli(&plan.opencode_cli)
+        } else {
+            flavor.probe_cli_flags()
+        };
+        plan.opencode_flags = Some(flags);
         // `can_attach`, not `run_password`: the question is whether a turn of this CLI can be a
         // client of a **guarded** server, and opencode 2 answers yes by a different route — the
         // password in the environment beside `run --server <url>` — having removed the flag.

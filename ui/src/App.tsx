@@ -1589,7 +1589,7 @@ export function App() {
           pane={detachedPane}
           // A pane opened onto an agent run's conversation spawns in that run's directory —
           // its worktree — which is where the harness filed the transcript (M42).
-          cwd={detachedPane.continues?.cwd ?? owner.roots[0]?.path ?? '.'}
+          cwd={detachedPane.harnessConversation?.cwd ?? detachedPane.continues?.cwd ?? owner.roots[0]?.path ?? '.'}
           project={project}
           roots={owner.roots.map((r) => r.path)}
           // The plan entry for this pane. `lifecycle::plan_restore` has always walked
@@ -2944,7 +2944,7 @@ const TabPane = memo(function TabPane({
         pane={pane}
         // The run's worktree for a pane opened onto a run's conversation
         // (M42); the project root for every other pane.
-        cwd={pane.continues?.cwd ?? projectRoot ?? '.'}
+        cwd={pane.harnessConversation?.cwd ?? pane.continues?.cwd ?? projectRoot ?? '.'}
         project={project}
         primarySession={primarySession}
         diff={tabKind.kind === 'diff' ? tabKind.spec : undefined}

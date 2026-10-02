@@ -135,10 +135,8 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
               <code>--add-dir</code> from swallowing cide’s own session id.
             </InfoPara>
             <InfoPara>
-              They reach <strong>panes only</strong>. The one-shots behind Generate commit
-              message and Explain selection keep cide’s own argv — <code>-p --output-format
-              json</code> and the rest — because a <code>--model</code> or <code>--tools</code>{' '}
-              folded into that vector breaks the parse of a reply that never arrives.
+              They also reach one-shots. cide preserves the flags that select models and launch wrappers,
+              and filters flags that conflict with the one-shot output format or tool policy.
             </InfoPara>
           </>
         }

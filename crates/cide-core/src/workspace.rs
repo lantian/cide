@@ -128,6 +128,7 @@ pub fn open_project(
             session: Some(primary_session),
             conversation: None,
             conversation_since: None,
+            harness_conversation: None,
             continues: None,
             harness: None,
             title: format!("{name} : claude"),
@@ -1856,6 +1857,9 @@ fn prepare_session_binding(
     harness: Option<cide_ipc::Harness>,
 ) {
     let next = harness.unwrap_or_else(|| pane_harness(pane));
+    if pane.session != Some(session) {
+        pane.harness_conversation = None;
+    }
     if pane.session != Some(session) && next == cide_ipc::Harness::Codex {
         pane.conversation = None;
         pane.conversation_since = None;
@@ -1888,6 +1892,7 @@ fn stamp_harness(pane: &mut Pane, harness: Option<cide_ipc::Harness>) {
     };
     let was = pane_harness(pane);
     if was != harness {
+        pane.harness_conversation = None;
         pane.conversation = None;
         pane.conversation_since = None;
     }
@@ -1898,6 +1903,7 @@ fn stamp_harness(pane: &mut Pane, harness: Option<cide_ipc::Harness>) {
     // `cide : codex`. A title the user renamed says something else and is left alone.
     let word = |h: cide_ipc::Harness| match h {
         cide_ipc::Harness::Codex => "codex",
+        cide_ipc::Harness::Opencode => "opencode",
         _ => "claude",
     };
     let (from, to) = (format!(" : {}", word(was)), format!(" : {}", word(harness)));
@@ -1936,6 +1942,42 @@ pub fn pane_codex_thread(pane: &Pane) -> Option<SessionId> {
 /// What a resume or a fork asks before it spawns: the conversation belongs to one CLI, and the
 /// pane that holds it is where that fact is recorded. `None` when no pane holds the id — a
 /// caller then keeps whatever program it was asked for.
+pub fn native_conversation_holding(
+    ws: &Workspace,
+    id: SessionId,
+) -> Option<cide_ipc::HarnessSession> {
+    ws.projects
+        .values()
+        .flat_map(|project| {
+            project
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tree.panes.values())
+                .chain(project.detached.values())
+        })
+        .find(|pane| pane.session == Some(id))
+        .and_then(|pane| pane.harness_conversation.clone())
+}
+
+pub fn note_native_conversation(
+    ws: &mut Workspace,
+    id: SessionId,
+    conversation: &cide_ipc::HarnessSession,
+) {
+    for project in ws.projects.values_mut() {
+        for pane in project
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.tree.panes.values_mut())
+            .chain(project.detached.values_mut())
+        {
+            if pane.session == Some(id) {
+                pane.harness_conversation = Some(conversation.clone());
+            }
+        }
+    }
+}
+
 pub fn harness_holding(ws: &Workspace, id: SessionId) -> Option<cide_ipc::Harness> {
     let text = id.to_string();
     ws.projects
@@ -2733,6 +2775,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         session: attached.then(SessionId::new),
         conversation: None,
         conversation_since: None,
+        harness_conversation: None,
         continues: None,
         harness: None,
         title: title.to_string(),

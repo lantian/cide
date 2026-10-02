@@ -55,6 +55,120 @@ pub fn settings_defaults() -> Settings {
     Settings::default()
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_harness_get(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<cide_ipc::ProjectHarnessSettings, CoreError> {
+    state.with(|ws| cide_core::harness_settings::overrides(ws, project))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_harness_effective(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Settings, CoreError> {
+    state.with(|ws| {
+        workspace::project(ws, project)?;
+        Ok(cide_core::harness_settings::effective(ws, Some(project)))
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn opencode_cli_support(app: AppHandle, project: Option<ProjectId>) -> CodexCliSupport {
+    let state = app.state::<WorkspaceState>();
+    let cli = state.with(|ws| {
+        cide_core::harness_settings::effective(ws, project)
+            .opencode
+            .cli
+    });
+    let binary = cli.binary.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = cide_core::opencode_cli::plan(&cli);
+        let resolved = cide_core::opencode_cli::resolve(&binary);
+        let version = resolved
+            .as_ref()
+            .ok()
+            .and_then(|path| cide_claude::version::probe(path));
+        let note = |(index, reason): (usize, String)| CodexCliNote {
+            index,
+            refused: true,
+            reason: Some(reason),
+        };
+        let mut argv = vec![ArgvPart {
+            text: binary.clone(),
+            ours: false,
+        }];
+        argv.extend(
+            plan.args
+                .iter()
+                .cloned()
+                .map(|text| ArgvPart { text, ours: false }),
+        );
+        let flags = cide_agents::harness::opencode::OPENCODE_CLI.probe_with_cli(&cli);
+        let args = match flags.generation {
+            cide_agents::harness::opencode::Generation::V1 => {
+                vec!["attach", "<private server>", "--session", "<conversation>"]
+            }
+            cide_agents::harness::opencode::Generation::V2 => vec![
+                "--server",
+                "<private server>",
+                "--session",
+                "<conversation>",
+            ],
+        };
+        argv.extend(args.into_iter().map(|text| ArgvPart {
+            text: text.into(),
+            ours: true,
+        }));
+        CodexCliSupport {
+            binary,
+            resolved: resolved
+                .as_ref()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            problem: resolved.err(),
+            version,
+            arg_notes: plan.arg_notes.into_iter().map(note).collect(),
+            env_notes: plan.env_notes.into_iter().map(note).collect(),
+            argv,
+        }
+    })
+    .await
+    .unwrap_or_else(|error| CodexCliSupport {
+        binary: String::new(),
+        resolved: None,
+        problem: Some(error.to_string()),
+        version: None,
+        arg_notes: vec![],
+        env_notes: vec![],
+        argv: vec![],
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_harness_set(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    edit: cide_ipc::ProjectHarnessEdit,
+) -> Result<cide_ipc::ProjectHarnessSettings, CoreError> {
+    state.update(|ws| {
+        let key = cide_core::harness_settings::project_key(ws, project)?;
+        let path = persist::config_dir().join("harness-settings.json");
+        // Refuse to replace a file we cannot read, and preserve other projects' edits.
+        let mut projects = cide_core::harness_settings::load(&path)?;
+        let overrides = projects.entry(key.clone()).or_default();
+        overrides.apply(edit);
+        let result = overrides.clone();
+        if result == Default::default() {
+            projects.remove(&key);
+        }
+        cide_core::harness_settings::save(&path, &projects)?;
+        ws.project_harness = projects;
+        Ok(result)
+    })
+}
+
 /// Apply a patch and return the settings as they now stand.
 ///
 /// Returns the whole struct rather than a revision: the caller is a form, and a form that
@@ -282,6 +396,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         open_run_in,
         task_proposal_run_mode,
         codex,
+        opencode,
         proxy,
         sidebar,
         explorer,
@@ -353,6 +468,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     }
     // Stored and nothing more: the setting is read when a console spawns fresh, so no open
     // pane is touched by a switch. See `Settings::console_harness`.
+    if let Some(v) = opencode {
+        settings.opencode = v;
+    }
     if let Some(v) = console_harness {
         settings.console_harness = v;
     }
@@ -499,6 +617,7 @@ fn open_settings_tab(
             session: None,
             conversation: None,
             conversation_since: None,
+            harness_conversation: None,
             continues: None,
             harness: None,
             title: "settings".into(),
@@ -874,7 +993,12 @@ pub async fn claude_headless(
     request: HeadlessRequest,
 ) -> Result<HeadlessResult, HeadlessError> {
     let cwd = project_root(&state, project)?;
-    run_console_headless(state.with(|ws| ws.settings.clone()), cwd, request).await
+    run_console_headless(
+        state.with(|ws| cide_core::harness_settings::effective(ws, Some(project))),
+        cwd,
+        request,
+    )
+    .await
 }
 
 /// All console one-shots follow the configured harness, including commit generation.
@@ -888,6 +1012,13 @@ async fn run_console_headless(
     let proxy =
         cide_core::proxy::ProxyEnv::for_target(&settings.proxy, settings.proxy.scope.claude);
     match settings.console_harness {
+        cide_ipc::ConsoleHarness::Opencode => tauri::async_runtime::spawn_blocking(move || {
+            crate::opencode_console::headless(settings, cwd, request)
+        })
+        .await
+        .map_err(|error| HeadlessError::NotInstalled {
+            detail: error.to_string(),
+        })?,
         cide_ipc::ConsoleHarness::Codex => {
             run_headless_codex(cwd, request, proxy, settings.codex.cli).await
         }
@@ -901,6 +1032,53 @@ async fn run_console_headless(
 ///
 /// The proxy is `ProxyScope::claude`'s, which the Settings screen labels as the console's scope
 /// — a one-shot is a console's CLI asked one thing, whichever CLI that is.
+fn headless_args(args: Vec<String>) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut tokens = args.into_iter();
+    while let Some(arg) = tokens.next() {
+        let key = arg.split('=').next().unwrap_or(&arg);
+        if matches!(
+            key,
+            "-p" | "--print"
+                | "--output-format"
+                | "--input-format"
+                | "--json"
+                | "--json-schema"
+                | "--output-schema"
+                | "--tools"
+                | "--allowedTools"
+                | "--allowed-tools"
+                | "--disallowedTools"
+                | "--disallowed-tools"
+                | "--no-session-persistence"
+                | "--ephemeral"
+                | "--max-budget-usd"
+                | "--"
+        ) {
+            if !arg.contains('=')
+                && matches!(
+                    key,
+                    "--output-format"
+                        | "--input-format"
+                        | "--json-schema"
+                        | "--output-schema"
+                        | "--tools"
+                        | "--allowedTools"
+                        | "--allowed-tools"
+                        | "--disallowedTools"
+                        | "--disallowed-tools"
+                        | "--max-budget-usd"
+                )
+            {
+                let _ = tokens.next();
+            }
+        } else {
+            output.push(arg);
+        }
+    }
+    output
+}
+
 async fn run_headless_codex(
     cwd: PathBuf,
     request: HeadlessRequest,
@@ -911,7 +1089,8 @@ async fn run_headless_codex(
     let program = PathBuf::from(cli.binary.trim());
     let run = cide_claude::Headless::new(request, cwd)
         .proxy(proxy)
-        .env(plan.env);
+        .env(plan.env)
+        .args(headless_args(plan.args));
     tauri::async_runtime::spawn_blocking(move || cide_claude::headless::run_codex(&program, &run))
         .await
         .map_err(|e| HeadlessError::NotInstalled {
@@ -1000,7 +1179,8 @@ async fn run_headless(
     let program = PathBuf::from(cli.binary);
     let run = cide_claude::Headless::new(request, cwd)
         .proxy(proxy)
-        .env(plan.env);
+        .env(plan.env)
+        .args(headless_args(plan.args));
     tauri::async_runtime::spawn_blocking(move || cide_claude::headless::run(&program, &run))
         .await
         .map_err(|e| HeadlessError::NotInstalled {
@@ -1090,7 +1270,13 @@ pub async fn claude_commit_message(
             .map_err(|e| ClaudeTaskError::Git {
                 message: format!("could not read commit changes: {e}"),
             })??;
-    Ok(run_console_headless(state.with(|ws| ws.settings.clone()), root, request).await?)
+    let settings = state.with(|ws| cide_core::harness_settings::effective(ws, Some(project)));
+    // The built-in Claude cap is unavailable on OpenCode; explicit caller caps still fail.
+    let mut request = request;
+    if settings.console_harness == cide_ipc::ConsoleHarness::Opencode {
+        request.max_budget_usd = None;
+    }
+    Ok(run_console_headless(settings, root, request).await?)
 }
 
 fn commit_message_request(
@@ -1309,10 +1495,16 @@ pub struct CodexCliSupport {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn codex_cli_support(app: AppHandle) -> CodexCliSupport {
+pub async fn codex_cli_support(app: AppHandle, project: Option<ProjectId>) -> CodexCliSupport {
     let cli = app
         .try_state::<WorkspaceState>()
-        .map(|state| state.with(|ws| ws.settings.codex.cli.clone()))
+        .map(|state| {
+            state.with(|ws| {
+                cide_core::harness_settings::effective(ws, project)
+                    .codex
+                    .cli
+            })
+        })
         .unwrap_or_default();
     let fallback = cli.clone();
     tauri::async_runtime::spawn_blocking(move || codex_support(&cli, true))
@@ -1415,7 +1607,7 @@ fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
 /// the frontend would have to handle and never see. `session_spawn` reaches the workspace the
 /// same way and for the same reason.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn claude_cli_support(app: AppHandle) -> ClaudeCliSupport {
+pub async fn claude_cli_support(app: AppHandle, project: Option<ProjectId>) -> ClaudeCliSupport {
     // Read on this thread and cloned out: the workspace lock is `parking_lot` and must not be
     // held across an await, let alone across a `fork`.
     // The whole launch configuration, not only the binary: since the injection switches exist,
@@ -1424,7 +1616,13 @@ pub async fn claude_cli_support(app: AppHandle) -> ClaudeCliSupport {
     // entitled to write.
     let cli = app
         .try_state::<WorkspaceState>()
-        .map(|state| claude_cli(&state))
+        .map(|state| {
+            state.with(|ws| {
+                cide_core::harness_settings::effective(ws, project)
+                    .claude
+                    .cli
+            })
+        })
         .unwrap_or_default();
     // A join failure means the pool is going away, which is a shutting-down application. The
     // no-CLI answer is the honest one to draw with and this screen must still render.
@@ -2402,13 +2600,19 @@ mod tests {
         for harness in [
             cide_ipc::ConsoleHarness::Claude,
             cide_ipc::ConsoleHarness::Codex,
+            cide_ipc::ConsoleHarness::Opencode,
         ] {
             let repo = TempRepo::new(match harness {
                 cide_ipc::ConsoleHarness::Claude => "message-fake-claude",
                 cide_ipc::ConsoleHarness::Codex => "message-fake-codex",
+                cide_ipc::ConsoleHarness::Opencode => "message-fake-opencode",
             });
             let binary = repo.root.join("fake-console");
             let (env_key, frames) = match harness {
+                cide_ipc::ConsoleHarness::Opencode => (
+                    "OPENAI_BASE_URL",
+                    r#"{"type":"text","sessionID":"ses_fake","part":{"text":"Fake OpenCode draft"}}"#,
+                ),
                 cide_ipc::ConsoleHarness::Claude => (
                     "ANTHROPIC_BASE_URL",
                     r#"{"type":"result","result":"Fake Claude draft","is_error":false,"subtype":"success"}"#,
@@ -2422,6 +2626,7 @@ mod tests {
                 &binary,
                 format!(
                     "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.226'; exit 0; fi\n\
+                 for token in \"$@\"; do if [ \"$token\" = --help ]; then echo '--format --standalone --server'; exit 0; fi; done\n\
                  cat > received-prompt.txt\n\
                  printf '%s\\n' \"$@\" > received-args.txt\n\
                  printf '%s' \"${env_key}\" > received-env.txt\n\
@@ -2441,6 +2646,10 @@ mod tests {
                 value: "https://example.invalid".into(),
             }];
             match harness {
+                cide_ipc::ConsoleHarness::Opencode => {
+                    settings.opencode.cli.binary = binary.to_string_lossy().into_owned();
+                    settings.opencode.cli.env = env;
+                }
                 cide_ipc::ConsoleHarness::Claude => {
                     settings.claude.cli.binary = binary.to_string_lossy().into_owned();
                     settings.claude.cli.env = env;
@@ -2450,7 +2659,10 @@ mod tests {
                     settings.codex.cli.env = env;
                 }
             }
-            let request = cide_claude::prompt::commit_message("+selected change\n", None);
+            let mut request = cide_claude::prompt::commit_message("+selected change\n", None);
+            if harness == cide_ipc::ConsoleHarness::Opencode {
+                request.max_budget_usd = None;
+            }
             let prompt = request.prompt.clone();
             let result = tauri::async_runtime::block_on(run_console_headless(
                 settings,
@@ -2473,6 +2685,9 @@ mod tests {
             match harness {
                 cide_ipc::ConsoleHarness::Claude => assert!(args.contains("--tools\n\n")),
                 cide_ipc::ConsoleHarness::Codex => assert!(args.contains("read-only")),
+                cide_ipc::ConsoleHarness::Opencode => {
+                    assert!(args.contains("--standalone") && args.contains("cide-one-shot"))
+                }
             }
         }
     }

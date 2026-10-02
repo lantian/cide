@@ -1303,6 +1303,16 @@ pub trait AgentSink: Send + Sync {
         Err("settings are not available here".into())
     }
 
+    fn project_harness(&self) -> Result<cide_ipc::ProjectHarnessSettings, String> {
+        Err("project harness settings are not available here".into())
+    }
+    fn set_project_harness(
+        &self,
+        _edit: cide_ipc::ProjectHarnessEdit,
+    ) -> Result<cide_ipc::ProjectHarnessSettings, String> {
+        Err("project harness settings are not available here".into())
+    }
+
     /// Apply one patch through `settings_set` and answer the settings as they now stand.
     fn set_settings(
         &self,

@@ -41,6 +41,7 @@ pub mod ext_assets;
 /// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
 pub mod ext_state;
 mod image_snapshots;
+mod opencode_console;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
 /// [`spinner`] reads to decide a project has gone quiet. (M94)
 ///
@@ -625,6 +626,10 @@ pub fn run() {
             cmd::session::session_resumable,
             cmd::settings::settings_get,
             cmd::settings::settings_defaults,
+            cmd::settings::project_harness_get,
+            cmd::settings::project_harness_set,
+            cmd::settings::project_harness_effective,
+            cmd::settings::opencode_cli_support,
             cmd::settings::settings_set,
             cmd::settings::tab_open_settings,
             cmd::settings::keymap_report,
