@@ -40,6 +40,7 @@ pub mod ext_assets;
 /// One store and not one per project — an extension is a tool the user chose, not a fact about a
 /// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
 pub mod ext_state;
+mod image_snapshots;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
 /// [`spinner`] reads to decide a project has gone quiet. (M94)
 ///
@@ -302,6 +303,7 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default()
+        .manage(image_snapshots::ImageSnapshots::default())
         // `cide-ext://localhost/<marketplace>/<extension>/<path>`. Registered here rather than
         // in `setup`
         // because a scheme handler has to exist before the first webview is created — a window
@@ -1235,6 +1237,7 @@ pub fn run() {
                 }
                 tauri::RunEvent::Exit => {
                     lifecycle::shutdown(app);
+                    app.state::<image_snapshots::ImageSnapshots>().clear();
                 }
                 _ => {}
             }

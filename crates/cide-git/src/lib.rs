@@ -59,6 +59,7 @@ pub mod changelist;
 pub mod commit;
 pub mod conflict;
 pub mod diff;
+pub mod image_diff;
 pub mod lanes;
 pub mod log;
 pub mod merge;

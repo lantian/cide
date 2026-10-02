@@ -352,6 +352,10 @@ pub struct DiffHunkView {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct FileDiff {
+    /// Omitted for text and non-image binary diffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub images: Option<crate::image::ImageDiff>,
     pub path: String,
     pub old_path: Option<String>,
     pub side: DiffSide,

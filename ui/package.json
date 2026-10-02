@@ -47,6 +47,7 @@
     "check:handshake": "node scripts/check-handshake.mjs",
     "check:icons": "node scripts/check-icons.mjs",
     "check:image": "node scripts/check-image.mjs",
+    "check:image-diff": "node scripts/check-image-diff.mjs",
     "check:input": "node scripts/check-input-emitters.mjs",
     "check:json-log": "node scripts/check-json-log.mjs",
     "check:kit": "node scripts/check-kit.mjs",

@@ -132,6 +132,8 @@ import {
 } from './changeNav'
 import { diffTabOnScreen, revisionTabOnScreen, sameSide } from './diffTabs'
 import { Icon } from '@/icons/Icon'
+import { GitImageDiffView, imageSideLabels } from './GitImageDiffView'
+import type { ImageDiff } from '@/ipc/generated'
 
 import styles from './GitDiffPane.module.css'
 
@@ -288,6 +290,7 @@ const SIDES: ReadonlyArray<{ side: DiffSide; label: string; title: string }> = [
  * revision diff, which is exactly what `RevisionDiff`'s own doc comment refuses.
  */
 export interface DrawnDiff {
+  readonly images?: ImageDiff | undefined
   readonly path: string
   readonly oldPath: string | null
   readonly status: FileState
@@ -514,6 +517,9 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    * places; one `staging === null` is also what makes the withheld controls legible as a set.
    */
   const staging = props.readOnly === true ? null : props
+  const images = diff?.images ?? null
+  const hasImages = images !== null
+  const previousPath = images?.oldPath ?? diff?.oldPath
   /** The pair to draw in the header, or `null` when this is a working-tree diff. */
   const revisions = props.readOnly === true ? props.revisions : null
   const marks: Marks = staging?.marks ?? NO_MARKS
@@ -630,6 +636,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    * model below is a hook and hooks cannot sit past a conditional return.
    */
   const selectable =
+    images === null &&
     staging !== null &&
     staging.diff !== null &&
     staging.diff.partialOk &&
@@ -643,13 +650,13 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    */
   const whole = useMemo(
     () =>
-      diff === null || diff.hunks.length === 0
+      diff === null || diff.images !== undefined || diff.hunks.length === 0
         ? null
         : wholeFileSegments(diff.hunks, diff.newText),
     [diff],
   )
   const totalLines = useMemo(
-    () => (diff?.newText == null ? 0 : splitLines(diff.newText).length),
+    () => (diff?.newText == null || diff.images !== undefined ? 0 : splitLines(diff.newText).length),
     [diff],
   )
   const segments: DisplaySegment[] | null = useMemo(
@@ -681,7 +688,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    * construction rather than by a filter somebody has to remember to apply.
    */
   const model = useMemo(() => {
-    if (diff === null || diff.hunks.length === 0) return null
+    if (diff === null || diff.images !== undefined || diff.hunks.length === 0) return null
     return segments === null
       ? columnRows(hunkSegments(diff.hunks), { bars: true, collapsed })
       /*
@@ -1045,26 +1052,27 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
   })
   navImpl.current = {
     step: (delta) => {
+      if (hasImages) return false
       const next = stepIndex(anchors.length, currentChange, delta)
       if (next === null || onCurrentChange === undefined) return false
       onCurrentChange(next)
       return true
     },
-    cursor: () => ({ index: currentChange, count: anchors.length }),
+    cursor: () => hasImages ? NO_CURSOR : ({ index: currentChange, count: anchors.length }),
   }
   const navRef = useRef<ChangeNavSlot | null>(null)
   useEffect(() => {
+    if (hasImages) return
     const slot = claimChangeNav(navStable.current, visibleRef.current)
     navRef.current = slot
     return () => {
       slot.release()
       navRef.current = null
     }
-    // Once per mount. `visible` moves the claim through the effect below rather than by
-    // retaking it, so that a tab switch does not drop and re-add a slot the dispatcher may be
-    // reading between the two.
+    // Keep the claim for text diffs; image previews have no line changes to navigate.
+    // `visible` moves the claim through the effect below rather than retaking it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [hasImages])
   useEffect(() => {
     if (visible) navRef.current?.focus()
   }, [visible])
@@ -1195,21 +1203,21 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
   const header = (
     <header className={styles.header}>
       <span className={styles.path}>{diff?.path ?? path}</span>
-      {diff?.oldPath != null && (
+      {previousPath != null && (
         <>
           <span className={styles.arrow}>
             <Icon name="arrow-left-right" size={0} />
           </span>
-          <span className={styles.path}>{diff.oldPath}</span>
+          <span className={styles.path}>{previousPath}</span>
         </>
       )}
       {diff !== null && <span className={styles.status}>{diff.status}</span>}
       {/* One right-aligned group, so a long path clips against both switchers rather than
           having the free space split between two `margin-left: auto` siblings. */}
       <div className={styles.controls}>
-        {changeStepper}
-        {layoutSwitcher}
-        {blameSwitcher}
+        {images === null && changeStepper}
+        {images === null && layoutSwitcher}
+        {images === null && blameSwitcher}
         {revisions !== null ? (
           /*
            * The pair, oldest first, in the direction the diff reads: `9f8e7d6 → a1b2c3d`.
@@ -1678,13 +1686,16 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
           {note}
         </p>
       )}
-      {staging !== null && staging.diff !== null && !staging.diff.partialOk && (
+      {staging !== null && images !== null && (
+        <p className={styles.note}>Select this file in Changes to stage or commit the whole image.</p>
+      )}
+      {images === null && staging !== null && staging.diff !== null && !staging.diff.partialOk && (
         <p className={styles.note} data-audit="gitDiffWhole">
           This file can only be staged whole — it is binary, a submodule, a symlink, a deletion
           or a rename. Tick it in the panel instead.
         </p>
       )}
-      {diff.textsOmitted && (
+      {images === null && diff.textsOmitted && (
         <p className={styles.note} data-audit="gitDiffTruncated">
           This file is too large to show whole — showing the changes alone.
         </p>
@@ -1726,6 +1737,10 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
          * how many changes it has.
          */
         <div className={styles.parked} data-audit="gitDiffParked" />
+      ) : images !== null ? (
+        <GitImageDiffView images={images} path={diff.path} labels={revisions !== null
+          ? { old: revisions.from ?? 'Empty tree', new: revisions.to }
+          : imageSideLabels(staging?.side ?? 'combined')} />
       ) : layout === 'split' && split !== null ? (
         /*
          * Side by side: two independently scrolling columns, each drawing only its own
@@ -1861,7 +1876,7 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
         * this kind of document at all. The same argument the file tree makes for a group row
         * returning a one-item menu rather than fifteen greyed ones.
         */}
-      {staging !== null && (
+      {staging !== null && images === null && (
         <footer className={styles.actions}>
           <span className={styles.count} data-audit="gitDiffCount">
             {painted.size} of {totalChanges} line{totalChanges === 1 ? '' : 's'} selected
@@ -1993,8 +2008,8 @@ export function useDiffTokens(diff: DrawnDiff | null): DiffTokens | null {
   const [tokens, setTokens] = useState<DiffTokens | null>(null)
   const path = diff?.path ?? null
   const oldPath = diff?.oldPath ?? null
-  const oldText = diff?.oldText ?? null
-  const newText = diff?.newText ?? null
+  const oldText = diff?.images === undefined ? diff?.oldText ?? null : null
+  const newText = diff?.images === undefined ? diff?.newText ?? null : null
 
   useEffect(() => {
     if (path === null || (oldText === null && newText === null)) return
@@ -2140,7 +2155,7 @@ const GitDiff = memo(function GitDiff({
   const [blameOn, setBlameOn] = useState(false)
   const [blameFile, setBlameFile] = useState<BlameFile | null>(null)
   /** `null` when this side's new text can be blamed at all. See `diffBlame.blameRefusal`. */
-  const blameRefused = blameRefusal(side)
+  const blameRefused = diff?.images !== undefined ? 'Images cannot be annotated.' : blameRefusal(side)
 
   useEffect(() => {
     if (!blameOn || blameRefused !== null) {
@@ -2987,7 +3002,7 @@ export const RevisionDiffPane = memo(function RevisionDiffPane({
   const [blameFile, setBlameFile] = useState<BlameFile | null>(null)
   const workingSide = next.kind === 'workingTree'
   const newest = workingSide ? null : (diff?.newOid ?? null)
-  const blamable = diff !== null && (workingSide || newest !== null)
+  const blamable = diff !== null && diff.images === undefined && (workingSide || newest !== null)
 
   useEffect(() => {
     if (!blameOn || !blamable) {

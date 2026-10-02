@@ -88,6 +88,26 @@ pub fn revision_diff(
     new: &RevSide,
     old: &RevSide,
 ) -> Result<RevisionDiff> {
+    read_diff(root, path, new, old, false).map(|(diff, _)| diff)
+}
+
+/// The app's read includes image bytes from the same resolved trees as the hunks.
+pub fn revision_diff_with_images(
+    root: &Path,
+    path: &str,
+    new: &RevSide,
+    old: &RevSide,
+) -> Result<(RevisionDiff, Option<crate::image_diff::ImageDiffBytes>)> {
+    read_diff(root, path, new, old, true)
+}
+
+fn read_diff(
+    root: &Path,
+    path: &str,
+    new: &RevSide,
+    old: &RevSide,
+    with_images: bool,
+) -> Result<(RevisionDiff, Option<crate::image_diff::ImageDiffBytes>)> {
     let repo = repo_mod::open(root)?;
     let (new_side, old_side) = resolve_sides(&repo, new, old)?;
     let diff = build_diff(&repo, &new_side, &old_side, false)?;
@@ -106,7 +126,8 @@ pub fn revision_diff(
     // The whole file on both sides, for the pane that draws more than the hunks. The same
     // helpers the staging surface uses, so the skip rules and the byte cap cannot drift
     // between the two diff panes.
-    let texts = if diff::text_skip(&raw) {
+    let image_candidate = with_images && crate::image_diff::candidate(&raw);
+    let texts = if image_candidate || diff::text_skip(&raw) {
         diff::DiffTexts::NONE
     } else {
         let old_path = raw.old_path.as_deref().unwrap_or(&raw.path);
@@ -122,26 +143,48 @@ pub fn revision_diff(
         diff::DiffTexts::combine(old_read, new_read)
     };
 
-    Ok(RevisionDiff {
-        path: raw.path.clone(),
-        old_path: raw.old_path.clone(),
-        new: new.clone(),
-        old: old.clone(),
-        new_oid: new_side.oid().map(|oid| oid.to_string()),
-        old_oid: old_side.oid().map(|oid| oid.to_string()),
-        status: diff::state_of(raw.status),
-        binary: raw.binary,
-        old_mode: raw.old_mode,
-        new_mode: raw.new_mode,
-        // `diff::hunk_views` and not a second mapping. The `LineOrigin` translation and the
-        // trailing-newline rule are the two places a copy would drift, and it would drift on the
-        // read-only surface — the one nobody stages from, so the one where a wrong line number
-        // produces no visible failure until somebody trusts it.
-        hunks: diff::hunk_views(&raw),
-        old_text: texts.old_text,
-        new_text: texts.new_text,
-        texts_omitted: texts.omitted,
-    })
+    let images = image_candidate.then(|| {
+        use crate::image_diff::{ImageBytes, ImageDiffBytes, tree_image, workdir_image};
+        let old_path = raw.old_path.as_deref().unwrap_or(&raw.path);
+        let old = match &old_side {
+            Side::Tree { tree, .. } => tree_image(&repo, tree.as_ref(), old_path, raw.old_mode),
+            Side::Workdir => ImageBytes::Absent,
+        };
+        let new = match &new_side {
+            Side::Tree { tree, .. } => tree_image(&repo, tree.as_ref(), &raw.path, raw.new_mode),
+            Side::Workdir => workdir_image(&repo, &raw.path, raw.new_mode),
+        };
+        ImageDiffBytes {
+            old_path: raw.old_path.clone(),
+            old,
+            new,
+        }
+    });
+
+    Ok((
+        RevisionDiff {
+            images: None,
+            path: raw.path.clone(),
+            old_path: raw.old_path.clone(),
+            new: new.clone(),
+            old: old.clone(),
+            new_oid: new_side.oid().map(|oid| oid.to_string()),
+            old_oid: old_side.oid().map(|oid| oid.to_string()),
+            status: diff::state_of(raw.status),
+            binary: raw.binary,
+            old_mode: raw.old_mode,
+            new_mode: raw.new_mode,
+            // `diff::hunk_views` and not a second mapping. The `LineOrigin` translation and the
+            // trailing-newline rule are the two places a copy would drift, and it would drift on the
+            // read-only surface — the one nobody stages from, so the one where a wrong line number
+            // produces no visible failure until somebody trusts it.
+            hunks: diff::hunk_views(&raw),
+            old_text: texts.old_text,
+            new_text: texts.new_text,
+            texts_omitted: texts.omitted,
+        },
+        images,
+    ))
 }
 
 /// The index of the delta for `path`, matching either side of it.

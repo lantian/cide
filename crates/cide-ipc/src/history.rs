@@ -877,6 +877,9 @@ pub enum RevSide {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct RevisionDiff {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub images: Option<crate::image::ImageDiff>,
     pub path: String,
     /// The pre-rename path, when the pair differs by a rename.
     pub old_path: Option<String>,

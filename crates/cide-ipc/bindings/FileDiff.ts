@@ -2,11 +2,16 @@
 import type { DiffHunkView } from "./DiffHunkView";
 import type { DiffSide } from "./DiffSide";
 import type { FileState } from "./FileState";
+import type { ImageDiff } from "./ImageDiff";
 
 /**
  * A per-file diff, and the only thing a [`Selection`] is meaningful against.
  */
-export type FileDiff = { path: string, oldPath: string | null, side: DiffSide, status: FileState, binary: boolean, 
+export type FileDiff = { 
+/**
+ * Omitted for text and non-image binary diffs.
+ */
+images?: ImageDiff, path: string, oldPath: string | null, side: DiffSide, status: FileState, binary: boolean, 
 /**
  * Unix mode bits, e.g. 33188 (0o100644). Zero when the side does not exist.
  */

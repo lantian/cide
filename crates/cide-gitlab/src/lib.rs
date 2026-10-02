@@ -1586,6 +1586,7 @@ fn comparison_from_text(
     };
     drop(patch);
     Ok(RevisionDiff {
+        images: None,
         path: doc.path.clone(),
         old_path: (doc.old_path != doc.path).then(|| doc.old_path.clone()),
         new: RevSide::Commit {

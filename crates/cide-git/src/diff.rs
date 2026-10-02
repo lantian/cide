@@ -459,6 +459,7 @@ pub fn hunk_views(file: &RawFile) -> Vec<DiffHunkView> {
 pub fn view(repo: &Repository, file: &RawFile, side: DiffSide) -> FileDiff {
     let texts = side_texts(repo, file, side);
     FileDiff {
+        images: None,
         path: file.path.clone(),
         old_path: file.old_path.clone(),
         side,

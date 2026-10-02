@@ -104,3 +104,28 @@ pub struct ImageDoc {
     /// is the same behaviour cide had before and not a failure worth reporting.
     pub stamp: Option<FileStamp>,
 }
+
+/// Preview of one Git side. Absence is distinct from an existing file that cannot be shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum ImageDiffSide {
+    Absent,
+    Ready { doc: ImageDoc },
+    Unavailable { reason: String },
+}
+
+/// Immutable previews of the actual Git comparison, served through the asset protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ImageDiff {
+    /// Changes can resolve an image rename without changing the patch used for staging.
+    pub old_path: Option<String>,
+    pub old: ImageDiffSide,
+    pub new: ImageDiffSide,
+}

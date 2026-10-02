@@ -34,7 +34,7 @@ use cide_ipc::git::{
     PushRequest, RepoInfo, ShelfEntry, StashEntry, TreeStatusMap, WorktreeInfo,
 };
 use cide_ipc::{ProjectId, RepoId, ToolTabId};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::cmd::log::LogRegistry;
 use crate::workspace_state::WorkspaceState;
@@ -455,6 +455,7 @@ pub async fn git_commit_line_counts(
 /// *old* side moves under it is not a diff of anything.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn git_diff_revision(
+    app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     repo: RepoId,
@@ -465,7 +466,13 @@ pub async fn git_diff_revision(
     let roots = roots(&state, project)?;
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        cide_git::revision::revision_diff(&root, &path, &new, &old)
+        let (mut view, images) =
+            cide_git::revision::revision_diff_with_images(&root, &path, &new, &old)?;
+        view.images = images.map(|bytes| {
+            app.state::<crate::image_snapshots::ImageSnapshots>()
+                .materialize(&app, bytes)
+        });
+        Ok(view)
     })
     .await
 }
@@ -636,6 +643,7 @@ pub async fn git_branch_info(
 /// a selection made against this diff is refused if the file has moved since.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn git_diff_file(
+    app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     repo: RepoId,
@@ -646,24 +654,12 @@ pub async fn git_diff_file(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         let handle = cide_git::repo::open(&root)?;
-        // Renames are asked for here and not during staging: the panel wants to *show* a rename,
-        // and the staging path refuses one anyway.
-        //
-        // The flag does not currently do anything, and this is the honest record of that rather
-        // than a silent dead call. `file_diff` passes a pathspec, libgit2 applies it while building
-        // the diff, and `find_similar` then has only one side of the rename to look at — so a
-        // renamed file comes back `Added`, with no `oldPath` and with `partialOk: true`. The panel
-        // therefore offers per-line staging of a rename's new side. Nothing is corrupted (staging
-        // re-diffs without renames and writes a valid whole-new-file patch), and the changed-files
-        // list still labels the row `Renamed`, because `status.rs` detects renames by a different
-        // mechanism. Fixing it means widening this diff to the whole repo before the similarity
-        // pass, on a call the UI makes on every file click, which is a cost worth deciding on
-        // deliberately. `cide-git/tests/patch_props.rs::a_rename_is_only_detected_when_both_sides_are_in_the_diff`
-        // pins the mechanism and fails here when it changes.
-        let request = diff::DiffRequest::new(side).renames(true);
-        let file = diff::file_diff(&handle, &path, request)?
-            .ok_or(GitError::NoSuchChange { path: path.clone() })?;
-        Ok(diff::view(&handle, &file, side))
+        let (mut view, images) = cide_git::image_diff::file_diff(&handle, &path, side)?;
+        view.images = images.map(|bytes| {
+            app.state::<crate::image_snapshots::ImageSnapshots>()
+                .materialize(&app, bytes)
+        });
+        Ok(view)
     })
     .await
 }

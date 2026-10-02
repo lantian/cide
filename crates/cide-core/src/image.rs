@@ -14,16 +14,13 @@
 //!
 //! # Detection is by content, never by extension
 //!
-//! There is no extension table here, on purpose, and there is one in
-//! `ui/src/panes/imageKinds.ts`. They answer different questions and putting both on one side
-//! would silently merge them:
+//! Viewer eligibility is separate from byte detection. The frontend's `imageKinds.ts` chooses
+//! ordinary image tabs; `is_image_path` lets Git request previews even for invalid image bytes.
 //!
 //! * *Which viewer does this tab open with?* — the frontend, from the name, **before** any
 //!   IPC, because a pane has to render something on its first frame.
 //! * *What are these bytes?* — here, from the bytes, because that is the only question whose
-//!   honest answer catches a `.png` that is really a zip file. A second extension table in
-//!   Rust would let those two drift and would make the refusal below unreachable for exactly
-//!   the file it exists to catch.
+//!   honest answer catches a `.png` that is really a zip file.
 
 use std::fs::File;
 use std::io::Read;
@@ -79,6 +76,104 @@ const _IMAGE_CAP_FITS_UNDER_THE_EDITORS: () = assert!(
 /// [`document::looks_binary`] sniffs, deliberately — two different answers about "the start of
 /// a file" measured over two different lengths is a difference nobody would think to look for.
 const HEADER_BYTES: usize = 8 * 1024;
+
+/// Keep in step with the existing image viewer's `imageKinds.ts` extension list.
+pub fn is_image_path(path: &str) -> bool {
+    let Some(name) = path.rsplit(['/', '\\']).next() else {
+        return false;
+    };
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg"
+        )
+}
+
+/// Process-owned, immutable Git image snapshots. No files are placed in the repository.
+/// Callers serialize writes and keep this cache alive until the application exits.
+pub struct SnapshotCache {
+    directory: std::path::PathBuf,
+    created: bool,
+}
+
+impl Default for SnapshotCache {
+    fn default() -> Self {
+        Self {
+            directory: std::env::temp_dir()
+                .join(format!("cide-image-diffs-{}", uuid::Uuid::new_v4())),
+            created: false,
+        }
+    }
+}
+
+impl SnapshotCache {
+    pub fn store(&mut self, bytes: &[u8]) -> Result<ImageDoc> {
+        use std::io::Write;
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(CoreError::Io(
+                "This image exceeds the 32 MiB preview limit.".into(),
+            ));
+        }
+        let format = sniff(&bytes[..bytes.len().min(HEADER_BYTES)])
+            .ok_or_else(|| CoreError::Io("These bytes are not a supported image.".into()))?;
+        let extension = match format {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Bmp => "bmp",
+            ImageFormat::Ico => "ico",
+            ImageFormat::Svg => "svg",
+        };
+        if !self.created {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(&self.directory)
+                .map_err(|e| CoreError::Io(e.to_string()))?;
+            self.created = true;
+        }
+        let path = self
+            .directory
+            .join(format!("{}.{extension}", blake3::hash(bytes)));
+        if !path.exists() {
+            let written = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                file.write_all(bytes)
+            })();
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&path);
+                return Err(CoreError::Io(format!(
+                    "The image snapshot could not be written: {e}"
+                )));
+            }
+        }
+        read(&path)
+    }
+
+    pub fn clear(&mut self) {
+        if self.created {
+            let _ = std::fs::remove_dir_all(&self.directory);
+            self.created = false;
+        }
+    }
+}
+
+impl Drop for SnapshotCache {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 
 /// What a file's leading bytes say it is, or `None` for anything else.
 ///
@@ -607,5 +702,56 @@ mod tests {
             !name.contains(':'),
             "a colon is a separator on Windows: {name}"
         );
+    }
+
+    #[test]
+    fn image_diff_snapshots_are_immutable_deduplicated_and_cleaned_up() {
+        let a = encode_png(&[255, 0, 0, 255], 1, 1).unwrap();
+        let b = encode_png(&[0, 255, 0, 255], 1, 1).unwrap();
+        let mut cache = SnapshotCache::default();
+        let first = cache.store(&a).unwrap();
+        assert_eq!(first.path, cache.store(&a).unwrap().path);
+        let second = cache.store(&b).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(fs::read(&first.path).unwrap(), a);
+        assert_eq!(fs::read(&second.path).unwrap(), b);
+        assert_eq!(first.format, ImageFormat::Png);
+        assert_eq!(first.bytes, a.len() as u64);
+        drop(cache);
+        assert!(!first.path.exists());
+        assert!(!second.path.exists());
+    }
+
+    #[test]
+    fn image_diff_snapshots_refuse_invalid_or_oversized_content() {
+        let mut cache = SnapshotCache::default();
+        assert!(cache.store(b"not an image").is_err());
+        assert!(
+            cache
+                .store(&vec![0; MAX_IMAGE_BYTES as usize + 1])
+                .unwrap_err()
+                .to_string()
+                .contains("32 MiB")
+        );
+        assert!(!cache.directory.exists());
+    }
+
+    #[test]
+    fn git_image_names_match_the_viewers_formats() {
+        for ext in [
+            "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "PNG",
+        ] {
+            assert!(is_image_path(&format!("folder/figure.{ext}")));
+        }
+        for path in [
+            "folder.png/source.rs",
+            ".png",
+            "file.",
+            "file.tiff",
+            "file.avif",
+            "file.svgz",
+        ] {
+            assert!(!is_image_path(path));
+        }
     }
 }
