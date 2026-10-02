@@ -930,10 +930,7 @@ try {
   const rawDialog = readFileSync(join(UI, 'src', 'chrome', 'ConfirmDestructive.tsx'), 'utf8')
   const dialog = stripComments(rawDialog)
 
-  // Rule 3, both halves — the focus, and the colour — plus its one declared exception: the
-  // default is Cancel's unless the caller set `defaultButton: 'confirm'`, which only the file
-  // tree's trash move (reversible by construction) may do. Focus and accent must travel
-  // together whichever way the default points.
+  // The default is Cancel unless a reversible act explicitly chooses confirm.
   ok(
     /\(confirmDefault \? confirmBtn : cancel\)\.current\?\.focus\(\)/.test(dialog),
     'the initial focus follows the declared default — Cancel unless the caller flipped it, so ' +
@@ -989,9 +986,9 @@ try {
       '"this destroys work"',
   )
   ok(
-    /const danger = active === undefined \|\| active\.danger === true/.test(dialog),
-    'with the older single-mode callers still red by default — every one of them is destroying ' +
-      'something, and only a mode that explicitly risks nothing gives the colour up',
+    /const danger = active === undefined \? state\.danger !== false : active\.danger === true/.test(dialog),
+    'single-mode callers keep danger styling by default and can explicitly opt out; ' +
+      'choices still control their own danger styling',
   )
 
   // The radio group, and the guard in front of it.

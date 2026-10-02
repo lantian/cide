@@ -73,6 +73,8 @@ export function archiveChange(project: ProjectId, change: string): void {
             } ${touch.operation}`,
         ),
         confirmLabel: 'Archive',
+        defaultButton: 'confirm',
+        danger: false,
         mark: 'file-diff',
         run: () => {
           void specApi

@@ -6,14 +6,13 @@
  * Worth a check because the failure is silent and remote: it is invisible to `tsc`, invisible
  * on the developing machine (Linux, which is the fallback branch — so a detection that never
  * matches anything still looks right here), and only shows up as a macOS user reaching for a
- * close button that is at the other end of the window. There is no macOS in this harness and
- * no browser, so the rule lives in a DOM-free module and this script feeds it user agent
- * strings directly.
+ * close button that is at the other end of the window. The platform rules get real user agent
+ * fixtures; the shared frame's event handlers additionally run under JSDOM with mocked IPC.
  *
  * Same shape as `check-menu-model.mjs`: a bare `tsc` over one import-free file, then import
  * the output and assert. The tail additionally reads `WindowFrame.tsx` as *source*, because a
  * rule the component does not consult is a rule that does not exist — this project's signature
- * defect — and no check here can mount React. Those assertions run over comment-stripped text:
+ * defect. Those assertions run over comment-stripped text:
  * `WindowFrame.tsx` explains `startResizeDragging` and the macOS suppression by name in prose,
  * so a grep over raw source would match the explanation of code that had been deleted.
  *
@@ -21,8 +20,8 @@
  *   - that the header renders the cluster at that end. That is JSX and CSS; the layout audit
  *     (`./run.sh --audit-chrome`) measures the buttons themselves, and neither of its three
  *     `trafficLight` rules — width, height, sibling gap — depends on which side they are on.
- *   - that the buttons act. `WindowFrame.tsx` binds `data-window-button`, and the capability
- *     files are what let the calls through; a missing permission fails at runtime only.
+ *   - that native window commands succeed. DOM tests verify the calls and event ordering,
+ *     but a missing capability or an AppKit failure requires a real application window.
  *   - that AppKit really does resize a borderless window by its edges. That is the claim the
  *     macOS branch rests on and it needs a Mac; see README's Platforms section.
  *
@@ -32,6 +31,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { checkWindowFrameEvents } from './check-window-frame-dom.mjs'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-window-controls-'))
 let failed = 0
@@ -196,8 +196,8 @@ try {
   // =====================================================================================
   //
   // The rule above is a pure function, so it is trivially green whether or not anything calls
-  // it. `WindowFrame.tsx` is where it has to be consulted, and it is JSX inside a component —
-  // exactly the place no check in this repository can execute.
+  // it. `WindowFrame.tsx` is where it has to be consulted, inside a component.
+  // The DOM checks below also mount the frame and exercise its window event handlers.
 
   const frame = strip(readFileSync('src/chrome/WindowFrame.tsx', 'utf8'))
 
@@ -229,6 +229,7 @@ try {
         `strips that swallow the pointer and resize nothing. Got: ${gripList[1].trim()}`,
     )
   }
+  await checkWindowFrameEvents({ mac: MAC_WEBKIT, linux: LINUX_WEBKIT, windows: WINDOWS_EDGE })
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

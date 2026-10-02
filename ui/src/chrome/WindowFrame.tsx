@@ -20,7 +20,7 @@ import { useSyncExternalStore } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { guardUnlisten } from '@/ipc/unlisten'
-import { currentUserAgent, drawsOwnResizeGrips } from './windowControls'
+import { currentUserAgent, drawsOwnResizeGrips, isMacUserAgent } from './windowControls'
 import styles from './WindowFrame.module.css'
 
 /*
@@ -97,11 +97,11 @@ async function refresh(): Promise<void> {
  *
  * This needs `core:window:allow-toggle-maximize` in every capability file, and it is a
  * *separate* permission from `allow-maximize` and `allow-unmaximize` — holding both of those
- * does not imply it. Without it the call is rejected in the webview with `Command
- * plugin:window|toggle_maximize not allowed by …`, which is how the zoom button and
- * double-click-to-maximize both shipped inert: Tauri's own injected drag script
- * (`src/window/scripts/drag.js`) invokes the same command for its double-click, so one missing
- * line took out both gestures at once and neither of them logs anywhere the user looks.
+ * does not imply it. Tauri's injected drag script uses a different command,
+ * `internal_toggle_maximize`, granted by `core:default`. That command checks
+ * `is_maximizable` first, which is false for our borderless macOS window because tao
+ * checks the native zoom button and there is none. This public command works without
+ * that button, so the project tabs, zoom control and macOS header use it directly.
  */
 export async function toggleMaximize(): Promise<void> {
   await getCurrentWindow().toggleMaximize()
@@ -111,11 +111,11 @@ export async function toggleMaximize(): Promise<void> {
 }
 
 /*
- * Tauri's injected drag script already toggles maximize on the second mousedown inside a
- * `data-tauri-drag-region` (tauri 2.11.5, src/window/scripts/drag.js, `e.detail === 2`), and
- * the header's drag filler carries that attribute alongside `data-window-drag`. Acting here
- * as well would toggle twice and leave the window exactly where it started, so this pair of
- * helpers mirrors that script's `isDragRegion` walk and stands down whenever it says yes.
+ * Tauri's injected drag script toggles maximize on the second mousedown on Linux/Windows
+ * and on the second mouseup on macOS (tauri 2.11.5, src/window/scripts/drag.js). These
+ * helpers mirror its `isDragRegion` walk so the dblclick fallback does not toggle again.
+ * On macOS we replace just that mouseup with the public command above; dragging is still
+ * owned by Tauri.
  *
  * The rule is narrower than "an ancestor has the attribute", which is why it is copied
  * rather than approximated with `closest()`: a bare or `"true"` region only fires for a
@@ -167,6 +167,45 @@ function tauriOwnsDoubleClick(path: readonly EventTarget[]): boolean {
     if (attr === '' || attr === 'true') return el === innermost
   }
   return false
+}
+
+/* Match Tauri's macOS release rule: the second press and release must have the same
+ * coordinates and both must hit a drag region. Capture runs before Tauri's injected
+ * document bubble listener, even though that listener was installed before ours. */
+let macDoubleClickPress: { x: number; y: number } | null = null
+
+function isWindowDragRegion(event: MouseEvent): boolean {
+  return (
+    event.target instanceof Element &&
+    event.target.closest('[data-window-drag="true"]') !== null &&
+    tauriOwnsDoubleClick(event.composedPath())
+  )
+}
+
+function onMacHeaderMouseDown(event: MouseEvent): void {
+  macDoubleClickPress =
+    event.button === 0 && event.detail === 2 && isWindowDragRegion(event)
+      ? { x: event.clientX, y: event.clientY }
+      : null
+}
+
+function onMacHeaderMouseUp(event: MouseEvent): void {
+  const press = macDoubleClickPress
+  macDoubleClickPress = null
+  if (
+    press === null ||
+    event.button !== 0 ||
+    event.detail !== 2 ||
+    event.clientX !== press.x ||
+    event.clientY !== press.y ||
+    !isWindowDragRegion(event)
+  ) {
+    return
+  }
+
+  // Prevent a second toggle if Tauri's internal command can also maximize this window.
+  event.stopImmediatePropagation()
+  void toggleMaximize()
 }
 
 function onDocumentDoubleClick(event: MouseEvent): void {
@@ -221,6 +260,10 @@ function attach(): void {
    */
   document.addEventListener('dblclick', onDocumentDoubleClick)
   document.addEventListener('click', onDocumentClick)
+  if (isMacUserAgent(currentUserAgent())) {
+    document.addEventListener('mousedown', onMacHeaderMouseDown, true)
+    document.addEventListener('mouseup', onMacHeaderMouseUp, true)
+  }
 
   void refresh()
   void getCurrentWindow()
@@ -252,6 +295,9 @@ function detach(): void {
   generation++
   document.removeEventListener('dblclick', onDocumentDoubleClick)
   document.removeEventListener('click', onDocumentClick)
+  document.removeEventListener('mousedown', onMacHeaderMouseDown, true)
+  document.removeEventListener('mouseup', onMacHeaderMouseUp, true)
+  macDoubleClickPress = null
   unlistenResize?.()
   unlistenResize = null
 }

@@ -16,10 +16,10 @@
  * 3. **Cancel is the default.** Escape cancels, initial focus is on Cancel, and the
  *    destructive button is the plain one while the accent-filled button is the safe one — so
  *    a reflexive Enter, the keystroke already in flight when the dialog appeared, backs out.
- *    One caller is exempt, by declaration rather than by accident — see
- *    [`ConfirmState.defaultButton`]: the file tree's *Move to Trash* is reversible by
- *    construction, and there Enter performs the move, the way every desktop file manager
- *    answers it. The focus and the accent travel together whichever way the default points,
+ *    Reversible acts can opt into confirming by default — see
+ *    [`ConfirmState.defaultButton`]: the file tree's *Move to Trash* and OpenSpec's *Archive*.
+ *    Archive also opts out of danger styling through [`ConfirmState.danger`].
+ *    The focus and the prominence travel together whichever way the default points,
  *    because a dialog whose prominent button and whose Enter answer disagree is lying about
  *    what a keystroke will do.
  *
@@ -167,6 +167,8 @@ export interface ConfirmState {
   files: readonly string[]
   /** The word on the destructive button, e.g. `Revert 4 files`. Ignored while `choices` is set. */
   confirmLabel: string
+  /** Use danger styling for a single-mode act. Defaults to true; ignored with `choices`. */
+  danger?: boolean
   /**
    * The glyph before each path. `−` (removal) unless the caller says otherwise.
    *
@@ -217,8 +219,8 @@ export interface ConfirmState {
    * only because the gesture is easy to trigger by accident — the file tree's *Move to Trash*,
    * where a bare Delete key opens this and every desktop file manager answers the Enter that
    * follows with the trash move, not with a cancel the user then has to notice happened.
-   * The confirm button keeps the kit's `danger` fill either way — see the comment above
-   * `runButton` for why the accent no longer replaces it.
+   * OpenSpec's Archive also confirms by default, with `danger: false` so its button uses
+   * the primary accent. Other single-mode acts keep the kit's `danger` fill by default.
    */
   defaultButton?: 'confirm' | 'cancel'
   choices?: readonly ConfirmChoice[]
@@ -263,8 +265,7 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
   // class of bug entirely.
   const group = useId()
 
-  // Rule 3's one dial. `false` — Cancel — unless the caller said `'confirm'`; see the field's
-  // doc for who may, and why it is exactly one caller today.
+  // Cancel is the default unless the caller explicitly chooses confirm.
   const confirmDefault = state.defaultButton === 'confirm'
 
   useEffect(() => {
@@ -307,9 +308,8 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
   const body = active?.body ?? state.body
   const files = active?.files ?? state.files
   const confirmLabel = active?.confirmLabel ?? state.confirmLabel
-  // No choices means the older callers, every one of which *is* destroying something — so the
-  // red stays theirs by default and only a mode that explicitly risks nothing gives it up.
-  const danger = active === undefined || active.danger === true
+  // Single-mode acts keep danger styling unless explicitly opted out, as Archive does.
+  const danger = active === undefined ? state.danger !== false : active.danger === true
 
   /*
    * Rule 3 lives in these two `variant`s. For every destructive caller the prominent button is
@@ -320,9 +320,9 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
    * fill — a filled button, so the prominence still travels with the focus, and Cancel drops to
    * secondary. This used to hand the act the accent instead, on the argument that a reversible
    * act has no claim on the destroy look; it read as "Move to Trash is the ordinary, safe
-   * button", which is not what a dialog raised by a bare Delete key should say. Only a choice
-   * that risks nothing (a `--soft` reset) gives the danger fill up — to the accent if it is the
-   * default, otherwise to a plain secondary.
+   * button", which is not what a dialog raised by a bare Delete key should say. A choice
+   * that risks nothing (a `--soft` reset), or an act with `danger: false` (Archive), gives the
+   * danger fill up — to the accent if it is the default, otherwise to a plain secondary.
    */
   const runButton = (
     <Button
