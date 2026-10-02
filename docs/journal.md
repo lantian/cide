@@ -17296,3 +17296,21 @@ for its short text, keeping both scopes aligned on the right at the usual Settin
 Headless Chromium reproduced the original wrap and verified both scopes at a 620px row,
 plus scaled widths for UI sizes 11 and 17 in light and dark themes. The mounted harness
 control check, TypeScript and UI scale check pass.
+
+## M150 — Codex interactive questions mark the console awaiting input
+
+Codex's `PreToolUse` hook for `request_user_input` previously left the session busy while its
+interactive question waited for an answer. The hook applier now identifies that exact tool
+and emits the existing `AwaitingInput` state. The shared state pipeline raises the pane,
+console-tab and project-tab awaiting markers and removes that console from active counts.
+The question's `PostToolUse` returns the session to busy when the answer arrives. Pane
+interaction still acknowledges the marker; it does not change the backend session state.
+The pane tooltip now says the session is waiting, covering questions during a turn too.
+
+**Verified:** 34 Rust hook/running tests, including the question/answer sequence, duplicate
+hooks, routing to the pane rather than the Codex conversation, exact tool-name matching and
+another console remaining active. UI awaiting, running, input, exit and status-format checks
+and TypeScript pass.
+
+**Not confirmed in the live IDE:** an interactive question in the main console, a separate tab
+or a background project. The running backend was not restarted and no paid model turn was run.

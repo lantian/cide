@@ -928,7 +928,7 @@ export function PaneFrame({
           className={awaiting ? `${styles.marker} ${styles.markerOn}` : styles.marker}
           role={awaiting ? 'status' : undefined}
           aria-label={awaiting ? 'This session is waiting for you' : undefined}
-          title={awaiting ? 'This session has finished and is waiting for you' : undefined}
+          title={awaiting ? 'This session is waiting for you' : undefined}
           aria-hidden={awaiting ? undefined : true}
         />
       </div>

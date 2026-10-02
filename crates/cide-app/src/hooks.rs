@@ -617,12 +617,20 @@ fn decide(
         .map(|s| *s)
         .unwrap_or(SessionState::Spawning);
 
-    // A permission request is a `Notification` whose text says so; the state machine cannot
-    // see the payload, so that one case is decided here.
+    // The state machine cannot see payloads: permissions need the notification text, and
+    // Codex's interactive question is a tool call that waits for the user mid-turn.
     let next = if event == HookEvent::Notification {
         cide_claude::is_permission_request(&frame.payload)
             .then_some(SessionState::AwaitingPermission)
             .filter(|s| *s != current)
+    } else if event == HookEvent::PreToolUse
+        && frame
+            .payload
+            .get("tool_name")
+            .and_then(|name| name.as_str())
+            == Some("request_user_input")
+    {
+        (current != SessionState::AwaitingInput).then_some(SessionState::AwaitingInput)
     } else {
         cide_claude::next_state(current, event)
     };
@@ -850,6 +858,136 @@ mod tests {
             }]
         );
         assert_eq!(state_of(&states, busy), Some(SessionState::AwaitingInput));
+    }
+
+    #[test]
+    fn a_codex_question_waits_mid_turn_and_its_answer_resumes_work() {
+        let states = States::new();
+        let session = SessionId::new();
+        let other = SessionId::new();
+        states.insert(session, SessionState::Busy);
+        states.insert(other, SessionState::Busy);
+        let asking = HookFrame::new(
+            "PreToolUse",
+            json!({
+                "session_id": session.to_string(),
+                "tool_name": "request_user_input",
+                "tool_use_id": "question-1",
+                "tool_input": { "questions": [{
+                    "id": "choice", "header": "Choice", "question": "Which option?",
+                    "options": [{ "label": "A", "description": "First option" }],
+                }] },
+            }),
+        );
+
+        assert_eq!(
+            decide(&asking, &states),
+            vec![Effect::State {
+                session: session.to_string(),
+                state: SessionState::AwaitingInput,
+            }]
+        );
+        assert_eq!(
+            state_of(&states, session),
+            Some(SessionState::AwaitingInput)
+        );
+        assert!(decide(&asking, &states).is_empty(), "dedupe question hooks");
+        assert_eq!(state_of(&states, other), Some(SessionState::Busy));
+        assert!(!crate::running::pane_is_busy(
+            true,
+            false,
+            state_of(&states, session).unwrap(),
+            crate::running::Busy::Working,
+        ));
+        assert!(crate::running::pane_is_busy(
+            true,
+            false,
+            state_of(&states, other).unwrap(),
+            crate::running::Busy::Working,
+        ));
+
+        let answered = HookFrame::new(
+            "PostToolUse",
+            json!({
+                "session_id": session.to_string(),
+                "tool_name": "request_user_input",
+                "tool_use_id": "question-1",
+                "tool_response": { "answers": { "choice": { "answers": ["A"] } } },
+            }),
+        );
+        assert_eq!(
+            decide(&answered, &states),
+            vec![
+                Effect::Tool {
+                    session: session.to_string(),
+                    paths: Vec::new()
+                },
+                Effect::State {
+                    session: session.to_string(),
+                    state: SessionState::Busy
+                },
+            ]
+        );
+        assert_eq!(state_of(&states, session), Some(SessionState::Busy));
+    }
+
+    #[test]
+    fn a_codex_question_addresses_the_pane_instead_of_its_conversation() {
+        let pane = SessionId::new();
+        let conversation = SessionId::new();
+        let states = States::new();
+        let conversations = DashMap::new();
+        states.insert(pane, SessionState::Busy);
+        let mut asking = HookFrame::new(
+            "PreToolUse",
+            json!({ "session_id": conversation.to_string(), "tool_name": "request_user_input" }),
+        );
+        asking.spawned_as = Some(pane.to_string());
+
+        assert_eq!(
+            super::decide(&asking, &states, &conversations),
+            vec![
+                Effect::Conversation {
+                    session: pane,
+                    conversation
+                },
+                Effect::State {
+                    session: pane.to_string(),
+                    state: SessionState::AwaitingInput
+                },
+            ]
+        );
+        assert_eq!(state_of(&states, pane), Some(SessionState::AwaitingInput));
+        assert_eq!(state_of(&states, conversation), None);
+        assert!(super::decide(&asking, &states, &conversations).is_empty());
+    }
+
+    #[test]
+    fn only_the_exact_question_tool_marks_a_pre_tool_hook_awaiting() {
+        for tool_name in [
+            json!("Bash"),
+            json!("apply_patch"),
+            json!("request_user_input_async"),
+            json!("mcp__other__request_user_input"),
+            json!(null),
+            json!(42),
+        ] {
+            let session = SessionId::new();
+            let states = States::new();
+            states.insert(session, SessionState::AwaitingInput);
+            let tool = HookFrame::new(
+                "PreToolUse",
+                json!({ "session_id": session.to_string(), "tool_name": tool_name }),
+            );
+            assert_eq!(
+                decide(&tool, &states),
+                vec![Effect::State {
+                    session: session.to_string(),
+                    state: SessionState::Busy
+                }],
+                "ordinary tool traffic remains busy: {tool_name}",
+            );
+        }
     }
 
     #[test]
