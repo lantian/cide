@@ -65,10 +65,8 @@
  * * **Paths a TUI has truncated** — `ui/src/sidebar/GitPa…`. The ellipsis is the producer
  *   saying the text is not the path. Claude Code's own TUI does this constantly in a narrow
  *   pane.
- * * **Paths a TUI has wrapped by itself.** The terminal's *own* wrapping is handled (see
- *   `pathLinks.ts`, which rebuilds the logical line through `isWrapped`), but Ink draws its
- *   own line breaks without setting that flag, and a path split that way is unrecoverable
- *   from the buffer. Better unmatched than matched as two wrong halves.
+ * * **Paths split by a TUI** need their adjacent rows as well as this line. `pathBuffer.ts`
+ *   reconstructs those fragments and offers them only after filesystem verification.
  * * **`~/…`.** Trivial to expand and excluded on purpose: it is the one form that reaches out
  *   of every project root, and `~/.claude/.credentials.json` is a small UTF-8 text file. One
  *   fewer way to leave the project.
@@ -143,15 +141,20 @@ export interface Candidate {
 /**
  * The characters a path may be spelled with here.
  *
- * `/` and no backslash. `@` is in the set so `node_modules/@xterm/xterm/package.json` survives
+ * `/` and Markdown escapes. `@` is in the set so `node_modules/@xterm/xterm/package.json` survives
  * as one run; a *leading* `@` is stripped afterwards because that is Claude Code's mention
  * marker. `:` is deliberately absent — it is what ends the body and begins the position, and
  * having it in both roles is how `foo.ts:12` becomes a filename nobody has.
  */
 const BODY = /[A-Za-z0-9._+%~@/-]/
 
-/** A run of body characters, as long as possible. Maximal, so runs never overlap. */
-const RUN = /[A-Za-z0-9._+%~@/-]+/g
+/** Include backslashes so an escaped filename stays whole; build refuses unknown escapes. */
+const RUN = /[A-Za-z0-9._+%~@/\\-]+/g
+
+/** Decode only Markdown escapes for punctuation already supported by the path grammar. */
+function decodePath(text: string): string {
+  return text.replace(/\\([._+~@/\-])/g, '$1')
+}
 
 /**
  * A URL, so its insides can be skipped whole.
@@ -256,7 +259,7 @@ function build(
 
   // Sentence punctuation the producer added, not part of the name: "see src/main.rs." The
   // comma, semicolon and the rest are not body characters and so were never in the run.
-  while (text.endsWith('.')) text = text.slice(0, -1)
+  while (text.endsWith('.') && !text.endsWith('\\.')) text = text.slice(0, -1)
 
   // Claude Code's mention marker. One, not a run: `@@foo` is not a mention of `@foo`.
   if (text.startsWith('@')) {
@@ -278,6 +281,7 @@ function build(
     proven = true
   }
 
+  text = decodePath(text)
   if (text === '' || !plausible(text, proven)) return null
 
   const position = readPosition(line, posAt)
@@ -466,7 +470,7 @@ function quotedSpans(line: string): Array<{ text: string; start: number; end: nu
     // Every character must be one a path may be spelled with, or a space. This is what stops
     // a quoted *sentence* — which build tools print constantly — from being taken as a
     // filename with several spaces in it.
-    if (![...body].every((c) => c === ' ' || BODY.test(c))) continue
+    if (![...decodePath(body)].every((c) => c === ' ' || BODY.test(c))) continue
     const start = match.index + lead.length + 1
     out.push({ text: body, start, end: start + body.length })
   }
@@ -613,9 +617,9 @@ export interface ResolveContext extends Bases {
   /**
    * Whether an absolute path is a regular file.
    *
-   * Supplied by the caller — from the project index for a path inside a root (`fs_paths_exist`,
-   * zero syscalls) and from `fs_stat_paths` for one outside every root, which the index will
-   * never hold — so this module needs no disk and the check script can drive it from a `Set`.
+   * Supplied by the caller — from the project index (`fs_paths_exist`, zero syscalls), with
+   * `fs_stat_paths` for index misses and outside-project paths — so this module needs no disk
+   * and the check script can drive it from a `Set`.
    * Which oracle answered is deliberately invisible here: a link is offered for a file that
    * exists, and *whether cide may open it* is a question for the click, in Rust, where it can be
    * asked of the user.

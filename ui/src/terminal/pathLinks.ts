@@ -1,8 +1,8 @@
 /**
  * File links in terminal panes: the DOM and xterm half of `pathMatch.ts`.
  *
- * Every *rule* is next door in `pathMatch.ts`, which is pure and import-free so
- * `ui/scripts/check-paths.mjs` can compile it alone and drive it under node. What is here is
+ * Parsing, buffer reconstruction and lookup caching live in testable modules next door, so
+ * `ui/scripts/check-paths.mjs` can exercise them under node. What is here is
  * everything that needs a terminal, a mouse or an IPC call, and it owns no decisions of its
  * own beyond the two written out below.
  *
@@ -17,7 +17,7 @@
  * trip rather than a guess.
  *
  * The line number is 1-based and absolute over the whole buffer including scrollback, while
- * `buffer.active.getLine()` is 0-based — hence the `y - 1` in [`windowedLineStrings`]. Ranges
+ * `buffer.active.getLine()` is 0-based — hence the `y - 1` passed to `readPathLine`. Ranges
  * handed back are 1-based with `end.x` inclusive.
  *
  * `OscLinkProvider` is registered in the terminal's constructor, so it is index 0 and outranks
@@ -85,27 +85,24 @@
  * error line names `/usr/bin/ld`, `/lib64/libc.so.6`, `/dev/null` and half a dozen `.so`s, and
  * underlining all of them is how an underline stops meaning "cide can open this".
  *
- * So out-of-project candidates get a real `stat`, through `fs_stat_paths` — a *second* command,
- * so that in-project hovering keeps costing zero syscalls, which is a stated property of
- * `fs_paths_exist` and not an accident. Their answers live in their own map with a TTL, because
- * the exact invalidation the other map enjoys (`cide://fs-changed`) is the project watcher's and
- * does not reach outside the project.
+ * Index hits avoid disk work on hover. Index misses and outside-project candidates get a
+ * real `stat` through `fs_stat_paths`; their answers expire because the project watcher does
+ * not cover ignored directories or outside files. Activation refreshes disk answers.
  */
-import type { IBufferLine, ILink, IDisposable, Terminal } from '@xterm/xterm'
+import type { IBufferCell, IBufferLine, ILink, IDisposable, Terminal } from '@xterm/xterm'
 import { notify } from '@/chrome/notices'
 import { isWebUrl, openWebLink } from '@/chrome/webLinks'
 import { events, fs as fsApi, session as sessionApi, type TreeRowKind } from '@/ipc/client'
 import { cellFromPoint, linkAtCell, pressVerdict, type Cell } from './clickGate'
 import {
   candidatePaths,
-  matchPaths,
   matchUrls,
   outsidePaths,
-  resolveCandidate,
-  resolveDirectory,
   type Candidate,
   type Resolution,
 } from './pathMatch'
+import { bufferPaths, pathRange, readPathLine, resolveBufferPaths } from './pathBuffer'
+import { PathExistence } from './pathExistence'
 import { matchTaskCodes } from './taskLinks'
 import type { TerminalHandle } from './xterm'
 
@@ -155,83 +152,14 @@ export function setPathLinkEnv(paneId: string, env: PathLinkEnv | null): void {
   else envs.set(paneId, env)
 }
 
-/** What the index says is at a path. `absent` is an answer, and it is cached like the others. */
-type Existence = 'file' | 'dir' | 'absent'
+/** Index hits stay cheap; ignored and outside-project files use the disk fallback. */
+const existence = new PathExistence(
+  async (project, paths) => (await fsApi.pathsExist(project, paths)).map(linkable),
+  async (paths) => (await fsApi.statPaths(paths)).map(linkable),
+)
 
-/**
- * Answers from `fs_paths_exist`, keyed by absolute path.
- *
- * Bounded and invalidated rather than given a TTL. The invalidation channel already exists —
- * `cide://fs-changed`, debounced 300 ms in Rust — and it is exact: a path that changed is
- * dropped, and everything else stays. A TTL would be a number invented to stand in for a fact
- * the app is already being told.
- */
-const existence = new Map<string, Existence>()
-
-/**
- * Answers from `fs_stat_paths`, for paths no root contains.
- *
- * A **separate map with a TTL**, and not entries in `existence`, because the invalidation that
- * makes that one exact does not reach here: `cide://fs-changed` is emitted by the project's
- * watcher, which watches the project. An out-of-project entry parked in `existence` would go
- * stale for the life of the window — a file created in a sibling repo would never light up, and
- * one deleted there would keep its underline for ever. A TTL is a number invented to stand in
- * for a fact the app is being told, which is why `existence` does not have one; here there is no
- * fact to be told, so a short one is the honest answer rather than the lazy one.
- */
-const outsideExistence = new Map<string, { at: number; kind: Existence }>()
-
-/**
- * How long a `stat` answer for an out-of-project path is believed.
- *
- * Long enough that dragging the pointer down a linker error costs one round trip rather than one
- * per line; short enough that `go build` writing a file into the module cache lights it up while
- * the user is still looking at the line that named it.
- */
-const OUTSIDE_TTL_MS = 3_000
-
-/** Entries kept. A build log hovered end to end is a few thousand distinct paths at most. */
-const CACHE_MAX = 4096
-
-/** Paths per `fs_paths_exist` call. Mirrors the clamp in `cmd/fs.rs`. */
-const PROBE_MAX = 128
-
-/** How long a pane's `/proc` cwd is believed. See [`sessionCwd`]. */
+/** How long a pane’s `/proc` cwd is believed. */
 const CWD_TTL_MS = 1_000
-
-function remember(path: string, kind: Existence): void {
-  // Delete before set: `Map` iterates in insertion order and the eviction below takes the
-  // oldest, so an in-place update would leave a freshly answered path first in line to go.
-  existence.delete(path)
-  existence.set(path, kind)
-  while (existence.size > CACHE_MAX) {
-    const oldest = existence.keys().next().value
-    if (oldest === undefined) break
-    existence.delete(oldest)
-  }
-}
-
-/** The same, for the TTL'd half. Same eviction, one extra field. */
-function rememberOutside(path: string, kind: Existence): void {
-  outsideExistence.delete(path)
-  outsideExistence.set(path, { at: Date.now(), kind })
-  while (outsideExistence.size > CACHE_MAX) {
-    const oldest = outsideExistence.keys().next().value
-    if (oldest === undefined) break
-    outsideExistence.delete(oldest)
-  }
-}
-
-/** A live answer for an out-of-project path, or `undefined` if there is none or it has aged out. */
-function outsideKnown(path: string): Existence | undefined {
-  const entry = outsideExistence.get(path)
-  if (entry === undefined) return undefined
-  if (Date.now() - entry.at >= OUTSIDE_TTL_MS) {
-    outsideExistence.delete(path)
-    return undefined
-  }
-  return entry.kind
-}
 
 let watching = false
 
@@ -257,7 +185,7 @@ function watchInvalidation(): void {
      * something a comment can be relied on to prevent.
      */
     .onFsChanged((_project, change) => {
-      for (const path of change.paths) existence.delete(path)
+      existence.invalidate(change.paths)
     })
     .catch(() => {
       // No watcher in this build or this window. The cache then only grows staler than it
@@ -310,32 +238,6 @@ async function sessionCwd(project: string, session: string | null): Promise<stri
 }
 
 /**
- * Ask the **disk** about every out-of-project path not already answered for.
- *
- * The costly sibling of [`probe`], and it is called with a list that is almost always empty:
- * `outsidePaths` yields at most one candidate, only for text that was spelled as a full absolute
- * path, and only when that path is in no root. A line of ordinary relative diagnostics costs
- * nothing here.
- *
- * A failure is not cached, exactly as in [`probe`] and for the same reason: caching it would
- * make the pane stay dark after the command becomes available.
- */
-async function probeOutside(paths: string[]): Promise<void> {
-  for (let i = 0; i < paths.length; i += PROBE_MAX) {
-    const batch = paths.slice(i, i + PROBE_MAX)
-    let answers: Array<TreeRowKind | null>
-    try {
-      answers = await fsApi.statPaths(batch)
-    } catch {
-      return
-    }
-    for (const [j, path] of batch.entries()) {
-      rememberOutside(path, linkable(answers[j]))
-    }
-  }
-}
-
-/**
  * A probe answer, as this module's two-state cache stores it.
  *
  * `TreeRowKind` gained `group` and `note` in M13 — synthetic rows the *file tree* draws — and
@@ -346,28 +248,6 @@ async function probeOutside(paths: string[]): Promise<void> {
  */
 function linkable(answer: TreeRowKind | null | undefined): 'dir' | 'file' | 'absent' {
   return answer === 'dir' || answer === 'file' ? answer : 'absent'
-}
-
-/** Ask about every path not already answered for, in bounded batches. */
-async function probe(project: string, paths: string[]): Promise<void> {
-  for (let i = 0; i < paths.length; i += PROBE_MAX) {
-    const batch = paths.slice(i, i + PROBE_MAX)
-    let answers: Array<TreeRowKind | null>
-    try {
-      answers = await fsApi.pathsExist(project, batch)
-    } catch {
-      /*
-       * The project has no index yet, or the command is older than this frontend. Neither is
-       * worth a toast on a mouse *hover* — the honest result is that nothing lights up until
-       * the walk finishes. Deliberately not cached as `absent`: caching a failure would make
-       * the pane stay dark after the index arrives.
-       */
-      return
-    }
-    for (const [j, path] of batch.entries()) {
-      remember(path, linkable(answers[j]))
-    }
-  }
 }
 
 /**
@@ -419,8 +299,8 @@ export function attachPathLinks(
    * The second half is not decoration. A press this module has claimed **must** end in something
    * the user can see, and "`src/foo.rs` does not name a file in this project" is a far better
    * answer than a generic shrug — but only the scan knows the text that failed. Keeping misses
-   * costs one `rangeOf` per unresolved candidate, which the walk was going to have to do sooner
-   * or later anyway; see [`rangeOf`] on why that stays linear.
+   * costs a range per unresolved fragment. `pathBuffer.ts` maps displayed offsets to cells
+   * in one pass, including wide characters and Markdown escapes.
    */
   interface Scan {
     /**
@@ -438,14 +318,13 @@ export function attachPathLinks(
 
   const EMPTY_SCAN: Scan = { links: [], misses: [] }
 
-  async function scanLine(y: number): Promise<Scan> {
-    const [lines, topIdx] = windowedLineStrings(y - 1, term)
-    if (lines.length === 0) return EMPTY_SCAN
-    const logical = lines.join('')
+  async function scanLine(y: number, refresh = false): Promise<Scan> {
+    const current = readPathLine<IBufferCell>(term.buffer.active, y - 1)
+    if (current === null) return EMPTY_SCAN
 
     // Web links first, and before any of the project checks below: a URL needs no project, no
     // roots and no `open` to mean something, so a pane with none of them still opens one.
-    const scan: Scan = { links: webLinks(logical, topIdx), misses: [] }
+    const scan: Scan = { links: webLinks(current), misses: [] }
 
     const env = envs.get(ctx.paneId)
     // No project, no roots, or nowhere to send an open. The first two mean there is nothing to
@@ -460,7 +339,7 @@ export function attachPathLinks(
     if (env === undefined || env.project === '' || env.roots.length === 0) return scan
     if (env.open === null) return scan
 
-    const candidates = matchPaths(logical)
+    const candidates = bufferPaths<IBufferCell>(term.buffer.active, current)
     if (candidates.length === 0) return scan
 
     // The pane's own cwd first, the spawn cwd second. `candidatePaths` de-duplicates, so a
@@ -469,81 +348,43 @@ export function attachPathLinks(
     const cwds = proc === null ? [env.cwd] : [proc, env.cwd]
     const bases = { cwds, roots: env.roots }
 
-    // Two oracles, because the index cannot answer for a path it will never hold. Which one a
-    // candidate goes to is decided by `pathMatch.ts` and nowhere else: `candidatePaths` is
-    // in-project by construction, `outsidePaths` is out-of-project by construction, and the two
-    // are disjoint. Nothing here re-derives that, so there is no second place for it to drift.
-    const unknown: string[] = []
-    const unknownOutside: string[] = []
-    for (const candidate of candidates) {
-      for (const path of candidatePaths(candidate.text, bases)) {
-        if (!existence.has(path) && !unknown.includes(path)) unknown.push(path)
-      }
-      for (const path of outsidePaths(candidate.text, bases)) {
-        if (outsideKnown(path) === undefined && !unknownOutside.includes(path)) {
-          unknownOutside.push(path)
-        }
-      }
-    }
-    if (unknown.length > 0) await probe(env.project, unknown)
-    if (unknownOutside.length > 0) await probeOutside(unknownOutside)
+    const inside = candidates.flatMap(({ candidate }) => candidatePaths(candidate.text, bases))
+    const outside = candidates.flatMap(({ candidate }) => outsidePaths(candidate.text, bases))
+    await existence.lookup(env.project, inside, outside, refresh)
 
-    const isFile = (path: string): boolean =>
-      existence.get(path) === 'file' || outsideKnown(path) === 'file'
-    const isDir = (path: string): boolean =>
-      existence.get(path) === 'dir' || outsideKnown(path) === 'dir'
-    let cursor: Cursor = { y: topIdx, x: 0, idx: 0 }
-    for (const candidate of candidates) {
-      /*
-       * A file first, a directory second, and never both.
-       *
-       * The order is not arbitrary and it is not "files are more interesting": a path cannot be
-       * a regular file and a directory at the same absolute location, so the only way both
-       * answer is a multi-root project where one root holds a file and another a directory of
-       * the same relative name. Taking the file there is the same rule `resolveCandidate`'s
-       * `many` arm refuses to apply — except that here the two answers are of *different kinds*,
-       * and offering "open this file" is strictly more useful than offering to reveal a folder
-       * the user did not point at. The genuinely ambiguous case — two files, or two directories
-       * — still comes back `many` and is still refused.
-       */
-      const asFile = resolveCandidate(candidate.text, { ...bases, isFile })
-      const asDir =
-        asFile.kind === 'none' && env.reveal !== null
-          ? resolveDirectory(candidate.text, { ...bases, isDir })
-          : NONE_RESOLUTION
-      const resolution = asFile.kind === 'none' ? asDir : asFile
-      const range = rangeOf(candidate, cursor)
-      if (range === null) continue
-      // Advance on every successful mapping, resolved or not: the cursor's only job is to make
-      // the next candidate's walk short, and a candidate that named nothing still tells us
-      // exactly where in the buffer we have reached.
-      cursor = { y: range.start.y - 1, x: range.start.x - 1, idx: candidate.start }
-      if (resolution.kind === 'none') {
-        // Kept, not dropped. A press that lands here has already been swallowed, and this is the
-        // only place that still knows what text failed to resolve.
-        scan.misses.push({ range, text: candidate.text })
-        continue
+    const paths = resolveBufferPaths(candidates, bases,
+      (path) => existence.kind(path) === 'file',
+      (path) => env.reveal !== null && existence.kind(path) === 'dir')
+    for (const { candidate, ranges, resolution, isDirectory } of paths) {
+      for (const range of ranges) {
+        if (resolution.kind === 'none') {
+          scan.misses.push({ range, text: candidate.text })
+          continue
+        }
+        const act = (): void => activate(env, candidate, resolution, isDirectory)
+        scan.links.push({
+          act,
+          link: {
+            range,
+            text: candidate.text,
+            // Guarded on the modifier, so a plain click — or the mouseup of a right click, which
+            // `Linkifier._handleMouseUp` does not distinguish — opens nothing. This path only runs
+            // for a press the capture listener below did not swallow.
+            activate: (event: MouseEvent) => {
+              if (event.ctrlKey || event.metaKey) {
+                void scanLine(range.start.y, true).then((fresh) => actOnCell(fresh, range.start),
+                  () => notify('cide could not read the line under the pointer.', { kind: 'warn' }))
+              }
+            },
+            hover: () => {
+              hovered = true
+            },
+            leave: () => {
+              hovered = false
+            },
+          },
+        })
       }
-      const act = (): void => activate(env, candidate, resolution, resolution === asDir)
-      scan.links.push({
-        act,
-        link: {
-          range,
-          text: candidate.text,
-          // Guarded on the modifier, so a plain click — or the mouseup of a right click, which
-          // `Linkifier._handleMouseUp` does not distinguish — opens nothing. This path only runs
-          // for a press the capture listener below did not swallow.
-          activate: (event: MouseEvent) => {
-            if (event.ctrlKey || event.metaKey) act()
-          },
-          hover: () => {
-            hovered = true
-          },
-          leave: () => {
-            hovered = false
-          },
-        },
-      })
     }
     return scan
   }
@@ -553,17 +394,14 @@ export function attachPathLinks(
    *
    * Same gesture as a path — ctrl+click, claimed by the gate below — and the same guarded
    * `activate` for a press that reached xterm some other way. The open goes through Rust
-   * (`chrome/webLinks.ts`), never this webview. Their own cursor, because `matchPaths` skips
-   * exactly these spans, so the two lists interleave and neither can reuse the other's walk;
-   * a line holds few enough URLs that the walk stays short.
+   * (`chrome/webLinks.ts`), never this webview. They use the same displayed-offset mapping
+   * as file paths; the path matcher skips URL spans.
    */
-  function webLinks(logical: string, topIdx: number): Scan['links'] {
+  function webLinks(current: NonNullable<ReturnType<typeof readPathLine>>): Scan['links'] {
     const out: Scan['links'] = []
-    let cursor: Cursor = { y: topIdx, x: 0, idx: 0 }
-    for (const url of matchUrls(logical)) {
-      const range = rangeOf(url, cursor)
+    for (const url of matchUrls(current.text)) {
+      const range = pathRange(current, url.start, url.end)
       if (range === null) continue
-      cursor = { y: range.start.y - 1, x: range.start.x - 1, idx: url.start }
       const act = (): void => openWebLink(url.text)
       out.push({
         act,
@@ -583,78 +421,6 @@ export function attachPathLinks(
       })
     }
     return out
-  }
-
-  /** A position in the wrapped block, paired with the string offset it corresponds to. */
-  interface Cursor {
-    y: number
-    x: number
-    idx: number
-  }
-
-  /**
-   * Map a candidate's string offsets back to a 1-based buffer range.
-   *
-   * `from` is a running cursor, not the top of the wrapped block, and that is the whole point.
-   * Walking from `topIdx` for every candidate made the mapping O(start) per candidate and so
-   * quadratic over the line — and the input is untrusted output, so the worst case is chosen by
-   * whatever the pane happens to print. A wrapped logical line dense with real paths is the
-   * shape that hurts, and `resolveCandidate` gates this call on the file *existing*, which a
-   * cloned repo decides. Candidates arrive in increasing `start` order, so one cursor carried
-   * across them makes the whole line linear.
-   */
-  function rangeOf(
-    candidate: Pick<Candidate, 'start' | 'end'>,
-    from: Cursor,
-  ): ILink['range'] | null {
-    const [startY, startX] = mapStrIdx(from.y, from.x, candidate.start - from.idx)
-    if (startY === -1 || startX === -1) return null
-    const [endY, endX] = mapStrIdx(startY, startX, candidate.end - candidate.start)
-    if (endY === -1 || endX === -1) return null
-    // 1-based, right side including — thus +1 everywhere except `end.x`, which is already
-    // exclusive on the way in. Transcribed from `addon-web-links`' `LinkComputer`.
-    return { start: { x: startX + 1, y: startY + 1 }, end: { x: endX, y: endY + 1 } }
-  }
-
-  /**
-   * Map a string index in the joined logical line back to `[lineIndex, columnIndex]`, 0-based.
-   *
-   * Transcribed from `@xterm/addon-web-links`' `LinkComputer._mapStrIdx`, wide-character
-   * correction included, because that addon exports only `WebLinksAddon` — the algorithm we
-   * need is not importable. `[-1, -1]` when the walk runs off the end of the buffer.
-   */
-  function mapStrIdx(lineIndex: number, rowIndex: number, stringIndex: number): [number, number] {
-    const buf = term.buffer.active
-    const cell = buf.getNullCell()
-    let start = rowIndex
-    let index = stringIndex
-    let line = lineIndex
-    while (index) {
-      const bufferLine = buf.getLine(line)
-      if (!bufferLine) return [-1, -1]
-      for (let i = start; i < bufferLine.length; ++i) {
-        bufferLine.getCell(i, cell)
-        const chars = cell.getChars()
-        const width = cell.getWidth()
-        if (width) {
-          index -= chars.length || 1
-          // A wide character that wrapped early leaves an empty last cell; the cells to its
-          // right are reset with `chars=''` and `width=1`. Without this correction every
-          // range after such a cell is one column out.
-          if (i === bufferLine.length - 1 && chars === '') {
-            const next = buf.getLine(line + 1)
-            if (next && next.isWrapped) {
-              next.getCell(0, cell)
-              if (cell.getWidth() === 2) index += 1
-            }
-          }
-        }
-        if (index < 0) return [line, i]
-      }
-      line++
-      start = 0
-    }
-    return [line, start]
   }
 
   /**
@@ -722,7 +488,7 @@ export function attachPathLinks(
       openWebLink(osc)
       return
     }
-    void scanLine(cell.y).then(
+    void scanLine(cell.y, true).then(
       (scan) => actOnCell(scan, cell),
       () => {
         // The scan itself failed — a disposed terminal, or a probe that threw. The press is
@@ -909,58 +675,4 @@ function oscLinkAt(term: Terminal, cell: { x: number; y: number }): string | nul
   } catch {
     return null
   }
-}
-
-/** The `none` answer, so `scanLine` can skip the directory probe without an `undefined`. */
-const NONE_RESOLUTION: Resolution = { kind: 'none' }
-
-/**
- * Rebuild the logical line the pointer is on, following the terminal's own wrapping.
- *
- * Transcribed from `@xterm/addon-web-links`' `LinkComputer._getWindowedLineStrings`: expand up
- * while the line `isWrapped` and holds no space, expand down likewise, stop at 2048 characters
- * in each direction. `trimRight=true` on purpose, which is what makes an early-wrapped wide
- * character match — and what makes [`mapStrIdx`]'s correction necessary.
- *
- * This handles the *terminal's* wrapping and nothing else. A TUI that draws its own line
- * breaks — Claude Code's does — leaves `isWrapped` false, and a path it split is not
- * recoverable from the buffer by anyone. `pathMatch.ts` says so in its "deliberately not
- * matched" list rather than half-handling it.
- */
-function windowedLineStrings(
-  lineIndex: number,
-  term: TerminalHandle['term'],
-): [string[], number] {
-  let line: IBufferLine | undefined
-  let topIdx = lineIndex
-  let bottomIdx = lineIndex
-  let length = 0
-  let content = ''
-  const lines: string[] = []
-
-  if ((line = term.buffer.active.getLine(lineIndex))) {
-    const current = line.translateToString(true)
-
-    if (line.isWrapped && current[0] !== ' ') {
-      length = 0
-      while ((line = term.buffer.active.getLine(--topIdx)) && length < 2048) {
-        content = line.translateToString(true)
-        length += content.length
-        lines.push(content)
-        if (!line.isWrapped || content.indexOf(' ') !== -1) break
-      }
-      lines.reverse()
-    }
-
-    lines.push(current)
-
-    length = 0
-    while ((line = term.buffer.active.getLine(++bottomIdx)) && line.isWrapped && length < 2048) {
-      content = line.translateToString(true)
-      length += content.length
-      lines.push(content)
-      if (content.indexOf(' ') !== -1) break
-    }
-  }
-  return [lines, topIdx]
 }

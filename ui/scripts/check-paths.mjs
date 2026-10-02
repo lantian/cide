@@ -196,6 +196,26 @@ try {
 
   eq(texts(' M ui/package.json'), ['ui/package.json'], '`git status --short` is a two-column row')
 
+  {
+    const path = String.raw`.cide/worktrees/player-hover-outline/reports/e2e/unit\_inspection\_session/contact.png`
+    const line = `- Проверенные скриншоты (${path}).`
+    const candidate = only(line)
+    eq(candidate.text, '.cide/worktrees/player-hover-outline/reports/e2e/unit_inspection_session/contact.png',
+      'the reported screenshot is one decoded filename, not two partial paths')
+    eq(line.slice(candidate.start, candidate.end), path,
+      'the clickable span still covers the original escaped text')
+    eq(texts(String.raw`"reports/my\_session/contact shot.png"`),
+      ['reports/my_session/contact shot.png'], 'quoted spaces and Markdown escapes together')
+    eq(texts(String.raw`/tmp/unit\_inspection/contact.png:12:3`),
+      ['/tmp/unit_inspection/contact.png'], 'escaped absolute outside-project paths')
+    eq(only(String.raw`src/my\_file.ts:12:3`).column, 3,
+      'position suffixes are read after the displayed escape sequence')
+    eq(texts(String.raw`src/unit\q_session/contact.png`), [],
+      'unknown escapes cannot leave a clickable suffix')
+    eq(texts(String.raw`https://host/unit\_session/contact.png`), [],
+      'escaped URL text is still excluded from path matching')
+  }
+
   eq(
     texts('--- a/ui/package.json'),
     ['ui/package.json'],
@@ -851,6 +871,8 @@ try {
     '`@xterm/addon-web-links` stays removed: its default handler is window.open() on a URL ' +
       'parsed out of untrusted bytes, and the part worth having (LinkComputer) is not exported',
   )
+
+  await import('./check-path-buffer.mjs')
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

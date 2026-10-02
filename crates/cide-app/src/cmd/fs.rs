@@ -672,9 +672,9 @@ const MAX_PROBE: usize = 128;
 /// # What it deliberately cannot see
 ///
 /// The index is gitignore-filtered and does not descend through symlinked directories, so
-/// `target/debug/…` and `node_modules/…` answer `None` and never light up. That is the policy
-/// and not a gap: index membership is what makes an *offered* link contained by construction.
-/// The click is re-checked in Rust regardless — see `cmd::file::terminal_open_path` — because
+/// `target/debug/…` and `node_modules/…` answer `None`. Terminal links fall back to
+/// [`fs_stat_paths`] for these misses, so file-tree visibility does not decide whether a file
+/// is openable. The click is re-checked in Rust — see `cmd::file::terminal_open_path` — because
 /// this answer travelled through the webview and comes back as a claim, not as evidence.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_paths_exist(
@@ -701,7 +701,7 @@ pub async fn fs_paths_exist(
 }
 
 /// What is on **disk** at each of these paths — the oracle for terminal links that leave the
-/// project.
+/// project, or that the index excludes.
 ///
 /// [`fs_paths_exist`]'s disk-touching sibling, and a separate command rather than a flag on it
 /// because the two have different costs and the difference has to stay visible at the call site.
@@ -711,13 +711,10 @@ pub async fn fs_paths_exist(
 ///
 /// # Why the project-scoped one could not simply be relaxed
 ///
-/// Two properties would have gone with it. `fs_paths_exist` is asked from `provideLinks` while
-/// the pointer crosses a line of output, so *in-project hovering costs zero syscalls* — that is
-/// a design property, written down where it is relied on, and putting a `stat` behind the same
-/// name would have made every hover in every pane pay filesystem latency to buy a case that
-/// only arises for absolute paths naming somewhere else. Splitting them also puts the new cost
-/// in one greppable place: if terminal hovering ever gets slow on a stalled mount, this is the
-/// command to look at, and it has exactly one caller.
+/// `fs_paths_exist` remains an index-only fast path. The frontend uses this disk command for
+/// index misses as well as outside-project paths, and refreshes it on activation. Keeping the
+/// commands separate avoids disk work for indexed hover hits and makes filesystem latency
+/// visible at the call site.
 ///
 /// # What it does and does not reveal
 ///

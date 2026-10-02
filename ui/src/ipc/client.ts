@@ -660,10 +660,9 @@ export const fs = {
    * no `stat`s.
    *
    * `null` means "not in the index", which is a stronger statement than "not on disk": the
-   * index is gitignore-filtered and does not descend through symlinked directories, so
-   * `target/…`, `node_modules/…` and everything outside the project's roots answer `null` and
-   * never become links. Rejects while the project has no index yet; the caller treats that as
-   * "nothing lights up", not as an error worth showing.
+   * index is gitignore-filtered and does not descend through symlinked directories. Terminal
+   * links use `statPaths` for misses, including ignored worktree screenshots. Rejects while
+   * the project has no index yet; terminal links can still fall back to disk.
    */
   pathsExist: (projectId: ProjectId, paths: string[]) =>
     invoke<Array<TreeRowKind | null>>('fs_paths_exist', { project: projectId, paths }),
@@ -671,11 +670,8 @@ export const fs = {
   /**
    * The same question, answered from **disk** instead of from the index.
    *
-   * The oracle for the one case `pathsExist` structurally cannot answer: an absolute path
-   * outside every root, which the index will never hold however long it walks. One `stat` per
-   * path, clamped to the same 128, so it is asked *only* for the candidates
-   * `terminal/pathMatch.ts`'s `outsidePaths` produced — in-project hovering keeps its
-   * zero-syscall property, which is a design property of `pathsExist` and not an accident.
+   * Used for index misses and absolute outside-project paths. One `stat` per path, clamped
+   * to the same 128. Index hits avoid disk work on hover; activation refreshes disk answers.
    *
    * Not project-scoped, because the answer is not: it stats what it is given. A FIFO, a socket
    * and a device node all answer `null` rather than `'file'`, so the shape that would park a

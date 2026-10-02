@@ -196,7 +196,7 @@ try {
       'so without this every such candidate is silently "not a file" and never lights up',
   )
   ok(
-    /OUTSIDE_TTL_MS/.test(links),
+    /DISK_TTL_MS/.test(read('src/terminal/pathExistence.ts')),
     'out-of-project answers age out. `cide://fs-changed` is the project watcher\'s and does ' +
       'not reach them, so an entry in the exactly-invalidated cache would go stale for ever',
   )
