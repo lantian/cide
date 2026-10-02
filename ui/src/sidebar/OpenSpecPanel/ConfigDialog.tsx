@@ -211,7 +211,7 @@ function OpenSpecEditor({ project, onClose }: { project: ProjectId; onClose: () 
       try {
         const { nextBoard, nextConfig, nextSchemas } = await load()
         if (cancelled) return
-        setBoard(nextBoard)
+        setBoard(nextBoard?.board ?? null)
         setConfig(nextConfig)
         setSchemas(nextSchemas)
         setDraft(draftFrom(nextConfig))
@@ -266,7 +266,7 @@ function OpenSpecEditor({ project, onClose }: { project: ProjectId; onClose: () 
         specConfig.get(project),
         specConfig.schemas(project),
       ])
-      setBoard(nextBoard)
+      setBoard(nextBoard.board)
       setConfig(nextConfig)
       setSchemas(nextSchemas)
       setDraft(draftFrom(nextConfig))

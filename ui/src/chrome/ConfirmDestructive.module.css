@@ -25,3 +25,7 @@
   display: inline-flex;
   color: var(--red);
 }
+
+.virtualFiles {
+  height: min(45vh, 400px);
+}

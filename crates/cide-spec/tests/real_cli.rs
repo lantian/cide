@@ -427,7 +427,13 @@ fn a_change_archives_and_its_requirements_land_in_the_specs() {
         before.validation.issues
     );
 
-    os.archive(&change).expect("openspec archive");
+    let result = os.archive(&change).expect("openspec archive");
+    assert_eq!(result.root, scratch.0);
+    assert!(result.path.is_dir());
+    assert_eq!(
+        result.path.file_name().unwrap().to_str(),
+        Some(result.archived_as.as_str())
+    );
 
     // The requirement is in the spec now…
     let spec_file = scratch.0.join("openspec/specs/dark-mode/spec.md");
@@ -461,12 +467,9 @@ fn a_change_archives_and_its_requirements_land_in_the_specs() {
      * a fixture, because the date stamp and the directory shape are upstream's and the unit test
      * one file over can only assert cide's reading of what cide wrote.
      */
-    assert!(
-        os.change(&change).is_err(),
-        "if the CLI ever learns to read an archive, the fallback below is dead code"
-    );
-    let archived = cide_spec::archived_change(&scratch.0, &change)
-        .expect("the archived change reads back off the disk");
+    let archived = os
+        .change(&change)
+        .expect("archived change reads without active-change CLI commands");
     match &archived.origin {
         cide_ipc::SpecOrigin::Archived { folder } => assert!(
             folder.ends_with(change.as_str()),
@@ -708,4 +711,30 @@ fn a_concurrent_write_is_refused_rather_than_clobbered() {
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "spawns the real openspec CLI"]
+fn archive_refusals_preserve_the_active_change() {
+    let (scratch, os, change, _) = seeded("archive-refusal");
+    write_file(
+        &scratch.0.join("openspec/changes/add-dark-mode/tasks.md"),
+        "- [x] Done\n",
+    );
+    write_file(
+        &scratch
+            .0
+            .join("openspec/changes/add-dark-mode/specs/dark-mode/spec.md"),
+        &delta(
+            "MODIFIED",
+            "Does not exist",
+            "The app SHALL refuse a missing requirement.",
+            &[("Refusal", "the original is absent")],
+        ),
+    );
+    assert!(
+        os.archive(&change).is_err(),
+        "a missing canonical requirement cannot be archived"
+    );
+    assert!(scratch.0.join("openspec/changes/add-dark-mode").is_dir());
 }

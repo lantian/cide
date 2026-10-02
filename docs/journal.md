@@ -17289,3 +17289,10 @@ The main tab, switcher and detached header now name the primary pane's recorded 
 The menu regression check covers all three harnesses, legacy snapshots and an auxiliary pane
 running another harness. TypeScript, menu-model, tab-overflow and detached-window checks pass;
 the caption change was not visually confirmed in the live IDE.
+
+The project harness selector's extra inheritance choice exceeded the generic form row's
+reserved label width and moved the control below its label. This row now reserves less width
+for its short text, keeping both scopes aligned on the right at the usual Settings width.
+Headless Chromium reproduced the original wrap and verified both scopes at a 620px row,
+plus scaled widths for UI sizes 11 and 17 in light and dark themes. The mounted harness
+control check, TypeScript and UI scale check pass.

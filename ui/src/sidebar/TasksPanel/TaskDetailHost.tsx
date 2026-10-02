@@ -113,7 +113,7 @@ import type { ArmedDelete, FieldEdit, LinkChip, LinkTargetOption, RunRef } from 
 import type { LinkAdd } from './TaskDetail'
 import { openTaskSpec, approveTaskSpec } from './openSpec'
 import { taskSpecSessions, taskSpecPhase } from './specSessions'
-import { followSpecRuns, openSession as openSpecSession, useSpecRuns } from '../OpenSpecPanel/specRuns'
+import { openSession as openSpecSession, useSpecRuns } from '../OpenSpecPanel/specRuns'
 
 /** How often the comment log's ages are recomputed. See the header for why it is not 1 s. */
 const TICK_MS = 30_000
@@ -137,7 +137,6 @@ function TaskDetailHostImpl() {
   // their events also preserves the link after the user switches away from OpenSpec.
   const specRuns = useSpecRuns((s) => s.runs)
   const specRunsProject = useSpecRuns((s) => s.project)
-  useEffect(() => followSpecRuns(project, false), [project])
 
   /*
    * The join with the agents store — see the header. All four selectors return stored values

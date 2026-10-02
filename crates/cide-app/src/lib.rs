@@ -50,6 +50,7 @@ mod opencode_console;
 pub mod running;
 mod spec_reveal;
 mod spec_state;
+mod spec_cache;
 mod spec_triggers;
 /// The timer that wakes a project which has gone quiet with work still open. (M79)
 ///

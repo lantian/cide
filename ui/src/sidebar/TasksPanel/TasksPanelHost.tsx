@@ -88,7 +88,7 @@ import { basename, type StagedAttachment } from './model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { useWorkspace } from '@/store/workspace'
 import { useSpec } from '../specStore'
-import { followSpecRuns, useSpecRuns } from '../OpenSpecPanel/specRuns'
+import { useSpecRuns } from '../OpenSpecPanel/specRuns'
 import { useAgents } from '@/sidebar/agentsStore'
 import { rosterColors, rosterRoles } from '@/sidebar/AgentsPanel/model'
 import { TasksPanelView } from './TasksPanel'
@@ -116,7 +116,6 @@ function TasksPanelImpl({ project }: TasksPanelProps) {
   const proposalRunMode = useWorkspace((s) => s.boot?.workspace.settings.taskProposalRunMode ?? 'background')
   const specRuns = useSpecRuns((s) => s.runs)
   const specRunsProject = useSpecRuns((s) => s.project)
-  useEffect(() => followSpecRuns(project, false), [project])
   const board = useTasks((s) => s.board)
   const selected = useTasks((s) => s.selected)
   const compose = useTasks((s) => s.compose)

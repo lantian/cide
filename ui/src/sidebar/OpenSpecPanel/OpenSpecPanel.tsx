@@ -13,6 +13,8 @@
  * transfers to the CLI, to the docs, and to a teammate's editor. A cide-flavoured vocabulary
  * would have to be translated at every one of those boundaries.
  */
+import { memo, useMemo } from 'react'
+import { VirtualList } from '@/chrome/VirtualList'
 import { Icon, asIcon } from '@/icons/Icon'
 import { Badge, Dot } from '@/kit/components/Status'
 import { Button, IconButton } from '@/kit/components/Button'
@@ -187,7 +189,7 @@ export function OpenSpecPanelView(props: OpenSpecPanelViewProps) {
         * nothing to offer, which is `ChangesTree`'s rule.
         */}
       <div
-        className={styles.body}
+        className={cx(styles.body, board.kind === 'ready' && styles.readyBody)}
         data-audit="openspecBody"
         onContextMenu={props.onContextMenu}
       >
@@ -287,7 +289,13 @@ function body(props: OpenSpecPanelViewProps) {
     )
   }
 
-  const rows = specRows(board, props.expanded, props.tasks)
+  return <ReadyBody {...props} />
+}
+
+function ReadyBody(props: OpenSpecPanelViewProps) {
+  const { board } = props
+  const rows = useMemo(() => specRows(board, props.expanded, props.tasks), [board, props.expanded, props.tasks])
+
 
   return (
     <>
@@ -373,9 +381,15 @@ function body(props: OpenSpecPanelViewProps) {
           ))}
         </div>
       )}
-      {rows.map((row) => (
-        <Row key={`${row.kind}:${row.id}`} row={row} props={props} />
-      ))}
+      {rows.length > 100 ? (
+        <VirtualList items={rows} itemKey={(row) => `${row.kind}:${row.id}`}
+          estimateSize={(row) => row.kind === 'change' ? 118 : 30}
+          className={styles.rows} render={(row) => <MemoRow row={row} props={props} />} />
+      ) : (
+        <div className={styles.rows}>
+          {rows.map((row) => <MemoRow key={`${row.kind}:${row.id}`} row={row} props={props} />)}
+        </div>
+      )}
     </>
   )
 }
@@ -448,6 +462,18 @@ function Row({ row, props }: { row: SpecRow; props: OpenSpecPanelViewProps }) {
   return <ChangeRow row={row} props={props} />
 }
 
+// A checklist update should render its own row, without walking every card's JSX.
+const MemoRow = memo(Row, (previous, next) => {
+  if (JSON.stringify(previous.row) !== JSON.stringify(next.row)) return false
+  const a = previous.props, b = next.props, id = next.row.id
+  return a.expanded[id] === b.expanded[id] && a.tracker === b.tracker
+    && JSON.stringify(a.checkouts?.[id]) === JSON.stringify(b.checkouts?.[id])
+    && JSON.stringify(a.sessions?.byChange[id]) === JSON.stringify(b.sessions?.byChange[id])
+    && a.onToggleSection === b.onToggleSection && a.onOpenSpec === b.onOpenSpec
+    && a.onOpenChange === b.onOpenChange && a.onRowAction === b.onRowAction
+    && a.onReadyAct === b.onReadyAct && a.onOpenSession === b.onOpenSession
+})
+
 /**
  * A change row: the row itself opens the proposal, the action beside it starts or opens the work.
  *
@@ -462,8 +488,8 @@ function ChangeRow({ row, props }: { row: SpecRow & { kind: 'change' }; props: O
   const progress = rowProgress(row, checkout)
   const session = props.sessions?.byChange[row.id]
   const acts =
-    progress.stage === 'ready' && props.onReadyAct !== undefined
-      ? readyActs(checkout !== null)
+    (progress.stage === 'ready' || progress.stage === 'archived') && props.onReadyAct !== undefined
+      ? readyActs(checkout !== null).filter((act) => progress.stage !== 'archived' || act.id !== 'archive')
       : []
   const pct = progress.total === 0 ? 0 : Math.round((progress.done / progress.total) * 100)
   return (
@@ -555,7 +581,7 @@ function ChangeRow({ row, props }: { row: SpecRow & { kind: 'change' }; props: O
             data-write="true"
             /* The reason *is* the tooltip when there is one, and the button goes inert with it. */
             title={action.disabledReason ?? action.title}
-            disabled={action.disabledReason !== undefined}
+            disabled={action.disabledReason !== undefined || progress.stage === 'archived'}
             data-disabled={action.disabledReason === undefined ? undefined : 'true'}
             onClick={() => props.onRowAction(row.id, action.id)}
           >

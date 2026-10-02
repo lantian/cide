@@ -30,4 +30,4 @@ specsTouched: Array<SpecTouch>,
  * Empty means the gesture will go through. Non-empty is the list of sentences to draw
  * instead of the button, each naming what to do next.
  */
-refusals: Array<string>, };
+refusals: Array<string>, archiveRoot: string, };

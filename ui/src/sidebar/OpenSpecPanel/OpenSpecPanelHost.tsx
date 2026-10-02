@@ -31,7 +31,7 @@ import {
   type TrackerKind,
 } from './model'
 import { useApplyDialog } from './ApplyDialog'
-import { followSpecRuns, openSession, useSpecRuns } from './specRuns'
+import { openSession, useSpecRuns } from './specRuns'
 import { archiveChange, runReadyAct } from './specActs'
 import { ConfigDialog } from './ConfigDialog'
 import { reloadConsoleAfterSetUp } from './consoleReload'
@@ -44,7 +44,6 @@ export interface OpenSpecPanelProps {
 function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
   const board = useSpec((state) => state.board)
   const busy = useSpec((state) => state.busy)
-  const attach = useSpec((state) => state.attach)
   const refresh = useSpec((state) => state.refresh)
   const setUp = useSpec((state) => state.setUp)
 
@@ -117,12 +116,11 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
    */
   const runs = useSpecRuns((state) => state.runs)
   const checkoutRows = useSpecRuns((state) => state.checkouts)
-  useEffect(() => followSpecRuns(project), [project])
   const sessions = useMemo(() => sessionViews(runs), [runs])
   const checkouts = useMemo(() => {
     const byChange: Record<string, CheckoutProgress> = {}
     for (const checkout of checkoutRows) {
-      byChange[checkout.change] = { done: checkout.completedTasks, total: checkout.totalTasks }
+      byChange[checkout.change] = { done: checkout.completedTasks, total: checkout.totalTasks, archivedAs: checkout.archivedAs }
     }
     return byChange
   }, [checkoutRows])
@@ -137,23 +135,6 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
     [project],
   )
 
-  useEffect(() => {
-    attach(project)
-    /*
-     * And a read on **every mount**, not only when the project changes.
-     *
-     * This panel is conditionally rendered, so a mount *is* the user opening it — which makes
-     * this the one moment a re-read is certainly wanted and certainly affordable. It is also the
-     * recovery path for a board that went stale: the watcher can miss a burst (an agent writing
-     * a whole change tree faster than a directory watch can be taken), and without this the only
-     * way back to the truth was relaunching cide. `attach` is a no-op when the project has not
-     * changed, so the two together are exactly one read.
-     */
-    if (project !== null) void refresh().catch(notifyFailure)
-    // Deliberately mount-only: `refresh` is stable and re-running this on every render would put
-    // two subprocesses behind every keystroke that touches this component.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [attach, project])
 
   const onToggleSection = useCallback((id: string) => {
     setExpanded((current) => ({ ...current, [id]: current[id] === false }))
@@ -204,7 +185,7 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
   }, [setUp, project])
 
   const onRetry = useCallback(() => {
-    void refresh().catch(notifyFailure)
+    void refresh(true).catch(notifyFailure)
   }, [refresh])
 
   /*
@@ -342,7 +323,7 @@ function OpenSpecPanelImpl({ project }: OpenSpecPanelProps) {
           changeRowActions({
             done: checkout?.done ?? row.completed,
             total: checkout?.total ?? row.total,
-          }),
+          }).filter((action) => !checkout?.archivedAs || action.id === 'open'),
           (action) => runChange(name, action),
         )
       }

@@ -948,6 +948,10 @@ pub(crate) fn close_project_here(
         Ok(Mutated { rev: ws.rev })
     })?;
 
+    if let Some(boards) = app.try_state::<std::sync::Arc<crate::spec_state::SpecBoards>>() {
+        boards.remove(project);
+    }
+
     // Only once the close has happened: `close_project` refuses an unsaved buffer, and a
     // layout remembered before the refusal would describe a project that is still open.
     let sessions = record.as_ref().map(sessions_of).unwrap_or_default();

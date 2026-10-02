@@ -41,6 +41,35 @@ use ts_rs::TS;
 
 use crate::ids::{ChangeName, ProjectId, SpecId};
 
+/// A board and the project generation it represents. Commands and events use the same clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpecSnapshot {
+    #[ts(type = "number")]
+    pub revision: u64,
+    pub board: SpecBoard,
+}
+
+/// Paths are relative to the project, including the checkout prefix for worktree edits.
+/// Full invalidation is reserved for ambiguous directory events, configuration, and Retry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpecInvalidation {
+    pub full: bool,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpecChanged {
+    pub project: ProjectId,
+    pub snapshot: SpecSnapshot,
+    pub invalidated: SpecInvalidation,
+}
+
 /// What cide can say about a project's `openspec/` right now.
 ///
 /// Three shapes rather than an empty list, on [`crate::TaskBoard`]'s argument: an empty board
@@ -510,6 +539,9 @@ pub struct SpecAcceptPlan {
     /// Empty means the gesture will go through. Non-empty is the list of sentences to draw
     /// instead of the button, each naming what to do next.
     pub refusals: Vec<String>,
+    // Checkout in which the archive will actually be written.
+    #[ts(type = "string")]
+    pub archive_root: PathBuf,
 }
 
 /// One capability an archive would change.
@@ -542,6 +574,7 @@ pub enum SpecAccepted {
         commit: Option<String>,
         files: u32,
         change: ChangeName,
+        archive: SpecArchiveResult,
     },
     /// The plan said no. Nothing was merged and nothing was archived.
     Refused { plan: SpecAcceptPlan },
@@ -551,6 +584,18 @@ pub enum SpecAccepted {
     /// would put behaviour into `openspec/specs/` that the checked-out branch does not implement,
     /// and every later run would read it as true.
     Conflicts { paths: Vec<String> },
+}
+
+/// A CLI-confirmed archive destination, distinct from a preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpecArchiveResult {
+    #[ts(type = "string")]
+    pub root: PathBuf,
+    pub archived_as: String,
+    #[ts(type = "string")]
+    pub path: PathBuf,
 }
 
 /* ==============================================================================================
@@ -835,6 +880,9 @@ pub struct SpecCheckout {
     pub completed_tasks: Option<u32>,
     #[ts(optional)]
     pub total_tasks: Option<u32>,
+    // Archived in this checkout; its root copy may still await integration.
+    #[ts(optional)]
+    pub archived_as: Option<String>,
 }
 
 /// What Publish did: the work committed and the branch pushed.

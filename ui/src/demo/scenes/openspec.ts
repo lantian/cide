@@ -1,4 +1,4 @@
-import type { SpecArtifactText, SpecBoard, SpecChange, TaskBoard } from '../../ipc/generated'
+import type { SpecArtifactText, SpecChange, TaskBoard } from '../../ipc/generated'
 import { PROPOSAL, SPEC_BOARD, SPEC_CHANGE } from '../data/openspec'
 import { click, showPanel } from '../drive'
 import type { Scene } from '../scenes'
@@ -16,7 +16,7 @@ export const openspec: Scene = {
     // editor pane — `cmd/spec.rs` opens it exactly so.
     const host = pane('editor', 'openspec')
     world.open(tab({ kind: 'openSpec', subject: { kind: 'change', change: SPEC_CHANGE.name } }, leaf(host.id), [host]))
-    handlers.set('spec_board', (): SpecBoard => SPEC_BOARD)
+    handlers.set('spec_board', () => ({ revision: 1, board: SPEC_BOARD }))
     handlers.set('spec_change', (): SpecChange => SPEC_CHANGE)
     handlers.set('spec_artifact', (): SpecArtifactText => PROPOSAL)
     // A read tracker, even an empty one: while it is unread every *Start work* is greyed out,

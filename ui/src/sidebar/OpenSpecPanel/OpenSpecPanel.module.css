@@ -594,3 +594,6 @@ button.caption:hover {
 .editorProblemLine {
   font-family: var(--font-mono);
 }
+
+.readyBody { display: flex; flex-direction: column; overflow: hidden; }
+.rows { flex: 1 1 auto; min-height: 0; overflow-y: auto; }

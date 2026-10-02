@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 use cide_core::CoreError;
 use cide_ipc::{
-    ChangeName, ProjectId, SpecBoard, SpecChange, SpecConfig, SpecConfigEdit, SpecRequirementSet,
-    SpecSchema, SpecValidation, SpecWriteOutcome,
+    ChangeName, ProjectId, SpecChange, SpecConfig, SpecConfigEdit, SpecRequirementSet, SpecSchema,
+    SpecValidation, SpecWriteOutcome,
 };
 use cide_spec::{Openspec, SpecError};
 use tauri::{AppHandle, Manager as _, State};
@@ -127,9 +127,15 @@ pub(super) fn open(cwd: PathBuf) -> Result<Openspec> {
 /// "the tool that reads it is missing" and "it is set up and nothing is in flight" are three
 /// different screens with three different next actions.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn spec_board(state: State<'_, WorkspaceState>, project: ProjectId) -> Result<SpecBoard> {
+pub async fn spec_board(
+    state: State<'_, WorkspaceState>,
+    boards: State<'_, Arc<SpecBoards>>,
+    project: ProjectId,
+    force: Option<bool>,
+) -> Result<cide_ipc::SpecSnapshot> {
     let root = tasks_state::project_root(&state, project)?;
-    blocking(move || Ok(crate::spec_state::read_at(&root))).await
+    let reader = boards.project(project);
+    blocking(move || Ok(reader.snapshot(&root, force.unwrap_or(false)))).await
 }
 
 /// One change in full: its deltas, its artifacts, its checklist and its verdict.
@@ -152,18 +158,15 @@ pub async fn spec_board(state: State<'_, WorkspaceState>, project: ProjectId) ->
 /// change.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn spec_change(
+    boards: State<'_, Arc<SpecBoards>>,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     change: ChangeName,
     worktree: Option<PathBuf>,
 ) -> Result<SpecChange> {
     let cwd = working_dir(&state, project, worktree)?;
-    blocking(move || match open(cwd.clone())?.change(&change) {
-        Ok(live) => Ok(live),
-        Err(error) => cide_spec::archived_change(&cwd, &change)
-            .ok_or_else(|| CoreError::Io(error.to_string())),
-    })
-    .await
+    let reader = boards.project(project);
+    blocking(move || reader.change(&cwd, &change).map_err(CoreError::Io)).await
 }
 
 /// One artifact file's text — a proposal, a design, a checklist.
@@ -173,22 +176,15 @@ pub async fn spec_change(
 /// nobody has expanded. See `cide_spec::Openspec::artifact` for the jail and the size cap.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn spec_artifact(
+    boards: State<'_, Arc<SpecBoards>>,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     path: PathBuf,
     worktree: Option<PathBuf>,
 ) -> Result<cide_ipc::SpecArtifactText> {
     let cwd = working_dir(&state, project, worktree)?;
-    blocking(move || {
-        let text = open(cwd)?
-            .artifact(&path)
-            .map_err(|error| CoreError::Io(error.to_string()))?;
-        Ok(cide_ipc::SpecArtifactText {
-            text: text.text,
-            truncated: text.truncated,
-        })
-    })
-    .await
+    let reader = boards.project(project);
+    blocking(move || reader.artifact(&cwd, &path).map_err(CoreError::Io)).await
 }
 
 /// Validate one change, or everything.
@@ -241,19 +237,22 @@ pub async fn spec_init(
     boards: State<'_, Arc<SpecBoards>>,
     project: ProjectId,
     context: Option<String>,
-) -> Result<SpecBoard> {
+) -> Result<cide_ipc::SpecSnapshot> {
     let root = tasks_state::project_root(&state, project)?;
     let boards = Arc::clone(&boards);
-    let board = blocking(move || {
+    let root_for_work = root.clone();
+    blocking(move || {
+        let root = root_for_work;
         init_at(&root, context.as_deref())?;
-        Ok(crate::spec_state::read_at(&root))
+        Ok(())
     })
     .await?;
     // The directory arriving is also a watcher event, so the other windows would learn about it
     // anyway — but a beat later, and through a path that is allowed to be slow. Marking here is
     // what makes them agree with this one immediately.
     boards.mark_changed(&app, project);
-    Ok(board)
+    let reader = boards.project(project);
+    blocking(move || Ok(reader.snapshot(&root, false))).await
 }
 
 /// `openspec init` in `root`, then the optional `context:` — the body of [`spec_init`], callable
@@ -307,18 +306,21 @@ pub async fn spec_propose(
     change: ChangeName,
     title: String,
     body: Option<String>,
-) -> Result<SpecBoard> {
+) -> Result<cide_ipc::SpecSnapshot> {
     let root = tasks_state::project_root(&state, project)?;
     let boards = Arc::clone(&boards);
-    let board = blocking(move || {
+    let root_for_work = root.clone();
+    blocking(move || {
+        let root = root_for_work;
         open(root.clone())?
             .propose(&change, &title, body.as_deref().unwrap_or_default())
             .map_err(|error| CoreError::Io(error.to_string()))?;
-        Ok(crate::spec_state::read_at(&root))
+        Ok(())
     })
     .await?;
     boards.mark_changed(&app, project);
-    Ok(board)
+    let reader = boards.project(project);
+    blocking(move || Ok(reader.snapshot(&root, false))).await
 }
 
 /// Replace one requirement block in one delta file.
@@ -338,6 +340,8 @@ pub async fn spec_requirement_set(
     let cwd = working_dir(&state, req.project, worktree)?;
     let project = req.project;
     let boards = Arc::clone(&boards);
+    let changed = cwd.join("openspec/changes").join(req.change.as_str());
+    let root = tasks_state::project_root(&state, project)?;
     let outcome = blocking(move || {
         let os = open(cwd)?;
         cide_spec::write::set_requirement(
@@ -352,7 +356,7 @@ pub async fn spec_requirement_set(
     })
     .await?;
     if matches!(outcome, SpecWriteOutcome::Written { .. }) {
-        boards.mark_changed(&app, project);
+        boards.mark_paths(&app, project, &[changed], &root);
     }
     Ok(outcome)
 }
@@ -1134,8 +1138,6 @@ pub async fn spec_accept(
     project: ProjectId,
     task: cide_ipc::TaskId,
 ) -> Result<cide_ipc::SpecAccepted> {
-    use cide_ipc::{SpecAccepted, TaskAuthor, TaskEdit, TaskStatus};
-
     let root = tasks_state::project_root(&state, project)?;
     let store = stores.ensure(project, &root);
     let boards = Arc::clone(&boards);
@@ -1143,84 +1145,111 @@ pub async fn spec_accept(
     let store_for_work = Arc::clone(&store);
     let root_for_work = root.clone();
     let task_for_work = task.clone();
+    let reader = boards.project(project);
     let outcome = blocking(move || {
-        let plan = plan_accept(&root_for_work, &store_for_work, &task_for_work)?;
-        if !plan.refusals.is_empty() {
-            return Ok(SpecAccepted::Refused { plan });
-        }
-        let Some(row) = store_for_work.get(&task_for_work) else {
-            return Err(CoreError::Io(format!("no such task: {task_for_work}")));
-        };
-        let Some(change) = row.change.clone() else {
-            return Err(CoreError::Io("this task names no OpenSpec change".into()));
-        };
-
-        // 1. The merge. A conflict returns here, with nothing archived.
-        let (commit, files) = match row.agent.as_ref().filter(|_| plan.branch.is_some()) {
-            Some(agent) => {
-                match crate::cmd::agents::integrate_for(
-                    &root_for_work,
-                    agent,
-                    Some(&task_for_work),
-                )? {
-                    crate::cmd::agents::AgentIntegration::Conflicts { paths } => {
-                        return Ok(SpecAccepted::Conflicts { paths });
-                    }
-                    crate::cmd::agents::AgentIntegration::Merged { commit, files } => {
-                        (Some(commit), files as u32)
-                    }
-                    crate::cmd::agents::AgentIntegration::UpToDate => (None, 0),
-                }
-            }
-            // A `worktree: false` role commits into the checked-out tree, so there is nothing to
-            // merge. Not a refusal — see `SpecAcceptPlan::branch`.
-            None => (None, 0),
-        };
-
-        // 2. The archive, from the **project root**: the merge has just put the deltas there.
-        open(root_for_work.clone())?
-            .archive(&change)
-            .map_err(|error| CoreError::Io(error.to_string()))?;
-
-        // 3. And the task is done — authored `User`, because a person pressed a button, and
-        //    since M27 `Task::history` records that claim where the card shows it.
-        let _ = store_for_work.edit(
-            &task_for_work,
-            TaskEdit::SetStatus {
-                status: TaskStatus::Done,
-            },
-            TaskAuthor::User,
-        );
-        Ok(SpecAccepted::Accepted {
-            commit,
-            files,
-            change,
-        })
+        reader
+            .archive(&root_for_work, || {
+                reader
+                    .foreground(|| accept_at(&root_for_work, &store_for_work, &task_for_work))
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(CoreError::Io)
     })
-    .await?;
+    .await;
+    boards.mark_changed(&app, project);
+    let outcome = outcome?;
 
     if matches!(outcome, cide_ipc::SpecAccepted::Accepted { .. }) {
         crate::tasks_state::broadcast(&app, project, &store);
-        boards.mark_changed(&app, project);
     }
     Ok(outcome)
+}
+
+fn accept_at(
+    root: &std::path::Path,
+    store: &cide_tasks::TaskStore,
+    task: &cide_ipc::TaskId,
+) -> Result<cide_ipc::SpecAccepted> {
+    use cide_ipc::{SpecAccepted, TaskAuthor, TaskEdit, TaskStatus};
+    let plan = plan_accept(root, store, task)?;
+    if !plan.refusals.is_empty() {
+        return Ok(SpecAccepted::Refused { plan });
+    }
+    let Some(row) = store.get(task) else {
+        return Err(CoreError::Io(format!("no such task: {task}")));
+    };
+    let Some(change) = row.change.clone() else {
+        return Err(CoreError::Io("this task names no OpenSpec change".into()));
+    };
+
+    // 1. The merge. A conflict returns here, with nothing archived.
+    let (commit, files) = match row.agent.as_ref().filter(|_| plan.branch.is_some()) {
+        Some(agent) => match crate::cmd::agents::integrate_for(root, agent, Some(task))? {
+            crate::cmd::agents::AgentIntegration::Conflicts { paths } => {
+                return Ok(SpecAccepted::Conflicts { paths });
+            }
+            crate::cmd::agents::AgentIntegration::Merged { commit, files } => {
+                (Some(commit), files as u32)
+            }
+            crate::cmd::agents::AgentIntegration::UpToDate => (None, 0),
+        },
+        // A `worktree: false` role commits into the checked-out tree, so there is nothing to
+        // merge. Not a refusal — see `SpecAcceptPlan::branch`.
+        None => (None, 0),
+    };
+
+    // 2. The archive, from the **project root**: the merge has just put the deltas there.
+    let archive = open(root.to_path_buf()).and_then(|os| os.archive(&change).map_err(|error| CoreError::Io(error.to_string()))).map_err(|error| {
+        CoreError::Io(if commit.is_some() {
+            format!("The branch was integrated, but archive success is not confirmed: {error}. The task remains open.")
+        } else { error.to_string() })
+    })?;
+
+    // 3. And the task is done — authored `User`, because a person pressed a button, and
+    //    since M27 `Task::history` records that claim where the card shows it.
+    store.edit(
+        task,
+        TaskEdit::SetStatus {
+            status: TaskStatus::Done,
+        },
+        TaskAuthor::User,
+    ).map_err(|error| CoreError::Io(format!("Archived to {}, but could not mark the task done: {error}. Update the task status manually.", archive.path.display())))?;
+    Ok(SpecAccepted::Accepted {
+        commit,
+        files,
+        change,
+        archive,
+    })
 }
 
 /// What archiving this change would do, without a task in the picture.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn spec_change_plan(
     state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<crate::tasks_state::TasksStores>>,
+    boards: State<'_, Arc<SpecBoards>>,
     project: ProjectId,
     change: ChangeName,
+    force: Option<bool>,
 ) -> Result<cide_ipc::SpecAcceptPlan> {
     let root = tasks_state::project_root(&state, project)?;
-    // Where Archive will actually run — `spec_change_archive`'s rule — so the preview's
-    // checklist count is the one the archive will be refused or allowed on.
+    let store = stores.ensure(project, &root);
+    let reader = boards.project(project);
+    if force.unwrap_or(false) {
+        reader.invalidate(
+            &root,
+            &cide_ipc::SpecInvalidation {
+                full: true,
+                paths: vec![],
+            },
+        );
+    }
     blocking(move || {
-        plan_change(
-            &super::spec_sessions::archive_dir(&root, &change.0),
-            &change,
-        )
+        let dir = super::spec_sessions::archive_dir(&root, &change.0);
+        let detail = reader.change(&dir, &change).map_err(CoreError::Io)?;
+        let mut plan = plan_detail(&dir, &change, &detail);
+        add_linked_refusals(&root, &store, &change, &mut plan);
+        Ok(plan)
     })
     .await
 }
@@ -1245,68 +1274,57 @@ pub async fn spec_change_archive(
     boards: State<'_, Arc<SpecBoards>>,
     project: ProjectId,
     change: ChangeName,
+    expected_root: PathBuf,
 ) -> Result<cide_ipc::SpecAccepted> {
     use cide_ipc::SpecAccepted;
-
     let root = tasks_state::project_root(&state, project)?;
     let store = stores.ensure(project, &root);
-    let boards = Arc::clone(&boards);
-
-    let root_for_work = root.clone();
-    let change_for_work = change.clone();
-    let store_for_work = Arc::clone(&store);
-    let outcome = blocking(move || {
-        // A change applied in its own worktree (`spec_sessions`) is archived **there** while the
-        // worktree still holds work the project's branch lacks: that is where its ticked
-        // checklist is, and the archive then lands with Publish or Integrate instead of putting
-        // requirements into the root's `specs/` ahead of the code. Anywhere else, the root.
-        let dir = super::spec_sessions::archive_dir(&root_for_work, &change_for_work.0);
-        let mut plan = plan_change(&dir, &change_for_work)?;
-
-        // A task on this change whose role has a live worktree means there is code to merge, and
-        // this path cannot merge it. Refuse and name where the gesture that can lives, rather
-        // than writing requirements into `specs/` that the checked-out tree does not implement.
-        let linked: Vec<cide_ipc::TaskRow> = store_for_work
-            .list()
-            .into_iter()
-            .filter(|task| task.change.as_ref() == Some(&change_for_work))
-            .collect();
-        for task in &linked {
-            let Some(agent) = task.agent.as_ref() else {
-                continue;
-            };
-            let name = cide_agents::checkout_name(agent, Some(&task.id));
-            let known = cide_git::worktree::list(&root_for_work).unwrap_or_default();
-            if known.iter().any(|tree| tree.agent == name) {
-                plan.refusals.push(format!(
-                    "{} is working this change in .cide/worktrees/{name}, and archiving from \
-                     here would not merge it — the requirements would land in openspec/specs/ \
-                     while the code stayed on cide/{name}. Open task {} and use Integrate & \
-                     Archive, which does both in that order.",
-                    agent, task.id
-                ));
+    let reader = boards.project(project);
+    let result = blocking(move || {
+        let dir = super::spec_sessions::archive_dir(&root, &change.0);
+        if dir.canonicalize().unwrap_or_else(|_| dir.clone())
+            != expected_root.canonicalize().unwrap_or_else(|_| expected_root.clone()) {
+            return Err(CoreError::Io("The archive destination changed. Review a fresh preview before archiving.".into()));
+        }
+        reader.archive(&dir, || reader.foreground(|| {
+            let mut plan = plan_change(&dir, &change).map_err(|e| e.to_string())?;
+            add_linked_refusals(&root, &store, &change, &mut plan);
+            if !plan.refusals.is_empty() { return Ok(SpecAccepted::Refused { plan }); }
+            // Queueing and fresh validation can take seconds; recheck immediately before writing.
+            let current = super::spec_sessions::archive_dir(&root, &change.0);
+            if current.canonicalize().unwrap_or(current) != expected_root.canonicalize().unwrap_or_else(|_| expected_root.clone()) {
+                return Err("The archive destination changed. Review a fresh preview before archiving.".into());
             }
+            let archive = open(dir.clone()).map_err(|e| e.to_string())?
+                .archive(&change).map_err(|e| e.to_string())?;
+            Ok(SpecAccepted::Accepted { commit: None, files: 0, change: change.clone(), archive })
+        })).map_err(CoreError::Io)
+    }).await;
+    // Even a timeout/error may follow file edits. Always reconcile and never retry implicitly.
+    boards.mark_changed(&app, project);
+    result
+}
+
+fn add_linked_refusals(
+    root: &std::path::Path,
+    store: &cide_tasks::TaskStore,
+    change: &ChangeName,
+    plan: &mut cide_ipc::SpecAcceptPlan,
+) {
+    let known = cide_git::worktree::list(root).unwrap_or_default();
+    for task in store
+        .list()
+        .into_iter()
+        .filter(|task| task.change.as_ref() == Some(change))
+    {
+        let Some(agent) = task.agent.as_ref() else {
+            continue;
+        };
+        let name = cide_agents::checkout_name(agent, Some(&task.id));
+        if known.iter().any(|tree| tree.agent == name) {
+            plan.refusals.push(format!("{agent} is working this change in .cide/worktrees/{name}. Open task {} and use Integrate & Archive to merge its code before archiving.", task.id));
         }
-
-        if !plan.refusals.is_empty() {
-            return Ok(SpecAccepted::Refused { plan });
-        }
-
-        open(dir)?
-            .archive(&change_for_work)
-            .map_err(|error| CoreError::Io(error.to_string()))?;
-        Ok(SpecAccepted::Accepted {
-            commit: None,
-            files: 0,
-            change: change_for_work,
-        })
-    })
-    .await?;
-
-    if matches!(outcome, SpecAccepted::Accepted { .. }) {
-        boards.mark_changed(&app, project);
     }
-    Ok(outcome)
 }
 
 /// Everything accepting would do, and every reason it would not.
@@ -1363,12 +1381,18 @@ fn plan_change(
     root: &std::path::Path,
     change: &cide_ipc::ChangeName,
 ) -> Result<cide_ipc::SpecAcceptPlan> {
-    use cide_ipc::{SpecAcceptPlan, SpecTouch};
-
-    let os = open(root.to_path_buf())?;
-    let detail = os
+    let detail = open(root.to_path_buf())?
         .change(change)
         .map_err(|error| CoreError::Io(error.to_string()))?;
+    Ok(plan_detail(root, change, &detail))
+}
+
+fn plan_detail(
+    root: &std::path::Path,
+    change: &ChangeName,
+    detail: &SpecChange,
+) -> cide_ipc::SpecAcceptPlan {
+    use cide_ipc::{SpecAcceptPlan, SpecTouch};
     let change = change.clone();
 
     let specs_touched: Vec<SpecTouch> = detail
@@ -1384,6 +1408,9 @@ fn plan_change(
     // Each refusal names the next action. A greyed control with no sentence is a dead control
     // in grey — `cide_core::commands`' rule, applied to a button.
     let mut refusals = Vec::new();
+    if matches!(detail.origin, cide_ipc::SpecOrigin::Archived { .. }) {
+        refusals.push("This change is already archived in this checkout.".into());
+    }
     if detail.progress.total > 0 && detail.progress.completed < detail.progress.total {
         refusals.push(format!(
             "{} of {} steps are still unticked in this change's task list. Archiving now would \
@@ -1406,7 +1433,8 @@ fn plan_change(
         );
     }
 
-    Ok(SpecAcceptPlan {
+    SpecAcceptPlan {
+        archive_root: root.to_path_buf(),
         change,
         // Filled in by `plan_accept` when a task names a role whose worktree exists.
         branch: None,
@@ -1414,7 +1442,7 @@ fn plan_change(
         total_tasks: detail.progress.total,
         specs_touched,
         refusals,
-    })
+    }
 }
 
 /* ==============================================================================================

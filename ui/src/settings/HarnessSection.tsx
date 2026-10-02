@@ -6,6 +6,7 @@ import { InfoPara } from '@/kit/components/InfoTip'
 import { ClaudeCliSection } from './ClaudeCliSection'
 import { CodexCliSection } from './CodexCliSection'
 import { OpencodeCliSection } from './OpencodeCliSection'
+import styles from './HarnessSection.module.css'
 
 export const HARNESSES: readonly { value: ConsoleHarness; label: string }[] = [
   { value: 'claude', label: 'Claude Code' },
@@ -29,35 +30,37 @@ export function HarnessChoice({ settings, patch, projectHarness, editProjectHarn
     : resetTo(settings.consoleHarness, def?.consoleHarness, (consoleHarness) => patch({ consoleHarness }))
   return (
     <Group title="Console">
-      <Row
-        label="Harness"
-        hint="The CLI a new console runs."
-        info={
-          <>
-            <InfoPara>
-              Which CLI a new console runs — the project’s pinned tab, a new pane, a tab cide
-              opens by itself, and the one-shots behind Generate commit message.
-            </InfoPara>
-            <InfoPara>
-              A console that is already running keeps its CLI and its Resume; Restart session
-              starts the one chosen here. Roles keep the harness their definition names; matching roles
-              use this project’s launch configuration.
-            </InfoPara>
-          </>
-        }
-        {...reset}
-        control={
-          <Segmented
-            label="Console harness"
-            value={projectScope ? projectHarness.consoleHarness ?? 'global' : settings.consoleHarness}
-            options={projectScope ? [{ value: 'global' as const, label: 'Use global' }, ...HARNESSES] : HARNESSES}
-            onChange={(value) => {
-              if (projectScope) editProjectHarness?.({ field: 'consoleHarness', value: value === 'global' ? null : value as ConsoleHarness })
-              else patch({ consoleHarness: value as ConsoleHarness })
-            }}
-          />
-        }
-      />
+      <div className={styles.choiceRow}>
+        <Row
+          label="Harness"
+          hint="The CLI a new console runs."
+          info={
+            <>
+              <InfoPara>
+                Which CLI a new console runs — the project’s pinned tab, a new pane, a tab cide
+                opens by itself, and the one-shots behind Generate commit message.
+              </InfoPara>
+              <InfoPara>
+                A console that is already running keeps its CLI and its Resume; Restart session
+                starts the one chosen here. Roles keep the harness their definition names; matching roles
+                use this project’s launch configuration.
+              </InfoPara>
+            </>
+          }
+          {...reset}
+          control={
+            <Segmented
+              label="Console harness"
+              value={projectScope ? projectHarness.consoleHarness ?? 'global' : settings.consoleHarness}
+              options={projectScope ? [{ value: 'global' as const, label: 'Use global' }, ...HARNESSES] : HARNESSES}
+              onChange={(value) => {
+                if (projectScope) editProjectHarness?.({ field: 'consoleHarness', value: value === 'global' ? null : value as ConsoleHarness })
+                else patch({ consoleHarness: value as ConsoleHarness })
+              }}
+            />
+          }
+        />
+      </div>
     </Group>
   )
 }

@@ -42,11 +42,32 @@ pub fn run(
     args: &[&str],
     deadline: Duration,
 ) -> Result<Vec<u8>, SpecError> {
+    run_with_status(binary, cwd, args, deadline, false)
+}
+
+/// Mutations must acknowledge both the process status and the JSON verdict.
+pub fn run_checked(
+    binary: &Path,
+    cwd: &Path,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<Vec<u8>, SpecError> {
+    run_with_status(binary, cwd, args, deadline, true)
+}
+
+fn run_with_status(
+    binary: &Path,
+    cwd: &Path,
+    args: &[&str],
+    deadline: Duration,
+    checked: bool,
+) -> Result<Vec<u8>, SpecError> {
     let mut command = Command::new(binary);
     command
         .args(args)
         .current_dir(cwd)
         .env(NON_INTERACTIVE, "0")
+        .env("OPENSPEC_TELEMETRY", "0")
         // Colour in a JSON document would be escape sequences inside string values.
         .env("NO_COLOR", "1");
 
@@ -60,11 +81,22 @@ pub fn run(
         .map_err(|error| SpecError::Ran(describe(binary, args, &error)))?;
     tracing::debug!(
         args = ?args,
+        cwd = %cwd.display(),
+        ok = filtered.ok,
         ms = started.elapsed().as_millis() as u64,
         bytes = filtered.stdout.len(),
         ok = filtered.ok,
         "openspec"
     );
+
+    if checked {
+        check_mutation_output(
+            filtered.ok,
+            &filtered.stdout,
+            &filtered.stderr,
+            &args.join(" "),
+        )?;
+    }
 
     // The exit status is *not* the verdict — see the crate header — so it is only consulted when
     // stdout carried nothing to read. A refusal with a JSON body is reported by `parse` from the
@@ -78,6 +110,25 @@ pub fn run(
         }));
     }
     Ok(filtered.stdout)
+}
+
+fn check_mutation_output(
+    ok: bool,
+    stdout: &[u8],
+    stderr: &str,
+    what: &str,
+) -> Result<(), SpecError> {
+    // Parse even a zero exit: older CLIs signal refusals exclusively in JSON.
+    let _: serde_json::Value = parse(stdout, what)?;
+    if !ok {
+        let detail = first_line(stderr);
+        return Err(SpecError::Refused(if detail.is_empty() {
+            format!("`openspec {what}` exited unsuccessfully; archive success is not confirmed")
+        } else {
+            detail
+        }));
+    }
+    Ok(())
 }
 
 /// Deserialise one `--json` document, checking the `status` array first.
@@ -173,6 +224,22 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::model;
+
+    #[test]
+    fn mutation_refusals_never_become_success() {
+        let refused = br#"{"archive":null,"status":[{"severity":"error","code":"archive_target_exists","message":"Archive already exists"}]}"#;
+        for ok in [true, false] {
+            let error = check_mutation_output(ok, refused, "", "archive test").unwrap_err();
+            assert!(error.to_string().contains("archive_target_exists"));
+        }
+        for output in [b"".as_slice(), b"not JSON"] {
+            assert!(check_mutation_output(true, output, "", "archive test").is_err());
+        }
+        assert!(
+            check_mutation_output(false, br#"{"archive":{}}"#, "failed", "archive test").is_err()
+        );
+        assert!(check_mutation_output(true, br#"{"archive":{}}"#, "", "archive test").is_ok());
+    }
 
     #[test]
     fn a_json_failure_is_a_status_array_and_not_an_exit_code() {

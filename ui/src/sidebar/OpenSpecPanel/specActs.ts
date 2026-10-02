@@ -18,83 +18,84 @@ import {
   type ProjectId,
 } from '@/ipc/client'
 import { notify, notifyFailure, type NoticeAction } from '@/chrome/notices'
-import type { ConfirmState } from '@/chrome/ConfirmDestructive'
+import type { SpecAcceptPlan } from '@/ipc/generated'
 import type { ReadyAct } from './model'
 import { startSession, useSpecRuns } from './specRuns'
 
+export interface ArchiveConfirmation {
+  project: ProjectId
+  change: string
+  phase: 'preparing' | 'ready' | 'archiving' | 'failed'
+  plan: SpecAcceptPlan | null
+  error: string | null
+}
 interface ConfirmStore {
-  confirming: ConfirmState | null
-  set: (confirming: ConfirmState | null) => void
+  confirming: ArchiveConfirmation | null
+  set: (confirming: ArchiveConfirmation | null) => void
 }
 
-/** Archive's confirm, waiting to be drawn. `SpecActsConfirm` is the one reader. */
 export const useSpecConfirm = create<ConfirmStore>((set) => ({
   confirming: null,
   set: (confirming) => set({ confirming }),
 }))
 
-/** Run one of a finished change's acts. Every outcome is said, success included. */
+// Persists after dismissing the dialog, so another surface cannot submit the same operation.
+const archiving = new Map<string, ArchiveConfirmation>()
+const archiveKey = (project: ProjectId, change: string) => `${project}:${change}`
+const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error)
+
 export function runReadyAct(project: ProjectId, change: string, act: ReadyAct['id']): void {
   if (act === 'archive') archiveChange(project, change)
   else if (act === 'publish') publishChange(project, change)
   else integrateChange(project, change)
 }
 
-/**
- * Archive: plan first, then confirm, then run.
- *
- * The plan is a subprocess — it validates and reads the deltas — so a refusal arrives after the
- * click, as a notice naming what to do rather than a dialog to dismiss for nothing. Rust decides
- * where it runs: the change's worktree while that holds unmerged work, else the project root.
- */
-export function archiveChange(project: ProjectId, change: string): void {
-  void specApi
-    .changePlan(project, change as never)
-    .then((plan) => {
-      if (plan.refusals.length > 0) {
-        notify(`${change} cannot be archived yet.`, {
-          kind: 'error',
-          detail: plan.refusals.join('\n\n'),
-        })
-        return
-      }
-      useSpecConfirm.getState().set({
-        title: `Archive ${change}?`,
-        body:
-          'Merges this change’s requirement edits into openspec/specs/ — the project’s ' +
-          'source of truth — and moves the change to openspec/changes/archive/. Both are ' +
-          'ordinary file edits in your repository, so git is the way back.',
-        // Named, not counted: `ConfirmDestructive`'s rule is that the user is about to act on
-        // *specific* files and "3 requirements" is not something anybody can check.
-        files: plan.specsTouched.map(
-          (touch) =>
-            `openspec/specs/${touch.spec}/spec.md — ${touch.requirements} ${
-              touch.requirements === 1 ? 'requirement' : 'requirements'
-            } ${touch.operation}`,
-        ),
-        confirmLabel: 'Archive',
-        defaultButton: 'confirm',
-        danger: false,
-        mark: 'file-diff',
-        run: () => {
-          void specApi
-            .archiveChange(project, change as never)
-            .then((outcome) => {
-              if (outcome.kind === 'refused') {
-                notify(`${change} was not archived.`, {
-                  kind: 'error',
-                  detail: outcome.plan.refusals.join('\n\n'),
-                })
-                return
-              }
-              notify(`${change} archived.`, { kind: 'ok' })
-              void useSpecRuns.getState().refreshCheckouts()
-            })
-            .catch(notifyFailure)
-        },
-      })
-    })
-    .catch(notifyFailure)
+/** Open immediately; the preview is asynchronous and never silently consumes a click. */
+export function archiveChange(project: ProjectId, change: string, force = false): void {
+  const running = archiving.get(archiveKey(project, change))
+  if (running) { useSpecConfirm.getState().set(running); return }
+  const current = useSpecConfirm.getState().confirming
+  if (current?.project === project && current.change === change && current.phase === 'preparing') return
+  const state: ArchiveConfirmation = { project, change, phase: 'preparing', plan: null, error: null }
+  useSpecConfirm.getState().set(state)
+  void specApi.changePlan(project, change as never, force).then((plan) => {
+    if (useSpecConfirm.getState().confirming !== state) return
+    useSpecConfirm.getState().set({ ...state, plan, phase: plan.refusals.length ? 'failed' : 'ready', error: plan.refusals.join('\n\n') || null })
+  }).catch((error: unknown) => {
+    if (useSpecConfirm.getState().confirming === state) useSpecConfirm.getState().set({ ...state, phase: 'failed', error: messageOf(error) })
+    else notifyFailure(error, { project })
+  })
+}
+
+/** A retry prepares a fresh preview; it never repeats a mutation automatically. */
+export async function confirmArchive(): Promise<void> {
+  const current = useSpecConfirm.getState().confirming
+  if (!current) return
+  if (current.phase === 'failed') { archiveChange(current.project, current.change, true); return }
+  if (current.phase !== 'ready' || !current.plan) return
+  const { project, change, plan } = current
+  const key = archiveKey(project, change)
+  if (archiving.has(key)) return
+  const running: ArchiveConfirmation = { ...current, phase: 'archiving', error: null }
+  archiving.set(key, running)
+  useSpecConfirm.getState().set(running)
+  try {
+    const outcome = await specApi.archiveChange(project, change as never, plan.archiveRoot)
+    switch (outcome.kind) {
+      case 'accepted':
+        if (useSpecConfirm.getState().confirming === running) useSpecConfirm.getState().set(null)
+        notify(`${change} archived.`, { kind: 'ok', detail: outcome.archive.path })
+        void useSpecRuns.getState().refreshCheckouts()
+        break
+      case 'refused':
+        throw new Error(outcome.plan.refusals.join('\n\n') || 'Archive was refused. Review a fresh preview.')
+      case 'conflicts':
+        throw new Error(`Archive was not completed. Conflicting paths: ${outcome.paths.join(', ')}`)
+    }
+  } catch (error) {
+    if (useSpecConfirm.getState().confirming === running) useSpecConfirm.getState().set({ ...running, phase: 'failed', error: messageOf(error) })
+    notify(`${change} was not archived.`, { kind: 'error', detail: messageOf(error) })
+  } finally { archiving.delete(key) }
 }
 
 /** Publish: commit what the session left, push its branch, then offer the merge request. */

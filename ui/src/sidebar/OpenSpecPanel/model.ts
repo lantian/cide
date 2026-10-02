@@ -276,16 +276,7 @@ export function openChangeCount(board: Board): number | null {
   return board.changes.length
 }
 
-/**
- * Drop a board that is not newer than what is on screen.
- *
- * Returns `current` when the update should be ignored, so a caller can compare by identity. The
- * rule is narrower than `TasksPanel`'s `newerBoard` because `cide://spec-changed` carries no
- * revision — it does not need one, since `spec_state`'s coalescer runs one read at a time per
- * project — so the only drop here is the one that matters: a `ready` board must not be replaced
- * by an `unknown` one, which is what an unrelated project's event or a torn-down store would
- * otherwise do.
- */
+/** Keep a known board when a read has no answer. specStore separately checks snapshot revisions. */
 export function newerBoard(current: Board, next: Board): Board {
   if (next.kind === 'unknown' && current.kind !== 'unknown') return current
   return next
@@ -1484,6 +1475,7 @@ export function sessionViews(
 
 /** A change's checklist as its worktree has it, when the session applied it in one. */
 export interface CheckoutProgress {
+  archivedAs?: string | undefined
   /** `undefined` when the worktree's `openspec` could not be read: the row keeps the root's. */
   done?: number | undefined
   total?: number | undefined
@@ -1502,5 +1494,5 @@ export function rowProgress(
 ): { done: number; total: number; stage: ChangeStage } {
   const done = checkout?.done ?? row.done
   const total = checkout?.total ?? row.total
-  return { done, total, stage: summaryStage({ name: '', completed: done, total, status: '' }) }
+  return { done, total, stage: checkout?.archivedAs ? 'archived' : summaryStage({ name: '', completed: done, total, status: '' }) }
 }

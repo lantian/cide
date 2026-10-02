@@ -94,6 +94,8 @@ import { ProposeDialog, useProposeDialog } from '@/sidebar/OpenSpecPanel/Propose
 import { ApplyDialog, useApplyDialog } from '@/sidebar/OpenSpecPanel/ApplyDialog'
 import { SpecActsConfirm } from '@/sidebar/OpenSpecPanel/SpecActsConfirm'
 import { useSpecConfirm } from '@/sidebar/OpenSpecPanel/specActs'
+import { followSpecRuns, useSpecRuns } from '@/sidebar/OpenSpecPanel/specRuns'
+import { invalidateSpecData, retainSpecProjects } from '@/sidebar/OpenSpecPanel/specData'
 import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
 import { openCount, waitingCount } from '@/sidebar/TasksPanel/model'
@@ -993,12 +995,22 @@ export function App() {
   const adoptDocker = useDocker((s) => s.adopt)
 
   useEffect(() => {
-    attachSpec(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
+    if (openProjects) retainSpecProjects(Object.keys(openProjects) as ProjectId[])
+  }, [openProjects])
+
+  useEffect(() => {
+    const project = boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null)
+    attachSpec(project)
+    return followSpecRuns(project)
   }, [attachSpec, activeProjectId, boot?.role.kind])
 
   useEffect(() => {
-    const off = specEvents.onChanged((project, board) => {
-      adoptSpec(project, board)
+    const off = specEvents.onChanged((project, snapshot, invalidated) => {
+      invalidateSpecData(project, snapshot, invalidated)
+      adoptSpec(project, snapshot)
+      if (useSpecRuns.getState().project === project && (invalidated.full || invalidated.paths.some((path) => path.startsWith('.cide/worktrees/')))) {
+        void useSpecRuns.getState().refreshCheckouts()
+      }
     })
     return () => {
       void off.then((stop) => stop())

@@ -4689,10 +4689,12 @@ export function extAssetUrl(id: ExtensionRef, path: string): string {
  * ======================================================================================== */
 import type {
   ChangeName,
+  SpecSnapshot,
+  SpecInvalidation,
+  SpecChanged,
   SpecAcceptPlan,
   SpecAccepted,
   SpecArtifactText,
-  SpecBoard,
   SpecChange,
   SpecSubject,
   SpecId,
@@ -4701,12 +4703,8 @@ import type {
 } from './generated'
 
 export const spec = {
-  board: (project: ProjectId) =>
-    pendingCommand(
-      'spec_board',
-      () => invoke<SpecBoard>('spec_board', { project }),
-      null as SpecBoard | null,
-    ),
+  board: (project: ProjectId, force = false) =>
+    invoke<SpecSnapshot>('spec_board', { project, force }),
 
   /**
    * One change in full.
@@ -4718,23 +4716,15 @@ export const spec = {
    * value to this project's `.cide/worktrees/`.
    */
   change: (project: ProjectId, change: ChangeName, worktree?: string) =>
-    pendingCommand(
-      'spec_change',
-      () => invoke<SpecChange>('spec_change', { project, change, worktree }),
-      null as SpecChange | null,
-    ),
+    invoke<SpecChange>('spec_change', { project, change, worktree }),
 
   artifact: (project: ProjectId, path: string, worktree?: string) =>
-    pendingCommand(
-      'spec_artifact',
-      () => invoke<SpecArtifactText>('spec_artifact', { project, path, worktree }),
-      null as SpecArtifactText | null,
-    ),
+    invoke<SpecArtifactText>('spec_artifact', { project, path, worktree }),
 
   validate: (project: ProjectId, change?: ChangeName, worktree?: string) =>
     invoke<SpecValidation>('spec_validate', { project, change, worktree }),
 
-  init: (project: ProjectId) => invoke<SpecBoard>('spec_init', { project }),
+  init: (project: ProjectId) => invoke<SpecSnapshot>('spec_init', { project }),
 
   /**
    * Type one of OpenSpec's workflow commands into this project's Claude tab.
@@ -4755,7 +4745,7 @@ export const spec = {
     invoke<void>('spec_run_command', { project, command, text }),
 
   propose: (project: ProjectId, change: ChangeName, title: string, body?: string) =>
-    invoke<SpecBoard>('spec_propose', { project, change, title, body }),
+    invoke<SpecSnapshot>('spec_propose', { project, change, title, body }),
 
   /**
    * Start OpenSpec's propose workflow in a conversation, for a task that has no change yet.
@@ -4833,11 +4823,11 @@ export const spec = {
    * pinned session has no cide task, and the whole accept gesture was built on the task card —
    * which left that (more common) road with no way to finish at all.
    */
-  changePlan: (project: ProjectId, change: ChangeName) =>
-    invoke<SpecAcceptPlan>('spec_change_plan', { project, change }),
+  changePlan: (project: ProjectId, change: ChangeName, force = false) =>
+    invoke<SpecAcceptPlan>('spec_change_plan', { project, change, force }),
 
-  archiveChange: (project: ProjectId, change: ChangeName) =>
-    invoke<SpecAccepted>('spec_change_archive', { project, change }),
+  archiveChange: (project: ProjectId, change: ChangeName, expectedRoot: string) =>
+    invoke<SpecAccepted>('spec_change_archive', { project, change, expectedRoot }),
 
   /**
    * Open a change or a capability as a workspace tab, or activate the one it already has.
@@ -4854,9 +4844,9 @@ export const spec = {
  * closed a thousand lines ago. `taskEvents` and `agentEvents` are the precedents.
  */
 export const specEvents = {
-  onChanged: (handler: (project: ProjectId, board: SpecBoard) => void) =>
-    listen<{ project: ProjectId; board: SpecBoard }>('cide://spec-changed', (event) =>
-      handler(event.payload.project, event.payload.board),
+  onChanged: (handler: (project: ProjectId, snapshot: SpecSnapshot, invalidated: SpecInvalidation) => void) =>
+    listen<SpecChanged>('cide://spec-changed', (event) =>
+      handler(event.payload.project, event.payload.snapshot, event.payload.invalidated),
     ),
 }
 
@@ -4924,7 +4914,7 @@ export const specConfig = {
    * writes no key at all, which is what Skip means.
    */
   setUp: (project: ProjectId, context: string) =>
-    invoke<SpecBoard>('spec_init', { project, context }),
+    invoke<SpecSnapshot>('spec_init', { project, context }),
 }
 
 /* ==========================================================================================

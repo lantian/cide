@@ -202,6 +202,7 @@ pub mod spec;
 pub mod docker;
 
 pub use spec::{
+    SpecArchiveResult, SpecSnapshot, SpecInvalidation, SpecChanged,
     ArtifactState, ChangeSummary, DeltaOperation, SpecAcceptPlan, SpecAccepted, SpecArtifact,
     SpecArtifactRules, SpecArtifactText, SpecBoard, SpecChange, SpecCommand, SpecConfig,
     SpecConfigEdit, SpecDelta, SpecIssue, SpecOperationGuidance, SpecOrigin, SpecProgress,

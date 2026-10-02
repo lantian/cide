@@ -91,6 +91,7 @@
  * touched, still leaves the work retrievable from the Shelf.
  */
 import { useEffect, useId, useRef } from 'react'
+import { VirtualList } from '@/chrome/VirtualList'
 import { Modal } from '@/overlays/ModalShell'
 import { Button } from '@/kit/components/Button'
 import { Checkbox, RadioGroup } from '@/kit/components/Choice'
@@ -250,13 +251,16 @@ export interface ConfirmState {
 }
 
 export interface ConfirmDestructiveProps {
+  busy?: boolean
+  error?: string | null
+  virtualizeFiles?: boolean
   state: ConfirmState
   onCancel: () => void
   /** Go ahead. The caller runs `state.run` and closes; this component does neither. */
   onConfirm: () => void
 }
 
-export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestructiveProps) {
+export function ConfirmDestructive({ state, onCancel, onConfirm, busy = false, error, virtualizeFiles = false }: ConfirmDestructiveProps) {
   const cancel = useRef<HTMLButtonElement>(null)
   const confirmBtn = useRef<HTMLButtonElement>(null)
   // Native `<input type="radio">`s group by `name`, and a fixed string would make two dialogs
@@ -329,6 +333,8 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
       ref={confirmBtn}
       variant={danger ? 'danger' : confirmDefault ? 'primary' : 'secondary'}
       data-audit="confirmDestructiveRun"
+      disabled={busy}
+      aria-busy={busy || undefined}
       onClick={onConfirm}
     >
       {confirmLabel}
@@ -376,7 +382,8 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
                 />
               </div>
             )}
-            <p className={styles.body}>{body}</p>
+            <p className={styles.body} role="status">{body}</p>
+            {error && <p className={styles.body} role="alert">{error}</p>}
           </>
         }
         footNote={
@@ -412,33 +419,21 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
           )
         }
       >
-        <PathList data-audit="confirmDestructiveList">
-          {files.map((path) => {
-            // `basename`/`dirname` rather than the Git panel's `splitPath`, which does the
-            // same arithmetic: this file no longer lives in that panel, and a chrome component
-            // reaching back into a feature folder for a two-line helper is the import that
-            // makes a shared component un-shareable again.
-            const split = state.split !== false
-            return (
-              <PathRow
-                key={path}
-                full={path}
-                name={split ? basename(path) : path}
-                where={split ? dirname(path) : ''}
-                /* `minus` rather than the tab strip's dirty dot: what is about to happen to
-                   these rows is removal, and reusing the dot would say "unsaved" instead. The
-                   out-of-project open overrides it with an outward arrow, because nothing is
-                   being removed there — see `ConfirmState.mark`. Red: "this goes". */
-                mark={
-                  <span className={styles.mark}>
-                    <Icon name={asIcon(state.mark ?? 'minus')} size={1} />
-                  </span>
-                }
-              />
-            )
-          })}
-        </PathList>
+        {virtualizeFiles && files.length > 100 ? (
+          <VirtualList items={files} itemKey={(path) => path} estimateSize={() => 48}
+            className={styles.virtualFiles} render={(path) => <ConfirmPath path={path} state={state} />} />
+        ) : (
+          <PathList data-audit="confirmDestructiveList">
+            {files.map((path) => <ConfirmPath key={path} path={path} state={state} />)}
+          </PathList>
+        )}
       </Dialog>
     </Modal>
   )
+}
+
+function ConfirmPath({ path, state }: { path: string; state: ConfirmState }) {
+  const split = state.split !== false
+  return <PathRow full={path} name={split ? basename(path) : path} where={split ? dirname(path) : ''}
+    mark={<span className={styles.mark}><Icon name={asIcon(state.mark ?? 'minus')} size={1} /></span>} />
 }

@@ -17,7 +17,7 @@
 
 use cide_ipc::Workspace;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Sent after every accepted mutation, to every window.
 pub const WORKSPACE_CHANGED: &str = "cide://workspace-changed";
@@ -434,6 +434,9 @@ pub fn git_status(
     worktree: Option<&std::path::Path>,
     tree: &cide_ipc::git::ChangesTree,
 ) {
+    if let Some(boards) = app.try_state::<std::sync::Arc<crate::spec_state::SpecBoards>>() {
+        boards.invalidate_git(project);
+    }
     let payload = GitStatus {
         project,
         worktree: worktree.map(std::path::Path::to_path_buf),
@@ -1142,32 +1145,8 @@ struct ExtChanged {
 /// A project's `openspec/` changed — a spec, a change, or the directory arriving at all.
 pub const SPEC_CHANGED: &str = "cide://spec-changed";
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SpecChanged {
-    project: cide_ipc::ProjectId,
-    board: cide_ipc::SpecBoard,
-}
-
-/// Broadcast one project's spec board.
-///
-/// # Why this one carries no `rev`, when `tasks-changed` does
-///
-/// `agents-changed`'s argument, with a stronger version of the same guarantee. That event carries
-/// none because the roster has a single writer; this one carries none because the board is
-/// **derived** — every emit is preceded by a fresh read, and `spec_state::SpecBoards`' coalescer
-/// runs exactly one flusher per burst, so only one read is ever in flight for a project. Two
-/// boards therefore cannot land in an order other than the one they were read in, and there is
-/// nothing an ordering number could protect against.
-///
-/// That is a property of the coalescer, not a coincidence: a second path that read a board and
-/// emitted it directly would break it, which is why `cmd::spec` goes through `mark_changed` for
-/// anything a watcher could also see.
-pub fn spec_changed(app: &AppHandle, project: cide_ipc::ProjectId, board: &cide_ipc::SpecBoard) {
-    let payload = SpecChanged {
-        project,
-        board: board.clone(),
-    };
+/// Broadcast an ordered snapshot with the scopes whose content changed.
+pub fn spec_changed(app: &AppHandle, payload: &cide_ipc::SpecChanged) {
     if let Err(error) = app.emit(SPEC_CHANGED, payload) {
         tracing::debug!(%error, "spec-changed reached no window");
     }

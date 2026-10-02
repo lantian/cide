@@ -24,9 +24,9 @@
 //!
 //! # Three facts about the CLI that the code turns on
 //!
-//! **The exit code is not the failure signal.** Every `--json` command exits 0 and reports
-//! failure as a `status` array on stdout. A caller that checked `ok` would treat
-//! `openspec show nope --json` as success with an empty document.
+//! **JSON and process status both matter.** Older CLI versions can report a refusal in a
+//! `status` array even with exit 0. Validation reads can return useful JSON on nonzero exits;
+//! archive requires a successful exit, no JSON refusal and a confirmed move on disk.
 //!
 //! **Root resolution walks ancestors.** `openspec` climbs parent directories looking for an
 //! `openspec/`, and reports what it found as `root: {path, source}`. A worktree that has none
@@ -40,7 +40,7 @@
 //!
 //! # What this crate deliberately does not do
 //!
-//! No broadcast, no `AppHandle`, no thread, no cache. `cide_agents::load_project`'s posture: a
+//! No broadcast, no `AppHandle`, no persistent cache. `cide_agents::load_project`'s posture: a
 //! board is a re-read, and the coalescing that keeps re-reads from being a storm belongs to the
 //! layer that owns the watcher. It also never runs `archive` as a side effect of anything —
 //! that is the one command that rewrites files cide did not open, and it stays a gesture.
@@ -158,6 +158,17 @@ impl Openspec {
         &self.binary
     }
 
+    pub fn changes(&self) -> Result<Vec<cide_ipc::ChangeSummary>, SpecError> {
+        let answer: model::ListChanges = self.json(&["list", "--json", "--sort", "recent"])?;
+        self.pin_root(answer.root.as_ref(), "list")?;
+        Ok(answer.changes.into_iter().map(Into::into).collect())
+    }
+
+    pub fn specs(&self) -> Result<Vec<cide_ipc::SpecSummary>, SpecError> {
+        let answer: model::ListSpecs = self.json(&["list", "--specs", "--json"])?;
+        Ok(answer.specs.into_iter().map(Into::into).collect())
+    }
+
     /// The board: active changes and the capabilities that already exist.
     /// Both halves run at once, for [`Self::change`]'s reason: each is a node process and a
     /// panel that waited for them in turn waited twice as long as it had to.
@@ -214,6 +225,16 @@ impl Openspec {
     /// another, and that is the kind of bug that gets reported as "it says something different
     /// every time".
     pub fn change(&self, change: &ChangeName) -> Result<cide_ipc::SpecChange, SpecError> {
+        // An archive has no active CLI representation. Avoid four doomed subprocesses.
+        if !self
+            .cwd
+            .join("openspec/changes")
+            .join(change.as_str())
+            .is_dir()
+            && let Some(archived) = archived_change(&self.cwd, change)
+        {
+            return Ok(archived);
+        }
         let (shown, status, progress, validation) = std::thread::scope(|scope| {
             let shown = scope.spawn(|| -> Result<model::ShowChange, SpecError> {
                 self.json(&["show", change.as_str(), "--json", "--type", "change"])
@@ -450,12 +471,26 @@ impl Openspec {
     /// and both are answers cide must not give on their behalf: the first writes an archive that
     /// changes no requirement, the second files behaviour into the source of truth that the
     /// validator was not allowed to look at. A user who means either can say so in a terminal.
-    pub fn archive(&self, change: &ChangeName) -> Result<(), SpecError> {
-        self.run(
+    pub fn archive(&self, change: &ChangeName) -> Result<cide_ipc::SpecArchiveResult, SpecError> {
+        let stdout = cli::run_checked(
+            &self.binary,
+            &self.cwd,
             &["archive", change.as_str(), "--yes", "--json"],
             cli::MUTATE,
         )?;
-        Ok(())
+        let result = archive_result(&stdout, &self.cwd, change)?;
+        if self
+            .cwd
+            .join("openspec/changes")
+            .join(change.as_str())
+            .exists()
+            || !result.path.is_dir()
+        {
+            return Err(SpecError::Refused(
+                "openspec reported success but the change's move to the archive could not be confirmed".into(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Run and parse, at the read deadline.
@@ -504,6 +539,52 @@ impl Openspec {
             }),
         }
     }
+}
+
+fn archive_result(
+    stdout: &[u8],
+    root: &Path,
+    change: &ChangeName,
+) -> Result<cide_ipc::SpecArchiveResult, SpecError> {
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        archive: Archived,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Archived {
+        change: String,
+        archived_as: String,
+        path: PathBuf,
+    }
+    let answer: Answer = cli::parse(stdout, "archive")?;
+    let archive = answer.archive;
+    let expected = root
+        .join("openspec/changes/archive")
+        .join(&archive.archived_as);
+    if archive.change != change.as_str()
+        || archive.archived_as.is_empty()
+        || Path::new(&archive.archived_as).components().count() != 1
+        || !matches!(
+            Path::new(&archive.archived_as).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || archive
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| archive.path.clone())
+            != expected.canonicalize().unwrap_or(expected)
+    {
+        return Err(SpecError::Refused(
+            "openspec returned an archive destination that does not match this change and checkout"
+                .into(),
+        ));
+    }
+    Ok(cide_ipc::SpecArchiveResult {
+        root: root.to_path_buf(),
+        archived_as: archive.archived_as,
+        path: archive.path,
+    })
 }
 
 /// One artifact file's text, and whether it is all of it.
@@ -562,25 +643,33 @@ fn group_deltas(
     artifacts: &[cide_ipc::SpecArtifact],
 ) -> Vec<cide_ipc::SpecDelta> {
     let mut groups: Vec<(cide_ipc::SpecId, cide_ipc::DeltaOperation, String, usize)> = Vec::new();
+    let mut positions: std::collections::HashMap<(String, &str), usize> =
+        std::collections::HashMap::new();
     for row in rows {
         let spec = cide_ipc::SpecId(row.spec.clone());
         let operation = model::operation(&row.operation);
         let carried = row.requirement_count();
-        match groups
-            .iter_mut()
-            .find(|(id, op, _, _)| *id == spec && *op == operation)
-        {
-            Some((_, _, _, count)) => *count += carried,
-            None => groups.push((spec, operation, row.description, carried)),
+        let key = (row.spec, operation.header());
+        if let Some(&index) = positions.get(&key) {
+            groups[index].3 += carried;
+        } else {
+            positions.insert(key, groups.len());
+            groups.push((spec, operation, row.description, carried));
         }
     }
+    let mut files = std::collections::HashMap::new();
 
     groups
         .into_iter()
         .map(|(spec, operation, description, reported)| {
-            let requirements = delta_file(artifacts, &spec)
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .map(|text| requirements_in(&text, operation))
+            let operations = files.entry(spec.0.clone()).or_insert_with(|| {
+                delta_file(artifacts, &spec)
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .map(|text| requirements_by_operation(&text))
+                    .unwrap_or_default()
+            });
+            let requirements = operations
+                .remove(&operation.header().to_ascii_lowercase())
                 .unwrap_or_default();
             if requirements.len() != reported {
                 // Not a failure — `validate` will have something to say about a delta file the
@@ -728,8 +817,11 @@ pub fn archived_change(root: &Path, change: &ChangeName) -> Option<cide_ipc::Spe
         };
         // Every operation, because the file says which it uses and cide has no CLI answer to ask
         // — a delta file may carry more than one section, and an empty one is simply not there.
+        let mut indexed = requirements_by_operation(&text);
         for operation in cide_ipc::DeltaOperation::EVERY {
-            let requirements = requirements_in(&text, operation);
+            let requirements = indexed
+                .remove(&operation.header().to_ascii_lowercase())
+                .unwrap_or_default();
             if requirements.is_empty() {
                 continue;
             }
@@ -820,17 +912,36 @@ fn delta_file<'a>(
 }
 
 /// Every requirement under one operation's section of a delta file.
+#[cfg(test)]
 fn requirements_in(
     text: &str,
     operation: cide_ipc::DeltaOperation,
 ) -> Vec<cide_ipc::SpecRequirement> {
-    block::names(text, operation.header())
-        .into_iter()
-        .filter_map(|name| {
-            let found = block::find(text, operation.header(), &name).ok()?;
-            let raw = text.get(found.start..found.end)?;
-            let parsed = block::parse(raw);
-            Some(cide_ipc::SpecRequirement {
+    requirements_by_operation(text)
+        .remove(&operation.header().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn requirements_by_operation(
+    text: &str,
+) -> std::collections::HashMap<String, Vec<cide_ipc::SpecRequirement>> {
+    use std::collections::HashMap;
+    let blocks = block::blocks(text);
+    let mut counts = HashMap::new();
+    for (op, name, _) in &blocks {
+        *counts.entry((op.as_str(), name.as_str())).or_insert(0) += 1;
+    }
+    let mut result: HashMap<String, Vec<cide_ipc::SpecRequirement>> = HashMap::new();
+    for (op, name, range) in &blocks {
+        if counts[&(op.as_str(), name.as_str())] != 1 {
+            continue;
+        }
+        let raw = &text[range.start..range.end];
+        let parsed = block::parse(raw);
+        result
+            .entry(op.clone())
+            .or_default()
+            .push(cide_ipc::SpecRequirement {
                 name: parsed.name,
                 text: parsed.text,
                 scenarios: parsed
@@ -841,17 +952,108 @@ fn requirements_in(
                         body: scenario.body,
                     })
                     .collect(),
-                // Trailing whitespace trimmed, matching what the writer splices back — so a
-                // block read and written unchanged really is unchanged.
                 block: raw.trim_end().to_string(),
-            })
-        })
-        .collect()
+            });
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_requires_a_matching_positive_result() {
+        let root = Path::new("/repo");
+        let change = ChangeName("test".into());
+        for answer in [
+            r#"{}"#,
+            r#"{"archive":null}"#,
+            r#"{"archive":{}}"#,
+            r#"{"archive":{"change":"other","archivedAs":"stamp-test","path":"/repo/openspec/changes/archive/stamp-test"}}"#,
+            r#"{"archive":{"change":"test","archivedAs":"../outside","path":"/repo/openspec/changes/outside"}}"#,
+        ] {
+            assert!(
+                archive_result(answer.as_bytes(), root, &change).is_err(),
+                "{answer}"
+            );
+        }
+        let result = archive_result(br#"{"archive":{"change":"test","archivedAs":"stamp-test","path":"/repo/openspec/changes/archive/stamp-test"}}"#, root, &change).unwrap();
+        assert_eq!(result.archived_as, "stamp-test");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_checks_the_process_result_and_the_actual_move() {
+        use std::os::unix::fs::PermissionsExt;
+        for (tag, exit, move_files, body, success) in [
+            ("json-refusal-zero", 0, false, "refusal", false),
+            ("json-refusal-one", 1, false, "refusal", false),
+            ("nonzero-success", 1, true, "success", false),
+            ("missing-move", 0, false, "success", false),
+            ("null", 0, false, "null", false),
+            ("empty", 0, false, "", false),
+            ("malformed", 0, false, "not json", false),
+            ("confirmed", 0, true, "success", true),
+        ] {
+            let root = scratch(tag);
+            write(&root, "openspec/changes/test/tasks.md", "- [x] Done\n");
+            let destination = root.join("openspec/changes/archive/stamp-test");
+            let json = match body {
+                "success" => serde_json::json!({"archive":{"change":"test","archivedAs":"stamp-test","path":destination}}).to_string(),
+                "refusal" => r#"{"archive":null,"status":[{"severity":"error","code":"REFUSED","message":"incomplete tasks"}]}"#.into(),
+                "null" => r#"{"archive":null}"#.into(),
+                other => other.into(),
+            };
+            let binary = root.join("fake-openspec");
+            let movement = if move_files {
+                "mkdir -p openspec/changes/archive\nmv openspec/changes/test openspec/changes/archive/stamp-test\n"
+            } else {
+                ""
+            };
+            std::fs::write(&binary, format!("#!/bin/sh\n[ \"$OPENSPEC_TELEMETRY\" = 0 ] || exit 7\n{movement}cat <<'JSON'\n{json}\nJSON\nexit {exit}\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let os = Openspec {
+                binary,
+                cwd: root.clone(),
+            };
+            assert_eq!(
+                os.archive(&ChangeName("test".into())).is_ok(),
+                success,
+                "{tag}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn thousands_of_requirements_are_indexed_in_document_order() {
+        let mut text = "## ADDED Requirements\n".to_string();
+        for n in 0..5000 {
+            text.push_str(&format!("### Requirement: R{n}\nThe app SHALL work.\n#### Scenario: Works\n- WHEN used\n- THEN works\n"));
+        }
+        let started = std::time::Instant::now();
+        let parsed = requirements_in(&text, cide_ipc::DeltaOperation::Added);
+        eprintln!("indexed 5000 requirements in {:?}", started.elapsed());
+        assert_eq!(parsed.len(), 5000);
+        assert_eq!(parsed[4999].name, "R4999");
+    }
+
+    #[test]
+    fn indexed_requirements_match_the_editors_scanner() {
+        for text in [
+            include_str!("../tests/corpus/fenced.md"),
+            include_str!("../tests/corpus/crlf-bom.md"),
+            include_str!("../tests/corpus/modified.md"),
+        ] {
+            for (op, name, range) in block::blocks(text) {
+                let found = block::find(text, &op, &name).unwrap();
+                assert_eq!(range, found);
+            }
+        }
+        let text = "## ADDED Requirements\n### Requirement: Same\na\n### Requirement: Same\nb\n";
+        assert!(requirements_in(text, cide_ipc::DeltaOperation::Added).is_empty());
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

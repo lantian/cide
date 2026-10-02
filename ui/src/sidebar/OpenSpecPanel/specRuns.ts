@@ -16,7 +16,7 @@
 import { create } from 'zustand'
 import {
   agentRuns,
-  specEvents,
+  events,
   specSessions,
   type ProjectId,
 } from '@/ipc/client'
@@ -43,6 +43,8 @@ interface SpecRunsState {
 }
 
 let generation = 0
+let attachment = 0
+const checkoutReads = new Map<ProjectId, { dirty: boolean; promise: Promise<void> }>()
 
 export const useSpecRuns = create<SpecRunsState>((set, get) => ({
   project: null,
@@ -52,6 +54,7 @@ export const useSpecRuns = create<SpecRunsState>((set, get) => ({
   attach: (project, withCheckouts = true) => {
     if (get().project === project) return
     generation += 1
+    attachment += 1
     // Cleared before the reads: another project's sessions under this one's changes would be a
     // wrong answer that reads as real.
     set({ project, runs: [], checkouts: [] })
@@ -77,12 +80,24 @@ export const useSpecRuns = create<SpecRunsState>((set, get) => ({
     set({ runs })
   },
 
-  refreshCheckouts: async () => {
+  refreshCheckouts: () => {
     const project = get().project
-    if (project === null) return
-    const checkouts = await specSessions.checkouts(project).catch(() => null)
-    if (checkouts === null || get().project !== project) return
-    set({ checkouts })
+    if (project === null) return Promise.resolve()
+    const existing = checkoutReads.get(project)
+    if (existing) { existing.dirty = true; return existing.promise }
+    const request = { dirty: false, promise: Promise.resolve() }
+    request.promise = (async () => {
+      do {
+        request.dirty = false
+        const mine = attachment
+        const checkouts = await specSessions.checkouts(project).catch(() => null)
+        if (get().project !== project) return
+        if (mine !== attachment) { request.dirty = true; continue }
+        if (checkouts !== null && !request.dirty) set({ checkouts })
+      } while (request.dirty)
+    })().finally(() => { checkoutReads.delete(project) })
+    checkoutReads.set(project, request)
+    return request.promise
   },
 }))
 
@@ -188,31 +203,18 @@ export async function openSession(project: ProjectId, row: SpecRunRow): Promise<
   if (!opened) throw new Error('This session has not started yet — it is waiting for a run slot.')
 }
 
-/**
- * Follow a project's sessions and worktrees: attach, read both, and keep them live — the rows on
- * `cide://spec-runs-changed`, the worktrees when the spec board moves. Answers the cleanup.
- *
- * Called by the panel, the change page and task cards. A task card sets `withCheckouts` false
- * because linking its proposal needs only runs, without reading worktree checklists.
- * The page can be open with the panel shut,
- * and it has to know a change has a session (Open session, not a second Apply) and whether it was
- * applied in a worktree (which acts a finished change offers). Two followers of one project hear
- * the same events twice and set the same rows; that costs nothing.
- */
-export function followSpecRuns(project: ProjectId | null, withCheckouts = true): () => void {
-  const store = useSpecRuns.getState()
-  store.attach(project, withCheckouts)
+/** One application-owned subscription, independent of mounted panels and tabs. */
+export function followSpecRuns(project: ProjectId | null): () => void {
+  useSpecRuns.getState().attach(project)
   if (project === null) return () => {}
-  void store.refreshRuns()
-  if (withCheckouts) void store.refreshCheckouts()
   const offRuns = specSessions.onChanged((changed, rows) => {
     useSpecRuns.getState().adoptRuns(changed, rows)
   })
-  const offBoard = withCheckouts ? specEvents.onChanged((changed) => {
+  const offGit = events.onGitStatus((changed) => {
     if (changed === project) void useSpecRuns.getState().refreshCheckouts()
-  }) : Promise.resolve(() => {})
+  })
   return () => {
     void offRuns.then((stop) => stop())
-    void offBoard.then((stop) => stop())
+    void offGit.then((stop) => stop())
   }
 }

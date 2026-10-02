@@ -67,6 +67,8 @@
     "check:new-entry": "node scripts/check-new-entry.mjs",
     "check:notes": "node scripts/check-notes.mjs",
     "check:notices": "node scripts/check-notices.mjs",
+    "bench:openspec-browser": "node scripts/bench-openspec-browser.mjs",
+    "check:openspec-performance": "node scripts/check-openspec-performance.mjs",
     "check:openspec": "node scripts/check-openspec.mjs",
     "check:openspec-config": "node scripts/check-openspec-config.mjs",
     "check:openspec-render": "node scripts/check-openspec-render.mjs",

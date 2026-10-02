@@ -1,0 +1,6 @@
+/* The short harness label needs less room than a general settings description. This keeps
+ * the four project choices and reset beside it at the Settings page's usual width. The kit
+ * still wraps the control when a narrower pane cannot fit both. */
+.choiceRow > [data-setting='Harness'] {
+  --form-row-text: calc(180px * var(--ui-scale));
+}

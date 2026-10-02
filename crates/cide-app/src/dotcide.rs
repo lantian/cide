@@ -211,11 +211,10 @@ pub fn files_changed(app: &AppHandle, project: ProjectId, paths: &[PathBuf]) {
 
     if spec {
         // Marked, not read. The board is a subprocess away, so a burst of a hundred paths must
-        // become one `openspec list` and not a hundred — `SpecBoards`' coalescer is the same one
-        // the roster uses, and its `flushing` flag is also what keeps two reads from racing and
-        // landing out of order.
+        // become one read of the affected lists. SpecBoards keeps worker ownership through
+        // the actual read and emits ordered snapshots with the affected content scopes.
         if let Some(boards) = app.try_state::<Arc<crate::spec_state::SpecBoards>>() {
-            boards.mark_changed(app, project);
+            boards.mark_paths(app, project, paths, &root);
         }
         // And the checklist may have just been finished. Same events, a different question, and
         // deliberately a different module — see `crate::spec_triggers`.

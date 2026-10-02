@@ -229,6 +229,40 @@ pub fn names(text: &str, operation: &str) -> Vec<String> {
     found
 }
 
+/// Every block and its operation, located in one pass. Duplicate names remain present so
+/// callers can reject ambiguity instead of silently choosing one of the blocks.
+pub fn blocks(text: &str) -> Vec<(String, String, Block)> {
+    let mut out: Vec<(String, String, Block)> = Vec::new();
+    let mut operation: Option<String> = None;
+    let mut open: Option<usize> = None;
+    for line in lines_of(text) {
+        let section = section_title(&line);
+        let name = requirement_name(&line);
+        if (section.is_some() || name.is_some())
+            && let Some(index) = open.take()
+        {
+            out[index].2.end = line.start;
+        }
+        if let Some(section) = section {
+            operation = section
+                .to_ascii_lowercase()
+                .strip_suffix(" requirements")
+                .map(str::to_string);
+        } else if let (Some(op), Some(name)) = (&operation, name) {
+            open = Some(out.len());
+            out.push((
+                op.clone(),
+                name,
+                Block {
+                    start: line.start,
+                    end: text.len(),
+                },
+            ));
+        }
+    }
+    out
+}
+
 /// One requirement block, taken apart into the pieces an editor shows. (M28)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed {

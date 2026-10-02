@@ -26,4 +26,4 @@ dirty: boolean,
  * project root's copy — what the board reads — stays unticked until the branch lands.
  * `None` when the worktree's `openspec` could not be read.
  */
-completedTasks?: number, totalTasks?: number, };
+completedTasks?: number, totalTasks?: number, archivedAs?: string, };

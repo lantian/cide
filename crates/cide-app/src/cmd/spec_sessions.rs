@@ -644,34 +644,51 @@ pub async fn spec_session_dismiss(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn spec_checkouts(
     state: State<'_, WorkspaceState>,
+    boards: State<'_, Arc<crate::spec_state::SpecBoards>>,
     project: ProjectId,
 ) -> Result<Vec<SpecCheckout>> {
     let root = tasks_state::project_root(&state, project)?;
-    blocking(move || Ok(checkouts(&root))).await
+    let reader = boards.project(project);
+    blocking(move || {
+        let mut rows = reader
+            .checkout_metadata(|| checkout_metadata(&root))
+            .map_err(CoreError::Io)?;
+        reader.retain_checkouts(
+            &rows
+                .iter()
+                .map(|row| cide_git::worktree::path_of(&root, &checkout_for(&row.change.0)))
+                .collect::<Vec<_>>(),
+        );
+        for row in &mut rows {
+            let cwd = cide_git::worktree::path_of(&root, &checkout_for(&row.change.0));
+            if !cwd.join("openspec/changes").join(&row.change.0).is_dir() {
+                row.archived_as = cide_spec::archived_dir(&cwd, &row.change).and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                });
+            }
+            if row.archived_as.is_none() {
+                if let Ok((done, total)) = reader.progress(&cwd, &row.change) {
+                    row.completed_tasks = Some(done);
+                    row.total_tasks = Some(total);
+                }
+            }
+        }
+        Ok(rows)
+    })
+    .await
 }
 
-fn checkouts(root: &Path) -> Vec<SpecCheckout> {
+fn checkout_metadata(root: &Path) -> Vec<SpecCheckout> {
     cide_git::worktree::list(root)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|tree| {
             let change = tree.agent.strip_prefix("spec-")?.to_string();
-            // One `openspec list` per worktree: the progress the session is making lives in the
-            // worktree's copy of the checklist, not the root's. The panel asks for this when the
-            // board moves (`spec_triggers` watches the worktrees too), not on every run event.
-            let progress = super::spec::open(tree.path.clone())
-                .ok()
-                .and_then(|os| os.board().ok())
-                .and_then(|board| match board {
-                    cide_ipc::SpecBoard::Ready { changes, .. } => changes
-                        .into_iter()
-                        .find(|summary| summary.name.0 == change)
-                        .map(|summary| (summary.completed_tasks, summary.total_tasks)),
-                    _ => None,
-                });
             Some(SpecCheckout {
-                completed_tasks: progress.map(|(done, _)| done),
-                total_tasks: progress.map(|(_, total)| total),
+                completed_tasks: None,
+                total_tasks: None,
+                archived_as: None,
                 branch: format!("{}/{}", cide_git::worktree::BRANCH_PREFIX, tree.agent),
                 unmerged: cide_git::worktree::unmerged(root, &tree.agent)
                     .ok()

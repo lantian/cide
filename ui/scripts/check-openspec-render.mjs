@@ -680,7 +680,7 @@ try {
      * for, not the rule it resolves to.
      */
     ok(
-      /<MarkdownPreview[\s\S]{0,400}?scrolls=\{false\}/.test(
+      /<(?:Memo)?MarkdownPreview[\s\S]{0,400}?scrolls=\{false\}/.test(
         read('../src/sidebar/OpenSpecPanel/SpecTab.tsx'),
       ),
       'the proposal is rendered as a section of the page, not as its own scrollport — without ' +

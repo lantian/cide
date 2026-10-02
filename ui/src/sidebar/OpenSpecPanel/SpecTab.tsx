@@ -12,12 +12,8 @@
  * The page also draws what no file contains: whether it validates, how far the checklist has got,
  * which task tracks it, and the actions. `TabKind::OpenSpec` carries the argument in full.
  *
- * # It owns no state that outlives it
- *
- * Everything is read through `spec.change` / `spec.spec` on mount and again whenever the board
- * moves, deliberately: a change's contents change while an agent works on it, and a page holding
- * its own copy would be a second, staler answer than the panel's. The one thing it keeps is the
- * open editor's draft, which is the user's typing and belongs to nobody else.
+ * Reads are shared and keyed by checkout and content generation. Hidden tabs keep their drafts,
+ * foldouts and scroll positions, and refresh changed content when activated.
  */
 import {
   memo,
@@ -31,6 +27,7 @@ import {
 } from 'react'
 import { Icon, asIcon } from '@/icons/Icon'
 import { notify, notifyFailure } from '@/chrome/notices'
+import { changePath, readChange, readArtifact, resourceRevision, useSpecData } from './specData'
 import { parseMarkdown } from '@/editor/markdown/blocks'
 import { MarkdownPreview } from '@/editor/markdown/MarkdownPreview'
 import { dirOf, resolveLocal, targetKind } from '@/editor/markdown/links'
@@ -40,7 +37,7 @@ import { useTasks } from '../tasksStore'
 import { useAgents } from '../agentsStore'
 import { useApplyDialog } from './applyStore'
 import { Badge } from '@/kit/components/Status'
-import { followSpecRuns, openSession, useSpecRuns } from './specRuns'
+import { openSession, useSpecRuns } from './specRuns'
 import { runReadyAct } from './specActs'
 import { adaptChange } from './adapt'
 import { RequirementEditor } from './RequirementEditor'
@@ -106,6 +103,7 @@ export interface SpecTabViewProps {
   view: ChangeView | null
   /** Why there is no view, when there is none and the read has finished. */
   failed: string | null
+  onRetry?: (() => void) | undefined
   reading: boolean
   /**
    * The task tracking this change: its id, assignee, status, and the conversation its work went
@@ -285,8 +283,11 @@ function Block({
   )
 }
 
+const MemoMarkdownPreview = memo(MarkdownPreview)
+
 export function SpecTabView(props: SpecTabViewProps) {
   const { view, failed, reading, task, edit, find } = props
+  const parsedProposal = useMemo(() => props.proposal ? parseMarkdown(props.proposal.text) : null, [props.proposal?.text])
   const session = props.session ?? null
   const acts = props.readyActs ?? []
   const query = find?.query ?? ''
@@ -311,6 +312,7 @@ export function SpecTabView(props: SpecTabViewProps) {
         <p className={styles.failed} data-audit="specTabFailed">
           {failed ?? 'This change could not be read.'}
         </p>
+        {props.onRetry && <button type="button" onClick={props.onRetry}>Retry</button>}
       </div>
     )
   }
@@ -336,6 +338,7 @@ export function SpecTabView(props: SpecTabViewProps) {
 
   return (
     <div ref={props.ref} className={styles.page} data-audit="specTab" data-change={view.name}>
+      {failed && <p role="alert" className={styles.failed}>{failed} <button type="button" onClick={props.onRetry}>Retry</button></p>}
       {/*
         * The find bar is the first thing in the page and sticks to the top of it — the editor's
         * own bar is `position: sticky; top: 0` in its scroller for the same reason. It sat below
@@ -610,8 +613,8 @@ export function SpecTabView(props: SpecTabViewProps) {
               * usable at the bottom of a file, and which here was a screenful of blank between
               * the proposal and the Steps below it.
               */}
-            <MarkdownPreview
-              doc={parseMarkdown(props.proposal.text)}
+            <MemoMarkdownPreview
+              doc={parsedProposal!}
               path={props.proposal.path}
               onNavigate={props.onNavigate}
               scrolls={false}
@@ -871,10 +874,14 @@ function ChangeTab({
   active: boolean
   change: string
 }) {
-  const board = useSpec((state) => state.board)
+  const root = useSpec((state) => state.project === project && state.board.kind === 'ready' ? state.board.root : null)
   const [view, setView] = useState<ChangeView | null>(null)
   const [reading, setReading] = useState(true)
   const [failed, setFailed] = useState<string | null>(null)
+  const [artifactError, setArtifactError] = useState<string | null>(null)
+  const boardFailure = useSpec((state) => state.project !== project ? null :
+    state.board.kind === 'unusable' ? state.board.reason :
+    state.board.kind === 'absent' ? 'OpenSpec is not set up in this project.' : null)
 
   const [target, setTarget] = useState<string | null>(null)
   const [draft, setDraft] = useState<RequirementDraft | null>(null)
@@ -899,31 +906,21 @@ function ChangeTab({
 
   const page = useRef<HTMLDivElement | null>(null)
 
-  /*
-   * Re-read on every board move, which is what makes the page follow an agent: the watcher route
-   * for a run's own worktree fires `cide://spec-changed`, `specStore` adopts it, and this asks
-   * again. Without the dependency the page would be a snapshot of the moment it was opened.
-   */
-  /*
-   * OpenSpec sessions: follow them (the panel may be shut), and find this change's — its session,
-   * and its `spec-<change>` worktree when it was applied in one. The page reads the change **from
-   * that worktree** then: the session ticks the boxes there, and the root's copy stays unticked
-   * until the branch lands, which would leave the page offering nothing on finished work.
-   */
-  useEffect(() => followSpecRuns(project), [project])
+  // Session and checkout state comes from the application-owned subscription.
   const runs = useSpecRuns((state) => state.runs)
   const checkouts = useSpecRuns((state) => state.checkouts)
   const session = useMemo(() => sessionViews(runs).byChange[change] ?? null, [runs, change])
   const hasCheckout = checkouts.some((checkout) => checkout.change === change)
   const worktree =
-    hasCheckout && board.kind === 'ready'
-      ? `${board.root}/.cide/worktrees/spec-${change}`
+    hasCheckout && root !== null
+      ? `${root}/.cide/worktrees/spec-${change}`
       : undefined
 
+  const detailRevision = useSpecData((state) => resourceRevision(state.epochs, project, changePath(worktree ?? root ?? '', change), true))
   useEffect(() => {
+    if (!active || root === null) return
     let live = true
-    void specApi
-      .change(project, change as ChangeName, worktree)
+    void readChange(project, root, change, worktree)
       .then((wire) => {
         if (!live) return
         setReading(false)
@@ -943,50 +940,42 @@ function ChangeTab({
     return () => {
       live = false
     }
-  }, [project, change, board, worktree])
+  }, [project, change, root, worktree, active, detailRevision])
 
-  /*
-   * The proposal's text: a second read, keyed on the *path* rather than on `view`.
-   *
-   * Keyed on the path because that is what decides which bytes to fetch, and because the change
-   * object is a fresh value on every board move — an effect that depended on it would re-read the
-   * file every time an agent ticked a box, on a page that is otherwise already re-reading four
-   * subprocesses. `board` is in the deps as well so that editing the proposal itself still
-   * refreshes it; that is a file read, which is cheap, and it is the one signal that the prose on
-   * screen has gone stale.
-   *
-   * Reset to `null` first, so a change whose proposal cannot be read does not keep drawing the
-   * previous change's prose under the new change's title.
-   */
+  // Proposal bytes have their own content generation, independent of board summary equality.
   const proposalPath = useMemo(() => {
     if (view === null) return null
     const artifact = proposalArtifact(view)
     return artifact?.existing[0] ?? null
   }, [view])
 
+  const proposalRevision = useSpecData((state) => resourceRevision(state.epochs, project, proposalPath ?? ''))
   useEffect(() => {
+    if (!active) return
     if (proposalPath === null) {
+      setArtifactError(null)
       setProposal(null)
       return
     }
     let live = true
-    void specApi
-      .artifact(project, proposalPath)
+    setProposal((current) => current?.path === proposalPath ? current : null)
+    void readArtifact(project, proposalPath, worktree)
       .then((answer) => {
         if (!live) return
+        setArtifactError(null)
         setProposal(
           answer === null
             ? null
             : { path: proposalPath, text: answer.text, truncated: answer.truncated },
         )
       })
-      .catch(() => {
-        if (live) setProposal(null)
+      .catch((error: unknown) => {
+        if (live) setArtifactError(`Could not read the proposal: ${String(error)}`)
       })
     return () => {
       live = false
     }
-  }, [project, proposalPath, board])
+  }, [project, proposalPath, worktree, active, proposalRevision])
 
   const tasks = useTasks((state) => state.board)
   const task = useMemo(() => {
@@ -1226,15 +1215,15 @@ function ChangeTab({
    * this counts the elements that came out. It cannot disagree with the screen because it *is*
    * the screen.
    *
-   * `useLayoutEffect` with no dependency array, guarded by an equality check: it runs after every
-   * render, and the guard is what stops the state it sets from causing another one.
+   * Only count while searching in the active tab and after searchable content changes.
    */
   useLayoutEffect(() => {
+    if (!active || !find?.query) { setMatches(0); return }
     const node = page.current
     if (node === null) return
     const total = node.querySelectorAll('[data-audit="specTabMark"]').length
     setMatches((current) => (current === total ? current : total))
-  })
+  }, [active, find?.query, view, proposal, target, draft])
 
   /*
    * Bring the current hit into view — including out of a section somebody has collapsed.
@@ -1247,14 +1236,14 @@ function ChangeTab({
    * edge of the fold it was scrolled to.
    */
   useEffect(() => {
-    if (find === null) return
+    if (!active || find === null) return
     const node = page.current?.querySelector(`[data-hit="${find.index}"]`)
     if (!(node instanceof HTMLElement)) return
     for (let at: HTMLElement | null = node; at !== null; at = at.parentElement) {
       if (at instanceof HTMLDetailsElement) at.open = true
     }
     node.scrollIntoView({ block: 'center' })
-  }, [find])
+  }, [active, find])
 
   /*
    * A link inside the proposal.
@@ -1304,8 +1293,9 @@ function ChangeTab({
       matches={matches}
       onFind={setFind}
       view={view}
-      failed={failed}
-      reading={reading}
+      failed={failed ?? boardFailure ?? artifactError}
+      onRetry={() => { void useSpec.getState().refresh(true).catch(notifyFailure) }}
+      reading={reading && boardFailure === null}
       task={task}
       roleWorktree={roleWorktree}
       edit={{ target, draft, busy, problem }}
@@ -1318,8 +1308,8 @@ function ChangeTab({
         if (row !== undefined) void openSession(project, row).catch(notifyFailure)
       }}
       readyActs={
-        view !== null && view.archivedAs == null && stageOf(view) === 'ready'
-          ? readyActs(hasCheckout)
+        view !== null && (stageOf(view) === 'ready' || (view.archivedAs != null && hasCheckout))
+          ? readyActs(hasCheckout).filter((act) => view.archivedAs == null || act.id !== 'archive')
           : []
       }
       onReadyAct={(act) => runReadyAct(project, change, act)}
@@ -1351,29 +1341,36 @@ function ChangeTab({
  * exists to prevent. The action is *Propose a change to this*, which is the road that leads back
  * here properly.
  */
-function CapabilityPage({ project, spec }: { project: ProjectId; spec: string }) {
+function CapabilityPage({ project, spec, active }: { project: ProjectId; spec: string; active: boolean }) {
   const [text, setText] = useState<string | null>(null)
   const [path, setPath] = useState<string | null>(null)
-  const board = useSpec((state) => state.board)
+  const root = useSpec((state) => state.project === project && state.board.kind === 'ready' ? state.board.root : null)
 
+  const [error, setError] = useState<string | null>(null)
+  const boardFailure = useSpec((state) => state.project !== project ? null :
+    state.board.kind === 'unusable' ? state.board.reason :
+    state.board.kind === 'absent' ? 'OpenSpec is not set up in this project.' : null)
+  const problem = error ?? boardFailure
+  const filePath = root === null ? '' : `${root}/openspec/specs/${spec}/spec.md`
+  const revision = useSpecData((state) => resourceRevision(state.epochs, project, filePath))
   useEffect(() => {
-    if (board.kind !== 'ready') return
+    if (!active || root === null) return
     let live = true
-    const file = `${board.root}/openspec/specs/${spec}/spec.md`
-    void specApi
-      .artifact(project, file)
+    const file = filePath
+    void readArtifact(project, file)
       .then((answer) => {
         if (!live) return
+        setError(null)
         setText(answer?.text ?? null)
         setPath(answer === null ? null : file)
       })
-      .catch(() => {
-        if (live) setText(null)
+      .catch((error: unknown) => {
+        if (live) setError(String(error))
       })
     return () => {
       live = false
     }
-  }, [project, spec, board])
+  }, [project, root, filePath, active, revision])
 
   /*
    * A link inside a capability, resolved the way the proposal's are.
@@ -1419,7 +1416,8 @@ function CapabilityPage({ project, spec }: { project: ProjectId; spec: string })
           {spec}
         </h1>
       </header>
-      {doc === null || path === null ? (
+      {problem && <p role="alert" className={styles.failed}>{problem} <button type="button" onClick={() => { void useSpec.getState().refresh(true).catch(notifyFailure) }}>Retry</button></p>}
+      {problem && doc === null ? null : doc === null || path === null ? (
         <p className={styles.reading} data-audit="specTabReading">
           Reading {spec}…
         </p>
@@ -1437,7 +1435,7 @@ function CapabilityPage({ project, spec }: { project: ProjectId; spec: string })
          * 40vh tail is for a scrollport, which a section of a page is not.
          */
         <div className={cx(styles.prose, styles.specProse)} data-audit="specTabBody">
-          <MarkdownPreview doc={doc} path={path} onNavigate={onNavigate} scrolls={false} />
+          <MemoMarkdownPreview doc={doc} path={path} onNavigate={onNavigate} scrolls={false} />
         </div>
       )}
     </div>
@@ -1446,7 +1444,7 @@ function CapabilityPage({ project, spec }: { project: ProjectId; spec: string })
 
 /** A change or a capability. Exactly one of the two props. */
 function SpecTabImpl({ project, active, change, spec }: SpecTabProps) {
-  if (spec !== undefined) return <CapabilityPage project={project} spec={spec} />
+  if (spec !== undefined) return <CapabilityPage project={project} spec={spec} active={active} />
   if (change !== undefined)
     return <ChangeTab project={project} active={active} change={change} />
   // Neither: a tab kind that carries no subject cannot exist — `SpecSubject` has two arms and
