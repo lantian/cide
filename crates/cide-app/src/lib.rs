@@ -48,9 +48,9 @@ mod opencode_console;
 /// One definition of *busy* serving both, deliberately: its header says why a second would be
 /// wrong, and why this one is Rust's to compute rather than the webview's.
 pub mod running;
+mod spec_cache;
 mod spec_reveal;
 mod spec_state;
-mod spec_cache;
 mod spec_triggers;
 /// The timer that wakes a project which has gone quiet with work still open. (M79)
 ///

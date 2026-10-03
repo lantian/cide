@@ -55,6 +55,11 @@ impl TempRepo {
         repo.git(&["init", "-q", "-b", "main"]);
         repo.git(&["config", "user.name", "cide tests"]);
         repo.git(&["config", "user.email", "tests@cide.invalid"]);
+        // Keep fixtures under the test's control: detached maintenance can remove loose
+        // objects while another commit is being written, or fanout directories while a twin
+        // is being copied. The rebase-cap fixture lost its newest HEAD object this way.
+        repo.git(&["config", "gc.auto", "0"]);
+        repo.git(&["config", "maintenance.auto", "false"]);
         // Every generated file's bytes must survive a round trip through the index unchanged
         // unless a test asks otherwise, so the eol machinery is off by default and switched on
         // explicitly by the CRLF cases.

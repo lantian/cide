@@ -202,12 +202,12 @@ pub mod spec;
 pub mod docker;
 
 pub use spec::{
-    SpecArchiveResult, SpecSnapshot, SpecInvalidation, SpecChanged,
-    ArtifactState, ChangeSummary, DeltaOperation, SpecAcceptPlan, SpecAccepted, SpecArtifact,
-    SpecArtifactRules, SpecArtifactText, SpecBoard, SpecChange, SpecCommand, SpecConfig,
-    SpecConfigEdit, SpecDelta, SpecIssue, SpecOperationGuidance, SpecOrigin, SpecProgress,
-    SpecRename, SpecRequirement, SpecRequirementSet, SpecScenario, SpecSchema, SpecSummary,
-    SpecTask, SpecTouch, SpecValidation, SpecWriteOutcome,
+    ArtifactState, ChangeSummary, DeltaOperation, SpecAcceptPlan, SpecAccepted, SpecArchiveResult,
+    SpecArtifact, SpecArtifactRules, SpecArtifactText, SpecBoard, SpecChange, SpecChanged,
+    SpecCommand, SpecConfig, SpecConfigEdit, SpecDelta, SpecInvalidation, SpecIssue,
+    SpecOperationGuidance, SpecOrigin, SpecProgress, SpecRename, SpecRequirement,
+    SpecRequirementSet, SpecScenario, SpecSchema, SpecSnapshot, SpecSummary, SpecTask, SpecTouch,
+    SpecValidation, SpecWriteOutcome,
 };
 pub use spec::{
     SpecCheckout, SpecIntegrated, SpecLauncher, SpecOp, SpecPublished, SpecRunRow,

@@ -214,13 +214,6 @@ fn edit(repo: &TempRepo, rng: &mut Rng, path: &str, salt: usize) {
 /// A linear history of `commits` commits over `files` text files.
 fn history(tag: &str, rng: &mut Rng, commits: usize, files: usize) -> TempRepo {
     let repo = TempRepo::new(tag);
-    // `git commit` starts a **detached** `git gc --auto`, which packs loose objects and removes
-    // their fanout directories. That is invisible in a normal test and fatal to `twin`: the
-    // `cp -a` lists `.git/objects/` and then finds `d8/` gone underneath it, which showed up as
-    // a copy failing one run in a few hundred. Turning both off is the fix, and it is only
-    // needed for the repositories that get copied.
-    repo.git(&["config", "gc.auto", "0"]);
-    repo.git(&["config", "maintenance.auto", "false"]);
     for index in 0..files {
         // Long enough that two edits to one file usually land in different hunks. A six-line
         // file makes every second replay a conflict for reasons that have nothing to do with

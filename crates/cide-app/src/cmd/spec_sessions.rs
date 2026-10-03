@@ -667,11 +667,11 @@ pub async fn spec_checkouts(
                         .map(|name| name.to_string_lossy().to_string())
                 });
             }
-            if row.archived_as.is_none() {
-                if let Ok((done, total)) = reader.progress(&cwd, &row.change) {
-                    row.completed_tasks = Some(done);
-                    row.total_tasks = Some(total);
-                }
+            if row.archived_as.is_none()
+                && let Ok((done, total)) = reader.progress(&cwd, &row.change)
+            {
+                row.completed_tasks = Some(done);
+                row.total_tasks = Some(total);
             }
         }
         Ok(rows)

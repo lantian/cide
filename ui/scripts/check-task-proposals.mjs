@@ -13,6 +13,7 @@ const ui = resolve(import.meta.dirname, '..')
 mkdirSync(join(ui, 'node_modules/.cache'), { recursive: true })
 const out = mkdtempSync(join(ui, 'node_modules/.cache/task-proposals-'))
 const listeners = new Set()
+const gitListeners = new Set()
 const calls = { create: [], propose: [], apply: [], opened: [], failures: [], specTabs: [], focusedTabs: [] }
 let rows = []
 let saveError = null
@@ -34,6 +35,10 @@ globalThis.__taskProposalChecks = {
     start: async (...args) => { calls.apply.push(args); return applyResult ?? 'apply-42' },
     onChanged: async (handler) => { listeners.add(handler); return () => listeners.delete(handler) },
     runs: async () => { if (readError) throw readError; return rows },
+    checkouts: async () => [],
+  },
+  events: {
+    onGitStatus: async (handler) => { gitListeners.add(handler); return () => gitListeners.delete(handler) },
   },
   agentRuns: { open: async () => openPlan ?? { kind: 'live', session: 'session-42', continues: null } },
   spec: { openTab: async (...args) => { calls.specTabs.push(args); return 'spec-tab-42' } },
@@ -70,7 +75,7 @@ try {
           const t = globalThis.__taskProposalChecks;
           export const tasks = t.tasks, attachments = {}, specEvents = {};
           export const settings = { effective: async (project) => ({ consoleHarness: t.projectHarness?.[project] ?? t.consoleHarness ?? 'codex' }) };
-          export const specSessions = t.specSessions, agentRuns = t.agentRuns, spec = t.spec;`
+          export const specSessions = t.specSessions, agentRuns = t.agentRuns, spec = t.spec, events = t.events;`
         if (id === '\0workspace') return `
           import { create } from 'zustand';
           export const useWorkspace = create(() => ({ boot: null,
@@ -178,8 +183,9 @@ try {
   assert.equal(calls.failures.length, 1)
   reset()
   rows = [{ run: 'run-42', task: 't-42', op: 'propose', state: { state: 'queued' } }]
-  const stopCard = followSpecRuns('project-1', false)
+  const stopCard = followSpecRuns('project-1')
   await flush()
+  assert.equal(gitListeners.size, 1, 'following spec runs also subscribes to checkout invalidations')
   assert.equal(useSpecRuns.getState().runs[0].task, 't-42', 'the task card receives the persisted proposal association')
   emit([{ ...rows[0], session: 'session-42', state: { state: 'running' } }])
   await flush()
@@ -188,6 +194,7 @@ try {
   stopCard()
   await flush()
   assert.equal(listeners.size, 0, 'task-card proposal subscriptions are released')
+  assert.equal(gitListeners.size, 0, 'checkout invalidation subscriptions are released')
   reset()
   useTasks.getState().select('t-42')
   let answerSpecTab
