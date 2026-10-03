@@ -223,6 +223,11 @@ diff collection and both console harnesses using fake CLIs, without paid model c
 
 ### OpenSpec sessions, and the tracker switch
 
+`check:openspec-apply` drives Apply's mounted keyboard/focus lifecycle in headless Chromium,
+including reopening and pending/failed launches with mocked IPC. It requires Chromium or
+Google Chrome; set `CHROMIUM` to override the executable path. Native WebView behavior still
+needs a smoke check from both the OpenSpec panel and the change tab.
+
 **Touches:** `cmd::spec_sessions` (`spec_session_start`, `spec_runs`, `spec_checkouts`, `spec_publish`, `spec_integrate`, `archive_dir`), `agents::RunPurpose::Spec`/`SpecPurpose` and its `SavedRun::spec`, `cide_agents::harness::spec_session_brief`, `RunPlan::review`, `cide_git::worktree::{commit_all,dirty}`, `milestones::before_integrate_at`, `config::{load_tracker,write_tracker,load_spec_settings,write_spec_settings}`, `OrchestrationConfig::tracker_enabled`, `ProjectTools::tracker`/`Scope::Run::board`, `tools::tool::ORCHESTRATION_NO_TRACKER`, `cmd::session`'s `no_tracker_manual`/`SESSIONS_PARAGRAPH_NO_TRACKER`, `sidebar/OpenSpecPanel/{ApplyDialog,LauncherPicker,specRuns,applyStore}`, the Tasks panel's `off` screen (`TasksPanelView`'s `off`/`onEnable`)
 
 `cargo test -p cide-agents -- config tools`, `cargo test -p cide-app -- cmd::session cmd::spec_sessions agents agent_rpc spinner`, `cargo test -p cide-git worktree`, `check:openspec`, `check:openspec-render` (the `board-sessions` story), `check:settings-agents`, `check:sidebar`, `cargo --locked xtask codegen --check`. Silent failures:
