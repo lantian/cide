@@ -204,6 +204,7 @@ try {
 
 const profile = mkdtempSync(join(tmpdir(), 'cide-apply-check-'))
 let server, child
+let browserClosed = Promise.resolve()
 try {
   server = await createServer({
     root: ui, configFile: false, logLevel: 'error',
@@ -238,6 +239,7 @@ try {
       '--no-default-browser-check', '--disable-dev-shm-usage', '--no-sandbox',
       '--user-data-dir=' + profile, '--dump-dom', '--virtual-time-budget=10000',
       'http://127.0.0.1:' + server.httpServer.address().port + '/apply-check'])
+    browserClosed = new Promise((resolve) => child.once('close', resolve))
     let stdout = '', stderr = ''
     child.stdout.on('data', (chunk) => {
       stdout += chunk
@@ -262,7 +264,17 @@ try {
   assert.ok(result.ok, result.error)
   console.log('OpenSpec Apply: ' + result.checks.length + ' browser assertions passed')
 } finally {
+  // kill() only sends a signal. Chrome can still write to its profile until it exits,
+  // so removing that directory immediately races shutdown even after every assertion passes.
+  const forceStop = child?.pid && child.exitCode === null && child.signalCode === null
+    ? setTimeout(() => child.kill('SIGKILL'), 5000)
+    : undefined
   child?.kill()
+  try {
+    await browserClosed
+  } finally {
+    clearTimeout(forceStop)
+  }
   await server?.close()
   rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
 }

@@ -227,6 +227,9 @@ diff collection and both console harnesses using fake CLIs, without paid model c
 including reopening and pending/failed launches with mocked IPC. It requires Chromium or
 Google Chrome; set `CHROMIUM` to override the executable path. Native WebView behavior still
 needs a smoke check from both the OpenSpec panel and the change tab.
+The browser check must await Chromium's `close` event before deleting its temporary profile:
+`kill()` only sends a signal, and profile writes during shutdown can make cleanup fail with
+`ENOTEMPTY` or mask an earlier test failure. A bounded shutdown escalates to `SIGKILL` if needed.
 
 **Touches:** `cmd::spec_sessions` (`spec_session_start`, `spec_runs`, `spec_checkouts`, `spec_publish`, `spec_integrate`, `archive_dir`), `agents::RunPurpose::Spec`/`SpecPurpose` and its `SavedRun::spec`, `cide_agents::harness::spec_session_brief`, `RunPlan::review`, `cide_git::worktree::{commit_all,dirty}`, `milestones::before_integrate_at`, `config::{load_tracker,write_tracker,load_spec_settings,write_spec_settings}`, `OrchestrationConfig::tracker_enabled`, `ProjectTools::tracker`/`Scope::Run::board`, `tools::tool::ORCHESTRATION_NO_TRACKER`, `cmd::session`'s `no_tracker_manual`/`SESSIONS_PARAGRAPH_NO_TRACKER`, `sidebar/OpenSpecPanel/{ApplyDialog,LauncherPicker,specRuns,applyStore}`, the Tasks panel's `off` screen (`TasksPanelView`'s `off`/`onEnable`)
 

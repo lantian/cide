@@ -17333,3 +17333,13 @@ strict OpenSpec change validation and whitespace checks pass. No dependencies or
 **Native smoke unavailable:** both computer-use attempts to access CIDE failed with
 `Sky Computer Use native pipe startup failed`. Opening Apply from the OpenSpec panel and change
 tab, repeated opening, instructions entry and Escape in the native WebView remain unverified.
+
+**CI follow-up:** the Apply browser check could remove its temporary profile while Chrome
+was still shutting down: `kill()` sends a signal without waiting, and concurrent profile
+writes caused `ENOTEMPTY` in the Linux UI job and a local macOS run. Cleanup now waits for the
+child's `close` event, with a five-second forced-stop fallback, before removing the profile.
+The corrected browser check passes all 60 assertions and exits 0 on macOS with Node 22.
+The full local CI run completed with 130 passing checks and one failing Rust-test step;
+all 121 UI checks (including install, TypeScript and production build) passed. The two
+Rust failures were `a_shutdown_thaws_before_it_signals` (passed on an isolated rerun) and
+`a_project_with_no_marker_does_not_start_a_server` (no rust-analyzer available on this host).
