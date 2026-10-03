@@ -502,6 +502,12 @@ pub enum ClientBody {
     /// A device holds rows and asks for a body only when somebody opens one — the board carries
     /// no content for the reason `TaskRow` exists at all.
     TaskGet { project: ProjectId, task: TaskId },
+    /// Atomic user response. Offered when features contains `"taskRespond"`.
+    TaskRespond {
+        project: ProjectId,
+        task: TaskId,
+        response: crate::TaskResponse,
+    },
     /// Page the **view** of a session, up (negative) or down: PgUp/PgDn on a phone. (M91)
     ///
     /// Not [`Self::Input`]'s `PageUp`, which is `ESC[5~` handed to the program — ignored by a
@@ -685,6 +691,11 @@ pub enum ServerBody {
     /// A dispatch started. The run id, so a device can open what it just started.
     Dispatched {
         run: RunId,
+    },
+    /// The response was recorded; the envelope carries the request id.
+    TaskResponded {
+        project: ProjectId,
+        task: TaskId,
     },
     /// A watched session repainted.
     Screen {

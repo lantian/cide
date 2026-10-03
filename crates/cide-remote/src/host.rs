@@ -178,6 +178,17 @@ pub trait RemoteHost: Send + Sync + 'static {
         edit: cide_ipc::TaskEdit,
     ) -> Result<(), String>;
 
+    /// Record a response through the same atomic operation as the desktop.
+    fn task_respond(
+        &self,
+        project: ProjectId,
+        task: cide_ipc::TaskId,
+        response: cide_ipc::TaskResponse,
+    ) -> Result<(), String> {
+        let _ = (project, task, response);
+        Err("this cide cannot answer tasks from a device".to_owned())
+    }
+
     /// This session has been looked at; clear its *finished and not yet seen* mark.
     ///
     /// One session. The set travels **to** a device whole and **from** one entry at a time, which

@@ -134,6 +134,7 @@ fn main() {
 /// reported as verified when nothing had been verified at all.
 #[derive(Default)]
 struct Constants {
+    answered_task: std::sync::Mutex<Option<cide_ipc::TaskDetail>>,
     acknowledged: std::sync::Mutex<std::collections::HashSet<cide_ipc::SessionId>>,
     /// What has been typed at the prompt, echoed back into [`RemoteHost::screen`]. (M76)
     ///
@@ -191,6 +192,29 @@ fn attachment(id: &str, name: &str, kind: cide_ipc::AttachmentKind) -> cide_ipc:
 }
 
 impl Constants {
+    fn question_detail(&self) -> cide_ipc::TaskDetail {
+        let mut detail = self.detail();
+        detail.row.id = "t-8".to_owned().into();
+        detail.row.title = "Choose a design".into();
+        detail.row.status = cide_ipc::TaskStatus::Review;
+        detail.row.question = Some(serde_json::from_value(serde_json::json!({
+            "text": "Which design should we use?", "selection": "multiple",
+            "options": [
+                {"id": "blue", "title": "Blue", "description": "The first design", "image": "a-png"},
+                {"id": "green", "title": "Green"}
+            ]
+        })).expect("a valid question"));
+        detail
+    }
+
+    fn current_question_detail(&self) -> cide_ipc::TaskDetail {
+        self.answered_task
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.question_detail())
+    }
+
     /// The one task, and the conversation on it. See [`RemoteHost::board`].
     fn detail(&self) -> cide_ipc::TaskDetail {
         let id = cide_ipc::TaskId("t-7".to_owned());
@@ -404,11 +428,15 @@ impl RemoteHost for Constants {
         if project != self::project() {
             return Vec::new();
         }
-        vec![self.detail().row]
+        vec![self.detail().row, self.current_question_detail().row]
     }
 
     fn task(&self, project: ProjectId, task: cide_ipc::TaskId) -> Option<cide_ipc::TaskDetail> {
-        let detail = self.detail();
+        let detail = if task.0 == "t-8" {
+            self.current_question_detail()
+        } else {
+            self.detail()
+        };
         if project != self::project() || task != detail.row.id {
             return None;
         }
@@ -769,6 +797,59 @@ impl RemoteHost for Constants {
 
     fn dispatch(&self, _request: cide_ipc::DispatchRequest) -> Result<cide_ipc::RunId, String> {
         Err("this example dispatches nothing".to_owned())
+    }
+
+    fn task_respond(
+        &self,
+        project: ProjectId,
+        task: cide_ipc::TaskId,
+        response: cide_ipc::TaskResponse,
+    ) -> Result<(), String> {
+        if project != self::project() || task.0 != "t-8" {
+            return Err("no such task".into());
+        }
+        let cide_ipc::TaskResponse::Answer {
+            text,
+            selected_ids,
+            expected_question,
+        } = response
+        else {
+            return Err("this fixture only answers questions".into());
+        };
+        let mut held = self.answered_task.lock().unwrap();
+        let mut detail = held.clone().unwrap_or_else(|| self.question_detail());
+        let question = detail
+            .row
+            .question
+            .as_ref()
+            .ok_or("this question has already been answered or cleared")?;
+        if expected_question
+            .as_ref()
+            .is_some_and(|shown| shown != question)
+        {
+            return Err("the question changed; review it before answering".into());
+        }
+        question.validate_answer(&selected_ids, &text)?;
+        detail.comments.push(cide_ipc::TaskComment {
+            id: cide_ipc::CommentId("00000000-0000-4000-8000-000000000004".to_owned()),
+            author: cide_ipc::TaskAuthor::User,
+            text: format!(
+                "**The user answered:** {} {}",
+                selected_ids.join(", "),
+                text.trim()
+            ),
+            at_unix_ms: 1_789_903_600_001,
+            edited_at_unix_ms: None,
+            deleted: false,
+            attachments: Vec::new(),
+            superseded: false,
+        });
+        detail.row.question = None;
+        detail.row.status = cide_ipc::TaskStatus::Doing;
+        detail.row.comment_count += 1;
+        detail.row.updated_unix_ms += 1;
+        *held = Some(detail);
+        Ok(())
     }
 
     fn task_new(&self, _task: cide_ipc::TaskNew) -> Result<(), String> {

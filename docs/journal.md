@@ -17357,3 +17357,46 @@ each makes the check fail. All 121 shared UI steps, including TypeScript and pro
 pass on macOS with Node 22. Shell, dependency-pin and no-Tauri checks pass too. The full latest
 GitHub job log requires authentication unavailable to this session, so its precise exception
 was not confirmed. Native WebView verification remains unavailable as recorded above.
+
+## M151 — Mobile visual answers and image zoom
+
+The phone now draws string and structured task questions, single or multiple choices, option
+images and custom text. Responses use the new capability-gated `taskRespond` remote command,
+which calls the desktop's atomic `task_respond` operation. A correlated success acknowledgement
+allows the phone to clear a draft only after the response lands; refusals and disconnections
+preserve the draft. The displayed question travels with the answer, so changed and duplicate
+questions retain the tracker's existing refusal rules. The task list reads a structured question's
+text, and the task card hides acceptance while an open question takes priority. An older server
+shows an explanation instead of sending the former comment-and-clear pair of edits.
+
+Question images resolve live body and comment attachments and open the same fullscreen viewer
+as task attachments. That viewer supports pinch zoom from fit to 8x, bounded panning, double-tap
+fit/3x and Reset. Gallery paging is disabled while pinching or enlarged; changing images or
+rotating resets the view. The modal owns a gesture root for Android, and enlarged pictures keep
+their source resolution. Existing cache, download, Save and Share behavior remains in use.
+
+**Verified:** cide-mobile's full check passes (277 tests, including the sealed real-server
+visual-answer/image-download test and stale/duplicate refusals). The Android Expo bundle exports
+successfully. IPC, tracker and remote suites pass, including the new request-id/host-routing
+regression; socket tests were rerun outside the sandbox. Nine application remote tests,
+application check, protocol/codegen, protocol closure tests, UI TypeScript and remote UI check
+pass.
+
+**Not confirmed on hardware:** pinch/pan, rotation and paging interactions on Android or iOS;
+ADB found no connected device. The running desktop backend was not restarted, and no APK was
+installed. Existing uncommitted mobile work was preserved.
+
+
+**Follow-up — Mobile choice selection:** The phone could render and swipe through variants,
+but the capability guard disabled their press controls on a desktop that did not yet expose
+`taskRespond`. Local selections and custom text are now editable independently of submission
+support; only sending requires that capability. Each variant has an explicit 48-point radio or
+checkbox control, separate from the image preview. The nested variant list retains keyboard
+taps and receives selection state explicitly. Single choice replaces the previous selection;
+multiple choice toggles each option independently.
+
+Mounted-form tests reproduced the old disabled-selection and missing keyboard-tap behavior,
+then passed with the fix. They also cover both selection-only submission modes, image previews
+without selection changes, and preserving a failed answer. The full mobile check now passes
+284 tests. A signed release APK was rebuilt and published on port 9990. Both running desktop
+processes were inspected and still lack the new remote answer command; they were not restarted.

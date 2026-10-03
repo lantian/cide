@@ -156,6 +156,7 @@ pub const FEATURES: &[&str] = &[
     "milestones",
     // A task attachment's bytes, a slice at a time. (M136)
     "attachments",
+    "taskRespond",
 ];
 
 /// Something that happened in cide, on its way to whichever devices care.
@@ -1532,6 +1533,30 @@ async fn serve(
                 }
             }
 
+            (
+                true,
+                ClientBody::TaskRespond {
+                    project,
+                    task,
+                    response,
+                },
+            ) => {
+                let wanted = task.clone();
+                let done = ask(&inner, move |host| {
+                    host.task_respond(project, wanted, response)
+                })
+                .await;
+                let sent = match done {
+                    Ok(()) => {
+                        say(&out_tx, id_of, ServerBody::TaskResponded { project, task }).await
+                    }
+                    Err(detail) => refused(&out_tx, id_of, Err(detail)).await,
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+
             (true, ClientBody::TaskGet { project, task }) => {
                 // Answered, never pushed. A device holds rows and asks for contents only when
                 // somebody opens one, which is why the board carries none.
@@ -2539,6 +2564,23 @@ mod tests {
             _edit: cide_ipc::TaskEdit,
         ) -> Result<(), String> {
             self.task_calls.lock().push(format!("edit {}", task.0));
+            Ok(())
+        }
+
+        fn task_respond(
+            &self,
+            project: ProjectId,
+            task: cide_ipc::TaskId,
+            response: cide_ipc::TaskResponse,
+        ) -> Result<(), String> {
+            if project != self.projects[0].id {
+                return Err("no such project".to_owned());
+            }
+            self.task_calls.lock().push(format!(
+                "respond {} {}",
+                task.0,
+                serde_json::to_string(&response).unwrap()
+            ));
             Ok(())
         }
 
@@ -4666,6 +4708,66 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_responses_are_acknowledged_and_refusals_keep_the_request_id() {
+        let (h, first, _second) = harness().await;
+        let (device, key) = pair(&h).await;
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        for _ in 0..3 {
+            heard(&mut ws).await.unwrap();
+        }
+        let question: cide_ipc::TaskQuestion = serde_json::from_value(serde_json::json!({
+            "text": "Which design?", "selection": "multiple",
+            "options": [{"id": "blue", "title": "Blue", "image": "a-blue"}]
+        }))
+        .unwrap();
+        let response = cide_ipc::TaskResponse::Answer {
+            text: "details".into(),
+            selected_ids: vec!["blue".into()],
+            expected_question: Some(question),
+        };
+        for (id, project) in [(73, first), (74, ProjectId::new())] {
+            say(
+                &mut ws,
+                Some(id),
+                ClientBody::TaskRespond {
+                    project,
+                    task: "t-7".to_owned().into(),
+                    response: response.clone(),
+                },
+            )
+            .await;
+            let frame = loop {
+                let frame = heard_frame(&mut ws).await.unwrap();
+                if frame.id == Some(id) {
+                    break frame;
+                }
+            };
+            assert_eq!(frame.id, Some(id));
+            if project == first {
+                assert_eq!(
+                    frame.body,
+                    ServerBody::TaskResponded {
+                        project,
+                        task: "t-7".to_owned().into()
+                    }
+                );
+            } else {
+                assert!(
+                    matches!(frame.body, ServerBody::Error { detail, .. } if detail == "no such project")
+                );
+            }
+        }
+        assert_eq!(
+            h.host.task_calls.lock().as_slice(),
+            &[format!(
+                "respond t-7 {}",
+                serde_json::to_string(&response).unwrap()
+            )]
+        );
     }
 
     /// The three orchestration gestures a device may make, and the shape of their answers:

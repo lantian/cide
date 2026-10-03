@@ -333,7 +333,7 @@ expectScreen?: string, } | { "t": "paste", session: SessionId, text: string, seq
 /**
  * See [`Self::Input`]'s field of the same name.
  */
-expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "ping" };
+expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "taskRespond", project: ProjectId, task: TaskId, response: TaskResponse, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "ping" };
 
 /**
  * One frame from a device.
@@ -1143,7 +1143,7 @@ features: Array<string>, } | { "t": "paired", device: string, key: string,
  * placeholder shared by every typed pairing makes two machines look like one — so the
  * list would show one entry that connects to whichever answered last.
  */
-instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
+instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
 /**
  * Whether the queue will start anything new.
  *
@@ -1584,6 +1584,20 @@ acceptance?: Acceptance, };
  * A text question remains a string on disk and on the wire for older callers.
  */
 export type TaskQuestion = string | QuestionChoices;
+
+/**
+ * The user's answer to a task waiting for them — the Waiting-for-you list's three buttons.
+ * (M132) One command rather than three task edits, because each is several writes that must land
+ * together and one of them starts a run: "send back" is a comment, a status and a dispatch into
+ * the same role's conversation, and a UI composing that from `task_edit` calls would start the
+ * role before the note it is meant to read had reached the board.
+ */
+export type TaskResponse = { "kind": "accept" } | { "kind": "sendBack", note: string, } | { "kind": "answer", text: string, selectedIds?: Array<string>, 
+/**
+ * The displayed question, checked under the store lock before writing an answer.
+ * Omitted by legacy text-only callers.
+ */
+expectedQuestion?: TaskQuestion, };
 
 /**
  * One task as the *board* carries it: everything except its body, its log and its files. (M68)

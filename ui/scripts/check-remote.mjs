@@ -212,6 +212,7 @@ const KNOWN_CLIENT_FRAMES = [
   'taskEdit',
   'taskGet',
   'taskNew',
+  'taskRespond',
   'unwatchScreen',
   'watchScreen',
 ]

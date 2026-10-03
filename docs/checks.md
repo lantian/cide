@@ -574,6 +574,14 @@ Since M136 **a task attachment's bytes cross this wire**, as `attachmentRead` â†
 
 Gates: `cargo test -p cide-remote` (`an_attachment_is_served_in_slices_that_concatenate`), `cargo test -p cide-app -- remote::`, and cide-mobile's `npm run check`, whose end-to-end test downloads `fake_cide`'s two fixture attachments.
 
+Task-question responses (M151) also require cide-mobile's `npm run check`. The remote
+`taskRespond` road must acknowledge success with the request id and return correlated refusals;
+mobile's `Connection.request` **resolves** error bodies, so callers must check them before
+clearing a draft. Keep `expectedQuestion` on every mobile answer and route it through the desktop
+`task_respond` command rather than composing comment/question/status edits. Device verification
+is required for fullscreen image gestures: pinch, bounded pan, double-tap, paging after Reset,
+rotation, and Android Back, from both question options and task attachments.
+
 ### A Claude tab cide opened by itself
 
 **Touches:** a Claude tab cide opened by itself â€” `cide_app::claude_tab`, `cide_app::spinner`, `TabKind::ClaudeFull::ephemeral`, `AgentsConfig`'s `finish_in_new_tab`/`auto_spin*`, `agent_rpc`'s `review_prompt`/`live_reviewer`, `cmd::session::spawn_session`

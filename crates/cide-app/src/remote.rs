@@ -563,6 +563,23 @@ impl RemoteHost for AppRemoteHost {
         .map_err(|error| error.to_string())
     }
 
+    fn task_respond(
+        &self,
+        project: ProjectId,
+        task: cide_ipc::TaskId,
+        response: cide_ipc::TaskResponse,
+    ) -> Result<(), String> {
+        let app = self.app.clone();
+        on_the_runtime(async move {
+            let state = app.state::<WorkspaceState>();
+            let stores = app.state::<std::sync::Arc<crate::tasks_state::TasksStores>>();
+            crate::cmd::tasks::task_respond(app.clone(), state, stores, project, task, response)
+                .await
+        })?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
     fn acknowledge(&self, session: cide_ipc::SessionId) -> Result<(), String> {
         let Some(state) = self.app.try_state::<WorkspaceState>() else {
             return Err("this cide is still starting".to_owned());
