@@ -55,3 +55,7 @@ Thumbs.db
 .pnpm-store/
 
 /tmp/
+/.cide/agents/
+/.agents/
+/.claude/
+/openspec/

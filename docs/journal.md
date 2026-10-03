@@ -17314,3 +17314,32 @@ and TypeScript pass.
 
 **Not confirmed in the live IDE:** an interactive question in the main console, a separate tab
 or a background project. The running backend was not restarted and no paid model turn was run.
+
+## M151 — Escape dismisses OpenSpec Apply
+
+Apply now handles Escape locally through the same guarded dismissal as Cancel. Idle dismissal
+clears instructions; a pending session launch keeps the dialog and draft intact. Each opening
+places focus inside the dialog before paint, including reopening with the host still mounted,
+and preserves focus already inside. Handled Escape stops bubbling; the launcher's own popup
+retains its first Escape before the dialog closes on the next one.
+
+**Verified:** `check:openspec-apply` passes 60 assertions in headless Google Chrome 127.0.6533.89
+on macOS arm64, using the real mounted dialog, launcher controls and store with mocked IPC and
+session launch. Coverage includes immediate Escape, instructions, launcher focus, popup dismissal,
+reopening after dismissal/success, pending and failed launches, and native/React bubbling observers
+outside the portal. TypeScript, OpenSpec model/render/config and agents-render checks pass;
+strict OpenSpec change validation and whitespace checks pass. No dependencies or lockfile changed.
+
+**Native smoke unavailable:** both computer-use attempts to access CIDE failed with
+`Sky Computer Use native pipe startup failed`. Opening Apply from the OpenSpec panel and change
+tab, repeated opening, instructions entry and Escape in the native WebView remain unverified.
+
+**CI follow-up:** the Apply browser check could remove its temporary profile while Chrome
+was still shutting down: `kill()` sends a signal without waiting, and concurrent profile
+writes caused `ENOTEMPTY` in the Linux UI job and a local macOS run. Cleanup now waits for the
+child's `close` event, with a five-second forced-stop fallback, before removing the profile.
+The corrected browser check passes all 60 assertions and exits 0 on macOS with Node 22.
+The full local CI run completed with 130 passing checks and one failing Rust-test step;
+all 121 UI checks (including install, TypeScript and production build) passed. The two
+Rust failures were `a_shutdown_thaws_before_it_signals` (passed on an isolated rerun) and
+`a_project_with_no_marker_does_not_start_a_server` (no rust-analyzer available on this host).

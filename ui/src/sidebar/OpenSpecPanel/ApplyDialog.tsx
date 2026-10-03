@@ -12,7 +12,7 @@
  *
  * Rendered once by `App.tsx`, like `ProposeDialog`, so it works whichever panel is showing.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Modal } from '@/overlays/ModalShell'
 import { Button } from '@/kit/components/Button'
 import { Dialog } from '@/kit/components/Overlay'
@@ -37,6 +37,16 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [worktree, setWorktree] = useState<boolean | null>(null)
+  const instructions = useRef<HTMLTextAreaElement>(null)
+
+  // The host stays mounted while closed, so focus follows each opening. Set it before paint
+  // so an immediate key reaches Apply; keep any focus a descendant already established.
+  useLayoutEffect(() => {
+    if (change === null) return
+    const target = instructions.current
+    const dialog = target?.closest('[role="dialog"]')
+    if (dialog && !dialog.contains(document.activeElement)) target?.focus()
+  }, [change])
 
   useEffect(() => {
     if (project === null || change === null) return
@@ -83,6 +93,13 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
     <Modal onDismiss={dismiss}>
       <Dialog
         data-audit="openspecApplyDialog"
+        onKeyDown={(event) => {
+          // A launcher popup consumes Escape by preventing default before it bubbles here.
+          if (event.key !== 'Escape' || event.defaultPrevented) return
+          event.preventDefault()
+          event.stopPropagation()
+          dismiss()
+        }}
         title={`Apply ${change}`}
         lead="Implement this change in a new tab. Linked Todo tasks move to Doing. You can close the tab and open the session again from OpenSpec."
         onClose={dismiss}
@@ -126,6 +143,7 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
         <Field label="Instructions" optional hint="Typed after the apply command, on one line.">
           {({ id, describedBy }) => (
             <Textarea
+              ref={instructions}
               id={id}
               aria-describedby={describedBy}
               rows={3}
