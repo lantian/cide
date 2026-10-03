@@ -17400,3 +17400,33 @@ then passed with the fix. They also cover both selection-only submission modes, 
 without selection changes, and preserving a failed answer. The full mobile check now passes
 284 tests. A signed release APK was rebuilt and published on port 9990. Both running desktop
 processes were inspected and still lack the new remote answer command; they were not restarted.
+
+
+## M152 — A closed task releases its paths, even under an open run tab
+
+A macOS user watched the orchestrator's reviewer merge t-20, close it, and still leave the
+queue frozen: t-21 sat at "waiting: t-20 holds this task declares no `touches`, so it runs
+alone", and the subagent's own tab kept showing "In review by orchestrator" forever. The board
+was right — t-20 was done — and the reviewer had run both `cide_agent_integrate` and
+`cide_task_update`. Only the queue disagreed.
+
+The M132 path gate asks two things of a run: is it live, and is it on a task. It never asked
+the board. And `retire_done` deliberately leaves a run idle when its session is shown in an
+open tab — closing it under the user is a lost message — so the subagent's run survived the
+close, and a live run on a task with empty `touches` holds the whole repository. A task the
+board calls done now holds nothing even under a live run: the merge and the close are the end
+of the hold, and the tab outliving them is not a reason to freeze the next task. The rule
+moved into a pure `path_holders(runs, rows)` beside `path_table`. The idle child of a task
+still in review keeps holding — it is the reviewer's send-back target until the close — and a
+task with no board row keeps the old conservative hold. The waiting run starts the moment the
+close lands: `broadcast` already reruns `refresh_paths_and_pump` after every board change.
+
+The panel's word was the same stale fact: `with_reviewers` filled `run.reviewer` from the
+reviewer table whatever the board said, so a closed task kept drawing "In review by
+orchestrator". It now fills only while the task's status is review.
+
+**Verified:** a new Rust regression covers all three board answers under one open idle run —
+done releases the hold, review still holds (live), no row still holds. The full cide-app suite
+passes (784 tests), with clippy and fmt clean.
+
+**Not confirmed on a display:** the reported macOS sequence was not replayed in a running GUI.

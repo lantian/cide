@@ -9590,6 +9590,44 @@ pub(crate) fn refresh_paths_and_pump(app: &AppHandle, project: ProjectId) {
     });
 }
 
+/// Which tasks the runs hold, and whether each hold is live. (M132)
+///
+/// A run holds the task it is on while that task is open on the board. A task the board
+/// calls done holds nothing even under a live run: the reviewer merged it and closed it,
+/// and the run's tab outliving that — `retire_done` leaves a shown run idle on purpose —
+/// is not a reason to hold the repository from the next task. The idle child of a task
+/// still in review does hold: it is the send-back target until the reviewer closes it.
+fn path_holders(
+    runs: &[cide_ipc::AgentRun],
+    rows: &[cide_ipc::TaskRow],
+) -> Vec<(TaskId, AgentId, bool)> {
+    let mut seen: Vec<TaskId> = Vec::new();
+    let mut out: Vec<(TaskId, AgentId, bool)> = Vec::new();
+    for run in runs {
+        let live = matches!(
+            run.state,
+            RunState::Starting
+                | RunState::Running
+                | RunState::AwaitingPermission
+                | RunState::Paused { .. }
+                | RunState::Idle
+        );
+        if let (true, Some(task)) = (live, run.task.as_ref())
+            && !seen.contains(task)
+        {
+            let closed = rows
+                .iter()
+                .any(|r| &r.id == task && r.status == cide_ipc::TaskStatus::Done);
+            if closed {
+                continue;
+            }
+            seen.push(task.clone());
+            out.push((task.clone(), run.agent.clone(), true));
+        }
+    }
+    out
+}
+
 /// The path table as the board and the checkouts say it is now. (M132)
 ///
 /// **Held** is every task a run is on (starting, running, waiting on a permission, paused, or
@@ -9615,24 +9653,8 @@ fn path_table(
         table.touches.insert(row.id.clone(), row.touches.clone());
     }
     let runs = registry.runs_for(project);
-    let mut seen: Vec<TaskId> = Vec::new();
-    let mut candidates: Vec<(TaskId, AgentId, bool)> = Vec::new();
-    for run in &runs {
-        let live = matches!(
-            run.state,
-            RunState::Starting
-                | RunState::Running
-                | RunState::AwaitingPermission
-                | RunState::Paused { .. }
-                | RunState::Idle
-        );
-        if let (true, Some(task)) = (live, run.task.as_ref())
-            && !seen.contains(task)
-        {
-            seen.push(task.clone());
-            candidates.push((task.clone(), run.agent.clone(), true));
-        }
-    }
+    let mut candidates = path_holders(&runs, &rows);
+    let mut seen: Vec<TaskId> = candidates.iter().map(|(task, _, _)| task.clone()).collect();
     for row in rows.iter().filter(|r| {
         matches!(
             r.status,
@@ -12658,6 +12680,60 @@ mod tests {
         let admitted = registry.take_admissions();
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].run, blocked);
+    }
+
+    /// (M132) A task the board calls done holds nothing even under an open idle run: the reviewer
+    /// merged it and closed it, and the run's tab outliving that — `retire_done` leaves a shown
+    /// run idle on purpose — must not hold the repository from the next task. The idle child of a
+    /// task still in review does hold: it is the reviewer's send-back target until the close.
+    #[test]
+    fn a_done_task_holds_nothing_even_under_an_open_run() {
+        let row = |id: &str, status: &str| -> cide_ipc::TaskRow {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "title": id, "status": status,
+                "createdUnixMs": 0, "updatedUnixMs": 0, "commentCount": 0, "attachmentCount": 0,
+            }))
+            .expect("a task row")
+        };
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(DispatchSpec {
+            task: Some(TaskId("t-20".into())),
+            ..spec(project, "developer", 1, 8)
+        });
+        registry.take_admissions();
+        registry.set_state(None, run, RunState::Idle);
+        let runs = registry.runs_for(project);
+        assert_eq!(
+            state_of(&registry, run),
+            RunState::Idle,
+            "the shown tab's run"
+        );
+
+        // Closed by the reviewer: the open run releases its hold at once.
+        let done = [row("t-20", "done")];
+        assert!(
+            path_holders(&runs, &done).is_empty(),
+            "a done task holds nothing even under a live run"
+        );
+
+        // Still in review: the idle child is the send-back target, so it holds.
+        let review = [row("t-20", "review")];
+        let holders = path_holders(&runs, &review);
+        assert_eq!(
+            holders.len(),
+            1,
+            "the idle child of a review task still holds"
+        );
+        assert_eq!(holders[0].0, TaskId("t-20".into()));
+        assert!(holders[0].2, "and the hold is live");
+
+        // A task the board has no row for keeps the old conservative hold.
+        assert_eq!(
+            path_holders(&runs, &[]).len(),
+            1,
+            "no row: the run still holds"
+        );
     }
 
     #[test]

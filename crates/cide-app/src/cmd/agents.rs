@@ -2125,17 +2125,30 @@ fn roster(
 
 /// Each run's review tab, when one owns its task (M114) — filled here, beside the roster, because
 /// the table is the app's and `roster` stays a function of a directory for its tests.
+///
+/// Only while the board calls the task in review: the reviewer's tab outlives the close it made,
+/// and a closed task still drawing "In review by orchestrator" reads as a review that never ended.
 fn with_reviewers(
     app: &AppHandle,
     project: ProjectId,
     runs: Vec<cide_ipc::AgentRun>,
 ) -> Vec<cide_ipc::AgentRun> {
+    let store = app
+        .try_state::<Arc<TasksStores>>()
+        .and_then(|stores| stores.get(project));
     runs.into_iter()
         .map(|mut run| {
-            run.reviewer = run
-                .task
-                .as_ref()
-                .and_then(|task| crate::agent_rpc::reviewer_of(app, project, task));
+            run.reviewer = run.task.as_ref().and_then(|task| {
+                let in_review = store
+                    .as_ref()
+                    .and_then(|s| s.get(task))
+                    .is_some_and(|t| t.status == cide_ipc::TaskStatus::Review);
+                if in_review {
+                    crate::agent_rpc::reviewer_of(app, project, task)
+                } else {
+                    None
+                }
+            });
             run
         })
         .collect()
