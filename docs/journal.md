@@ -17343,3 +17343,17 @@ The full local CI run completed with 130 passing checks and one failing Rust-tes
 all 121 UI checks (including install, TypeScript and production build) passed. The two
 Rust failures were `a_shutdown_thaws_before_it_signals` (passed on an isolated rerun) and
 `a_project_with_no_marker_does_not_start_a_server` (no rust-analyzer available on this host).
+
+**CI approach correction:** waiting for Chrome to exit fixed only profile cleanup; it left a
+browser executable, a listening Vite server and Chromium's virtual-time scheduler in the
+automatically enumerated `check:*` suite. The next Linux UI job still failed, and a restricted
+local run failed at `listen EPERM`. Apply's check now follows `check:harness-settings` and
+`check:commit-message`: Vite SSR-bundles the real dialog, launcher and store into
+`node_modules/.cache`, then React's client reconciler mounts them in jsdom with mocked IPC.
+`act` drains promise updates; no browser process, server or profile is needed. All 60 behavior
+assertions remain, including immediate focus, portal bubbling, nested Escape and pending/failure
+retention. Deliberately removing Escape handling, initial focus or the busy dismissal guard
+each makes the check fail. All 121 shared UI steps, including TypeScript and production build,
+pass on macOS with Node 22. Shell, dependency-pin and no-Tauri checks pass too. The full latest
+GitHub job log requires authentication unavailable to this session, so its precise exception
+was not confirmed. Native WebView verification remains unavailable as recorded above.
