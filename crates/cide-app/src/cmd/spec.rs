@@ -1184,15 +1184,18 @@ fn accept_at(
 
     // 1. The merge. A conflict returns here, with nothing archived.
     let (commit, files) = match row.agent.as_ref().filter(|_| plan.branch.is_some()) {
-        Some(agent) => match crate::cmd::agents::integrate_for(root, agent, Some(task))? {
-            crate::cmd::agents::AgentIntegration::Conflicts { paths } => {
-                return Ok(SpecAccepted::Conflicts { paths });
+        Some(agent) => {
+            match crate::cmd::agents::integrate_for(root, agent, Some(task), Some(change.as_str()))?
+            {
+                crate::cmd::agents::AgentIntegration::Conflicts { paths } => {
+                    return Ok(SpecAccepted::Conflicts { paths });
+                }
+                crate::cmd::agents::AgentIntegration::Merged { commit, files } => {
+                    (Some(commit), files as u32)
+                }
+                crate::cmd::agents::AgentIntegration::UpToDate => (None, 0),
             }
-            crate::cmd::agents::AgentIntegration::Merged { commit, files } => {
-                (Some(commit), files as u32)
-            }
-            crate::cmd::agents::AgentIntegration::UpToDate => (None, 0),
-        },
+        }
         // A `worktree: false` role commits into the checked-out tree, so there is nothing to
         // merge. Not a refusal — see `SpecAcceptPlan::branch`.
         None => (None, 0),

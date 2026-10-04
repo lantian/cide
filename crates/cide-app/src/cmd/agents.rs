@@ -1470,7 +1470,11 @@ pub async fn agents_integrate(
     let root = project_root(&state, project)?;
     let name = cide_agents::checkout_name(&agent, task.as_ref());
     let for_a_task = task.is_some();
-    let outcome = blocking(move || integrate(&root, &agent, task.as_ref())).await?;
+    // The task's OpenSpec change, if it names one, read off the board here — the free
+    // `integrate` stays store-free so it stays testable.
+    let change = crate::tasks_state::task_change(&app, project, task.as_ref());
+    let outcome =
+        blocking(move || integrate(&root, &agent, task.as_ref(), change.as_deref())).await?;
     // The work is in (or was already): the task's checkout has nothing left to give, so it goes
     // — unless a run still stands in it or it holds something the branch does not. (M89) Only
     // for a task's checkout; the bare role's base branch has no worktree since M40.
@@ -1494,22 +1498,37 @@ pub async fn agents_integrate(
 /// with no task stands in the project root and mints no branch. Composed with the same
 /// `checkout_name` a dispatch's worktree is named by, so the branch integrated is by
 /// construction the branch that run committed to.
+///
+/// `change` is the OpenSpec change that task names, when it names one: the run's branch carries
+/// the copy dispatch carried into its checkout, and the root still holds its own untracked copy
+/// of that folder, which a plain merge would be refused over. It is parked for the merge and
+/// settled once it lands — see [`spec_sessions::integrate_parked`]. `None` is a plain merge.
 pub(crate) fn integrate_for(
     root: &Path,
     agent: &AgentId,
     task: Option<&TaskId>,
+    change: Option<&str>,
 ) -> Result<AgentIntegration> {
-    integrate(root, agent, task)
+    integrate(root, agent, task, change)
 }
 
-fn integrate(root: &Path, agent: &AgentId, task: Option<&TaskId>) -> Result<AgentIntegration> {
+fn integrate(
+    root: &Path,
+    agent: &AgentId,
+    task: Option<&TaskId>,
+    change: Option<&str>,
+) -> Result<AgentIntegration> {
     let name = cide_agents::checkout_name(agent, task);
-    match cide_git::worktree::integrate(root, &name) {
-        Ok(cide_git::worktree::Integration::UpToDate) => Ok(AgentIntegration::UpToDate),
-        Ok(cide_git::worktree::Integration::Merged { commit, files }) => {
+    match crate::cmd::spec_sessions::integrate_parked(root, &name, change) {
+        Ok((cide_git::worktree::Integration::UpToDate, kept)) => {
+            log_kept(root, &name, kept);
+            Ok(AgentIntegration::UpToDate)
+        }
+        Ok((cide_git::worktree::Integration::Merged { commit, files }, kept)) => {
+            log_kept(root, &name, kept);
             Ok(AgentIntegration::Merged { commit, files })
         }
-        Ok(cide_git::worktree::Integration::Conflicts { paths }) => {
+        Ok((cide_git::worktree::Integration::Conflicts { paths }, _)) => {
             Ok(AgentIntegration::Conflicts { paths })
         }
         // The one rewrite. See the doc comment above: git is right and its sentence names a ref
@@ -1530,6 +1549,22 @@ fn integrate(root: &Path, agent: &AgentId, task: Option<&TaskId>) -> Result<Agen
             ),
         })),
         Err(error) => Err(CoreError::Io(error.to_string())),
+    }
+}
+
+/// A root copy of the change the user edited while the run worked is not silently eaten — it
+/// stays where the merge parked it. The spec panel's Integrate names kept paths on the wire
+/// (`SpecIntegrated::kept`); this command's `AgentIntegration` has no field for them and gets
+/// none, so the sentence goes to the log rather than reshaping what the panel already renders.
+fn log_kept(root: &Path, name: &str, kept: Vec<String>) {
+    for path in &kept {
+        tracing::warn!(
+            path,
+            park = %crate::cmd::spec_sessions::carried_dir(root, name)
+                .join("parked")
+                .display(),
+            "the root's copy of the change was edited while the run worked; it stays in the park"
+        );
     }
 }
 
@@ -3236,7 +3271,7 @@ mod tests {
     fn an_agent_id_that_is_a_path_is_refused_and_nothing_is_created() {
         let root = temp("integrate-traversal");
 
-        let why = integrate(&root, &AgentId("../../etc".into()), None)
+        let why = integrate(&root, &AgentId("../../etc".into()), None, None)
             .expect_err("an id that is a path is refused");
         assert!(
             why.to_string().contains("../../etc"),
@@ -3253,7 +3288,7 @@ mod tests {
     fn integrating_outside_a_repository_says_that_and_not_something_about_branches() {
         let root = temp("integrate-not-a-repo");
 
-        let why = integrate(&root, &AgentId("developer".into()), None)
+        let why = integrate(&root, &AgentId("developer".into()), None, None)
             .expect_err("/tmp is not a git repository");
         let sentence = why.to_string();
         assert!(sentence.contains("git repository"), "{sentence}");

@@ -8859,6 +8859,30 @@ fn start_child(
             let tree = cide_git::worktree::ensure(&facts.root, &name)
                 .map_err(|error| CoreError::Io(error.to_string()))?;
 
+            // The run's OpenSpec change travels into the checkout with it. A worktree is cut
+            // from `HEAD`, and a proposal is usually uncommitted in the root when the run is
+            // dispatched — without this the run stands in a checkout with no such folder, is
+            // pointed by its own prompt at `openspec/changes/<change>/`, and reports that the
+            // change does not exist. The same copy Apply's launcher makes, and idempotent like
+            // it: a re-fork leaves the checkout's own (possibly ticked) copy alone, and the base
+            // copy beside it is what Integrate's parking compares against. A Spec session's
+            // launcher already carried at start; carrying again here is what repairs a checkout
+            // deleted while the session queued.
+            let change = match &admission.purpose {
+                RunPurpose::Work(_) => admission.change.as_deref(),
+                RunPurpose::Spec(spec) => spec.change.as_deref(),
+                RunPurpose::MrReview { .. } => None,
+            };
+            if let Some(change) = change {
+                crate::cmd::spec_sessions::carry_change(
+                    &facts.root,
+                    &tree.path,
+                    change,
+                    &crate::cmd::spec_sessions::carried_dir(&facts.root, &name),
+                )
+                .map_err(|error| CoreError::Io(error.to_string()))?;
+            }
+
             // One checkout, one process. An `Idle` run whose child is still sitting in *this*
             // directory is wound down at the one moment the checkout is actually needed. See
             // `idle_children_in` — scoped to the name, never the role, since worktrees went

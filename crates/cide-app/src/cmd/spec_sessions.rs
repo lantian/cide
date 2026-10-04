@@ -532,15 +532,34 @@ fn harness_label(harness: Harness) -> &'static str {
 /// the root keeps its copy, so the panel still shows the change and its checklist, and the
 /// worktree's copy is committed with the work.
 ///
-/// And a **base** copy beside it, under `.cide/spec-carried/spec-<change>/base/`: the folder
+/// And a **base** copy beside it, under `.cide/spec-carried/<checkout>/base/`: the folder
 /// exactly as it was carried. Integrate compares the root's copy with it — a file the user has
 /// not touched since is dropped when the branch's version lands, and one they edited while the
 /// session worked is kept (see [`settle_parked`]). Without the base the two cannot be told apart,
 /// and the root's copy is always "different" from the branch's, which has the ticks.
-fn carry_change(root: &Path, checkout: &Path, change: &str, carried: &Path) -> Result<()> {
+///
+/// Not only Apply calls this: an ordinary dispatch whose task names a change carries it into the
+/// run's `<role>-<task>` checkout at the fork (`agents::start_child`), for the same reason —
+/// the run's own prompt points at `openspec/changes/<change>/`, and a worktree cut from `HEAD`
+/// would not hold an uncommitted proposal. Hence the two skips:
+///
+/// * the root has no such folder (anymore — it was archived there, or the link dangles), and
+/// * the **checkout** has already archived the change: re-forking a run whose branch archived it
+///   would otherwise resurrect the folder beside its own archive entry.
+pub(crate) fn carry_change(
+    root: &Path,
+    checkout: &Path,
+    change: &str,
+    carried: &Path,
+) -> Result<()> {
     let from = root.join("openspec/changes").join(change);
     let to = checkout.join("openspec/changes").join(change);
     if to.is_dir() {
+        return Ok(());
+    }
+    if !from.is_dir()
+        || cide_spec::archived_dir(checkout, &cide_ipc::ChangeName(change.into())).is_some()
+    {
         return Ok(());
     }
     let failed = |error: std::io::Error| {
@@ -555,16 +574,59 @@ fn carry_change(root: &Path, checkout: &Path, change: &str, carried: &Path) -> R
 }
 
 /// `.cide/spec-carried/<checkout>`: the base copy [`carry_change`] made, and what Integrate parks.
-fn carried_dir(root: &Path, checkout: &str) -> PathBuf {
+pub(crate) fn carried_dir(root: &Path, checkout: &str) -> PathBuf {
     root.join(cide_agents::config::CIDE_DIR)
         .join("spec-carried")
         .join(checkout)
 }
 
+/// `openspec/changes/<change>` relative to a root, when `change` is a name OpenSpec's grammar
+/// allows — the folder [`carry_change`] copies and [`integrate_parked`] parks. Anything else is
+/// `None`: a name with a separator in it must not be joined onto a root.
+pub(crate) fn change_folder(change: &str) -> Option<PathBuf> {
+    cide_spec::claude::valid_name(change).then(|| PathBuf::from("openspec/changes").join(change))
+}
+
+/// Integrate `name`'s branch with the root's untracked copy of `openspec/changes/<change>/`
+/// parked out of the way first, and settle the park once the merge lands. `None` — or a name
+/// that is not OpenSpec's kebab grammar — is a plain integrate.
+///
+/// The OpenSpec case on **every** integrate road, not just the spec panel's: a change proposed
+/// in the root stays uncommitted there, and the run's branch carries the copy that
+/// [`carry_change`] put into its checkout. Merging that branch back then meets the root's own
+/// untracked copy of every one of those files, and git's safe checkout refuses — "N conflicts
+/// prevent checkout" — over files the branch is the continuation of. Parked for the merge, put
+/// back if it does not land, settled once it has (see [`settle_parked`]).
+///
+/// Answers the merge outcome and the **kept** paths — a root copy the user edited while the run
+/// worked, left in the park and named by the caller.
+pub(crate) fn integrate_parked(
+    root: &Path,
+    name: &str,
+    change: Option<&str>,
+) -> std::result::Result<(cide_git::worktree::Integration, Vec<String>), cide_ipc::git::GitError> {
+    let Some(change_dir) = change.and_then(change_folder) else {
+        return cide_git::worktree::integrate(root, name).map(|outcome| (outcome, Vec::new()));
+    };
+    let carried = carried_dir(root, name);
+    let park = carried.join("parked");
+    let parked = cide_git::worktree::park_untracked(root, name, &change_dir, &park)?;
+    let merged = cide_git::worktree::integrate(root, name);
+    let kept = match &merged {
+        Ok(cide_git::worktree::Integration::Merged { .. })
+        | Ok(cide_git::worktree::Integration::UpToDate) => settle_parked(root, &carried, &parked),
+        _ => {
+            cide_git::worktree::unpark(root, &park, &parked);
+            Vec::new()
+        }
+    };
+    merged.map(|merged| (merged, kept))
+}
+
 /// After a merge that landed: drop each parked file the user never touched (it is byte for byte
 /// the base copy Apply carried), keep the rest where they are parked, and answer the kept ones as
 /// paths under the root. The base goes either way — the change is in the branch now.
-fn settle_parked(root: &Path, carried: &Path, parked: &[PathBuf]) -> Vec<String> {
+pub(crate) fn settle_parked(root: &Path, carried: &Path, parked: &[PathBuf]) -> Vec<String> {
     let park = carried.join("parked");
     let base = carried.join("base");
     let mut kept = Vec::new();
@@ -839,30 +901,12 @@ pub async fn spec_integrate(
 
     let root_for_work = root.clone();
     let name_for_work = name.clone();
-    let change_dir = PathBuf::from("openspec/changes").join(&change_name);
     let merged = blocking(move || {
         // The root's untracked copy of the change folder — the proposal, never committed, that
         // Apply carried into the worktree (`carry_change`) — would make git refuse the checkout
         // ("N conflicts prevent checkout") over files the branch is the continuation of. Parked
         // for the merge, put back if it does not land, dropped once it has.
-        let carried = carried_dir(&root_for_work, &name_for_work);
-        let park = carried.join("parked");
-        let parked =
-            cide_git::worktree::park_untracked(&root_for_work, &name_for_work, &change_dir, &park)
-                .map_err(|error| CoreError::Io(error.to_string()))?;
-        let merged = cide_git::worktree::integrate(&root_for_work, &name_for_work);
-        let kept = match &merged {
-            Ok(
-                cide_git::worktree::Integration::Merged { .. }
-                | cide_git::worktree::Integration::UpToDate,
-            ) => settle_parked(&root_for_work, &carried, &parked),
-            _ => {
-                cide_git::worktree::unpark(&root_for_work, &park, &parked);
-                Vec::new()
-            }
-        };
-        merged
-            .map(|merged| (merged, kept))
+        integrate_parked(&root_for_work, &name_for_work, Some(&change_name))
             .map_err(|error| CoreError::Io(error.to_string()))
     })
     .await?;
@@ -996,6 +1040,109 @@ mod tests {
             "- [x] one\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two skips the ordinary-dispatch carry needs. A run re-forked (resume, a checkout
+    /// deleted while it queued) must not fail because the root archived the change in the
+    /// meantime, and must not **resurrect** the folder beside an archive entry the run's own
+    /// branch made.
+    #[test]
+    fn a_carry_skips_when_there_is_nothing_to_carry_or_something_to_resurrect() {
+        let dir =
+            std::env::temp_dir().join(format!("cide-spec-carry-skip-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("root");
+        let tree = dir.join("tree");
+        let carried = dir.join("carried");
+        std::fs::create_dir_all(&tree).unwrap();
+        // Nothing in the root: no folder, no base copy, no error.
+        carry_change(&root, &tree, "c1", &carried).unwrap();
+        assert!(!tree.join("openspec/changes/c1").exists());
+        assert!(!carried.join("base").exists());
+        // The checkout has archived the change: the root's copy stays out of it.
+        std::fs::create_dir_all(root.join("openspec/changes/c1")).unwrap();
+        std::fs::write(root.join("openspec/changes/c1/tasks.md"), "- [ ] one\n").unwrap();
+        let archived = tree.join("openspec/changes/archive/2026-10-04-c1");
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::write(archived.join("tasks.md"), "- [x] one\n").unwrap();
+        carry_change(&root, &tree, "c1", &carried).unwrap();
+        assert!(archived.is_dir());
+        assert!(
+            !tree.join("openspec/changes/c1").exists(),
+            "the archive stands; the folder is not resurrected beside it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reported bug's other half, at the helper's level: a proposal uncommitted in the
+    /// root, carried into a role's checkout and committed there with its ticks. A plain
+    /// integrate is refused — git's safe checkout will not write over the root's own untracked
+    /// copy of every one of those files — while the parked one lands the branch's copy and
+    /// drops the root's untouched one.
+    #[test]
+    fn integrating_a_carried_change_parks_the_root_copy_and_lands_the_branchs() {
+        let root = std::env::temp_dir().join(format!("cide-spec-parked-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "cide tests"]);
+        git(&root, &["config", "user.email", "tests@cide.invalid"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+
+        let wt = cide_git::worktree::ensure(&root, "developer-t1").expect("checkout");
+        // The proposal, uncommitted in the root, carried into the checkout and ticked there.
+        std::fs::create_dir_all(root.join("openspec/changes/c1")).unwrap();
+        std::fs::write(root.join("openspec/changes/c1/tasks.md"), "- [ ] one\n").unwrap();
+        carry_change(&root, &wt.path, "c1", &carried_dir(&root, "developer-t1")).unwrap();
+        std::fs::write(wt.path.join("openspec/changes/c1/tasks.md"), "- [x] one\n").unwrap();
+        git(&wt.path, &["add", "-A"]);
+        git(&wt.path, &["commit", "-qm", "apply c1"]);
+
+        // The bug, pinned: plain integrate refuses over the root's untracked copy.
+        assert!(
+            cide_git::worktree::integrate(&root, "developer-t1").is_err(),
+            "git refuses the checkout; that refusal is the bug this helper exists to clear"
+        );
+
+        let (merged, kept) = integrate_parked(&root, "developer-t1", Some("c1")).expect("merge");
+        assert!(
+            matches!(merged, cide_git::worktree::Integration::Merged { .. }),
+            "the branch lands once the copy is parked"
+        );
+        assert!(kept.is_empty(), "the root's copy was never touched");
+        assert_eq!(
+            std::fs::read_to_string(root.join("openspec/changes/c1/tasks.md")).unwrap(),
+            "- [x] one\n",
+            "the branch's copy, with its ticks, landed"
+        );
+        assert!(
+            !carried_dir(&root, "developer-t1").exists(),
+            "settled: the base and the park go with it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run git in a scratch repo with the user's config held out, so a global `user.name`, an
+    /// alias or a hook on the test machine cannot change what these tests see.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "cide tests")
+            .env("GIT_AUTHOR_EMAIL", "tests@cide.invalid")
+            .env("GIT_COMMITTER_NAME", "cide tests")
+            .env("GIT_COMMITTER_EMAIL", "tests@cide.invalid")
+            .output()
+            .unwrap_or_else(|error| panic!("running git {args:?}: {error}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     /// A root copy the user never touched is dropped once the branch lands; one they edited while

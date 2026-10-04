@@ -200,7 +200,12 @@ export async function openRunTab(project: ProjectId, run: RunId, title: string, 
 /** *Open session* on a row: the tab, or the sentence saying why there is nothing to open yet. */
 export async function openSession(project: ProjectId, row: SpecRunRow): Promise<void> {
   const opened = await openRunTab(project, row.run, sessionTitle(row.op, row.change ?? null, row.label))
-  if (!opened) throw new Error('This session has not started yet — it is waiting for a run slot.')
+  if (opened) return
+  // A run that died before forking has no conversation to open, and the queue is not why — the
+  // row already carries the sentence the failure was reported with (a worktree fork into a
+  // repository with no commits, say). Only a run that is genuinely waiting gets the slot sentence.
+  if (row.state.state === 'failed') throw new Error(`This session failed before it started — ${row.state.reason}`)
+  throw new Error('This session has not started yet — it is waiting for a run slot.')
 }
 
 /** One application-owned subscription, independent of mounted panels and tabs. */

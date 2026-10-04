@@ -261,3 +261,24 @@ pub fn project_root(state: &WorkspaceState, project: ProjectId) -> Result<PathBu
             .ok_or(CoreError::NoRoots)
     })
 }
+
+/// The OpenSpec change a task names, read off the board — `None` for no task, no board, or a
+/// task that links nothing.
+///
+/// The integrate roads need it to know which folder the root holds an untracked copy of: a
+/// branch built on a proposal dispatch carried into its checkout merges back over that copy,
+/// and only parking it out of the way lets the checkout land
+/// (`cmd::spec_sessions::integrate_parked`). One helper because three roads — the panel's
+/// Integrate, the model's `cide_agent_integrate`, and a batch review's advance — must agree on
+/// what a task links, and the board is the only place that says.
+pub(crate) fn task_change(
+    app: &AppHandle,
+    project: ProjectId,
+    task: Option<&cide_ipc::TaskId>,
+) -> Option<String> {
+    let task = task?;
+    tauri::Manager::try_state::<Arc<TasksStores>>(app)?
+        .get(project)?
+        .get(task)
+        .and_then(|task| task.change.map(|change| change.0))
+}

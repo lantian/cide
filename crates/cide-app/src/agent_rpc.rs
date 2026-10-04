@@ -1526,6 +1526,19 @@ impl AgentSink for RegistrySink {
             format!("could not make the worktree {name} for this session: {error}")
         })?;
 
+        // The task's OpenSpec change, if it names one, travels into the checkout with the
+        // session — the same copy a dispatched run gets at its fork, for the same reason: the
+        // worktree is cut from `HEAD`, and the proposal is usually uncommitted there.
+        if let Some(change) = task.as_ref().and_then(|task| task.change.as_ref()) {
+            crate::cmd::spec_sessions::carry_change(
+                &root,
+                &checkout.path,
+                change.as_str(),
+                &crate::cmd::spec_sessions::carried_dir(&root, &name),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
         // Spelled the way the tab's own CLI presents cide's tools.
         let tools = cide_agents::harness::for_kind(chosen);
         let prompt = match (&request.work, task.as_ref()) {
@@ -2575,15 +2588,40 @@ pub(crate) fn integrate_checked(
     // or fails the project's verify command is refused here with the reason — this is the
     // model's road, and the panel's Integrate (the user's) does not pass through it.
     let verified = crate::milestones::before_integrate(app, project, root, agent, task)?;
-    let outcome = cide_git::worktree::integrate(root, &cide_agents::checkout_name(agent, task))
-        .map(|outcome| match outcome {
-            cide_git::worktree::Integration::UpToDate => Integrated::UpToDate { verified },
-            cide_git::worktree::Integration::Merged { commit, files } => Integrated::Merged {
-                commit,
-                files,
-                verified,
-            },
-            cide_git::worktree::Integration::Conflicts { paths } => Integrated::Conflicts { paths },
+    // The task's OpenSpec change, if it names one: the run's branch carries the copy dispatch
+    // carried into its checkout, and the root still holds its own untracked copy of that
+    // folder — the proposal, never committed. Merging straight over it is the "N conflicts
+    // prevent checkout" refusal, over files the branch is the continuation of, so the copy is
+    // parked for the merge and settled once it lands (`spec_sessions::integrate_parked`).
+    let name = cide_agents::checkout_name(agent, task);
+    let change = crate::tasks_state::task_change(app, project, task);
+    let outcome = crate::cmd::spec_sessions::integrate_parked(root, &name, change.as_deref())
+        .map(|(outcome, kept)| {
+            // A root copy the user edited while the run worked is not silently eaten: it stays
+            // where it was parked. The panel's Integrate names kept paths on the wire; this
+            // road's `Integrated` shape has no field for them, so the sentence goes to the log.
+            for path in &kept {
+                tracing::warn!(
+                    path,
+                    park = %crate::cmd::spec_sessions::carried_dir(root, &name)
+                        .join("parked")
+                        .display(),
+                    "the root's copy of the change was edited while the run worked; it stays in the park"
+                );
+            }
+            match outcome {
+                cide_git::worktree::Integration::UpToDate => Integrated::UpToDate { verified },
+                cide_git::worktree::Integration::Merged { commit, files } => {
+                    Integrated::Merged {
+                        commit,
+                        files,
+                        verified,
+                    }
+                }
+                cide_git::worktree::Integration::Conflicts { paths } => {
+                    Integrated::Conflicts { paths }
+                }
+            }
         })
         .map_err(|error| error.to_string())?;
     // Something landed, so the active milestone's gate is asked again — in the background,
@@ -2983,11 +3021,65 @@ pub(crate) fn integrate_batch_checked(
     if let Err(error) = cide_git::worktree::remove(root, scratch) {
         tracing::debug!(%error, "the batch's scratch checkout was not removed");
     }
-    let moved = verdict.and_then(|line| {
-        cide_git::worktree::advance_to(root, &composed.base, &head)
-            .map(|_| line)
-            .map_err(|error| error.to_string())
-    });
+    // The root's untracked copies of change folders — the proposals dispatch carried into
+    // these runs' checkouts (`carry_change`) — would make the batch's checkout refuse to land,
+    // exactly as they do for a single merge. Parked for the advance, settled once it lands,
+    // put back if it does not: the one-by-one fallback below re-parks per branch through
+    // `integrate_checked`, which is why the failure road unparks rather than leaves them.
+    let mut parked: Vec<(String, PathBuf, Vec<PathBuf>)> = Vec::new();
+    let parking: Result<(), String> = admitted
+        .iter()
+        .filter_map(|(_, task, name)| {
+            Some((
+                name.clone(),
+                crate::tasks_state::task_change(app, project, Some(task))?,
+            ))
+        })
+        .try_for_each(|(name, change)| {
+            let dir = match crate::cmd::spec_sessions::change_folder(&change) {
+                Some(dir) => dir,
+                None => return Ok(()),
+            };
+            let carried = crate::cmd::spec_sessions::carried_dir(root, &name);
+            let park = carried.join("parked");
+            match cide_git::worktree::park_untracked(root, &name, &dir, &park) {
+                Ok(paths) => {
+                    if !paths.is_empty() {
+                        parked.push((name, carried, paths));
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+    // A failed park is the same shape as a failed advance: whatever did get parked goes back
+    // (the `Err` arm below), and the batch falls back to merging one by one.
+    let moved = match parking {
+        Err(why) => Err(why),
+        Ok(()) => verdict.and_then(|line| {
+            cide_git::worktree::advance_to(root, &composed.base, &head)
+                .map(|_| line)
+                .map_err(|error| error.to_string())
+        }),
+    };
+    match &moved {
+        Ok(_) => {
+            for (name, carried, paths) in &parked {
+                for path in crate::cmd::spec_sessions::settle_parked(root, carried, paths) {
+                    tracing::warn!(
+                        path,
+                        park = %carried.join("parked").display(),
+                        "the root's copy of {name}'s change was edited while the run worked; it stays in the park"
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            for (_, carried, paths) in &parked {
+                cide_git::worktree::unpark(root, &carried.join("parked"), paths);
+            }
+        }
+    }
     match moved {
         Ok(line) => {
             out.verified = line;

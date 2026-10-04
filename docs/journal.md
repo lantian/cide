@@ -17430,3 +17430,43 @@ done releases the hold, review still holds (live), no row still holds. The full 
 passes (784 tests), with clippy and fmt clean.
 
 **Not confirmed on a display:** the reported macOS sequence was not replayed in a running GUI.
+
+
+## M153 — A dispatched run's worktree holds its task's OpenSpec change
+
+A macOS user proposed a change, linked it to a task, and asked the main agent to implement it.
+The role the orchestrator dispatched reported that the change did not exist. The reporter could
+not reproduce it from the panel: pressing Apply works. Both reports are right, and the split is
+the bug.
+
+Carrying an uncommitted change into a worktree — `carry_change`, the copy Apply makes because a
+worktree is cut from `HEAD` and a proposal written a minute ago is not in any commit — lived
+only on the spec-session road. The ordinary dispatch road, which is what the orchestrator's
+`cide_agent_dispatch` and an agent-authored Doing transition take, forked `<role>-<task>` from
+`HEAD` and said nothing: the run stood in a checkout with no such folder while its own opening
+prompt pointed at `openspec/changes/<change>/`. (The second machine that never hit it had either
+committed the proposal, pressed Apply, or runs its roles in the root.)
+
+The carry now happens at the fork, where every dispatch road converges: `start_child` carries
+the change stamped from the task (and a Spec session's, which also repairs a checkout deleted
+while it queued), and `cide_session_open` carries into a `session-<task>` checkout. Two skips
+keep re-forks honest: nothing is carried when the root no longer holds the folder, and nothing
+is carried back when the **checkout** has already archived the change — a resume must not
+resurrect the folder beside its own archive entry.
+
+The other half was waiting at Integrate: once branches start adding the carried folder, the
+root's own untracked copy of it makes git's safe checkout refuse — "N conflicts prevent
+checkout" — over files the branch is the continuation of. Apply's Integrate already knew the
+answer (park, merge, settle); it is now one helper, `integrate_parked`, and it runs on every
+integrate road: the panel's Integrate, the model's `cide_agent_integrate`, a batch review's
+advance (parked per branch before the composed checkout lands, put back if it does not), and
+accept's merge. A root copy the user edited while the run worked is not eaten: it stays in the
+park and is named — on the wire for the spec panel, in the log for the roads whose shapes have
+no field for it.
+
+**Verified:** new Rust regressions pin both halves — the carry's two skips, and that a plain
+integrate refuses over the root's untracked copy (the bug, pinned) while the parked one lands
+the branch's ticks and settles the park. The full cide-app suite passes (786 tests), with
+clippy and fmt clean.
+
+**Not confirmed on a display:** the reported macOS sequence was not replayed in a running GUI.
