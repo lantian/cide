@@ -4,7 +4,7 @@ use std::path::Path;
 
 use cide_ipc::git::{DiffSide, GitError, PathSelection, Selection};
 
-use crate::{Result, changelist, diff, patch, repo};
+use crate::{Result, changelist, diff, patch, rename, repo};
 
 /// Normal commits describe precisely the selected working-tree changes. Staging-area
 /// commits and merge/cherry-pick/revert conclusions record the index as it stands.
@@ -26,7 +26,14 @@ pub fn commit_diff(root: &Path, selections: &[PathSelection]) -> Result<String> 
             text.push_str(&String::from_utf8_lossy(&file.render()));
         }
     } else {
-        for selection in selections {
+        let expanded = rename::expand(&repo, selections, DiffSide::Combined)?;
+        for selection in &expanded.selections {
+            if expanded.removals.contains(&selection.path) {
+                text.push_str(&String::from_utf8_lossy(
+                    &diff::head_deletion(&repo, &selection.path, false)?.render(),
+                ));
+                continue;
+            }
             let Some(file) = diff::file_diff(
                 &repo,
                 &selection.path,

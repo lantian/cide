@@ -28,12 +28,13 @@ use cide_ipc::git::{DiffSide, GitError, PathSelection, Selection};
 use git2::{ApplyLocation, Diff, Repository, build::CheckoutBuilder};
 
 use crate::diff::{DiffRequest, RawFile};
-use crate::{Result, Wrap, changelist, diff, patch, repo as repo_mod};
+use crate::{Result, Wrap, changelist, diff, patch, rename, repo as repo_mod};
 
 /// One file's resolved plan.
 enum Plan {
     /// Take the working tree's whole file, or drop it if it is gone.
     Whole(String),
+    Remove(String),
     /// A synthesized unified diff.
     Partial(Vec<u8>),
 }
@@ -106,19 +107,36 @@ fn is_whole(file: &RawFile, selection: &Selection) -> Result<bool> {
 /// Move the selected changes from the working tree into the index.
 pub fn stage(root: &Path, selections: &[PathSelection]) -> Result<()> {
     let repo = repo_mod::open(root)?;
+    let expanded = rename::expand(&repo, selections, DiffSide::Unstaged)?;
+    let selections = &expanded.selections;
     let mut plans = Vec::with_capacity(selections.len());
 
     // Everything is resolved and synthesized before a single byte is written. A failure
     // halfway through would otherwise leave the index holding some of what was asked for and
     // none of the rest, with no record of which.
     for selection in selections {
-        let file = resolve(&repo, selection, DiffSide::Unstaged).map_err(|error| {
+        if expanded.removals.contains(&selection.path) {
+            plans.push(Plan::Remove(selection.path.clone()));
+            continue;
+        }
+        // Moving an already staged whole file into Changes is a valid, idempotent add.
+        let resolved = if matches!(selection.selection, Selection::Whole) && selection.rev.is_none()
+        {
+            resolve_or_index(&repo, selection, DiffSide::Unstaged)
+        } else {
+            resolve(&repo, selection, DiffSide::Unstaged).map(Some)
+        };
+        let file = resolved.map_err(|error| {
             // The one refusal that has to be re-read before it is reported. See `why_nothing`.
             match error {
                 GitError::NoSuchChange { path } => why_nothing(&repo, path),
                 other => other,
             }
         })?;
+        let Some(file) = file else {
+            plans.push(Plan::Whole(selection.path.clone()));
+            continue;
+        };
         if is_whole(&file, &selection.selection)? {
             plans.push(Plan::Whole(file.path.clone()));
             continue;
@@ -154,10 +172,10 @@ fn apply_plans(repo: &Repository, plans: &[Plan], location: ApplyLocation) -> Re
         .iter()
         .filter_map(|plan| match plan {
             Plan::Whole(path) => Some(path),
-            Plan::Partial(_) => None,
+            Plan::Partial(_) | Plan::Remove(_) => None,
         })
         .collect();
-    if wholes.is_empty() {
+    if wholes.is_empty() && !plans.iter().any(|p| matches!(p, Plan::Remove(_))) {
         return Ok(());
     }
 
@@ -167,6 +185,11 @@ fn apply_plans(repo: &Repository, plans: &[Plan], location: ApplyLocation) -> Re
     index.read(true).wrap()?;
     for path in wholes {
         add_or_remove(repo, &mut index, path)?;
+    }
+    for plan in plans {
+        if let Plan::Remove(path) = plan {
+            index.remove_path(Path::new(path)).wrap()?;
+        }
     }
     index.write().wrap()
 }
@@ -280,6 +303,8 @@ fn apply(repo: &Repository, text: &[u8], location: ApplyLocation) -> Result<()> 
 /// Take the selected changes back out of the index.
 pub fn unstage(root: &Path, selections: &[PathSelection]) -> Result<()> {
     let repo = repo_mod::open(root)?;
+    let expanded = rename::expand(&repo, selections, DiffSide::Staged)?;
+    let selections = &expanded.selections;
     // `git_reset_default` peels its target to a commit, so this must be the commit and not
     // the tree that everything else in this crate works with.
     let head = repo
@@ -330,6 +355,9 @@ pub fn unstage(root: &Path, selections: &[PathSelection]) -> Result<()> {
 /// kept.
 pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
     let repo = repo_mod::open(root)?;
+    let expanded = rename::expand(&repo, selections, DiffSide::Combined)?;
+    expanded.check_restore_sources(&repo)?;
+    let selections = &expanded.selections;
     let head_tree = diff::head_tree(&repo)?;
     // `git_reset_default` peels its target to a commit, so this has to be the commit and not the
     // tree the rest of this function works with — the same split `unstage` makes above.
@@ -344,6 +372,10 @@ pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
         let tracked = head_tree
             .as_ref()
             .is_some_and(|tree| tree.get_path(Path::new(&selection.path)).is_ok());
+        if expanded.removals.contains(&selection.path) {
+            plans.push((selection.path.clone(), tracked, None));
+            continue;
+        }
         // `None` is a change that exists only in the index — see `resolve_or_index`. There are
         // no hunks to choose from, so it is a whole-file plan by construction.
         let Some(file) = resolve_or_index(&repo, selection, DiffSide::Combined)? else {
@@ -404,10 +436,11 @@ pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
     //
     // A `None` target — an unborn branch — removes the entries outright, which is the right
     // answer there: no HEAD content exists for anything to go back to.
-    if !plans.is_empty() {
+    if !plans.is_empty() || !expanded.affected.is_empty() {
         let specs: Vec<String> = plans
             .iter()
             .map(|(path, _, _)| escape_pathspec(path))
+            .chain(expanded.affected.iter().map(|path| escape_pathspec(path)))
             .collect();
         repo.reset_default(head.as_ref(), specs.iter().map(String::as_str))
             .wrap()?;

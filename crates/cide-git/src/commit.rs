@@ -50,7 +50,7 @@ use cide_ipc::git::{
 use git2::{ApplyLocation, Diff, Oid, Repository};
 
 use crate::diff::{DiffRequest, RawFile};
-use crate::{Result, Wrap, changelist, diff, patch, repo as repo_mod, status};
+use crate::{Result, Wrap, changelist, diff, patch, rename, repo as repo_mod, status};
 
 /// Commit, per [`CommitRequest`].
 pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
@@ -134,11 +134,15 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
      * with it.
      */
     let mut saved: Vec<(String, Option<git2::IndexEntry>)> = Vec::new();
+    let mut rename_paths = BTreeSet::new();
+    let files;
 
     let committed: Vec<String> = if staging_arm {
         // Nothing to build: whatever the index holds is what gets committed — the user's own
         // staging, or the merge's.
-        staged_paths(&repo)?
+        let paths = staged_paths(&repo)?;
+        files = paths.len() as u32;
+        paths
     } else {
         let list = request
             .changelist
@@ -148,6 +152,10 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
             Some(explicit) => explicit.clone(),
             None => default_selections(root, &sidecar, &list)?,
         };
+        files = selections.len() as u32;
+        let expanded = rename::expand(&repo, &selections, DiffSide::Combined)?;
+        let selections = expanded.selections;
+        rename_paths = expanded.affected;
         // Answered before the reset, not after. `rebuild_index` clears the index down to HEAD,
         // so committing an empty changelist would otherwise throw away whatever the index held
         // and *then* report that there was nothing to commit.
@@ -174,12 +182,19 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
             return Err(GitError::NothingToCommit);
         }
         saved = staged_entries(&repo, head_tree.as_ref())?;
-        rebuild_index(&repo, head_tree.as_ref(), &selections)?;
+        if let Err(error) =
+            rebuild_index(&repo, head_tree.as_ref(), &selections, &expanded.removals)
+        {
+            let _ = rewind_index(&repo, head_tree.as_ref(), &saved);
+            let _ = changelist::record_index(root, &repo);
+            return Err(error);
+        }
         selections.iter().map(|s| s.path.clone()).collect()
     };
-    let consumed: BTreeSet<String> = committed.iter().cloned().collect();
+    let mut consumed: BTreeSet<String> = committed.iter().cloned().collect();
+    consumed.extend(rename_paths);
 
-    let outcome = match write_commit(&repo, request, &merge_heads, committed.len() as u32) {
+    let outcome = match write_commit(&repo, request, &merge_heads, files) {
         Ok(outcome) => outcome,
         Err(error) => {
             // Nothing was committed, so the index goes back to what this call found — a
@@ -416,12 +431,17 @@ fn rebuild_index(
     repo: &Repository,
     head_tree: Option<&git2::Tree<'_>>,
     selections: &[PathSelection],
+    removals: &BTreeSet<String>,
 ) -> Result<()> {
     // Resolved before anything is written: a patch synthesized from a diff taken *after* the
     // reset would have the reset index as its pre-image on one side and the old one on the
     // other, and every offset in it would be wrong.
     let mut plans: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(selections.len());
     for selection in selections {
+        if removals.contains(&selection.path) {
+            plans.push((selection.path.clone(), None));
+            continue;
+        }
         let request = DiffRequest::new(DiffSide::Combined);
         let Some(file) = diff::file_diff(repo, &selection.path, request)? else {
             return Err(GitError::NoSuchChange {
@@ -473,7 +493,7 @@ fn rebuild_index(
         if patch.is_some() {
             continue;
         }
-        if std::fs::symlink_metadata(workdir.join(path)).is_ok() {
+        if !removals.contains(path) && std::fs::symlink_metadata(workdir.join(path)).is_ok() {
             index.add_path(Path::new(path)).wrap()?;
         } else {
             index.remove_path(Path::new(path)).wrap()?;

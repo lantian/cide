@@ -69,6 +69,7 @@ pub mod patch;
 pub mod properties;
 pub mod pull;
 pub mod push;
+mod rename;
 pub mod replay;
 pub mod repo;
 pub mod reset;

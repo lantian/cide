@@ -708,21 +708,9 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Rename detection is a pass over the deltas *of one diff*, so both sides have to be in it.
 ///
-/// [`diff::file_diff`] passes a pathspec, and libgit2 applies it while building the diff —
-/// before `find_similar` ever runs. The deleted counterpart is filtered out, there is nothing
-/// left to pair the addition with, and a rename comes back as a plain added file.
-/// `DiffRequest::renames(true)` is therefore inert for every caller that goes through
-/// `file_diff`, which today is `shelf::shelve` and the app's `git_diff_file` command — the one
-/// whose comment says "the panel wants to *show* a rename".
-///
-/// Nothing is corrupted by it: staging never asks for rename detection (a rename delta is
-/// refused there anyway), and what the narrow diff describes — a new file, whole — is a patch
-/// that applies correctly. What is lost is the display, and the refusal that goes with it:
-/// through `file_diff` the same file reports `partial_ok`, so the panel offers partial staging
-/// of a rename's new side while believing it is offering it on an ordinary addition.
-///
-/// The assertions below pin the *mechanism*, not the wish. When `file_diff` learns to widen its
-/// diff before the similarity pass, this is the test that says so.
+/// `file_diff` includes the source found in status before running the similarity pass.
+/// The panel must see the complete rename, including its partial-selection refusal,
+/// rather than an ordinary addition that silently loses the source half.
 #[test]
 fn a_rename_is_only_detected_when_both_sides_are_in_the_diff() {
     let repo = TempRepo::new("rename-pathspec");
@@ -746,14 +734,9 @@ fn a_rename_is_only_detected_when_both_sides_are_in_the_diff() {
     let narrow = diff::file_diff(&git_repo, "b.txt", request)
         .expect("diff")
         .expect("a delta for b.txt");
-    assert_eq!(
-        narrow.status,
-        git2::Delta::Added,
-        "a pathspec'd diff found a rename — `file_diff` now widens its diff, so the corpus's \
-         `delta_for` and both `renames(true)` callers should be revisited"
-    );
-    assert_eq!(narrow.old_path, None);
-    assert_eq!(narrow.partial_refusal(), None);
+    assert_eq!(narrow.status, git2::Delta::Renamed);
+    assert_eq!(narrow.old_path.as_deref(), Some("a.txt"));
+    assert_eq!(narrow.partial_refusal(), Some(PartialRefusal::Rename));
 
     let wide = diff::build(&git_repo, request, None).expect("diff");
     let wide = diff::raw_files(&wide)
@@ -764,6 +747,7 @@ fn a_rename_is_only_detected_when_both_sides_are_in_the_diff() {
     assert_eq!(wide.status, git2::Delta::Renamed);
     assert_eq!(wide.old_path.as_deref(), Some("a.txt"));
     assert_eq!(wide.partial_refusal(), Some(PartialRefusal::Rename));
+    assert_eq!(narrow, wide);
 }
 
 /// A random subset of the file's additions and deletions.

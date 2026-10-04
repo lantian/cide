@@ -207,8 +207,8 @@ pub struct DiffRequest {
     /// file) and never by staging (a binary file is staged whole through the index).
     pub binary: bool,
     pub context: u32,
-    /// Detect renames. Off for staging — a rename delta is refused there anyway and finding
-    /// them costs a similarity pass over every added and deleted blob.
+    /// Detect renames. Whole-file operations resolve both paths through status; partial
+    /// patch synthesis uses ordinary file deltas. The display asks for rename context.
     pub renames: bool,
 }
 
@@ -261,7 +261,17 @@ pub fn build<'r>(
     request: DiffRequest,
     pathspec: Option<&str>,
 ) -> Result<Diff<'r>> {
-    let mut opts = options(&request, pathspec);
+    build_paths(repo, request, &pathspec.into_iter().collect::<Vec<_>>())
+}
+
+fn build_paths<'r>(repo: &'r Repository, request: DiffRequest, paths: &[&str]) -> Result<Diff<'r>> {
+    let mut opts = options(&request, None);
+    if !paths.is_empty() {
+        opts.disable_pathspec_match(true);
+        for path in paths {
+            opts.pathspec(path);
+        }
+    }
     let head_tree = head_tree(repo)?;
 
     let mut diff = match request.side {
@@ -278,7 +288,9 @@ pub fn build<'r>(
 
     if request.renames {
         let mut find = git2::DiffFindOptions::new();
-        find.renames(true).copies(false).for_untracked(false);
+        find.renames(true)
+            .copies(false)
+            .for_untracked(request.side != DiffSide::Staged);
         diff.find_similar(Some(&mut find)).wrap()?;
     }
     Ok(diff)
@@ -404,8 +416,33 @@ pub fn raw_file_at(diff: &Diff<'_>, index: usize) -> Result<Option<RawFile>> {
 
 /// The diff of exactly one path, or `None` when it has no changes on that side.
 pub fn file_diff(repo: &Repository, path: &str, request: DiffRequest) -> Result<Option<RawFile>> {
+    if request.renames
+        && let Some((Some(old), new)) = crate::rename::endpoints(repo, path, request.side)?
+        && old != new
+    {
+        let diff = build_paths(repo, request, &[&old, &new])?;
+        return Ok(raw_files(&diff)?.into_iter().find(|f| f.path == new));
+    }
     let diff = build(repo, request, Some(path))?;
     Ok(raw_files(&diff)?.into_iter().find(|f| f.path == path))
+}
+
+/// The source of a whole rename is a deletion of HEAD's blob, even if an unrelated
+/// untracked file has since appeared at that path. Used for shelf and message patches.
+pub(crate) fn head_deletion(repo: &Repository, path: &str, binary: bool) -> Result<RawFile> {
+    let empty = git2::Index::new().wrap()?;
+    let head = head_tree(repo)?;
+    let mut opts = options(
+        &DiffRequest::new(DiffSide::Staged).binary(binary),
+        Some(path),
+    );
+    let diff = repo
+        .diff_tree_to_index(head.as_ref(), Some(&empty), Some(&mut opts))
+        .wrap()?;
+    raw_files(&diff)?
+        .into_iter()
+        .find(|f| f.path == path)
+        .ok_or_else(|| GitError::NoSuchChange { path: path.into() })
 }
 
 /// The frontend's view of one file's hunks, on their own.

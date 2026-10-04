@@ -18,6 +18,8 @@
  * ticks, and not the selection either. The press that preceded the drag has already put the
  * selection where it belongs (`rowSelection.ts::pressSelect` selects an unselected row on
  * mousedown, which is IDEA's rule and the reason this function never has to write anything).
+ * An unversioned group header carries its entire group, regardless of the row selection or
+ * which folders are expanded.
  *
  * This used to widen by **ticks**, and that was the wrong set — the header here argued for it
  * at length and the argument was wrong in a way worth keeping on the record. It ran: this
@@ -125,12 +127,11 @@ export interface DragSet {
 /**
  * What a gesture on `row` picks up, or `null` when that row is not a drag source.
  *
- * Repo rows and group rows are `null`, deliberately, and for two different reasons. A
+ * Repo rows and all group rows except the unversioned header are `null`. A
  * repository is not in any changelist and its rows span its submodules, whose files belong to
- * a different sidecar. A changelist header is not a source because a press on one *folds it*
- * — that is the click rule this tree already had (`gitTreeClick`), and a drag that began by
- * collapsing the row under the pointer would be unusable; moving a whole changelist is the
- * group menu's `Move N Files to Changelist…`, one keystroke away and with a count to read.
+ * a different sidecar. Whole changelists are moved through their group menu. The unversioned
+ * header is a handle for adding all its files to git; folding already waits for release and
+ * is skipped when the press becomes a drag (`ChangesTree`).
  */
 export function grab(
   view: StatusView,
@@ -141,7 +142,8 @@ export function grab(
   carried: ReadonlySet<string>,
   row: Row,
 ): DragSet | null {
-  if (row.kind !== 'file' && row.kind !== 'dir') return null
+  const wholeGroup = row.kind === 'group' && row.groupKind === 'unversioned'
+  if (row.kind !== 'file' && row.kind !== 'dir' && !wholeGroup) return null
   const kind = row.groupKind
   if (kind === undefined) return null
 
@@ -163,7 +165,7 @@ export function grab(
    * selection band, and refusing to carry them would make a folder the one row kind that
    * silently drops the rest of a multi-row drag.
    */
-  const widen = carried.has(row.id)
+  const widen = !wholeGroup && carried.has(row.id)
   const files = widen
     ? all.flatMap((f) =>
         f.repo === row.repo && f.kind === kind && carried.has(f.id)
@@ -186,7 +188,7 @@ export function grab(
 
 /** `3 files`, `GitPanel.tsx`, `ui/src/sidebar` — what the ghost carries under the pointer. */
 function labelFor(row: Row, count: number, widened: boolean): string {
-  if (widened || (row.kind === 'file' && count > 1)) return plural(count)
+  if (row.kind === 'group' || widened || (row.kind === 'file' && count > 1)) return plural(count)
   if (row.kind === 'dir') return `${row.path ?? row.label}/`
   return row.label
 }

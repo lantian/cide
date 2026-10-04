@@ -521,6 +521,34 @@ try {
       + 'staged", so a file filed there arrives ticked even when nothing there is',
   )
 
+  // A rename remains one destination row across the move-to-Changes and stage responses.
+  // Reload clears ticks; a subsequent explicit move must select that same destination again.
+  const renameDestination = 'openspec/changes/archive/change/proposal.md'
+  const renameSource = 'openspec/changes/change/proposal.md'
+  const renameView = (staged) => m.normalizeStatus({
+    repos: [{
+      ...repo(APP, '/w/app', 'app'),
+      changelists: [{
+        id: 'default', name: 'Changes', comment: '', active: true,
+        changes: [entry(renameDestination, staged ? 'renamed' : 'unmodified', staged ? 'unmodified' : 'renamed', 'default', { origPath: renameSource })],
+      }],
+      unversioned: [], ignored: [], conflicts: [],
+    }],
+  })
+  const unstagedRename = renameView(false)
+  const stagedRename = renameView(true)
+  eq(m.flatFiles(unstagedRename).length, 1, 'a renamed file occupies exactly one selectable row')
+  eq(m.flatFiles(unstagedRename)[0].entry.origPath, renameSource, 'the rename row retains its source for display')
+  const renameTicks = m.ticksAfterMove(unstagedRename, new Set(), APP, 'default', [renameDestination])
+  const stagedRenameTicks = m.pruneSelection(m.allFiles(stagedRename), renameTicks)
+  eq([...stagedRenameTicks], [m.fileRowId(APP, renameDestination)], 'staging a rename preserves its destination checkbox')
+  eq(m.commitUnits(stagedRename, stagedRenameTicks)[0].paths, [renameDestination], 'the selected rename destination reaches the commit request')
+  eq(
+    [...m.ticksAfterMove(stagedRename, new Set(), APP, 'default', [renameDestination])],
+    [...stagedRenameTicks],
+    'moving an already staged rename into Changes after Reload selects it again',
+  )
+
   // --- Space over a multi-row selection --------------------------------------------------
   //
   // This is here because the defect it pins was invisible to all 29 gates: the rule lived in
@@ -1634,9 +1662,7 @@ try {
   eq(
     d.grab(withEmptyView, new Set(), rowsE.find((r) => r.label === 'Changes')),
     null,
-    'a changelist header is not a drag source: a press on one FOLDS it (see `gitTreeClick`), '
-      + 'so a drag from it would begin by collapsing the thing being dragged. The group menu '
-      + 'moves a whole changelist instead, with a count to read first',
+    'a changelist header is not a drag source: its group menu moves the whole changelist',
   )
   eq(
     d.grab(m.normalizeStatus({ repos: [repo(APP, '/w/app', 'app'), repo(LIB, '/w/lib', 'lib')] }),
@@ -1651,6 +1677,89 @@ try {
 
   const carried = d.grab(withEmptyView, new Set(), rowA)
   const group = (label) => rowsE.find((r) => r.kind === 'group' && r.label === label)
+
+  // Dragging the unversioned header adds the entire group, including hidden descendants.
+  const allUntrackedPaths = ['notes.md', 'new/top.txt', 'new/nested/child.txt']
+  const untrackedView = m.normalizeStatus({
+    repos: [
+      {
+        ...repo(APP, '/w/app', 'app'),
+        unversioned: allUntrackedPaths.map((path) =>
+          entry(path, 'unmodified', 'untracked', 'default'),
+        ),
+      },
+      repo(LIB, '/w/lib', 'lib'),
+    ],
+  })
+  const untrackedRows = m.buildRows(untrackedView, openAll(untrackedView))
+  const untrackedHeader = untrackedRows.find(
+    (r) => r.repo === APP && r.groupKind === 'unversioned' && r.kind === 'group',
+  )
+  const entireUntracked = d.grab(untrackedView, new Set(), untrackedHeader)
+  eq(paths(entireUntracked), allUntrackedPaths, 'an unversioned header carries every file in its own repository')
+  eq(entireUntracked.label, '3 files', 'the group drag indicator shows the total file count')
+  eq(entireUntracked.widened, false, 'a whole-group grab carries its own files without selection widening')
+  eq(
+    paths(d.grab(
+      untrackedView,
+      new Set([untrackedHeader.id, m.fileRowId(APP, 'a.rs'), m.fileRowId(LIB, 'notes.md')]),
+      untrackedHeader,
+    )),
+    allUntrackedPaths,
+    'a group grab ignores unrelated row selections even if its header id is included',
+  )
+  for (const expanded of [new Set([m.repoRowId(APP)]), new Set([m.repoRowId(APP), untrackedHeader.id])]) {
+    const hiddenHeader = m.buildRows(untrackedView, expanded).find((r) => r.id === untrackedHeader.id)
+    eq(
+      paths(d.grab(untrackedView, new Set(), hiddenHeader)),
+      allUntrackedPaths,
+      'a collapsed group or its collapsed folders still carry all untracked files',
+    )
+  }
+  eq(
+    d.grab(untrackedView, new Set(), { ...untrackedHeader, files: [] }),
+    null,
+    'an empty unversioned group cannot start a drag',
+  )
+  eq(d.grab(withEmptyView, new Set(), group('Ignored Files')), null, 'ignored group headers remain non-draggable')
+  eq(
+    d.grab(untrackedView, new Set(), { ...untrackedHeader, groupKind: 'conflicts' }),
+    null,
+    'conflict group headers remain non-draggable',
+  )
+  const addGroup = d.dropOutcome(entireUntracked, group('Changes'))
+  eq(
+    addGroup,
+    {
+      kind: 'track',
+      repo: APP,
+      changelist: 'default',
+      list: 'Changes',
+      paths: allUntrackedPaths,
+      hint: 'Add 3 files to git and move to “Changes”',
+    },
+    'dropping the unversioned header onto Changes stages and files every path',
+  )
+  eq(
+    [...m.ticksAfterMove(untrackedView, new Set([rowA.id]), addGroup.repo, addGroup.changelist, addGroup.paths)].sort(),
+    [rowA.id, ...allUntrackedPaths.map((path) => m.fileRowId(APP, path))].sort(),
+    'every file added by the group drop is checked for commit and existing ticks remain',
+  )
+  eq(d.dropOutcome(entireUntracked, group('fixes')).paths, allUntrackedPaths, 'other changelists also accept the entire unversioned group')
+  eq(
+    d.dropOutcome(
+      entireUntracked,
+      untrackedRows.find((r) => r.repo === LIB && r.group === 'cl:default' && r.kind === 'group'),
+    ).kind,
+    'refuse',
+    'a whole unversioned group cannot be dropped into another repository',
+  )
+  eq(
+    d.dropOutcome(entireUntracked, group('Ignored Files')).kind,
+    'refuse',
+    'a whole unversioned group cannot be dropped into a sibling list',
+  )
+
   eq(
     d.dropOutcome(carried, group('fixes')),
     {

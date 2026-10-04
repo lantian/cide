@@ -58,7 +58,7 @@ pub fn changes_tree(roots: &[PathBuf], request: StatusRequest) -> Result<Changes
 /// One repository's changes.
 pub fn repo_changes(info: &RepoInfo, request: StatusRequest) -> Result<RepoChanges> {
     let repo = repo_mod::open(&info.root)?;
-    let entries = collect(&repo, request)?;
+    let (entries, renames) = collect(&repo, request)?;
 
     let live: BTreeSet<String> = entries
         .iter()
@@ -72,7 +72,25 @@ pub fn repo_changes(info: &RepoInfo, request: StatusRequest) -> Result<RepoChang
     // something was actually dropped — this function runs on a 150 ms debounce while the user
     // types, and an unconditional save would be a disk write per keystroke.
     let mut sidecar = changelist::load(&info.root);
-    if sidecar.reconcile(&live)
+    let mut moved = false;
+    for (destination, sources) in renames {
+        if sidecar.lists.iter().any(|l| l.paths.contains(&destination)) {
+            continue;
+        }
+        let owner = sources.iter().find_map(|source| {
+            sidecar
+                .lists
+                .iter()
+                .find(|l| l.paths.contains(source))
+                .map(|l| l.id.clone())
+        });
+        if let Some(owner) = owner {
+            sidecar.move_paths(&owner, &[destination])?;
+            moved = true;
+        }
+    }
+    let reconciled = sidecar.reconcile(&live);
+    if (moved || reconciled)
         && let Err(error) = changelist::save(&info.root, &sidecar)
     {
         tracing::warn!(%error, "could not write the reconciled changelists sidecar");
@@ -121,20 +139,35 @@ pub fn repo_changes(info: &RepoInfo, request: StatusRequest) -> Result<RepoChang
     })
 }
 
-fn collect(repo: &Repository, request: StatusRequest) -> Result<Vec<ChangeEntry>> {
+pub(crate) fn options(include_ignored: bool) -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(request.include_ignored)
+        .include_ignored(include_ignored)
         .include_unmodified(false)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true)
         .include_unreadable(false);
+    opts
+}
 
+type RenameAliases = Vec<(String, Vec<String>)>;
+
+fn collect(repo: &Repository, request: StatusRequest) -> Result<(Vec<ChangeEntry>, RenameAliases)> {
+    let mut opts = options(request.include_ignored);
     let statuses = repo.statuses(Some(&mut opts)).wrap()?;
     let mut out = Vec::with_capacity(statuses.len());
+    let mut renames = Vec::new();
     for entry in statuses.iter() {
-        let Ok(path) = entry.path() else {
+        let head_to_index = entry.head_to_index();
+        let index_to_workdir = entry.index_to_workdir();
+        // StatusEntry::path() is the OLD path, including for a rename. A row must name
+        // the destination or staging it removes the source and never adds the new file.
+        let path = index_to_workdir
+            .as_ref()
+            .and_then(|d| d.new_file().path())
+            .or_else(|| head_to_index.as_ref().and_then(|d| d.new_file().path()));
+        let Some(path) = path.and_then(Path::to_str) else {
             // A path libgit2 could not render as UTF-8. Skipping it is wrong in principle,
             // but every downstream type on the wire is a `String` and inventing a lossy
             // name here would let a commit target a file the user never saw.
@@ -142,14 +175,29 @@ fn collect(repo: &Repository, request: StatusRequest) -> Result<Vec<ChangeEntry>
             continue;
         };
         let status = entry.status();
-        let head_to_index = entry.head_to_index();
-        let index_to_workdir = entry.index_to_workdir();
+        if status.intersects(Status::INDEX_RENAMED | Status::WT_RENAMED) {
+            // Prefer the index name: a staged A→B followed by B→C should retain B's
+            // explicit changelist, even though the displayed original is A.
+            let sources = [
+                head_to_index.as_ref().and_then(|d| d.new_file().path()),
+                index_to_workdir.as_ref().and_then(|d| d.old_file().path()),
+                head_to_index.as_ref().and_then(|d| d.old_file().path()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Path::to_str)
+            .filter(|source| *source != path)
+            .map(str::to_owned)
+            .collect();
+            renames.push((path.to_owned(), sources));
+        }
 
         let orig_path = head_to_index
             .as_ref()
             .and_then(|d| d.old_file().path())
             .or_else(|| index_to_workdir.as_ref().and_then(|d| d.old_file().path()))
-            .map(|p| p.to_string_lossy().into_owned())
+            .and_then(Path::to_str)
+            .map(str::to_owned)
             .filter(|p| p != path);
 
         let submodule = [&head_to_index, &index_to_workdir].iter().any(|delta| {
@@ -178,7 +226,7 @@ fn collect(repo: &Repository, request: StatusRequest) -> Result<Vec<ChangeEntry>
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
+    Ok((out, renames))
 }
 
 fn index_side(status: Status) -> FileState {
@@ -302,6 +350,7 @@ fn short_name(reference: &str) -> &str {
 pub fn live_paths(root: &Path) -> Result<BTreeSet<String>> {
     let repo = repo_mod::open(root)?;
     Ok(collect(&repo, StatusRequest::default())?
+        .0
         .into_iter()
         .map(|e| e.path)
         .collect())

@@ -873,11 +873,11 @@ function FileLabel({
         theme={iconTheme}
         className={styles.icon}
       />
-      <span className={styles.fileName} data-status={entryStatus(entry)} title={entry.path}>
+      <span className={styles.fileName} data-status={entryStatus(entry)} title={entry.origPath === null ? entry.path : `${entry.origPath} → ${entry.path}`}>
         <SpeedName name={name} span={match} />
       </span>
       {entry.origPath !== null && (
-        <span className={styles.dir}>← {splitPath(entry.origPath).name}</span>
+        <span className={styles.dir} title={entry.origPath}>← {splitPath(entry.origPath).name}</span>
       )}
     </>
   )
