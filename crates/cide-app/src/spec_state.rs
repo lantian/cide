@@ -441,6 +441,53 @@ pub const ABSENT_HINT: &str = "OpenSpec keeps this project's requirements in ope
 mod tests {
     use super::*;
     #[test]
+    fn full_invalidation_discovers_a_checkout_after_an_empty_scan() {
+        let service = ProjectSpecs::default();
+        let root = Path::new("/repo");
+        assert!(service.checkout_metadata(Vec::new).unwrap().is_empty());
+        let checkout = SpecCheckout {
+            change: cide_ipc::ChangeName("one".into()),
+            branch: "cide/spec-one".into(),
+            completed_tasks: None,
+            total_tasks: None,
+            archived_as: None,
+            unmerged: Some(1),
+            dirty: false,
+        };
+        let read = || vec![checkout.clone()];
+        // Artifact events refresh the checklist, but cannot discover new git registrations.
+        service.invalidate(
+            root,
+            &SpecInvalidation {
+                full: false,
+                paths: vec![".cide/worktrees/spec-one/openspec/changes/one/tasks.md".into()],
+            },
+        );
+        assert!(service.checkout_metadata(read).unwrap().is_empty());
+        // Apply creation explicitly marks a full change before publishing its snapshot.
+        service.invalidate(
+            root,
+            &SpecInvalidation {
+                full: true,
+                paths: vec![],
+            },
+        );
+        let rows = service.checkout_metadata(read).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].branch, "cide/spec-one");
+        // Integrate's response can precede retirement. Its removal event clears the cached
+        // registration so a later frontend scan cannot keep offering Integrate indefinitely.
+        service.invalidate(
+            root,
+            &SpecInvalidation {
+                full: true,
+                paths: vec![],
+            },
+        );
+        assert!(service.checkout_metadata(Vec::new).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_large_checkout_scan_keeps_counts_hot_and_prunes_closed_checkouts() {
         let service = ProjectSpecs::default();
         let paths: Vec<_> = (0..100)

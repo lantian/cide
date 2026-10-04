@@ -812,15 +812,6 @@ export function primaryAction(
   const { done, total } = taskProgress(change)
   const finished = total > 0 && done >= total
 
-  if (taskStatus === 'done') {
-    return {
-      id: 'none',
-      label: '',
-      hint: 'Archived. Its requirements are in openspec/specs/ now.',
-      gate: { ok: false, reason: 'this change has been accepted' },
-    }
-  }
-
   if (finished) {
     const blocking = change.validation.issues.filter(isBlocking).length
     const gate: Gate =
@@ -850,6 +841,16 @@ export function primaryAction(
         ? "Merges the agent's branch, then merges these requirement edits into openspec/specs/ and closes the task."
         : 'Merges these requirement edits into openspec/specs/ and closes the task. This work was done in your own checkout, so there is no branch to merge.',
       gate,
+    }
+  }
+
+  // Done closes a tracker item; only archivedAs proves the specs were archived.
+  if (taskStatus === 'done') {
+    return {
+      id: 'none',
+      label: '',
+      hint: 'This task is done, but this change’s checklist is still incomplete.',
+      gate: { ok: false, reason: 'This task is done, but this change’s checklist is still incomplete.' },
     }
   }
 
@@ -1427,6 +1428,13 @@ export interface SessionView {
   /** Who runs it: a role's label or the harness. */
   who: string
   state: SessionStateView
+  /** The last turn finished normally; an idle child can still be continued with Apply. */
+  turnComplete?: boolean | undefined
+}
+
+/** An unfinished Apply still owns the work. A completed turn may be retried or continued. */
+export function blocksApply(session: SessionView | null | undefined): boolean {
+  return session?.op === 'apply' && session.state.live && session.turnComplete !== true
 }
 
 /**
@@ -1459,6 +1467,7 @@ export function sessionViews(
       caption: change ?? sessionCaption(row.op, row.text),
       who: row.label,
       state: sessionState(row.state, row.turnComplete),
+      turnComplete: sessionPhase(row.state, row.turnComplete) === 'finished',
     }
     if (change !== null) {
       if (!Object.hasOwn(byChange, change)) byChange[change] = view

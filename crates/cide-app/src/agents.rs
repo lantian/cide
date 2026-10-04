@@ -9791,6 +9791,13 @@ pub(crate) fn retire_worktree(
                     // The roster's `AgentRun::worktree` just changed, and History's Integrate
                     // with it.
                     registry.mark_changed(&app, project);
+                    // Retirement runs after Integrate returns. The earlier spec snapshot may
+                    // still contain this checkout; invalidate and publish its actual removal.
+                    if name.starts_with("spec-")
+                        && let Some(boards) = app.try_state::<Arc<crate::spec_state::SpecBoards>>()
+                    {
+                        boards.mark_changed(&app, project);
+                    }
                 }
                 Ok(cide_git::worktree::Retired::Absent) => {}
                 Ok(kept) => {

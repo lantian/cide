@@ -165,6 +165,8 @@ export interface SpecDigest {
   tabDeltas: string[]
   tabIssues: number
   tabStart: string | null
+  tabApprove: string | null
+  tabHint: string | null
   /** The page's *Open session*, and the acts a finished change offers there. */
   tabOpenSession: boolean
   tabReadyActs: string[]
@@ -285,6 +287,8 @@ function digest(story: string, html: string): SpecDigest {
     ),
     tabIssues: hits(html, 'specTabIssue'),
     tabStart: (all(html, 'specTabStart')[0] ?? null) && text(all(html, 'specTabStart')[0] ?? ''),
+    tabApprove: ((f) => f === null ? null : `${text(f)}${f.includes('disabled') ? '|inert' : ''}`)(all(html, 'specTabApprove')[0] ?? null),
+    tabHint: (all(html, 'specTabHint')[0] ?? null) && text(all(html, 'specTabHint')[0] ?? ''),
     tabOpenSession: hits(html, 'specTabOpenSession') > 0,
     tabReadyActs: all(html, 'specTabReadyAct').map((fragment) => attr(fragment, 'data-act') ?? ''),
     tabSplit: ((f) =>

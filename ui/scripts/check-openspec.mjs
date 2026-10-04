@@ -609,6 +609,11 @@ try {
 
     const done = M.primaryAction(change({ completed: 9, total: 9 }), 'developer', 'review', null, true)
     eq(done.id, 'accept', 'a finished change offers the accept gesture')
+    eq(M.primaryAction(change({ completed: 9, total: 9 }), null, 'done', null, null).id,
+      'accept', 'Done does not imply a finished change was archived')
+    const closedIncomplete = M.primaryAction(change(), null, 'done', null, null)
+    eq(closedIncomplete.id, 'none', 'a closed task is not approved again')
+    ok(closedIncomplete.gate.reason.includes('incomplete'), 'a closed task does not misreport archiving')
     ok(
       done.hint.includes('openspec/specs/'),
       `the accept hint names what archiving writes: ${done.hint}`,
@@ -1073,6 +1078,18 @@ try {
     eq(views.byChange.c1.run, 'r5', 'a change shows its newest session')
     eq(views.loose.map((v) => v.run), ['r3', 'r2', 'r1', 'r0'], 'the live one and three that ended')
     eq(views.loose[0].caption, 'idea', 'named by what the user typed')
+    eq(M.blocksApply(views.byChange.c1), true, 'a running Apply blocks duplicate work')
+    for (const state of ['queued', 'starting', 'running', 'awaitingPermission', 'paused', 'idle']) {
+      const session = M.sessionViews([{ run: 'a', op: 'apply', change: 'c', text: '', label: 'dev', state: { state } }]).byChange.c
+      eq(M.blocksApply(session), true, `${state}: unfinished Apply owns its work`)
+    }
+    for (const state of ['idle', 'interrupted', 'finished', 'failed']) {
+      const session = M.sessionViews([{ run: 'a', op: 'apply', change: 'c', text: '', label: 'dev', state: { state }, turnComplete: true }]).byChange.c
+      eq(M.blocksApply(session), false, `${state}: an ended turn can be continued`)
+    }
+    const restarted = M.sessionViews([{ run: 'a', op: 'apply', change: 'c', text: '', label: 'dev', state: { state: 'running' }, turnComplete: true }]).byChange.c
+    eq(M.blocksApply(restarted), true, 'a previous completed turn does not unblock a running follow-up')
+    eq(M.blocksApply({ ...views.byChange.c1, op: 'propose' }), false, 'a proposal session does not replace Apply')
 
     // What a finished change offers: three separate roads with a worktree, Archive without.
     eq(M.readyActs(true).map((a) => a.id), ['publish', 'integrate', 'archive'], 'worktree: all three')

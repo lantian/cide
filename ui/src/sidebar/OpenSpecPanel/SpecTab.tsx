@@ -55,6 +55,7 @@ import {
   issuesFor,
   opLabel,
   primaryAction,
+  blocksApply,
   proposalArtifact,
   rowAction,
   splitAction,
@@ -154,6 +155,9 @@ export interface SpecTabViewProps {
    */
   startAction: RowAction
   onStart: () => void
+  /** Approval uses the task card's Apply flow; completion actions remain separate. */
+  onApprove?: (() => void) | undefined
+  approvalBusy?: boolean | undefined
   /**
    * *Split work*'s label, tooltip and — when the tracker cannot answer — its refusal.
    *
@@ -329,6 +333,18 @@ export function SpecTabView(props: SpecTabViewProps) {
     task?.session ?? null,
     props.roleWorktree,
   )
+  const canApprove = task !== null && (task.status === 'todo' || task.status === 'inbox') &&
+    action.id === 'approve' && !blocksApply(session) && props.onApprove !== undefined
+  const canApply = task === null && view.archivedAs == null &&
+    (progress.total === 0 || progress.done < progress.total) && !blocksApply(session)
+  const hint = acts.length > 0
+    ? acts.some((act) => act.id === 'integrate')
+      ? 'Publish pushes this change’s branch. Integrate merges it into your current branch. Archive updates openspec/specs/ separately.'
+      : 'Archive merges these requirement edits into openspec/specs/.'
+    : view.archivedAs != null ? action.hint
+    : canApply ? props.startAction.title
+    : blocksApply(session) ? 'Open this session to follow the implementation.'
+    : action.gate.ok ? action.hint : action.gate.reason
   const names = view.deltas.flatMap((delta) => delta.requirements.map((req) => req.name))
   const orphans = unattributedIssues(view.validation, names)
   const design = hasDesign(view)
@@ -419,11 +435,11 @@ export function SpecTabView(props: SpecTabViewProps) {
           * out of work that is finished. *Open task* survives, because a link back to the task
           * that did it is the most useful thing on this page once it is archived.
           */}
-        {task === null && session !== null && view.archivedAs == null && (
+        {session !== null && view.archivedAs == null && (
           <>
             <button
               type="button"
-              className={cx(styles.button, acts.length === 0 && styles.primary)}
+              className={cx(styles.button, !canApply && !canApprove && acts.length === 0 && styles.primary)}
               data-audit="specTabOpenSession"
               title={OPEN_SESSION_TITLE}
               onClick={() => props.onOpenSession?.(session.run)}
@@ -435,25 +451,37 @@ export function SpecTabView(props: SpecTabViewProps) {
             </Badge>
           </>
         )}
-        {task === null &&
-          acts.map((act) => (
-            <button
-              key={act.id}
-              type="button"
-              className={cx(styles.button, act.id !== 'archive' && styles.primary)}
-              data-audit="specTabReadyAct"
-              data-act={act.id}
-              data-write="true"
-              title={act.title}
-              onClick={() => props.onReadyAct?.(act.id)}
-            >
-              {act.label}
-            </button>
-          ))}
-        {(task !== null || view.archivedAs == null) && (task !== null || session === null) && (
+        {canApprove && (
+          <button
+            type="button"
+            className={cx(styles.button, styles.primary)}
+            data-audit="specTabApprove"
+            data-write="true"
+            title={action.hint}
+            disabled={props.approvalBusy === true || !action.gate.ok}
+            onClick={props.onApprove}
+          >
+            {props.approvalBusy ? 'Approving…' : 'Approve'}
+          </button>
+        )}
+        {acts.map((act) => (
+          <button
+            key={act.id}
+            type="button"
+            className={cx(styles.button, act.id !== 'archive' && styles.primary)}
+            data-audit="specTabReadyAct"
+            data-act={act.id}
+            data-write="true"
+            title={act.title}
+            onClick={() => props.onReadyAct?.(act.id)}
+          >
+            {act.label}
+          </button>
+        ))}
+        {(task !== null || canApply) && (
         <button
           type="button"
-          className={cx(styles.button, styles.primary)}
+          className={cx(styles.button, !canApprove && acts.length === 0 && styles.primary)}
           data-audit="specTabStart"
           data-write="true"
           /*
@@ -498,14 +526,8 @@ export function SpecTabView(props: SpecTabViewProps) {
             {props.splitAction.label}
           </button>
         )}
-        {/*
-          * The primary action is *drawn* here and acted on from the task card, deliberately.
-          * Approving is assigning and accepting integrates a branch — both belong beside the
-          * task's own status and history, and a second place to press them would be a second
-          * place to get the ordering wrong. This says what the next step is; the card does it.
-          */}
         <p className={styles.hint} data-audit="specTabHint">
-          {action.gate.ok ? action.hint : action.gate.reason}
+          {hint}
         </p>
       </section>
 
@@ -886,6 +908,8 @@ function ChangeTab({
   const [target, setTarget] = useState<string | null>(null)
   const [draft, setDraft] = useState<RequirementDraft | null>(null)
   const [busy, setBusy] = useState(false)
+  const [approvalBusy, setApprovalBusy] = useState(false)
+  const approving = useRef(false)
   const [problem, setProblem] = useState<
     { kind: 'regressed' | 'conflicted'; messages: readonly string[] } | null
   >(null)
@@ -1026,6 +1050,17 @@ function ChangeTab({
     }
     useApplyDialog.getState().open(change)
   }, [task, change])
+
+  const onApprove = useCallback(() => {
+    if (task === null || approving.current) return
+    approving.current = true
+    setApprovalBusy(true)
+    // The task helper reaches the terminal host; load it only when a browser clicks approval.
+    void import('../TasksPanel/openSpec')
+      .then(({ approveTaskSpec }) => approveTaskSpec(project, task.id, change))
+      .catch(notifyFailure)
+      .finally(() => { approving.current = false; setApprovalBusy(false) })
+  }, [project, task, change])
 
   /**
    * Ask the project's conversation to fan this change out into a main task and subtasks.
@@ -1301,6 +1336,8 @@ function ChangeTab({
       edit={{ target, draft, busy, problem }}
       startAction={startAction}
       onStart={onStart}
+      onApprove={onApprove}
+      approvalBusy={approvalBusy}
       canSplit={trackerOn}
       session={session}
       onOpenSession={(run) => {
@@ -1308,7 +1345,7 @@ function ChangeTab({
         if (row !== undefined) void openSession(project, row).catch(notifyFailure)
       }}
       readyActs={
-        view !== null && (stageOf(view) === 'ready' || (view.archivedAs != null && hasCheckout))
+        view !== null && ((stageOf(view) === 'ready' && !view.validation.issues.some(isBlocking)) || (view.archivedAs != null && hasCheckout))
           ? readyActs(hasCheckout).filter((act) => view.archivedAs == null || act.id !== 'archive')
           : []
       }

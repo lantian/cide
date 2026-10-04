@@ -39,6 +39,7 @@ import {
   rowAction,
   readyActs,
   rowProgress,
+  blocksApply,
   DISMISS_SESSION_LABEL,
   OPEN_SESSION_LABEL,
   OPEN_SESSION_TITLE,
@@ -554,11 +555,8 @@ function ChangeRow({ row, props }: { row: SpecRow & { kind: 'change' }; props: O
           </Button>
         ))}
         <span className={styles.changeActsGap} />
-        {/*
-          * The way to the work: the change's session when it has one — never a second Apply,
-          * which Rust would refuse anyway — else Apply or the task that already tracks it.
-          */}
-        {session !== undefined && props.onOpenSession !== undefined ? (
+        {/* Keep the previous session available alongside a deliberate Apply continuation. */}
+        {session !== undefined && props.onOpenSession !== undefined && (
           <Button
             size="sm"
             variant="quiet"
@@ -570,7 +568,8 @@ function ChangeRow({ row, props }: { row: SpecRow & { kind: 'change' }; props: O
           >
             {OPEN_SESSION_LABEL}
           </Button>
-        ) : (
+        )}
+        {(action.id === 'open' || (progress.stage !== 'ready' && progress.stage !== 'archived' && !blocksApply(session))) && (
           <Button
             size="sm"
             variant={acts.length === 0 && action.id === 'start' ? 'secondary' : 'quiet'}

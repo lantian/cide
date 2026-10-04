@@ -18,9 +18,9 @@ import type { OpenSpecPanelViewProps } from './OpenSpecPanel'
 import type { ProposeFormProps } from './ProposeForm'
 import type { RequirementEditorProps } from './RequirementEditor'
 import type { SpecTabViewProps } from './SpecTab'
-import type { ChangeView } from './model'
+import type { ChangeView, SessionView } from './model'
 import type { Board } from './model'
-import { rowAction, splitAction } from './model'
+import { readyActs, rowAction, splitAction } from './model'
 
 /**
  * Every handler, on every story, so an absence assertion is never vacuous.
@@ -99,6 +99,7 @@ export type SpecStoryName =
   | 'board-collapsed'
   | 'board-tracker-unread'
   | 'board-sessions'
+  | 'board-finished-session'
   | 'ask-propose'
   | 'ask-propose-legacy'
   | 'ask-explore'
@@ -242,6 +243,12 @@ export const SPEC_STORIES: Record<SpecStoryName, OpenSpecPanelViewProps> = {
     checkouts: { 'add-dark-mode': { done: 9, total: 9 } },
     onOpenSession: () => {},
     onReadyAct: () => {},
+  }),
+
+  'board-finished-session': story(READY, {
+    tasks: {},
+    sessions: { byChange: { 'rework-auth': finishedApply('rework-auth') }, loose: [] },
+    onOpenSession: () => {},
   }),
 
   /*
@@ -534,8 +541,17 @@ function tab(over: Partial<SpecTabViewProps> = {}): SpecTabViewProps {
     proposal: null,
     find: null,
     matches: 0,
+    onApprove: () => {},
     ...TAB_HANDLERS,
     ...over,
+  }
+}
+
+function finishedApply(change: string): SessionView {
+  return {
+    run: 'finished-apply', op: 'apply', change, caption: change, who: 'OpenSpec · Codex',
+    state: { label: 'Finished', tone: 'green', live: true, working: false },
+    turnComplete: true,
   }
 }
 
@@ -548,9 +564,18 @@ export type TabStoryName =
   | 'tab-failed'
   | 'tab'
   | 'tab-with-task'
+  | 'tab-approve'
+  | 'tab-approve-inbox'
+  | 'tab-approve-busy'
+  | 'tab-done-ready'
+  | 'tab-done-incomplete'
+  | 'tab-root-ready'
+  | 'tab-archived-task'
   | 'tab-tracker-unknown'
   | 'tab-ready'
   | 'tab-session-ready'
+  | 'tab-session-incomplete'
+  | 'tab-session-running'
   | 'tab-invalid'
   | 'tab-finding'
   | 'tab-finding-nothing'
@@ -599,6 +624,38 @@ export const TAB_STORIES: Record<TabStoryName, SpecTabViewProps> = {
 
   'tab-with-task': tab({ task: { id: 't-14', agent: 'developer', status: 'doing', session: null } }),
 
+  'tab-approve': tab({
+    view: { ...CHANGE, completed: 0 },
+    task: { id: 't-14', agent: null, status: 'todo', session: null },
+  }),
+  'tab-approve-inbox': tab({
+    view: { ...CHANGE, completed: 0 },
+    task: { id: 't-14', agent: null, status: 'inbox', session: null },
+  }),
+  'tab-approve-busy': tab({
+    view: { ...CHANGE, completed: 0 },
+    task: { id: 't-14', agent: null, status: 'todo', session: null },
+    approvalBusy: true,
+  }),
+  'tab-done-ready': tab({
+    view: { ...CHANGE, completed: 4, total: 4 },
+    task: { id: 't-14', agent: null, status: 'done', session: null },
+    readyActs: readyActs(true),
+  }),
+  'tab-done-incomplete': tab({
+    task: { id: 't-14', agent: null, status: 'done', session: null },
+  }),
+  'tab-root-ready': tab({
+    view: { ...CHANGE, completed: 4, total: 4 },
+    task: { id: 't-14', agent: null, status: 'review', session: null },
+    readyActs: readyActs(false),
+  }),
+  'tab-archived-task': tab({
+    view: ARCHIVED,
+    task: { id: 't-14', agent: null, status: 'done', session: null },
+    readyActs: readyActs(true).filter((act) => act.id !== 'archive'),
+  }),
+
   /**
    * The board has not answered yet, which is the arm where **both** controls must be inert.
    *
@@ -612,10 +669,11 @@ export const TAB_STORIES: Record<TabStoryName, SpecTabViewProps> = {
     splitAction: splitAction('unknown'),
   }),
 
-  /** Every box ticked and valid — the state whose next step is Integrate & Archive. */
+  /** Every box ticked and valid — completion actions survive a linked task. */
   'tab-ready': tab({
     view: { ...CHANGE, completed: 4, total: 4 },
     task: { id: 't-14', agent: 'developer', status: 'review', session: null },
+    readyActs: readyActs(true),
   }),
 
   /*
@@ -636,6 +694,17 @@ export const TAB_STORIES: Record<TabStoryName, SpecTabViewProps> = {
     onOpenSession: () => {},
     readyActs: [{ id: 'archive', label: 'Archive', title: 'Archive it.' }],
     onReadyAct: () => {},
+  }),
+
+  'tab-session-incomplete': tab({
+    view: { ...CHANGE, completed: 0, total: 0, validation: { valid: false, issues: [] } },
+    session: finishedApply(CHANGE.name),
+    onOpenSession: () => {},
+  }),
+  'tab-session-running': tab({
+    session: { ...finishedApply(CHANGE.name), turnComplete: false,
+      state: { label: 'Working', tone: 'blue', live: true, working: true } },
+    onOpenSession: () => {},
   }),
 
   /** Finished and refused by the validator, which is the pair `tab-ready` exists against. */

@@ -142,7 +142,16 @@ fn start_session(
         .and_then(|change| registry.change_holding(project, change.as_str()));
     // Plan before changing statuses: a missing change or workflow must leave the board alone.
     let spec = if held.is_none() {
-        Some(plan_session(root, project, request.clone())?)
+        let spec = plan_session(root, project, request.clone())?;
+        // Planning Apply can create a worktree after spec_checkouts cached an empty list.
+        // File events inside openspec invalidate progress, but not that git metadata. Publish
+        // a fresh snapshot now so both the sidebar and change tab discover the checkout.
+        if spec.checkout.is_some()
+            && let Some(boards) = app.try_state::<Arc<crate::spec_state::SpecBoards>>()
+        {
+            boards.mark_changed(app, project);
+        }
+        Some(spec)
     } else {
         None
     };
@@ -233,6 +242,9 @@ fn continue_apply(
             && scope.cwd == cide_git::worktree::path_of(root, name)
         {
             carry_change(root, &scope.cwd, change.as_str(), &carried_dir(root, name))?;
+            if let Some(boards) = app.try_state::<Arc<crate::spec_state::SpecBoards>>() {
+                boards.mark_changed(app, project);
+            }
         }
         let line = match request
             .text
@@ -554,9 +566,6 @@ pub(crate) fn carry_change(
 ) -> Result<()> {
     let from = root.join("openspec/changes").join(change);
     let to = checkout.join("openspec/changes").join(change);
-    if to.is_dir() {
-        return Ok(());
-    }
     if !from.is_dir()
         || cide_spec::archived_dir(checkout, &cide_ipc::ChangeName(change.into())).is_some()
     {
@@ -567,10 +576,51 @@ pub(crate) fn carry_change(
             "could not copy {change} into its worktree: {error}"
         ))
     };
-    copy_dir(&from, &to).map_err(failed)?;
     let base = carried.join("base").join("openspec/changes").join(change);
+    if to.is_dir() {
+        // Apply may have been launched while Propose was still writing. Carry documents added
+        // since that first copy, preserving existing edits and files deliberately deleted from
+        // the worktree. A checkout with no carried base belongs to its own author.
+        if base.is_dir() {
+            copy_new_artifacts(&from, &to, &base).map_err(failed)?;
+        }
+        return Ok(());
+    }
+    copy_dir(&from, &to).map_err(failed)?;
     let _ = std::fs::remove_dir_all(&base);
     copy_dir(&from, &base).map_err(failed)
+}
+
+fn copy_new_artifacts(from: &Path, to: &Path, base: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        let original = base.join(entry.file_name());
+        match std::fs::symlink_metadata(&target) {
+            Ok(existing) => {
+                if kind.is_dir() && existing.is_dir() {
+                    copy_new_artifacts(&entry.path(), &target, &original)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if original.exists() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    copy_dir(&entry.path(), &target)?;
+                    copy_dir(&entry.path(), &original)?;
+                } else if kind.is_file() {
+                    std::fs::create_dir_all(to)?;
+                    std::fs::create_dir_all(base)?;
+                    std::fs::copy(entry.path(), target)?;
+                    std::fs::copy(entry.path(), original)?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// `.cide/spec-carried/<checkout>`: the base copy [`carry_change`] made, and what Integrate parks.
@@ -1040,6 +1090,67 @@ mod tests {
             "- [x] one\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retrying_an_early_apply_carries_new_artifacts_and_preserves_worktree_edits() {
+        let dir =
+            std::env::temp_dir().join(format!("cide-spec-carry-late-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("root");
+        let tree = dir.join("tree");
+        let carried = dir.join("carried");
+        let source = root.join("openspec/changes/c1");
+        let target = tree.join("openspec/changes/c1");
+        let base = carried.join("base/openspec/changes/c1");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("proposal.md"), "early proposal").unwrap();
+        std::fs::write(source.join("deleted.md"), "known artifact").unwrap();
+        carry_change(&root, &tree, "c1", &carried).unwrap();
+
+        std::fs::write(target.join("proposal.md"), "worktree edit").unwrap();
+        std::fs::remove_file(target.join("deleted.md")).unwrap();
+        std::fs::write(source.join("proposal.md"), "completed proposal").unwrap();
+        std::fs::write(source.join("tasks.md"), "- [ ] one\n").unwrap();
+        std::fs::write(source.join("design.md"), "design").unwrap();
+        std::fs::create_dir_all(source.join("specs/a")).unwrap();
+        std::fs::write(source.join("specs/a/spec.md"), "requirement").unwrap();
+        carry_change(&root, &tree, "c1", &carried).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("proposal.md")).unwrap(),
+            "worktree edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("proposal.md")).unwrap(),
+            "early proposal"
+        );
+        assert!(
+            !target.join("deleted.md").exists(),
+            "a deliberately deleted artifact stays deleted"
+        );
+        for file in ["tasks.md", "design.md", "specs/a/spec.md"] {
+            assert_eq!(
+                std::fs::read(target.join(file)).unwrap(),
+                std::fs::read(source.join(file)).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(base.join(file)).unwrap(),
+                std::fs::read(source.join(file)).unwrap()
+            );
+        }
+        std::fs::write(target.join("tasks.md"), "- [x] one\n").unwrap();
+        std::fs::create_dir_all(source.join("specs/b")).unwrap();
+        std::fs::write(source.join("specs/b/spec.md"), "another requirement").unwrap();
+        carry_change(&root, &tree, "c1", &carried).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("tasks.md")).unwrap(),
+            "- [x] one\n"
+        );
+        assert!(
+            target.join("specs/b/spec.md").is_file(),
+            "new nested artifacts are carried too"
+        );
+        assert!(base.join("specs/b/spec.md").is_file());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The two skips the ordinary-dispatch carry needs. A run re-forked (resume, a checkout

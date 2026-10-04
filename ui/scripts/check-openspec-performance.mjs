@@ -21,6 +21,7 @@ Object.defineProperties(dom.window.HTMLElement.prototype, {
   offsetWidth: { get() { return 320 } },
 })
 dom.window.HTMLElement.prototype.scrollIntoView = function () {}
+dom.window.HTMLCanvasElement.prototype.getContext = () => null
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 const calls = []
 const callbacks = new Map()
@@ -107,6 +108,130 @@ try {
   await render(capability(true)); assert.equal(calls.filter((c) => c.command === 'spec_artifact').length, 1)
   await render(null)
 
+  // A linked proposal can be approved on the page; launch failures remain retryable.
+  reset()
+  M.clearNotices()
+  const opened = []
+  M.useWorkspace.setState({ boot: { role: { kind: 'shell', active: 'p' } }, newRunTab: async (...args) => opened.push(args) })
+  const tracked = { id: 't-1', agent: null, session: null, status: 'todo', change: 'one' }
+  const taskBoard = (status) => M.useTasks.setState({ project: 'p', board: { kind: 'ready', rev: 1, tasks: [{ ...tracked, status }] }, selected: null })
+  taskBoard('todo')
+  M.useSpec.setState({ project: 'p', board, revision: 1 })
+  M.useSpecRuns.setState({ project: 'p', runs: [], checkouts: [] })
+  let launch = deferred(), applied = false, completed = 0, invalid = false, archived = false, integrateSuccess = false
+  const checkoutRow = { change: 'one', branch: 'cide/spec-one', completedTasks: completed, totalTasks: 1, dirty: false, unmerged: 1 }
+  respond = (command, args) => {
+    if (command === 'spec_change') return {
+      ...change(), origin: archived ? { kind: 'archived', folder: 'stamp-one' } : { kind: 'active' },
+      progress: { completed: args.worktree ? completed : 0, total: invalid && !applied ? 0 : 1, tasks: [] },
+      validation: { valid: !invalid || invalid === 'blocking', issues: invalid ? [{ level: 'ERROR', path: '', message: 'Invalid change' }] : [] },
+    }
+    if (command === 'project_harness_effective') return { consoleHarness: 'codex' }
+    if (command === 'spec_session_start') return launch.promise
+    if (command === 'spec_runs') return [{ run: 'apply-1', op: 'apply', change: 'one', label: 'OpenSpec · Codex', state: { state: 'running' } }]
+    if (command === 'agents_run_open') return { kind: 'live', session: 'session-1', continues: null }
+    if (command === 'spec_checkouts') return applied ? [{ ...checkoutRow, completedTasks: completed }] : []
+    if (command === 'spec_integrate') {
+      if (!integrateSuccess) return { kind: 'refused', reason: 'Verify failed' }
+      M.invalidateSpecData('p', snapshot, { full: true, paths: [] })
+      return { kind: 'merged', files: 1, kept: [] }
+    }
+    if (command === 'spec_publish') return { kind: 'refused', reason: 'No remote configured' }
+    if (command === 'spec_change_plan') return preview
+    return []
+  }
+  await render(tab(true))
+  const approve = () => document.querySelector('[data-audit="specTabApprove"]')
+  assert.equal(approve().textContent, 'Approve')
+  await act(async () => { approve().click(); approve().click(); for (let i = 0; i < 8; i++) await flush() })
+  assert.equal(calls.filter((c) => c.command === 'spec_session_start').length, 1)
+  assert.equal(approve().disabled, true)
+  await act(async () => { launch.reject(new Error('Apply could not start')); await flush() })
+  assert.equal(approve().disabled, false, 'failed approval can be retried')
+  assert.ok(M.noticeSnapshot().some((notice) => notice.text.includes('Apply could not start')))
+  launch = deferred()
+  await act(async () => { approve().click(); for (let i = 0; i < 8; i++) await flush() })
+  assert.equal(calls.filter((c) => c.command === 'spec_session_start').length, 2)
+  assert.deepEqual(calls.filter((c) => c.command === 'spec_session_start').at(-1).args.request,
+    { op: 'apply', change: 'one', launcher: { kind: 'harness', harness: 'codex' } })
+  await act(async () => { launch.resolve('apply-1'); for (let i = 0; i < 8; i++) await flush() })
+  assert.equal(opened.length, 1, 'approval presents the Apply session')
+  assert.equal(approve(), null, 'a live Apply suppresses approval before the task status event arrives')
+
+  // The application receives the creation invalidation, discovers the worktree, then follows
+  // its checklist instead of the still-unticked root proposal, all without remounting the tab.
+  await act(async () => M.useSpecRuns.getState().refreshCheckouts())
+  assert.equal(M.useSpecRuns.getState().checkouts.length, 0)
+  applied = true
+  await act(async () => {
+    taskBoard('doing')
+    M.invalidateSpecData('p', snapshot, { full: true, paths: [] })
+    await M.useSpecRuns.getState().refreshCheckouts()
+  })
+  assert.equal(approve(), null)
+  assert.equal(calls.filter((c) => c.command === 'spec_change').at(-1).args.worktree, '/repo/.cide/worktrees/spec-one')
+  const readyButtons = () => [...document.querySelectorAll('[data-audit="specTabReadyAct"]')].map((node) => node.dataset.act)
+  assert.deepEqual(readyButtons(), [])
+  completed = 1
+  await act(async () => {
+    taskBoard('done')
+    M.invalidateSpecData('p', snapshot, { full: false, paths: ['.cide/worktrees/spec-one/openspec/changes/one/tasks.md'] })
+    await M.useSpecRuns.getState().refreshCheckouts()
+  })
+  assert.deepEqual(readyButtons(), ['publish', 'integrate', 'archive'])
+  assert.equal(document.querySelector('[data-audit="specTabStart"]').textContent, 'Open t-1')
+  await act(async () => { document.querySelector('[data-act="integrate"]').click(); await flush() })
+  assert.equal(calls.filter((c) => c.command === 'spec_integrate').length, 1)
+  assert.ok(M.noticeSnapshot().some((notice) => notice.detail === 'Verify failed'))
+  await act(async () => { document.querySelector('[data-act="publish"]').click(); await flush() })
+  assert.equal(calls.filter((c) => c.command === 'spec_publish').length, 1)
+  assert.ok(M.noticeSnapshot().some((notice) => notice.detail === 'No remote configured'))
+  await act(async () => { document.querySelector('[data-act="archive"]').click(); await flush() })
+  assert.equal(M.useSpecConfirm.getState().confirming.phase, 'ready', 'the page reuses Archive confirmation')
+  M.useSpecConfirm.getState().set(null)
+  invalid = true
+  await act(async () => M.invalidateSpecData('p', snapshot, { full: true, paths: [] }))
+  assert.deepEqual(readyButtons(), [], 'invalid completed changes do not offer completion actions')
+  invalid = 'blocking'
+  await act(async () => M.invalidateSpecData('p', snapshot, { full: true, paths: [] }))
+  assert.deepEqual(readyButtons(), [], 'blocking issues prevent completion even if the valid flag is true')
+  invalid = false
+  archived = true
+  await act(async () => M.invalidateSpecData('p', snapshot, { full: true, paths: [] }))
+  assert.deepEqual(readyButtons(), ['publish', 'integrate'], 'archiving does not imply the checkout was merged')
+  integrateSuccess = true
+  await act(async () => { document.querySelector('[data-act="integrate"]').click(); for (let i = 0; i < 8; i++) await flush() })
+  assert.ok(readyButtons().includes('integrate'), 'a checkout kept for a live session still exists')
+  // Retirement happens asynchronously after the integration response and publishes its own
+  // full invalidation; the application refreshes the checkout list on that event.
+  applied = false
+  await act(async () => {
+    M.invalidateSpecData('p', snapshot, { full: true, paths: [] })
+    await M.useSpecRuns.getState().refreshCheckouts()
+  })
+  assert.equal(M.useSpecRuns.getState().checkouts.length, 0)
+  assert.deepEqual(readyButtons(), [], 'Integrate disappears immediately once its worktree is removed')
+  await render(null)
+
+  // The screenshot's case: an early Apply ended with an incomplete 0/0 change and no task.
+  // Keeping its idle child alive must not hide the Apply dialog for a deliberate retry.
+  completed = 0
+  invalid = true
+  archived = false
+  M.useTasks.setState({ board: { kind: 'ready', rev: 1, tasks: [] } })
+  M.useSpecRuns.setState({ runs: [{ run: 'apply-1', op: 'apply', change: 'one', text: '', label: 'OpenSpec · Codex', state: { state: 'idle' }, turnComplete: true }] })
+  M.invalidateSpecData('p', snapshot, { full: true, paths: [] })
+  await render(tab(true))
+  assert.equal(document.querySelector('[data-audit="specTabStart"]').textContent, 'Apply…')
+  assert.ok(document.querySelector('[data-audit="specTabOpenSession"]'))
+  await act(async () => document.querySelector('[data-audit="specTabStart"]').click())
+  assert.equal(M.useApplyDialog.getState().change, 'one', 'Apply opens the existing launcher dialog')
+  M.useApplyDialog.getState().close()
+  await render(null)
+  M.useTasks.setState({ project: null, board: { kind: 'unknown' } })
+  M.useSpecRuns.setState({ project: null, runs: [], checkouts: [] })
+  M.useWorkspace.setState({ boot: null })
+
   respond = async () => { throw new Error('board read failed') }
   await M.useSpec.getState().refresh(true)
   assert.equal(M.useSpec.getState().board.kind, 'unusable')
@@ -170,7 +295,7 @@ try {
   assert.equal(M.useSpecConfirm.getState().confirming.phase, 'failed')
   assert.match(M.useSpecConfirm.getState().confirming.error, /incomplete/)
   M.useSpecConfirm.getState().set(null)
-  console.log('openspec performance: ok (shared reads, invalidation, hidden tabs, bounded lists, archive state and retries)')
+  console.log('openspec performance: ok (shared reads, invalidation, hidden tabs, linked-task approval and completion, bounded lists, archive state and retries)')
 } finally {
   if (root) await act(async () => root.unmount())
   dom.window.close()

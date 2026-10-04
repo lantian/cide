@@ -207,8 +207,8 @@ try {
      */
     eq(
       board.rowActions,
-      ['drop-legacy-theme|start', 'rework-auth|start', 'add-dark-mode|open'],
-      'a change with a task opens it; one without offers to start the work',
+      ['rework-auth|start', 'add-dark-mode|open'],
+      'a change with a task opens it; unfinished work without a task offers Apply',
     )
     /*
      * And the same board with the **task** tracker unread. (OpenSpec sessions)
@@ -219,7 +219,7 @@ try {
      */
     eq(
       t('board-tracker-unread').rowActions,
-      ['drop-legacy-theme|start', 'rework-auth|start', 'add-dark-mode|start'],
+      ['rework-auth|start', 'add-dark-mode|start'],
       'a tracker that has not answered neither greys Apply nor trusts its task ids',
     )
 
@@ -235,8 +235,8 @@ try {
       )
       eq(
         sessions.rowActions,
-        ['drop-legacy-theme|start', 'add-dark-mode|start'],
-        'and only the changes with no session offer Apply — never a second session over the first',
+        [],
+        'completed checklists and an active Apply do not offer another Apply',
       )
       ok(
         sessions.stages.includes('add-dark-mode|ready|9/9'),
@@ -253,6 +253,8 @@ try {
         'a worktree offers Publish, Integrate and Archive; the project root only Archive',
       )
       eq(board.readyActs, [], 'and a panel with no session handlers draws none of it')
+      ok(t('board-finished-session').rowActions.includes('rework-auth|start'), 'a completed turn with incomplete work offers Apply in the sidebar')
+      eq(t('board-finished-session').openSessions, ['rework-auth'], 'the previous session remains available')
       eq(
         sessions.dismissals,
         2,
@@ -533,6 +535,23 @@ try {
     eq(page.tabDeltas, ['added|dark-mode'], 'and the requirement edits it makes')
     eq(page.tabStart, 'Apply…', 'a change nobody is working offers to apply it')
     eq(t('tab-with-task').tabStart, 'Open t-14', 'and one with a task opens it')
+    for (const name of ['tab-approve', 'tab-approve-inbox']) {
+      eq(t(name).tabApprove, 'Approve', `${name}: approval is available on the change page`)
+      eq(t(name).tabStart, 'Open t-14', `${name}: approval keeps the task link`)
+    }
+    eq(t('tab-approve-busy').tabApprove, 'Approving…|inert', 'approval cannot be pressed while launching')
+    for (const name of ['tab-ready', 'tab-done-ready']) {
+      eq(t(name).tabReadyActs, ['publish', 'integrate', 'archive'], `${name}: linked tasks retain separate completion actions`)
+      eq(t(name).tabApprove, null, `${name}: finished work is not offered for approval again`)
+      ok(!t(name).tabHint.includes('accepted'), `${name}: Done does not claim the branch was accepted`)
+    }
+    eq(t('tab-root-ready').tabReadyActs, ['archive'], 'a finished linked task in the root only needs Archive')
+    eq(t('tab-archived-task').tabReadyActs, ['publish', 'integrate'], 'an archived change can still have an unmerged checkout')
+    for (const name of ['tab-with-task', 'tab-invalid', 'tab-done-incomplete', 'tab-archived-task']) {
+      eq(t(name).tabApprove, null, `${name}: no duplicate implementation approval`)
+    }
+    eq(t('tab-invalid').tabReadyActs, [], 'invalid changes have no completion actions')
+    ok(t('tab-done-incomplete').tabHint.includes('incomplete'), 'a closed task with unticked steps does not claim to be archived')
     {
       // A change with an OpenSpec session: the page offers it back, never a second Apply, and a
       // finished one offers its acts — the panel row's, run by the same `specActs.ts`.
@@ -542,6 +561,9 @@ try {
       eq(done.tabReadyActs, ['archive'], 'and a finished change applied in the root offers Archive')
       eq(done.tabSplit, null, 'nor Split work — it has a session')
       eq(page.tabOpenSession, false, 'a change with no session has no Open session')
+      eq(t('tab-session-incomplete').tabStart, 'Apply…', 'a finished session with 0/0 steps and invalid documents can be retried')
+      eq(t('tab-session-incomplete').tabOpenSession, true, 'Apply does not remove the previous session link')
+      eq(t('tab-session-running').tabStart, null, 'an active Apply is opened instead of started again')
     }
 
     /*
