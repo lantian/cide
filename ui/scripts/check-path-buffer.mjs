@@ -335,6 +335,55 @@ try {
     dispose()
     setPathLinkEnv(name, null)
   }
+  // Drive the actual hover provider and capture listener for the reported basename failure.
+  for (const name of ['codex', 'claude', 'opencode', 'shell']) {
+    for (const scenario of ['present', 'column', 'wrapped', 'missing', 'ambiguous']) {
+      const root = `/${name}-${scenario}`
+      const target = `${root}/AGENTS.md`
+      const el = new Element()
+      const active = buffer(scenario === 'wrapped'
+        ? ['See AGENTS.', { text: 'md:58', isWrapped: true }]
+        : [scenario === 'column' ? 'See AGENTS.md:58:3' : 'See AGENTS.md:58'])
+      let provider
+      const term = { buffer: { active }, element: el, cols: 160, rows: 5,
+        getSelection: () => '', registerLinkProvider: (value) => { provider = value; return { dispose() {} } } }
+      setPathLinkEnv(root, { project: root, roots: [root], cwd: `${root}/subdir`,
+        open: (path, at) => harness.opened.push({ path, at }), reveal: () => {} })
+      if (scenario !== 'missing') harness.files.set(target, 'file')
+      if (scenario === 'ambiguous') harness.files.set(`${root}/subdir/AGENTS.md`, 'file')
+      const dispose = attachPathLinks({ term }, el, { paneId: root, session: () => null })
+      const links = await new Promise((done) => provider.provideLinks(scenario === 'wrapped' ? 2 : 1, done))
+      eq(links?.length ?? 0, scenario === 'missing' ? 0 : 1,
+        `${name}/${scenario}: a basename is offered only when it exists`)
+      const suffix = scenario === 'wrapped' ? { x: 5, y: 2 }
+        : { x: scenario === 'column' ? 18 : 16, y: 1 }
+      // Both ends of the reference must work even without a completed hover.
+      for (const cell of [{ x: 5, y: 1 }, suffix]) {
+        const count = harness.opened.length
+        let swallowed = false
+        el.listeners.get('mousedown').listener({ button: 0, ctrlKey: true, metaKey: false,
+          clientX: (cell.x - 0.5) * 10, clientY: (cell.y - 0.5) * 20,
+          preventDefault() {}, stopPropagation() { swallowed = true } })
+        ok(swallowed, `${name}/${scenario}: Ctrl-click is claimed before the child`)
+        await drain()
+        if (scenario === 'missing' || scenario === 'ambiguous') {
+          eq(harness.opened.length, count, `${name}/${scenario}: no file is opened`)
+          ok(harness.notices.at(-1)?.includes(scenario === 'missing'
+            ? 'does not name a file or folder' : 'names 2 files'),
+          `${name}/${scenario}: the refusal explains the candidate`)
+        } else {
+          eq(harness.opened.length, count + 1, `${name}/${scenario}: each click opens one file`)
+          eq(harness.opened.at(-1), { path: target,
+            at: { line: 58, column: scenario === 'column' ? 3 : 1 } },
+          `${name}/${scenario}: the filename and suffix open the requested position`)
+          eq(harness.notices, [], `${name}/${scenario}: no false missing-path notice`)
+        }
+        harness.notices.length = 0
+      }
+      dispose()
+      setPathLinkEnv(root, null)
+    }
+  }
   // Relative reconstructions still cannot invent an outside-project target.
   eq(candidatePaths('../../tmp/shot.png', bases), [], 'relative paths stay contained')
   eq(outsidePaths('../../tmp/shot.png', bases), [], 'outside lookup requires a displayed absolute path')

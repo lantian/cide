@@ -59,9 +59,9 @@
  *   where the path begins. Guessing lights up half a sentence. A path inside `'…'` or `"…"` is
  *   the one place a space is allowed, because there the producer said where it ended.
  * * **Bare words with a dot and no slash** — `0.12.0`, `v0.1.0`, `e.g.`, `README`,
- *   `target(s)`. Resolving a lone basename against the project index is possible and is
- *   deliberately not done in v1: it is the rule that turns every English sentence into
- *   candidate links, and it is the one whose false positives are unbounded.
+ *   `target(s)`. A basename needs an explicit positive line reference, such as `AGENTS.md:58`,
+ *   before it is resolved against the cwd and roots. Numbers and numeric version tokens stay
+ *   excluded even with a position suffix.
  * * **Paths a TUI has truncated** — `ui/src/sidebar/GitPa…`. The ellipsis is the producer
  *   saying the text is not the path. Claude Code's own TUI does this constantly in a narrow
  *   pane.
@@ -109,12 +109,10 @@
  * The two negatives in that table are the ones worth keeping. `Bash(cargo test -p cide-git)`
  * yields nothing because `cide-git` has no slash — the two-segment rule, unchanged. And
  * `Update(ProjectSwitcher.tsx)`, a **bare basename in parentheses**, is still deliberately not
- * matched even though a human reading the line knows exactly which file it means: resolving a
- * lone basename against the project index is the rule whose false positives are unbounded (it
- * would light up `README`, `Cargo.toml` and every `foo.rs` in every sentence), and Claude Code
- * prints the workspace-relative path whenever it has one. Nothing about parentheses changes
- * that trade — a matcher that trusted `Word(token)` would light up `Bash(npm run build)`,
- * `TodoWrite(3 items)` and every other tool line in the transcript.
+ * matched: the enclosing tool call alone does not prove it is a path. A positive position
+ * suffix does, so `Read(AGENTS.md:58)` is admitted and then verified against the filesystem.
+ * Trusting `Word(token)` alone would light up `Bash(npm run build)`, `TodoWrite(3 items)` and
+ * every other tool line in the transcript.
  */
 
 /** How much of one logical line is scanned. Past this the line is not searched at all. */
@@ -183,6 +181,9 @@ const PAREN_POS = /^\((\d{1,9}),(\d{1,9})\)/
 
 /** `#L12` / `#L12-20` — the form Claude Code writes its own mentions in. */
 const HASH_POS = /^#L(\d{1,9})(?:-\d{1,9})?/
+
+/** Numeric versions remain prose even when followed by a position-shaped suffix. */
+const VERSION_TOKEN = /^v?\d+(?:\.\d+)+$/i
 
 /**
  * `git diff`'s pre-image/post-image prefixes, which name no directory anybody has.
@@ -282,9 +283,13 @@ function build(
   }
 
   text = decodePath(text)
+  const position = readPosition(line, posAt)
+  // A positive position proves a basename, but not a number, version or slash-only path.
+  // Use the ordinary filename alphabet; unquoted spaces still end the run.
+  if (position.line !== null && /^[A-Za-z0-9._+%~@-]+$/.test(text)
+    && /[A-Za-z]/.test(text) && !VERSION_TOKEN.test(text)) proven = true
   if (text === '' || !plausible(text, proven)) return null
 
-  const position = readPosition(line, posAt)
   return {
     text,
     start,
@@ -302,7 +307,8 @@ function build(
  * it. `/etc` fails deliberately — one segment behind a slash is a word, not a path — and so
  * does a bare `src/`, whose trailing empty segment leaves it with one.
  *
- * `proven` is the one way past it, and only the diff-header prefix sets it: see [`build`].
+ * `proven` admits one segment for a diff-header filename or a basename with an explicit
+ * positive position suffix: see [`build`]. Standalone basenames still fail the slash rule.
  *
  * A backslash anywhere is refused rather than treated as a separator: in this output it is an
  * escape, and a run containing one is a quoted string being reported, not a Windows path.
@@ -513,8 +519,8 @@ export interface Bases {
  * not evidence — it is the first of the two locks, and the one that keeps the hover probe from
  * asking the *index* about a file outside the project.
  *
- * A bare basename yields nothing: [`matchPaths`] cannot produce one, and if a caller invents
- * one anyway, resolving it against every root is the ambiguity this whole design refuses.
+ * A positioned basename uses these same bases, without recursively searching for that name.
+ * Multiple existing targets remain ambiguous in [`resolveCandidate`].
  */
 export function candidatePaths(text: string, bases: Bases): string[] {
   const roots = bases.roots.map(normalize).filter((r) => r !== '')

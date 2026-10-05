@@ -152,6 +152,29 @@ try {
 
   // --- what this repo's toolchain prints ------------------------------------------------
 
+  for (const [reference, text, line, column] of [
+    ['AGENTS.md:58', 'AGENTS.md', 58, null],
+    ['AGENTS.md:58:3', 'AGENTS.md', 58, 3],
+    ['AGENTS.md:58:3:', 'AGENTS.md', 58, 3],
+    ['AGENTS.md(58,3)', 'AGENTS.md', 58, 3],
+    ['AGENTS.md#L58-60', 'AGENTS.md', 58, null],
+    ['Makefile:12', 'Makefile', 12, null],
+    ['.gitignore:2', '.gitignore', 2, null],
+    [String.raw`my\_file.ts:12:3`, 'my_file.ts', 12, 3],
+  ]) {
+    eq(only(`See ${reference}`),
+      { text, start: 4, end: 4 + reference.length, line, column },
+      `a positioned basename is clickable, including its full suffix: ${reference}`)
+  }
+  eq(only('Read(AGENTS.md:58)'),
+    { text: 'AGENTS.md', start: 5, end: 17, line: 58, column: null },
+    'a harness tool reference can name a top-level file')
+  eq(only('see `@AGENTS.md:58`'),
+    { text: 'AGENTS.md', start: 6, end: 18, line: 58, column: null },
+    'Markdown and a mention marker are outside the clickable basename')
+  eq(texts('error at foo bar.rs:3'), ['bar.rs'],
+    'an unquoted space ends a basename; the matcher does not invent foo bar.rs')
+
   eq(
     only('   --> crates/cide-app/src/lib.rs:270:13'),
     { text: 'crates/cide-app/src/lib.rs', start: 7, end: 40, line: 270, column: 13 },
@@ -348,7 +371,12 @@ try {
     ['ls -la /', 'and the root directory is not a file link'],
     ['building src/', 'a bare directory reference has one non-empty segment'],
     ['C:\\Users\\me\\file.txt', 'a backslash here is an escape, not a separator'],
-    ['error at foo bar.rs:3', 'an unquoted path with a space has no discoverable start'],
+    ['AGENTS.md Cargo.toml Makefile', 'basenames without positions stay excluded'],
+    ['AGENTS.md:0 AGENTS.md(0,3) AGENTS.md#L0', 'a basename needs a positive line number'],
+    ['AGENTS.md:no AGENTS.md:-58', 'a malformed position does not prove a basename'],
+    ['0.12.0:58 v0.1.0:58 V1.2:3 123:58', 'positions do not turn numbers or versions into filenames'],
+    ['https://host/AGENTS.md:58 file:///AGENTS.md:58', 'positioned basenames inside URLs stay excluded'],
+    ['AGENTS.md… AGENTS.md...', 'truncated basenames stay excluded'],
     ['~/.claude/.credentials.json', 'and `~` is never expanded — one fewer way out of the project'],
   ]
   for (const [line, what] of nothing) {
@@ -380,6 +408,12 @@ try {
 
   const ROOT = '/home/u/work/cide'
   const bases = (cwds, roots = [ROOT]) => ({ cwds, roots })
+
+  eq(candidatePaths('AGENTS.md', bases([`${ROOT}/ui`])),
+    [`${ROOT}/ui/AGENTS.md`, `${ROOT}/AGENTS.md`],
+    'positioned basenames use the cwd and roots, without a recursive filename search')
+  eq(outsidePaths('AGENTS.md', bases([ROOT])), [],
+    'a basename cannot invent an outside-project target')
 
   eq(
     candidatePaths('src/App.tsx', bases([`${ROOT}/ui`])),
