@@ -23,8 +23,8 @@
 //! * **A blocked task starts nothing until every blocker is `Done`.** (M30) The rule that makes
 //!   `LinkType::BlockedBy` a real edge rather than the advisory one `cide_ipc::tasks`' header
 //!   used to cut: an assignment or mention on a blocked task records intent exactly as one on a
-//!   `review` task does, and the block clearing is not itself a trigger — somebody re-gestures,
-//!   or the orchestrator dispatches, once the blocker lands. `Done` alone satisfies, not
+//!   `review` task does. A user/orchestrator completing its last blocker starts the assigned
+//!   dependent when both tasks belong to the same active milestone. `Done` alone satisfies, not
 //!   `Review`: review work can bounce back to `Doing`, and a dependent run dispatched against
 //!   unaccepted work builds on a branch `integrate` may yet rewrite. The blockers arrive as a
 //!   parameter ([`blocker_statuses`] is the caller's half) because this function is pure over
@@ -62,7 +62,7 @@
 //!   change would be a destructive act with no confirm; `agents_stop` and the Stop button stay
 //!   the only ways to end a run, and the run-end nudge is what surfaces any work left orphaned.
 
-use cide_ipc::{AgentId, LinkType, Task, TaskAuthor, TaskRow, TaskStatus};
+use cide_ipc::{AgentId, LinkType, MilestonePlan, Task, TaskAuthor, TaskId, TaskRow, TaskStatus};
 
 use crate::mentions;
 
@@ -79,6 +79,66 @@ pub fn blocker_statuses(task: &Task, board: &[TaskRow]) -> Vec<TaskStatus> {
         .filter(|l| l.link == LinkType::BlockedBy && !l.deleted)
         .filter_map(|l| board.iter().find(|t| t.id == l.target))
         .map(|t| t.status)
+        .collect()
+}
+
+/// An assigned dependent released by this completion, within the same active milestone.
+/// Also used immediately before enqueueing, so a stale completion cannot start a task whose
+/// blocker was reopened, whose assignment changed, or whose milestone moved meanwhile.
+#[must_use]
+pub fn dependent_agent(
+    completed: &TaskId,
+    dependent: &TaskRow,
+    board: &[TaskRow],
+    plan: &MilestonePlan,
+) -> Option<AgentId> {
+    let blocker = board.iter().find(|row| &row.id == completed)?;
+    if blocker.status != TaskStatus::Done
+        || !matches!(dependent.status, TaskStatus::Todo | TaskStatus::Doing)
+        || dependent.question.is_some()
+        || !dependent.links.iter().any(|link| {
+            link.link == LinkType::BlockedBy && !link.deleted && &link.target == completed
+        })
+        || dependent.links.iter().any(|link| {
+            link.link == LinkType::BlockedBy
+                && !link.deleted
+                && board
+                    .iter()
+                    .any(|row| row.id == link.target && row.status != TaskStatus::Done)
+        })
+    {
+        return None;
+    }
+    let active = plan.current()?;
+    if crate::milestones::inside_milestone(plan, board, completed)?.id != active.id
+        || crate::milestones::inside_milestone(plan, board, &dependent.id)?.id != active.id
+    {
+        return None;
+    }
+    dependent.agent.clone()
+}
+
+/// Only a real completion by the user/orchestrator releases dependency work. Comments on an
+/// already-done task, creations, and worker-authored edits must not become dispatch gestures.
+#[must_use]
+pub fn completed_dependents(
+    before: Option<&Task>,
+    after: &Task,
+    author: &TaskAuthor,
+    board: &[TaskRow],
+    plan: &MilestonePlan,
+) -> Vec<(TaskId, AgentId)> {
+    if !matches!(author, TaskAuthor::User | TaskAuthor::Orchestrator)
+        || after.status != TaskStatus::Done
+        || !before.is_some_and(|task| task.id == after.id && task.status != TaskStatus::Done)
+    {
+        return Vec::new();
+    }
+    board
+        .iter()
+        .filter_map(|row| {
+            dependent_agent(&after.id, row, board, plan).map(|agent| (row.id.clone(), agent))
+        })
         .collect()
 }
 
@@ -203,6 +263,210 @@ mod tests {
 
     fn ids(trigger: &Trigger) -> Vec<&str> {
         trigger.dispatch.iter().map(|id| id.0.as_str()).collect()
+    }
+
+    fn dependency_board() -> (Task, Task, Vec<TaskRow>, MilestonePlan) {
+        let mut before = task(TaskStatus::Review, Some("developer"));
+        before.links.push(cide_ipc::TaskLink {
+            link: LinkType::SubtaskOf,
+            target: TaskId("t-100".into()),
+            deleted: false,
+            at_unix_ms: 1,
+        });
+        let mut after = before.clone();
+        after.status = TaskStatus::Done;
+        let mut dependent = task(TaskStatus::Todo, Some("qa"));
+        dependent.id = TaskId("t-2".into());
+        dependent.links = vec![
+            before.links[0].clone(),
+            cide_ipc::TaskLink {
+                link: LinkType::BlockedBy,
+                target: after.id.clone(),
+                deleted: false,
+                at_unix_ms: 1,
+            },
+        ];
+        let mut goal = task(TaskStatus::Todo, None);
+        goal.id = TaskId("t-100".into());
+        let mut later = goal.clone();
+        later.id = TaskId("t-200".into());
+        let board = [after.clone(), dependent, goal, later]
+            .iter()
+            .map(TaskRow::of)
+            .collect();
+        let plan = MilestonePlan {
+            items: ["100", "200"]
+                .into_iter()
+                .map(|n| cide_ipc::Milestone {
+                    id: n.into(),
+                    title: n.into(),
+                    task: Some(TaskId(format!("t-{n}"))),
+                    gate: "true".into(),
+                    timeout_secs: None,
+                })
+                .collect(),
+            active: Some("100".into()),
+            ..MilestonePlan::default()
+        };
+        (before, after, board, plan)
+    }
+
+    #[test]
+    fn completion_starts_assigned_dependents_only_on_an_authorized_done_edge() {
+        let (before, after, board, plan) = dependency_board();
+        let expected = vec![(TaskId("t-2".into()), AgentId("qa".into()))];
+        for author in [TaskAuthor::User, TaskAuthor::Orchestrator] {
+            assert_eq!(
+                completed_dependents(Some(&before), &after, &author, &board, &plan),
+                expected
+            );
+        }
+        let worker = TaskAuthor::Agent {
+            agent: AgentId("developer".into()),
+            label: "Developer".into(),
+        };
+        assert!(completed_dependents(Some(&before), &after, &worker, &board, &plan).is_empty());
+        assert!(completed_dependents(None, &after, &TaskAuthor::User, &board, &plan).is_empty());
+        assert!(
+            completed_dependents(Some(&after), &after, &TaskAuthor::User, &board, &plan).is_empty()
+        );
+        assert!(
+            completed_dependents(Some(&before), &before, &TaskAuthor::User, &board, &plan)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_the_last_blocker_releases_work_and_a_reopened_blocker_stops_it() {
+        let (before, after, mut board, plan) = dependency_board();
+        let mut second = board[0].clone();
+        second.id = TaskId("t-3".into());
+        second.status = TaskStatus::Review;
+        board[1].links.push(cide_ipc::TaskLink {
+            link: LinkType::BlockedBy,
+            target: second.id.clone(),
+            deleted: false,
+            at_unix_ms: 1,
+        });
+        board.push(second);
+        assert!(
+            completed_dependents(Some(&before), &after, &TaskAuthor::User, &board, &plan)
+                .is_empty()
+        );
+        board.last_mut().unwrap().status = TaskStatus::Done;
+        assert_eq!(
+            completed_dependents(Some(&before), &after, &TaskAuthor::User, &board, &plan).len(),
+            1
+        );
+        board[0].status = TaskStatus::Doing;
+        assert!(
+            dependent_agent(&after.id, &board[1], &board, &plan).is_none(),
+            "recheck refuses a stale completion"
+        );
+    }
+
+    #[test]
+    fn dependency_starts_stay_in_one_active_milestone() {
+        let (_, after, board, plan) = dependency_board();
+        for index in [0, 1] {
+            let mut cross = board.clone();
+            cross[index].links[0].target = TaskId("t-200".into());
+            assert!(dependent_agent(&after.id, &cross[1], &cross, &plan).is_none());
+            cross[index].links[0].deleted = true;
+            assert!(
+                dependent_agent(&after.id, &cross[1], &cross, &plan).is_none(),
+                "loose tasks do not auto-start"
+            );
+        }
+        let mut inactive = plan.clone();
+        inactive.active = Some("200".into());
+        assert!(dependent_agent(&after.id, &board[1], &board, &inactive).is_none());
+        assert!(dependent_agent(&after.id, &board[1], &board, &MilestonePlan::default()).is_none());
+        let mut nested = board.clone();
+        let mut parent = board[2].clone();
+        parent.id = TaskId("t-50".into());
+        parent.links = vec![board[1].links[0].clone()];
+        nested[1].links[0].target = parent.id.clone();
+        nested.push(parent);
+        assert_eq!(
+            dependent_agent(&after.id, &nested[1], &nested, &plan),
+            Some(AgentId("qa".into())),
+            "nested subtasks share the milestone"
+        );
+    }
+
+    #[test]
+    fn dependency_completion_obeys_task_holds_and_live_edges() {
+        let (_, after, board, plan) = dependency_board();
+        for status in [TaskStatus::Inbox, TaskStatus::Review, TaskStatus::Done] {
+            let mut held = board.clone();
+            held[1].status = status;
+            assert!(dependent_agent(&after.id, &held[1], &held, &plan).is_none());
+        }
+        let mut held = board.clone();
+        held[1].agent = None;
+        assert!(dependent_agent(&after.id, &held[1], &held, &plan).is_none());
+        held = board.clone();
+        held[1].question = Some("Which variant?".into());
+        assert!(dependent_agent(&after.id, &held[1], &held, &plan).is_none());
+        held = board.clone();
+        held[1].links[1].deleted = true;
+        assert!(dependent_agent(&after.id, &held[1], &held, &plan).is_none());
+        held = board.clone();
+        held[1].links[1].link = LinkType::Related;
+        assert!(dependent_agent(&after.id, &held[1], &held, &plan).is_none());
+        held = board.clone();
+        held[1].links.push(cide_ipc::TaskLink {
+            link: LinkType::BlockedBy,
+            target: TaskId("t-999".into()),
+            deleted: false,
+            at_unix_ms: 1,
+        });
+        assert!(
+            dependent_agent(&after.id, &held[1], &held, &plan).is_some(),
+            "dangling blockers keep their existing semantics"
+        );
+        held[1].status = TaskStatus::Doing;
+        assert!(dependent_agent(&after.id, &held[1], &held, &plan).is_some());
+    }
+
+    #[test]
+    fn completion_fans_out_and_advances_a_chain_one_step_at_a_time() {
+        let (before, after, mut board, plan) = dependency_board();
+        let mut parallel = board[1].clone();
+        parallel.id = TaskId("t-3".into());
+        let mut downstream = board[1].clone();
+        downstream.id = TaskId("t-4".into());
+        downstream.links[1].target = board[1].id.clone();
+        board.extend([parallel, downstream]);
+        assert_eq!(
+            completed_dependents(
+                Some(&before),
+                &after,
+                &TaskAuthor::Orchestrator,
+                &board,
+                &plan
+            )
+            .into_iter()
+            .map(|(id, _)| id.0)
+            .collect::<Vec<_>>(),
+            ["t-2", "t-3"]
+        );
+        let mut next_before = task(TaskStatus::Review, Some("qa"));
+        next_before.id = board[1].id.clone();
+        let mut next_after = next_before.clone();
+        next_after.status = TaskStatus::Done;
+        board[1].status = TaskStatus::Done;
+        assert_eq!(
+            completed_dependents(
+                Some(&next_before),
+                &next_after,
+                &TaskAuthor::User,
+                &board,
+                &plan
+            ),
+            vec![(TaskId("t-4".into()), AgentId("qa".into()))]
+        );
     }
 
     /// A task with an open question starts nothing, and the answer — the question cleared —

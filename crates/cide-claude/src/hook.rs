@@ -49,14 +49,12 @@ pub enum HookEvent {
     SessionEnd,
     /// Something wants the user's attention — most importantly a permission prompt.
     Notification,
-    /// **Codex only**: the turn is blocked on an approval prompt. (M93)
-    ///
-    /// Codex has no `Notification` event, and it does not need one for this: it names the
-    /// moment itself, which is better than the substring match [`crate::is_permission_request`]
-    /// has to make of a Claude notification's prose. Read out of the 0.155.1 binary
-    /// (`hooks/src/events/permission_request.rs`); never subscribed to for `claude`, whose own
-    /// set is [`Self::ALL`] and stays exactly what it was.
+    /// **Codex only**: an approval is being evaluated, possibly by automatic review.
+    /// This hook runs before a human prompt exists and cannot establish human waiting.
     PermissionRequest,
+    /// Internal event from Codex's live `approval-requested` OSC 9 notification.
+    /// Never included in either CLI's hook subscriptions.
+    CodexApprovalPrompt,
 }
 
 impl HookEvent {
@@ -106,12 +104,16 @@ impl HookEvent {
             Self::SessionEnd => "SessionEnd",
             Self::Notification => "Notification",
             Self::PermissionRequest => "PermissionRequest",
+            Self::CodexApprovalPrompt => "CodexApprovalPrompt",
         }
     }
 
     /// Either CLI's spelling. A frame is parsed without knowing which CLI sent it — the socket
-    /// is shared — so this answers for the union of [`Self::ALL`] and [`Self::CODEX`].
+    /// is shared — so this answers for both subscription lists and Cide's internal events.
     pub fn parse(s: &str) -> Option<Self> {
+        if s == Self::CodexApprovalPrompt.as_str() {
+            return Some(Self::CodexApprovalPrompt);
+        }
         Self::ALL
             .iter()
             .chain(Self::CODEX)
@@ -233,6 +235,12 @@ mod tests {
         // document is a hook that never fires at best — so the codex addition stays out of it.
         assert!(!HookEvent::ALL.contains(&HookEvent::PermissionRequest));
         assert!(HookEvent::CODEX.contains(&HookEvent::PermissionRequest));
+        assert!(!HookEvent::ALL.contains(&HookEvent::CodexApprovalPrompt));
+        assert!(!HookEvent::CODEX.contains(&HookEvent::CodexApprovalPrompt));
+        assert_eq!(
+            HookEvent::parse("CodexApprovalPrompt"),
+            Some(HookEvent::CodexApprovalPrompt)
+        );
         // …and the codex list names nothing codex lacks: every one of these would be a
         // subscription to silence.
         for absent in [

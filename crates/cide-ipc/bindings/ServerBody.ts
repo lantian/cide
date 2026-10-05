@@ -4,6 +4,7 @@ import type { AwaitingEntry } from "./AwaitingEntry";
 import type { ImageFormat } from "./ImageFormat";
 import type { InstanceInfo } from "./InstanceInfo";
 import type { MilestonesView } from "./MilestonesView";
+import type { PaneId } from "./PaneId";
 import type { PermissionPrompt } from "./PermissionPrompt";
 import type { ProjectId } from "./ProjectId";
 import type { RemoteAgent } from "./RemoteAgent";
@@ -37,7 +38,7 @@ features: Array<string>, } | { "t": "paired", device: string, key: string,
  * placeholder shared by every typed pairing makes two machines look like one — so the
  * list would show one entry that connects to whichever answered last.
  */
-instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
+instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "pasteAccepted", session: SessionId, seq: number, } | { "t": "consoleClosed", pane: PaneId, } | { "t": "consoleUploadReady", upload: string, } | { "t": "consoleUploadProgress", upload: string, offset: number, } | { "t": "consoleUploadFinished", upload: string, path: string, } | { "t": "consoleUploadCancelled", upload: string, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
 /**
  * Whether the queue will start anything new.
  *

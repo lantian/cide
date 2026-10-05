@@ -189,6 +189,12 @@ const KNOWN_CLIENT_FRAMES = [
   'attachmentRead',
   // M91: the Milestones screen reads a check's log, runs the active gate, accepts it.
   'checkLog',
+  // Mobile tab-console closure and streamed phone file/image attachments.
+  'consoleClose',
+  'consoleUploadBegin',
+  'consoleUploadCancel',
+  'consoleUploadChunk',
+  'consoleUploadFinish',
   'dispatch',
   'gateRun',
   'hello',

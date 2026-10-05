@@ -95,10 +95,10 @@ pub fn next_state(current: SessionState, event: HookEvent) -> Option<SessionStat
         // here would claim a clean exit for a session that may have crashed.
         HookEvent::SessionEnd => return None,
 
-        // Codex names the approval prompt itself (M93), so unlike a Claude `Notification`
-        // there is no prose to read: this *is* the turn blocked on a human. The next tool
-        // traffic or `Stop` moves it on, exactly as it does after a Claude permission prompt.
-        HookEvent::PermissionRequest => SessionState::AwaitingPermission,
+        // The PermissionRequest hook precedes automatic review as well as human approval.
+        // Only the TUI's approval-requested notification establishes a displayed prompt.
+        HookEvent::PermissionRequest => return None,
+        HookEvent::CodexApprovalPrompt => SessionState::AwaitingPermission,
     };
 
     if next == current { None } else { Some(next) }
@@ -216,7 +216,11 @@ mod tests {
 
     #[test]
     fn a_codex_approval_prompt_is_awaiting_permission_and_tool_traffic_ends_it() {
-        let s = next_state(SessionState::Busy, HookEvent::PermissionRequest)
+        assert_eq!(
+            next_state(SessionState::Busy, HookEvent::PermissionRequest),
+            None
+        );
+        let s = next_state(SessionState::Busy, HookEvent::CodexApprovalPrompt)
             .expect("busy -> awaiting permission");
         assert_eq!(s, SessionState::AwaitingPermission);
         assert!(

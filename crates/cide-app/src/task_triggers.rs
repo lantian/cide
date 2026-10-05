@@ -59,6 +59,7 @@
 //! each dispatch on its own spawned task, exactly like [`crate::agents::AgentRegistry::pump`]'s
 //! admissions.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cide_agents::autodispatch;
@@ -251,9 +252,9 @@ fn consider_blocking(
 
     // One read per burst, for the blocking gate: `mutation.after` carries the task's own
     // `blockedBy` edges, but a blocker's *status* lives on the other task, so the policy is
-    // handed `blocker_statuses` over the whole board. The read races later mutations only in
-    // the direction that is safe — a blocker finished after this snapshot delays a dispatch
-    // until the next gesture, it never starts one early. (M30)
+    // handed `blocker_statuses` over the whole board. Completion also scans this snapshot for
+    // assigned dependents, and rechecks their live state before enqueueing. The ordinary
+    // dispatch funnel applies the blocking gate again. (M30)
     let board: Vec<TaskRow> = app
         .try_state::<Arc<TasksStores>>()
         .and_then(|stores| stores.get(project))
@@ -262,6 +263,30 @@ fn consider_blocking(
 
     // Read once per burst, like the board above. (M83)
     let milestones = cide_agents::config::load_milestones(&root);
+
+    let mut released = HashSet::new();
+    for mutation in &mutations {
+        for (task, agent) in autodispatch::completed_dependents(
+            mutation.before.as_ref(),
+            &mutation.after,
+            &mutation.author,
+            &board,
+            &milestones,
+        ) {
+            if released.insert((task.clone(), agent.clone()))
+                && registry.run_holding(project, &agent, &task).is_none()
+            {
+                dispatch(
+                    app,
+                    project,
+                    agent,
+                    task,
+                    notify.clone(),
+                    Some(mutation.after.id.clone()),
+                );
+            }
+        }
+    }
 
     for mutation in mutations {
         let fresh: Vec<&str> = mutation.fresh_text.iter().map(String::as_str).collect();
@@ -304,7 +329,7 @@ fn consider_blocking(
                 );
                 continue;
             }
-            dispatch(app, project, agent, task.clone(), notify.clone());
+            dispatch(app, project, agent, task.clone(), notify.clone(), None);
         }
     }
 }
@@ -330,8 +355,16 @@ fn adopt(app: &AppHandle, project: ProjectId, task: &TaskId, agent: AgentId, aut
     }
 }
 
-/// One auto-dispatch, on its own task so nothing here waits on the queue.
-fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, notify: RunNotify) {
+/// One auto-dispatch, on its own task so nothing here waits on the queue. A dependency
+/// completion carries its blocker id for a final current-board check before dispatch.
+fn dispatch(
+    app: &AppHandle,
+    project: ProjectId,
+    agent: AgentId,
+    task: TaskId,
+    notify: RunNotify,
+    completed: Option<TaskId>,
+) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let (Some(workspace), Some(agents), Some(tasks)) = (
@@ -341,6 +374,28 @@ fn dispatch(app: &AppHandle, project: ProjectId, agent: AgentId, task: TaskId, n
         ) else {
             return;
         };
+        if let Some(completed) = &completed {
+            let Ok(root) = crate::tasks_state::project_root(&workspace, project) else {
+                return;
+            };
+            let config = cide_agents::config::load(&root).agents;
+            if !config.enabled || !config.auto_dispatch || !cide_agents::config::load_tracker(&root)
+            {
+                return;
+            }
+            let Some(store) = tasks.get(project) else {
+                return;
+            };
+            let board = store.list();
+            let plan = cide_agents::config::load_milestones(&root);
+            if !board.iter().find(|row| row.id == task).is_some_and(|row| {
+                autodispatch::dependent_agent(completed, row, &board, &plan).as_ref()
+                    == Some(&agent)
+            }) {
+                tracing::debug!(%project, %task, %completed, "dependency completion no longer releases this task");
+                return;
+            }
+        }
         let request = DispatchRequest {
             project,
             agent: agent.clone(),

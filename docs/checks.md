@@ -125,6 +125,14 @@ diff collection and both console harnesses using fake CLIs, without paid model c
 
 `check:agents`, `check:agents-render`, `check:task-proposals`, `check:sidebar`, `check:commands`
 
+Dependency completion and planner eligibility: `cargo test --locked -p cide-agents autodispatch`,
+`cargo test --locked -p cide-app --lib -- task_triggers cmd::agents agents::tests running spinner
+state::tests hooks cmd::session`, and `check:running`. Completion must be a user/orchestrator
+Done edge, and both tasks must resolve to the same active milestone; the live recheck refuses a
+reopened blocker or changed assignment. An unprompted console with unknown hook state permits
+quiet time, while a prompted automated child still holds startup. Replacing/removing that child
+must clear opening intent, even when its pane retains a Planner/Reviewer origin.
+
 **A mutation answers short, and a read answers recent (M124).** `cide_task_comment`, `cide_task_update`, `cide_task_link`, `cide_task_unlink` and `cide_task_attach` answer with `tools.rs`'s `render_ack` — the summary line, the attachments, the links only for link/unlink, and only the comments *other* authors added since the caller's own last one — and never `render_full`. `cide_task_get` sends the last `RECENT_COMMENTS` (ten) live comments with a line naming how many it left out, and all of them under `all: true`; a deleted comment is never drawn. The whole task after every comment was 11.5k characters a call on selfcraft's codex runs, each copy re-sent with every later request of the conversation; `cide_task_get` is the road to the whole task. Two silent failures. **The caller is `TaskSink::author`**, the connection's identity: a sink that did not answer it would default to the orchestrator and show an agent its own comments as news. **`commented` must be true only for `cide_task_comment`**, whose last comment is the one just written: "since your last" then means the one *before* it, and passing false shows nothing new ever — the reason the whole task used to come back, gone without a failing line.
 
 ### A role's colour, or who a comment is signed by
@@ -559,6 +567,14 @@ both the OpenSpec panel and the change tab.
 the `--r-*`, `--sp-*`, `--shadow-*` and `--dur-*` families in `tokens.css`. `--shadow-*` carries colour and must be declared in **both** palette blocks; the rest are theme-independent. `check:menus` resolves every token a menu reads against the palette blocks, so a new family needs its prefix in that script's shape rule
 
 ### The remote surface
+
+Phone console ordering and close/upload metadata also need `cargo test --locked -p cide-core
+--lib workspace::tests`, `cargo test --locked -p cide-app --lib remote::tests`, and `npm run check`
+in `../cide-mobile`. The phone's loopback test uploads real bytes, inserts a path without Enter,
+refuses pinned consoles, and closes an eligible console. Build the native Android/iOS app when
+picker or clipboard modules change. Long-press selection across rows, photo/camera picking and
+terminal appearance still require a device check; TypeScript and socket tests cannot confirm
+native gestures or glyph placement.
 
 **Touches:** the remote surface — `cide-remote`, `cide_ipc::{remote,screen}`, `cide_pty::screen`, `cide_core::remote`, `cide_app::remote`, `cmd/remote.rs`, `emit.rs`'s tee, `windows.rs`'s awaiting map, `settings/RemoteSection`, `contract/protocol.ts`, `cide_core::remote::pairing_qr`
 

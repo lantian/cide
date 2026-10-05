@@ -40,6 +40,7 @@ pub mod keys;
 pub(crate) mod screen;
 pub mod seal;
 pub mod server;
+pub(crate) mod uploads;
 
 pub use devices::{Device, DeviceStore};
 pub use host::{AttachmentSlice, RemoteHost};

@@ -197,12 +197,10 @@ pub(crate) fn run_is_busy(state: &RunState, task_in_review: bool, asking: Busy) 
 ///
 /// # Where the two readings differ, and why `Spawning` is the important one
 ///
-/// `Spawning` means **this session has never said anything**. For [`Busy::Claimed`] that counts,
-/// and has to: `claude_tab` forks the child before the pane exists, so the tab `spinner::tick`
-/// has just opened reads as `Spawning` for its first second or so, and if that read as quiet the
-/// next tick — thirty seconds later, with the dwell already satisfied — would open a second
-/// planning tab over the first, and a third after that.
-/// `a_just_spun_project_is_busy_by_its_own_new_pane` is the test.
+/// `Spawning` means **this session has never said anything**. It holds off planning only when
+/// this child was supplied an opening prompt: a new planner/reviewer is work awaiting its first
+/// hook. An unprompted console can remain at its composer forever without reporting a hook,
+/// so treating that unknown state as work silently prevents every future automatic plan.
 ///
 /// For [`Busy::Working`] it must **not** count, and this arm is the whole reason that split
 /// carries its own tests. M93 measured that codex fires `SessionStart` *with the first prompt,
@@ -212,9 +210,9 @@ pub(crate) fn run_is_busy(state: &RunState, task_in_review: bool, asking: Busy) 
 /// same shape for a second or two, and any future harness that never speaks Claude's hook
 /// protocol has it for ever.
 ///
-/// A bounded grace — count `Spawning` only while the session is young — was the first fix, and
-/// it was the wrong one: it made the chip lie for thirty seconds instead of for ever, and it
-/// changed the spinner's behaviour to buy that. The right answer is that a badge does not guess.
+/// No age-based guess is needed: the opening prompt is a fact about this child, recorded before
+/// its automated pane is published, reset when it is replaced, and never inferred from pane
+/// origin. The badge still does not count `Spawning`, prompted or not.
 /// *Nothing has been heard about this session* is not evidence of work, and the honest direction
 /// for a count on a tab is to under-report for the moment before a real turn's first hook
 /// arrives rather than to over-report every console anyone opens.
@@ -229,6 +227,7 @@ pub(crate) fn pane_is_busy(
     owned_by_run: bool,
     state: SessionState,
     asking: Busy,
+    opening_prompt: bool,
 ) -> bool {
     if !alive || owned_by_run {
         return false;
@@ -236,9 +235,8 @@ pub(crate) fn pane_is_busy(
     match state {
         SessionState::Idle | SessionState::AwaitingInput | SessionState::Exited { .. } => false,
         SessionState::Busy | SessionState::AwaitingPermission => true,
-        SessionState::Spawning | SessionState::Paused | SessionState::Splash => {
-            asking == Busy::Claimed
-        }
+        SessionState::Spawning => asking == Busy::Claimed && opening_prompt,
+        SessionState::Paused | SessionState::Splash => asking == Busy::Claimed,
     }
 }
 
@@ -339,6 +337,8 @@ pub(crate) fn counts_for(
                     registry.owns_session(**session),
                     hooks.state(**session),
                     asking,
+                    ptys.as_ref()
+                        .is_some_and(|ptys| ptys.has_opening_prompt(**session)),
                 )
             })
             .count(),
@@ -400,7 +400,7 @@ pub(crate) fn waiting_for(app: &AppHandle, project: ProjectId) -> usize {
 /// reading, narrowed to a live turn. `ProjectRunning::tabs` says why a permission prompt is left
 /// to the awaiting badge.
 pub(crate) fn pane_is_turning(alive: bool, owned_by_run: bool, state: SessionState) -> bool {
-    state == SessionState::Busy && pane_is_busy(alive, owned_by_run, state, Busy::Working)
+    state == SessionState::Busy && pane_is_busy(alive, owned_by_run, state, Busy::Working, false)
 }
 
 /// Group `(tab, session)` pairs into per-tab counts of turning sessions.
@@ -601,7 +601,7 @@ mod tests {
     /// `mark_busy` is the other half of the guard; this is the half that does not depend on it.
     #[test]
     fn a_just_spun_project_is_busy_by_its_own_new_pane() {
-        let busy = |state| pane_is_busy(true, false, state, Busy::Claimed);
+        let busy = |state| pane_is_busy(true, false, state, Busy::Claimed, true);
         assert!(busy(SessionState::Spawning));
         assert!(busy(SessionState::Splash));
         assert!(busy(SessionState::Busy));
@@ -624,7 +624,8 @@ mod tests {
             false,
             false,
             SessionState::Spawning,
-            Busy::Claimed
+            Busy::Claimed,
+            false
         ));
         // An opencode run's mirror: alive, silent to hooks, owned by the registry — which
         // counts it through the run count instead.
@@ -632,10 +633,17 @@ mod tests {
             true,
             true,
             SessionState::Spawning,
-            Busy::Claimed
+            Busy::Claimed,
+            false
         ));
         // A claude run's mirror mid-turn is the registry's to count too, not a second time here.
-        assert!(!pane_is_busy(true, true, SessionState::Busy, Busy::Claimed));
+        assert!(!pane_is_busy(
+            true,
+            true,
+            SessionState::Busy,
+            Busy::Claimed,
+            false
+        ));
     }
 
     /// **A console that has never said a word is not working, and the badge must not guess.**
@@ -649,22 +657,23 @@ mod tests {
     /// that console sits in `Spawning` for as long as it is open. Claude has the same shape for
     /// its first second or two, and a harness that speaks no Claude hooks has it for ever.
     ///
-    /// The spinner's reading is the opposite and must stay that way: `claude_tab` forks the
-    /// child before the pane exists, so the tab `tick` just opened reads `Spawning`, and if that
-    /// read as quiet the next tick would open a second planning tab over the first.
+    /// The timer must also ignore this *unprompted* console. A prompted automated tab still
+    /// holds off planning before the first hook, as the sibling startup test asserts.
     #[test]
     fn a_console_that_has_never_spoken_is_not_working() {
         assert!(!pane_is_busy(
             true,
             false,
             SessionState::Spawning,
-            Busy::Working
+            Busy::Working,
+            false
         ));
-        assert!(pane_is_busy(
+        assert!(!pane_is_busy(
             true,
             false,
             SessionState::Spawning,
-            Busy::Claimed
+            Busy::Claimed,
+            false
         ));
     }
 
@@ -763,13 +772,15 @@ mod tests {
             true,
             false,
             SessionState::Paused,
-            Busy::Working
+            Busy::Working,
+            false
         ));
         assert!(pane_is_busy(
             true,
             false,
             SessionState::Paused,
-            Busy::Claimed
+            Busy::Claimed,
+            false
         ));
     }
 
@@ -808,8 +819,8 @@ mod tests {
             assert!(run_is_busy(&state, false, Busy::Claimed));
         }
         for state in [SessionState::Busy, SessionState::AwaitingPermission] {
-            assert!(pane_is_busy(true, false, state, Busy::Working));
-            assert!(pane_is_busy(true, false, state, Busy::Claimed));
+            assert!(pane_is_busy(true, false, state, Busy::Working, false));
+            assert!(pane_is_busy(true, false, state, Busy::Claimed, false));
         }
     }
 
@@ -821,13 +832,15 @@ mod tests {
             true,
             false,
             SessionState::Splash,
-            Busy::Working
+            Busy::Working,
+            false
         ));
         assert!(pane_is_busy(
             true,
             false,
             SessionState::Splash,
-            Busy::Claimed
+            Busy::Claimed,
+            false
         ));
     }
 
@@ -891,7 +904,8 @@ mod tests {
             true,
             false,
             SessionState::AwaitingPermission,
-            Busy::Working
+            Busy::Working,
+            false
         ));
         for quiet in [
             SessionState::Idle,

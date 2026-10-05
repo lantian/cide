@@ -333,7 +333,7 @@ expectScreen?: string, } | { "t": "paste", session: SessionId, text: string, seq
 /**
  * See [`Self::Input`]'s field of the same name.
  */
-expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "taskRespond", project: ProjectId, task: TaskId, response: TaskResponse, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "ping" };
+expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "taskRespond", project: ProjectId, task: TaskId, response: TaskResponse, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "consoleClose", project: ProjectId, pane: PaneId, session: SessionId, } | { "t": "consoleUploadBegin", session: SessionId, name: string, size: number, } | { "t": "consoleUploadChunk", upload: string, offset: number, data: string, } | { "t": "consoleUploadFinish", upload: string, } | { "t": "consoleUploadCancel", upload: string, } | { "t": "ping" };
 
 /**
  * One frame from a device.
@@ -383,6 +383,11 @@ platform: string, appVersion: string, };
  * empty id must never reach the merge, and `repair` is the seam that guarantees it.
  */
 export type CommentId = string;
+
+/**
+ * A console's desktop location, independent of its harness or pane role.
+ */
+export type ConsoleLocation = "main" | "tab" | "detached";
 
 /**
  * Where the cursor is. Absent from a capture means hidden, not at the origin.
@@ -917,7 +922,19 @@ tab?: TabId,
  * column of identical rows; the tab is what tells them apart, and it is the same string
  * the workspace tab strip draws.
  */
-tabTitle?: string, title: string, kind: PaneKind, role: PaneRole, state: SessionState, 
+tabTitle?: string, title: string, 
+/**
+ * Actual CLI, rather than the setting for the next console.
+ */
+harness?: Harness, 
+/**
+ * Which desktop surface holds this pane. Older servers omit this.
+ */
+location?: ConsoleLocation, 
+/**
+ * Closing is offered only for consoles in ordinary tabs.
+ */
+canClose?: boolean, kind: PaneKind, role: PaneRole, state: SessionState, 
 /**
  * Whether this session is in the *finished and not yet looked at* set.
  *
@@ -1143,7 +1160,7 @@ features: Array<string>, } | { "t": "paired", device: string, key: string,
  * placeholder shared by every typed pairing makes two machines look like one — so the
  * list would show one entry that connects to whichever answered last.
  */
-instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
+instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "pasteAccepted", session: SessionId, seq: number, } | { "t": "consoleClosed", pane: PaneId, } | { "t": "consoleUploadReady", upload: string, } | { "t": "consoleUploadProgress", upload: string, offset: number, } | { "t": "consoleUploadFinished", upload: string, path: string, } | { "t": "consoleUploadCancelled", upload: string, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
 /**
  * Whether the queue will start anything new.
  *

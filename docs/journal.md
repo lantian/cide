@@ -17470,3 +17470,87 @@ the branch's ticks and settles the park. The full cide-app suite passes (786 tes
 clippy and fmt clean.
 
 **Not confirmed on a display:** the reported macOS sequence was not replayed in a running GUI.
+
+
+## M154 — Idle consoles no longer stall planning; dependencies advance within a milestone
+
+TerraStrike had no running subagents and no review tasks, with todo work still on the board,
+yet its five-minute automatic planner never fired. Its restored main Codex console had sent
+no hook events. `HookServer::state` therefore returned `Spawning`; the quiet detector counted
+that as busy forever, while the running badge correctly showed no work.
+
+The runtime session registry now records whether the current child received an opening
+prompt. An unknown, unprompted console permits quiet time. A prompted planner/reviewer still
+holds startup until hooks describe it, with the same Busy/permission/pause rules afterward.
+Opening intent is recorded before publishing an automated pane and is reset on replacement
+or removal; a persisted Planner origin does not turn a restored unprompted child into work.
+No synthetic Idle hook or startup timeout is used. Planner eligibility changes are logged
+with the reason, outstanding runs and console states, rather than disappearing behind a
+silent early return or logging the same latch every tick.
+
+A user/orchestrator non-Done → Done edit also submits assigned Todo/Doing dependents once
+all their existing live blockers are Done, but only when the blocker and dependent resolve
+to the same active milestone. Worker edits cannot dispatch. Questions, review and inbox
+still hold work; dangling/tombstoned blockers keep their existing semantics. The shared
+mutation funnel deduplicates candidates, rereads their current state before submitting, and
+uses the normal dispatch path for pause, admission and atomic duplicate protection. No
+restart/link-removal/deletion/milestone-activation sweep was added.
+
+**Verified:** 16 dispatch-policy tests and 339 scoped app tests pass; clippy with warnings
+denied and Rust formatting pass. The app tests cover running, spinner, trigger, registry,
+hooks, RPC, session spawning and automated tabs. `check:agents`, `check:agents-render`,
+`check:running` and `check:awaiting` pass. Concurrent console-notification edits appeared
+in the shared checkout during validation, so the final Rust tests and lint were run against
+this change alone in an isolated checkout. Test sockets required an unsandboxed run; the
+checkout under `/tmp` required a separate `TMPDIR` for the cwd-containment fixture.
+
+**Not confirmed in the live IDE:** the production TerraStrike profile was not restarted,
+and no unattended planner turn was launched to spend model quota. Its settings were unchanged.
+
+
+## M155 — Phone consoles follow the desktop and accept files and images
+
+The phone called every harness Claude, reordered consoles by attention, could not close a tab
+console, and offered only text input. Codex's full-width light fills became white rectangles
+when wrapped, while desktop soft wraps split words on the phone and lost separators on copy.
+
+Remote session projections now include the actual harness, desktop location and close eligibility.
+They walk each tab's layout leaves in order, with the pinned main tab first, then the desktop tab
+strip and detached panes. Mobile labels and running counters use **AI console**, preserve custom
+tab names and keep shells distinct. The list preserves the projection's order when narrowed.
+
+A phone close names project, pane and session and revalidates inside the workspace mutation.
+Every pane of the main tab is protected. A split close removes only that pane; a sole pane uses
+the desktop's tab-close path, including closed-tab history and ephemeral-process cleanup. A
+remaining mirror or agent-run binding keeps a shared child alive on split close.
+
+Files, selected photos and camera photos stream in bounded acknowledged chunks, up to 32 MiB
+per file, into the session's spawn directory under `.cide/mobile-uploads/<uuid>/`. The host
+chooses the destination and locally excludes it from Git. Each connection owns its upload
+handles; cancellation/disconnect removes unfinished files, while finished files remain for the
+harness and transcript. Container consoles report uploads unavailable. The phone shows progress,
+cancellation, errors and deliberate retry, then requests an acknowledged quoted-path paste.
+It never submits Enter or automatically replays a paste after losing the connection.
+
+The mobile renderer resolves the complete ANSI palette, preserves colored diff fills, uses
+readable dark prompt fills in wrap mode, trims background padding, and joins terminal soft wraps
+before word/cell wrapping. Pan mode retains the original column layout and fills. PTY capture
+keeps spaces on soft-wrapped rows, preserving word boundaries. **Select text** opens a frozen
+native selectable snapshot of the loaded history and current screen, with **Copy all**; selection
+never sends terminal input.
+
+**Verified:** the applied mobile repository passes its full check: protocol sync, require interop,
+TypeScript, 301 tests including 14 encrypted-loopback tests. The remote crate passes 102 unit
+and one vector test; PTY passes 73 tests (two existing opt-in probes ignored); core workspace
+passes 126; scoped app remote tests pass 11. `check:remote`, codegen check and contract check
+pass. An arm64 Android release APK builds with the new native modules. Socket checks required
+an unsandboxed run. A pre-existing timing-sensitive workspace-coalescing test failed in the
+parallel remote run and passed with the whole remote suite run sequentially. Desktop UI
+TypeScript passes. Clippy passes with warnings denied and only `type_complexity` disabled;
+the unrestricted run is blocked by concurrent `OutputObserver` edits in `cide-pty/src/lib.rs`,
+which this change leaves intact. Handwritten-source formatting and whitespace checks pass;
+generated TypeScript retains ts-rs's existing trailing-space style.
+
+**Not confirmed on a device:** no Android phone/emulator was connected. Camera/gallery flows,
+multiline selection handles and the supplied Codex screenshot's live appearance still need
+native QA. An iOS build was not run on this Linux machine. No desktop profile was restarted.

@@ -166,6 +166,20 @@ HEAD and every non-goal task's (id, status, has-a-question) against the last pla
 open work is todo and doing tasks without a question. Work in review or waiting on you does not
 count as a reason to plan.
 
+An idle console that has not reported a hook does not hold off the timer unless its current
+child was given an opening prompt. This matters for a restored Codex console: it can wait at
+its composer without sending `SessionStart`. A newly opened planner or reviewer does hold off
+planning while its opening prompt starts. The log's `planner eligibility changed` entries name
+the current reason for waiting and the relevant runs and console states.
+
+Closing a task also submits its assigned dependents to the queue once every live blocker is
+Done, when the user or an orchestrator made that completion. Both the completed blocker and
+dependent must belong to the same active milestone. Review still blocks dependencies, and
+tasks with a question wait for the answer. This does not plan new work or require the idle
+timer; the normal pause, concurrency and duplicate-run checks still apply. Link removal,
+deletion, restart and milestone activation do not sweep for ready tasks, so previously stranded
+work needs reassignment or an explicit dispatch once.
+
 ### The queue: "waiting: t-N holds …"
 
 A queued run whose task's `touches` overlap what another task holds waits. A task holds its

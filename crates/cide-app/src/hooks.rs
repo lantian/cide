@@ -56,6 +56,7 @@ use tauri::{AppHandle, Manager};
 /// The socket, and every session's last known state.
 pub struct HookServer {
     path: PathBuf,
+    frames: std::sync::mpsc::Sender<Inbound>,
     /// Last known state per session. The state machine needs a "current" to transition from,
     /// and a session with no entry yet is treated as `Spawning`.
     states: Arc<DashMap<SessionId, SessionState>>,
@@ -132,6 +133,7 @@ impl HookServer {
         // Frames are two small strings and a `Value`, and they arrive at the rate a human
         // prompts, not at the rate a terminal prints.
         let (frames, inbox) = std::sync::mpsc::channel::<Inbound>();
+        let submit = frames.clone();
 
         thread::Builder::new()
             .name("cide-hook-apply".into())
@@ -228,6 +230,7 @@ impl HookServer {
         tracing::info!(path = %path.display(), "hook socket listening");
         Ok(Self {
             path,
+            frames: submit,
             states,
             conversations,
         })
@@ -236,6 +239,12 @@ impl HookServer {
     /// The value for a child's `CIDE_HOOK_SOCK`.
     pub fn socket(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Observe only live output from a Codex child launched with approval-only OSC 9
+    /// notifications. Queue it beside real hooks, never apply state on the PTY thread.
+    pub fn codex_approval_observer(&self, session: SessionId) -> cide_pty::OutputObserver {
+        codex_approval_observer(session, self.frames.clone())
     }
 
     /// State reported by a console adapter that has no Claude-shaped hooks.
@@ -277,6 +286,23 @@ impl HookServer {
         // conversation and never record its own.
         self.conversations.remove(&session);
     }
+}
+
+fn codex_approval_observer(
+    session: SessionId,
+    frames: std::sync::mpsc::Sender<Inbound>,
+) -> cide_pty::OutputObserver {
+    let parser = parking_lot::Mutex::new(cide_pty::notifications::Osc9::default());
+    cide_pty::OutputObserver::new(move |bytes| {
+        let notifications = parser.lock().process(bytes);
+        for _ in 0..notifications {
+            let frame = HookFrame::new(
+                HookEvent::CodexApprovalPrompt.as_str(),
+                serde_json::json!({ "session_id": session.to_string() }),
+            );
+            let _ = frames.send(Inbound::Frame(frame));
+        }
+    })
 }
 
 /// The live set of a state map. See [`decide`] for why this is a free function.
@@ -677,6 +703,61 @@ mod tests {
 
     type States = DashMap<SessionId, SessionState>;
 
+    #[test]
+    fn codex_review_is_quiet_and_only_a_live_prompt_notifies_its_pane() {
+        let pane = SessionId::new();
+        let conversation = SessionId::new();
+        let states = States::new();
+        let conversations = DashMap::new();
+        states.insert(pane, SessionState::Busy);
+        conversations.insert(pane, conversation);
+
+        let mut review = frame("PermissionRequest", &conversation.to_string());
+        review.spawned_as = Some(pane.to_string());
+        assert!(super::decide(&review, &states, &conversations).is_empty());
+        assert_eq!(state_of(&states, pane), Some(SessionState::Busy));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = codex_approval_observer(pane, tx);
+        observer.process(b"\x1b]9;Approval requested");
+        assert!(rx.try_recv().is_err());
+        observer.process(b": test\x1b\\");
+        let Inbound::Frame(prompt) = rx.try_recv().expect("complete OSC notification") else {
+            panic!("a notification is a frame");
+        };
+        let effects = super::decide(&prompt, &states, &conversations);
+        assert!(
+            matches!(effects.as_slice(), [Effect::State { session, state: SessionState::AwaitingPermission }] if session == &pane.to_string())
+        );
+        assert_eq!(conversations.get(&pane).map(|c| *c), Some(conversation));
+        assert!(
+            super::decide(&prompt, &states, &conversations).is_empty(),
+            "duplicate prompts must not re-notify"
+        );
+
+        let mut answered = frame("PostToolUse", &conversation.to_string());
+        answered.spawned_as = Some(pane.to_string());
+        super::decide(&answered, &states, &conversations);
+        assert_eq!(state_of(&states, pane), Some(SessionState::Busy));
+        super::decide(&review, &states, &conversations);
+        assert_eq!(
+            state_of(&states, pane),
+            Some(SessionState::Busy),
+            "automatic review remains quiet after manual approval too"
+        );
+        observer.process(b"\x1b]0;title\x07\x1b]9;4;1;50\x07");
+        assert!(rx.try_recv().is_err());
+
+        let mut stop = frame("Stop", &conversation.to_string());
+        stop.spawned_as = Some(pane.to_string());
+        super::decide(&stop, &states, &conversations);
+        assert_eq!(
+            state_of(&states, pane),
+            Some(SessionState::AwaitingInput),
+            "completion still waits for the user"
+        );
+    }
+
     /// A frame as the CLI sends it: an event name and a payload naming a session.
     fn frame(event: &str, session: &str) -> HookFrame {
         HookFrame::new(event, json!({ "session_id": session }))
@@ -898,12 +979,14 @@ mod tests {
             false,
             state_of(&states, session).unwrap(),
             crate::running::Busy::Working,
+            false
         ));
         assert!(crate::running::pane_is_busy(
             true,
             false,
             state_of(&states, other).unwrap(),
             crate::running::Busy::Working,
+            false
         ));
 
         let answered = HookFrame::new(

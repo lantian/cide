@@ -189,7 +189,11 @@ fn capture_row(screen: &vt100::Screen, row: u16, cols: u16) -> ScreenLine {
         }
     }
 
-    trim_trailing_blank(&mut runs);
+    // Soft wraps used every cell; trailing spaces can separate words across rows.
+    // Trimming them makes a remote copy say "helloworld".
+    if !screen.row_wrapped(row) {
+        trim_trailing_blank(&mut runs);
+    }
     ScreenLine {
         row,
         wrapped: screen.row_wrapped(row),
@@ -365,6 +369,15 @@ mod tests {
         let capture = capture(vt.screen());
         assert!(capture.lines[1].runs.is_empty());
         assert_eq!(capture.lines.len(), 6);
+    }
+
+    #[test]
+    fn soft_wrap_keeps_spaces_that_separate_words() {
+        let vt = parser(b"abcdefghijklmnopqr  next");
+        let capture = capture(vt.screen());
+        assert!(capture.lines[0].wrapped);
+        assert_eq!(plain(&capture.lines[0]), "abcdefghijklmnopqr  ");
+        assert_eq!(plain(&capture.lines[1]), "next");
     }
 
     #[test]

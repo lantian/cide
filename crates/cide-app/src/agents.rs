@@ -9365,6 +9365,14 @@ fn start_child(
             _ => String::new(),
         }
     ));
+    let mut spec = spec;
+    if resolved.harness == Harness::Codex
+        && plan.codex.cli.inject.hooks
+        && plan.hook_bin.is_some()
+        && let Some(hooks) = app.try_state::<crate::hooks::HookServer>()
+    {
+        spec.output_observer = Some(hooks.codex_approval_observer(session));
+    }
     let pty = PtySession::spawn(spec).map_err(|error| CoreError::Io(error.to_string()))?;
 
     Ok(Started {

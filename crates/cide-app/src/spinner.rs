@@ -178,6 +178,84 @@ fn spin_config(root: &std::path::Path) -> AgentsConfig {
 /// A `std::sync::Mutex` and not `parking_lot`'s: this is touched once every [`POLL`] by one
 /// thread, so there is nothing to tune, and the standard one needs no import to justify.
 static SINCE: Mutex<Option<HashMap<ProjectId, Instant>>> = Mutex::new(None);
+/// Eligibility is logged on a change, not on every thirty-second poll.
+static LAST_ELIGIBILITY: Mutex<Option<HashMap<ProjectId, &'static str>>> = Mutex::new(None);
+
+fn eligibility(quiet: &Quiet, config: &AgentsConfig, unchanged: bool) -> &'static str {
+    if !config.enabled {
+        "subagents disabled"
+    } else if !config.auto_spin {
+        "auto-planning or tracker disabled"
+    } else if !quiet.dispatching {
+        "project paused"
+    } else if quiet.live_runs > 0 {
+        "outstanding agent runs"
+    } else if quiet.busy_panes > 0 {
+        "console holds work"
+    } else if quiet.open_tasks == 0 {
+        "no eligible todo/doing tasks"
+    } else if quiet.milestone_waiting {
+        "milestone awaits acceptance"
+    } else if quiet.quiet_for < config.spin_after() {
+        "waiting for quiet dwell"
+    } else if unchanged {
+        "unchanged since last plan"
+    } else {
+        "ready to plan"
+    }
+}
+
+fn log_eligibility(
+    app: &AppHandle,
+    ws: &cide_ipc::Workspace,
+    project: ProjectId,
+    quiet: &Quiet,
+    reason: &'static str,
+) {
+    let changed = {
+        let mut guard = LAST_ELIGIBILITY.lock().unwrap_or_else(|e| e.into_inner());
+        let notes = guard.get_or_insert_with(HashMap::new);
+        notes.retain(|id, _| ws.projects.contains_key(id));
+        notes.insert(project, reason) != Some(reason)
+    };
+    if !changed {
+        return;
+    }
+    let runs = app
+        .try_state::<std::sync::Arc<crate::agents::AgentRegistry>>()
+        .map(|registry| {
+            registry
+                .runs_for(project)
+                .iter()
+                .filter(|run| {
+                    !matches!(
+                        run.state,
+                        cide_ipc::RunState::Finished { .. } | cide_ipc::RunState::Failed { .. }
+                    )
+                })
+                .map(|run| format!("{}: {:?} task={:?}", run.run, run.state, run.task))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let hooks = app.try_state::<crate::hooks::HookServer>();
+    let ptys = app.try_state::<crate::state::SessionRegistry>();
+    let consoles: Vec<_> = cide_core::workspace::session_panes(ws, Some(project))
+        .into_iter()
+        .filter(|found| found.pane.kind == cide_ipc::PaneKind::Claude)
+        .map(|found| {
+            let session = found.session;
+            format!(
+                "{session}: {:?} opening_prompt={}",
+                hooks.as_ref().map(|hooks| hooks.state(session)),
+                ptys.as_ref()
+                    .is_some_and(|ptys| ptys.has_opening_prompt(session))
+            )
+        })
+        .collect();
+    tracing::debug!(%project, reason, quiet_secs = quiet.quiet_for.as_secs(),
+        live_runs = quiet.live_runs, busy_panes = quiet.busy_panes,
+        open_tasks = quiet.open_tasks, ?runs, ?consoles, "planner eligibility changed");
+}
 
 /// Start the spinner. Called once, from `setup`.
 ///
@@ -240,13 +318,27 @@ fn tick(app: &AppHandle) {
         };
         let config = spin_config(&root);
         if !should_spin(&quiet, &config) {
+            log_eligibility(
+                app,
+                &ws,
+                project,
+                &quiet,
+                eligibility(&quiet, &config, false),
+            );
             continue;
         }
         // Nothing changed since the last plan: the planner would read what it read then and
         // either invent work or stop again. Latched until the board or the branch moves. (M132)
         let print = fingerprint(app, project, &root);
-        if latched(project, &print) {
-            tracing::debug!(%project, "quiet, but nothing changed since the last plan; not waking");
+        let unchanged = latched(project, &print);
+        log_eligibility(
+            app,
+            &ws,
+            project,
+            &quiet,
+            eligibility(&quiet, &config, unchanged),
+        );
+        if unchanged {
             continue;
         }
 
@@ -798,6 +890,116 @@ mod tests {
             auto_spin: true,
             ..AgentsConfig::default()
         }
+    }
+
+    #[test]
+    fn an_unprompted_codex_console_allows_the_full_quiet_dwell() {
+        let config = AgentsConfig {
+            auto_spin_after_secs: 300,
+            ..asking()
+        };
+        let now = Instant::now();
+        let project = ProjectId::new();
+        let mut quiet = ready();
+        for opening_prompt in [false, true] {
+            quiet.busy_panes = usize::from(crate::running::pane_is_busy(
+                true,
+                false,
+                cide_ipc::SessionState::Spawning,
+                crate::running::Busy::Claimed,
+                opening_prompt,
+            ));
+            quiet.quiet_for = dwell(project, now, quiet.busy_panes == 0);
+            assert!(!should_spin(&quiet, &config));
+            quiet.quiet_for = dwell(
+                project,
+                now + Duration::from_secs(300),
+                quiet.busy_panes == 0,
+            );
+            assert_eq!(
+                should_spin(&quiet, &config),
+                !opening_prompt,
+                "only the unprompted console can accrue quiet time before any hook"
+            );
+        }
+        // Actual hooks supersede opening intent; a returned turn is no longer startup.
+        for (state, busy) in [
+            (cide_ipc::SessionState::Busy, true),
+            (cide_ipc::SessionState::AwaitingPermission, true),
+            (cide_ipc::SessionState::AwaitingInput, false),
+            (cide_ipc::SessionState::Idle, false),
+        ] {
+            assert_eq!(
+                crate::running::pane_is_busy(
+                    true,
+                    false,
+                    state,
+                    crate::running::Busy::Claimed,
+                    true,
+                ),
+                busy
+            );
+        }
+    }
+
+    #[test]
+    fn planner_eligibility_names_the_hold_and_the_unchanged_plan_latch() {
+        let config = asking();
+        let mut quiet = ready();
+        assert_eq!(eligibility(&quiet, &config, false), "ready to plan");
+        assert_eq!(
+            eligibility(&quiet, &config, true),
+            "unchanged since last plan"
+        );
+        quiet.busy_panes = 1;
+        assert_eq!(eligibility(&quiet, &config, false), "console holds work");
+        quiet.live_runs = 1;
+        assert_eq!(
+            eligibility(&quiet, &config, false),
+            "outstanding agent runs"
+        );
+        quiet.dispatching = false;
+        assert_eq!(eligibility(&quiet, &config, false), "project paused");
+        quiet = ready();
+        quiet.open_tasks = 0;
+        assert_eq!(
+            eligibility(&quiet, &config, false),
+            "no eligible todo/doing tasks"
+        );
+        quiet = ready();
+        quiet.milestone_waiting = true;
+        assert_eq!(
+            eligibility(&quiet, &config, false),
+            "milestone awaits acceptance"
+        );
+        quiet = ready();
+        quiet.quiet_for = Duration::ZERO;
+        assert_eq!(
+            eligibility(&quiet, &config, false),
+            "waiting for quiet dwell"
+        );
+        assert_eq!(
+            eligibility(
+                &quiet,
+                &AgentsConfig {
+                    auto_spin: false,
+                    ..config.clone()
+                },
+                false
+            ),
+            "auto-planning or tracker disabled"
+        );
+        assert_eq!(
+            eligibility(
+                &quiet,
+                &AgentsConfig {
+                    enabled: false,
+                    ..config
+                },
+                false
+            ),
+            "subagents disabled"
+        );
     }
 
     /// A green gate stands the timer down only when the milestone has nothing left open; a red

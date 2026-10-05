@@ -42,6 +42,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+pub mod notifications;
 pub mod screen;
 mod startup_colors;
 
@@ -364,6 +365,27 @@ impl std::fmt::Debug for LineRender {
     }
 }
 
+/// Observes live child output before rendering. Never called for preloads or screen replays.
+/// The callback runs on the coalescer thread: it must not block or re-enter the session.
+#[derive(Clone)]
+pub struct OutputObserver(Arc<dyn Fn(&[u8]) + Send + Sync>);
+
+impl OutputObserver {
+    pub fn new(callback: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn process(&self, bytes: &[u8]) {
+        (self.0)(bytes);
+    }
+}
+
+impl std::fmt::Debug for OutputObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutputObserver(..)")
+    }
+}
+
 /// What to run, where, and with which environment.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -438,6 +460,8 @@ pub struct SpawnSpec {
     /// `None` — every pane, every claude child — is the zero-cost path: bytes flow untouched.
     /// See [`LineRender`] for the contract and the reason there is no raw sink class beside it.
     pub render: Option<LineRender>,
+    /// Installed before spawning, so even the first bytes reach the observer.
+    pub output_observer: Option<OutputObserver>,
 }
 
 impl SpawnSpec {
@@ -454,6 +478,7 @@ impl SpawnSpec {
             fixed_size: false,
             watch_jobs: None,
             render: None,
+            output_observer: None,
         }
     }
 
@@ -895,6 +920,7 @@ impl PtySession {
             spec.credit,
             probe,
             spec.render.clone(),
+            spec.output_observer.clone(),
         );
         spawn_writer(writer, writer_rx);
 
@@ -1730,6 +1756,7 @@ fn spawn_coalescer(
     policy: CreditPolicy,
     mut probe: Option<JobProbe>,
     render: Option<LineRender>,
+    output_observer: Option<OutputObserver>,
 ) {
     thread::Builder::new()
         .name("cide-pty-coalesce".into())
@@ -1781,6 +1808,9 @@ fn spawn_coalescer(
                         );
                     }
                     Event::Output(chunk) => {
+                        if let Some(observer) = &output_observer {
+                            observer.process(&chunk);
+                        }
                         // The render hook, if any, rewrites the stream **here** — before the
                         // mirror, before `pending`, before the frame splitter — so everything
                         // downstream, the choked-sink catch-up included, agrees on one text.
@@ -2278,6 +2308,37 @@ mod tests {
         let sink: Arc<dyn Sink> =
             Arc::new(move |bytes: &[u8]| tx.lock().send(bytes.to_vec()).is_ok());
         (sink, rx)
+    }
+
+    #[test]
+    fn live_output_is_observed_once_without_preloads_or_reattachment() {
+        let (tx, rx) = mpsc::channel();
+        let mut spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg(r"printf '\033]9;live\007ready'; read answer")
+            .preload(b"\x1b]9;old\x07previous screen".to_vec());
+        spec.output_observer = Some(OutputObserver::new(move |bytes| {
+            let _ = tx.send(bytes.to_vec());
+        }));
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        let mut observed = Vec::new();
+        while !observed.ends_with(b"ready") {
+            observed.extend(rx.recv_timeout(DEADLINE).expect("live output"));
+        }
+        assert_eq!(
+            observed, b"\x1b]9;live\x07ready",
+            "raw output is preserved and preload excluded"
+        );
+        let (sink, _out) = collect_sink();
+        let (id, _) = session.attach_with_snapshot(sink, false);
+        let _ = session.full_state();
+        session.detach(id);
+        session.attach_with_snapshot(Arc::new(|_: &[u8]| true), true);
+        assert!(
+            rx.try_recv().is_err(),
+            "screen replay must not re-trigger the observer"
+        );
+        session.kill();
     }
 
     /// Collect frames until `needle` appears, or the deadline passes.

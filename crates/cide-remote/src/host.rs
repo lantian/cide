@@ -135,6 +135,26 @@ pub trait RemoteHost: Send + Sync + 'static {
         seq: u64,
     ) -> Result<(), String>;
 
+    /// Remove one console view using desktop ownership and tab-close behavior.
+    fn console_close(
+        &self,
+        project: ProjectId,
+        pane: cide_ipc::PaneId,
+        session: cide_ipc::SessionId,
+    ) -> Result<(), String> {
+        let _ = (project, pane, session);
+        Err("this cide cannot close consoles from a device".into())
+    }
+
+    /// Server-selected directory; never a device-supplied destination.
+    fn console_upload_root(
+        &self,
+        session: cide_ipc::SessionId,
+    ) -> Result<std::path::PathBuf, String> {
+        let _ = session;
+        Err("this cide cannot receive console attachments".into())
+    }
+
     /// Stop an agent run.
     ///
     /// Routed through cide's own stop, which is the whole point: `stop_route` refuses to *ask* a

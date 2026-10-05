@@ -2081,9 +2081,9 @@ pub struct SessionPane<'a> {
 /// of the other.
 ///
 /// Order is projects in workspace order, each project's tabs in tab order, then its detached
-/// panes. Two panes mirroring one child yield two entries carrying one `session` — de-duplicate
-/// at the caller, which is the only place that knows whether it is counting panes or
-/// conversations.
+/// panes, with each tab's panes in layout reading order. Two panes mirroring one child yield
+/// two entries carrying one `session` — de-duplicate at the caller, which is the only place
+/// that knows whether it is counting panes or conversations.
 pub fn session_panes(ws: &Workspace, only: Option<ProjectId>) -> Vec<SessionPane<'_>> {
     let mut out = Vec::new();
     for (id, project) in &ws.projects {
@@ -2091,7 +2091,10 @@ pub fn session_panes(ws: &Workspace, only: Option<ProjectId>) -> Vec<SessionPane
             continue;
         }
         for tab in &project.tabs {
-            for pane in tab.tree.panes.values() {
+            for pane_id in layout::leaves(&tab.tree.root) {
+                let Some(pane) = tab.tree.panes.get(&pane_id) else {
+                    continue;
+                };
                 if let Some(session) = pane.session {
                     out.push(SessionPane {
                         project: *id,
@@ -4236,6 +4239,74 @@ mod tests {
                 .expect("just asserted")
                 .tab,
             Some(console)
+        );
+    }
+
+    #[test]
+    fn session_panes_follow_the_layout_and_current_tab_strip() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/tmp/remote-order");
+        let home = console_tab(&ws, project).unwrap();
+        let first = tab(&ws, project, home).unwrap().tree.focused;
+        let before = layout::split(
+            &mut tab_mut(&mut ws, project, home).unwrap().tree,
+            first,
+            Axis::Row,
+            Side::Before,
+            aux_pane(),
+        )
+        .unwrap();
+        let below = layout::split(
+            &mut tab_mut(&mut ws, project, home).unwrap().tree,
+            before,
+            Axis::Col,
+            Side::After,
+            aux_pane(),
+        )
+        .unwrap();
+        let a = open_tab(
+            &mut ws,
+            project,
+            TabKind::ClaudeFull {
+                title: "A".into(),
+                ephemeral: false,
+            },
+            aux_pane(),
+        )
+        .unwrap();
+        let b = open_tab(
+            &mut ws,
+            project,
+            TabKind::ClaudeFull {
+                title: "B".into(),
+                ephemeral: false,
+            },
+            aux_pane(),
+        )
+        .unwrap();
+        let expected: Vec<_> = [home, b, a]
+            .into_iter()
+            .flat_map(|id| layout::leaves(&tab(&ws, project, id).unwrap().tree.root))
+            .collect();
+        assert_eq!(&expected[..3], &[before, below, first]);
+        assert_eq!(
+            session_panes(&ws, Some(project))
+                .iter()
+                .map(|p| p.pane.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        reorder_tab(&mut ws, project, 1, 2).unwrap();
+        let expected: Vec<_> = [home, a, b]
+            .into_iter()
+            .flat_map(|id| layout::leaves(&tab(&ws, project, id).unwrap().tree.root))
+            .collect();
+        assert_eq!(
+            session_panes(&ws, Some(project))
+                .iter()
+                .map(|p| p.pane.id)
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 

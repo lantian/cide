@@ -18,8 +18,8 @@
 //! * the **real TUI** in the PTY, at the pane's geometry — the person who opens the run reads
 //!   codex itself, and can answer an approval prompt in it;
 //! * **state from hooks**, through the same [`cide_claude::next_state`] a claude run and a
-//!   console use, plus the one event claude does not have: codex names its approval prompt
-//!   (`PermissionRequest`), so [`RunState::AwaitingPermission`] exists on this harness now;
+//!   console use. `PermissionRequest` precedes automatic review; Cide's internal
+//!   `CodexApprovalPrompt` from the TUI notification establishes human waiting;
 //! * **[`SessionBinding::Caller`]**: cide mints the run's routing id and hands it over as
 //!   `CIDE_SESSION`, so a hook frame is routable before codex has said anything. The
 //!   *conversation* is still codex's to mint — its TUI cannot be handed an id — and it arrives
@@ -182,7 +182,8 @@ impl Harness for CodexHarness {
     /// | observation | answer |
     /// | --- | --- |
     /// | `Exit(code)` | `Finished { code }` from any state |
-    /// | `Hook` — `PermissionRequest` | `AwaitingPermission` |
+    /// | `Hook` — `PermissionRequest` | `None` — review is not human waiting |
+    /// | `Hook` — `CodexApprovalPrompt` | `AwaitingPermission` |
     /// | `Hook` — anything else | [`cide_claude::next_state`], mapped as a claude run's is |
     /// | `Line` | `None` — the TUI paints a screen; nothing is read off it |
     fn observe(&self, current: RunState, ob: Observation<'_>) -> Option<RunState> {
@@ -1053,17 +1054,34 @@ mod tests {
             "codex has no such event"
         );
         assert!(args.iter().any(|a| a == codex_cli::BYPASS_HOOK_TRUST));
+        assert_eq!(
+            config_value(&args, "tui.notifications"),
+            r#"["approval-requested"]"#
+        );
+        assert_eq!(config_value(&args, "tui.notification_method"), r#""osc9""#);
+        assert_eq!(
+            config_value(&args, "tui.notification_condition"),
+            r#""always""#
+        );
 
         let mut off = plan_for(&agent, SessionId::new());
         off.codex.cli.inject.hooks = false;
         let args = CodexHarness.spawn_spec(&off).expect("spawnable").spec.args;
         assert!(!args.iter().any(|a| a.starts_with("hooks.")), "{args:?}");
         assert!(!args.iter().any(|a| a == codex_cli::BYPASS_HOOK_TRUST));
+        assert!(
+            !args.iter().any(|a| a.starts_with("tui.notification")),
+            "{args:?}"
+        );
 
         let mut bare = plan_for(&agent, SessionId::new());
         bare.hook_bin = None;
         let args = CodexHarness.spawn_spec(&bare).expect("spawnable").spec.args;
         assert!(!args.iter().any(|a| a.starts_with("hooks.")), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.starts_with("tui.notification")),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -1617,8 +1635,9 @@ mod tests {
             observe(RunState::Idle, "UserPromptSubmit"),
             Some(RunState::Running)
         );
+        assert_eq!(observe(RunState::Running, "PermissionRequest"), None);
         assert_eq!(
-            observe(RunState::Running, "PermissionRequest"),
+            observe(RunState::Running, "CodexApprovalPrompt"),
             Some(RunState::AwaitingPermission)
         );
         assert_eq!(

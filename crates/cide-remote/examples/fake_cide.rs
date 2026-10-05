@@ -74,7 +74,10 @@ fn main() {
         .enable_all()
         .build()
         .expect("a runtime");
-    let host: Arc<dyn RemoteHost> = Arc::new(Constants::default());
+    let host: Arc<dyn RemoteHost> = Arc::new(Constants {
+        upload_root: dir.join("console-work"),
+        ..Constants::default()
+    });
 
     let server = runtime
         .block_on(RemoteServer::bind(
@@ -134,6 +137,8 @@ fn main() {
 /// reported as verified when nothing had been verified at all.
 #[derive(Default)]
 struct Constants {
+    upload_root: PathBuf,
+    closed: std::sync::Mutex<std::collections::HashSet<cide_ipc::SessionId>>,
     answered_task: std::sync::Mutex<Option<cide_ipc::TaskDetail>>,
     acknowledged: std::sync::Mutex<std::collections::HashSet<cide_ipc::SessionId>>,
     /// What has been typed at the prompt, echoed back into [`RemoteHost::screen`]. (M76)
@@ -486,7 +491,7 @@ impl RemoteHost for Constants {
         if only.is_some_and(|wanted| wanted != project()) {
             return Vec::new();
         }
-        vec![
+        let rows = vec![
             RemoteSession {
                 session: "00000000-0000-4000-8000-000000000002"
                     .parse()
@@ -498,6 +503,9 @@ impl RemoteHost for Constants {
                 tab: None,
                 tab_title: Some("Claude".to_owned()),
                 title: "claude".to_owned(),
+                harness: None,
+                location: Some(cide_ipc::remote::ConsoleLocation::Main),
+                can_close: Some(false),
                 kind: cide_ipc::PaneKind::Claude,
                 role: cide_ipc::PaneRole::Primary,
                 state: cide_ipc::SessionState::Idle,
@@ -517,6 +525,9 @@ impl RemoteHost for Constants {
                 tab: None,
                 tab_title: Some("Claude".to_owned()),
                 title: "bash".to_owned(),
+                harness: None,
+                location: Some(cide_ipc::remote::ConsoleLocation::Main),
+                can_close: Some(false),
                 kind: cide_ipc::PaneKind::Shell,
                 role: cide_ipc::PaneRole::Auxiliary,
                 state: cide_ipc::SessionState::Busy,
@@ -536,6 +547,9 @@ impl RemoteHost for Constants {
                 tab: None,
                 tab_title: Some("shell".to_owned()),
                 title: "bash".to_owned(),
+                harness: None,
+                location: Some(cide_ipc::remote::ConsoleLocation::Tab),
+                can_close: Some(true),
                 kind: cide_ipc::PaneKind::Shell,
                 role: cide_ipc::PaneRole::Auxiliary,
                 state: cide_ipc::SessionState::Spawning,
@@ -544,7 +558,11 @@ impl RemoteHost for Constants {
                 agent: None,
                 task: None,
             },
-        ]
+        ];
+        let closed = self.closed.lock().unwrap();
+        rows.into_iter()
+            .filter(|row| !closed.contains(&row.session))
+            .collect()
     }
 
     fn awaiting(&self) -> Vec<AwaitingEntry> {
@@ -583,6 +601,9 @@ impl RemoteHost for Constants {
     /// line of **Cyrillic** prose, and a **braille** spinner — each a different block, and none of
     /// them in the same font file as the Latin text on a stock Android.
     fn screen(&self, _session: cide_ipc::SessionId) -> Option<ScreenCapture> {
+        if self.closed.lock().unwrap().contains(&_session) {
+            return None;
+        }
         const COLS: u16 = 120;
         /// The frames Claude Code's own spinner uses, so the moving row moves the way one does.
         const SPINNER: [char; 8] = [
@@ -715,6 +736,31 @@ impl RemoteHost for Constants {
         _expect_screen: &str,
     ) -> Result<(), String> {
         Err("this example answers nothing".to_owned())
+    }
+
+    fn console_upload_root(&self, session: cide_ipc::SessionId) -> Result<PathBuf, String> {
+        if !self.sessions(None).iter().any(|row| row.session == session) {
+            return Err("that session is not running here".into());
+        }
+        std::fs::create_dir_all(&self.upload_root).map_err(|e| e.to_string())?;
+        Ok(self.upload_root.join(".cide/mobile-uploads"))
+    }
+    fn console_close(
+        &self,
+        project: ProjectId,
+        pane: cide_ipc::PaneId,
+        session: cide_ipc::SessionId,
+    ) -> Result<(), String> {
+        let row = self
+            .sessions(Some(project))
+            .into_iter()
+            .find(|row| row.pane == pane && row.session == session)
+            .ok_or("that console changed")?;
+        if row.can_close != Some(true) {
+            return Err("the project console tab is pinned".into());
+        }
+        self.closed.lock().unwrap().insert(session);
+        Ok(())
     }
 
     /// Echo, the way a terminal in canonical mode would. See [`Constants::typed`].

@@ -1224,6 +1224,19 @@ pub fn tab_close(
     tab: TabId,
     force: bool,
 ) -> Result<Mutated, CoreError> {
+    close_tab_checked(app, &state, project, tab, force, None)
+}
+
+/// The phone closes a tab only if its named console remains the sole pane at mutation time.
+/// Keeping this check inside update prevents a newly split neighbour being closed by a stale tap.
+pub(crate) fn close_tab_checked(
+    app: tauri::AppHandle,
+    state: &WorkspaceState,
+    project: ProjectId,
+    tab: TabId,
+    force: bool,
+    expected: Option<(cide_ipc::PaneId, cide_ipc::SessionId)>,
+) -> Result<Mutated, CoreError> {
     // Closing a diff tab **rejects** it, and this is a deliberate divergence worth naming.
     //
     // The protocol's `TAB_CLOSED` means accepted-as-proposed — verified against the real CLI,
@@ -1233,7 +1246,7 @@ pub fn tab_close(
     // a user who means to accept has a button that says so. A `×` on a tab reads as dismiss,
     // and resolving a dismissal as acceptance would write a file change on a gesture nobody
     // makes with that intent. Rejection is recoverable; a write is not.
-    let dismissed = crate::ide::request_id_for_tab(&state, project, tab);
+    let dismissed = crate::ide::request_id_for_tab(state, project, tab);
 
     // Read *before* the close, because after it there is nothing left to read. `with` rather
     // than a second `update`, so the record describes the tab as it stood one instant before it
@@ -1244,6 +1257,14 @@ pub fn tab_close(
     let ending = state.with(|ws| ephemeral_sessions(ws, project, tab));
 
     let out = state.update(|ws| {
+        if let Some((pane, session)) = expected {
+            let target = crate::remote::console_close_target(ws, project, pane, session)?;
+            if target != (tab, true) {
+                return Err(CoreError::Invariant(
+                    "that console's tab changed; try again".into(),
+                ));
+            }
+        }
         workspace::close_tab(ws, project, tab, force)?;
         Ok(Mutated { rev: ws.rev })
     })?;
@@ -1284,7 +1305,7 @@ pub fn tab_close(
 
     // Same reason as `project_close`: a tab can own detached windows, and their roles have
     // just been pruned.
-    crate::cmd::window::reconcile(&app, &state)?;
+    crate::cmd::window::reconcile(&app, state)?;
     Ok(out)
 }
 

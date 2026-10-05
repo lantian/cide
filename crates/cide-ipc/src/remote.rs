@@ -112,6 +112,18 @@ pub struct RemoteSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_title: Option<String>,
     pub title: String,
+    /// Actual CLI, rather than the setting for the next console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness: Option<Harness>,
+    /// Which desktop surface holds this pane. Older servers omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub location: Option<ConsoleLocation>,
+    /// Closing is offered only for consoles in ordinary tabs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub can_close: Option<bool>,
     pub kind: PaneKind,
     pub role: PaneRole,
     pub state: SessionState,
@@ -133,6 +145,16 @@ pub struct RemoteSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub task: Option<TaskId>,
+}
+
+/// A console's desktop location, independent of its harness or pane role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ConsoleLocation {
+    Main,
+    Tab,
+    Detached,
 }
 
 /// One entry of the *finished and not yet looked at* set.
@@ -344,21 +366,29 @@ pub enum ClientBody {
     /// may send it once: anything else, or a second attempt, closes the socket. A short code is
     /// only strong against a single guess, so a retry budget is exactly what would make it
     /// guessable.
-    Pair { code: String, client: ClientInfo },
+    Pair {
+        code: String,
+        client: ClientInfo,
+    },
     /// Say which protocol this device speaks. The first frame of a resumed connection.
     ///
     /// **It carries no credential**, and that is the point of the sealed transport: the device
     /// was identified in the handshake and authenticated by being able to seal a frame this cide
     /// could open. There is nothing here for anybody watching the network to take, because after
     /// pairing nothing is ever sent.
-    Hello { protocol: u32, client: ClientInfo },
+    Hello {
+        protocol: u32,
+        client: ClientInfo,
+    },
     /// Declare, in full, which projects this connection wants news about.
     ///
     /// **A replace and never a delta.** An array that says what the set *is* can be re-sent
     /// after a reconnect and leave the server in a known state; one that says what the caller
     /// *did* cannot, because the server has no way to tell a repeat from a change. The same rule
     /// `cide_task_link` states for a task's links.
-    Subscribe { projects: Vec<ProjectId> },
+    Subscribe {
+        projects: Vec<ProjectId>,
+    },
     /// Answer a permission prompt by tapping one of its options.
     ///
     /// `expect_screen` is the digest of the prompt the device was *shown*. The server re-reads
@@ -433,16 +463,22 @@ pub enum ClientBody {
     /// **One session, never a set.** `ui/src/panes/awaiting.ts` states the rule and the reason: a
     /// surface that has observed nothing yet would report its empty set and clear every marker in
     /// the application. A device consumes the whole set and reports one entry at a time.
-    Acknowledge { session: SessionId },
+    Acknowledge {
+        session: SessionId,
+    },
     /// Start receiving repaints of this session's screen.
     ///
     /// Watching is what costs cide anything: with nothing watched, no grid is read and no timer
     /// runs. A device that is looking at a list rather than a terminal should watch nothing, and
     /// that is the difference between a companion app somebody keeps and one they delete for
     /// eating the battery.
-    WatchScreen { session: SessionId },
+    WatchScreen {
+        session: SessionId,
+    },
     /// Stop. Implied by the connection ending.
-    UnwatchScreen { session: SessionId },
+    UnwatchScreen {
+        session: SessionId,
+    },
     /// A page of retained scrollback, counted in lines from the **oldest**.
     ///
     /// From the top because the scrollback grows from the bottom: an offset from the end names a
@@ -484,9 +520,13 @@ pub enum ClientBody {
         run: Option<RunId>,
     },
     /// Put a role onto a task.
-    Dispatch { request: DispatchRequest },
+    Dispatch {
+        request: DispatchRequest,
+    },
     /// Create a task.
-    TaskNew { task: TaskNew },
+    TaskNew {
+        task: TaskNew,
+    },
     /// Edit one.
     ///
     /// Answered with nothing on success: the new board arrives on its own, because a device that
@@ -501,7 +541,10 @@ pub enum ClientBody {
     ///
     /// A device holds rows and asks for a body only when somebody opens one — the board carries
     /// no content for the reason `TaskRow` exists at all.
-    TaskGet { project: ProjectId, task: TaskId },
+    TaskGet {
+        project: ProjectId,
+        task: TaskId,
+    },
     /// Atomic user response. Offered when features contains `"taskRespond"`.
     TaskRespond {
         project: ProjectId,
@@ -532,7 +575,9 @@ pub enum ClientBody {
     /// Answered with [`ServerBody::Milestones`]; a subscribed project is also pushed one whenever
     /// a gate starts or finishes, so a device learns "running" and the verdict without polling.
     /// Offered when `features` carries `"milestones"`.
-    MilestonesGet { project: ProjectId },
+    MilestonesGet {
+        project: ProjectId,
+    },
     /// Run a milestone's gate now, in the background. The verdict arrives as a pushed
     /// [`ServerBody::Milestones`] — twice, as on the desk: once running, once finished.
     GateRun {
@@ -549,9 +594,15 @@ pub enum ClientBody {
     /// it exactly as the desk's Proposal card would. Answered with the new
     /// [`ServerBody::Milestones`]; refused, with nothing changed, when a file it changes has moved
     /// since it was proposed. (M91)
-    ProposalAccept { project: ProjectId, id: String },
+    ProposalAccept {
+        project: ProjectId,
+        id: String,
+    },
     /// Dequeue a proposal; nothing is changed. Answered with the new [`ServerBody::Milestones`].
-    ProposalReject { project: ProjectId, id: String },
+    ProposalReject {
+        project: ProjectId,
+        id: String,
+    },
     /// The full output of a gate (`kind: "gate"`, `key` a milestone id) or of a verify
     /// (`"verify"`, `key` a task id) — the last MiB of it. Answered with [`ServerBody::CheckLog`].
     CheckLog {
@@ -579,6 +630,32 @@ pub enum ClientBody {
         #[ts(type = "number")]
         offset: u64,
         len: u32,
+    },
+    /// Close one ordinary-tab console, guarded against a changed session binding.
+    ConsoleClose {
+        project: ProjectId,
+        pane: PaneId,
+        session: SessionId,
+    },
+    /// Start a connection-owned upload into the session's working directory.
+    ConsoleUploadBegin {
+        session: SessionId,
+        name: String,
+        #[ts(type = "number")]
+        size: u64,
+    },
+    /// Standard base64, at most ATTACHMENT_CHUNK bytes after decoding.
+    ConsoleUploadChunk {
+        upload: String,
+        #[ts(type = "number")]
+        offset: u64,
+        data: String,
+    },
+    ConsoleUploadFinish {
+        upload: String,
+    },
+    ConsoleUploadCancel {
+        upload: String,
     },
     /// Keep the connection honest. RN's `WebSocket` exposes no protocol-level ping, and a NAT
     /// mapping that has gone away is otherwise indistinguishable from a quiet server.
@@ -696,6 +773,30 @@ pub enum ServerBody {
     TaskResponded {
         project: ProjectId,
         task: TaskId,
+    },
+    /// A requested paste reached the input watermark; unrequested typing remains silent.
+    PasteAccepted {
+        session: SessionId,
+        #[ts(type = "number")]
+        seq: u64,
+    },
+    ConsoleClosed {
+        pane: PaneId,
+    },
+    ConsoleUploadReady {
+        upload: String,
+    },
+    ConsoleUploadProgress {
+        upload: String,
+        #[ts(type = "number")]
+        offset: u64,
+    },
+    ConsoleUploadFinished {
+        upload: String,
+        path: String,
+    },
+    ConsoleUploadCancelled {
+        upload: String,
     },
     /// A watched session repainted.
     Screen {
@@ -1092,6 +1193,9 @@ mod tests {
             tab: None,
             tab_title: None,
             title: "claude".to_owned(),
+            harness: None,
+            location: None,
+            can_close: None,
             kind: PaneKind::Claude,
             role: PaneRole::Primary,
             state: SessionState::Idle,

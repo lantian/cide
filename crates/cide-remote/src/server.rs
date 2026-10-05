@@ -157,6 +157,8 @@ pub const FEATURES: &[&str] = &[
     // A task attachment's bytes, a slice at a time. (M136)
     "attachments",
     "taskRespond",
+    "consoleClose",
+    "consoleUpload",
 ];
 
 /// Something that happened in cide, on its way to whichever devices care.
@@ -1025,6 +1027,7 @@ async fn serve(
     let desynced = Arc::new(AtomicBool::new(false));
     let authenticated = Arc::new(AtomicBool::new(false));
     let subscribed = Arc::new(Mutex::new(Vec::new()));
+    let uploads = Arc::new(Mutex::new(crate::uploads::Uploads::default()));
     let watches: Watches = Arc::new(Mutex::new(std::collections::HashMap::new()));
     inner.conns.lock().push(Conn {
         id,
@@ -1269,6 +1272,159 @@ async fn serve(
             }
 
             // --- authenticated ----------------------------------------------------------
+            (
+                true,
+                ClientBody::ConsoleClose {
+                    project,
+                    pane,
+                    session,
+                },
+            ) => {
+                match ask(&inner, move |host| {
+                    host.console_close(project, pane, session)
+                })
+                .await
+                {
+                    Ok(()) => {
+                        if say(&out_tx, id_of, ServerBody::ConsoleClosed { pane })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if refused(&out_tx, id_of, Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            (
+                true,
+                ClientBody::ConsoleUploadBegin {
+                    session,
+                    name,
+                    size,
+                },
+            ) => {
+                let held = Arc::clone(&uploads);
+                let done = ask(&inner, move |host| {
+                    let root = host.console_upload_root(session)?;
+                    held.lock().begin(session, &root, &name, size)
+                })
+                .await;
+                match done {
+                    Ok(upload) => {
+                        if say(&out_tx, id_of, ServerBody::ConsoleUploadReady { upload })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if refused(&out_tx, id_of, Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            (
+                true,
+                ClientBody::ConsoleUploadChunk {
+                    upload,
+                    offset,
+                    data,
+                },
+            ) => {
+                let held = Arc::clone(&uploads);
+                let token = upload.clone();
+                let done = ask(&inner, move |_host| {
+                    use base64::Engine as _;
+                    if data.len() > cide_ipc::remote::ATTACHMENT_CHUNK as usize * 4 / 3 {
+                        return Err("invalid upload chunk size".to_owned());
+                    }
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|_| "invalid upload base64".to_owned())?;
+                    held.lock().chunk(&token, offset, &bytes)
+                })
+                .await;
+                match done {
+                    Ok(offset) => {
+                        if say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::ConsoleUploadProgress { upload, offset },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if refused(&out_tx, id_of, Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            (true, ClientBody::ConsoleUploadFinish { upload }) => {
+                let held = Arc::clone(&uploads);
+                let token = upload.clone();
+                let done = ask(&inner, move |host| {
+                    let mut held = held.lock();
+                    host.console_upload_root(held.session(&token)?)?;
+                    held.finish(&token)
+                })
+                .await;
+                match done {
+                    Ok(path) => {
+                        if say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::ConsoleUploadFinished { upload, path },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if refused(&out_tx, id_of, Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            (true, ClientBody::ConsoleUploadCancel { upload }) => {
+                let held = Arc::clone(&uploads);
+                let token = upload.clone();
+                let done = ask(&inner, move |_host| held.lock().cancel(&token)).await;
+                match done {
+                    Ok(()) => {
+                        if say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::ConsoleUploadCancelled { upload },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if refused(&out_tx, id_of, Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
             (true, ClientBody::Ping) => {
                 if say(&out_tx, id_of, ServerBody::Pong).await.is_err() {
                     break;
@@ -1386,18 +1542,14 @@ async fn serve(
                     continue;
                 };
                 let bytes = crate::keys::paste(&text, &modes);
-                if let Err(why) = write_into(&inner, session, bytes, &writer_tag, id, seq).await
-                    && say(
-                        &out_tx,
-                        id_of,
-                        ServerBody::Error {
-                            kind: error_kind::REFUSED.to_owned(),
-                            detail: why,
-                        },
-                    )
-                    .await
-                    .is_err()
-                {
+                let sent = match write_into(&inner, session, bytes, &writer_tag, id, seq).await {
+                    Ok(()) if id_of.is_some() => {
+                        say(&out_tx, id_of, ServerBody::PasteAccepted { session, seq }).await
+                    }
+                    Ok(()) => Ok(()),
+                    Err(why) => refused(&out_tx, id_of, Err(why)).await,
+                };
+                if sent.is_err() {
                     break;
                 }
             }
@@ -2371,6 +2523,9 @@ mod tests {
             tab: None,
             tab_title: None,
             title: "claude".to_owned(),
+            harness: None,
+            location: None,
+            can_close: None,
             kind: PaneKind::Claude,
             role: PaneRole::Primary,
             state: SessionState::Idle,

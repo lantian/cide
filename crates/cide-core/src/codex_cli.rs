@@ -150,6 +150,21 @@ impl RefusedKey {
 
 pub const REFUSED_KEYS: &[RefusedKey] = &[
     RefusedKey {
+        prefix: "tui.notifications",
+        reason: "cide uses Codex's approval-requested terminal notifications to detect when a human approval prompt is displayed.",
+        because: |i| i.hooks,
+    },
+    RefusedKey {
+        prefix: "tui.notification_method",
+        reason: "cide reads OSC 9 approval notifications from the terminal stream.",
+        because: |i| i.hooks,
+    },
+    RefusedKey {
+        prefix: "tui.notification_condition",
+        reason: "cide needs approval notifications even when the terminal has focus.",
+        because: |i| i.hooks,
+    },
+    RefusedKey {
         prefix: "hooks",
         reason: "cide installs its own hooks on this command line — they are how a codex pane \
                  reports busy, awaiting and which conversation it is on. A second table here \
@@ -547,13 +562,13 @@ pub fn push_config(args: &mut Vec<String>, key: &str, toml_value: String) {
     args.push(format!("{key}={toml_value}"));
 }
 
-/// The hook table for `events`, as `-c` overrides, followed by [`BYPASS_HOOK_TRUST`].
+/// The hook table for `events`, [`BYPASS_HOOK_TRUST`], and approval-only OSC 9 notifications.
 ///
 /// `events` are the CLI's own spellings — `cide_claude::HookEvent::CODEX`, passed in as strings
 /// because this crate sits below `cide-claude`. One entry per event with an empty matcher (every
 /// tool), each running `<hook_bin> <Event>`: `cide-claude`'s `inline_settings` shape, in TOML.
 pub fn hook_overrides(hook_bin: &str, events: &[&str]) -> Vec<String> {
-    let mut args = Vec::with_capacity(events.len() * 2 + 1);
+    let mut args = Vec::with_capacity(events.len() * 2 + 7);
     for event in events {
         let command = toml_string(&format!("{hook_bin} {event}"));
         push_config(
@@ -563,6 +578,16 @@ pub fn hook_overrides(hook_bin: &str, events: &[&str]) -> Vec<String> {
         );
     }
     args.push(BYPASS_HOOK_TRUST.to_string());
+    // PermissionRequest runs before auto-review. The TUI notification is the signal
+    // that an approval prompt was actually displayed. Restrict this stream to approvals;
+    // turn completion and interactive questions already arrive through hooks.
+    for config in [
+        r#"tui.notifications=["approval-requested"]"#,
+        r#"tui.notification_method="osc9""#,
+        r#"tui.notification_condition="always""#,
+    ] {
+        args.extend(["-c".to_string(), config.to_string()]);
+    }
     args
 }
 
@@ -985,6 +1010,12 @@ mod tests {
                 "-c",
                 r#"hooks.Stop=[{matcher="",hooks=[{type="command",command="/opt/cide/cide-hook Stop"}]}]"#,
                 BYPASS_HOOK_TRUST,
+                "-c",
+                r#"tui.notifications=["approval-requested"]"#,
+                "-c",
+                r#"tui.notification_method="osc9""#,
+                "-c",
+                r#"tui.notification_condition="always""#,
             ]
         );
     }
@@ -997,6 +1028,22 @@ mod tests {
             "{}",
             args[1]
         );
+    }
+
+    #[test]
+    fn approval_notification_keys_belong_to_cide_only_while_hooks_are_injected() {
+        let mut injected = Injected::from(&CodexInjections::default());
+        for config in [
+            "tui.notifications=false",
+            r#"tui.notification_method="bel""#,
+            r#"tui.notification_condition="unfocused""#,
+        ] {
+            assert!(config_verdict(config, &injected).is_refused());
+            injected.hooks = false;
+            assert!(!config_verdict(config, &injected).is_refused());
+            injected.hooks = true;
+        }
+        assert!(!config_verdict("tui.theme=dark", &injected).is_refused());
     }
 
     #[test]

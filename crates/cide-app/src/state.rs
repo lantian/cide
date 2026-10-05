@@ -24,6 +24,9 @@ pub struct SessionRegistry {
     applied_write: DashMap<WriterKey, WriteMark>,
     /// When each live session's child was forked. See [`Self::started`].
     started: DashMap<SessionId, std::time::SystemTime>,
+    /// This child was supplied an opening prompt. Unknown hook state alone is not work:
+    /// an unprompted Codex console can stay at its composer without ever sending a hook.
+    opening_prompts: DashMap<SessionId, ()>,
     /// Which CLI each **console** session runs. (M93) See [`Self::harness_of`].
     harnesses: DashMap<SessionId, cide_ipc::Harness>,
     /// Latest hook identity, retained even when its pane has not bound yet.
@@ -102,12 +105,34 @@ pub struct AttachmentKey {
 
 impl SessionRegistry {
     pub fn insert(&self, id: SessionId, session: Arc<PtySession>) {
+        self.insert_prompted(id, session, false);
+    }
+
+    pub(crate) fn insert_prompted(
+        &self,
+        id: SessionId,
+        session: Arc<PtySession>,
+        opening_prompt: bool,
+    ) {
         // Stamped on every insert, restarts included — `claude.restart` forks a new child under
         // the same [`SessionId`], and the whole point of the stamp is that the new one *has*
         // read whatever was on disk by then. A registry that kept the first time would go on
         // refusing a conversation the user had already restarted.
         self.started.insert(id, std::time::SystemTime::now());
+        self.opening_prompts.remove(&id);
+        if opening_prompt {
+            self.note_opening_prompt(id);
+        }
         self.sessions.insert(id, session);
+    }
+
+    /// For a prompt typed after spawning, before publishing the automated pane.
+    pub(crate) fn note_opening_prompt(&self, id: SessionId) {
+        self.opening_prompts.insert(id, ());
+    }
+
+    pub(crate) fn has_opening_prompt(&self, id: SessionId) -> bool {
+        self.opening_prompts.contains_key(&id)
     }
 
     /// When this session's current child was forked, wall-clock.
@@ -229,6 +254,7 @@ impl SessionRegistry {
         // long before it reaches a watermark, so keeping them would only be dead entries.
         self.applied_write.retain(|k, _| k.session != id);
         self.started.remove(&id);
+        self.opening_prompts.remove(&id);
         self.harnesses.remove(&id);
         self.conversations.remove(&id);
         self.native_conversations.remove(&id);
@@ -314,6 +340,26 @@ mod tests {
 
     fn null_sink() -> Arc<dyn Sink> {
         Arc::new(|_: &[u8]| true)
+    }
+
+    #[test]
+    fn restoring_or_replacing_a_child_does_not_inherit_its_opening_prompt() {
+        let registry = SessionRegistry::default();
+        let id = SessionId::new();
+        let session = idle_session();
+        registry.insert_prompted(id, Arc::clone(&session), true);
+        assert!(registry.has_opening_prompt(id));
+        // A restored pane may still say Planner; its new child received no prompt.
+        registry.insert(id, Arc::clone(&session));
+        assert!(!registry.has_opening_prompt(id));
+        registry.note_opening_prompt(id);
+        assert!(
+            registry.has_opening_prompt(id),
+            "a typed opening also holds startup"
+        );
+        registry.remove(id);
+        assert!(!registry.has_opening_prompt(id));
+        session.kill();
     }
 
     #[test]

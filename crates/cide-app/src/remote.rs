@@ -142,6 +142,27 @@ pub fn sessions(
                 tab: found.tab,
                 tab_title: found.tab_title.clone(),
                 title: found.pane.title.clone(),
+                harness: found
+                    .pane
+                    .harness
+                    .or_else(|| found.pane.continues.as_ref().map(|c| c.harness))
+                    .or_else(|| {
+                        (found.pane.kind == cide_ipc::PaneKind::Claude)
+                            .then_some(cide_ipc::Harness::Claude)
+                    }),
+                location: Some(match found.tab {
+                    None => cide_ipc::remote::ConsoleLocation::Detached,
+                    Some(tab)
+                        if cide_core::workspace::console_tab(ws, found.project).ok()
+                            == Some(tab) =>
+                    {
+                        cide_ipc::remote::ConsoleLocation::Main
+                    }
+                    Some(_) => cide_ipc::remote::ConsoleLocation::Tab,
+                }),
+                can_close: Some(found.tab.is_some_and(|tab| {
+                    cide_core::workspace::console_tab(ws, found.project).ok() != Some(tab)
+                })),
                 kind: found.pane.kind,
                 role: found.pane.role,
                 state: facts.state(found.session),
@@ -228,6 +249,38 @@ impl AppRemoteHost {
         // `emit::last_session_states`.
         SessionFacts::gather(crate::emit::last_session_states(), agents, ws, only)
     }
+}
+
+/// A stale tap must never close a pane that has been rebound, or any pane of the pinned tab.
+pub(crate) fn console_close_target(
+    ws: &Workspace,
+    project: ProjectId,
+    pane: cide_ipc::PaneId,
+    session: SessionId,
+) -> Result<(cide_ipc::TabId, bool), cide_core::CoreError> {
+    use cide_core::{CoreError, workspace};
+    let p = workspace::project(ws, project)?;
+    for tab in &p.tabs {
+        if let Some(found) = tab.tree.panes.get(&pane) {
+            if !tab.kind.closable() {
+                return Err(CoreError::TabPinned);
+            }
+            if found.session != Some(session)
+                || !matches!(
+                    found.kind,
+                    cide_ipc::PaneKind::Claude | cide_ipc::PaneKind::Shell
+                )
+            {
+                return Err(CoreError::Invariant(
+                    "that console changed; refresh the list".into(),
+                ));
+            }
+            return Ok((tab.id, tab.tree.panes.len() == 1));
+        }
+    }
+    Err(CoreError::Invariant(
+        "that console is no longer in a tab".into(),
+    ))
 }
 
 impl RemoteHost for AppRemoteHost {
@@ -486,6 +539,97 @@ impl RemoteHost for AppRemoteHost {
             pty.write(bytes);
         }
         Ok(())
+    }
+
+    fn console_close(
+        &self,
+        project: ProjectId,
+        pane: cide_ipc::PaneId,
+        session: SessionId,
+    ) -> Result<(), String> {
+        let state = self.app.state::<WorkspaceState>();
+        let (tab, last) = state
+            .with(|ws| console_close_target(ws, project, pane, session))
+            .map_err(|e| e.to_string())?;
+        if last {
+            crate::cmd::project::close_tab_checked(
+                self.app.clone(),
+                &state,
+                project,
+                tab,
+                false,
+                Some((pane, session)),
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            let owned = state
+                .update(|ws| {
+                    let (current, last) = console_close_target(ws, project, pane, session)?;
+                    if current != tab || last {
+                        return Err(cide_core::CoreError::Invariant(
+                            "that console changed; try again".into(),
+                        ));
+                    }
+                    cide_core::workspace::close_pane(ws, project, tab, pane, false)?;
+                    Ok(!cide_core::workspace::session_panes(ws, None)
+                        .iter()
+                        .any(|p| p.session == session))
+                })
+                .map_err(|e| e.to_string())?;
+            // A borrowed run's console, or any remaining mirror, keeps the shared child alive.
+            let borrowed = self.app.try_state::<Arc<AgentRegistry>>().is_some_and(|r| {
+                r.runs_for(project)
+                    .iter()
+                    .any(|r| r.session == Some(session))
+            });
+            if owned
+                && !borrowed
+                && let Some(registry) = self.app.try_state::<SessionRegistry>()
+                && let Some(pty) = registry.get(session)
+            {
+                pty.kill();
+            }
+            crate::cmd::window::reconcile(&self.app, &state).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn console_upload_root(&self, session: SessionId) -> Result<std::path::PathBuf, String> {
+        let registry = self.app.state::<SessionRegistry>();
+        let pty = registry
+            .get(session)
+            .ok_or_else(|| "that session is not running here".to_owned())?;
+        if pty.has_exited() {
+            return Err("that session has exited".into());
+        }
+        let state = self.app.state::<WorkspaceState>();
+        let container = state.with(|ws| {
+            cide_core::workspace::session_panes(ws, None)
+                .iter()
+                .any(|p| p.session == session && p.pane.docker.is_some())
+        });
+        if container {
+            return Err("phone attachments are available for consoles on this machine".into());
+        }
+        let cwd = pty.spawn_cwd();
+        // The exclude lives in the common Git directory, including for a linked worktree.
+        // Runtime uploads stay local without editing the project's tracked .gitignore.
+        if let Ok(dirs) = cide_git::worktree::git_dirs(cwd) {
+            use std::io::Write;
+            let path = dirs.common_dir.join("info/exclude");
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            let pattern = "**/.cide/mobile-uploads/";
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            if !current.lines().any(|line| line == pattern) {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|e| e.to_string())?;
+                writeln!(file, "\n{pattern}").map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(cwd.join(".cide/mobile-uploads"))
     }
 
     fn run_stop(
@@ -1256,6 +1400,91 @@ mod tests {
         };
         ws.settings.proxy.http = format!("http://user:{PLANTED_KEY}@proxy.corp:3128");
         ws
+    }
+
+    #[test]
+    fn phone_close_protects_all_main_panes_and_checks_the_session_binding() {
+        use cide_core::{layout, workspace};
+        use cide_ipc::{Axis, PaneRole, Side, TabKind};
+        let mut ws = workspace_holding_a_key();
+        let project = *ws.projects.keys().next().unwrap();
+        let home = workspace::console_tab(&ws, project).unwrap();
+        let primary = workspace::tab(&ws, project, home).unwrap().tree.focused;
+        let session = workspace::tab(&ws, project, home).unwrap().tree.panes[&primary]
+            .session
+            .unwrap();
+        assert!(matches!(
+            console_close_target(&ws, project, primary, session),
+            Err(cide_core::CoreError::TabPinned)
+        ));
+        let mut aux = workspace::tab(&ws, project, home).unwrap().tree.panes[&primary].clone();
+        aux.id = cide_ipc::PaneId::new();
+        aux.role = PaneRole::Auxiliary;
+        aux.session = Some(SessionId::new());
+        let extra = layout::split(
+            &mut workspace::tab_mut(&mut ws, project, home).unwrap().tree,
+            primary,
+            Axis::Row,
+            Side::After,
+            aux.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            console_close_target(&ws, project, extra, aux.session.unwrap()),
+            Err(cide_core::CoreError::TabPinned)
+        ));
+        aux.id = cide_ipc::PaneId::new();
+        let pane = aux.id;
+        let sid = aux.session.unwrap();
+        let tab = workspace::open_tab(
+            &mut ws,
+            project,
+            TabKind::ClaudeFull {
+                title: "Phone".into(),
+                ephemeral: false,
+            },
+            aux.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            console_close_target(&ws, project, pane, sid).unwrap(),
+            (tab, true)
+        );
+        assert!(console_close_target(&ws, project, pane, SessionId::new()).is_err());
+        aux.id = cide_ipc::PaneId::new();
+        aux.session = Some(SessionId::new());
+        layout::split(
+            &mut workspace::tab_mut(&mut ws, project, tab).unwrap().tree,
+            pane,
+            Axis::Col,
+            Side::After,
+            aux,
+        )
+        .unwrap();
+        assert_eq!(
+            console_close_target(&ws, project, pane, sid).unwrap(),
+            (tab, false)
+        );
+        workspace::detach_pane(&mut ws, project, tab, pane).unwrap();
+        assert!(console_close_target(&ws, project, pane, sid).is_err());
+    }
+
+    #[test]
+    fn phone_projection_reports_actual_harness_and_main_protection() {
+        let mut ws = workspace_holding_a_key();
+        let project = *ws.projects.keys().next().unwrap();
+        let home = cide_core::workspace::console_tab(&ws, project).unwrap();
+        let tab = cide_core::workspace::tab_mut(&mut ws, project, home).unwrap();
+        let pane = tab.tree.panes.get_mut(&tab.tree.focused).unwrap();
+        pane.harness = Some(cide_ipc::Harness::Codex);
+        let facts = SessionFacts::gather(HashMap::new(), None, &ws, None);
+        let projected = sessions(&ws, &facts, None);
+        assert_eq!(projected[0].harness, Some(cide_ipc::Harness::Codex));
+        assert_eq!(
+            projected[0].location,
+            Some(cide_ipc::remote::ConsoleLocation::Main)
+        );
+        assert_eq!(projected[0].can_close, Some(false));
     }
 
     /// A device asking cide to copy a desktop file into a task is refused whole. (M136)

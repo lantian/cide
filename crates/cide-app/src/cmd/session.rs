@@ -1430,6 +1430,7 @@ pub(crate) async fn spawn_session(
         (Some(seed), true) if opening.is_none() => Some(seed.clone()),
         _ => opening,
     };
+    let opening_prompt = opening.is_some() || (is_claude && seed.is_some());
 
     // The user's launch configuration, filtered. Enforced *here* as well as on the Settings
     // screen and not instead of it: `workspace.json` is hand-editable and `settings_set` is one
@@ -1691,6 +1692,15 @@ pub(crate) async fn spawn_session(
         // exactly as claude's does (measured, M93). Its hook table is already in the argv.
         if is_codex || is_opencode {
             spec = spec.env("CIDE_SESSION", id.to_string());
+        }
+        if is_codex
+            && settings.codex.cli.inject.hooks
+            && spec
+                .args
+                .iter()
+                .any(|arg| arg == r#"tui.notifications=["approval-requested"]"#)
+        {
+            spec.output_observer = Some(server.codex_approval_observer(id));
         }
         if is_claude {
             // The routing key for every frame this child's hooks send. Set only for Claude
@@ -1964,7 +1974,7 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_for_exit(app.clone(), id, &session);
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
-    registry.insert(id, Arc::clone(&session));
+    registry.insert_prompted(id, Arc::clone(&session), opening_prompt);
     if let Some(observer) = opencode {
         registry.note_native_conversation(id, observer.conversation());
         observer.observe(app.clone(), id, &session);
@@ -2921,6 +2931,13 @@ mod tests {
                 .any(|a| a == r#"developer_instructions="roster""#)
         );
         assert!(args.iter().any(|a| a.starts_with("hooks.SessionStart=")));
+        for config in [
+            r#"tui.notifications=["approval-requested"]"#,
+            r#"tui.notification_method="osc9""#,
+            r#"tui.notification_condition="always""#,
+        ] {
+            assert!(args.iter().any(|a| a == config));
+        }
         assert!(
             args.iter()
                 .any(|a| a.starts_with("hooks.PermissionRequest="))

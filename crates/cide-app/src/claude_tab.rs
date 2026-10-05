@@ -338,6 +338,11 @@ pub(crate) fn open(
                 ))
             })?;
 
+    // Claude's opening is typed below; Codex/OpenCode already received it in argv. Mark
+    // both before the pane becomes visible to the planner's quiet detector. This belongs to
+    // this child, not the pane's origin: restoring this tab without a prompt is unprompted.
+    registry.note_opening_prompt(session);
+
     // **Whether the strip moves is the one thing the two modes disagree about on screen.**
     //
     // A reviewer opens *because* a subagent finished while the user was reading something else —
