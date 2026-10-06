@@ -644,7 +644,7 @@ pub fn default_permission_args(
             let mut result = if mode == Mode::ReadOnly {
                 vec!["-s".into(), "read-only".into()]
             } else if let Some(profile) = git_profile {
-                profile.args()
+                profile.args_with_approval_reviewer(mode == Mode::ApproveForMe)
             } else {
                 vec!["-s".into(), "workspace-write".into()]
             };

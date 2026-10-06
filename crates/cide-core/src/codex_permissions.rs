@@ -56,6 +56,22 @@ impl GitProfile {
             format!("default_permissions=\"{PROFILE_NAME}\""),
         ]
     }
+
+    /// Codex highlights the named filesystem profile rather than a built-in approval mode.
+    /// Show the explicitly selected reviewer in that row without changing its permissions.
+    pub fn args_with_approval_reviewer(&self, automatic: bool) -> Vec<String> {
+        let mut args = self.args();
+        codex_cli::push_config(
+            &mut args,
+            &format!("permissions.{PROFILE_NAME}.description"),
+            codex_cli::toml_string(if automatic {
+                "Approve for me; workspace access with scoped Git writes"
+            } else {
+                "Ask for approval; workspace access with scoped Git writes"
+            }),
+        );
+        args
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

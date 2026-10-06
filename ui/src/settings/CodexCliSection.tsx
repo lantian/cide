@@ -130,6 +130,7 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
             <InfoPara>Applies to new, reopened, resumed and forked consoles, agent runs and automatic tabs. Running sessions keep their current mode; use /permissions to change it.</InfoPara>
             <InfoPara>Use Codex config preserves existing launch defaults. Explicit role and review policies take precedence, followed by permission options in Extra arguments. Agent run injection switches still apply.</InfoPara>
             <InfoPara>Approve for me keeps the workspace sandbox and sends eligible approvals to Codex’s automatic reviewer. Full access removes sandbox restrictions and approval prompts. Read-only allows inspection without workspace edits.</InfoPara>
+            <InfoPara>With scoped Git writes enabled, /permissions shows cide-git as current for Ask for approval and Approve for me. The profile description identifies the selected approval mode.</InfoPara>
           </>}
           {...resetTo(cli.permissionMode, def?.permissionMode, (permissionMode) => onChange({ ...cli, permissionMode }))}
           control={<Select<CodexPermissionMode>
