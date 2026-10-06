@@ -366,10 +366,12 @@ impl std::fmt::Debug for LineRender {
     }
 }
 
+type OutputObserverFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// Observes live child output before rendering. Never called for preloads or screen replays.
 /// The callback runs on the coalescer thread: it must not block or re-enter the session.
 #[derive(Clone)]
-pub struct OutputObserver(Arc<dyn Fn(&[u8]) + Send + Sync>);
+pub struct OutputObserver(OutputObserverFn);
 
 impl OutputObserver {
     pub fn new(callback: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {

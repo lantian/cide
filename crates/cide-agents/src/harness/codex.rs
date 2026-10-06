@@ -365,8 +365,8 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
             .and_then(cide_core::codex_permissions::GitPermissions::profile)
             .filter(|_| !review_permissions && sandboxes_writes(policy));
         if let Some(profile) = git_profile {
-            let automatic = policy == AUTO_REVIEW
-                || policy.contains(&"approvals_reviewer=\"auto_review\"");
+            let automatic =
+                policy == AUTO_REVIEW || policy.contains(&"approvals_reviewer=\"auto_review\"");
             let manual = policy.contains(&"approvals_reviewer=\"user\"");
             args.extend(if automatic || manual {
                 profile.args_with_approval_reviewer(automatic)
