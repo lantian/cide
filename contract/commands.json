@@ -284,6 +284,7 @@
   "sessions_list",
   "sessions_open",
   "sessions_search",
+  "sessions_user_inputs",
   "settings_defaults",
   "settings_get",
   "settings_set",

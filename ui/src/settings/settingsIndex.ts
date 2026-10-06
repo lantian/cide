@@ -90,6 +90,8 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'terminal', label: 'Font size', keywords: 'terminal text size' },
   { section: 'terminal', label: 'Scrollback', keywords: 'history lines buffer' },
   { section: 'terminal', label: 'Renderer', keywords: 'webgl dom gpu' },
+  { section: 'claudeSessions', tab: 'messages', label: 'Show recap', keywords: 'claude codex prompt input history conversation' },
+  { section: 'claudeSessions', tab: 'messages', label: 'Highlight user input', keywords: 'claude codex prompt message colour color' },
   { section: 'terminal', label: 'Render JSON log lines', keywords: 'structured logs json' },
   { section: 'terminal', label: 'Announce a job after (seconds)', keywords: 'notification long running command threshold' },
   { section: 'claudeSessions', tab: 'console', label: 'Version', keywords: 'claude codex cli version untested' },

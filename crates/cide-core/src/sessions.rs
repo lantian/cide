@@ -291,9 +291,10 @@ pub fn worktree_name(root: &Path, cwd: &Path) -> Option<String> {
 //
 // * claude and qwen: `{"type":"user","message":{"content": "…" | [{"type":"text","text":"…"}]}}`,
 //   with `isMeta: true` on lines the CLI wrote itself, and qwen's `message.parts[].text`;
-// * codex: `{"type":"event_msg","payload":{"type":"user_message","message":"…"}}` for what the
-//   user typed — its `response_item` user messages also carry AGENTS.md and approval-review
-//   preambles, which are not what anybody would call the first prompt.
+// * codex: `event_msg` with `user_message.message`, or (0.160) `item_completed` with a
+//   `UserMessage` item's `content[].text`, for what the user typed. Its `response_item` user
+//   messages also carry AGENTS.md and approval-review preambles, which are not what anybody
+//   would call the first prompt. Read the completed user item, not that model-input mirror.
 
 /// How much of a transcript the first-prompt reader looks at. The first user message is near the
 /// top; a transcript whose first megabyte holds none has nothing a row could show.
@@ -341,7 +342,7 @@ fn is_typed(text: &str) -> bool {
 }
 
 /// The texts of a user message line, in any of the three shapes above; empty for anything else.
-fn user_texts(value: &serde_json::Value) -> Vec<String> {
+pub(crate) fn user_texts(value: &serde_json::Value) -> Vec<String> {
     if value["type"] == "user" && value["isMeta"] != true {
         return texts_of(&value["message"]);
     }
@@ -350,6 +351,12 @@ fn user_texts(value: &serde_json::Value) -> Vec<String> {
             .as_str()
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default();
+    }
+    if value["type"] == "event_msg"
+        && value["payload"]["type"] == "item_completed"
+        && value["payload"]["item"]["type"] == "UserMessage"
+    {
+        return texts_of(&value["payload"]["item"]);
     }
     Vec::new()
 }

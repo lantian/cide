@@ -1,0 +1,15 @@
+{"type":"session_meta","payload":{"id":"test-thread","cli_version":"0.160.0"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /project\nInjected instructions"},{"type":"input_text","text":"<environment_context>injected environment</environment_context>"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["agents_md.instructions","environments.environment_context"]}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"test-thread","turn_id":"turn-1","item":{"type":"UserMessage","id":"user-1","client_id":"client-1","content":[{"type":"text","text":"hi","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"Hi! What would you like to work on?"}]}}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"How are you?"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}}}
+{"type":"event_msg","payload":{"type":"item_started","item":{"type":"UserMessage","id":"user-2","content":[{"type":"text","text":"How are you?"}]}}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"test-thread","turn_id":"turn-2","item":{"type":"UserMessage","id":"user-2","client_id":"client-2","content":[{"type":"text","text":"How are you?","text_elements":[]}]},"started_at_ms":2,"completed_at_ms":2}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"Doing well, thanks! How are you?"}]}}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"test-thread","turn_id":"turn-3","item":{"type":"UserMessage","id":"user-3","client_id":"client-3","content":[{"type":"text","text":"How are you?","text_elements":[]},{"type":"image","url":"image placeholder"}]},"started_at_ms":3,"completed_at_ms":3}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":"echo tool output","content":[{"type":"text","text":"tool output"}]}}}

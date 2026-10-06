@@ -941,6 +941,28 @@ pub fn milestones_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
 /// neither of which the journal itself holds.
 pub const SESSIONS_CHANGED: &str = "cide://sessions-changed";
 
+/// Only invalidation crosses the wire; paged text is fetched once per conversation/window.
+pub const USER_INPUTS_CHANGED: &str = "cide://user-inputs-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserInputsChanged {
+    project: cide_ipc::ProjectId,
+    id: String,
+}
+
+pub fn user_inputs_changed(app: &AppHandle, project: cide_ipc::ProjectId, id: &str) {
+    if let Err(error) = app.emit(
+        USER_INPUTS_CHANGED,
+        UserInputsChanged {
+            project,
+            id: id.into(),
+        },
+    ) {
+        tracing::debug!(%error, "user-inputs-changed reached no window");
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionsChanged {

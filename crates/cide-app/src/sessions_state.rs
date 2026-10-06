@@ -34,9 +34,9 @@ use std::time::Duration;
 use cide_core::persist::{self, Debouncer};
 use cide_core::sessions::{Journal, TranscriptHead};
 use cide_ipc::agents::Harness;
-use cide_ipc::sessions::{SessionListing, SessionRecord, SessionRow};
+use cide_ipc::sessions::{SessionListing, SessionRecord, SessionRow, UserInputPage};
 use cide_ipc::{PaneId, ProjectId, SessionId, Workspace};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tauri::{AppHandle, Manager};
 
 use crate::state::SessionRegistry;
@@ -55,6 +55,14 @@ pub struct SessionsState {
     /// Transcript → how many bytes it held when its head was last read. A transcript that has not
     /// grown has nothing new to say, and one that is not live never grows.
     heads: Mutex<HashMap<PathBuf, u64>>,
+    inputs: Mutex<HashMap<PathBuf, cide_core::user_inputs::TranscriptInputs>>,
+    announced_inputs: Mutex<HashMap<PathBuf, (u32, u32)>>,
+    /// In particular, Codex's rollout lookup walks dated directories. Resolve once rather
+    /// than repeating that walk for every live thread at every poll.
+    input_paths: Mutex<HashMap<(PathBuf, String), PathBuf>>,
+    codex_activations: Mutex<HashMap<SessionId, (PathBuf, i64)>>,
+    wake: Condvar,
+    wake_pending: Mutex<bool>,
 }
 
 fn journal_path() -> PathBuf {
@@ -72,6 +80,12 @@ impl SessionsState {
             debounce: Debouncer::default(),
             changed: Mutex::new(BTreeSet::new()),
             heads: Mutex::new(HashMap::new()),
+            inputs: Mutex::new(HashMap::new()),
+            announced_inputs: Mutex::new(HashMap::new()),
+            input_paths: Mutex::new(HashMap::new()),
+            codex_activations: Mutex::new(HashMap::new()),
+            wake: Condvar::new(),
+            wake_pending: Mutex::new(false),
         }
     }
 
@@ -82,7 +96,13 @@ impl SessionsState {
             .name("cide-sessions".into())
             .spawn(move || {
                 loop {
-                    thread::sleep(POLL);
+                    let mut pending = state.wake_pending.lock();
+                    if !*pending {
+                        state.wake.wait_for(&mut pending, POLL);
+                    }
+                    *pending = false;
+                    drop(pending);
+                    state.refresh_live_inputs(&app);
                     if state.debounce.take() {
                         state.write_now();
                         state.announce(&app);
@@ -286,6 +306,169 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
 }
 
 impl SessionsState {
+    fn input_path(&self, record: &SessionRecord) -> Option<PathBuf> {
+        let key = (record.cwd.clone(), record.id.clone());
+        if let Some(path) = self.input_paths.lock().get(&key).cloned()
+            && path.is_file()
+        {
+            return Some(path);
+        }
+        let path = transcript_path(record)?;
+        self.input_paths.lock().insert(key, path.clone());
+        Some(path)
+    }
+
+    /// Hooks may precede the transcript append; the ordinary poll retries that race. Waking
+    /// this worker must never read a transcript on the hook applier or GTK loop.
+    pub(crate) fn wake_inputs(&self) {
+        *self.wake_pending.lock() = true;
+        self.wake.notify_one();
+    }
+
+    fn refresh_live_inputs(&self, app: &AppHandle) {
+        self.refresh_codex_identity(app);
+        let Some(workspace) = app.try_state::<WorkspaceState>() else {
+            return;
+        };
+        let projects = workspace.with(|ws| {
+            if !ws.settings.terminal.show_recap && !ws.settings.terminal.highlight_user_input {
+                return Vec::new();
+            }
+            ws.projects
+                .values()
+                .filter_map(|p| p.roots.first().map(|r| (p.id, r.path.clone())))
+                .collect::<Vec<_>>()
+        });
+        let Some(registry) = app.try_state::<SessionRegistry>() else {
+            return;
+        };
+        for (project, root) in projects {
+            let records = self.journal.lock().list(&root);
+            for record in records {
+                if !matches!(record.harness, Harness::Claude | Harness::Codex) {
+                    continue;
+                }
+                let Some(session) = record.session else {
+                    continue;
+                };
+                if registry.get(session).is_none_or(|p| p.has_exited()) {
+                    continue;
+                }
+                // A /clear leaves the old journal row pointing to the same live PTY handle.
+                // Only the conversation currently held by that handle may keep polling.
+                if registry
+                    .native_conversation(session)
+                    .is_some_and(|c| c.id != record.id)
+                    || registry
+                        .conversation_of(session)
+                        .is_some_and(|(c, _)| c.to_string() != record.id)
+                {
+                    continue;
+                }
+                if let Some(path) = self.input_path(&record) {
+                    let version = {
+                        let mut inputs = self.inputs.lock();
+                        let cache = inputs.entry(path.clone()).or_default();
+                        cache.refresh(&path).ok().map(|_| cache.version())
+                    };
+                    if let Some(version) = version
+                        && self.announced_inputs.lock().insert(path, version) != Some(version)
+                    {
+                        crate::emit::user_inputs_changed(app, project, &record.id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `/resume` applies settings without firing a model-turn hook in Codex 0.160. Its process
+    /// keeps writers for visited threads, so use their latest explicit settings activation,
+    /// never directory-wide mtime. This also catches a picker selection and returning to an
+    /// already-open thread. All stat/JSON/process inspection stays on this background worker.
+    fn refresh_codex_identity(&self, app: &AppHandle) {
+        let Some(registry) = app.try_state::<SessionRegistry>() else {
+            return;
+        };
+        let Some(hooks) = app.try_state::<crate::hooks::HookServer>() else {
+            return;
+        };
+        let live = registry.ids();
+        self.codex_activations
+            .lock()
+            .retain(|id, _| live.contains(id));
+        for session in live {
+            if registry.harness_of(session) != Some(Harness::Codex) {
+                continue;
+            }
+            let Some(pty) = registry.get(session).filter(|p| !p.has_exited()) else {
+                continue;
+            };
+            let Some(pid) = pty.child_pid() else { continue };
+            let paths = cide_core::codex_active::owned_rollouts(pid);
+            let mut activations = Vec::new();
+            {
+                let mut inputs = self.inputs.lock();
+                for path in paths {
+                    let cache = inputs.entry(path.clone()).or_default();
+                    if cache.refresh(&path).is_ok()
+                        && let Some(stamp) = cache.activated_at()
+                    {
+                        activations.push((path, stamp));
+                    }
+                }
+            }
+            let Some((path, stamp)) = cide_core::codex_active::latest(activations) else {
+                continue;
+            };
+            let previous = self
+                .codex_activations
+                .lock()
+                .insert(session, (path.clone(), stamp));
+            let Some(thread) = cide_core::codex_active::thread_of(&path)
+                .and_then(|id| id.parse::<SessionId>().ok())
+            else {
+                continue;
+            };
+            // The child's CODEX_HOME may differ from the IDE's. Keep its observed native
+            // path so the recap reads this same rollout rather than searching another home.
+            self.input_paths.lock().insert(
+                (pty.spawn_cwd().to_path_buf(), thread.to_string()),
+                path.clone(),
+            );
+            // A startup snapshot cannot undo a just-applied hook or /clear. A later settings
+            // activation may explicitly resume even a cleared thread, including the same id.
+            let changed = previous
+                .as_ref()
+                .is_some_and(|previous| *previous != (path.clone(), stamp));
+            if registry
+                .conversation_of(session)
+                .is_none_or(|(current, since)| current != thread && stamp >= since as i64)
+                && (!registry.codex_cleared(session) || changed)
+            {
+                hooks.codex_resumed(session, thread, &path, stamp);
+            }
+        }
+    }
+
+    pub(crate) fn input_page(&self, record: &SessionRecord, before: Option<u32>) -> UserInputPage {
+        if matches!(record.harness, Harness::Claude | Harness::Codex)
+            && let Some(path) = self.input_path(record)
+        {
+            let mut inputs = self.inputs.lock();
+            let cache = inputs.entry(path.clone()).or_default();
+            if cache.refresh(&path).is_ok() {
+                return cache.page(before);
+            }
+        }
+        UserInputPage {
+            inputs: Vec::new(),
+            total: 0,
+            has_previous: false,
+            available: false,
+            generation: 0,
+        }
+    }
+
     /// A transcript's head, unless it has not grown since it was last read — or it has, but the
     /// row already has its prompt and the file cannot have a new name yet (only a `/rename` in a
     /// live conversation adds one, and that grows the file too).

@@ -139,6 +139,31 @@ pub struct SessionListing {
     pub rows: Vec<SessionRow>,
 }
 
+/// A submitted human prompt, not a terminal keystroke or a CLI's injected context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UserInput {
+    /// Transcript byte offset: two equal prompts remain two separate entries.
+    pub id: String,
+    pub ordinal: u32,
+    pub text: String,
+}
+
+/// An ascending page of prompts from one conversation. Older pages end before `ordinal`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UserInputPage {
+    pub inputs: Vec<UserInput>,
+    pub total: u32,
+    pub has_previous: bool,
+    /// Distinguishes a missing/unsupported transcript from a conversation with no prompts.
+    pub available: bool,
+    /// Changes when a transcript is replaced or truncated, so clients discard old pages.
+    pub generation: u32,
+}
+
 /// A transcript that says what was searched for. Outbound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

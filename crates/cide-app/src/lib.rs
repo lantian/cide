@@ -813,6 +813,7 @@ pub fn run() {
             cmd::agents::agents_ack_stale_turn,
             cmd::agents::agents_run_open,
             cmd::sessions::sessions_list,
+            cmd::sessions::sessions_user_inputs,
             cmd::sessions::sessions_search,
             cmd::sessions::sessions_open,
             cmd::agents::agents_integrate,

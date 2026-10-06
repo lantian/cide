@@ -110,6 +110,8 @@ const ICONS = [
   // Chevrons, everywhere: menus, twisties, overflow, find bar, merge navigation.
   'chevron-down', 'chevron-left', 'chevron-right', 'chevron-up',
   'chevrons-left', 'chevrons-right',
+  // Prompt history: jump to the first or latest submission.
+  'chevron-first', 'chevron-last',
   // Status bar and branch indicator. `git-branch` replaces `⑂` (U+2442), which the rail's own
   // header records as being in no UI font. `circle-plus` left with the status bar's diff stat
   // (M28); `circle-minus` stayed because an interrupted agent run draws it.

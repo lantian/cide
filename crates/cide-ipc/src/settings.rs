@@ -717,6 +717,13 @@ pub struct TerminalSettings {
     /// one field up.
     #[serde(default = "default_json_logs")]
     pub json_logs: bool,
+    /// A recap of submitted prompts above Claude/Codex terminals. Off because it takes space
+    /// from the CLI; the independent highlight remains useful without a header.
+    #[serde(default)]
+    pub show_recap: bool,
+    /// Distinguish submitted user messages from model/tool output in Claude/Codex terminals.
+    #[serde(default = "default_json_logs")]
+    pub highlight_user_input: bool,
 }
 
 /// `serde(default)` for [`TerminalSettings::json_logs`]: on.
@@ -742,6 +749,8 @@ impl Default for TerminalSettings {
             renderer: TerminalRenderer::default(),
             job_notify_after_secs: default_job_notify_after_secs(),
             json_logs: default_json_logs(),
+            show_recap: false,
+            highlight_user_input: true,
         }
     }
 }
@@ -2053,6 +2062,14 @@ mod tests {
         assert_eq!(
             terminal.job_notify_after_secs, 120,
             "the default is two minutes, and it reaches workspaces stored before the field existed"
+        );
+        assert!(
+            !terminal.show_recap,
+            "recap stays opt-in for existing workspaces"
+        );
+        assert!(
+            terminal.highlight_user_input,
+            "message highlighting defaults on independently"
         );
     }
 

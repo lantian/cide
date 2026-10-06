@@ -10,6 +10,8 @@
     "check:agents": "node scripts/check-agents.mjs",
     "check:agents-render": "node scripts/check-agents-render.mjs",
     "check:sessions": "node scripts/check-sessions.mjs",
+    "check:user-inputs": "node scripts/check-user-inputs.mjs",
+    "audit:user-inputs": "node scripts/audit-user-inputs.mjs",
     "check:docker": "node scripts/check-docker.mjs",
     "check:docker-render": "node scripts/check-docker-render.mjs",
     "check:attach": "node scripts/check-attach.mjs",

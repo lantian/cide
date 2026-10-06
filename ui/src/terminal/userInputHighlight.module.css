@@ -1,0 +1,14 @@
+.rails {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+  overflow: hidden;
+}
+
+.rail {
+  position: absolute;
+  left: 0;
+  width: 2px;
+  background: var(--user-input-edge);
+}

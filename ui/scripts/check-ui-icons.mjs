@@ -269,6 +269,19 @@ for (const file of sources(SRC, ['.ts', '.tsx'])) {
         }
       }
     }
+    // Kit icon buttons forward `icon` to Icon's `name`. They are direct evidence too,
+    // even when the feature imports only Button rather than the lower-level icon API.
+    if (ts.isJsxAttribute(node) && node.name.getText() === 'icon'
+      && node.parent?.parent?.tagName?.getText() === 'IconButton'
+      && node.initializer) {
+      const init = node.initializer
+      if (ts.isStringLiteral(init)) referenced.add(init.text)
+      else if (ts.isJsxExpression(init) && init.expression && ts.isConditionalExpression(init.expression)) {
+        for (const branch of [init.expression.whenTrue, init.expression.whenFalse]) {
+          if (ts.isStringLiteral(branch)) referenced.add(branch.text)
+        }
+      }
+    }
     if (ts.isCallExpression(node) && /^(iconElement|asIcon)$/.test(node.expression.getText())) {
       const [first] = node.arguments
       if (first && ts.isStringLiteral(first)) referenced.add(first.text)

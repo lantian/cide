@@ -1,7 +1,7 @@
 import type { Bootstrap, Geometry, SessionExit, TreeStatusMap } from '../ipc/generated'
 import type { Args, Handler } from './fakeTauri'
 import type { SceneId } from './sceneIds'
-import { encode, screen } from './transcripts'
+import { encode, screen, userInputs } from './transcripts'
 import { HOME, makeWorld, sessions, TREE_STATUS, treeRows, wire, type World } from './world'
 import { SCENES } from './sceneTable'
 import { BRANCHES, STATUS } from './data/git'
@@ -62,6 +62,14 @@ function baseHandlers(world: World, theme: Theme): Handlers {
     ['session_list', () => [...sessions.keys()]],
     ['session_exit', (): SessionExit => ({ kind: 'running' })],
     ['session_resumable', () => true],
+    ['sessions_user_inputs', (a: Args) => {
+      const content = sessions.get(String(a['id']))
+      const prompts = content ? userInputs(content) : []
+      return {
+        inputs: prompts.map((text, index) => ({ id: String(index), ordinal: index + 1, text })),
+        total: prompts.length, hasPrevious: false, available: !!content, generation: 0,
+      }
+    }],
     ['session_attach', (a: Args) => {
       const session = String(a['session'])
       geometry.set(session, a['geometry'] as Geometry)

@@ -199,6 +199,11 @@ export function shellScreen(cols: number, rows: number): string {
 
 export type TerminalContent = { kind: 'claude'; conversation: Conversation } | { kind: 'shell' }
 
+/** The recap and the painted CLI must describe the same deterministic prompt. */
+export function userInputs(content: TerminalContent): string[] {
+  return content.kind === 'claude' ? [TURNS[content.conversation].prompt] : []
+}
+
 export function screen(content: TerminalContent, theme: Theme, cols: number, rows: number): string {
   return content.kind === 'claude' ? claudeScreen(content.conversation, theme, cols, rows) : shellScreen(cols, rows)
 }

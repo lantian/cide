@@ -17822,3 +17822,195 @@ prior failure and do not enqueue. The installed-Codex composer/submission audit 
 again and the debug binary is rebuilt. No real paid exchange or live IDE restart was
 performed. An already-paused run still needs a continuation task after restarting;
 the failed queue and replies refused before queueing are not replayed blindly.
+
+## M165 — Conversation recap and distinct user messages
+
+Claude and Codex terminals have independent Terminal settings: **Show recap** (off by default)
+and **Highlight user input** (on). Recap reserves space above the existing terminal host,
+shows two lines, and offers previous/next, a counter, latest and full-text disclosure. A
+historical selection stays put when another prompt arrives. Its identity is the harness
+conversation rather than the pane: moves, detached windows and resume read the same transcript;
+Codex's pending `/clear` drops the previous conversation immediately.
+
+Rust reads complete JSONL records incrementally, preserving full text and repeated prompts,
+with fifty-entry pages. The existing session worker polls live conversations at 500 ms and
+wakes on submit/start hooks. Rollout paths and parsed records are cached; replaced/truncated
+files have a new generation. CLI context, tool results and local commands stay out. A Claude
+model command enters history only when an assistant record confirms a model turn. The frontend
+shares readers and browsing state by project/conversation, rejects released readers' late
+answers, and retries temporarily missing transcripts. Late historical pages cannot lower the
+newest prompt count or restore a selection from a discarded generation. No second durable
+prompt file is written.
+
+Terminal highlighting matches a complete recorded prompt at a CLI user boundary with a following
+assistant/tool boundary. Ambiguous layouts, collapsed paste placeholders and the editable
+composer remain undecorated. Dedicated light/dark wash, ink and rail tokens have at least 4.5:1
+text contrast. Bottom-layer xterm decorations preserve PTY/clipboard text; a non-interactive
+rail also works on the alternate buffer, where xterm hides its decoration DOM. DOM terminals
+also colour the row ground because xterm omits trailing blank cells. Search retains its own
+fill; buffer changes, writes, resize, scroll and theme changes invalidate old marks.
+
+**Validation:** the shared suite's workspace tests, UI checks, codegen/contract and production
+build pass. Its CSS-prefix failure was fixed and rechecked. Strict workspace Clippy still fails
+on the pre-existing `OutputObserver` type-complexity warning in `cide-pty/src/lib.rs:372`; scoped
+Clippy passes with that lint allowed. `check:user-inputs` exercises Unicode, wrapping, repeated
+prompts, role-shaped quotations, composer exclusion, contrast, paging, controls, concurrent
+tail/history responses and reset during navigation. Headless Chromium exercised real xterm in both themes, DOM and active WebGL, Claude
+and Codex role markers, and normal/alternate buffers; all sixteen combinations passed. These
+are deterministic transcript/terminal fixtures, not paid CLI turns or a live IDE restart.
+
+## M166 — Read the installed Codex's completed user messages
+
+The user's real Codex 0.160.0 conversation showed two submitted prompts but a `0 / 0` recap
+and no cide highlighting. Its rollout had no legacy `event_msg/user_message` records: both
+submissions were `event_msg/item_completed` records whose item type was `UserMessage`.
+M165's browser fixtures supplied history directly and therefore missed this format change.
+
+The shared transcript reader now extracts text parts from completed `UserMessage` items as
+well as legacy user-message records. Model-input `response_item` mirrors, injected AGENTS.md
+and environment context, started items, assistant messages and tool records remain excluded;
+identical submitted prompts remain separate entries. This fixes both recap and highlighting,
+which consumes the same conversation history, and the Sessions tab's first-prompt reader.
+
+**Validation:** seventeen scoped domain tests and the new captured-format integration test
+pass, as do the recap UI checks, typechecking and strict core Clippy. The debug backend is
+rebuilt. The quota-free existing-transcript audit
+read the user's exact two-prompt rollout and asserted `["hi", "How are you?"]`. The browser
+audit now feeds that Rust result through the real mounted feature hook, recap store and xterm
+highlighter: `2 / 2`, `How are you?` and two rails pass in both themes with DOM and active
+WebGL. All sixteen previous renderer/buffer cases also pass. No model call or live IDE restart
+was performed.
+
+## M167 — Recap controls, Harness settings and immediate Codex resume
+
+Recap navigation now starts on the left with first, previous, next and latest icons; first
+and latest use the shared Lucide chevron-with-bar marks. The former “Your input” label and
+text latest button are gone. First loads ordinal one directly even when it lies before the
+cached tail page. Disclosure appears only when the collapsed two-line preview overflows,
+with a measured clone retaining the collapse control while full text is open. Wrapping,
+resizing and font loading remeasure it. Both feature toggles and their search destinations
+move to Settings → Harness → User messages, retaining saved settings and reset behavior.
+
+The installed Codex 0.160 reproduces the reported `/resume` failure: it replays a different
+thread before delivering a model-turn `SessionStart`. Its process retains writable handles
+for all visited rollouts, including when returning to a thread. The background session worker
+now reads their explicit `thread_settings_applied` activations and applies the newest
+unambiguous CLI thread through the serialized hook channel. Linux reads process descriptors;
+macOS uses bounded lsof inspection. Launcher descendants are allowed until the console owner
+is found; its tool descendants cannot select its conversation. Model output, subagents and
+another console's unrelated files do not supply identity. Existing `/clear` invalidation
+remains authoritative until a subsequent explicit activation. A resume preserves activation
+time rather than queue-application time, and late old-thread hooks cannot switch it back.
+The observed rollout path also handles a child's different CODEX_HOME.
+
+**Validation:** scoped history/activation tests and all twenty-five hook tests pass. An
+installed-CLI regression generates two local conversations with an isolated home and dummy
+provider; A → B → A activates and exposes each correct prompt before any model request.
+The browser audit passes all sixteen renderer/theme/harness/buffer cases and four mounted
+Rust-transcript cases, now including A → B → A with the same terminal object. Native layout
+checks cover long/short text, width-dependent overflow and collapsing. UI feature, Harness,
+settings-copy, icons, kit, scale, prefix, attach, find and theme checks pass, as do TypeScript
+and the production frontend/debug backend builds. Core's macOS arms type-check using the documented
+Darwin shim with `blake3/pure` (the default NEON C dependency needs a cross compiler); macOS
+runtime remains untested. Scoped Clippy allows the existing cide-pty OutputObserver
+type-complexity warning documented in M165. No live IDE restart or paid model call occurred.
+
+## M168 — Accent-coloured user messages without scroll flicker
+
+The user asked for recap and prompt highlighting to follow cide's main colour, and reported
+frequent blinking during wheel scrolling. The old highlighter removed all decorations and
+rails immediately on every scroll/write, then waited 120 ms to rebuild them. A continuing
+scroll therefore repeatedly showed an undecorated terminal between paints.
+
+Both surfaces now derive a 10% accent wash over the panel, an accent rail, and the theme's
+high-contrast ink. CSS variables follow the live custom accent automatically; xterm resolves
+the same mixed colour before registering decorations. The dedicated user-message wash
+remains softer than the search and selection fills.
+
+Highlighting now reconciles decorations by their existing buffer markers. A native scroll
+only positions the permanent rail layer and visible DOM row grounds. Parsed writes retain
+unchanged rows and update changed ones before rendering, including fullscreen TUI redraws.
+Render callbacks update positions without re-registering decorations. Theme/search changes,
+resizing, repainting model text over an old prompt, buffer switches and disposal still remove
+obsolete marks. The blank interval and delayed wholesale repaint are gone.
+
+**Validation:** the browser audit covers the existing sixteen renderer/theme/harness/buffer
+cases and four mounted conversation/resume cases, plus eight scrolling/redraw cases. Twenty
+wheel/scroll/cursor repetitions retain decorations with zero registrations. Alternate-grid
+Erase Display retires xterm's own markers; these are immediately replaced while all scroll
+and redraw cases retain the same rail elements, with zero removals, gaps or misplaced rails. Wheel events
+actually move the history viewport; DOM grounds follow the correct user row. Live custom
+accent colours reach recap and xterm in both themes and renderers; search, selection and model
+repaint checks still pass. Feature, accent, theme, kit, find and attach checks, TypeScript and
+the production frontend build pass. No backend change, live IDE restart or model call.
+
+## M169 — Preserve the CLI's colours under user-input highlighting
+
+The user confirmed scroll flicker was gone but reported missing Codex colours. The row-wide
+speaker decoration had forced every foreground to the same theme ink and replaced explicit
+CLI backgrounds. The highlighter now leaves foregrounds entirely to xterm/ANSI and washes
+only runs of default-background cells. Explicit coloured backgrounds and inverse-video
+cells retain their native appearance. Recap keeps its own readable ink, and the accent rail
+still identifies every submitted prompt even when its native background fills the whole row.
+Reconciliation signatures include the background runs, so an SGR-only redraw updates the
+wash without changing history; the permanent rails and immediate repaint remain intact.
+
+**Validation:** eight additional browser cases cover both themes, DOM/WebGL and normal/alt
+buffers with ANSI and true-colour prompt text plus an explicit colour pair. Per-glyph DOM
+measurements preserve foregrounds and the CLI background exactly; both renderers register
+no foreground overrides or wash over native background cells. The existing sixteen basic,
+eight scroll/redraw and four mounted conversation/resume cases still pass, including search
+priority, selection, custom accents and zero rail gaps/removals. Feature checks, TypeScript
+and the production frontend build pass. No live IDE restart or model call.
+
+## M170 — Choose cide highlighting or native CLI backgrounds
+
+Preserving Codex's own background in M169 left only the thin accent rail on its user-message
+rows. The user resolved the conflict explicitly: when Highlight user input is enabled,
+show cide's highlighting; when disabled, show the standard Codex rendering. Enabled
+highlighting now supplies the full prompt-row accent wash over native backgrounds while
+retaining ANSI foregrounds. Disabling disposes only the overlay and restores the untouched
+CLI backgrounds. Search priority and permanent rails during scroll/redraw remain as before.
+The settings hint describes these two modes; recap remains independently controlled.
+
+**Validation:** the browser colour cases now assert that enabled highlighting replaces the
+native background, preserves foregrounds, and disabling restores original DOM colours exactly.
+Both renderer paths remove the rails when disabled. The mounted feature also toggles the
+actual setting off/on in both themes and DOM/WebGL, preserving recap and the terminal object.
+The previous history/resume, search, selection, custom-accent and scrolling/redraw cases pass,
+with no rail gaps or removals during scrolling. Feature/settings-copy checks, TypeScript and
+the production frontend build pass. No live IDE restart or model call.
+
+## M171 — Recap follows output and reveals its input
+
+Recap now selects the input belonging to output at the console viewport's top. Scrolling
+back until a prompt reaches that edge shows its predecessor; scrolling below the prompt
+shows that prompt, and the normal buffer's bottom follows latest. Manual history browsing
+pins the chosen recap until the next console scroll. Clicking the selectable preview (or
+Enter/Space) reveals that input and keeps it selected while its own row is visible; copying
+selected text does not jump. Navigation owns neither the terminal nor its decorations and
+works with highlighting disabled. Its conversation reader now loads older input pages for
+viewport following too, sharing the existing reader and cancelling on source changes.
+
+Confirmed terminal blocks receive ordinals only when earliest/latest chronological matches
+agree, disambiguating repeats with their neighbours without guessing a clipped duplicate.
+Scroll uses cached locations; parsed writes and resize refresh them. Normal-buffer reveal
+uses xterm's scrollback directly. Alternate-screen reveal sends bounded, overlapping wheel
+reports through xterm's requested mouse protocol and waits for CLI redraws. User interaction
+or a conversation change cancels the jump. A CLI with no mouse tracking receives no arrow
+keys, and an absent target produces feedback rather than fabricated history. A native grid
+without a confirmed prompt retains its last known context, so arbitrary unknown/fullscreen
+layouts and deleted scrollback cannot supply an exact location.
+
+**Validation:** pure and mounted checks cover repeats, multiline viewport boundaries, Enter,
+selection/copy, paging and reader races. The browser audit adds four mounted normal-history
+cases in both themes and DOM/WebGL with highlighting disabled, checking context boundaries,
+bottom/latest, wheel scrolling, click-to-reveal, manual selection during new output and the
+unchanged terminal object. Four alternate-grid cases use a local mouse-report consumer to
+check jumps up/down, user-wheel context, cancellation and no outbound input without mouse
+tracking. The sixteen earlier renderer/theme/harness/buffer cases, native-colour restoration,
+scroll/redraw stability and four conversation/resume cases still pass. Kit, scale, icon,
+CSS-prefix, attach, find and theme checks, TypeScript and the production frontend build pass.
+The kit specimen includes a scrollable output preview. This validates real xterm with local
+fixtures, not every installed CLI's fullscreen implementation. No backend change, live IDE
+restart or model call.

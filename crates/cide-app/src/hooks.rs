@@ -43,7 +43,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -95,6 +95,9 @@ impl CodexConsole {
             && frame.payload.get("source").and_then(|s| s.as_str()) == Some("resume")
             && let Some(cli) = cli
         {
+            if self.active.is_some_and(|active| active != cli) {
+                self.invalidated.extend(self.active);
+            }
             self.invalidated.remove(&cli);
         }
         if cli.is_some_and(|id| self.invalidated.contains(&id)) {
@@ -345,6 +348,26 @@ impl HookServer {
             let visible = cide_pty::codex_clear::composer(&pty.capture_screen());
             console.lock().clear.input(data, visible.as_deref());
         }
+    }
+
+    /// The session worker observes a settings activation in a rollout held by this child.
+    /// Serialize it beside real hooks; a delayed hook from the previous thread cannot undo it.
+    pub(crate) fn codex_resumed(
+        &self,
+        session: SessionId,
+        thread: SessionId,
+        path: &Path,
+        stamp: i64,
+    ) {
+        let mut frame = HookFrame::new(
+            "SessionStart",
+            serde_json::json!({
+                "session_id": thread.to_string(), "source": "resume", "transcript_path": path,
+                "cide_activation_ms": stamp,
+            }),
+        );
+        frame.spawned_as = Some(session.to_string());
+        let _ = self.frames.send(Inbound::Frame(frame));
     }
 
     /// State reported by a console adapter that has no Claude-shaped hooks.
@@ -670,10 +693,18 @@ fn apply(
                 // one so the rule can be driven from a test. It is only ever compared against
                 // the CLI's own `nameSince`, which is `Date.now()` in the same process tree on
                 // the same machine, so the two are the same clock.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                // Observed resumes keep their activation time: using the later applier time
+                // could hide a quick second resume that happened while this frame was queued.
+                let now_ms = frame
+                    .payload
+                    .get("cide_activation_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0)
+                    });
                 if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
                     registry.note_conversation(session, conversation, now_ms);
                 }
@@ -685,6 +716,13 @@ fn apply(
                 }
             }
         }
+    }
+    if matches!(
+        frame.kind(),
+        Some(HookEvent::UserPromptSubmit | HookEvent::SessionStart)
+    ) && let Some(sessions) = crate::sessions_state::handle(app)
+    {
+        sessions.wake_inputs();
     }
 }
 
@@ -858,6 +896,32 @@ mod tests {
             console.accepts(&start),
             "an explicit resume can revisit history"
         );
+    }
+
+    #[test]
+    fn codex_resume_switches_identity_and_rejects_the_previous_threads_late_hooks() {
+        let session = SessionId::new();
+        let a = SessionId::new();
+        let b = SessionId::new();
+        let mut console = CodexConsole {
+            active: Some(a),
+            ..Default::default()
+        };
+        let states = DashMap::new();
+        let conversations = DashMap::new();
+        for (target, retired) in [(b, a), (a, b)] {
+            let mut start = frame("SessionStart", &target.to_string());
+            start.spawned_as = Some(session.to_string());
+            start.payload["source"] = serde_json::json!("resume");
+            assert!(console.accepts(&start));
+            assert!(super::decide(&start, &states, &conversations).iter().any(|effect|
+                matches!(effect, Effect::Conversation { conversation, .. } if *conversation == target)));
+            for event in ["Stop", "PostToolUse", "SessionEnd"] {
+                let mut late = frame(event, &retired.to_string());
+                late.spawned_as = Some(session.to_string());
+                assert!(!console.accepts(&late));
+            }
+        }
     }
 
     #[test]

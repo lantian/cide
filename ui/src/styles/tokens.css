@@ -41,6 +41,10 @@
   --chrome-hi: #e6e6eb;
   --panel: #ffffff;
   --panel-2: #f6f6f9;
+  /* Submitted human messages: distinct from search/selection and from CLI status colours. */
+  --user-input-bg: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  --user-input-edge: var(--accent);
+  --user-input-text: var(--text-hi);
   --border: #d8d8de;
   --border-soft: #e9e9ee;
   --text: #1b1b1f;
@@ -393,6 +397,9 @@
   --chrome: #1a1a1e;
   --chrome-hi: #232329;
   --panel: #151518;
+  --user-input-bg: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  --user-input-edge: var(--accent);
+  --user-input-text: var(--text-hi);
   --panel-2: #0e0e10;
   --border: #2a2a31;
   --border-soft: #202027;

@@ -61,4 +61,13 @@ jobNotifyAfterSecs: number,
  * `#[serde(default = "…")]` for [`TerminalSettings::job_notify_after_secs`]'s reason,
  * one field up.
  */
-jsonLogs: boolean, };
+jsonLogs: boolean, 
+/**
+ * A recap of submitted prompts above Claude/Codex terminals. Off because it takes space
+ * from the CLI; the independent highlight remains useful without a header.
+ */
+showRecap: boolean, 
+/**
+ * Distinguish submitted user messages from model/tool output in Claude/Codex terminals.
+ */
+highlightUserInput: boolean, };

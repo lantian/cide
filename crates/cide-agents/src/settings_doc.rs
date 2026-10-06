@@ -188,6 +188,16 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "bool",
         "A shell pane rewrites structured (JSON) log lines into readable ones.",
     ),
+    doc(
+        "terminal.showRecap",
+        "bool",
+        "Harness → User messages: browsable recap above Claude/Codex. Off by default.",
+    ),
+    doc(
+        "terminal.highlightUserInput",
+        "bool",
+        "Harness → User messages: highlight Claude/Codex input independently of recap.",
+    ),
     // --- graphics ------------------------------------------------------------------------
     doc(
         "graphics.disableDmabufRenderer",

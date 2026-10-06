@@ -222,6 +222,7 @@ export const SECTION_TABS: Partial<Record<SettingsSection, readonly { value: str
     { value: 'console', label: 'Console' },
     { value: 'launch', label: 'Launch' },
     { value: 'proxy', label: 'Proxy' },
+    { value: 'messages', label: 'User messages' },
   ],
   agents: [
     { value: 'project', label: 'This project' },
@@ -1065,6 +1066,32 @@ function Git({ settings, patch }: SectionProps) {
   )
 }
 
+/** These controls affect Claude/Codex conversations, so they live on their own Harness tab.
+ * Their existing durable terminal keys are retained so moving the UI preserves saved values. */
+function UserMessages({ settings, patch }: SectionProps) {
+  const terminal = settings.terminal
+  const set = (next: Partial<TerminalSettings>) => patch({ terminal: { ...terminal, ...next } })
+  const def = useSettingsDefaults()?.terminal
+  return (
+    <Group title="User messages">
+      <ToggleRow
+        label="Show recap"
+        hint="Last submitted prompt above Claude/Codex, with controls to browse this conversation."
+        {...resetTo(terminal.showRecap, def?.showRecap, (showRecap) => set({ showRecap }))}
+        checked={terminal.showRecap}
+        onChange={(showRecap) => set({ showRecap })}
+      />
+      <ToggleRow
+        label="Highlight user input"
+        hint="Use cide’s accent background; turn off to keep Claude/Codex’s own backgrounds."
+        {...resetTo(terminal.highlightUserInput, def?.highlightUserInput, (highlightUserInput) => set({ highlightUserInput }))}
+        checked={terminal.highlightUserInput}
+        onChange={(highlightUserInput) => set({ highlightUserInput })}
+      />
+    </Group>
+  )
+}
+
 function Terminal({ settings, patch }: SectionProps) {
   const terminal = settings.terminal
   const set = (next: Partial<TerminalSettings>) => patch({ terminal: { ...terminal, ...next } })
@@ -1196,7 +1223,7 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
     case 'keymap':
       return <KeymapSection />
     case 'claudeSessions':
-      // Three tabs since M133 — Console, Launch, Proxy — where it was one page that ran to
+      // Tabs since M133 — Console, Launch, Proxy, User messages — where it was one page that ran to
       // five groups, a dozen notes and two launch configurations' worth of rows.
       //
       // The proxy belongs to *every* child, shells included, so on the merits it wants a nav
@@ -1209,6 +1236,7 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       // other read as one long form whose half is inert. The other half is still stored and
       // still used — a role whose harness is codex runs Settings → Harness → Codex whatever the
       // console is — and flipping the switch shows it.
+      if (props.tab === 'messages') return <UserMessages {...props} />
       if (props.tab === 'proxy') return <ProxySection proxy={props.settings.proxy} patch={props.patch} />
       if (props.tab === 'launch') return <HarnessLaunch {...props} />
       return (

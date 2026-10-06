@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cide_core::CoreError;
-use cide_ipc::sessions::{SessionListing, TranscriptHit, TranscriptSearch};
+use cide_ipc::sessions::{SessionListing, TranscriptHit, TranscriptSearch, UserInputPage};
 use cide_ipc::{HarnessSession, ProjectId, RunOpen};
 use tauri::{AppHandle, Manager, State};
 
@@ -36,6 +36,30 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn sessions_list(app: AppHandle, project: ProjectId) -> Result<SessionListing> {
     blocking(move || crate::sessions_state::list(&app, project)).await
+}
+
+/// Prompt history is addressed by the CLI conversation, never by the displaying pane. Resolve
+/// its path from the project's journal instead of accepting a caller-provided filesystem path.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sessions_user_inputs(
+    app: AppHandle,
+    project: ProjectId,
+    id: String,
+    before: Option<u32>,
+) -> Result<UserInputPage> {
+    blocking(move || {
+        let workspace = app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| CoreError::Io("cide is shutting down".into()))?;
+        let root = crate::tasks_state::project_root(&workspace, project)?;
+        let sessions = crate::sessions_state::handle(&app)
+            .ok_or_else(|| CoreError::Io("cide is shutting down".into()))?;
+        let record = sessions.record(&root, &id).ok_or_else(|| {
+            CoreError::Io("This conversation is not yet in the session journal.".into())
+        })?;
+        Ok(sessions.input_page(&record, before))
+    })
+    .await
 }
 
 /// The newest search's token. A search whose token is older stops at its next file and answers

@@ -32,6 +32,8 @@ export const ICON_PATHS = {
   'case-sensitive': 'M2 16l4.039-9.69a.5.5 0 0 1 .923 0L11 16M22 9v7M3.304 13h6.392M15 12.5a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0 -7 0Z',  // from path + circle
   'check': 'M20 6 9 17l-5-5',
   'chevron-down': 'M6 9l6 6 6-6',
+  'chevron-first': 'M17 18l-6-6 6-6M7 6v12',
+  'chevron-last': 'M7 18l6-6-6-6M17 6v12',
   'chevron-left': 'M15 18l-6-6 6-6',
   'chevron-right': 'M9 18l6-6-6-6',
   'chevron-up': 'M18 15l-6-6-6 6',

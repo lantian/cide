@@ -29,6 +29,8 @@ import {
 } from './sessionSink'
 import { restartOffer, type RestartMode, type RestartOffer } from './restartRule'
 import { TerminalFindBar } from './TerminalFindBar'
+import { UserInputRecap, useUserInputs } from './UserInputRecap'
+import terminalStyles from './TerminalPane.module.css'
 import { openTerminalFind } from '@/terminal/findStore'
 import findStyles from './TerminalFindBar.module.css'
 import buttonStyles from '@/styles/buttons.module.css'
@@ -989,35 +991,39 @@ export function TerminalPane({
     resumable,
   })
 
+  const userInputs = useUserInputs(pane, project)
   return (
-    <>
-      <PaneSlot paneId={paneId} className={className} onResize={() => void syncSize(paneId)} />
-      {/*
-        * Both bottom bars, in one absolutely-positioned stack that is a *sibling* of the slot.
-        *
-        * Every half of that matters. Rendering either bar above the terminal **in flow** is what
-        * the restored-shell banner did: `PaneSlot` still claims `height: 100%`, so the terminal
-        * was pushed its own height past the bottom of the pane frame and painted over the row
-        * below. And the slot itself is never conditionally rendered — rule 2 of
-        * `layout/paneHosts.ts` — so the terminal, its scrollback and the `— exited —` line the
-        * user is reading all stay exactly where they were while a control sits over the last two
-        * lines.
-        *
-        * One stack rather than two `bottom: 0` boxes, because both states can be true at once: a
-        * child that has exited leaves a transcript, and searching a dead pane's transcript is
-        * exactly the moment somebody reaches for Ctrl+F. Stacked in this order the restart bar
-        * keeps the bottom edge it has always had and the find bar sits above it, so neither
-        * moves the other's pixels and neither is covered. `TerminalFindBar.module.css` carries
-        * the argument for why this is at the bottom of the pane at all — the top-right is the
-        * floating control cluster's, and the editor already paid for finding that out.
-        */}
-      <div className={findStyles.stack ?? ''}>
-        <TerminalFindBar paneId={paneId} />
-        {offer !== null && <ExitedBar offer={offer} onRun={runRestart} />}
+    <div className={terminalStyles.column}>
+      {userInputs.show && <UserInputRecap feature={userInputs} />}
+      <div className={terminalStyles.terminal}>
+        <PaneSlot paneId={paneId} className={className} onResize={() => void syncSize(paneId)} />
+        {/*
+          * Both bottom bars, in one absolutely-positioned stack that is a *sibling* of the slot.
+          *
+          * Every half of that matters. Rendering either bar above the terminal **in flow** is what
+          * the restored-shell banner did: `PaneSlot` still claims `height: 100%`, so the terminal
+          * was pushed its own height past the bottom of the pane frame and painted over the row
+          * below. And the slot itself is never conditionally rendered — rule 2 of
+          * `layout/paneHosts.ts` — so the terminal, its scrollback and the `— exited —` line the
+          * user is reading all stay exactly where they were while a control sits over the last two
+          * lines.
+          *
+          * One stack rather than two `bottom: 0` boxes, because both states can be true at once: a
+          * child that has exited leaves a transcript, and searching a dead pane's transcript is
+          * exactly the moment somebody reaches for Ctrl+F. Stacked in this order the restart bar
+          * keeps the bottom edge it has always had and the find bar sits above it, so neither
+          * moves the other's pixels and neither is covered. `TerminalFindBar.module.css` carries
+          * the argument for why this is at the bottom of the pane at all — the top-right is the
+          * floating control cluster's, and the editor already paid for finding that out.
+          */}
+        <div className={findStyles.stack ?? ''}>
+          <TerminalFindBar paneId={paneId} />
+          {offer !== null && <ExitedBar offer={offer} onRun={runRestart} />}
+        </div>
       </div>
       {/* Portals out of here entirely; it is in the tree so React owns its lifetime. */}
       {menu}
-    </>
+    </div>
   )
 }
 

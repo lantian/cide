@@ -160,6 +160,25 @@ on a panel is told apart from it by its border, not by a second fill.
 
 ## Components
 
+### Prompt recap: `Recap.tsx`
+
+`Recap` is a controlled prompt-history strip: `text`, `ordinal`, `total`, `expanded`, optional `status`/`busy`,
+and callbacks for first, previous, next, latest and expand, plus optional `onReveal`.
+With `onReveal`, the selectable preview is a keyboard-accessible action: click, Enter or
+Space shows the input in the caller's console. Selecting text for copying does not activate
+it; status text and busy previews cannot jump. First/latest use barred-chevron
+icon buttons alongside previous/next on the left; the counter stays on the right. Controls
+at the corresponding endpoint are disabled. The strip has no redundant "Your input" label.
+Shows two lines when collapsed; the expand icon appears only when text is clipped, measured
+again after resize and font loading. Full text scrolls within one third of its parent when
+expanded, retaining the collapse control while the two-line preview would still overflow.
+Uses `--user-input-bg`, `--user-input-edge` and `--user-input-text`: a soft wash of the
+current cide accent, an accent rail, and the theme's readable ink. These follow custom accent
+changes as well as both themes, with selectable mono text and kit buttons.
+The *Panels, cards, lists* chapter has the interactive specimen. Conversation identity and
+transcript reading and viewport following stay in the caller. Its specimen includes a
+scrollable output preview so revealing a chosen input has a visible result.
+
 Chapters are anchors on the page: `kit.html#<id>`.
 
 | chapter | id |

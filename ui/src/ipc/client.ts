@@ -5628,9 +5628,13 @@ export const update = {
 //
 // Appended, per this file's append-only rule. The Agents panel's Sessions tab: every agent
 // conversation cide has hosted for a project, from `sessions.json` (`cide-app`'s `sessions_state`).
-import type { SessionListing, TranscriptSearch } from './generated'
+import type { SessionListing, TranscriptSearch, UserInputPage } from './generated'
 
 export const sessionJournal = {
+  userInputs: (project: ProjectId, id: string, before?: number) =>
+    invoke<UserInputPage>('sessions_user_inputs', { project, id, before: before ?? null }),
+  onUserInputsChanged: (handler: (project: ProjectId, id: string) => void) =>
+    listen<{ project: ProjectId; id: string }>('cide://user-inputs-changed', (e) => handler(e.payload.project, e.payload.id)),
   /** The project's agent sessions, newest first, with liveness and the pane showing each. */
   list: (project: ProjectId) => invoke<SessionListing>('sessions_list', { project }),
   /**

@@ -22,6 +22,7 @@ pub mod buffers;
 pub mod check;
 pub mod child_env;
 pub mod claude_cli;
+pub mod codex_active;
 pub mod codex_cli;
 pub mod codex_permissions;
 pub mod commands;
@@ -65,6 +66,7 @@ pub mod shell;
 pub mod shell_history;
 pub mod toolchain;
 pub mod toolwindow;
+pub mod user_inputs;
 pub mod workspace;
 
 pub use error::{CoreError, Result};

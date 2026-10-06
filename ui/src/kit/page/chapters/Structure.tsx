@@ -1,8 +1,9 @@
-import { useState, type ReactElement } from 'react'
+import { useRef, useState, type ReactElement } from 'react'
 
 import { Button, IconButton } from '../../components/Button'
 import { Badge, Counter, Dot } from '../../components/Status'
 import { Icon } from '@/icons/Icon'
+import { Recap } from '../../components/Recap'
 import {
   Breadcrumbs,
   Card,
@@ -29,6 +30,11 @@ import { Cell, Chapter, Frame, Line, Specimen, Stack } from '../Specimen'
 export function Structure(): ReactElement {
   const [tab, setTab] = useState<'overview' | 'changes' | 'pipelines'>('changes')
   const [sel, setSel] = useState('Button.tsx')
+  const [recapIndex, setRecapIndex] = useState(2)
+  const [recapExpanded, setRecapExpanded] = useState(false)
+  const recapConsole = useRef<HTMLDivElement>(null)
+  const promptRows = useRef<(HTMLDivElement | null)[]>([])
+  const prompts = ['Read how the PTY coalescer works.', 'Keep prompt history on the conversation.\nMoving a pane must preserve it.', 'Check light and dark themes.\n\nCover wrapping, repeated prompts and model quotations.']
   return (
     <Chapter
       id="structure"
@@ -43,6 +49,24 @@ export function Structure(): ReactElement {
         </>
       }
     >
+      <Specimen name="Prompt recap" source="Recap.tsx" use="Browse inputs, then click the preview to show that input below. Only clipped text shows the full-text control. The caller owns history and console navigation.">
+        <Frame wide>
+          <div style={{ height: 'calc(300px * var(--ui-scale))', display: 'flex', flexDirection: 'column' }}>
+            <Recap text={prompts[recapIndex] ?? ''} ordinal={recapIndex + 1} total={prompts.length} expanded={recapExpanded}
+              onPrevious={() => setRecapIndex(Math.max(0, recapIndex - 1))}
+              onNext={() => setRecapIndex(Math.min(prompts.length - 1, recapIndex + 1))}
+              onFirst={() => setRecapIndex(0)}
+              onLatest={() => setRecapIndex(prompts.length - 1)} onExpand={() => setRecapExpanded(!recapExpanded)}
+              onReveal={() => { if (recapConsole.current) recapConsole.current.scrollTop = promptRows.current[recapIndex]?.offsetTop ?? 0 }} />
+            <div ref={recapConsole} style={{ flex: 1, minHeight: 0, overflow: 'auto', position: 'relative' }}>
+              {prompts.map((prompt, index) => <div key={prompt} ref={element => { promptRows.current[index] = element }}>
+                <CodeBlock>{`> ${prompt}\n\nResponse ${index + 1}\n\n${'Output continues…\n'.repeat(8)}`}</CodeBlock>
+              </div>)}
+            </div>
+          </div>
+        </Frame>
+      </Specimen>
+
       <Specimen
         name="Panel header, section, heading"
         source="Surface.tsx › PanelHeader, Section, Heading"

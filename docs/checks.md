@@ -803,6 +803,80 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 - **The listing hides rows that did nothing.** A row is dropped when it is not live, not on screen, and either was never named by its harness or has no transcript on disk. A transcript-path bug therefore empties the tab with no error. `cide-headless sessions <root>` prints the unfiltered file, which is how to tell a hidden row from a missing one.
 - **Reading a transcript is read-only and bounded, and every failure means "nothing".** `transcript_head` reads 1 MiB at most. `transcript_find` tests the raw line before parsing, which is sound only for needles JSON does not escape. Bookkeeping keys (`type`, `uuid`, `cwd`, …) are not searched, or a search for `user` would match every transcript. Open never spawns from the domain: `sessions_open` only answers, and `showOpenPlan` builds the pane, for `openRun.ts`'s ownership reason.
 
+### Prompt recap and terminal user messages
+
+`cargo test --locked -p cide-core user_inputs`, `cargo test --locked -p cide-ipc settings`,
+`check:user-inputs`, `check:attach`, `check:terminal-find`, `check:theme`, `check:kit`,
+`check:css-prefix`, typechecking and codegen/contract checks. The optional
+`pnpm --dir ui run audit:user-inputs` uses headless Chromium to exercise real xterm DOM/WebGL
+in light/dark themes and normal/alternate buffers without CLI processes or paid model calls.
+It also feeds the real Rust parser's output through the mounted recap/history/highlighter hook.
+The default transcript fixture records Codex 0.160's `item_completed → UserMessage` shape;
+`cargo test --locked -p cide-core --test user_inputs` pins it separately. To audit an existing
+rollout, set `CIDE_INPUT_TRANSCRIPT` to its path and optionally `CIDE_INPUT_EXPECTED` to a JSON
+array of its last fifty submitted texts before running the browser audit. This reads the file
+without starting a CLI or altering its conversation. Retain support for legacy `user_message`
+records; `response_item` user records are model-input mirrors and also contain injected context.
+Screenshots stay in `ui/node_modules/.cache/recap-browser-*`. In particular, xterm's cell
+decorations work on the active alternate buffer while its *DOM decoration elements* are hidden;
+the separate rail is deliberate. The DOM renderer also trims blank cells before consulting
+decorations, which is why the row ground is painted alongside them. History identity and late
+reader cancellation belong to the conversation, never to the displaying pane.
+
+`cargo test --locked -p cide-app --test real_codex_resume -- --ignored --nocapture` is an
+optional installed-Codex regression. It generates two transcripts in an isolated `CODEX_HOME`,
+uses a dummy provider on localhost, and runs local `/resume` commands A → B → A without a
+model turn. `cargo test --locked -p cide-core -- codex_active user_inputs` and
+`cargo test --locked -p cide-app --lib -- hooks` cover activation selection and late hooks.
+Codex 0.160 does not deliver `SessionStart` immediately on resume: its settings-application
+record in a process-owned writable rollout supplies identity before the next prompt. Do not
+substitute directory-wide mtime or the newest opened fd: old thread writers stay open, and
+returning to a previously visited thread reuses one. A startup observation must not undo
+`/clear`; model output and subagent rollouts cannot activate another conversation. The browser
+audit also switches the mounted feature A → B → A and verifies prompt text, count, rails and
+the unchanged terminal object. Disclosure is measured in the collapsed two-line layout,
+including after wrapping/resize, so an expanded message always retains its collapse control.
+
+The same browser audit now sends wheel events through xterm's scrollable element, scrolls
+through normal-buffer history, and clears/redraws an alternate-screen grid. It instruments
+the public decoration registration and observes rail removals: twenty native scroll/cursor
+repetitions must retain the same marks, with zero registrations, removals or gaps. Erase
+Display retires xterm's markers itself; a TUI redraw immediately replaces them while retaining
+the same rail elements and leaving no blank interval. Rendering repositions row grounds
+and rails; it must not invalidate cell decorations or schedule another paint itself. Parsed
+writes reconcile rows before the next render, preserving unchanged buffer markers. A clear,
+buffer switch, search change or theme change still retires obsolete marks. Recap and terminal
+wash/rail tokens derive from the current accent; test a live custom accent as well as both
+default themes, and keep the softer user-message wash distinct from search/selection fills.
+
+Native foregrounds belong to the CLI, not the speaker highlighter. The browser audit also
+renders ANSI-coloured and true-colour text with an explicit background before/after enabling
+highlighting. DOM measurements compare each glyph's colour and its explicit background:
+enabled highlighting replaces the CLI's prompt background with the cide wash, including
+explicit/inverse backgrounds; disabling restores native drawing exactly. Both renderers
+must register no foreground override. The mounted feature's settings toggle must remove
+and restore rails without replacing the terminal or hiding recap. Keep the recap's
+readable ink independent: it is ordinary UI text, whereas a terminal preserves ANSI styling.
+
+Recap now follows the console viewport independently of highlighting. The browser audit's
+mounted feature adds long output between actual parsed inputs, disables highlighting, and
+checks context below a prompt, the previous input when the prompt reaches the top, latest
+at the bottom, native wheel scrolling, manual browsing without scrolling, click-to-reveal,
+and preservation of the chosen recap while output arrives. The terminal object must stay
+the same. Pure checks cover chronological duplicate alignment and multiline boundaries;
+an ambiguous clipped repeat supplies no location. Mounted controls also cover Enter and
+selection/copy without a jump. Full transcript paging is needed for viewport following even
+with decorations disabled; keep the reader shared and release it on conversation changes.
+
+Alternate-screen history belongs to the CLI. The browser audit supplies a local mouse-report
+consumer which redraws xterm's alternate grid and checks jumps both ways, user-wheel context,
+interruption by manual input, and refusal without outbound keys when mouse tracking is off.
+Let xterm encode the requested wheel protocol; synthesizing arrows can edit the composer.
+Do not claim this fixture validates every installed CLI's fullscreen layout. If no confirmed
+anchor is visible, retain the last known context; if the target is absent or the CLI cannot
+scroll, report the failed reveal rather than rewriting terminal output. Scroll callbacks
+must use cached locations, never clear decorations or rescan history on every render.
+
 ### Added, renamed or moved any file
 
 **Touches:** added, renamed or moved any file
