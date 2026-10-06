@@ -847,10 +847,10 @@ jobs:
   # `linux` or `macos` job would leave behind if the bump ran earlier. (The release branch
   # and tag follow the same rule now: `publish` pushes them.)
   #
-  # The push carries `github.token`, so it does NOT start a CI run — GitHub refuses to
-  # trigger workflows from pushes made with that token, which is what keeps this from
-  # being a release that queues a full CI matrix behind itself. The bump's own gates run
-  # here instead, inside scripts/bump-version.sh (`package --check`, `metadata`).
+  # The push uses CI_DEPLOY_KEY so it can bypass the trunk's ruleset when deploy keys
+  # are allowed. Unlike github.token, this credential allows the push to trigger CI.
+  # The bump's own gates also run inside scripts/bump-version.sh (`package --check`,
+  # `metadata`).
   # ---------------------------------------------------------------------------------
   bump:
     name: bump ${{ inputs.base }} to the next dev version
@@ -866,6 +866,7 @@ jobs:
         with:
           ref: ${{ inputs.base }}
           fetch-depth: 0
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
 
       - uses: ./.github/actions/setup-rust
         with:
