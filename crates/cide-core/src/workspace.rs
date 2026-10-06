@@ -119,6 +119,7 @@ pub fn open_project(
     let primary_session = SessionId::new();
 
     let console = Tab {
+        peer_chat: None,
         id: TabId::new(),
         kind: TabKind::ClaudeHome,
         tree: layout::new_tree(Pane {
@@ -128,6 +129,7 @@ pub fn open_project(
             session: Some(primary_session),
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -384,6 +386,7 @@ fn insert_tab(
     p.tabs.insert(
         at,
         Tab {
+            peer_chat: None,
             id,
             kind,
             tree: layout::new_tree(first_pane),
@@ -459,7 +462,15 @@ pub fn reinsert_tab(
 
     let id = TabId::new();
     let at = index.clamp(1, p.tabs.len());
-    p.tabs.insert(at, Tab { id, kind, tree });
+    p.tabs.insert(
+        at,
+        Tab {
+            id,
+            kind,
+            tree,
+            peer_chat: None,
+        },
+    );
     set_active(p, id);
     bump(ws);
     Ok(id)
@@ -585,6 +596,13 @@ pub fn reopen_project(
         );
         return open_project(ws, roots, name);
     };
+
+    for tab in &mut project.tabs {
+        if let Some(chat) = &mut tab.peer_chat {
+            chat.paused = true;
+            chat.starting = false;
+        }
+    }
 
     let id = ProjectId::new();
     project.id = id;
@@ -777,6 +795,7 @@ pub fn close_pane(
     pane: PaneId,
     force: bool,
 ) -> Result<()> {
+    crate::peer_chat::require_unpaired(ws, project, tab)?;
     // Immutable borrow first, like `close_tab`: a refusal must leave `rev` untouched.
     if !force {
         let t = self::tab(ws, project, tab)?;
@@ -1409,6 +1428,7 @@ pub fn detach_pane(
     tab: TabId,
     pane: PaneId,
 ) -> Result<WindowLabel> {
+    crate::peer_chat::require_unpaired(ws, project, tab)?;
     // `take_pane` enforces the same refusals as closing: the console's primary pane cannot
     // leave at all, and neither can a tab's last pane. Detaching the only pane of a tab
     // would leave an empty tab behind, which the tree has no way to represent; detaching
@@ -1733,6 +1753,7 @@ pub fn note_conversation(
     conversation: SessionId,
     now_ms: u64,
 ) -> bool {
+    let mut changed = false;
     for project in ws.projects.values_mut() {
         let panes = project
             .tabs
@@ -1748,9 +1769,10 @@ pub fn note_conversation(
             // Also skip when the CLI is simply using our id, so the field stays `None` for
             // the ordinary pane and `workspace.json` does not grow a redundant uuid per pane.
             let next = (conversation != session).then_some(conversation);
-            if pane.conversation == next {
-                return false;
+            if pane.conversation == next && !pane.codex_cleared {
+                continue;
             }
+            pane.codex_cleared = false;
             pane.conversation = next;
             // In lockstep, never independently: the stamp means "when the pane arrived on
             // *this* conversation", so a stamp left behind by the previous one would be worse
@@ -1758,10 +1780,37 @@ pub fn note_conversation(
             // it and let it win the comparison it exists to lose. Cleared with the id when the
             // CLI comes back to cide's own, for the same reason.
             pane.conversation_since = next.map(|_| now_ms);
-            return true;
+            changed = true;
         }
     }
-    false
+    changed
+}
+
+/// A confirmed Codex reset. Keep the routing id and working directory, but invalidate every
+/// saved thread fallback. This also covers detached panes and mirrors of the same child.
+pub fn note_codex_clear(ws: &mut Workspace, session: SessionId) -> bool {
+    let mut changed = false;
+    for project in ws.projects.values_mut() {
+        for pane in project
+            .tabs
+            .iter_mut()
+            .flat_map(|t| t.tree.panes.values_mut())
+            .chain(project.detached.values_mut())
+        {
+            if pane.session != Some(session) || pane_harness(pane) != cide_ipc::Harness::Codex {
+                continue;
+            }
+            changed |= !pane.codex_cleared || pane.conversation.is_some();
+            pane.codex_cleared = true;
+            pane.conversation = None;
+            pane.conversation_since = None;
+            pane.harness_conversation = None;
+            if let Some(continuation) = &mut pane.continues {
+                continuation.id = session.to_string();
+            }
+        }
+    }
+    changed
 }
 
 /// The instant each open conversation became the one its pane is on, keyed by conversation id.
@@ -1821,6 +1870,13 @@ pub fn bind_session(
     session: SessionId,
     harness: Option<cide_ipc::Harness>,
 ) -> Result<()> {
+    if crate::peer_chat::for_session(ws, session)
+        .is_some_and(|(p, t, id, _)| p != project || t != tab || id != pane)
+    {
+        return Err(CoreError::Invariant(
+            "A two-agent chat session cannot be shared outside its pair".into(),
+        ));
+    }
     // The detached map first only when the tab does not hold it: an id is in one place or the
     // other, never both, and preferring the tab keeps the ordinary path a single lookup.
     if let Ok(t) = tab_mut(ws, project, tab)
@@ -1892,6 +1948,7 @@ fn stamp_harness(pane: &mut Pane, harness: Option<cide_ipc::Harness>) {
     };
     let was = pane_harness(pane);
     if was != harness {
+        pane.codex_cleared = false;
         pane.harness_conversation = None;
         pane.conversation = None;
         pane.conversation_since = None;
@@ -1923,7 +1980,7 @@ pub fn pane_harness(pane: &Pane) -> cide_ipc::Harness {
 
 /// Codex chooses its own thread id. A continuation can name it before hooks arrive.
 pub fn pane_codex_thread(pane: &Pane) -> Option<SessionId> {
-    if pane_harness(pane) != cide_ipc::Harness::Codex {
+    if pane_harness(pane) != cide_ipc::Harness::Codex || pane.codex_cleared {
         return None;
     }
     pane.conversation.or_else(|| {
@@ -2295,6 +2352,41 @@ pub fn validate(ws: &Workspace) -> Result<()> {
             }
 
             layout::validate(&t.tree)?;
+            if let Some(chat) = &t.peer_chat {
+                let correct_order = matches!(&t.tree.root, cide_ipc::LayoutNode::Split { axis: Axis::Row, a, b, .. }
+                    if matches!(a.as_ref(), cide_ipc::LayoutNode::Leaf { pane } if *pane == chat.main)
+                    && matches!(b.as_ref(), cide_ipc::LayoutNode::Leaf { pane } if *pane == chat.peer));
+                if !correct_order
+                    || chat.main == chat.peer
+                    || t.tree.panes.len() != 2
+                    || t.tree.maximized.is_some()
+                    || !matches!(
+                        t.kind,
+                        TabKind::ClaudeFull {
+                            ephemeral: true,
+                            ..
+                        }
+                    )
+                    || [chat.main, chat.peer].iter().any(|id| {
+                        t.tree.panes.get(id).is_none_or(|p| {
+                            p.kind != PaneKind::Claude || p.role != PaneRole::Auxiliary
+                        })
+                    })
+                {
+                    return Err(CoreError::Invariant(
+                        "Invalid two-agent chat panel layout".into(),
+                    ));
+                }
+                if pane_harness(&t.tree.panes[&chat.main]) != chat.main_harness.harness()
+                    || chat.selection.as_ref().is_some_and(|s| {
+                        pane_harness(&t.tree.panes[&chat.peer]) != s.harness.harness()
+                    })
+                {
+                    return Err(CoreError::Invariant(
+                        "Two-agent chat harness identity changed".into(),
+                    ));
+                }
+            }
             for pane in t.tree.panes.keys() {
                 if !panes.insert(*pane) {
                     return Err(CoreError::Invariant(format!(
@@ -2778,6 +2870,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         session: attached.then(SessionId::new),
         conversation: None,
         conversation_since: None,
+        codex_cleared: false,
         harness_conversation: None,
         continues: None,
         harness: None,
@@ -2789,6 +2882,49 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_clear_invalidates_mirrors_and_defaults_off_for_older_workspaces() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/tmp/codex-clear-mirrors");
+        let session = ws.projects[&project].primary_session;
+        let mirror = split_console(&mut ws, project);
+        let tab = ws.projects[&project].tabs[0].id;
+        let old = SessionId::new();
+        for pane in ws.projects.get_mut(&project).unwrap().tabs[0]
+            .tree
+            .panes
+            .values_mut()
+        {
+            pane.kind = PaneKind::Claude;
+            pane.harness = Some(cide_ipc::Harness::Codex);
+            pane.session = Some(session);
+            pane.conversation = Some(old);
+            let legacy = serde_json::to_value(&*pane).unwrap();
+            assert!(legacy.get("codexCleared").is_none());
+            let loaded: Pane = serde_json::from_value(legacy).unwrap();
+            assert!(!loaded.codex_cleared);
+        }
+        detach_pane(&mut ws, project, tab, mirror).unwrap();
+        assert!(note_codex_clear(&mut ws, session));
+        assert!(
+            !note_codex_clear(&mut ws, session),
+            "duplicate resets are idempotent"
+        );
+        assert!(ws.projects[&project].detached[&mirror].codex_cleared);
+        let new = SessionId::new();
+        assert!(note_conversation(&mut ws, session, new, 10));
+        for pane in ws.projects[&project].tabs[0]
+            .tree
+            .panes
+            .values()
+            .chain(ws.projects[&project].detached.values())
+        {
+            assert!(!pane.codex_cleared);
+            assert_eq!(pane_codex_thread(pane), Some(new));
+        }
+        assert!(!note_conversation(&mut ws, session, new, 20));
+    }
+
     #[test]
     fn codex_continuations_use_the_latest_thread_and_never_the_routing_id() {
         let mut ws = Workspace::default();

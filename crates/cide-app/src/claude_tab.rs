@@ -205,9 +205,7 @@ pub(crate) fn open(
             cide_core::harness_settings::effective(ws, Some(project.id)).console_harness,
             cide_core::harness_settings::effective(ws, Some(project.id))
                 .codex
-                .cli
-                .inject
-                .permissions,
+                .cli,
         ))
     })?;
     let harness = match chosen.unwrap_or(TabHarness::Console(setting)) {
@@ -225,7 +223,7 @@ pub(crate) fn open(
             Vec::new()
         }
     } else {
-        stance_args(codex, mode.unattended, codex_policy)
+        stance_args(codex, mode.unattended, &codex_policy)
     };
     // Codex has no `--name`, and names a thread by itself.
     if !codex
@@ -383,6 +381,7 @@ pub(crate) fn open(
                 session: Some(session),
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 // OpenCode's native conversation (and worktree directory) is recorded by the adapter.
                 continues: (in_worktree && !opencode).then(|| cide_ipc::HarnessSession {
@@ -453,7 +452,7 @@ pub(crate) fn open(
 fn stance_args(
     codex: bool,
     unattended: cide_agents::Unattended,
-    codex_policy: bool,
+    codex_policy: &cide_ipc::CodexCli,
 ) -> Vec<String> {
     if codex {
         // Codex's vocabulary for the same three answers: the sandbox-and-approval pair a run of
@@ -463,7 +462,14 @@ fn stance_args(
         //
         // And nothing when Settings says a wrapper decides (M108, `CodexInjections::permissions`).
         let policy = match unattended {
-            _ if !codex_policy => None,
+            _ if !codex_policy.inject.permissions => None,
+            _ if codex_policy.permission_mode != cide_ipc::CodexPermissionMode::UseConfig
+                || cide_core::codex_cli::has_permission_override(
+                    &cide_core::codex_cli::plan_here(codex_policy).args,
+                ) =>
+            {
+                None
+            }
             cide_agents::Unattended::Ask => None,
             unattended => cide_agents::harness::codex::permission_policy(None, unattended).ok(),
         };
@@ -564,9 +570,7 @@ pub(crate) async fn resume_closed(
             root,
             cide_core::harness_settings::effective(ws, Some(project))
                 .codex
-                .cli
-                .inject
-                .permissions,
+                .cli,
         ))
     }) else {
         return Vec::new();
@@ -605,7 +609,7 @@ pub(crate) async fn resume_closed(
             args: if console == cide_ipc::ConsoleHarness::Opencode {
                 Vec::new()
             } else {
-                stance_args(codex, unattended, codex_policy)
+                stance_args(codex, unattended, &codex_policy)
             },
             cwd: cwd.to_string_lossy().into_owned(),
             geometry: Geometry::default(),
@@ -662,4 +666,30 @@ pub(crate) async fn resume_closed(
         }
     }
     started
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_tabs_leave_saved_and_explicit_defaults_to_the_console_launcher() {
+        let mut cli = cide_ipc::CodexCli::default();
+        assert_eq!(
+            stance_args(true, cide_agents::Unattended::Bypass, &cli),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        cli.permission_mode = cide_ipc::CodexPermissionMode::ApproveForMe;
+        assert!(stance_args(true, cide_agents::Unattended::Bypass, &cli).is_empty());
+        cli.permission_mode = cide_ipc::CodexPermissionMode::UseConfig;
+        cli.args = vec!["-s".into(), "read-only".into()];
+        assert!(stance_args(true, cide_agents::Unattended::Bypass, &cli).is_empty());
+        cli.args.clear();
+        cli.inject.permissions = false;
+        assert!(stance_args(true, cide_agents::Unattended::Bypass, &cli).is_empty());
+        assert_eq!(
+            stance_args(false, cide_agents::Unattended::Auto, &cli),
+            ["--permission-mode", "auto"]
+        );
+    }
 }

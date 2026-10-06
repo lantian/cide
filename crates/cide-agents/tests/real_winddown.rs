@@ -115,6 +115,7 @@ fn a_real_turn_is_interrupted_by_esc_and_the_next_line_is_taken_up() {
         review: false,
         server: None,
         git_dirs: Vec::new(),
+        codex_git_permissions: None,
         sandbox_brief: None,
         codex_trust_root: None,
         codex_path_prepend: None,

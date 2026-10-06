@@ -668,6 +668,13 @@ fn build() -> Vec<Command> {
         // tier falls to registry order, and this row sits above that one — so `create` would have
         // started answering with a project wizard, which the two tests pinning `create` to *New
         // branch…* exist to prevent. `new` is in the title and reaches it a tier higher anyway.
+        Command::new(
+            "experimental.peerChat",
+            "Experimental: Open Two-Agent Chat",
+            HARNESS,
+        )
+        .when("projectOpen")
+        .keywords(&["two-agent", "peer", "chat", "conversation"]),
         Command::new("project.new", "New project…", PROJECT).keywords(&[
             "scaffold",
             "init",

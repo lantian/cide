@@ -1236,6 +1236,10 @@ pub struct CodexCli {
     pub args: Vec<String>,
     /// Extra environment variables for `codex` children.
     pub env: Vec<ClaudeEnvVar>,
+    /// The default for launches without an explicit permission policy or CLI override.
+    pub permission_mode: CodexPermissionMode,
+    /// An existing Codex permissions profile, used only for `customProfile`.
+    pub permission_profile: String,
     /// Which of cide's own additions are still made. See [`CodexInjections`].
     pub inject: CodexInjections,
 }
@@ -1246,6 +1250,8 @@ impl Default for CodexCli {
             binary: "codex".to_string(),
             args: Vec::new(),
             env: Vec::new(),
+            permission_mode: CodexPermissionMode::UseConfig,
+            permission_profile: String::new(),
             inject: CodexInjections::default(),
         }
     }
@@ -1259,9 +1265,25 @@ impl fmt::Debug for CodexCli {
             .field("binary", &self.binary)
             .field("args", &self.args)
             .field("env", &self.env)
+            .field("permission_mode", &self.permission_mode)
+            .field("permission_profile", &self.permission_profile)
             .field("inject", &self.inject)
             .finish()
     }
+}
+
+/// The presets offered by Settings → Harness → Launch → Default permissions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum CodexPermissionMode {
+    #[default]
+    UseConfig,
+    AskForApproval,
+    ApproveForMe,
+    FullAccess,
+    ReadOnly,
+    CustomProfile,
 }
 
 /// What cide adds to a codex command line, each independently switchable. (M93)
@@ -1305,6 +1327,9 @@ pub struct CodexInjections {
     /// role's `permission-mode` and the project's unattended default are no longer expressed,
     /// so a run may stop on an approval prompt nobody is watching.
     pub permissions: bool,
+    /// Invocation-local Git write grants for eligible editable consoles and worker worktrees.
+    /// Off keeps Codex's own Git protections and supported approval route. Applied on launch.
+    pub git_permissions: bool,
     /// For MR reviews, suppress approval prompts while leaving the wrapper or Codex config in
     /// charge of the workspace sandbox boundary.
     pub review_permissions: bool,
@@ -1319,6 +1344,7 @@ impl Default for CodexInjections {
             resume: true,
             fork: true,
             permissions: true,
+            git_permissions: true,
             review_permissions: true,
         }
     }
@@ -1936,7 +1962,43 @@ impl InspectionSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_git_permissions_default_on_for_old_settings_and_persist_opt_out() {
+        let old: super::CodexInjections = serde_json::from_str(r#"{"permissions":false}"#).unwrap();
+        assert!(old.git_permissions);
+        let mut settings = super::CodexCli::default();
+        settings.inject.git_permissions = false;
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(saved.contains("\"gitPermissions\":false"));
+        let loaded: super::CodexCli = serde_json::from_str(&saved).unwrap();
+        assert!(!loaded.inject.git_permissions);
+    }
     use super::*;
+
+    #[test]
+    fn codex_permission_defaults_are_backward_compatible_and_round_trip() {
+        let old: CodexCli =
+            serde_json::from_str(r#"{"binary":"wrapper","args":["--search"]}"#).unwrap();
+        assert_eq!(old.permission_mode, CodexPermissionMode::UseConfig);
+        assert_eq!(old.permission_profile, "");
+        for mode in [
+            CodexPermissionMode::UseConfig,
+            CodexPermissionMode::AskForApproval,
+            CodexPermissionMode::ApproveForMe,
+            CodexPermissionMode::FullAccess,
+            CodexPermissionMode::ReadOnly,
+            CodexPermissionMode::CustomProfile,
+        ] {
+            let cli = CodexCli {
+                permission_mode: mode,
+                permission_profile: "team".into(),
+                ..old.clone()
+            };
+            let loaded: CodexCli =
+                serde_json::from_str(&serde_json::to_string(&cli).unwrap()).unwrap();
+            assert_eq!(loaded, cli);
+        }
+    }
 
     /// The two defaults, pinned, because they are the whole shape of the feature.
     ///

@@ -25,6 +25,8 @@ pub(crate) struct Console {
     instructions: Option<String>,
     instruction_file: Option<PathBuf>,
     events: bool,
+    peer_model: Option<String>,
+    peer_agent: Option<String>,
 }
 
 pub(crate) struct Start {
@@ -37,6 +39,10 @@ pub(crate) struct Start {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub unattended: bool,
+    pub reviewer: bool,
+    /// Paired agents address their one message tool directly. OpenCode 2 defaults
+    /// to Code Mode, whose execute wrapper is denied by the reviewer policy.
+    pub paired: bool,
 }
 
 impl Console {
@@ -51,6 +57,8 @@ impl Console {
             instructions,
             model,
             unattended,
+            reviewer,
+            paired,
         } = start;
         let cli = &settings.opencode.cli;
         cide_core::opencode_cli::resolve(&cli.binary)?;
@@ -66,10 +74,15 @@ impl Console {
         )?;
         let mut launch = cide_core::opencode_cli::plan(cli);
         let user_model = take_option(&mut launch.args, &["--model", "-m"]);
-        let agent = take_option(&mut launch.args, &["--agent"]);
+        let configured_agent = take_option(&mut launch.args, &["--agent"]);
+        let agent = if reviewer {
+            Some("cide-peer-reviewer".to_string())
+        } else {
+            configured_agent
+        };
         let title = take_option(&mut launch.args, &["--title"]);
         let model = model.or(user_model);
-        let unattended = unattended || launch.args.iter().any(|arg| arg == "--auto");
+        let unattended = !reviewer && (unattended || launch.args.iter().any(|arg| arg == "--auto"));
         launch.args.retain(|arg| arg != "--auto");
         let hook = crate::agents::cide_hook_binary();
         let mut document: serde_json::Value = OPENCODE_CLI
@@ -80,6 +93,12 @@ impl Console {
             )
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| json!({}));
+        if paired {
+            direct_peer_tools(&mut document, flags.generation);
+        }
+        if reviewer {
+            reviewer_config(&mut document, flags.generation);
+        }
         let instructions =
             instructions.filter(|_| cli.inject.instructions && cli.inject.mcp_config);
         let instruction_file = if flags.generation == Generation::V1 {
@@ -152,6 +171,8 @@ impl Console {
             instructions,
             instruction_file,
             events: cli.inject.events,
+            peer_model: model.clone(),
+            peer_agent: agent.clone(),
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         while !console.api.healthy() {
@@ -230,6 +251,19 @@ impl Console {
     fn api_url(&self, port: u16) -> String {
         format!("http://127.0.0.1:{port}")
     }
+    pub fn peer_ready(&self) -> Result<bool, String> {
+        let id = self.conversation().id;
+        let state = self.api.state(&id, false)?;
+        Ok(matches!(state, SessionState::Idle))
+    }
+    pub fn peer_prompt(&self, text: &str) -> Result<(), String> {
+        self.api.prompt_as(
+            &self.conversation().id,
+            text,
+            self.peer_model.as_deref(),
+            self.peer_agent.as_deref(),
+        )
+    }
     pub fn conversation(&self) -> HarnessSession {
         self.conversation.lock().clone()
     }
@@ -247,6 +281,27 @@ impl Console {
         };
         if info.get("parentID").is_some() || !same_directory(&info, &self.conversation().cwd) {
             return false;
+        }
+        if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
+            let pair = state.with(|ws| {
+                let (project, tab, _, chat) = cide_core::peer_chat::for_session(ws, routing)?;
+                let ids = [chat.main, chat.peer]
+                    .iter()
+                    .filter_map(|id| {
+                        cide_core::workspace::tab(ws, project, tab)
+                            .ok()?
+                            .tree
+                            .panes
+                            .get(id)?
+                            .session
+                    })
+                    .collect::<Vec<_>>();
+                Some((project, tab, ids))
+            });
+            if let Some((project, tab, ids)) = pair {
+                let _ = state.update(|ws| cide_core::peer_chat::set_paused(ws, project, tab, true));
+                app.state::<crate::peer_chat::Runtime>().cancel(&ids);
+            }
         }
         let conversation = {
             let mut conversation = self.conversation.lock();
@@ -317,6 +372,15 @@ impl Console {
                                     this.select_conversation(&event_app, routing, id);
                                 }
                             }
+                            if kind == "message.updated" || kind == "message.created" {
+                                let info = payload.get("info").unwrap_or(payload);
+                                if info["role"].as_str() == Some("user")
+                                    && info["sessionID"].as_str()
+                                        == Some(this.conversation().id.as_str())
+                                {
+                                    crate::peer_chat::note_native_prompt(&event_app, routing);
+                                }
+                            }
                             if kind == "file.edited"
                                 && let Some(path) = payload.get("file").and_then(|v| v.as_str())
                             {
@@ -376,6 +440,37 @@ impl Console {
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
+    }
+}
+
+/// Private server policy: all agents inherit the same denial, even if the TUI switches modes.
+fn direct_peer_tools(document: &mut serde_json::Value, generation: Generation) {
+    if generation == Generation::V2 {
+        // Keep the cide message tool on the native tool list. Allowing execute
+        // would enlarge the reviewer's vocabulary instead of exposing this one tool.
+        document["mcp"]["servers"]["cide"]["codemode"] = json!(false);
+    }
+}
+
+fn reviewer_config(document: &mut serde_json::Value, generation: Generation) {
+    if generation == Generation::V2 {
+        let mut rules = vec![json!({ "action": "*", "resource": "*", "effect": "deny" })];
+        for action in [
+            "read",
+            "glob",
+            "grep",
+            "list",
+            "external_directory",
+            "cide_cide_peer_chat_send",
+        ] {
+            rules.push(json!({ "action": action, "resource": "*", "effect": "allow" }));
+        }
+        document["permissions"] = json!(rules);
+        document["agents"]["cide-peer-reviewer"] = json!({ "system": "You are the read-only peer reviewer. Reply with cide_cide_peer_chat_send.", "permissions": rules });
+    } else {
+        let rules = json!({ "*": "deny", "read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "external_directory": "allow", "cide_cide_peer_chat_send": "allow" });
+        document["permission"] = rules.clone();
+        document["agent"]["cide-peer-reviewer"] = json!({ "mode": "primary", "description": "Read-only two-agent chat peer", "prompt": "Review without edits. Reply with cide_cide_peer_chat_send.", "permission": rules });
     }
 }
 
@@ -553,4 +648,79 @@ fn take_option(args: &mut Vec<String>, names: &[&str]) -> Option<String> {
     }
     *args = kept;
     result
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+    #[test]
+    fn paired_v2_exposes_the_message_tool_without_allowing_execute() {
+        let mut doc = json!({"mcp":{"servers":{
+            "cide":{"type":"local","command":["cide-hook","mcp"],"disabled":false},
+            "other":{"type":"local","command":["other"]}
+        }}});
+        direct_peer_tools(&mut doc, Generation::V2);
+        reviewer_config(&mut doc, Generation::V2);
+        assert_eq!(doc["mcp"]["servers"]["cide"]["codemode"], false);
+        assert_eq!(
+            doc["mcp"]["servers"]["cide"]["command"],
+            json!(["cide-hook", "mcp"])
+        );
+        assert!(doc["mcp"]["servers"]["other"].get("codemode").is_none());
+        let rules = doc["agents"]["cide-peer-reviewer"]["permissions"]
+            .as_array()
+            .unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["action"] == "cide_cide_peer_chat_send" && r["effect"] == "allow")
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r["action"] == "execute" && r["effect"] != "deny")
+        );
+        let original = json!({"mcp":{"cide":{"type":"local"}}});
+        let mut v1 = original.clone();
+        direct_peer_tools(&mut v1, Generation::V1);
+        assert_eq!(v1, original);
+    }
+    #[test]
+    fn native_peer_policy_denies_mutation_without_changing_providers() {
+        for generation in [Generation::V1, Generation::V2] {
+            let mut doc = json!({"provider":{"local":{"name":"Keep me"}}});
+            reviewer_config(&mut doc, generation);
+            assert_eq!(doc["provider"]["local"]["name"], "Keep me");
+            if generation == Generation::V1 {
+                assert_eq!(doc["permission"]["*"], "deny");
+                assert_eq!(doc["permission"]["cide_cide_peer_chat_send"], "allow");
+                assert_eq!(doc["permission"]["external_directory"], "allow");
+                assert_eq!(
+                    doc["agent"]["cide-peer-reviewer"]["permission"],
+                    doc["permission"]
+                );
+            } else {
+                let rules = doc["permissions"].as_array().unwrap();
+                assert_eq!(rules[0]["effect"], "deny");
+                assert!(
+                    rules
+                        .iter()
+                        .any(|r| r["action"] == "external_directory" && r["effect"] == "allow")
+                );
+                assert!(
+                    rules.iter().any(
+                        |r| r["action"] == "cide_cide_peer_chat_send" && r["effect"] == "allow"
+                    )
+                );
+                assert!(!rules.iter().any(|r| matches!(
+                    r["action"].as_str(),
+                    Some("edit" | "bash" | "task")
+                ) && r["effect"] == "allow"));
+                assert_eq!(
+                    doc["agents"]["cide-peer-reviewer"]["permissions"],
+                    doc["permissions"]
+                );
+            }
+        }
+    }
 }

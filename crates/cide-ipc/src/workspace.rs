@@ -571,6 +571,9 @@ pub struct Tab {
     pub id: TabId,
     pub kind: TabKind,
     pub tree: PaneTree,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub peer_chat: Option<crate::PeerChat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -1287,6 +1290,11 @@ pub struct Pane {
     /// `cide_core::workspace::claude_name_cutoffs` is the one reader.
     #[serde(default)]
     pub conversation_since: Option<u64>,
+    /// Codex accepted `/clear` and has not yet reported the replacement thread.
+    /// An intentional empty conversation restores fresh, rather than offering recovery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub codex_cleared: bool,
     /// Native conversation identity for console CLIs whose ids are not UUIDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

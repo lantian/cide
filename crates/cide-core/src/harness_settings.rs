@@ -64,10 +64,24 @@ mod tests {
         )));
         let mut cli = global.codex.cli.clone();
         cli.binary = "project-wrapper".into();
+        cli.inject.git_permissions = false;
+        cli.permission_mode = cide_ipc::CodexPermissionMode::ApproveForMe;
+        cli.permission_profile = "team".into();
         overrides.apply(ProjectHarnessEdit::Codex(Some(cli)));
         let resolved = overrides.resolve(&global);
         assert_eq!(resolved.console_harness, ConsoleHarness::Opencode);
         assert_eq!(resolved.codex.cli.binary, "project-wrapper");
+        assert!(!resolved.codex.cli.inject.git_permissions);
+        assert_eq!(
+            resolved.codex.cli.permission_mode,
+            cide_ipc::CodexPermissionMode::ApproveForMe
+        );
+        assert_eq!(
+            global.codex.cli.permission_mode,
+            cide_ipc::CodexPermissionMode::UseConfig
+        );
+        assert_eq!(resolved.codex.cli.permission_profile, "team");
+        assert!(global.codex.cli.inject.git_permissions);
         assert_eq!(global.codex.cli.binary, "global-wrapper");
         overrides.apply(ProjectHarnessEdit::Codex(None));
         assert_eq!(overrides.resolve(&global).codex, global.codex);

@@ -977,6 +977,15 @@ pub fn pool_notice(app: &AppHandle, project: cide_ipc::ProjectId, text: String) 
     }
 }
 
+/// A Codex launch kept the user's policy because a scoped Git grant was incompatible.
+pub const CODEX_GIT_PERMISSIONS_NOTICE: &str = "cide://codex-git-permissions-notice";
+
+pub fn codex_git_permissions_notice(app: &AppHandle, project: cide_ipc::ProjectId, text: String) {
+    if let Err(error) = app.emit(CODEX_GIT_PERMISSIONS_NOTICE, PoolNotice { project, text }) {
+        tracing::debug!(%error, "Codex Git permission notice reached no window");
+    }
+}
+
 // --- self-update ---------------------------------------------------------------------------
 
 /// A release newer than this build exists and the user has not skipped it. Sent once, by the

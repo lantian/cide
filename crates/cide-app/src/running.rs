@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use cide_ipc::{
     PaneKind, ProjectId, ProjectRunning, ProjectRunningSet, RunState, SessionId, SessionState,
-    TabId, TabRunning, TaskBoard, TaskId, TaskRow, Workspace,
+    TabId, TabRunning, TaskBoard, TaskId, TaskRow, TaskStatus, Workspace,
 };
 use tauri::{AppHandle, Manager};
 
@@ -130,7 +130,7 @@ pub(crate) enum Busy {
 /// run accruing time*, which is a billing question. This one answers *is there anything in
 /// flight*, and an `Idle` run is not accruing time and very much is in flight.
 ///
-/// ## Except an idle run whose task is in review
+/// ## Except an idle run whose task is in review or done
 ///
 /// A claude run hands its turn back, its task goes to `review`, and the child stays alive at
 /// its prompt so a send-back has somewhere to land — `AgentRegistry::retire_done` ends it only
@@ -138,8 +138,9 @@ pub(crate) enum Busy {
 /// rest of the session, and the project never looked quiet: one stuck task switched the
 /// *Quiet for* timer off without a word. Such a run has finished its work; waiting on it is
 /// waiting on a person, which is exactly the situation the wake exists for, and its prompt
-/// tells the planner to read what is sitting in review. `task_in_review` is read off the board
-/// at the tick.
+/// tells the planner to read what is sitting in review. `task_status` is read off the board
+/// at the tick. A done task likewise has no claim, even while its open conversation keeps
+/// the child alive: finishing review must not make the project busy again.
 ///
 /// # `Working`
 ///
@@ -154,22 +155,23 @@ pub(crate) enum Busy {
 /// badge that counted them would have gone from wrong to slightly-less-wrong. `Idle` is a live
 /// child between turns, which is the Agents panel's business and not a count of work in flight.
 ///
-/// `task_in_review` is not consulted at all here, and that is not an oversight: `Idle` and
+/// `task_status` is not consulted at all here, and that is not an oversight: `Idle` and
 /// `Interrupted` are already out, and they are the only arms the flag qualifies.
-pub(crate) fn run_is_busy(state: &RunState, task_in_review: bool, asking: Busy) -> bool {
+pub(crate) fn run_is_busy(state: &RunState, task_status: Option<TaskStatus>, asking: Busy) -> bool {
+    let handed_in = matches!(task_status, Some(TaskStatus::Review | TaskStatus::Done));
     match state {
         // Over, under every reading.
         RunState::Finished { .. } | RunState::Failed { .. } => false,
         // No child — so never on the header's chip — but a claim waiting on Resume or Discard,
         // which the spinner must not plan over. See `Interrupted is a claim` above.
-        RunState::Interrupted => asking == Busy::Claimed && !task_in_review,
+        RunState::Interrupted => asking == Busy::Claimed && !handed_in,
         // A child exists and the turn is live.
         RunState::Starting | RunState::Running | RunState::AwaitingPermission => true,
         // A claim on a slot or a worktree, with nothing executing behind it.
         RunState::Queued | RunState::Paused { .. } => asking == Busy::Claimed,
-        // Alive between turns — unless its task is parked in review, where even the spinner
+        // Alive between turns — unless its task is in review or done, where even the spinner
         // stops counting it. See above.
-        RunState::Idle => asking == Busy::Claimed && !task_in_review,
+        RunState::Idle => asking == Busy::Claimed && !handed_in,
     }
 }
 
@@ -289,17 +291,15 @@ pub(crate) fn counts_for(
         };
     };
 
-    let in_review = |task: &Option<TaskId>| {
-        task.as_ref().is_some_and(|id| {
-            tasks
-                .iter()
-                .any(|row| &row.id == id && row.status == cide_ipc::TaskStatus::Review)
-        })
+    let task_status = |task: &Option<TaskId>| {
+        task.as_ref()
+            .and_then(|id| tasks.iter().find(|row| &row.id == id))
+            .map(|row| row.status)
     };
     let runs = registry
         .runs_for(project)
         .iter()
-        .filter(|run| run_is_busy(&run.state, in_review(&run.task), asking))
+        .filter(|run| run_is_busy(&run.state, task_status(&run.task), asking))
         .count();
 
     // `session_panes` rather than a walk over `project.tabs`, and that is not a tidy-up: a
@@ -683,18 +683,48 @@ mod tests {
     /// working.
     #[test]
     fn an_idle_run_on_a_task_in_review_does_not_hold_the_spinner_off() {
-        assert!(!run_is_busy(&RunState::Idle, true, Busy::Claimed));
-        assert!(run_is_busy(&RunState::Running, true, Busy::Claimed));
+        assert!(!run_is_busy(
+            &RunState::Idle,
+            Some(TaskStatus::Review),
+            Busy::Claimed
+        ));
+        assert!(run_is_busy(
+            &RunState::Running,
+            Some(TaskStatus::Review),
+            Busy::Claimed
+        ));
         assert!(run_is_busy(
             &RunState::AwaitingPermission,
-            true,
+            Some(TaskStatus::Review),
             Busy::Claimed
         ));
         assert!(run_is_busy(
             &RunState::Paused { since_unix_ms: 1 },
-            true,
+            Some(TaskStatus::Review),
             Busy::Claimed
         ));
+    }
+
+    #[test]
+    fn finishing_review_keeps_the_planner_quiet_even_when_the_run_is_still_open() {
+        for state in [RunState::Idle, RunState::Interrupted] {
+            for status in [TaskStatus::Review, TaskStatus::Done] {
+                assert!(!run_is_busy(&state, Some(status), Busy::Claimed));
+                assert!(!run_is_busy(&state, Some(status), Busy::Working));
+            }
+            for status in [None, Some(TaskStatus::Doing), Some(TaskStatus::Todo)] {
+                assert!(run_is_busy(&state, status, Busy::Claimed));
+            }
+        }
+        for state in [
+            RunState::Starting,
+            RunState::Running,
+            RunState::AwaitingPermission,
+            RunState::Queued,
+            RunState::Paused { since_unix_ms: 1 },
+        ] {
+            assert!(run_is_busy(&state, Some(TaskStatus::Done), Busy::Claimed));
+        }
     }
 
     /// An `Idle` run is a live child holding its role's only worktree, so the project is not
@@ -714,7 +744,7 @@ mod tests {
         ];
         for state in busy {
             assert!(
-                run_is_busy(&state, false, Busy::Claimed),
+                run_is_busy(&state, None, Busy::Claimed),
                 "{state:?} should hold the spinner off"
             );
         }
@@ -724,11 +754,15 @@ mod tests {
         ];
         for state in over {
             assert!(
-                !run_is_busy(&state, false, Busy::Claimed),
+                !run_is_busy(&state, None, Busy::Claimed),
                 "{state:?} is over and says nothing about now"
             );
-            assert!(!run_is_busy(&state, true, Busy::Claimed));
-            assert!(!run_is_busy(&state, false, Busy::Working));
+            assert!(!run_is_busy(
+                &state,
+                Some(TaskStatus::Review),
+                Busy::Claimed
+            ));
+            assert!(!run_is_busy(&state, None, Busy::Working));
         }
     }
 
@@ -741,13 +775,17 @@ mod tests {
     #[test]
     fn an_interrupted_run_holds_the_spinner_but_not_the_chip() {
         let interrupted = RunState::Interrupted;
-        assert!(run_is_busy(&interrupted, false, Busy::Claimed));
+        assert!(run_is_busy(&interrupted, None, Busy::Claimed));
         assert!(
-            !run_is_busy(&interrupted, true, Busy::Claimed),
+            !run_is_busy(&interrupted, Some(TaskStatus::Review), Busy::Claimed),
             "its task is in review: the work was handed in before the restart"
         );
-        assert!(!run_is_busy(&interrupted, false, Busy::Working));
-        assert!(!run_is_busy(&interrupted, true, Busy::Working));
+        assert!(!run_is_busy(&interrupted, None, Busy::Working));
+        assert!(!run_is_busy(
+            &interrupted,
+            Some(TaskStatus::Review),
+            Busy::Working
+        ));
     }
 
     /// **Pause means nothing is running, and the header must say so.**
@@ -764,8 +802,8 @@ mod tests {
     #[test]
     fn a_paused_project_is_working_on_nothing() {
         let paused = RunState::Paused { since_unix_ms: 1 };
-        assert!(!run_is_busy(&paused, false, Busy::Working));
-        assert!(run_is_busy(&paused, false, Busy::Claimed));
+        assert!(!run_is_busy(&paused, None, Busy::Working));
+        assert!(run_is_busy(&paused, None, Busy::Claimed));
 
         // The console pause freezes too, through the session rather than the run.
         assert!(!pane_is_busy(
@@ -794,11 +832,11 @@ mod tests {
     fn a_queued_or_idle_run_is_not_running() {
         for state in [RunState::Queued, RunState::Idle] {
             assert!(
-                !run_is_busy(&state, false, Busy::Working),
+                !run_is_busy(&state, None, Busy::Working),
                 "{state:?} has nothing executing behind it"
             );
             assert!(
-                run_is_busy(&state, false, Busy::Claimed),
+                run_is_busy(&state, None, Busy::Claimed),
                 "{state:?} still holds a claim, so the spinner must not plan around it"
             );
         }
@@ -814,9 +852,9 @@ mod tests {
             RunState::Running,
             RunState::AwaitingPermission,
         ] {
-            assert!(run_is_busy(&state, false, Busy::Working));
-            assert!(run_is_busy(&state, true, Busy::Working));
-            assert!(run_is_busy(&state, false, Busy::Claimed));
+            assert!(run_is_busy(&state, None, Busy::Working));
+            assert!(run_is_busy(&state, Some(TaskStatus::Review), Busy::Working));
+            assert!(run_is_busy(&state, None, Busy::Claimed));
         }
         for state in [SessionState::Busy, SessionState::AwaitingPermission] {
             assert!(pane_is_busy(true, false, state, Busy::Working, false));

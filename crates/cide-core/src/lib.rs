@@ -23,6 +23,7 @@ pub mod check;
 pub mod child_env;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod codex_permissions;
 pub mod commands;
 pub mod diagnostics;
 pub mod document;
@@ -67,3 +68,7 @@ pub mod toolwindow;
 pub mod workspace;
 
 pub use error::{CoreError, Result};
+
+pub mod peer_chat;
+
+pub mod peer_composer;

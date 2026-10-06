@@ -53,6 +53,11 @@ fork: boolean,
  */
 permissions: boolean, 
 /**
+ * Invocation-local Git write grants for eligible editable consoles and worker worktrees.
+ * Off keeps Codex's own Git protections and supported approval route. Applied on launch.
+ */
+gitPermissions: boolean, 
+/**
  * For MR reviews, suppress approval prompts while leaving the wrapper or Codex config in
  * charge of the workspace sandbox boundary.
  */

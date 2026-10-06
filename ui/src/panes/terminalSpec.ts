@@ -77,6 +77,9 @@ export function specFor(
   restore?: PaneRestore | undefined,
   recovery?: 'picker' | 'fresh' | undefined,
 ): TerminalSpec | null {
+  if (pane.codexCleared && pane.kind === 'claude') {
+    return { program: 'codex', args: [], cwd, project }
+  }
   /*
    * A pane opened onto an agent run's conversation re-opens **that** conversation, whatever
    * its kind says the program is (M42): Rust spells `claude --resume <id>` or the opencode TUI

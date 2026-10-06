@@ -1817,6 +1817,7 @@ mod tests {
             session: session.then(SessionId::new),
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -1844,11 +1845,13 @@ mod tests {
         layout::split(&mut tree, second_id, Axis::Col, Side::After, third).unwrap();
 
         let home = Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::ClaudeHome,
             tree,
         };
         let editor = Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::File {
                 path: "/home/u/work/cide/lib.rs".into(),

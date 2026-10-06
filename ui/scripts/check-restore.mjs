@@ -46,6 +46,13 @@ try {
   assert.equal(fresh.resumePicker, false)
   assert.equal(fresh.resume, undefined)
   assert.equal(fresh.continues, undefined)
+  const cleared = { ...continued, codexCleared: true }
+  const empty = specFor(cleared, '/worktree', 'project', plan({ kind: 'fresh' }))
+  assert.equal(empty.program, 'codex', 'a cleared pane must retain its saved harness')
+  assert.equal(empty.cwd, '/worktree')
+  assert.equal(empty.resume, undefined)
+  assert.equal(empty.continues, undefined, 'the old continuation cannot resurrect a cleared thread')
+  assert.equal(empty.resumePicker, undefined)
   const openCode = { ...pane, harness: 'opencode', harnessConversation: { harness: 'opencode', id: 'ses_native', cwd: '/worktree' } }
   assert.equal(specFor(openCode, '/worktree', 'project', plan({ kind: 'resumable', session: 'routing-id' })).resume, 'routing-id')
   assert.equal(specFor(openCode, '/worktree', 'project', missing).resumePicker, undefined)

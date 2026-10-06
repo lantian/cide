@@ -497,6 +497,188 @@ pub fn plan_here(cli: &CodexCli) -> Plan {
     plan(cli, std::env::var("APPDIR").ok().as_deref())
 }
 
+fn permission_key(value: &str) -> bool {
+    let key = value.split('=').next().unwrap_or(value).trim();
+    [
+        "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "permissions",
+        "sandbox_mode",
+        "sandbox_workspace_write",
+    ]
+    .iter()
+    .any(|prefix| key == *prefix || key.starts_with(&format!("{prefix}.")))
+}
+
+fn permission_flag(token: &str) -> Option<bool> {
+    let flag = token.split('=').next().unwrap_or(token);
+    match flag {
+        "-s" | "--sandbox" | "-a" | "--ask-for-approval" => Some(true),
+        "--approve-for-me"
+        | "--full-auto"
+        | "--dangerously-bypass-approvals-and-sandbox"
+        | "--yolo" => Some(false),
+        _ if (token.starts_with("-s") || token.starts_with("-a"))
+            && !token.starts_with("--")
+            && token.len() > 2 =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Explicit CLI permission/config-profile choices take precedence over the saved default.
+pub fn has_permission_override(args: &[String]) -> bool {
+    args.iter().any(|token| {
+        matches!(token.split('=').next().unwrap_or(token), "-p" | "--profile")
+            || (token.starts_with("-p") && !token.starts_with("--") && token.len() > 2)
+    }) || strip_permission_args(args).len() != args.len()
+}
+
+/// Used only when a role/review/tool restriction has higher priority than the user's defaults.
+pub fn strip_permission_args(args: &[String]) -> Vec<String> {
+    filter_permission_args(args, false)
+}
+
+/// Reviews retain the configured sandbox while replacing approval routing.
+pub fn strip_approval_args(args: &[String]) -> Vec<String> {
+    filter_permission_args(args, true)
+}
+
+fn filter_permission_args(args: &[String], approval_only: bool) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        if let Some(takes_value) = permission_flag(token) {
+            let sandbox = matches!(token.split('=').next().unwrap_or(token), "-s" | "--sandbox")
+                || (token.starts_with("-s") && !token.starts_with("--"));
+            if approval_only && sandbox {
+                kept.push(token.clone());
+                if takes_value
+                    && !token.contains('=')
+                    && let Some(value) = args.get(index + 1)
+                {
+                    kept.push(value.clone());
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            index += 1 + usize::from(takes_value && !token.contains('='));
+            continue;
+        }
+        if token == "-c" || token == "--config" {
+            if args.get(index + 1).is_some_and(|value| {
+                permission_key(value)
+                    && (!approval_only
+                        || value.trim().starts_with("approval_policy")
+                        || value.trim().starts_with("approvals_reviewer"))
+            }) {
+                index += 2;
+                continue;
+            }
+        } else if let Some(value) = token
+            .strip_prefix("--config=")
+            .or_else(|| token.strip_prefix("-c="))
+            .or_else(|| {
+                token
+                    .strip_prefix("-c")
+                    .filter(|_| !token.starts_with("--"))
+            })
+            && permission_key(value)
+            && (!approval_only
+                || value.trim().starts_with("approval_policy")
+                || value.trim().starts_with("approvals_reviewer"))
+        {
+            index += 1;
+            continue;
+        }
+        kept.push(token.clone());
+        index += 1;
+    }
+    kept
+}
+
+pub fn selected_permission_mode(cli: &CodexCli, args: &[String]) -> cide_ipc::CodexPermissionMode {
+    if has_permission_override(args) {
+        cide_ipc::CodexPermissionMode::UseConfig
+    } else {
+        cli.permission_mode
+    }
+}
+
+/// Validate only an active selection; an unused custom profile never prevents a launch.
+pub fn validate_permissions(cli: &CodexCli, args: &[String]) -> Result<(), String> {
+    if selected_permission_mode(cli, args) == cide_ipc::CodexPermissionMode::CustomProfile
+        && cli.permission_profile.trim().is_empty()
+    {
+        Err("Codex Default permissions: enter a custom profile name in Settings → Harness → Launch.".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Invocation-local overrides. Workspace presets use a compatible scoped Git profile when
+/// available; otherwise the legacy sandbox flags work with existing Codex configurations.
+pub fn default_permission_args(
+    cli: &CodexCli,
+    args: &[String],
+    git_profile: Option<&crate::codex_permissions::GitProfile>,
+) -> Vec<String> {
+    use cide_ipc::CodexPermissionMode as Mode;
+    let mode = selected_permission_mode(cli, args);
+    match mode {
+        Mode::UseConfig => Vec::new(),
+        Mode::FullAccess => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+        Mode::CustomProfile => vec![
+            "-c".into(),
+            format!(
+                "default_permissions={}",
+                toml_string(cli.permission_profile.trim())
+            ),
+        ],
+        Mode::AskForApproval | Mode::ApproveForMe | Mode::ReadOnly => {
+            let mut result = if mode == Mode::ReadOnly {
+                vec!["-s".into(), "read-only".into()]
+            } else if let Some(profile) = git_profile {
+                profile.args()
+            } else {
+                vec!["-s".into(), "workspace-write".into()]
+            };
+            result.extend(["-a".into(), "on-request".into()]);
+            push_config(
+                &mut result,
+                "approvals_reviewer",
+                toml_string(if mode == Mode::ApproveForMe {
+                    "auto_review"
+                } else {
+                    "user"
+                }),
+            );
+            result
+        }
+    }
+}
+
+/// `codex exec` accepts config overrides, but not the TUI's `-a` option after its subcommand.
+pub fn exec_permission_args(args: Vec<String>) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut tokens = args.into_iter();
+    while let Some(token) = tokens.next() {
+        if token == "-a" {
+            if let Some(policy) = tokens.next() {
+                push_config(&mut result, "approval_policy", toml_string(&policy));
+            }
+        } else {
+            result.push(token);
+        }
+    }
+    result
+}
+
 // ==========================================================================================
 // The binary.
 // ==========================================================================================
@@ -845,6 +1027,123 @@ pub fn status_of(rollout: &std::path::Path, model: Option<&str>) -> Option<serde
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saved_permissions_preserve_git_grants_and_select_the_reviewer() {
+        use cide_ipc::CodexPermissionMode as Mode;
+        let profile = crate::codex_permissions::GitProfile::new(&["/repo/.git".into()], &[], false);
+        let mut cli = CodexCli::default();
+        assert!(default_permission_args(&cli, &[], Some(&profile)).is_empty());
+        for (mode, reviewer) in [
+            (Mode::AskForApproval, "user"),
+            (Mode::ApproveForMe, "auto_review"),
+        ] {
+            cli.permission_mode = mode;
+            let args = default_permission_args(&cli, &[], Some(&profile));
+            assert!(args.contains(&profile.config));
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "-s" || arg == "--approve-for-me")
+            );
+            assert!(args.contains(&format!("approvals_reviewer=\"{reviewer}\"")));
+            let fallback = default_permission_args(&cli, &[], None);
+            assert_eq!(
+                &fallback[..4],
+                ["-s", "workspace-write", "-a", "on-request"]
+            );
+        }
+        cli.permission_mode = Mode::ReadOnly;
+        let args = default_permission_args(&cli, &[], Some(&profile));
+        assert_eq!(&args[..4], ["-s", "read-only", "-a", "on-request"]);
+        assert!(!args.contains(&profile.config));
+        cli.permission_mode = Mode::FullAccess;
+        assert_eq!(
+            default_permission_args(&cli, &[], Some(&profile)),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        cli.permission_mode = Mode::CustomProfile;
+        assert!(validate_permissions(&cli, &[]).is_err());
+        cli.permission_profile = " team\"profile ".into();
+        assert_eq!(
+            default_permission_args(&cli, &[], Some(&profile)),
+            ["-c", "default_permissions=\"team\\\"profile\""]
+        );
+        assert!(validate_permissions(&cli, &[]).is_ok());
+    }
+
+    #[test]
+    fn explicit_permissions_override_the_saved_default_in_every_spelling() {
+        let cli = CodexCli {
+            permission_mode: cide_ipc::CodexPermissionMode::ApproveForMe,
+            ..Default::default()
+        };
+        for tokens in [
+            vec!["--approve-for-me"],
+            vec!["--sandbox", "read-only"],
+            vec!["--sandbox=read-only"],
+            vec!["-sread-only"],
+            vec!["-a", "never"],
+            vec!["--ask-for-approval=never"],
+            vec!["--yolo"],
+            vec!["--full-auto"],
+            vec!["--profile", "team"],
+            vec!["-pteam"],
+            vec!["-c", "approvals_reviewer=\"user\""],
+            vec!["--config=approval_policy=\"never\""],
+            vec!["-cdefault_permissions=\":read-only\""],
+            vec!["-c", "sandbox_workspace_write.network_access=true"],
+        ] {
+            let args: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+            assert!(has_permission_override(&args), "{args:?}");
+            assert!(
+                default_permission_args(&cli, &args, None).is_empty(),
+                "{args:?}"
+            );
+        }
+        let args = vec!["-c".into(), "model=\"gpt-test\"".into(), "--search".into()];
+        assert!(!has_permission_override(&args));
+        assert!(!default_permission_args(&cli, &args, None).is_empty());
+        assert_eq!(strip_permission_args(&args), args);
+        let args: Vec<String> = ["-p", "model-profile", "--yolo"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        // A role can override permissions while retaining the profile's model/preferences.
+        assert_eq!(strip_permission_args(&args), ["-p", "model-profile"]);
+    }
+
+    #[test]
+    fn review_overrides_approval_routing_but_preserves_the_sandbox() {
+        let args: Vec<String> = [
+            "-s",
+            "workspace-write",
+            "--approve-for-me",
+            "-a",
+            "never",
+            "-c",
+            "approvals_reviewer=\"user\"",
+            "-c",
+            "default_permissions=\"team\"",
+            "-m",
+            "model",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            strip_approval_args(&args),
+            [
+                "-s",
+                "workspace-write",
+                "-c",
+                "default_permissions=\"team\"",
+                "-m",
+                "model"
+            ]
+        );
+        assert_eq!(strip_permission_args(&args), ["-m", "model"]);
+    }
+
     use super::*;
     use cide_ipc::{ClaudeEnvVar, CodexInjections};
 

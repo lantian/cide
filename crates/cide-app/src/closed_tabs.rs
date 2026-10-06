@@ -70,6 +70,7 @@ pub struct ClosedTab {
     pub kind: TabKind,
     pub index: usize,
     pub tree: PaneTree,
+    pub peer_chat: Option<cide_ipc::PeerChat>,
 }
 
 #[derive(Default)]
@@ -205,6 +206,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -216,6 +218,7 @@ mod tests {
 
     fn record(project: ProjectId, name: &str) -> ClosedTab {
         ClosedTab {
+            peer_chat: None,
             project,
             kind: TabKind::File {
                 path: PathBuf::from(format!("/tmp/{name}")),
@@ -228,6 +231,7 @@ mod tests {
 
     fn diff(project: ProjectId, origin: DiffOrigin) -> ClosedTab {
         ClosedTab {
+            peer_chat: None,
             project,
             kind: TabKind::Diff {
                 spec: DiffSpec {
@@ -390,6 +394,7 @@ mod tests {
         let stack = ClosedTabs::default();
         let project = ProjectId::new();
         stack.push(ClosedTab {
+            peer_chat: None,
             project,
             kind: TabKind::ClaudeFull {
                 title: "Plan - 2026-09-26 10:00:00".into(),

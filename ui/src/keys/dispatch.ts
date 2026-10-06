@@ -102,6 +102,7 @@ import {
   toolWindow as toolWindowApi,
   history as historyApi,
   tab as tabApi,
+  peerChat,
   type Axis,
   type Direction,
   type PaneId,
@@ -693,6 +694,11 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       /* ------------------------------------------------------------------ Window: tabs */
 
+      case 'experimental.peerChat': {
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        return void peerChat.open(project.id).then(() => ws.synced()).catch((error: unknown) => notifyFailure(error, { project: project.id }))
+      }
       case 'tab.close': {
         // Ctrl+W. The complaint that started this round: the binding resolved, the gate
         // swallowed the keystroke, and no arm existed. `closeTab` confirms first when the

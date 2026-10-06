@@ -9471,7 +9471,7 @@ mod tests {
         };
         let text = text_of(&ask(tool::AGENTS_LIST, json!({}), &with(Some("auto"))));
         assert!(
-            text.contains("it can edit and commit in its worktree"),
+            text.contains("Git writes depend on the launch permissions"),
             "{text}"
         );
         // The way out is the narrow grant, not dropping the sandbox (M119): one seccomp switch

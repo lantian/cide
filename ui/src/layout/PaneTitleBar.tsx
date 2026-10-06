@@ -246,7 +246,10 @@ export function PaneFrame({
   )
   const detachedWindow = useMemo(inDetachedPaneWindow, [])
   // See `bare` on the props: never in a detached window, whose cluster is its window controls.
-  const noControls = bare === true && !detachedWindow
+  const projects = useWorkspace((s) => s.boot?.workspace.projects)
+  const paired = useMemo(() => Object.values(projects ?? {}).some((p) =>
+    p.tabs.some((t) => t.peerChat !== undefined && (t.peerChat.main === pane.id || t.peerChat.peer === pane.id))), [projects, pane.id])
+  const noControls = (bare === true || paired) && !detachedWindow
   const clusterRef = useRef<HTMLDivElement>(null)
   const addTileRef = useRef<HTMLButtonElement>(null)
 
@@ -266,7 +269,7 @@ export function PaneFrame({
    * because a button hidden with `display: none` still costs the cluster its width, and
    * `--pane-corner` is a reserve other stylesheets read.
    */
-  const grabbable = pane.kind === 'claude' || pane.kind === 'shell'
+  const grabbable = !paired && (pane.kind === 'claude' || pane.kind === 'shell')
 
   /*
    * The drag, and the band this pane should draw for one in flight.
@@ -333,6 +336,12 @@ export function PaneFrame({
    */
   const onWindowControl = (target: EventTarget | null): boolean =>
     target instanceof Element && target.closest('[data-window-button]') !== null
+
+  // These buttons acknowledge on click, after their action. Clearing on pointer-down or
+  // focus removes the Waiting badge and moves the button before the mouse is released.
+  // The grab handle keeps its pointer-down behavior; window controls never acknowledge.
+  const onPaneAction = (target: EventTarget | null): boolean =>
+    target instanceof Element && target.closest('[data-pane-action]') !== null
 
   const seen = () => acknowledge(session)
 
@@ -490,6 +499,8 @@ export function PaneFrame({
 
     // At open time, like everything else here: a tile added or a divider dragged since the
     // last right-click must not leave this item disabled against a row that has since grown.
+    if (paired) return [{ id: 'paired-panels', label: 'Two-agent chat keeps both panels together', disabledReason: 'Close the tab to end the conversation' }, { id: 'even-row', label: 'Even out this row', command: 'pane.evenRow', run: evenRow }]
+
     const here = paneLocation(useWorkspace.getState().boot, pane.id)
     const tiles =
       here === null ? 0 : (chainAround(here.tree.root, pane.id, 'row')?.members.length ?? 1)
@@ -653,11 +664,15 @@ export function PaneFrame({
       aria-label={`Pane ${index}: ${pane.title}`}
       onContextMenu={onContextMenu}
       onPointerDownCapture={(event) => {
-        if (acknowledgesButton(event.button) && !onWindowControl(event.target)) seen()
+        if (
+          acknowledgesButton(event.button) &&
+          !onWindowControl(event.target) &&
+          !onPaneAction(event.target)
+        ) seen()
         raise?.()
       }}
       onFocusCapture={(event) => {
-        if (!onWindowControl(event.target)) seen()
+        if (!onWindowControl(event.target) && !onPaneAction(event.target)) seen()
         raise?.()
       }}
     >
@@ -694,6 +709,10 @@ export function PaneFrame({
          */
         onMouseDown={(event) => {
           if (event.button === 0) event.preventDefault()
+        }}
+        // Bubble, so the button's own click handler runs before acknowledgement shifts it.
+        onClick={(event) => {
+          if (acknowledgesButton(event.button) && onPaneAction(event.target)) seen()
         }}
       >
         {/* A file tab's pane draws none of it — `bare` on the props says why. Not rendered
@@ -812,6 +831,7 @@ export function PaneFrame({
                   <button
                     ref={addTileRef}
                     type="button"
+                    data-pane-action
                     className={`${styles.action} ${styles.actionMenu}`}
                     title="Add a pane to this row — bash or claude"
                     aria-label="Add a pane to this row"
@@ -838,6 +858,7 @@ export function PaneFrame({
                 {onMaximize && (
                   <button
                     type="button"
+                    data-pane-action
                     className={maximized ? `${styles.action} ${styles.actionOn}` : styles.action}
                     title={maximized ? 'Restore pane' : 'Maximize pane'}
                     aria-label={maximized ? 'Restore pane' : 'Maximize pane'}
@@ -854,6 +875,7 @@ export function PaneFrame({
                 {(onDetach !== undefined || !detachable) && (
                   <button
                     type="button"
+                    data-pane-action
                     className={
                       detachable ? styles.action : `${styles.action} ${styles.actionDisabled}`
                     }
@@ -884,6 +906,7 @@ export function PaneFrame({
                  */}
                 <button
                   type="button"
+                  data-pane-action
                   className={closable ? styles.action : `${styles.action} ${styles.actionDisabled}`}
                   title={
                     !closable

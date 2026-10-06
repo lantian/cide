@@ -8462,15 +8462,13 @@ impl AgentRegistry {
     /// that is a stop mid-wind-down, and it must end its own way. And a run already carrying a
     /// stop record — every other stop has its own words, and this must not overwrite them.
     ///
-    /// Called from the two places a board is broadcast (`tasks_state::broadcast` and
-    /// `cmd::tasks::answer`), which between them are every road a task's status changes by:
-    /// the panel, a run's tool, the orchestrator's, an integrate, and an edit made on disk.
-    pub fn retire_done(
-        self: &Arc<Self>,
-        app: &AppHandle,
-        project: ProjectId,
-        board: &cide_ipc::TaskBoard,
-    ) {
+    /// Called on board changes and from the roster coalescer. Run transitions and removal of
+    /// the last view mark that coalescer, so a task closed while the child was busy or shown
+    /// is reconsidered as soon as the child goes idle or its last view closes.
+    pub fn retire_done(&self, app: &AppHandle, project: ProjectId, board: &cide_ipc::TaskBoard) {
+        if self.going_down() {
+            return;
+        }
         let cide_ipc::TaskBoard::Ready { tasks, .. } = board else {
             return;
         };
@@ -8514,6 +8512,9 @@ impl AgentRegistry {
         shown: &HashSet<SessionId>,
     ) -> Vec<SessionId> {
         let mut inner = self.inner.lock();
+        if self.going_down() {
+            return Vec::new();
+        }
         let mut picked = Vec::new();
         for live in inner.runs.values_mut() {
             let Some(session) = live.session else {
@@ -8710,6 +8711,11 @@ impl AgentRegistry {
                 continue;
             };
             for project in projects {
+                // Task status, run state and open views can change in either order. Reading
+                // all three here closes the gap left by retiring only on a board broadcast.
+                if let Some(board) = crate::running::board_of(&app, project) {
+                    self.retire_done(&app, project, &board);
+                }
                 // The roster is rebuilt from disk here — on this thread, off the hook applier and
                 // off the reaper — because it is derived: `.cide/config.json` and the role files
                 // can have moved under a running app, and `cide_agents`' module header is
@@ -9100,6 +9106,7 @@ fn start_child(
         review: matches!(admission.purpose, RunPurpose::MrReview { .. }),
         server: None,
         git_dirs,
+        codex_git_permissions: None,
         // Both decided just below, once the plan's policy can be read. (M119)
         sandbox_brief: None,
         codex_trust_root: None,
@@ -9115,7 +9122,10 @@ fn start_child(
     let caveat = (resolved.harness == Harness::Codex)
         .then(|| {
             cide_agents::harness::codex::sandbox_caveat(
-                plan.agent.permission_mode.as_deref(),
+                cide_agents::harness::codex::effective_permission_mode(
+                    plan.agent.permission_mode.as_deref(),
+                    &plan.codex.cli,
+                ),
                 plan.unattended,
                 in_worktree,
                 !plan.git_dirs.is_empty(),
@@ -9159,6 +9169,61 @@ fn start_child(
                 }
             }
         };
+    if resolved.harness == Harness::Codex
+        && in_worktree
+        && !plan.review
+        && plan.codex.cli.inject.permissions
+        && cide_agents::harness::codex::effective_permission_policy(
+            plan.agent.permission_mode.as_deref(),
+            plan.unattended,
+            &plan.codex.cli,
+        )
+        .is_ok_and(|policy| cide_agents::harness::codex::sandboxes_writes(&policy))
+    {
+        let mut cli = plan.codex.cli.clone();
+        if let Some(mode) = plan.agent.permission_mode.as_deref() {
+            // The probe must see the winning role policy, rather than an overridden default.
+            cli.args = cide_core::codex_cli::strip_permission_args(&cli.args);
+            cli.permission_mode = if mode == "auto" {
+                cide_ipc::CodexPermissionMode::ApproveForMe
+            } else {
+                cide_ipc::CodexPermissionMode::AskForApproval
+            };
+        }
+        // The probe must see the same project layer as the child when cide wrote rules.
+        if let Some(root) = &plan.codex_trust_root {
+            cide_core::codex_cli::push_config(
+                &mut cli.args,
+                &format!(
+                    "projects.{}.trust_level",
+                    cide_core::codex_cli::toml_string(&root.to_string_lossy())
+                ),
+                "\"trusted\"".into(),
+            );
+        }
+        let launch = cide_core::codex_cli::plan_here(&cli);
+        let mut env = cide_core::child_env::terminal_child_env(
+            &plan.claude,
+            env!("CARGO_PKG_VERSION"),
+            launch.env,
+        );
+        env.extend(plan.proxy.changes().to_vec());
+        env.extend(plan.env.clone());
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let permissions = cide_core::codex_permissions::preflight(
+            &cli,
+            &plan.cwd,
+            &plan.git_dirs,
+            &plan.agent.sandbox.writable_paths(home.as_deref()),
+            plan.agent.sandbox.wants_network(),
+            &env,
+        );
+        if let Some(reason) = permissions.warning() {
+            tracing::warn!(run = %admission.run, "{reason}");
+            crate::emit::codex_git_permissions_notice(app, admission.project, reason.into());
+        }
+        plan.codex_git_permissions = Some(permissions);
+    }
     // The GPU for a role that says `needs: [gpu]` (M125): a `bwrap` shim, which the harness puts
     // first on codex's `PATH`, binding `/dev/dri` and `/dev/nvidia*` into the sandbox codex builds
     // with it. Written only where the harness will use it — codex, cide deciding a sandbox that
@@ -9171,11 +9236,12 @@ fn start_child(
             .agent
             .sandbox
             .needs(cide_agents::sandbox::SandboxNeed::Gpu)
-        && cide_agents::harness::codex::permission_policy(
+        && cide_agents::harness::codex::effective_permission_policy(
             plan.agent.permission_mode.as_deref(),
             plan.unattended,
+            &plan.codex.cli,
         )
-        .is_ok_and(cide_agents::harness::codex::sandboxes_writes)
+        .is_ok_and(|policy| cide_agents::harness::codex::sandboxes_writes(&policy))
     {
         // `cide-run-<run>.bin`, the FIFO's sibling — and **not** in the worktree, which would be
         // tidier and would not work: codex passes over a `PATH` bwrap inside a writable root and
@@ -9193,7 +9259,10 @@ fn start_child(
     }
     if resolved.harness == Harness::Codex {
         plan.sandbox_brief = cide_agents::harness::codex::sandbox_brief(
-            plan.agent.permission_mode.as_deref(),
+            cide_agents::harness::codex::effective_permission_mode(
+                plan.agent.permission_mode.as_deref(),
+                &plan.codex.cli,
+            ),
             plan.unattended,
             in_worktree,
             !plan.git_dirs.is_empty(),
@@ -9202,6 +9271,19 @@ fn start_child(
             rules_written,
             plan.codex_path_prepend.is_some(),
         );
+    }
+    if let Some(permissions) = &plan.codex_git_permissions {
+        let note = match permissions {
+            cide_core::codex_permissions::GitPermissions::Applied(_) => {
+                "Cide granted sandboxed writes to this checkout's Git metadata. Other protected paths and approval settings remain in force."
+            }
+            _ => permissions.note(),
+        };
+        let brief = plan.sandbox_brief.get_or_insert_with(String::new);
+        if !brief.is_empty() {
+            brief.push('\n');
+        }
+        brief.push_str(note);
     }
     if let Some(flavor) = cide_agents::harness::opencode::Flavor::of(resolved.harness) {
         // Asked of the installed binary before the first spec is built (M108): which of cide's
@@ -12063,6 +12145,113 @@ mod tests {
                 .plan_retire(ProjectId::new(), |_| true, &HashSet::new())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_done_run_retires_after_its_view_closes_or_its_turn_ends_in_either_order() {
+        for idle_first in [false, true] {
+            let registry = AgentRegistry::default();
+            let project = ProjectId::new();
+            let run = registry.enqueue(spec(project, "developer", 1, 4));
+            registry.take_admissions();
+            let session = SessionId::new();
+            registry.bind_session(run, session);
+            registry.inner.lock().runs.get_mut(&run).unwrap().task = Some(TaskId("t-1".into()));
+            registry.set_state(None, run, RunState::Running);
+            if idle_first {
+                registry.set_state(None, run, RunState::Idle);
+            }
+            let shown = HashSet::from([session]);
+            // The board closes while the run is shown, possibly still finishing its turn.
+            assert!(registry.plan_retire(project, |_| true, &shown).is_empty());
+            if !idle_first {
+                // The last view closes before the turn ends: only its idle transition retires it.
+                assert!(
+                    registry
+                        .plan_retire(project, |_| true, &HashSet::new())
+                        .is_empty()
+                );
+                registry.set_state(None, run, RunState::Idle);
+            }
+            assert_eq!(
+                registry.plan_retire(project, |_| true, &HashSet::new()),
+                vec![session]
+            );
+            assert!(registry.was_retired(run));
+            assert!(
+                registry
+                    .plan_retire(project, |_| true, &HashSet::new())
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_preserves_a_done_idle_runs_interruption_record() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        let mut inner = registry.inner.lock();
+        let live = inner.runs.get_mut(&run).unwrap();
+        live.task = Some(TaskId("t-1".into()));
+        live.session = Some(SessionId::new());
+        live.state = RunState::Idle;
+        drop(inner);
+        registry.begin_going_down();
+        assert!(
+            registry
+                .plan_retire(project, |_| true, &HashSet::new())
+                .is_empty()
+        );
+        assert!(!registry.was_retired(run));
+    }
+
+    #[test]
+    fn a_retired_idle_child_is_reaped_without_failure_or_another_review() {
+        let registry = Arc::new(AgentRegistry::default());
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 4));
+        registry.take_admissions();
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).unwrap();
+            live.task = Some(TaskId("t-1".into()));
+            live.checkout = Some("developer-t-1".into());
+        }
+        registry.set_state(None, run, RunState::Running);
+        registry.set_state(None, run, RunState::Idle);
+        assert!(registry.checkout_in_use(project, "developer-t-1"));
+        let pty = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("exec sleep 60"),
+        )
+        .expect("fake idle CLI");
+        let (tx, rx) = std::sync::mpsc::channel();
+        registry.watch_exit_with(
+            session,
+            &pty,
+            move |_, run| {
+                let _ = tx.send(run);
+            },
+            |_, _| panic!("a retired child must not fail over"),
+            |_, _| panic!("a retired child must not be interrupted"),
+        );
+        assert_eq!(
+            registry.plan_retire(project, |_| true, &HashSet::new()),
+            vec![session]
+        );
+        end_tree(&pty, "test retired CLI");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(run));
+        assert!(matches!(
+            state_of(&registry, run),
+            RunState::Finished { .. }
+        ));
+        assert!(registry.was_retired(run));
+        assert!(registry.death_facts(run).is_none());
+        assert!(!registry.checkout_in_use(project, "developer-t-1"));
     }
 
     /// The admission gate and the reclaim ask one question, and it is this one.

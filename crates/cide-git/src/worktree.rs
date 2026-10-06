@@ -92,9 +92,9 @@ pub fn root_of_checkout(checkout: &Path) -> Option<PathBuf> {
 /// index, `HEAD` and per-worktree refs live; branches, objects and `packed-refs` live in the
 /// common `<repo>/.git`. A sandbox whose writable root is the checkout sees neither as writable,
 /// and codex's `workspace-write` sandbox re-binds any `.git` it finds read-only on top — so a
-/// codex run that is not told about these two directories cannot `git commit`, `merge` or
-/// `rebase` (`index.lock: Read-only file system`, selfcraft t-572). The codex harness passes
-/// them as `--add-dir`.
+/// codex run needs scoped grants or an approved operation for `git commit`, `merge` or
+/// `rebase` (`index.lock: Read-only file system`, selfcraft t-572). The Codex launchers use
+/// these paths in an invocation-local permission profile; legacy launches use `--add-dir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitDirs {
     /// `git rev-parse --git-dir`: the checkout's own admin directory.

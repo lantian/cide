@@ -120,6 +120,7 @@ fn plan<'a>(
         review: false,
         server: Some(server),
         git_dirs: Vec::new(),
+        codex_git_permissions: None,
         sandbox_brief: None,
         codex_trust_root: None,
         codex_path_prepend: None,

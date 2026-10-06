@@ -5463,11 +5463,17 @@ export interface CodexCliSupport {
   version: string | null
   argNotes: CodexCliNote[]
   envNotes: CodexCliNote[]
+  gitPermissionsNote?: string | null
+  permissionsNote?: string | null
   /** A fresh codex console's argv, program first; `ours` marks what cide adds. */
   argv: { text: string; ours: boolean }[]
 }
 
 export const codexCli = {
+  onGitPermissionsNotice: (handler: (project: ProjectId, text: string) => void) =>
+    listen<{ project: ProjectId; text: string }>('cide://codex-git-permissions-notice', (e) =>
+      handler(e.payload.project, e.payload.text),
+    ),
   /** Degrades to an empty readout rather than throwing: it renders inside a settings section. */
   support: (project: ProjectId | null = null): Promise<CodexCliSupport> =>
     pendingCommand<CodexCliSupport>(
@@ -5638,4 +5644,13 @@ export const sessionJournal = {
   /** `cide://sessions-changed`: a project's journal moved; re-ask with `list`. */
   onChanged: (handler: (project: ProjectId) => void) =>
     listen<{ project: ProjectId }>('cide://sessions-changed', (e) => handler(e.payload.project)),
+}
+
+/** Experimental pairing operations; selections never change project or global settings. */
+export const peerChat = {
+  open: (project: ProjectId) => invoke<TabId>('peer_chat_open', { project }),
+  configure: (project: ProjectId, tab: TabId, selection: import('./generated').PeerChatSelection) => invoke<void>('peer_chat_configure', { project, tab, selection }),
+  pause: (project: ProjectId, tab: TabId, paused: boolean) => invoke<void>('peer_chat_pause', { project, tab, paused }),
+  receipts: (project: ProjectId, tab: TabId) => invoke<import('./generated').PeerChatReceipt[]>('peer_chat_receipts', { project, tab }),
+  plan: (project: ProjectId, tab: TabId) => invoke<PaneRestore[]>('peer_chat_plan', { project, tab }),
 }

@@ -208,8 +208,9 @@ pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, o
      turn by asking what to do — a turn that ends in a question is a task nobody picks up. First \
      find out what actually happened: read the task with mcp__cide__cide_task_get and read its \
      comments, which are the only place the run reported; then diff the branch {branch} against \
-     the base to see what changed rather than what was claimed. Verify already ran on this branch, \
-     so do not run the project's checks again. Then take one of exactly two actions. If the work is done and correct \
+     the base to see what changed rather than what was claimed. Cide runs verify when configured; \
+     use its reported result without repeating the project's checks. Missing verify satisfies \
+     the gate and does not prevent review or integration. Then take one of exactly two actions. If the work is done and correct \
      and did what the task asked rather than something adjacent: comment your verdict with \
      mcp__cide__cide_task_comment, then **merge it yourself** with \
      mcp__cide__cide_agent_integrate (agent `{role}`, task {task_id}) — accepting work means \
@@ -250,14 +251,15 @@ pub const DEFAULT_REVIEW_PROMPT: &str = "A subagent just {outcome}: `{agent}`, o
 /// with `tasks` merges them together and verifies the combined result once, which is both the
 /// saving and the check a per-branch verify cannot make — two branches green alone and red
 /// together.
-pub const DEFAULT_BATCH_REVIEW_PROMPT: &str = "These tasks finished and their branches passed \
-     verify: {tasks}. Review them as one batch; nobody is at the keyboard and nobody will answer \
+pub const DEFAULT_BATCH_REVIEW_PROMPT: &str = "These tasks finished and are ready for \
+     review: {tasks}. Review them as one batch; nobody is at the keyboard and nobody will answer \
      you, so decide everything yourself and never end your turn with a question. For each, read \
      its report with mcp__cide__cide_task_get and its diff (git diff HEAD...<branch>), and decide \
-     whether it did what the task asked rather than something adjacent — verify already ran, so \
-     do not run the project's checks again. Merge every one you accept in a single \
+     whether it did what the task asked rather than something adjacent. Cide runs verify when \
+     configured; use its reported result without repeating the project's checks. Missing verify \
+     satisfies the gate and does not prevent review or integration. Merge every one you accept in a single \
      mcp__cide__cide_agent_integrate call with `tasks` naming each task and its role, in the \
-     order listed: cide merges them together and verifies the result once. Then set each task it \
+     order listed: cide merges them together and verifies the result once when configured. Then set each task it \
      merged to done with mcp__cide__cide_task_update. One it could not merge (a conflict, or the \
      combined verify pinned on it) is not done: send it back. To send one back, comment in a few \
      lines what is wrong and what is still needed, set it to doing, and hand it to the same role \

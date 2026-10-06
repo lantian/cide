@@ -123,6 +123,8 @@ pub async fn opencode_cli_support(app: AppHandle, project: Option<ProjectId>) ->
         }));
         CodexCliSupport {
             binary,
+            permissions_note: None,
+            git_permissions_note: None,
             resolved: resolved
                 .as_ref()
                 .ok()
@@ -137,6 +139,8 @@ pub async fn opencode_cli_support(app: AppHandle, project: Option<ProjectId>) ->
     .await
     .unwrap_or_else(|error| CodexCliSupport {
         binary: String::new(),
+        permissions_note: None,
+        git_permissions_note: None,
         resolved: None,
         problem: Some(error.to_string()),
         version: None,
@@ -617,6 +621,7 @@ fn open_settings_tab(
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -1032,7 +1037,7 @@ async fn run_console_headless(
 ///
 /// The proxy is `ProxyScope::claude`'s, which the Settings screen labels as the console's scope
 /// — a one-shot is a console's CLI asked one thing, whichever CLI that is.
-fn headless_args(args: Vec<String>) -> Vec<String> {
+fn headless_args(args: Vec<String>, codex: bool) -> Vec<String> {
     let mut output = Vec::new();
     let mut tokens = args.into_iter();
     while let Some(arg) = tokens.next() {
@@ -1054,7 +1059,8 @@ fn headless_args(args: Vec<String>) -> Vec<String> {
                 | "--ephemeral"
                 | "--max-budget-usd"
                 | "--"
-        ) {
+        ) && !(codex && key == "-p")
+        {
             if !arg.contains('=')
                 && matches!(
                     key,
@@ -1090,7 +1096,8 @@ async fn run_headless_codex(
     let run = cide_claude::Headless::new(request, cwd)
         .proxy(proxy)
         .env(plan.env)
-        .args(headless_args(plan.args));
+        .args(headless_args(plan.args, true))
+        .codex_cli(cli);
     tauri::async_runtime::spawn_blocking(move || cide_claude::headless::run_codex(&program, &run))
         .await
         .map_err(|e| HeadlessError::NotInstalled {
@@ -1180,7 +1187,7 @@ async fn run_headless(
     let run = cide_claude::Headless::new(request, cwd)
         .proxy(proxy)
         .env(plan.env)
-        .args(headless_args(plan.args));
+        .args(headless_args(plan.args, false));
     tauri::async_runtime::spawn_blocking(move || cide_claude::headless::run(&program, &run))
         .await
         .map_err(|e| HeadlessError::NotInstalled {
@@ -1489,6 +1496,9 @@ pub struct CodexCliSupport {
     pub version: Option<String>,
     pub arg_notes: Vec<CodexCliNote>,
     pub env_notes: Vec<CodexCliNote>,
+    /// Whether the current project's next console launch can apply scoped Git permissions.
+    pub git_permissions_note: Option<String>,
+    pub permissions_note: Option<String>,
     /// A fresh codex console's argv, program first, with placeholders for what only a spawn
     /// knows (the project directory, the pane's session, cide's socket).
     pub argv: Vec<ArgvPart>,
@@ -1496,24 +1506,45 @@ pub struct CodexCliSupport {
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn codex_cli_support(app: AppHandle, project: Option<ProjectId>) -> CodexCliSupport {
-    let cli = app
+    let (cli, cwd, env) = app
         .try_state::<WorkspaceState>()
         .map(|state| {
             state.with(|ws| {
-                cide_core::harness_settings::effective(ws, project)
-                    .codex
-                    .cli
+                let settings = cide_core::harness_settings::effective(ws, project);
+                let cwd = project
+                    .and_then(|id| workspace::project(ws, id).ok())
+                    .and_then(|p| p.roots.first().map(|r| r.path.clone()));
+                let launch = cide_core::codex_cli::plan_here(&settings.codex.cli);
+                let mut env = cide_core::child_env::terminal_child_env(
+                    &settings.claude,
+                    env!("CARGO_PKG_VERSION"),
+                    launch.env,
+                );
+                env.extend(
+                    cide_core::proxy::ProxyEnv::for_target(
+                        &settings.proxy,
+                        settings.proxy.scope.claude,
+                    )
+                    .changes()
+                    .to_vec(),
+                );
+                (settings.codex.cli, cwd, env)
             })
         })
         .unwrap_or_default();
     let fallback = cli.clone();
-    tauri::async_runtime::spawn_blocking(move || codex_support(&cli, true))
+    tauri::async_runtime::spawn_blocking(move || codex_support(&cli, cwd.as_deref(), &env, true))
         .await
-        .unwrap_or_else(|_| codex_support(&fallback, false))
+        .unwrap_or_else(|_| codex_support(&fallback, None, &[], false))
 }
 
 /// The readout, probing the binary only when `probe` — the fallback path must not fork.
-fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
+fn codex_support(
+    cli: &cide_ipc::CodexCli,
+    cwd: Option<&Path>,
+    env: &[cide_core::child_env::EnvChange],
+    probe: bool,
+) -> CodexCliSupport {
     let plan = cide_core::codex_cli::plan_here(cli);
     let resolved = cide_core::codex_cli::resolve(&cli.binary);
     let version = match (&resolved, probe) {
@@ -1531,8 +1562,33 @@ fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
             .collect()
     };
     let user = plan.args.len();
+    let git_permissions = if !cli.inject.git_permissions {
+        Some(cide_core::codex_permissions::GitPermissions::Inactive(
+            "Git permission injection is off.".into(),
+        ))
+    } else {
+        cwd.filter(|_| probe)
+            .map(|cwd| crate::cmd::session::codex_console_git_permissions(cli, cwd, env))
+    };
+    let git_permissions_note = Some(
+        git_permissions
+            .as_ref()
+            .map_or(
+                "Select a project to check scoped Git permission availability.",
+                cide_core::codex_permissions::GitPermissions::note,
+            )
+            .to_string(),
+    );
     let tokens = crate::cmd::session::codex_console_argv(&crate::cmd::session::CodexConsole {
         user_args: plan.args.clone(),
+        permission_args: cide_core::codex_cli::default_permission_args(
+            cli,
+            &plan.args,
+            git_permissions
+                .as_ref()
+                .and_then(cide_core::codex_permissions::GitPermissions::profile),
+        ),
+        git_permissions,
         cwd: "<project>".into(),
         inject: plan.inject,
         thread: None,
@@ -1562,6 +1618,15 @@ fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
     }));
     CodexCliSupport {
         binary: cli.binary.clone(),
+        permissions_note: cide_core::codex_cli::validate_permissions(cli, &plan.args)
+            .err()
+            .or_else(|| {
+                (cli.permission_mode != cide_ipc::CodexPermissionMode::UseConfig
+                    && cide_core::codex_cli::has_permission_override(&plan.args))
+                .then(|| {
+                    "Permission options in Extra arguments override Default permissions.".into()
+                })
+            }),
         resolved: resolved
             .as_ref()
             .ok()
@@ -1572,6 +1637,7 @@ fn codex_support(cli: &cide_ipc::CodexCli, probe: bool) -> CodexCliSupport {
         version,
         arg_notes: notes(&plan.arg_notes),
         env_notes: notes(&plan.env_notes),
+        git_permissions_note,
         argv,
     }
 }

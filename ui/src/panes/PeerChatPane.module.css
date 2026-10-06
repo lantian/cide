@@ -1,0 +1,49 @@
+.pane {
+  display: flex;
+  flex-direction: column;
+  /* PaneFrame's body is a block, so flex alone cannot size this child. Without
+   * this definite height the out-of-flow terminal hosts collapse below the header. */
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+.header strong { color: var(--text); }
+.setup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-6);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+  background: var(--bg);
+}
+.setup h2 { margin: 0; font-size: var(--fs-ui-16); }
+.setup p { margin: 0; color: var(--dim); }
+.notice {
+  flex: none;
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.terminal {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+}

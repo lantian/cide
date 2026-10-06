@@ -12,10 +12,11 @@
 import { registerLanguages } from '@/editor/languages'
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
 import { reconcile, restack } from '@/keys/switcher'
-import { activeProjectIdOf, windowProjectsOf } from '@/keys/target'
+import { activeProjectIdOf, focusTarget, windowProjectsOf } from '@/keys/target'
 import { useMemo } from 'react'
 import { create } from 'zustand'
 import { destroyHost, noteLivePanes, peekHost, releaseHost } from '@/layout/paneHosts'
+import { focusPaneDom } from '@/panes/paneFocus'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { pruneNotices, setNoticeScope } from '@/chrome/notices'
 import type { CloseScope } from '@/chrome/closeConfirmModel'
@@ -62,6 +63,23 @@ function nextFrame(): Promise<void> {
   return new Promise((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
   })
+}
+
+/** Creation selects the pane in Rust; put the keyboard in its input after React mounts it. */
+async function focusCreatedPane(project: ProjectId, pane: PaneId): Promise<void> {
+  await nextFrame()
+  // A later gesture may have selected another pane, closed this one, or switched tabs.
+  // Read this window's target now rather than focusing the creation snapshot's stale selection.
+  const target = focusTarget(useWorkspace.getState().boot)
+  if (target?.project !== project || target.pane.id !== pane) return
+  const host = peekHost(pane)
+  if (!host?.mounted || !host.opened || !host.el.isConnected) return
+  if (typeof host.el.checkVisibility === 'function') {
+    if (!host.el.checkVisibility({ visibilityProperty: true })) return
+  } else if (window.getComputedStyle(host.el).visibility !== 'visible') {
+    return
+  }
+  focusPaneDom(pane)
 }
 
 /* ------------------------------------------------------------------ waiting on the broadcast */
@@ -982,6 +1000,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   newClaudeTab: async (project) => {
     const created = await tabApi.newClaude(project)
     await synced()
+    const pane = get().boot?.workspace.projects[project]?.tabs.find(
+      (t) => t.id === created,
+    )?.tree.focused
+    if (pane !== undefined) await focusCreatedPane(project, pane)
     return created
   },
   newRunTab: async (project, title, intent) => {
@@ -990,6 +1012,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       rememberSpawnPlan(created.pane, created.intent)
     }
     await synced()
+    await focusCreatedPane(project, created.pane)
     return created
   },
   activateTab: async (project, tab) => {
@@ -1073,6 +1096,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
         return
       }
     }
+    const pairPanes = get().boot?.workspace.projects[project]?.tabs.find((t) => t.id === tab && t.peerChat !== undefined)?.tree.panes
     let rev: number | undefined
     const parked = await refused(
       'tab',
@@ -1083,6 +1107,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     )
     if (parked) return
     await synced(rev)
+    if (pairPanes) { await nextFrame(); for (const pane of Object.keys(pairPanes)) destroyHost(pane) }
   },
 
   splitPane: async (project, tab, pane, axis, side, intent = null) => {
@@ -1094,6 +1119,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       rememberSpawnPlan(created.pane, created.intent)
     }
     await synced()
+    await focusCreatedPane(project, created.pane)
     return created
   },
   addRow: async (project, tab, after = null, side = 'after', intent = null) => {
@@ -1105,6 +1131,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
       rememberSpawnPlan(created.pane, created.intent)
     }
     await synced()
+    await focusCreatedPane(project, created.pane)
     return created
   },
   closePane: async (project, tab, pane, force = false) => {

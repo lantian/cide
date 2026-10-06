@@ -259,6 +259,8 @@ impl ConsoleSpawn {
 pub(crate) struct CodexConsole {
     /// The user's surviving arguments, Settings → Harness → Codex.
     pub(crate) user_args: Vec<String>,
+    pub(crate) git_permissions: Option<cide_core::codex_permissions::GitPermissions>,
+    pub(crate) permission_args: Vec<String>,
     pub(crate) cwd: String,
     pub(crate) inject: cide_core::codex_cli::Injected,
     /// The thread a resume or fork continues.
@@ -284,9 +286,8 @@ pub(crate) struct CodexConsole {
 /// `resume` and `fork` accept every TUI option); the user's before cide's, as for claude; the
 /// thread last, because it is a positional and nothing may follow it.
 ///
-/// * **No sandbox or approval flags.** The console is a person's TUI, like a claude console
-///   that is given no `--permission-mode`: the user's own `config.toml` decides, and codex asks
-///   them in the pane.
+/// * The saved default applies unless explicit launch arguments override it. Worker
+///   continuations keep their role's policy. Workspace presets preserve scoped Git writes.
 /// * **A fork with the fork switch off starts fresh**, not a plain resume — claude's switch
 ///   degrades to a resume, which `AlreadyOpen` makes safe there; two TUIs writing one codex
 ///   thread would have nothing to stop them.
@@ -314,6 +315,15 @@ pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
     args.extend(user_args);
     args.push("-C".into());
     args.push(c.cwd.clone());
+    if c.permission_args.is_empty()
+        && let Some(profile) = c
+            .git_permissions
+            .as_ref()
+            .and_then(cide_core::codex_permissions::GitPermissions::profile)
+    {
+        args.extend(profile.args());
+    }
+    args.extend(c.permission_args.clone());
     args.extend(codex_cli::quiet_start());
     if c.inject.developer_instructions
         && let Some(paragraph) = &c.paragraph
@@ -351,6 +361,19 @@ pub(crate) fn codex_console_argv(c: &CodexConsole) -> Vec<String> {
         args.push(prompt.clone());
     }
     args
+}
+
+/// Run on a blocking thread, from the console launch and its Settings readout alike.
+pub(crate) fn codex_console_git_permissions(
+    cli: &cide_ipc::CodexCli,
+    cwd: &std::path::Path,
+    env: &[cide_core::child_env::EnvChange],
+) -> cide_core::codex_permissions::GitPermissions {
+    let dirs = match cide_git::worktree::git_dirs(cwd) {
+        Ok(dirs) => vec![dirs.git_dir, dirs.common_dir],
+        Err(_) => Vec::new(),
+    };
+    cide_core::codex_permissions::preflight(cli, cwd, &dirs, &[], false, env)
 }
 
 fn wants_fork(fork: Option<bool>) -> bool {
@@ -1343,7 +1366,39 @@ pub(crate) async fn spawn_session(
     // The console harness rides the same read (M93), with the two facts about the tree a resume
     // needs: which CLI holds the conversation being resumed, and — for codex — which thread that
     // is. Read here, under the one lock this function takes, and never again below.
-    let (settings, console, native) = app
+    // Pair launch overrides are derived from the owning pane, never from global settings.
+    let pair = app
+        .try_state::<crate::workspace_state::WorkspaceState>()
+        .and_then(|state| {
+            state.with(|ws| {
+                let pane = pane?;
+                let (owner, _, chat) = cide_core::peer_chat::for_pane(ws, pane)?;
+                Some(if Some(owner) != project {
+                    Err("The pair belongs to another project".to_string())
+                } else if let Some(selection) = &chat.selection {
+                    let reviewer = pane == chat.peer;
+                    Ok((
+                        if reviewer {
+                            selection.harness
+                        } else {
+                            chat.main_harness
+                        },
+                        reviewer,
+                        if reviewer {
+                            selection.model.clone()
+                        } else {
+                            None
+                        },
+                    ))
+                } else {
+                    Err("Choose the peer before starting this pair".into())
+                })
+            })
+        })
+        .transpose()
+        .map_err(SessionError::Pty)?;
+    let explicit_harness = pair.as_ref().map(|p| p.0).or(explicit_harness);
+    let (mut settings, console, native) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
         .map(|state| {
             state.with(|ws| {
@@ -1379,6 +1434,67 @@ pub(crate) async fn spawn_session(
                 continues.clone(),
             )
         });
+    let pair_paragraph = if let Some((harness, reviewer, model)) = &pair {
+        crate::cmd::peer_chat::validate_injections(&settings, *harness)
+            .map_err(|e| SessionError::Pty(e.to_string()))?;
+        if *reviewer && *harness == cide_ipc::ConsoleHarness::Codex {
+            settings.codex.cli.args =
+                cide_core::codex_cli::strip_permission_args(&settings.codex.cli.args);
+            settings.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::ReadOnly;
+        }
+        if *reviewer && *harness == cide_ipc::ConsoleHarness::Claude {
+            let mut args = Vec::new();
+            let mut source = settings.claude.cli.args.iter();
+            while let Some(arg) = source.next() {
+                if matches!(
+                    arg.as_str(),
+                    "--permission-mode"
+                        | "--allowedTools"
+                        | "--allowed-tools"
+                        | "--tools"
+                        | "--disallowedTools"
+                        | "--disallowed-tools"
+                ) {
+                    while source.clone().next().is_some_and(|v| !v.starts_with("--")) {
+                        source.next();
+                    }
+                    continue;
+                }
+                if [
+                    "--permission-mode=",
+                    "--allowedTools=",
+                    "--allowed-tools=",
+                    "--tools=",
+                    "--disallowedTools=",
+                    "--disallowed-tools=",
+                ]
+                .iter()
+                .any(|prefix| arg.starts_with(prefix))
+                    || arg == "--dangerously-skip-permissions"
+                {
+                    continue;
+                }
+                args.push(arg.clone());
+            }
+            args.extend([
+                "--permission-mode".into(),
+                "plan".into(),
+                "--allowedTools".into(),
+                "Read,Glob,Grep,mcp__cide__cide_peer_chat_send".into(),
+                "--tools".into(),
+                "Read,Glob,Grep".into(),
+                "--disallowedTools".into(),
+                "Edit,Write,NotebookEdit,Bash,Agent,Task,ExitPlanMode".into(),
+            ]);
+            settings.claude.cli.args = args;
+        }
+        if let Some(model) = model {
+            spec.args.extend(["--model".into(), model.clone()]);
+        }
+        Some(cide_core::peer_chat::instructions(*harness, *reviewer))
+    } else {
+        None
+    };
     let proxy = settings.proxy.clone();
     let claude_settings = settings.claude.clone();
     let codex_settings = settings.codex.clone();
@@ -1521,10 +1637,14 @@ pub(crate) async fn spawn_session(
     if is_claude
         && plan.inject.has(cide_core::claude_cli::Injection::McpConfig)
         && let Some(project) = project
-        && let Some(paragraph) =
+        && let Some(paragraph) = pair_paragraph.clone().or_else(|| {
             orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+        })
     {
         if carries_append_system_prompt_file(&plan.args) {
+            if pair.is_some() {
+                return Err(SessionError::Pty("Two-agent chat cannot add instructions beside --append-system-prompt-file; use the normal system prompt argument for this harness.".into()));
+            }
             // Degrade, do not refuse: the two flags cannot coexist and the CLI refuses the pair
             // outright, so adding ours would make this pane fail to start. One line, on the one
             // spawn per project where it can apply — `WARNED_ARGS` carries the user-facing half
@@ -1556,14 +1676,63 @@ pub(crate) async fn spawn_session(
     // needs it first: codex's MCP server is handed `CIDE_SESSION` in its own environment table.
     // See the long note at the claude half for what this id is and is not.
     let minted = SessionId::new();
+    let mut codex_git_warning = None;
 
     // The whole codex argv, in one place (M93). `codex_console_argv` is pure and carries the
     // order; this only gathers what it needs.
     if is_codex && let Some(console) = console {
+        let mut cli = codex_settings.cli.clone();
+        // Automatically opened tabs may carry a policy in their requested argv. The probe
+        // must see it too, or a legacy -s would silently defeat the scoped profile below.
+        cli.args.splice(0..0, spec.args.clone());
+        if voice.is_some() && !cli.inject.permissions {
+            cli.permission_mode = cide_ipc::CodexPermissionMode::UseConfig;
+        }
+        if continues.is_none() {
+            cide_core::codex_cli::validate_permissions(&cli, &cli.args).map_err(|message| {
+                SessionError::NoClaudeBinary {
+                    program: cli.binary.clone(),
+                    message,
+                }
+            })?;
+        }
+        let permission_cli = cli.clone();
+        let cwd = spec.cwd.clone();
+        let mut probe_env = cide_core::child_env::terminal_child_env(
+            &claude_settings,
+            env!("CARGO_PKG_VERSION"),
+            codex_plan.env.clone(),
+        );
+        probe_env.extend(
+            ProxyEnv::for_target(&proxy, pane_proxy_target(&proxy.scope, true))
+                .changes()
+                .to_vec(),
+        );
+        let git_permissions = if continues.is_some() {
+            // Reopening a worker conversation must not grant writes to a read-only role or
+            // a review. Its recorded policy remains the continuation's responsibility.
+            cide_core::codex_permissions::GitPermissions::Inactive(
+                "A worker continuation keeps its existing Codex permissions.".into(),
+            )
+        } else {
+            blocking(move || Ok(codex_console_git_permissions(&cli, &cwd, &probe_env))).await?
+        };
+        codex_git_warning = git_permissions.warning().map(str::to_owned);
         let inject = codex_plan.inject;
+        let permission_args = if continues.is_none() {
+            cide_core::codex_cli::default_permission_args(
+                &permission_cli,
+                &permission_cli.args,
+                git_permissions.profile(),
+            )
+        } else {
+            Vec::new()
+        };
         let paragraph = if inject.developer_instructions && inject.mcp_config {
-            project.and_then(|project| {
-                orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+            pair_paragraph.clone().or_else(|| {
+                project.and_then(|project| {
+                    orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+                })
             })
         } else {
             None
@@ -1577,6 +1746,8 @@ pub(crate) async fn spawn_session(
             .map(|server| server.socket().to_string_lossy().to_string());
         for a in codex_console_argv(&CodexConsole {
             user_args: codex_plan.args.clone(),
+            git_permissions: Some(git_permissions),
+            permission_args,
             cwd: spec.cwd.to_string_lossy().to_string(),
             inject,
             thread: console.thread,
@@ -1693,14 +1864,14 @@ pub(crate) async fn spawn_session(
         if is_codex || is_opencode {
             spec = spec.env("CIDE_SESSION", id.to_string());
         }
-        if is_codex
-            && settings.codex.cli.inject.hooks
-            && spec
-                .args
-                .iter()
-                .any(|arg| arg == r#"tui.notifications=["approval-requested"]"#)
-        {
-            spec.output_observer = Some(server.codex_approval_observer(id));
+        if is_codex {
+            let approvals = settings.codex.cli.inject.hooks
+                && spec
+                    .args
+                    .iter()
+                    .any(|arg| arg == r#"tui.notifications=["approval-requested"]"#);
+            spec.output_observer =
+                Some(server.codex_observer(id, console.as_ref().and_then(|c| c.thread), approvals));
         }
         if is_claude {
             // The routing key for every frame this child's hooks send. Set only for Claude
@@ -1887,10 +2058,26 @@ pub(crate) async fn spawn_session(
     {
         return Err(SessionError::AlreadyOpen(held));
     }
+    let mut pair_binding = if let Some((harness, _, _)) = &pair {
+        Some(
+            crate::peer_chat::Binding::start(
+                &app,
+                pane.ok_or_else(|| SessionError::Pty("Pair panel is missing".into()))?,
+                id,
+                *harness,
+            )
+            .map_err(SessionError::Pty)?,
+        )
+    } else {
+        None
+    };
     let opencode = if is_opencode {
-        let instructions = project
-            .and_then(|project| {
-                orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+        let instructions = pair_paragraph
+            .clone()
+            .or_else(|| {
+                project.and_then(|project| {
+                    orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+                })
             })
             .map(|text| text.replace("mcp__cide__", "cide_"));
         let model = spec
@@ -1908,7 +2095,9 @@ pub(crate) async fn spawn_session(
             prompt: opening,
             instructions,
             model,
-            unattended,
+            unattended: unattended && !pair.as_ref().is_some_and(|p| p.1),
+            reviewer: pair.as_ref().is_some_and(|p| p.1),
+            paired: pair.is_some(),
         };
         let (prepared, observer) = blocking(move || {
             crate::opencode_console::Console::start(start).map_err(SessionError::Pty)
@@ -1975,7 +2164,14 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert_prompted(id, Arc::clone(&session), opening_prompt);
+    if let (Some(project), Some(text)) = (project, codex_git_warning) {
+        crate::emit::codex_git_permissions_notice(&app, project, text);
+    }
     if let Some(observer) = opencode {
+        if pair.is_some() {
+            app.state::<crate::peer_chat::Runtime>()
+                .note_console(id, observer.clone());
+        }
         registry.note_native_conversation(id, observer.conversation());
         observer.observe(app.clone(), id, &session);
     }
@@ -1989,6 +2185,10 @@ pub(crate) async fn spawn_session(
         {
             registry.seed_conversation(id, thread, cide_core::persist::now_ms());
         }
+    }
+
+    if let Some(binding) = &mut pair_binding {
+        binding.commit();
     }
 
     // After the insert, for `claude_tab::open_with_prompt`'s reason: the typed line waits on this
@@ -2397,6 +2597,7 @@ pub fn session_in_alternate_screen(
 /// would put a red line in the log for the mechanism working.
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_write(
+    app: tauri::AppHandle,
     registry: State<'_, SessionRegistry>,
     window: tauri::Window,
     session: SessionId,
@@ -2413,7 +2614,19 @@ pub fn session_write(
     if data.contains('\r') {
         crate::agent_rpc::note_typed(session);
     }
-    s.write(data.into_bytes());
+    // Ordinary input keeps its original write path and never acquires the workspace lock.
+    let paired = app.state::<crate::peer_chat::Runtime>().is_paired(session);
+    if paired {
+        crate::peer_chat::note_input(&app, session, &data, &s);
+        app.state::<crate::peer_chat::Runtime>()
+            .manual_write(&app, session, &s, data.into_bytes())
+            .map_err(SessionError::Pty)?;
+    } else {
+        if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
+            hooks.note_codex_input(session, data.as_bytes(), &s);
+        }
+        s.write(data.into_bytes());
+    }
     Ok(())
 }
 
@@ -2883,6 +3096,8 @@ mod tests {
     fn codex_console(thread: Option<SessionId>, fork: bool) -> CodexConsole {
         CodexConsole {
             user_args: vec!["--search".into()],
+            git_permissions: None,
+            permission_args: Vec::new(),
             cwd: "/repo".into(),
             inject: cide_core::codex_cli::Injected::from(&cide_ipc::CodexInjections::default()),
             thread,
@@ -2893,6 +3108,66 @@ mod tests {
             session: SessionId::new(),
             agent_sock: Some("/run/cide-agents.sock".into()),
             prompt: None,
+        }
+    }
+
+    #[test]
+    fn codex_permission_default_reaches_fresh_resumed_and_forked_consoles_once() {
+        let cli = cide_ipc::CodexCli {
+            permission_mode: cide_ipc::CodexPermissionMode::ApproveForMe,
+            ..Default::default()
+        };
+        let profile =
+            cide_core::codex_permissions::GitProfile::new(&["/repo/.git".into()], &[], false);
+        for (thread, fork) in [
+            (None, false),
+            (Some(SessionId::new()), false),
+            (Some(SessionId::new()), true),
+        ] {
+            let mut console = codex_console(thread, fork);
+            console.permission_args =
+                cide_core::codex_cli::default_permission_args(&cli, &[], Some(&profile));
+            console.git_permissions = Some(cide_core::codex_permissions::GitPermissions::Applied(
+                profile.clone(),
+            ));
+            let args = codex_console_argv(&console);
+            assert_eq!(args.iter().filter(|arg| *arg == &profile.config).count(), 1);
+            assert!(args.contains(&"approvals_reviewer=\"auto_review\"".into()));
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "-s" || arg == "--approve-for-me")
+            );
+            if let Some(thread) = thread {
+                assert_eq!(args.last(), Some(&thread.to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_scoped_git_permissions_reach_fresh_resumed_and_forked_consoles() {
+        use cide_core::codex_permissions::{GitPermissions, GitProfile};
+        let profile = GitProfile::new(&["/repo/.git".into()], &[], false);
+        for (thread, fork) in [
+            (None, false),
+            (Some(SessionId::new()), false),
+            (Some(SessionId::new()), true),
+        ] {
+            let mut c = codex_console(thread, fork);
+            c.git_permissions = Some(GitPermissions::Applied(profile.clone()));
+            let args = codex_console_argv(&c);
+            assert!(args.contains(&profile.config));
+            assert!(args.contains(&"default_permissions=\"cide-git\"".into()));
+            assert!(!args.iter().any(|a| a == "-s" || a == "-a"));
+            if let Some(thread) = thread {
+                assert_eq!(args.last(), Some(&thread.to_string()));
+            }
+            c.git_permissions = Some(GitPermissions::Skipped("custom policy".into()));
+            assert!(!codex_console_argv(&c).contains(&profile.config));
+            c.resume_picker = true;
+            c.thread = None;
+            c.git_permissions = Some(GitPermissions::Applied(profile.clone()));
+            assert!(codex_console_argv(&c).contains(&profile.config));
         }
     }
 

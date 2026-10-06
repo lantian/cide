@@ -47,6 +47,8 @@ import {
 } from '@/ipc/client'
 
 export interface TerminalPaneProps {
+  /** A paired restored pane must spawn its conversation instead of adopting a dead child. */
+  forceSpawn?: boolean | undefined;
   pane: Pane
   /** Where a fresh child is spawned — the project's primary root. */
   cwd: string
@@ -253,6 +255,7 @@ export function TerminalPane({
   onRevealPath,
   onSessionBound,
   className,
+  forceSpawn,
 }: TerminalPaneProps) {
   const paneId = pane.id
   const boundRef = useRef<string | null>(null)
@@ -613,7 +616,7 @@ export function TerminalPane({
      * skips the adoption; `session_spawn`'s own guard still refuses if the id turns out to be
      * *live* somewhere, which is the refusal the user has to read.
      */
-    const spawns = plan?.kind === 'resume' || plan?.kind === 'continue'
+    const spawns = forceSpawn === true || plan?.kind === 'resume' || plan?.kind === 'continue'
 
     /**
      * This pane's child has gone: offer a way back.

@@ -1182,6 +1182,7 @@ pub fn tab_new_claude(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -1279,6 +1280,9 @@ pub(crate) fn close_tab_checked(
     // now — Ctrl+Shift+T respawns `claude --resume` over it (`claude_tab::resume_closed`) — and
     // the kill is still right: the CLI writes its transcript a message at a time, so what a kill
     // can cost is the turn in flight, in a tab the user closed to say they were done with it.
+    if record.as_ref().is_some_and(|r| r.peer_chat.is_some()) {
+        crate::peer_chat::stop_pair(&app, &ending);
+    }
     if !ending.is_empty()
         && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
     {
@@ -1443,6 +1447,7 @@ fn closing_record(
         other => other.clone(),
     };
     Some(crate::closed_tabs::ClosedTab {
+        peer_chat: t.peer_chat.clone(),
         project,
         kind,
         index,
@@ -1550,13 +1555,14 @@ pub async fn tab_reopen_closed(
                 return Ok(Some(id));
             }
             Reopen::Reinsert => {
-                let resumed = if matches!(
-                    record.kind,
-                    TabKind::ClaudeFull {
-                        ephemeral: true,
-                        ..
-                    }
-                ) {
+                let resumed = if record.peer_chat.is_none()
+                    && matches!(
+                        record.kind,
+                        TabKind::ClaudeFull {
+                            ephemeral: true,
+                            ..
+                        }
+                    ) {
                     crate::claude_tab::resume_closed(&app, &mut record).await
                 } else {
                     Vec::new()
@@ -1569,6 +1575,11 @@ pub async fn tab_reopen_closed(
                         record.kind,
                         record.tree,
                     )?;
+                    if let Some(mut chat) = record.peer_chat.clone() {
+                        chat.paused = true;
+                        chat.starting = false;
+                        workspace::tab_mut(ws, project, tab)?.peer_chat = Some(chat);
+                    }
                     if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
                         let bindings: Vec<_> = workspace::tab(ws, project, tab)?
                             .tree
@@ -1780,6 +1791,7 @@ mod tests {
             session: Some(session),
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -1879,6 +1891,7 @@ mod tests {
             session: Some(SessionId::new()),
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -2090,6 +2103,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -2161,6 +2175,7 @@ mod tests {
                     session: None,
                     conversation: None,
                     conversation_since: None,
+                    codex_cleared: false,
                     harness_conversation: None,
                     continues: None,
                     harness: None,
@@ -2325,6 +2340,7 @@ mod tests {
         let scratch = Scratch::new("lib.rs");
         let (mut ws, project) = bare();
         let record = crate::closed_tabs::ClosedTab {
+            peer_chat: None,
             project,
             kind: TabKind::File {
                 path: scratch.0.clone(),
@@ -2338,6 +2354,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -2365,6 +2382,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -2396,6 +2414,7 @@ mod tests {
         let scratch = Scratch::new("a.rs");
         let (ws, _) = bare();
         let orphan = crate::closed_tabs::ClosedTab {
+            peer_chat: None,
             project: ProjectId::new(),
             kind: TabKind::File {
                 path: scratch.0.clone(),
@@ -2409,6 +2428,7 @@ mod tests {
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,

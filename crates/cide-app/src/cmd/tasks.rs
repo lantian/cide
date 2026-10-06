@@ -437,6 +437,14 @@ pub async fn task_edit(
             assign_gesture,
             fresh_text,
         };
+        if mutation
+            .before
+            .as_ref()
+            .is_some_and(|t| t.question.is_some())
+            && mutation.after.question.is_none()
+        {
+            crate::spinner::milestone_question_answered(project, &plan, &task);
+        }
         Ok((store, mutation, continue_role))
     })
     .await?;
@@ -499,7 +507,7 @@ pub async fn task_respond(
     let for_thread = task.clone();
     let (store, continue_with) = blocking(move || {
         let task = for_thread;
-        let store = tracker(&stores, project, root);
+        let store = tracker(&stores, project, root.clone());
         let continue_with = match response {
             cide_ipc::TaskResponse::Accept => {
                 store.respond_to_review(&task, None)?;
@@ -528,6 +536,11 @@ pub async fn task_respond(
                     &selected_ids,
                     expected_question.as_ref(),
                 )?;
+                crate::spinner::milestone_question_answered(
+                    project,
+                    &cide_agents::config::load_milestones(&root),
+                    &task,
+                );
                 // Only a task that is work continues a role; a question on a milestone's goal is
                 // the planner's, which reads the answer on its next wake.
                 match (answered.agent.clone(), answered.status) {

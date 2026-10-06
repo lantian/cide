@@ -18,10 +18,10 @@
  * Everything is stored verbatim and nothing is rejected on save, for `ClaudeCliSection`'s
  * reason: a value you cannot see is a value you cannot correct.
  */
-import type { CodexCli, CodexCliSupport, CodexInjections, ClaudeEnvVar } from '@/ipc/client'
+import type { CodexCli, CodexCliSupport, CodexInjections, CodexPermissionMode, ClaudeEnvVar } from '@/ipc/client'
 import { IconButton } from '@/kit/components/Button'
 import { InfoPara, InfoTip } from '@/kit/components/InfoTip'
-import { Group, PathReadout, Row, Toggle, resetTo, useSettingsDefaults } from './controls'
+import { Group, PathReadout, Row, Select, Toggle, resetTo, useSettingsDefaults } from './controls'
 import { Add, Argv, ProgramInput, Remove, Why } from './ClaudeCliSection'
 
 import styles from './ClaudeCliSection.module.css'
@@ -96,6 +96,13 @@ const INJECTIONS: readonly {
     cost: 'Off: runs, reviews and tabs cide opens pass no sandbox or approval flag — your codex config, or the wrapper named above, decides. A role’s permission-mode and the project’s unattended default are no longer applied, so a run may wait on an approval nobody is watching.',
   },
   {
+    key: 'gitPermissions',
+    title: 'Git permissions',
+    flag: '-c permissions.cide-git -c default_permissions',
+    short: 'On: eligible consoles and worker worktrees can commit inside the sandbox.',
+    cost: 'Applied on the next launch. Grants writes to this checkout’s Git metadata while keeping other protected paths and approval settings. Custom profiles, legacy sandbox settings, wrappers and read-only sessions keep their existing permissions. Off: Git writes may require the supported approval route.',
+  },
+  {
     key: 'reviewPermissions',
     title: 'MR-review permissions',
     flag: 'without prompts',
@@ -114,6 +121,44 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
 
   return (
     <>
+      <Group title="Permissions">
+        <Row
+          label="Default permissions"
+          hint="The permission mode Codex uses on its next launch."
+          status={current?.permissionsNote ? { tone: 'info', text: current.permissionsNote } : undefined}
+          info={<>
+            <InfoPara>Applies to new, reopened, resumed and forked consoles, agent runs and automatic tabs. Running sessions keep their current mode; use /permissions to change it.</InfoPara>
+            <InfoPara>Use Codex config preserves existing launch defaults. Explicit role and review policies take precedence, followed by permission options in Extra arguments. Agent run injection switches still apply.</InfoPara>
+            <InfoPara>Approve for me keeps the workspace sandbox and sends eligible approvals to Codex’s automatic reviewer. Full access removes sandbox restrictions and approval prompts. Read-only allows inspection without workspace edits.</InfoPara>
+          </>}
+          {...resetTo(cli.permissionMode, def?.permissionMode, (permissionMode) => onChange({ ...cli, permissionMode }))}
+          control={<Select<CodexPermissionMode>
+            label="Codex default permissions"
+            value={cli.permissionMode}
+            options={[
+              { value: 'useConfig', label: 'Use Codex config' },
+              { value: 'askForApproval', label: 'Ask for approval' },
+              { value: 'approveForMe', label: 'Approve for me' },
+              { value: 'fullAccess', label: 'Full access' },
+              { value: 'readOnly', label: 'Read-only' },
+              { value: 'customProfile', label: 'Custom profile' },
+            ]}
+            onChange={(permissionMode) => onChange({ ...cli, permissionMode })}
+          />}
+        />
+        {cli.permissionMode === 'customProfile' && <Row
+          label="Permission profile"
+          hint="The name of an existing permissions profile in your Codex config."
+          status={!cli.permissionProfile.trim() ? { tone: 'bad', text: 'Enter a profile name to use Custom profile.' } : undefined}
+          {...resetTo(cli.permissionProfile, def?.permissionProfile, (permissionProfile) => onChange({ ...cli, permissionProfile }))}
+          control={<ProgramInput
+            label="Codex permission profile"
+            value={cli.permissionProfile}
+            placeholder="my-profile"
+            onCommit={(permissionProfile) => onChange({ ...cli, permissionProfile: permissionProfile.trim() })}
+          />}
+        />}
+      </Group>
       <Group title="Binary">
         {/* The hard verdict is the row's status, `ClaudeCliSection`'s shape (M133). */}
         <Row
@@ -315,6 +360,7 @@ export function CodexCliSection({ cli, onChange, support }: CodexCliSectionProps
           </>
         }
       >
+        {current?.gitPermissionsNote != null && <InfoPara>{current.gitPermissionsNote}</InfoPara>}
         {current !== null && current.argv.length > 0 ? (
           <Argv parts={current.argv.map((p, i) => ({ text: i === 0 ? p.text : ` ${p.text}`, ours: p.ours }))} />
         ) : (

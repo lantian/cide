@@ -42,6 +42,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+pub mod codex_clear;
 pub mod notifications;
 pub mod screen;
 mod startup_colors;

@@ -1,3 +1,4 @@
+import { PeerChatPane } from './PeerChatPane'
 import { ReviewEditor } from '@/gitlab/ReviewEditor'
 import { documentFromKey } from '@/gitlab/store'
 /**
@@ -231,6 +232,9 @@ export function PaneBody({
   const { revision, merge, mergeTab } = useWorkspace(
     useShallow((s) => documentTabFor(s.boot, project, pane.id)),
   )
+
+  const pairTab = useWorkspace((s) => s.boot?.workspace.projects[project ?? '']?.tabs.find((t) => t.peerChat !== undefined && pane.id in t.tree.panes))
+  if (pairTab) return <PeerChatPane tab={pairTab} pane={pane} cwd={cwd} project={project} primarySession={primarySession} restore={restore} roots={roots} onOpenPath={onOpenPath} onRevealPath={onRevealPath} onSessionBound={onSessionBound} onScreen={onScreen} />
 
   // A file is a document too: no session, no spawn, nothing to resume. (M9)
   //

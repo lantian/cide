@@ -99,6 +99,7 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         review: false,
         server: None,
         git_dirs: Vec::new(),
+        codex_git_permissions: None,
         sandbox_brief: None,
         codex_trust_root: None,
         codex_path_prepend: None,
@@ -510,6 +511,124 @@ fn in_codex_sandbox(dir: &Path, path: &str, script: &str) -> (bool, String, Stri
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Free, real enforcement of the exact shared profile used by worker and console launches.
+/// Run deliberately: requires a Codex installation with standard workspace permissions.
+#[test]
+#[ignore = "runs the real Codex sandbox and permission preflight; no model calls"]
+fn scoped_git_permissions_allow_commits_and_integration_but_protect_agent_config() {
+    use cide_core::codex_permissions::{GitPermissions, GitProfile, PROFILE_NAME, preflight};
+    let root = temp_dir("scoped-git");
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let checkout = root.join("worker");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "worker",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    let dirs = vec![root.join(".git"), root.join(".git/worktrees/worker")];
+    let cli = cide_ipc::CodexCli::default();
+    let permissions = preflight(&cli, &checkout, &dirs, &[], false, &[]);
+    let GitPermissions::Applied(profile) = permissions else {
+        panic!("preflight: {permissions:?}");
+    };
+    assert_eq!(profile, GitProfile::new(&dirs, &[], false));
+    let mut agent = role("Do exactly what you are asked.");
+    agent.permission_mode = Some("auto".into());
+    let mut run = plan(&agent, &checkout, "unused");
+    run.git_dirs = dirs.clone();
+    run.codex_git_permissions = Some(GitPermissions::Applied(profile.clone()));
+    let args = CodexHarness.spawn_spec(&run).unwrap().spec.args;
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == "-s" || a == "--approve-for-me" || a == "--add-dir")
+    );
+    assert!(args.contains(&profile.config));
+    // Take the profile overrides from the harness, not a second implementation of its argv.
+    let mut config = overrides(&args, "permissions.");
+    config.extend(overrides(&args, "default_permissions"));
+    let sandbox = |cwd: &Path, scoped: bool, command: &[&str]| {
+        let mut process = std::process::Command::new(codex());
+        process
+            .args([
+                "sandbox",
+                "-P",
+                if scoped { PROFILE_NAME } else { ":workspace" },
+                "-C",
+            ])
+            .arg(cwd);
+        if scoped {
+            process.args(&config);
+        }
+        process.arg("--").args(command).output().unwrap()
+    };
+    for cwd in [&root, &checkout] {
+        let out = sandbox(
+            cwd,
+            false,
+            &["git", "commit", "--allow-empty", "-m", "denied"],
+        );
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Read-only file system"),
+            "{out:?}"
+        );
+        for name in [".codex", ".agents"] {
+            std::fs::create_dir_all(cwd.join(name)).unwrap();
+        }
+        std::fs::write(cwd.join("probe"), "scoped Git write\n").unwrap();
+        let message = if cwd == &root {
+            "primary-scoped-git"
+        } else {
+            "worker-scoped-git"
+        };
+        for command in [
+            vec!["git", "add", "probe"],
+            vec!["git", "commit", "-qm", message],
+        ] {
+            let out = sandbox(cwd, true, &command);
+            assert!(out.status.success(), "{out:?}");
+        }
+        for protected in [".codex/probe", ".agents/probe"] {
+            let out = sandbox(cwd, true, &["touch", protected]);
+            assert!(!out.status.success(), "{protected} became writable");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("Read-only file system"),
+                "{out:?}"
+            );
+        }
+    }
+    let out = sandbox(
+        &root,
+        true,
+        &["git", "merge", "--no-ff", "worker", "-m", "integration"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        git(&root, &["rev-parse", "HEAD^2"]),
+        git(&checkout, &["rev-parse", "HEAD"])
+    );
+    for (value, warning) in [
+        ("sandbox_mode=\"workspace-write\"", true),
+        ("default_permissions=\":read-only\"", false),
+        ("default_permissions=\":danger-full-access\"", false),
+    ] {
+        let mut cli = cli.clone();
+        cli.args = vec!["-c".into(), value.into()];
+        let result = preflight(&cli, &checkout, &dirs, &[], false, &[]);
+        assert!(result.profile().is_none(), "{result:?}");
+        assert_eq!(result.warning().is_some(), warning, "{result:?}");
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// `needs: [gpu]` puts the real GPU inside codex's sandbox (M125): the `PATH` the harness hands a

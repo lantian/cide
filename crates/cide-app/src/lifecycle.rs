@@ -1651,7 +1651,9 @@ fn entry_for(
         // unresumable pane keeps its splash however this is set.
         eager: restore != SessionRestore::MissingConversation
             && (pane.session == Some(project.primary_session)
-                || (resume_all && matches!(restore, SessionRestore::Resumable { .. }))),
+                || (resume_all
+                    && (matches!(restore, SessionRestore::Resumable { .. })
+                        || pane.codex_cleared))),
     })
 }
 
@@ -1727,7 +1729,7 @@ fn restore_for(
     // by id alone, from any directory: codex does not file a thread under its cwd. Its own
     // resume switch, not claude's.
     if cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Codex {
-        if !resume_enabled.codex {
+        if pane.codex_cleared || !resume_enabled.codex {
             return SessionRestore::Fresh;
         }
         return match cide_core::workspace::pane_codex_thread(pane) {
@@ -2773,6 +2775,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -2794,6 +2797,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -2822,6 +2826,109 @@ mod tests {
         let dir = projects_dir.join(encoded);
         std::fs::create_dir_all(&dir).expect("create the transcript dir");
         std::fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").expect("write a transcript");
+    }
+
+    #[test]
+    fn a_codex_clear_restores_empty_without_changing_untouched_sessions() {
+        let root = temp_dir("codex-clear-restore");
+        let home = root.join("codex");
+        let day = home.join("sessions/2026/10/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let old = SessionId::new();
+        let rollout = day.join(format!("rollout-test-{old}.jsonl"));
+        std::fs::write(&rollout, b"{}\n").unwrap();
+        let mut ws = fixture(&root);
+        let project = *ws.projects.keys().next().unwrap();
+        let tab = ws.projects[&project].tabs[0].id;
+        let panes = &mut ws.projects.get_mut(&project).unwrap().tabs[0].tree.panes;
+        let primary = panes
+            .values_mut()
+            .find(|p| p.role == cide_ipc::PaneRole::Primary)
+            .unwrap();
+        primary.harness = Some(cide_ipc::Harness::Codex);
+        primary.conversation = Some(old);
+        let primary_id = primary.id;
+        let primary_session = primary.session.unwrap();
+        let auxiliary = panes
+            .values_mut()
+            .find(|p| p.kind == PaneKind::Claude && p.role == cide_ipc::PaneRole::Auxiliary)
+            .unwrap();
+        auxiliary.harness = Some(cide_ipc::Harness::Codex);
+        auxiliary.conversation = Some(old);
+        auxiliary.continues = Some(cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: old.to_string(),
+            cwd: root.join("worktree"),
+        });
+        let auxiliary_id = auxiliary.id;
+        let auxiliary_session = auxiliary.session.unwrap();
+        assert!(workspace::note_codex_clear(&mut ws, primary_session));
+        let saved = root.join("workspace.json");
+        cide_core::persist::save_atomic(&saved, &ws).unwrap();
+        let mut ws = cide_core::persist::load(&saved);
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        let primary = plan.iter().find(|e| e.pane == primary_id).unwrap();
+        assert_eq!(primary.restore, SessionRestore::Fresh);
+        assert!(primary.eager);
+        assert_eq!(
+            plan.iter()
+                .find(|e| e.pane == auxiliary_id)
+                .unwrap()
+                .restore,
+            SessionRestore::Resumable { session: old }
+        );
+        let window = workspace::detach_pane(&mut ws, project, tab, auxiliary_id).unwrap();
+        assert!(workspace::note_codex_clear(&mut ws, auxiliary_session));
+        cide_core::persist::save_atomic(&saved, &ws).unwrap();
+        let mut ws = cide_core::persist::load(&saved);
+        let plan = plan_restore_with_homes(&ws, None, Some(&home), None);
+        let auxiliary = plan.iter().find(|e| e.pane == auxiliary_id).unwrap();
+        assert_eq!(auxiliary.restore, SessionRestore::Fresh);
+        assert_eq!(auxiliary.cwd, root.join("worktree"));
+        assert_eq!(auxiliary.window, window);
+        assert!(auxiliary.eager);
+        ws.settings.claude.resume_all_on_launch = false;
+        assert!(
+            !plan_restore_with_homes(&ws, None, Some(&home), None)
+                .iter()
+                .find(|e| e.pane == auxiliary_id)
+                .unwrap()
+                .eager
+        );
+        // Repeated restarts at the empty composer must continue to open empty.
+        let fresh = SessionId::new();
+        workspace::bind_session(
+            &mut ws,
+            project,
+            tab,
+            primary_id,
+            fresh,
+            Some(cide_ipc::Harness::Codex),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_restore_with_homes(&ws, None, Some(&home), None)
+                .iter()
+                .find(|e| e.pane == primary_id)
+                .unwrap()
+                .restore,
+            SessionRestore::Fresh
+        );
+        let new = SessionId::new();
+        std::fs::write(day.join(format!("rollout-test-{new}.jsonl")), b"{}\n").unwrap();
+        workspace::note_conversation(&mut ws, fresh, new, 123);
+        cide_core::persist::save_atomic(&saved, &ws).unwrap();
+        let ws = cide_core::persist::load(&saved);
+        assert_eq!(
+            plan_restore_with_homes(&ws, None, Some(&home), None)
+                .iter()
+                .find(|e| e.pane == primary_id)
+                .unwrap()
+                .restore,
+            SessionRestore::Resumable { session: new }
+        );
+        assert!(rollout.is_file(), "clearing never removes the old history");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

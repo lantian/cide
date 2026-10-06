@@ -125,7 +125,7 @@ import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
 import { jumpTo, pendingJump } from '@/editor/jump'
 import { UNKNOWN_LINE } from '@/editor/navHistory'
-import { claudeSend, dockerEvents, pools, specEvents } from '@/ipc/client'
+import { claudeSend, codexCli, dockerEvents, pools, specEvents } from '@/ipc/client'
 import { startFileDrop } from '@/sidebar/TasksPanel/fileDrop'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
@@ -524,6 +524,20 @@ export function App() {
   // A newer cide release, its download and the restart that finishes it — shell windows only,
   // see `chrome/updates.ts`.
   useUpdateNotices(boot?.role.kind === 'shell')
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let gone = false
+    void codexCli.onGitPermissionsNotice((project, text) => notify(text, { kind: 'warn', project }))
+      .then((fn) => {
+        if (gone) fn()
+        else unlisten = fn
+      })
+    return () => {
+      gone = true
+      unlisten?.()
+    }
+  }, [])
 
   useEffect(() => {
     let unlisten: (() => void) | null = null

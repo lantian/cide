@@ -1628,6 +1628,7 @@ mod tests {
             session: Some(primary_session),
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -1649,6 +1650,7 @@ mod tests {
                 session: Some(SessionId::new()),
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,
@@ -1668,6 +1670,7 @@ mod tests {
         }
 
         let home = Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::ClaudeHome,
             tree,
@@ -1679,6 +1682,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -1687,6 +1691,7 @@ mod tests {
             origin: None,
         };
         let settings = Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::Settings {
                 section: SettingsSection::Keymap,
@@ -2352,6 +2357,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -2361,6 +2367,7 @@ mod tests {
         };
         let project = workspace.projects.values_mut().next().expect("a project");
         project.tabs.push(Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::Diff {
                 spec: DiffSpec {
@@ -2429,6 +2436,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -2441,6 +2449,7 @@ mod tests {
         };
         let project = workspace.projects.values_mut().next().expect("a project");
         project.tabs.push(Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::ClaudeFull {
                 title: "shop-db-1".into(),
@@ -2779,6 +2788,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -2793,6 +2803,7 @@ mod tests {
             .expect("the project")
             .tabs
             .push(Tab {
+                peer_chat: None,
                 id: tab_id,
                 kind: TabKind::ClaudeFull {
                     title: "scratch".into(),
@@ -2869,6 +2880,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -2877,6 +2889,7 @@ mod tests {
             origin: None,
         };
         project.tabs.push(Tab {
+            peer_chat: None,
             id: TabId::new(),
             kind: TabKind::File {
                 path: PathBuf::from("/home/dev/work/cide/src/main.rs"),

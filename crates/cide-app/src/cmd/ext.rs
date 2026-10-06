@@ -341,6 +341,7 @@ pub async fn tab_open_extension(
                 session: None,
                 conversation: None,
                 conversation_since: None,
+                codex_cleared: false,
                 harness_conversation: None,
                 continues: None,
                 harness: None,

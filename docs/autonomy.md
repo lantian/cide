@@ -164,7 +164,9 @@ It is one short turn:
 The planner timer does not wake it again while nothing changed. A latch compares the branch's
 HEAD and every non-goal task's (id, status, has-a-question) against the last plan. For the timer,
 open work is todo and doing tasks without a question. Work in review or waiting on you does not
-count as a reason to plan.
+count as a reason to plan. Answering the active milestone's question releases the latch and
+restarts the quiet dwell. The next plan receives the answer in its changes since the last plan;
+the planner's own goal edits still do not cause repeated planning turns.
 
 An idle console that has not reported a hook does not hold off the timer unless its current
 child was given an opening prompt. This matters for a restored Codex console: it can wait at
@@ -194,8 +196,9 @@ costs a conflict, which in this loop is nearly a whole task.
 
 ### Batch reviews
 
-When a run finishes a turn on a task, verify runs on its branch. Red goes back to the run itself
-(up to `agents.verifyRetries`). Green joins the pending batch. A review tab opens in the project
+When a run finishes a turn on a task, verify runs on its branch when configured. Red goes back to the run itself
+(up to `agents.verifyRetries`). Green joins the pending batch. Missing or blank verify satisfies
+the gate immediately, without running checks or consuming retries. A review tab opens in the project
 root when:
 
 - `reviewBatch` (3) tasks are waiting, or
@@ -207,14 +210,15 @@ A new batch never opens while the previous batch's reviewer is mid-turn, because
 merging into one branch is the race batching exists to avoid.
 
 The reviewer reads each task's report and diff and judges whether it did what the task asked.
-**It does not re-run checks**, because verify already ran. It merges every task it accepts in
+**It does not re-run checks**: it uses the verify result when configured, and proceeds without
+checks when verify is absent. It merges every task it accepts in
 **one** `cide_agent_integrate` call with `tasks: [{task, agent}, …]`:
 
 1. cide composes the merges **in memory**, moving no ref and touching no file. A branch that
    conflicts with the chain so far is skipped and named, and the rest still go.
-2. cide verifies the combined head **once**, in a scratch checkout
+2. When configured, cide verifies the combined head **once**, in a scratch checkout
    (`.cide/worktrees/batch-verify`).
-3. Only if that is green does cide advance your branch to it, with a safe checkout. The move is
+3. If verification passes or is not configured, cide advances your branch to it, with a safe checkout. The move is
    refused if the branch moved in the meantime.
 4. If the combined verify is red, nothing moves. cide then merges the branches one by one, each
    on its own verify, so the good ones still land and the answer names which road each task
@@ -222,6 +226,10 @@ The reviewer reads each task's report and diff and judges whether it did what th
 
 Tasks with `acceptance: user` never go to the reviewer at all (see below). Set `review: "each"`
 to go back to one reviewer per finished task.
+
+An idle agent remains alive while a pane shows its conversation. Once its task is done,
+closing the last view retires its process and moves the run to History. A completed idle
+conversation does not block automatic planning, even while its view remains open.
 
 ## Waiting for you
 
@@ -379,7 +387,9 @@ enough for batches to form.
   answer says when it fell back, and the next verify or gate is where it shows. Fix it
   as a task.
 - **The planner stopped.** It asked a question. Look in *Waiting for you*. Answer it, or update
-  the plan in the goal body. The timer wakes it again once the board or HEAD moves.
+  the plan in the goal body and press **Plan tasks**. Answering the active goal's question
+  releases the latch; the timer wakes the planner after the project has been quiet for its
+  configured dwell. Other automatic wakes require the board or HEAD to move.
 - **Tasks sit in review after a restart.** The batch pending set is in memory. After a restart
   the tasks stay in review until something announces them again. Ask the console to review
   them (it has `cide_agent_integrate` with `tasks` too), or dispatch the role again.

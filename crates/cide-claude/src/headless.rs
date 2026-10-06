@@ -108,6 +108,8 @@ pub struct Headless {
     pub env: Vec<(String, Option<String>)>,
     /// Launch arguments filtered by the caller to preserve the one-shot protocol.
     pub args: Vec<String>,
+    /// Resolved launch settings for the Codex lane; ignored by the Claude lane.
+    pub codex_cli: Option<cide_ipc::CodexCli>,
 }
 
 impl Headless {
@@ -124,6 +126,7 @@ impl Headless {
             proxy: ProxyEnv::default(),
             env: Vec::new(),
             args: Vec::new(),
+            codex_cli: None,
         }
     }
 
@@ -134,6 +137,11 @@ impl Headless {
 
     pub fn args(mut self, args: Vec<String>) -> Self {
         self.args = args;
+        self
+    }
+
+    pub fn codex_cli(mut self, cli: cide_ipc::CodexCli) -> Self {
+        self.codex_cli = Some(cli);
         self
     }
 
@@ -654,6 +662,11 @@ pub fn codex_argv(run: &Headless, schema_file: Option<&Path>) -> Vec<String> {
     if matches!(run.tools, ToolAccess::None) {
         args.push("-s".into());
         args.push("read-only".into());
+        args.extend(["-c".into(), "approval_policy=\"never\"".into()]);
+    } else if let Some(cli) = &run.codex_cli {
+        args.extend(cide_core::codex_cli::exec_permission_args(
+            cide_core::codex_cli::default_permission_args(cli, &run.args, None),
+        ));
     }
     if let Some(model) = &run.request.model {
         args.push("-m".into());
@@ -698,8 +711,9 @@ fn run_codex_with(
     schema_file: Option<&Path>,
 ) -> Result<HeadlessResult, HeadlessError> {
     let mut command = Command::new(program);
+    let user_args = codex_user_args(run)?;
     command
-        .args(&run.args)
+        .args(&user_args)
         .args(codex_argv(run, schema_file))
         .current_dir(&run.cwd)
         .stdin(Stdio::piped())
@@ -747,6 +761,18 @@ fn run_codex_with(
             }
         }
     }
+}
+
+fn codex_user_args(run: &Headless) -> Result<Vec<String>, HeadlessError> {
+    Ok(if matches!(run.tools, ToolAccess::None) {
+        cide_core::codex_cli::strip_permission_args(&run.args)
+    } else {
+        if let Some(cli) = &run.codex_cli {
+            cide_core::codex_cli::validate_permissions(cli, &run.args)
+                .map_err(|detail| HeadlessError::NotInstalled { detail })?;
+        }
+        run.args.clone()
+    })
 }
 
 /// The answer in a `codex exec --json` stream: the **last** agent message, the thread, and
@@ -827,6 +853,35 @@ pub fn parse_codex(stdout: &str, structured: bool) -> Result<HeadlessResult, Hea
 #[cfg(test)]
 mod codex_tests {
     use super::*;
+
+    #[test]
+    fn headless_tool_restrictions_precede_saved_and_explicit_permissions() {
+        let cli = cide_ipc::CodexCli {
+            permission_mode: cide_ipc::CodexPermissionMode::FullAccess,
+            ..Default::default()
+        };
+        let run = Headless::new(HeadlessRequest::new("commit message"), "/repo")
+            .codex_cli(cli)
+            .args(vec![
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--search".into(),
+            ]);
+        assert_eq!(codex_user_args(&run).unwrap(), ["--search"]);
+        let args = codex_argv(&run, None);
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
+        assert!(args.contains(&"approval_policy=\"never\"".into()));
+        assert!(!args.contains(&"-a".into()));
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
+
+        let cli = cide_ipc::CodexCli {
+            permission_mode: cide_ipc::CodexPermissionMode::ApproveForMe,
+            ..Default::default()
+        };
+        let run = Headless::new(HeadlessRequest::new("inspect"), "/repo")
+            .codex_cli(cli)
+            .tools(ToolAccess::Inherit);
+        assert!(codex_argv(&run, None).contains(&"approvals_reviewer=\"auto_review\"".into()));
+    }
 
     #[test]
     fn the_codex_lane_is_one_ephemeral_read_only_exec_with_the_prompt_on_stdin() {

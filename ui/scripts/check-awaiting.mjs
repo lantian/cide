@@ -12,7 +12,7 @@
  * marker nobody has acknowledged. Either way the user learns to ignore the badge, and the one
  * time it is true they will not look.
  *
- * Three sections:
+ * Four sections:
  *
  * 1. **The rule.** Compiled and driven, the way `check-exit-marker.mjs` and `check-menus.mjs`
  *    do it — there is no JS test runner in this project and this is a pure module the
@@ -25,6 +25,9 @@
  *    `data-awaiting` sat on an element no stylesheet could reach, no project surface existed
  *    at all, and nothing ever asked for the urgency hint a task bar actually renders. None of
  *    that is visible to a test of the rule, because the rule was never wrong.
+ * 4. **Pane action events**, mounting the real frame under JSDOM with mocked IPC. Clearing
+ *    Waiting on pointer-down moved fullscreen away before the click; its action must run
+ *    before acknowledgement, while content and window-control gestures keep their rules.
  *
  * Run: `pnpm --dir ui run check:awaiting`
  */
@@ -32,6 +35,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { checkPaneActionEvents } from './check-pane-action-dom.mjs'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-awaiting-'))
 let failed = 0
@@ -860,7 +864,8 @@ try {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
   }
-  console.log('awaiting rule: ok')
+  await checkPaneActionEvents()
+  console.log('awaiting rule and pane actions: ok')
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

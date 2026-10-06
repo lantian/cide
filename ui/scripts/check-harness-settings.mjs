@@ -13,6 +13,7 @@ const out = mkdtempSync(join(ui, 'node_modules/.cache/harness-settings-'))
 const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://cide.test' })
 for (const key of ['window', 'document', 'HTMLElement', 'Element', 'Node']) globalThis[key] = dom.window[key]
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
+dom.window.HTMLElement.prototype.scrollIntoView = () => {}
 const { createRoot } = await import('react-dom/client')
 const root = createRoot(document.getElementById('root'))
 try {
@@ -50,7 +51,33 @@ try {
   assert.equal(document.querySelector('[aria-label="OpenCode variable 1 value"]').value, 'https://gateway')
   await click(document.querySelector('[role="switch"][aria-label="Override global launch"]'))
   assert.deepEqual(writes.pop(), { field: 'opencode', value: null })
-  console.log('harness settings: ok (global/project choice, inheritance, launch override, OpenCode controls)')
+  const codex = {
+    binary: 'codex', args: [], env: [], permissionMode: 'useConfig', permissionProfile: '',
+    inject: { hooks: true, mcpConfig: true, developerInstructions: true, resume: true, fork: true, permissions: true, gitPermissions: true, reviewPermissions: true },
+  }
+  const codexProps = { settings: { consoleHarness: 'codex', codex: { cli: codex } } }
+  await render(HarnessLaunch, codexProps)
+  const selector = () => document.querySelector('[aria-label="Codex default permissions"]')
+  assert.equal(selector().textContent, 'Use Codex config')
+  await click(selector())
+  const options = [...document.querySelectorAll('[role="option"]')]
+  assert.deepEqual(options.map((option) => option.textContent), ['Use Codex config', 'Ask for approval', 'Approve for me', 'Full access', 'Read-only', 'Custom profile'])
+  await click(options[2])
+  assert.deepEqual(globalWrites.pop(), { codex: { cli: { ...codex, permissionMode: 'approveForMe' } } })
+  const custom = { ...codex, permissionMode: 'customProfile' }
+  await render(HarnessLaunch, { settings: { consoleHarness: 'codex', codex: { cli: custom } } })
+  assert(document.querySelector('[data-setting="Permission profile"]').textContent.includes('Enter a profile name'))
+  const profile = document.querySelector('[aria-label="Codex permission profile"]')
+  await act(async () => {
+    profile.focus()
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set.call(profile, ' team ')
+    profile.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  await act(async () => profile.blur())
+  assert.deepEqual(globalWrites.pop(), { codex: { cli: { ...custom, permissionProfile: 'team' } } })
+  await render(HarnessLaunch, { ...codexProps, codexSupport: { binary: 'codex', argNotes: [], envNotes: [], permissionsNote: 'Permission options in Extra arguments override Default permissions.', argv: [] } })
+  assert(document.querySelector('[data-setting="Default permissions"]').textContent.includes('Extra arguments override'))
+  console.log('harness settings: ok (global/project choice, inheritance, launch override, OpenCode controls, Codex permission presets and custom profiles)')
 } finally {
   await act(async () => root.unmount())
   dom.window.close()

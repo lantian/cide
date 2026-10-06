@@ -17554,3 +17554,271 @@ generated TypeScript retains ts-rs's existing trailing-space style.
 **Not confirmed on a device:** no Android phone/emulator was connected. Camera/gallery flows,
 multiline selection handles and the supplied Codex screenshot's live appearance still need
 native QA. An iOS build was not run on this Linux machine. No desktop profile was restarted.
+
+
+## M156 — Codex can commit with scoped Git permissions
+
+Selfcraft's Codex runs could edit their checkouts but still failed on Git's `index.lock` or
+`ORIG_HEAD`: writable workspace roots and `--add-dir` did not override the sandbox's protected
+Git metadata. Cide now resolves the actual Git directory and common directory and grants both
+through an invocation-local permission profile extending `:workspace`. This covers project
+consoles and editable worker worktrees, including console resumes and forks. Worker approval
+modes are expressed separately so legacy sandbox flags cannot silently defeat the profile;
+role network and extra writable-directory grants ride in the profile too.
+
+Settings → Harness → Codex has a **Git permissions** switch, enabled by default with project
+overrides and an opt-out. A bounded app-server preflight reads the installed binary's effective
+configuration and permission-profile availability without starting a model turn. Custom
+profiles, legacy sandbox settings, wrappers, explicit untrusted projects and managed refusals
+keep their existing launch policy. Compatibility skips appear in the settings argv preview,
+the launch warning and the worker brief. Read-only reviews and worker continuations receive
+no new Git grant. No user/project Codex configuration is rewritten.
+
+**Verified:** the scoped Rust suites pass 2,929 tests; the final session-launch rerun passes
+49 tests. A real Codex 0.160.0 sandbox regression reproduces the default profile's Git failure,
+then stages and commits in both primary and linked checkouts and merges the worker branch,
+while writes under `.codex` and `.agents` remain denied in both. All four free real-Codex
+checks pass; the final permission-preflight unit rerun passes six. UI TypeScript, relevant
+settings/event checks and the production build pass. Generated bindings, the IPC contract,
+Rust formatting and handwritten-source whitespace checks pass. Clippy passes with warnings
+denied and only `type_complexity` disabled; the unrestricted run stops on the existing
+`cide-pty::OutputObserver` warning. Socket and real sandbox checks required an unsandboxed
+run. Paid model-turn tests were not run.
+
+**Not confirmed in the live IDE:** no desktop profile was restarted and the settings row was
+not exercised on a display. The launch change takes effect in an updated cide on new sessions;
+already-running Codex processes retain their original permissions.
+
+
+## M157 — Completed subagents retire after their last view closes
+
+Terrastrike's t-1393 passed verify, was reviewed, merged and marked done, but its Codex run
+remained idle in the Agents panel. Its conversation was open when the board closed the task,
+so retirement deliberately preserved the child. Closing that view afterward never retried
+retirement. The automatic planner then counted the done idle run as outstanding work: its
+quiet rule excluded review tasks, but finishing review made the same run count again.
+
+Retirement now reconciles task status, run state and open views before the agent coalescer
+publishes a roster. Workspace mutations mark that coalescer when a session loses its last
+view; mirrors, detached panes and re-docking preserve it. Run transitions already mark the
+same coalescer, covering a task that closes before its child hands back the turn. The existing
+retirement record and process-tree cleanup remain the exit path, with shutdown excluded.
+The planner excludes idle and interrupted runs whose tasks are in review or done, while
+active, paused and unknown-task runs retain their claims.
+
+Missing or blank verify remains a satisfied gate with no command, retry or synthetic result.
+Default review prompts no longer claim checks ran unconditionally, and both single and batch
+reviewers receive the current no-verify policy even when their saved prompt is custom. The
+existing integration and user-acceptance paths remain available without verify.
+
+**Validation:** seven new Rust regressions cover both retirement event orders, shutdown,
+reaping a real fake CLI without failover or another review, the planner's done exemption,
+mirrored/detached view removal, session replacement, and no-verify review instructions.
+The full app suite passes 803 tests and the agents suite passes 465. The unrestricted reruns
+use isolated temporary app state and local sockets; the restricted runs blocked existing
+socket and scratch-directory tests. Seven UI checks pass: agents, agents-render, running,
+settings-agents, attach, detached and rows. Changed-source formatting and whitespace checks
+pass. Clippy passes with warnings denied and only the existing
+`cide-pty::OutputObserver` type-complexity lint allowed; the fully strict run stops on that
+warning. Paid CLI tests were not run.
+
+**Not confirmed in the live IDE:** no desktop profile was restarted and Terrastrike's run,
+board and configuration were left untouched. The behavior requires an updated Cide process.
+
+## M158 — Milestone answers release the planner's unchanged-board latch
+
+Terrastrike's planner asked for final acceptance of seven Hive candidates at 17:02 on
+2026-10-05. The user answered “Принимаем все 7” at 17:05, but the timer held the project as
+“unchanged since last plan.” Its fingerprint excludes milestone goals and comments to prevent
+the planner's own plan edits from starting repeated turns. The user's answer changed only
+that excluded goal, and the answer handler relied on a later planning wake to read it.
+
+A successful answer to the active milestone goal now releases that project's latch and
+restarts its quiet dwell. Both the desktop Answer command and the phone's plain question-clear
+edit take this path. Failed answers never reach it; ordinary tasks and inactive milestone
+goals do not release it. The previous planning cursor is retained, so the next delta still
+names the goal containing the answer. Normal planning records a fresh latch, and pause,
+busy-run, auto-planning and milestone-gate checks continue to govern the timer.
+
+**Validation:** two regressions cover the unchanged HEAD/child-task sequence, renewed quiet
+dwell, retained goal delta, re-latching after the next plan, inactive goals, ordinary tasks and
+project isolation. All eleven spinner tests and the full app suite (806 passed, 3 ignored)
+pass. Task storage tests (76), agent configuration tests (41) and persistence tests (72) pass.
+Six UI checks pass: agents, agents-render, settings-agents, selectors, theme and ui-scale.
+Code generation, contract checks, changed-source formatting and whitespace checks pass.
+Clippy passes with warnings denied and the existing cide-pty type-complexity lint allowed.
+The debug Cide binary was rebuilt successfully.
+
+**Not confirmed in the live IDE:** no profile was restarted and Terrastrike's task state was
+not changed. Its recorded answer remains available for planning after an updated Cide starts.
+
+
+## M159 — Experimental two-agent chat in a dedicated split tab
+
+The command palette now offers **Experimental: Open Two-Agent Chat**, with no default shortcut
+or menu/toolbar entry. It creates one closable tab with a draggable vertical divider. The main
+panel starts a fresh session of the project's console harness; the peer picker accepts Claude
+Code, Codex or OpenCode, including same-harness pairs. OpenCode uses native provider/model IDs;
+Claude and Codex keep their configured providers. Launch overrides are local to the pair.
+
+The main agent's instructions involve the peer for ordinary user tasks and keep the main as
+writer. The peer has read-only harness permissions and only the pair message MCP tool from
+cide. Messages carry side/harness labels and are addressed by bound session identity. Bounded
+queues return asynchronous receipts; Claude/Codex composers use small verified UTF-8 chunks
+and separate submission, while OpenCode uses authenticated private-server prompts retaining
+its model and reviewer agent. Drafts, unknown layouts, permission dialogs and uncertain
+submission fail closed. Partial bodies remain visible for manual recovery, without blind retries.
+
+Initial setup binds identities before MCP startup, cleans up a partial launch, and leaves the
+normal console independent. The pair keeps two panels together; structural pane operations and
+mirroring are refused. Closing ends paired process trees and retains reopen metadata. Native
+conversation identities persist, reopening/restoring waits paused, queued messages are not
+replayed, and missing transcripts need an explicit fresh choice. A late model catalog response
+cannot erase a startup error. [Usage and recovery](two-agent-chat.md).
+
+**Validation:** all 4,476 tests in the full workspace rerun pass under an isolated profile with
+local sockets enabled. The final affected crate suites, pair boundary tests and authenticated
+native OpenCode regression pass. The new mounted UI check covers selection, default providers,
+startup error display, paused restoration and explicit fresh recovery. TypeScript and the
+production UI build pass. Generated bindings and the IPC contract are in sync. The shared
+runner's remaining sandbox-blocked editor/task-link/fork-pin checks pass on rerun; selector and
+theme issues found during implementation are corrected. Clippy passes with warnings denied
+and the existing cide-pty OutputObserver type-complexity lint allowed; fully strict Clippy still
+stops on that existing lint. Handwritten source formatting and whitespace checks pass.
+
+**Confirmed on a display:** the isolated peer-audit profile passed 100 pane lifecycle cycles
+(102 terminals, one open per terminal, no lost terminals or hosts destroyed while mounted).
+Executing the palette action through that profile's real command dispatcher created the
+correct setup tab; close/reopen retained both panel IDs and paused the pair. Installed OpenCode
+2.0.16 accepted the private reviewer policy in an isolated, free configuration probe. The audit
+profile was stopped afterward; the live IDE was not restarted.
+
+**Not confirmed:** a paid agent-to-agent model conversation, every installed CLI's current
+composer rendering, and restored conversations after a real paid exchange. The conservative
+recognizers can withhold an ambiguous delivery; the recovery remains manual and explicit.
+
+## M160 — Codex `/clear` survives an IDE restart
+
+Codex starts a new conversation on `/clear`, but does not emit its replacement `SessionStart`
+hook until a prompt is submitted. cide used to retain the old thread and resume it on restart.
+An explicit, default-false pane flag now records the intentional empty state. A cleared pane
+starts fresh in Codex, retaining its working directory and launch preferences; untouched panes
+continue to restore their saved threads. The new thread's hook removes the flag and restores
+normal continuation behavior. Old transcripts are retained.
+
+The live console observer requires a submitted `/clear` and Codex's screen reset. It handles
+fragmented commands/output, bracketed paste, editing and completion, and excludes unsubmitted
+text, cancelled commands, modal answers and unrelated redraws. Clears travel through the
+ordered hook applier, invalidate registry and continuation fallbacks, and retire old thread IDs
+so late hook traffic cannot resurrect them. Explicitly resuming a historical thread remains
+possible. The startup registry stores cleared and known identities in one atomic entry.
+
+**Validation:** 220 core restore/workspace/persistence checks, 129 app hook/binding/lifecycle/
+session checks and the PTY suite pass, along with `check:restore`, TypeScript and IPC generation.
+An isolated free test against installed Codex 0.160.0 confirms its actual composer and reset
+bytes without submitting a model prompt. Clippy passes with the pre-existing `OutputObserver`
+type-complexity lint allowed; fully strict Clippy still reports that existing lint.
+
+**Not confirmed:** a full IDE shutdown/relaunch on a display, or other Codex versions' current
+composer layouts. Persistence tests cover empty restart, unchanged sessions, repeated clears,
+new-thread restoration, detached continuations and mirrors.
+
+## M161 — Paired terminals occupy their panels
+
+The configured two-agent tab showed both headers above blank panels. Its container used
+`flex: 1` inside PaneFrame's block body, which could not supply a height. The terminal hosts
+are positioned outside normal flow, so both terminal areas collapsed to zero height.
+The paired container now explicitly fills the body's height; its header and notices reserve
+space above the terminal. The change is confined to the experimental tab's stylesheet.
+
+The new `ui/scripts/audit-peer-chat.mjs` uses Chromium to mount the actual PeerChatPane,
+TerminalPane, PaneSlot, host registry and xterm with PaneFrame's actual CSS. Only Tauri IPC
+is faked. It reproduces both zero-height terminals when the height is removed, verifies
+visible output and usable geometry at three viewport sizes including the reported size,
+checks containment with a pause notice, and delivers keyboard text through the left
+terminal's real sink to its bound session. Both panes adopt their live sessions once.
+The earlier picker check mocked TerminalPane, and the M159 display audit exercised setup
+and ordinary pane lifecycle; neither verified configured paired terminal layout.
+
+**Validation:** the browser audit, picker check, TypeScript, production UI build, theme,
+UI scale and filename casing checks pass. No paid model exchange or live IDE restart was
+performed for this layout fix.
+
+## M162 — OpenCode peers can send their reviews back
+
+The peer's actual persisted session showed that it had the pairing instructions, but
+`cide_cide_peer_chat_send` was absent from its model-visible tools. OpenCode 2 defaults
+MCP servers to Code Mode. The read-only reviewer denies the `execute` wrapper, so a
+connected cide server could still provide no callable reply tool. Paired OpenCode
+consoles now set `mcp.servers.cide.codemode: false`; ordinary consoles keep their existing
+configuration. The exact send-tool permission stays allowed and write/shell/execute
+permissions stay denied. Both main and reviewer OpenCode pair roles use direct tools.
+
+The chat header now shows delivery separately for Main → Peer and Peer → Main, including
+an explicit absence of a reply. Receipt wording refers to the receiving agent, so a review
+arriving at Main is not described as delivery to Peer. Printed terminal output is still
+not automatically forwarded. Existing private servers require an IDE restart to pick up
+the new configuration; restored pairs return paused and reviews must be requested again.
+
+**Validation:** the new quota-free `scripts/audit-opencode-peer-tools.py` starts installed
+OpenCode 2 with isolated state, a local fake model and a fake MCP server. With the old
+configuration, the model sees only read/glob/grep. With direct tools enabled, it also sees
+the peer-send tool, executes a reply, and the fake MCP receiver records its text. An
+unrelated MCP mutation tool, edit/write/shell and execute remain hidden. Rust policy and
+pair-scope checks, native console API checks, directional receipt UI checks, TypeScript,
+production UI build, theme/UI scale and the real-terminal browser audit pass. The debug
+binary is rebuilt. No real paid model exchange or live IDE restart was performed.
+
+## M163 — Complete peer replies and external reviewer reads
+
+Peer → Main delivery stopped after its first chunk because chunks end at a space, while
+terminal captures trim spaces at the end of a row. Removing the verification witness
+after each chunk made intact input fail verification. Delivery now retains the witness
+between chunks, replaces it together with the next chunk, and removes it only once the
+whole normalized message is present. Each write stays under the existing byte limit.
+
+The installed Codex audit also exposed UUID witnesses wrapping onto a line beginning with
+a digit. Exact content verification now allows numeric input continuations; readiness
+detection still refuses numbered dialogs and existing drafts. Verification also requires
+the cursor to remain in the input rather than a footer. Incomplete messages still pause
+the pair and remain visible for manual recovery; no blind retries or clearing were added.
+
+The invocation-local OpenCode reviewer policy now permits `external_directory` as well
+as read/glob/grep. Directory admission is a separate check from read permission, so the
+previous deny-all baseline blocked even read-only reference repositories. Write, shell,
+execute, subagent and unrelated MCP actions retain their deny rules. Ordinary consoles
+and global/project configuration are unchanged.
+
+**Validation:** 834 core and 815 app tests pass (four deliberate ignores). The new free
+`real_peer_composer` audit drives installed Codex 0.160.0 through the shared production
+chunk planner and capture verifier, verifies a long wrapped Unicode reply, submits it,
+and checks its exact text in input history. A follow-up is accepted while its isolated
+provider is unavailable. The provider points only at an unused loopback port; no paid
+model endpoint is contacted. The extended installed-OpenCode audit reproduces the old
+external read/glob denial, then verifies successful external read/glob and reply-tool
+execution with mutation tools hidden. The debug binary is rebuilt. No paid two-agent
+conversation or live IDE restart was performed.
+
+## M164 — Busy receivers keep messages pending
+
+The reported header identified the next failure: Main → Peer exceeded the 40-second
+readiness deadline while OpenCode was reviewing, then the delivery worker paused both
+directions. Its subsequent review was refused because the pair was already paused.
+The actual Codex input history confirms that the two earlier reviews were submitted
+intact; the latest refusal was not another chunk-verification failure.
+
+The readiness wait now keeps messages queued until their recipient is ready, rather
+than treating a long turn or occupied composer as a transport failure. Each direction
+retains its own bounded queue and worker. Manual input stays available during the wait;
+pause, close and session replacement still cancel it. Actual write/submission verification
+deadlines and uncertain-delivery safeguards remain. Paused send errors now state that
+the rejected message was not queued and include the prior delivery problem when known.
+
+**Validation:** all 817 app tests pass (four deliberate ignores). The free wall-clock
+regression exercises the same readiness helper used by both harness paths, leaves a
+receiver busy for 41 seconds, and confirms readiness is accepted without a timeout.
+Cancellation leaves input unclaimed; paused diagnostics identify the correct tab's
+prior failure and do not enqueue. The installed-Codex composer/submission audit passes
+again and the debug binary is rebuilt. No real paid exchange or live IDE restart was
+performed. An already-paused run still needs a continuation task after restarting;
+the failed queue and replies refused before queueing are not replayed blindly.

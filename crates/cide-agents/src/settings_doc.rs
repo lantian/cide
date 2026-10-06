@@ -349,6 +349,16 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "Extra environment every codex child gets. Values are never shown back.",
     ),
     doc(
+        "codex.cli.permissionMode",
+        "enum useConfig | askForApproval | approveForMe | fullAccess | readOnly | customProfile",
+        "Default permissions on the next Codex launch. Explicit role/review policies and CLI permission arguments take precedence; useConfig preserves existing defaults.",
+    ),
+    doc(
+        "codex.cli.permissionProfile",
+        "string",
+        "Existing Codex permission-profile name, required when permissionMode is customProfile.",
+    ),
+    doc(
         "codex.cli.inject.hooks",
         "bool",
         "Pass cide's hooks to codex. Off: codex panes have no state and cannot resume.",
@@ -377,6 +387,11 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "codex.cli.inject.permissions",
         "bool",
         "Pass sandbox and approval flags to runs and tabs cide opens by itself.",
+    ),
+    doc(
+        "codex.cli.inject.gitPermissions",
+        "bool",
+        "Grant scoped Git writes to eligible editable Codex consoles and worker worktrees on their next launch. Custom and legacy permissions are preserved.",
     ),
     doc(
         "codex.cli.inject.reviewPermissions",

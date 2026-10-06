@@ -156,6 +156,16 @@ impl Api {
         } // v1 instructions are carried by the server's configuration document.
     }
     pub fn prompt(&self, id: &str, text: &str, model: Option<&str>) -> Result<(), String> {
+        self.prompt_as(id, text, model, None)
+    }
+    /// A v1 native prompt must retain the console's agent and selected model.
+    pub fn prompt_as(
+        &self,
+        id: &str,
+        text: &str,
+        model: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<(), String> {
         validate_id(id)?;
         let (path, mut body) = if self.generation == Generation::V2 {
             (
@@ -168,6 +178,9 @@ impl Api {
                 json!({ "parts": [{ "type": "text", "text": text }] }),
             )
         };
+        if let Some(agent) = agent {
+            body["agent"] = json!(agent);
+        }
         if self.generation == Generation::V1
             && let Some(model) = model.and_then(model_ref)
         {
@@ -445,6 +458,14 @@ mod tests {
                             );
                         }
                     }
+                    if path.ends_with("/prompt") || path.ends_with("/prompt_async") {
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["agent"], "cide-peer-reviewer");
+                        if generation == Generation::V1 {
+                            assert_eq!(body["model"]["providerID"], "provider");
+                            assert_eq!(body["model"]["modelID"], "model");
+                        }
+                    }
                     let body = response.to_string();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }
@@ -478,8 +499,13 @@ mod tests {
             api.exists("ses_original").unwrap();
             assert_eq!(api.fork("ses_original").unwrap(), "ses_fork");
             api.instructions("ses_fork", "Use cide tools").unwrap();
-            api.prompt("ses_fork", "continue", Some("provider/model"))
-                .unwrap();
+            api.prompt_as(
+                "ses_fork",
+                "continue",
+                Some("provider/model"),
+                Some("cide-peer-reviewer"),
+            )
+            .unwrap();
             assert_eq!(
                 api.state("ses_fork", false).unwrap(),
                 SessionState::AwaitingPermission

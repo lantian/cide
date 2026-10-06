@@ -2,6 +2,7 @@
   "cide://agents-changed",
   "cide://capabilities-changed",
   "cide://close-blocked",
+  "cide://codex-git-permissions-notice",
   "cide://command-requested",
   "cide://diagnostics",
   "cide://docker-changed",

@@ -590,7 +590,7 @@ pub(crate) fn plan_now(app: &AppHandle, project: ProjectId) -> Result<(), String
 struct LastSpin {
     at_ms: u64,
     head: Option<String>,
-    print: String,
+    print: Option<String>,
 }
 
 static LAST_SPIN: Mutex<Option<HashMap<ProjectId, LastSpin>>> = Mutex::new(None);
@@ -624,7 +624,7 @@ fn latched(project: ProjectId, print: &str) -> bool {
             guard
                 .as_ref()
                 .and_then(|m| m.get(&project))
-                .map(|l| l.print == print)
+                .map(|l| l.print.as_deref() == Some(print))
         })
         .unwrap_or(false)
 }
@@ -645,10 +645,30 @@ fn remember_spin(project: ProjectId, root: &std::path::Path, rows: &[TaskRow], p
             LastSpin {
                 at_ms: now_ms,
                 head: cide_core::check::head_of(root),
-                print,
+                print: Some(print),
             },
         );
     }
+}
+
+/// Goal edits are excluded from the fingerprint so a planner updating its own plan cannot
+/// spin forever. A user's answer is different: it releases the decision that stopped that
+/// plan. Keep the cursor for the next turn's delta, but release its latch and restart the dwell.
+/// Called only after a successful user answer, including the phone's plain question-clear edit.
+pub(crate) fn milestone_question_answered(
+    project: ProjectId,
+    plan: &cide_ipc::MilestonePlan,
+    task: &cide_ipc::TaskId,
+) {
+    if plan.current().and_then(|m| m.task.as_ref()) != Some(task) {
+        return;
+    }
+    if let Ok(mut guard) = LAST_SPIN.lock()
+        && let Some(last) = guard.as_mut().and_then(|m| m.get_mut(&project))
+    {
+        last.print = None;
+    }
+    mark_busy(project, Instant::now());
 }
 
 /// "Since the last plan: …" — the tasks that changed and the commits that landed, capped, or
@@ -890,6 +910,114 @@ mod tests {
             auto_spin: true,
             ..AgentsConfig::default()
         }
+    }
+
+    #[test]
+    fn a_milestone_answer_releases_the_latch_and_preserves_the_planning_delta() {
+        let project = ProjectId::new();
+        let goal = cide_ipc::TaskId::from("t-1110".to_owned());
+        let plan: cide_ipc::MilestonePlan = serde_json::from_value(serde_json::json!({
+            "items": [{"id": "look", "title": "Look", "task": "t-1110", "gate": "true"}]
+        }))
+        .unwrap();
+        let print = "same-head|t-1231:Todo:false";
+        LAST_SPIN
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                project,
+                LastSpin {
+                    at_ms: 1,
+                    head: None,
+                    print: Some(print.into()),
+                },
+            );
+        let config = AgentsConfig {
+            auto_spin_after_secs: 300,
+            ..asking()
+        };
+        mark_busy(project, Instant::now() - Duration::from_secs(600));
+        let mut quiet = ready();
+        quiet.quiet_for = dwell(project, Instant::now(), true);
+        assert!(should_spin(&quiet, &config));
+        assert_eq!(
+            eligibility(&quiet, &config, latched(project, print)),
+            "unchanged since last plan"
+        );
+
+        milestone_question_answered(project, &plan, &goal);
+        assert!(
+            !latched(project, print),
+            "the answer changes no non-goal task or HEAD"
+        );
+        let now = Instant::now();
+        quiet.quiet_for = dwell(project, now, true);
+        assert!(
+            !should_spin(&quiet, &config),
+            "an answer must still wait for quiet"
+        );
+        quiet.quiet_for = dwell(project, now + Duration::from_secs(300), true);
+        assert!(should_spin(&quiet, &config));
+        assert_eq!(
+            eligibility(&quiet, &config, latched(project, print)),
+            "ready to plan"
+        );
+
+        let goal_row: TaskRow = serde_json::from_value(serde_json::json!({
+            "id": "t-1110", "title": "Look", "status": "todo", "agent": null,
+            "createdUnixMs": 0, "updatedUnixMs": 2, "commentCount": 1, "attachmentCount": 0
+        }))
+        .unwrap();
+        let delta = delta_line(std::path::Path::new("/tmp"), project, &[goal_row]).unwrap();
+        assert!(
+            delta.contains("t-1110 [todo] Look"),
+            "the next planner must read the answered goal"
+        );
+        assert_eq!(
+            LAST_SPIN.lock().unwrap().as_ref().unwrap()[&project].at_ms,
+            1
+        );
+
+        // Once that next plan starts, an unchanged board is held again. The answer releases
+        // one planning turn, not every later timer tick.
+        remember_spin(project, std::path::Path::new("/tmp"), &[], print.into());
+        assert!(latched(project, print));
+    }
+
+    #[test]
+    fn answers_to_other_tasks_do_not_release_the_active_plan_or_another_project() {
+        let project = ProjectId::new();
+        let other_project = ProjectId::new();
+        let plan: cide_ipc::MilestonePlan = serde_json::from_value(serde_json::json!({
+            "active": "look",
+            "items": [
+                {"id": "look", "title": "Look", "task": "t-1110", "gate": "true"},
+                {"id": "lan", "title": "LAN", "task": "t-1321", "gate": "true"}
+            ]
+        }))
+        .unwrap();
+        for id in [project, other_project] {
+            LAST_SPIN
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(
+                    id,
+                    LastSpin {
+                        at_ms: 1,
+                        head: None,
+                        print: Some("unchanged".into()),
+                    },
+                );
+        }
+        for task in ["t-1394", "t-1321"] {
+            milestone_question_answered(project, &plan, &cide_ipc::TaskId::from(task.to_owned()));
+            assert!(latched(project, "unchanged"));
+        }
+        milestone_question_answered(project, &plan, &cide_ipc::TaskId::from("t-1110".to_owned()));
+        assert!(!latched(project, "unchanged"));
+        assert!(latched(other_project, "unchanged"));
     }
 
     #[test]

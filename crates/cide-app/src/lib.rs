@@ -42,6 +42,7 @@ pub mod ext_assets;
 pub mod ext_state;
 mod image_snapshots;
 mod opencode_console;
+mod peer_chat;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
 /// [`spinner`] reads to decide a project has gone quiet. (M94)
 ///
@@ -367,6 +368,7 @@ pub fn run() {
     };
 
     builder = builder.manage(SessionRegistry::default());
+    builder = builder.manage(peer_chat::Runtime::default());
     builder = builder.manage(updater::UpdaterState::default());
     builder = builder.manage(cmd::gitlab::GitLabState::default());
     // The raw text behind rendered log lines, one bounded ring per session. See `logring`.
@@ -604,6 +606,11 @@ pub fn run() {
             cmd::project::project_forget_recent,
             cmd::project::project_reveal,
             cmd::project::tab_new_claude,
+            cmd::peer_chat::peer_chat_open,
+            cmd::peer_chat::peer_chat_configure,
+            cmd::peer_chat::peer_chat_pause,
+            cmd::peer_chat::peer_chat_receipts,
+            cmd::peer_chat::peer_chat_plan,
             cmd::project::tab_activate,
             cmd::project::tab_close,
             cmd::project::tab_reorder,

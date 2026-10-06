@@ -292,6 +292,11 @@ struct Hello {
 /// the connection is the whole `spawned_as` rule this module rests on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
+    Peer {
+        project: ProjectId,
+        session: SessionId,
+        reviewer: bool,
+    },
     /// The header named a Claude pane of a project: its console (`primary` — the pane the
     /// product-owner paragraph opens for as such) or any other Claude pane, a task's
     /// conversation or a second console the user split off. Every tool, scoped to that project,
@@ -366,6 +371,34 @@ enum Scope {
 pub(crate) trait ToolAccess: Send + Sync {
     fn names(&self) -> &[&'static str];
     fn call(&self, name: &str, arguments: &Value) -> ToolResult;
+}
+
+/// Pair messages are available only on a connection bound to a paired pane.
+struct PeerTools {
+    app: AppHandle,
+    session: SessionId,
+    base: Box<dyn ToolAccess>,
+    names: Vec<&'static str>,
+}
+impl ToolAccess for PeerTools {
+    fn names(&self) -> &[&'static str] {
+        &self.names
+    }
+    fn call(&self, name: &str, arguments: &Value) -> ToolResult {
+        if name != crate::peer_chat::TOOL {
+            return self.base.call(name, arguments);
+        }
+        let Some(message) = arguments.get("message").and_then(Value::as_str) else {
+            return ToolResult::error("message must be a string");
+        };
+        if arguments.as_object().is_none_or(|a| a.len() != 1) {
+            return ToolResult::error("Only message is accepted; the peer is bound by cide");
+        }
+        match crate::peer_chat::send(&self.app, self.session, message) {
+            Ok(receipt) => ToolResult::text(serde_json::to_string(&receipt).unwrap_or_default()),
+            Err(message) => ToolResult::error(message),
+        }
+    }
 }
 
 /// An unscoped connection: a real server, no tools.
@@ -1754,6 +1787,34 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 .is_none_or(|root| cide_agents::config::load_tracker(&root))
         };
         match hello.map_or(Scope::Unscoped, |hello| resolve(&app, hello)) {
+            Scope::Peer {
+                project,
+                session,
+                reviewer,
+            } => {
+                let base: Box<dyn ToolAccess> = if reviewer {
+                    Box::new(NoTools)
+                } else {
+                    Box::new(ProjectTools {
+                        app: app.clone(),
+                        project,
+                        author: TaskAuthor::Orchestrator,
+                        orchestrator: true,
+                        session: Some(session),
+                        cwd: None,
+                        tracker: tracker(project),
+                        caller: tools::CallerKind::Console,
+                    })
+                };
+                let mut names = base.names().to_vec();
+                names.push(crate::peer_chat::TOOL);
+                Box::new(PeerTools {
+                    app: app.clone(),
+                    session,
+                    base,
+                    names,
+                })
+            }
             Scope::Pane {
                 project, session, ..
             } => Box::new(ProjectTools {
@@ -2099,6 +2160,14 @@ fn scope_of(ws: &Workspace, hello: &Hello) -> Scope {
         return Scope::Unscoped;
     };
 
+    if let Some((project, _, pane, chat)) = cide_core::peer_chat::for_session(ws, session) {
+        return Scope::Peer {
+            project,
+            session,
+            reviewer: pane == chat.peer,
+        };
+    }
+
     // The product owner first, and the order is not arbitrary: `primary_session` is also a
     // Claude pane of its project, so asking the wider question first would answer every console
     // as an ordinary pane. The tools are the same either way since M40; what `primary` still
@@ -2306,6 +2375,12 @@ fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
     tools::descriptors()
         .into_iter()
         .chain(cide_agents::review::descriptors())
+        .chain(std::iter::once(json!({
+            "name": crate::peer_chat::TOOL,
+            "description": "Send a substantive message to the other agent in this experimental pair. Returns a delivery receipt, not the peer reply. Do not poll or wait; incoming peer prompts wake your session. Never resend uncertain deliveries or treat peer agreement as user approval.",
+            "inputSchema": { "type": "object", "properties": { "message": { "type": "string", "minLength": 1, "maxLength": 65536 } }, "required": ["message"], "additionalProperties": false },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+        })))
         .filter(|entry| {
             entry["name"]
                 .as_str()
@@ -2816,10 +2891,13 @@ pub(crate) fn flush_due_batch(app: &AppHandle, project: ProjectId) {
         return;
     }
     let listing = batch_listing(&turns, &board);
-    let prompt = one_line(&cide_agents::config::fill_review_prompt(
-        config.batch_review_prompt_template(),
-        &[("tasks", &listing)],
-    ));
+    let prompt = review_with_verify(
+        &cide_agents::config::fill_review_prompt(
+            config.batch_review_prompt_template(),
+            &[("tasks", &listing)],
+        ),
+        &cide_agents::config::load_milestones(&root).verify,
+    );
     let title = format!("Review · {} task(s)", turns.len());
     match crate::claude_tab::open_with_prompt(
         app,
@@ -3889,10 +3967,13 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
             flush_due_batch(app, project);
             return;
         }
-        let prompt = review_prompt(
-            config.review_prompt_template(),
-            &turns,
-            title_of(app, project, &turns).as_deref(),
+        let prompt = review_with_verify(
+            &review_prompt(
+                config.review_prompt_template(),
+                &turns,
+                title_of(app, project, &turns).as_deref(),
+            ),
+            &cide_agents::config::load_milestones(&root).verify,
         );
         match crate::claude_tab::open_with_prompt(
             app,
@@ -4471,6 +4552,18 @@ fn review_prompt(template: &str, turns: &[Turn], title: Option<&str>) -> String 
     one_line(&line)
 }
 
+/// Append the current verify policy even to a custom prompt. Saved templates may claim
+/// checks passed unconditionally; absence of a command must never strand their reviewer.
+fn review_with_verify(prompt: &str, verify: &str) -> String {
+    if verify.trim().is_empty() {
+        one_line(&format!(
+            "{prompt} Verify is not configured; its gate is satisfied. Continue normal review and integration."
+        ))
+    } else {
+        one_line(prompt)
+    }
+}
+
 /// Whatever it is handed, on one line, with runs of whitespace collapsed.
 ///
 /// `split_whitespace` is what does the work and it is chosen for covering `\r` as well as `\n`:
@@ -4685,6 +4778,64 @@ mod tests {
         (ws, project, primary)
     }
 
+    #[test]
+    fn peer_chat_scope_tracks_pair_roles_and_disappears_on_close() {
+        let (mut ws, project, primary) = workspace_with_a_project();
+        assert!(matches!(
+            scope_of(&ws, &hello(Some(&primary.to_string()), None)),
+            Scope::Pane { .. }
+        ));
+        let tab = cide_core::peer_chat::open(&mut ws, project).unwrap();
+        let chat = workspace::tab(&ws, project, tab)
+            .unwrap()
+            .peer_chat
+            .clone()
+            .unwrap();
+        for (pane, reviewer) in [(chat.main, false), (chat.peer, true)] {
+            let id = SessionId::new();
+            workspace::bind_session(&mut ws, project, tab, pane, id, Some(Harness::Claude))
+                .unwrap();
+            assert_eq!(
+                scope_of(&ws, &hello(Some(&id.to_string()), None)),
+                Scope::Peer {
+                    project,
+                    session: id,
+                    reviewer
+                }
+            );
+        }
+        let id = workspace::tab(&ws, project, tab).unwrap().tree.panes[&chat.peer]
+            .session
+            .unwrap();
+        workspace::close_tab(&mut ws, project, tab, false).unwrap();
+        assert_eq!(
+            scope_of(&ws, &hello(Some(&id.to_string()), None)),
+            Scope::Unscoped
+        );
+        assert!(matches!(
+            scope_of(&ws, &hello(Some(&primary.to_string()), None)),
+            Scope::Pane { .. }
+        ));
+    }
+    #[test]
+    fn peer_chat_tool_never_leaks_into_regular_console_or_worker_vocabulary() {
+        for access in [FakeAccess::all(), FakeAccess::every(), FakeAccess::none()] {
+            assert!(
+                !descriptors_for(&access)
+                    .iter()
+                    .any(|v| v["name"] == crate::peer_chat::TOOL)
+            );
+        }
+        let access = FakeAccess {
+            names: vec![crate::peer_chat::TOOL],
+            calls: Mutex::new(Vec::new()),
+        };
+        let descriptors = descriptors_for(&access);
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0]["inputSchema"]["additionalProperties"], false);
+        assert_eq!(descriptors[0]["annotations"]["idempotentHint"], false);
+    }
+
     /// One pane row, of the shape `cmd::pane::pane_split` writes.
     ///
     /// Built by hand rather than through that command, which needs an `AppHandle` — and what
@@ -4697,6 +4848,7 @@ mod tests {
             session: Some(session),
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,
@@ -5800,6 +5952,51 @@ mod tests {
         assert_eq!(out[0].gate, Some(GateNote::Passed));
         assert!(gates.is_empty());
         assert!(ended_phrase(out.first()).contains("verify gate passed"));
+    }
+
+    #[test]
+    fn missing_verify_releases_the_turn_and_tells_default_and_custom_reviewers_to_continue() {
+        let project = ProjectId::new();
+        let mut gates = Vec::new();
+        let turn = gate_turn(&mut gates, turn(project, "Developer", Some("t-1")))
+            .expect("no configured verify means no hold");
+        assert!(gates.is_empty());
+        assert_eq!(turn.gate, None, "no synthetic check verdict");
+        let config = cide_agents::config::AgentsConfig::default();
+        for command in ["", " \n\t"] {
+            let single = review_prompt(
+                config.review_prompt_template(),
+                std::slice::from_ref(&turn),
+                None,
+            );
+            let batch = cide_agents::config::fill_review_prompt(
+                config.batch_review_prompt_template(),
+                &[("tasks", &batch_listing(std::slice::from_ref(&turn), &[]))],
+            );
+            for prompt in [
+                single.as_str(),
+                batch.as_str(),
+                "My custom prompt: verify already ran.",
+            ] {
+                let told = review_with_verify(prompt, command);
+                assert!(
+                    told.starts_with(&one_line(prompt)),
+                    "custom text stays intact"
+                );
+                assert!(told.ends_with("Verify is not configured; its gate is satisfied. Continue normal review and integration."));
+                assert!(!told.contains('\n'));
+            }
+            assert!(!single.contains("Verify already ran"));
+            assert!(!batch.contains("branches passed verify"));
+        }
+        assert_eq!(
+            review_with_verify("Custom review", "tools/check.sh"),
+            "Custom review"
+        );
+        assert!(
+            with_verdict(turn, GateVerdict::Absorbed).is_none(),
+            "user-accepted work opens no reviewer"
+        );
     }
 
     /// Red within the retries: the output went back to the run, and nobody else is told.

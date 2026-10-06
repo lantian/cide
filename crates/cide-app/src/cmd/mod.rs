@@ -92,3 +92,5 @@ pub mod spec;
 pub mod spec_sessions;
 
 pub mod gitlab;
+
+pub mod peer_chat;

@@ -44,6 +44,7 @@ import {
   session as sessionApi,
   type Geometry,
 } from '@/ipc/client'
+import { notifyFailure } from '@/chrome/notices'
 import type { TerminalHandle } from '@/terminal/xterm'
 import { attachSequencer, historyRequest, hydrationPlan } from './attachModel'
 import { exitMarkerBytes, markFor } from './exitMarker'
@@ -201,6 +202,11 @@ const writeFailures = new Set<string>()
  * shell on Wayland — see `cmd/diag.rs`, which is where that limitation is written down.
  */
 export function reportWriteFailure(paneId: string, error: unknown): void {
+  if (String(error).includes('A peer message is being delivered')) {
+    notifyFailure(error)
+    return
+  }
+
   if (writeFailures.has(paneId)) return
   writeFailures.add(paneId)
   const line = `pane ${paneId}: session write failed — keystrokes are being dropped: ${String(error)}`

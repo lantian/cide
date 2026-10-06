@@ -89,6 +89,7 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         review: false,
         server: None,
         git_dirs: Vec::new(),
+        codex_git_permissions: None,
         sandbox_brief: None,
         codex_trust_root: None,
         codex_path_prepend: None,

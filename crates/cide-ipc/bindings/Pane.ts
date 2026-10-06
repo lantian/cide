@@ -47,6 +47,11 @@ conversation: SessionId | null,
  */
 conversationSince: bigint | null, 
 /**
+ * Codex accepted `/clear` and has not yet reported the replacement thread.
+ * An intentional empty conversation restores fresh, rather than offering recovery.
+ */
+codexCleared?: boolean, 
+/**
  * Native conversation identity for console CLIs whose ids are not UUIDs.
  */
 harnessConversation?: HarnessSession, 

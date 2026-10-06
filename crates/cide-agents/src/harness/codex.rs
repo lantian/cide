@@ -63,18 +63,15 @@
 //! the workspace-write sandbox re-binds `.git` read-only and the brief asks every task run to
 //! commit.
 //!
-//! **A sandboxed run in a worktree can commit, since M118.** A role that names a mode itself —
-//! `auto` above all, which on claude and opencode means "run unattended" — used to land in the
-//! workspace-write sandbox with its git metadata read-only: the checkout's admin directory
-//! (`<repo>/.git/worktrees/<name>`) and the common `.git` are outside the one writable root, and
-//! codex re-binds `.git` read-only on top. Every such run in selfcraft stopped at its first
-//! commit (t-518, t-572, t-574, …), and M114's verify gate handed the dirty branch back to a run
-//! that could not act on it. [`RunPlan::git_dirs`] now rides as `--add-dir` under every policy
-//! [`sandboxes_writes`] names, which keeps the sandbox and makes the commit work (measured on
-//! 0.157.1, step 4 of [`assemble`]). What the sandbox still denies — an X display, audio — is
-//! [`sandbox_caveat`]'s to say.
+//! **Scoped Git writes (M156).** The app probes Codex's effective configuration and supplies
+//! an invocation-local profile granting writes to both [`RunPlan::git_dirs`]. Eligible runs
+//! use that profile plus separate approval settings; `--approve-for-me` and `-s` would select
+//! the legacy sandbox and defeat it. Custom/legacy policies and wrappers keep their existing
+//! launch, including M118's `--add-dir` fallback; their brief says Git writes may need the
+//! supported approval route. The free real-Codex test covers commits, integration and the
+//! `.codex`/`.agents` protections on 0.160.0.
 //!
-//! **Always an explicit pair**, never codex's own default: with neither flag, codex consults
+//! **Always an explicit policy**, never codex's own default: with no policy, codex consults
 //! the directory's trust and may open a "trust this folder?" chooser first — in a fresh
 //! worktree, every time. (Unmeasured in a worktree; measured absent with explicit flags.)
 //!
@@ -289,18 +286,27 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     // Refused before anything is built, so a role naming a mode this harness cannot honour is
     // refused at dispatch with the mode in the sentence.
     let review_permissions = plan.review && plan.codex.cli.inject.review_permissions;
-    let policy = if review_permissions {
+    let policy_owned = if review_permissions {
         // The shorthand also selects a sandbox and conflicts with wrappers that pass -s.
         // Route requests to the automatic reviewer without overriding the wrapper's sandbox.
-        &[
+        [
             "-a",
             "on-request",
             "-c",
             "approvals_reviewer=\"auto_review\"",
-        ][..]
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     } else {
-        permission_policy(plan.agent.permission_mode.as_deref(), plan.unattended)?
+        effective_permission_policy(
+            plan.agent.permission_mode.as_deref(),
+            plan.unattended,
+            &plan.codex.cli,
+        )?
     };
+    let policy_tokens: Vec<&str> = policy_owned.iter().map(String::as_str).collect();
+    let policy = policy_tokens.as_slice();
 
     // The user's launch configuration — Settings → Harness → Codex — filtered as a console's is.
     let cli = codex_cli::plan_here(&plan.codex.cli);
@@ -328,6 +334,11 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     // A wrapper separator belongs after cide's options, otherwise `-C <cwd>` is parsed by the
     // wrapper as a positional argument instead of reaching Codex.
     let mut user_args = cli.args;
+    if review_permissions {
+        user_args = codex_cli::strip_approval_args(&user_args);
+    } else if plan.codex.cli.inject.permissions && plan.agent.permission_mode.is_some() {
+        user_args = codex_cli::strip_permission_args(&user_args);
+    }
     let wrapper_separator = codex_cli::remove_wrapper_separator(&mut user_args);
     args.extend(user_args);
 
@@ -344,15 +355,33 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
     // Unless Settings says a wrapper decides (M108, `CodexInjections::permissions`). The policy
     // is still computed above, so a role naming a mode codex cannot honour is still refused.
     if plan.codex.cli.inject.permissions || review_permissions {
-        args.extend(policy.iter().map(|token| token.to_string()));
-        // The checkout's git metadata, writable beside it (M118). The sandbox's one writable
-        // root is `-C`, and codex re-binds any `.git` in it read-only on top; the linked
-        // worktree's admin directory and the common `.git` are outside it anyway. Without these
-        // a sandboxed task run cannot `git commit`, `merge` or `rebase` — selfcraft's t-572,
-        // `index.lock: Read-only file system`. Measured on 0.157.1: `--approve-for-me --add-dir
-        // <git-dir> --add-dir <common-dir>` commits from a linked worktree, and the same turn
-        // without them does not; `codex resume` takes `--add-dir` too.
-        if sandboxes_writes(policy) {
+        let git_profile = plan
+            .codex
+            .cli
+            .inject
+            .git_permissions
+            .then_some(plan.codex_git_permissions.as_ref())
+            .flatten()
+            .and_then(cide_core::codex_permissions::GitPermissions::profile)
+            .filter(|_| !review_permissions && sandboxes_writes(policy));
+        if let Some(profile) = git_profile {
+            args.extend(profile.args());
+            // The shorthand selects the legacy workspace sandbox too. Express approvals
+            // separately so they cannot silently override the explicit permission profile.
+            if policy == AUTO_REVIEW {
+                args.extend(["-a".into(), "on-request".into()]);
+                codex_cli::push_config(&mut args, "approvals_reviewer", "\"auto_review\"".into());
+            } else {
+                args.extend(policy[2..].iter().map(|token| token.to_string()));
+            }
+        } else {
+            args.extend(policy.iter().map(|token| token.to_string()));
+        }
+        // Preserve M118's writable-root arguments on the legacy fallback. Those arguments
+        // alone do not override Codex's protected Git paths: a previously successful commit
+        // may have used an approved command. The scoped profile above grants the actual
+        // metadata writes; the fallback brief explains the supported approval route.
+        if sandboxes_writes(policy) && git_profile.is_none() {
             for dir in &plan.git_dirs {
                 args.push("--add-dir".into());
                 args.push(dir.to_string_lossy().to_string());
@@ -598,8 +627,60 @@ const AUTO_REVIEW: &[&str] = &["--approve-for-me"];
 /// sandbox — the one where [`RunPlan::git_dirs`] must be added as writable roots for a commit to
 /// work. Not bypass (no sandbox, nothing to add) and not `read-only` (nothing is writable, and
 /// adding the git metadata alone would be a sandbox that can commit but not edit). (M118)
-pub fn sandboxes_writes(policy: &[&str]) -> bool {
-    [ASK_BEYOND_WORKSPACE, NEVER_ASK, AUTO_REVIEW].contains(&policy)
+pub fn sandboxes_writes<S: AsRef<str>>(policy: &[S]) -> bool {
+    policy.iter().any(|arg| arg.as_ref() == "--approve-for-me")
+        || policy.windows(2).any(|pair| {
+            matches!(pair[0].as_ref(), "-s" | "--sandbox") && pair[1].as_ref() == "workspace-write"
+        })
+}
+
+/// The role wins, then explicit arguments, then the saved default, then unattended behavior.
+pub fn effective_permission_policy(
+    mode: Option<&str>,
+    unattended: Unattended,
+    cli: &cide_ipc::CodexCli,
+) -> Result<Vec<String>, HarnessError> {
+    if mode.is_some() || !cli.inject.permissions {
+        return permission_policy(mode, unattended)
+            .map(|args| args.iter().map(|arg| (*arg).into()).collect());
+    }
+    let args = codex_cli::plan_here(cli).args;
+    if codex_cli::has_permission_override(&args) {
+        return Ok(Vec::new());
+    }
+    codex_cli::validate_permissions(cli, &args).map_err(|what| HarnessError::NoEquivalent {
+        harness: cide_ipc::Harness::Codex,
+        what,
+    })?;
+    if cli.permission_mode != cide_ipc::CodexPermissionMode::UseConfig {
+        Ok(codex_cli::default_permission_args(cli, &args, None))
+    } else {
+        permission_policy(None, unattended)
+            .map(|args| args.iter().map(|arg| (*arg).into()).collect())
+    }
+}
+
+/// The same effective mode for the existing sandbox explanations. An external/custom profile
+/// has unknown boundaries, so those explanations must not assume workspace writes.
+pub fn effective_permission_mode<'a>(
+    mode: Option<&'a str>,
+    cli: &cide_ipc::CodexCli,
+) -> Option<&'a str> {
+    if mode.is_some() || !cli.inject.permissions {
+        return mode;
+    }
+    use cide_ipc::CodexPermissionMode as Mode;
+    if codex_cli::has_permission_override(&codex_cli::plan_here(cli).args) {
+        return Some("custom");
+    }
+    match cli.permission_mode {
+        Mode::UseConfig => None,
+        Mode::AskForApproval => Some("default"),
+        Mode::ApproveForMe => Some("auto"),
+        Mode::FullAccess => Some("bypassPermissions"),
+        Mode::ReadOnly => Some("plan"),
+        Mode::CustomProfile => Some("custom"),
+    }
 }
 
 /// Codex's sandbox and approval flags for a definition's claude-vocabulary permission mode, or
@@ -682,15 +763,15 @@ pub fn sandbox_caveat(
         (true, true) if grant.needs(crate::sandbox::SandboxNeed::Gpu) => {
             "codex runs it in its workspace-write sandbox with the network on for the role's \
              `needs:` and the machine's GPU bound in for `needs: [gpu]`, so an Xvfb of its own, \
-             audio and Vulkan on the real GPU work there; it can edit and commit in its worktree"
+             audio and Vulkan on the real GPU work there; it can edit in its worktree; Git writes depend on the launch permissions"
         }
         (true, true) => {
             "codex runs it in its workspace-write sandbox with the network on for the role's \
              `needs:`, so an Xvfb of its own and audio work there, but Vulkan and GL run on \
-             llvmpipe without `needs: [gpu]`; it can edit and commit in its worktree"
+             llvmpipe without `needs: [gpu]`; it can edit in its worktree; Git writes depend on the launch permissions"
         }
         (true, false) => {
-            "codex runs it in its workspace-write sandbox: it can edit and commit in its worktree, \
+            "codex runs it in its workspace-write sandbox: it can edit in its worktree; Git writes depend on the launch permissions, \
              but the sandbox refuses unix sockets while the network is off, so it has no X display \
              and no audio and an Xvfb e2e run or a Blender render fails there, and it has no GPU; \
              a role that needs them says `needs: [display, audio, gpu]`, or lets the one command \
@@ -738,7 +819,7 @@ pub fn sandbox_brief(
             if worktree && !git_dirs_known {
                 lines.push(
                     "Your sandbox cannot write this worktree's git metadata, so `git commit` will \
-                     fail: do not retry it — say in your comment that the work is uncommitted."
+                     fail unless the current permissions allow an approved operation. Use the supported approval route when available; otherwise report the uncommitted work."
                         .into(),
                 );
             }
@@ -878,6 +959,73 @@ mod tests {
 
     const THREAD: &str = "0199a8f2-6d1e-7c3a-9b2e-4f5d6a7b8c9d";
 
+    #[test]
+    fn saved_default_applies_to_fresh_and_resumed_workers_with_git_grants() {
+        use cide_core::codex_permissions::{GitPermissions, GitProfile};
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.unattended = Unattended::Bypass;
+        plan.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::ApproveForMe;
+        let profile = GitProfile::new(&plan.git_dirs, &[], false);
+        plan.codex_git_permissions = Some(GitPermissions::Applied(profile.clone()));
+        for spawned in [
+            CodexHarness.spawn_spec(&plan).unwrap(),
+            CodexHarness.respawn_spec(&plan, THREAD).unwrap(),
+        ] {
+            let args = spawned.spec.args;
+            assert_eq!(config_value(&args, "approvals_reviewer"), "\"auto_review\"");
+            assert!(args.contains(&profile.config));
+            assert!(!args.iter().any(|arg| matches!(
+                arg.as_str(),
+                "-s" | "--approve-for-me" | "--dangerously-bypass-approvals-and-sandbox"
+            )));
+        }
+        plan.codex.cli.inject.permissions = false;
+        let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+        assert!(!has_config(&args, "approvals_reviewer"));
+        assert!(!args.contains(&profile.config));
+    }
+
+    #[test]
+    fn explicit_worker_arguments_and_role_policies_precede_the_default() {
+        let mut agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::ApproveForMe;
+        plan.codex.cli.args = vec!["-s".into(), "read-only".into(), "-a".into(), "never".into()];
+        let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
+        assert!(!has_config(&args, "approvals_reviewer"));
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
+
+        agent.permission_mode = Some("plan".into());
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::FullAccess;
+        plan.codex.cli.args = vec![
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "--search".into(),
+        ];
+        let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
+        assert!(args.contains(&"--search".into()));
+    }
+
+    #[test]
+    fn custom_worker_profile_is_selected_without_git_or_legacy_sandbox_overrides() {
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::CustomProfile;
+        assert!(CodexHarness.spawn_spec(&plan).is_err());
+        plan.codex.cli.permission_profile = "team".into();
+        let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+        assert_eq!(config_value(&args, "default_permissions"), "\"team\"");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-s" | "-a" | "--add-dir"))
+        );
+    }
+
     fn role() -> LoadedAgent {
         LoadedAgent {
             def: AgentDef {
@@ -936,6 +1084,7 @@ mod tests {
             review: false,
             server: None,
             git_dirs: Vec::new(),
+            codex_git_permissions: None,
             sandbox_brief: None,
             codex_trust_root: None,
             codex_path_prepend: None,
@@ -1190,11 +1339,74 @@ mod tests {
         }
     }
 
-    /// A sandboxed run in a worktree is given its git metadata as writable roots, and only a
-    /// sandboxed one: bypass has no sandbox to widen, `plan` must stay read-only, and a wrapper
-    /// that decides the sandbox is given nothing of cide's. (M118, selfcraft t-572)
+    /// A scoped profile must preserve the role's approval mapping while replacing the legacy
+    /// flags that would override it. Reviews, read-only modes and opt-outs get no profile.
     #[test]
-    fn a_worktree_run_can_write_its_git_metadata() {
+    fn a_scoped_profile_preserves_approvals_without_legacy_sandbox_flags() {
+        use cide_core::codex_permissions::{GitPermissions, GitProfile};
+        let profile = GitProfile::new(
+            &["/repo/.git".into(), "/repo/.git/worktrees/worker".into()],
+            &["/cache".into()],
+            true,
+        );
+        for mode in [
+            "auto",
+            "default",
+            "acceptEdits",
+            "dontAsk",
+            "plan",
+            "bypassPermissions",
+        ] {
+            let mut agent = role();
+            agent.permission_mode = Some(mode.into());
+            let mut plan = plan_for(&agent, SessionId::new());
+            plan.codex_git_permissions = Some(GitPermissions::Applied(profile.clone()));
+            let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+            if matches!(mode, "plan" | "bypassPermissions") {
+                assert!(!args.iter().any(|a| a.starts_with("default_permissions=")));
+                continue;
+            }
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "-s" || a == "--approve-for-me" || a == "--add-dir")
+            );
+            assert_eq!(config_value(&args, "default_permissions"), "\"cide-git\"");
+            assert_eq!(
+                config_value(&args, "permissions.cide-git"),
+                profile.config.split_once('=').unwrap().1
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.starts_with("sandbox_workspace_write."))
+            );
+            assert!(args.windows(2).any(|w| w
+                == [
+                    "-a",
+                    if mode == "dontAsk" {
+                        "never"
+                    } else {
+                        "on-request"
+                    }
+                ]));
+            if mode == "auto" {
+                assert_eq!(config_value(&args, "approvals_reviewer"), "\"auto_review\"");
+            }
+            plan.codex.cli.inject.git_permissions = false;
+            let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+            assert!(!args.iter().any(|a| a.starts_with("default_permissions=")));
+            plan.codex.cli.inject.git_permissions = true;
+            plan.codex.cli.inject.permissions = false;
+            let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+            assert!(!args.iter().any(|a| a.starts_with("default_permissions=")));
+        }
+    }
+
+    /// Preserve the legacy launch on skipped/disabled profiles. This checks argv, not whether
+    /// Codex permits a Git write; the real sandbox regression checks enforcement.
+    #[test]
+    fn a_legacy_worktree_launch_keeps_its_metadata_arguments() {
         let dirs = [
             std::path::PathBuf::from("/work/game/.git/worktrees/qa-t-572"),
             std::path::PathBuf::from("/work/game/.git"),

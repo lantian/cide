@@ -97,6 +97,8 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   // Harness › Launch (ClaudeCliSection / CodexCliSection — one is drawn at a time, per consoleHarness)
   { section: 'claudeSessions', tab: 'launch', label: 'Program', keywords: 'binary claude codex path executable wrapper mise asdf shim cli' },
   { section: 'claudeSessions', tab: 'launch', label: 'Resolves to', keywords: 'binary path version which resolved' },
+  { section: 'claudeSessions', tab: 'launch', label: 'Default permissions', keywords: 'codex permission permissions approve for me approval sandbox full access read only default' },
+  { section: 'claudeSessions', tab: 'launch', label: 'Permission profile', keywords: 'codex custom named permissions profile config' },
   // Harness › Proxy (ProxySection)
   { section: 'claudeSessions', tab: 'proxy', label: 'Mode', keywords: 'proxy inherit manual direct no proxy network' },
   { section: 'claudeSessions', tab: 'proxy', label: 'HTTP proxy', keywords: 'HTTP_PROXY http_proxy address url network' },

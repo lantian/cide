@@ -908,11 +908,12 @@ pub struct RunPlan<'a> {
     /// project root, and for a worktree whose repository could not be opened. (M118)
     ///
     /// Taken as paths for [`Self::cwd`]'s reason: nothing in this crate links git. Read by the
-    /// codex harness only, whose `workspace-write` sandbox has one writable root — the checkout
-    /// — and re-binds `.git` read-only on top, so without these a sandboxed codex run cannot
-    /// `git commit`, `merge` or `rebase`. claude and opencode have no filesystem sandbox of
-    /// their own and ignore it.
+    /// codex harness only, for its scoped permission profile or legacy `--add-dir` fallback.
+    /// Default workspace permissions protect `.git`; an approved operation may still grant
+    /// access when no profile applies. Claude and opencode ignore this field.
     pub git_dirs: Vec<PathBuf>,
+    /// The app's bounded Codex policy preflight; the pure harness never forks a probe.
+    pub codex_git_permissions: Option<cide_core::codex_permissions::GitPermissions>,
     /// What this run's sandbox denies it and which commands it may run past it, in words for
     /// the run itself — appended to its brief. (M119)
     ///
@@ -1481,6 +1482,7 @@ mod tests {
                     review: false,
                     server: None,
                     git_dirs: Vec::new(),
+                    codex_git_permissions: None,
                     sandbox_brief: None,
                     codex_trust_root: None,
                     codex_path_prepend: None,
@@ -1880,6 +1882,7 @@ mod tests {
                 review: false,
                 server: None,
                 git_dirs: Vec::new(),
+                codex_git_permissions: None,
                 sandbox_brief: None,
                 codex_trust_root: None,
                 codex_path_prepend: None,

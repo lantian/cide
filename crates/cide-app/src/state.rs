@@ -30,8 +30,14 @@ pub struct SessionRegistry {
     /// Which CLI each **console** session runs. (M93) See [`Self::harness_of`].
     harnesses: DashMap<SessionId, cide_ipc::Harness>,
     /// Latest hook identity, retained even when its pane has not bound yet.
-    conversations: DashMap<SessionId, (SessionId, u64)>,
+    conversations: DashMap<SessionId, Conversation>,
     native_conversations: DashMap<SessionId, cide_ipc::HarnessSession>,
+}
+
+#[derive(Clone, Copy)]
+enum Conversation {
+    Known(SessionId, u64),
+    CodexCleared,
 }
 
 /// Who minted a write sequence number.
@@ -170,18 +176,33 @@ impl SessionRegistry {
     }
 
     pub fn note_conversation(&self, id: SessionId, conversation: SessionId, since: u64) {
-        self.conversations.insert(id, (conversation, since));
+        self.conversations
+            .insert(id, Conversation::Known(conversation, since));
+    }
+
+    pub fn note_codex_clear(&self, id: SessionId) {
+        self.conversations.insert(id, Conversation::CodexCleared);
+        self.native_conversations.remove(&id);
+    }
+
+    pub fn codex_cleared(&self, id: SessionId) -> bool {
+        self.conversations
+            .get(&id)
+            .is_some_and(|c| matches!(*c, Conversation::CodexCleared))
     }
 
     /// A resume already knows its thread; never overwrite a newer startup hook.
     pub fn seed_conversation(&self, id: SessionId, conversation: SessionId, since: u64) {
         self.conversations
             .entry(id)
-            .or_insert((conversation, since));
+            .or_insert(Conversation::Known(conversation, since));
     }
 
     pub fn conversation_of(&self, id: SessionId) -> Option<(SessionId, u64)> {
-        self.conversations.get(&id).map(|c| *c)
+        self.conversations.get(&id).and_then(|c| match *c {
+            Conversation::Known(id, since) => Some((id, since)),
+            Conversation::CodexCleared => None,
+        })
     }
 
     pub fn note_native_conversation(&self, id: SessionId, conversation: cide_ipc::HarnessSession) {

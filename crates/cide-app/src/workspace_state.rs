@@ -29,6 +29,27 @@ use tauri::{AppHandle, Manager};
 /// already have, one file over.
 const POLL: Duration = Duration::from_millis(250);
 
+/// Projects where a session lost its last view. Moving a pane, detaching it, or closing one
+/// of several mirrors preserves the session; only the last removal can release a retired run.
+fn projects_losing_session_views(
+    before: &Workspace,
+    after: &Workspace,
+) -> Vec<cide_ipc::ProjectId> {
+    let remaining: std::collections::HashSet<_> = workspace::session_panes(after, None)
+        .into_iter()
+        .map(|found| (found.project, found.session))
+        .collect();
+    let projects: std::collections::BTreeSet<_> = workspace::session_panes(before, None)
+        .into_iter()
+        .filter(|found| {
+            after.projects.contains_key(&found.project)
+                && !remaining.contains(&(found.project, found.session))
+        })
+        .map(|found| found.project)
+        .collect();
+    projects.into_iter().collect()
+}
+
 pub struct WorkspaceState {
     inner: Mutex<Workspace>,
     path: PathBuf,
@@ -94,6 +115,14 @@ impl WorkspaceState {
         ) {
             Ok(projects) => workspace.project_harness = projects,
             Err(error) => tracing::warn!(%error, "could not load project harness settings"),
+        }
+        for project in workspace.projects.values_mut() {
+            for tab in &mut project.tabs {
+                if let Some(chat) = &mut tab.peer_chat {
+                    chat.paused = true;
+                    chat.starting = false;
+                }
+            }
         }
         publish_binaries(&workspace.settings);
 
@@ -300,6 +329,12 @@ impl WorkspaceState {
         let snapshot = guard.clone();
         drop(guard);
         if let Some(app) = self.app.get() {
+            if let Some(registry) = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>()
+            {
+                for project in projects_losing_session_views(&content_before, &snapshot) {
+                    registry.mark_changed(app, project);
+                }
+            }
             crate::emit::workspace_changed(app, &snapshot);
             // The OS window title is a **level over this tree**, so the one place that knows
             // the tree just moved is the one place that can hold it true. A title now names
@@ -387,6 +422,63 @@ impl WorkspaceState {
 mod tests {
     use super::*;
     use cide_ipc::Theme;
+
+    #[test]
+    fn closing_the_last_view_marks_its_project_but_mirrors_and_detaches_do_not() {
+        use cide_ipc::{Axis, PaneId, PaneRole, SessionId, Side};
+        let mut ws = state().with(Clone::clone);
+        let project = *ws.projects.keys().next().unwrap();
+        let tab = ws.projects[&project].active_tab;
+        let tree = &mut ws.projects.get_mut(&project).unwrap().tabs[0].tree;
+        let first = tree.focused;
+        let mut mirror = tree.panes[&first].clone();
+        mirror.id = PaneId::new();
+        mirror.role = PaneRole::Auxiliary;
+        mirror.session = Some(SessionId::new());
+        let session = mirror.session;
+        let mirrored =
+            cide_core::layout::split(tree, first, Axis::Row, Side::After, mirror.clone()).unwrap();
+        mirror.id = PaneId::new();
+        let detached =
+            cide_core::layout::split(tree, mirrored, Axis::Row, Side::After, mirror).unwrap();
+        let before = ws.clone();
+        let window = workspace::detach_pane(&mut ws, project, tab, detached).unwrap();
+        assert!(projects_losing_session_views(&before, &ws).is_empty());
+        let before = ws.clone();
+        workspace::close_pane(&mut ws, project, tab, mirrored, false).unwrap();
+        assert!(projects_losing_session_views(&before, &ws).is_empty());
+        assert_eq!(ws.projects[&project].detached[&detached].session, session);
+        let before = ws.clone();
+        workspace::redock_pane(&mut ws, &window).unwrap();
+        assert!(projects_losing_session_views(&before, &ws).is_empty());
+        let before = ws.clone();
+        workspace::close_pane(&mut ws, project, tab, detached, false).unwrap();
+        assert_eq!(projects_losing_session_views(&before, &ws), vec![project]);
+        workspace::validate(&ws).unwrap();
+    }
+
+    #[test]
+    fn replacing_a_session_reconsiders_the_old_run_but_closing_a_project_does_not() {
+        let mut ws = state().with(Clone::clone);
+        let project = *ws.projects.keys().next().unwrap();
+        let tab = ws.projects[&project].active_tab;
+        let pane = ws.projects[&project].tabs[0].tree.focused;
+        let before = ws.clone();
+        workspace::bind_session(
+            &mut ws,
+            project,
+            tab,
+            pane,
+            cide_ipc::SessionId::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(projects_losing_session_views(&before, &ws), vec![project]);
+        assert!(projects_losing_session_views(&ws, &ws).is_empty());
+        let before = ws.clone();
+        workspace::close_project(&mut ws, project, true).unwrap();
+        assert!(projects_losing_session_views(&before, &ws).is_empty());
+    }
 
     /// A state with no `AppHandle` attached, so `update` skips the emit/retitle tail —
     /// which is exactly what lets the rev discipline be tested without a Tauri app.

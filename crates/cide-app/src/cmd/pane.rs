@@ -121,6 +121,7 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // frame rather than copying a value that may be a turn out of date.
         conversation: None,
         conversation_since: None,
+        codex_cleared: false,
         harness_conversation: None,
         // What the pane keeps for later — see `Pane::continues`. A mirror of a run carries
         // the run's conversation so the pane can re-open it once the child ends; a
@@ -188,12 +189,34 @@ pub fn pane_split(
 ) -> Result<SplitOutcome, CoreError> {
     state.update(|ws| {
         let name = workspace::project(ws, project)?.name.clone();
-        let t = workspace::tab_mut(ws, project, tab)?;
-        let intent = intent.unwrap_or_else(|| default_intent(&t.kind, axis));
+        cide_core::peer_chat::require_unpaired(ws, project, tab)?;
+        let intent = intent.unwrap_or_else(|| {
+            default_intent(&workspace::tab(ws, project, tab).unwrap().kind, axis)
+        });
+        require_unpaired_source(ws, &intent)?;
         let fresh = pane_for(&intent, &name);
+        let t = workspace::tab_mut(ws, project, tab)?;
         let pane = apply_split(&mut t.tree, pane, axis, side, fresh)?;
         Ok(SplitOutcome { pane, intent })
     })
+}
+
+fn require_unpaired_source(
+    ws: &cide_ipc::Workspace,
+    intent: &SplitIntent,
+) -> Result<(), CoreError> {
+    let session = match intent {
+        SplitIntent::Mirror { session, .. }
+        | SplitIntent::Resume { session }
+        | SplitIntent::Adopt { session, .. } => Some(*session),
+        _ => None,
+    };
+    if session.is_some_and(|id| cide_core::peer_chat::for_session(ws, id).is_some()) {
+        return Err(CoreError::Invariant(
+            "A two-agent chat session cannot be mirrored outside its pair".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A new closable tab whose one pane shows a run — the MR review's tab. (M85)
@@ -227,6 +250,7 @@ pub fn tab_new_run(
     }
     state.update(|ws| {
         let name = workspace::project(ws, project)?.name.clone();
+        require_unpaired_source(ws, &intent)?;
         let fresh = pane_for(&intent, &name);
         let pane = fresh.id;
         workspace::open_tab(
@@ -260,9 +284,13 @@ pub fn pane_add_row(
 ) -> Result<SplitOutcome, CoreError> {
     state.update(|ws| {
         let name = workspace::project(ws, project)?.name.clone();
-        let t = workspace::tab_mut(ws, project, tab)?;
-        let intent = intent.unwrap_or_else(|| default_intent(&t.kind, Axis::Col));
+        cide_core::peer_chat::require_unpaired(ws, project, tab)?;
+        let intent = intent.unwrap_or_else(|| {
+            default_intent(&workspace::tab(ws, project, tab).unwrap().kind, Axis::Col)
+        });
+        require_unpaired_source(ws, &intent)?;
         let fresh = pane_for(&intent, &name);
+        let t = workspace::tab_mut(ws, project, tab)?;
         let pane = layout::add_row(&mut t.tree, after, side, fresh)?;
         Ok(SplitOutcome { pane, intent })
     })
@@ -317,6 +345,7 @@ pub fn pane_maximize(
 ) -> Result<Mutated, CoreError> {
     state
         .update_cosmetic(|ws| {
+            cide_core::peer_chat::require_unpaired(ws, project, tab)?;
             let t = workspace::tab_mut(ws, project, tab)?;
             layout::maximize(&mut t.tree, pane)
         })
@@ -409,6 +438,7 @@ pub fn pane_move(
 ) -> Result<Mutated, CoreError> {
     state
         .update(|ws| {
+            cide_core::peer_chat::require_unpaired(ws, project, tab)?;
             let t = workspace::tab_mut(ws, project, tab)?;
             layout::move_pane(&mut t.tree, pane, target, axis, side)
         })
@@ -425,6 +455,7 @@ pub fn pane_swap(
 ) -> Result<Mutated, CoreError> {
     state
         .update(|ws| {
+            cide_core::peer_chat::require_unpaired(ws, project, tab)?;
             let t = workspace::tab_mut(ws, project, tab)?;
             layout::swap(&mut t.tree, a, b)
         })
@@ -498,6 +529,9 @@ pub(crate) fn bind_recorded_session(
     if let Some((conversation, since)) = registry.conversation_of(session) {
         workspace::note_conversation(ws, session, conversation, since);
     }
+    if registry.codex_cleared(session) {
+        workspace::note_codex_clear(ws, session);
+    }
     Ok(())
 }
 
@@ -506,6 +540,33 @@ mod tests {
     use super::*;
     use cide_core::layout::{MIN_TILE, add_row, add_tile, leaves, new_tree, validate};
     use cide_ipc::{LayoutNode, PaneTree};
+
+    #[test]
+    fn a_clear_before_binding_invalidates_a_resume_seed() {
+        let mut ws = cide_ipc::Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec!["/tmp/codex-clear-binding".into()], None)
+                .unwrap();
+        let tab = ws.projects[&project].tabs[0].id;
+        let pane = ws.projects[&project].tabs[0].tree.focused;
+        let registry = crate::state::SessionRegistry::default();
+        let session = SessionId::new();
+        let old = SessionId::new();
+        registry.note_harness(session, cide_ipc::Harness::Codex);
+        registry.seed_conversation(session, old, 1);
+        registry.note_codex_clear(session);
+        registry.seed_conversation(session, old, 2);
+        bind_recorded_session(&mut ws, &registry, project, tab, pane, session).unwrap();
+        let held = &ws.projects[&project].tabs[0].tree.panes[&pane];
+        assert!(held.codex_cleared);
+        assert_eq!(workspace::pane_codex_thread(held), None);
+        let new = SessionId::new();
+        registry.note_conversation(session, new, 3);
+        bind_recorded_session(&mut ws, &registry, project, tab, pane, session).unwrap();
+        let held = &ws.projects[&project].tabs[0].tree.panes[&pane];
+        assert!(!held.codex_cleared);
+        assert_eq!(workspace::pane_codex_thread(held), Some(new));
+    }
 
     #[test]
     fn a_startup_thread_is_replayed_after_binding_and_survives_a_restart() {
@@ -650,6 +711,7 @@ mod tests {
             session: None,
             conversation: None,
             conversation_since: None,
+            codex_cleared: false,
             harness_conversation: None,
             continues: None,
             harness: None,

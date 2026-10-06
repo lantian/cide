@@ -64,6 +64,53 @@ pub struct HookServer {
     /// id. Deduped here rather than against `workspace.json` because every frame of a busy
     /// turn repeats it, and each write there bumps `rev` and schedules a disk write.
     conversations: Arc<DashMap<SessionId, SessionId>>,
+    codex_consoles: CodexConsoles,
+}
+
+#[derive(Default)]
+struct CodexConsole {
+    clear: cide_pty::codex_clear::ClearObserver,
+    active: Option<SessionId>,
+    invalidated: std::collections::HashSet<SessionId>,
+}
+
+type CodexConsoles = Arc<DashMap<SessionId, Arc<parking_lot::Mutex<CodexConsole>>>>;
+
+impl CodexConsole {
+    fn invalidate(&mut self, fallback: Option<SessionId>) {
+        self.invalidated.extend(self.active.take());
+        self.invalidated.extend(fallback);
+    }
+
+    fn accepts(&mut self, frame: &HookFrame) -> bool {
+        // Teardown can report every thread this process visited, including cleared ones.
+        // It is never evidence that the user switched back to one of those conversations.
+        if frame.kind() == Some(HookEvent::SessionEnd) {
+            return false;
+        }
+        let cli = frame
+            .session_id()
+            .and_then(|id| id.parse::<SessionId>().ok());
+        if frame.kind() == Some(HookEvent::SessionStart)
+            && frame.payload.get("source").and_then(|s| s.as_str()) == Some("resume")
+            && let Some(cli) = cli
+        {
+            self.invalidated.remove(&cli);
+        }
+        if cli.is_some_and(|id| self.invalidated.contains(&id)) {
+            return false;
+        }
+        if cli.is_some() && frame.spawned_as.is_some() {
+            self.active = cli;
+        }
+        if matches!(
+            frame.kind(),
+            Some(HookEvent::SessionStart | HookEvent::UserPromptSubmit)
+        ) {
+            self.clear.forget_input();
+        }
+        true
+    }
 }
 
 /// How long a `Busy` session must have sent nothing before [`sweep`] asks the CLI about it.
@@ -86,6 +133,9 @@ const SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// just replaced would end a turn that has only begun.
 enum Inbound {
     Frame(HookFrame),
+    CodexClear {
+        session: SessionId,
+    },
     /// "This session looked stuck at `seen`, and the CLI says it is idle." Re-checked on the
     /// applier thread against `seen` before anything is done, for the race above.
     Stale {
@@ -122,6 +172,8 @@ impl HookServer {
         let apply_states = Arc::clone(&states);
         let conversations: Arc<DashMap<SessionId, SessionId>> = Arc::new(DashMap::new());
         let apply_conversations = Arc::clone(&conversations);
+        let codex_consoles: CodexConsoles = Arc::new(DashMap::new());
+        let apply_codex = Arc::clone(&codex_consoles);
         // When each session's last frame was applied. Written by the applier only, read by the
         // sweeper — which is why it is an `Instant` per session and not a guess from state.
         let last_frame: Arc<DashMap<SessionId, Instant>> = Arc::new(DashMap::new());
@@ -146,9 +198,35 @@ impl HookServer {
                             if let Some(session) =
                                 frame.owner().and_then(|raw| raw.parse::<SessionId>().ok())
                             {
+                                if let Some(console) = apply_codex.get(&session)
+                                    && !console.lock().accepts(&frame)
+                                {
+                                    continue;
+                                }
                                 apply_last.insert(session, Instant::now());
                             }
                             apply(&frame, &app, &apply_states, &apply_conversations);
+                        }
+                        Inbound::CodexClear { session } => {
+                            let Some(console) = apply_codex.get(&session) else { continue };
+                            let fallback = app.try_state::<crate::state::SessionRegistry>()
+                                .and_then(|registry| registry.conversation_of(session).map(|c| c.0));
+                            console.lock().invalidate(fallback);
+                            drop(console);
+                            apply_conversations.remove(&session);
+                            apply_states.insert(session, SessionState::Idle);
+                            if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
+                                registry.note_codex_clear(session);
+                            }
+                            if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
+                                let _ = state.update(|ws| {
+                                    cide_core::workspace::note_codex_clear(ws, session);
+                                    Ok(())
+                                });
+                            }
+                            tracing::info!(%session, "codex: cleared conversation; next launch starts empty");
+                            crate::emit::session_state(&app, &session.to_string(), SessionState::Idle);
+                            crate::emit::session_status(&app, &session.to_string(), serde_json::json!({ "harness": "codex" }));
                         }
                         Inbound::Stale {
                             session,
@@ -233,6 +311,7 @@ impl HookServer {
             frames: submit,
             states,
             conversations,
+            codex_consoles,
         })
     }
 
@@ -245,6 +324,27 @@ impl HookServer {
     /// notifications. Queue it beside real hooks, never apply state on the PTY thread.
     pub fn codex_approval_observer(&self, session: SessionId) -> cide_pty::OutputObserver {
         codex_approval_observer(session, self.frames.clone())
+    }
+
+    pub fn codex_observer(
+        &self,
+        session: SessionId,
+        thread: Option<SessionId>,
+        approvals: bool,
+    ) -> cide_pty::OutputObserver {
+        let console = Arc::new(parking_lot::Mutex::new(CodexConsole {
+            active: thread,
+            ..Default::default()
+        }));
+        self.codex_consoles.insert(session, Arc::clone(&console));
+        codex_observer(session, self.frames.clone(), console, approvals)
+    }
+
+    pub fn note_codex_input(&self, session: SessionId, data: &[u8], pty: &cide_pty::PtySession) {
+        if let Some(console) = self.codex_consoles.get(&session) {
+            let visible = cide_pty::codex_clear::composer(&pty.capture_screen());
+            console.lock().clear.input(data, visible.as_deref());
+        }
     }
 
     /// State reported by a console adapter that has no Claude-shaped hooks.
@@ -285,7 +385,25 @@ impl HookServer {
         // Or a pane reusing this id after a restart would inherit the last run's
         // conversation and never record its own.
         self.conversations.remove(&session);
+        self.codex_consoles.remove(&session);
     }
+}
+
+fn codex_observer(
+    session: SessionId,
+    frames: std::sync::mpsc::Sender<Inbound>,
+    console: Arc<parking_lot::Mutex<CodexConsole>>,
+    approvals: bool,
+) -> cide_pty::OutputObserver {
+    let approval = codex_approval_observer(session, frames.clone());
+    cide_pty::OutputObserver::new(move |bytes| {
+        if console.lock().clear.output(bytes) {
+            let _ = frames.send(Inbound::CodexClear { session });
+        }
+        if approvals {
+            approval.process(bytes);
+        }
+    })
 }
 
 fn codex_approval_observer(
@@ -699,6 +817,65 @@ fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_clear_rejects_late_old_hooks_and_accepts_the_replacement_thread() {
+        let session = SessionId::new();
+        let old = SessionId::new();
+        let new = SessionId::new();
+        let mut console = CodexConsole {
+            active: Some(old),
+            ..Default::default()
+        };
+        let states = DashMap::new();
+        let conversations = DashMap::new();
+        let mut start = frame("SessionStart", &old.to_string());
+        start.spawned_as = Some(session.to_string());
+        assert!(console.accepts(&start));
+        super::decide(&start, &states, &conversations);
+        console.invalidate(None);
+        conversations.remove(&session);
+        for event in ["SessionEnd", "Stop", "PostToolUse", "SessionStart"] {
+            let mut late = frame(event, &old.to_string());
+            late.spawned_as = Some(session.to_string());
+            assert!(!console.accepts(&late), "{event} from the cleared thread");
+        }
+        assert!(!console.accepts(&frame("SessionEnd", &new.to_string())));
+        start.payload["session_id"] = serde_json::json!(new.to_string());
+        start.payload["source"] = serde_json::json!("clear");
+        assert!(console.accepts(&start));
+        assert!(super::decide(&start, &states, &conversations).iter().any(
+            |e| matches!(e, Effect::Conversation { conversation, .. } if *conversation == new)
+        ));
+        console.invalidate(None);
+        assert!(
+            !console.accepts(&start),
+            "a second clear retires the replacement too"
+        );
+        start.payload["session_id"] = serde_json::json!(old.to_string());
+        start.payload["source"] = serde_json::json!("resume");
+        assert!(
+            console.accepts(&start),
+            "an explicit resume can revisit history"
+        );
+    }
+
+    #[test]
+    fn codex_live_observer_queues_only_confirmed_resets() {
+        let session = SessionId::new();
+        let console = Arc::new(parking_lot::Mutex::new(CodexConsole::default()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = codex_observer(session, tx, Arc::clone(&console), false);
+        observer.process(b"\x1b[2J\x1b[3J");
+        assert!(rx.try_recv().is_err());
+        console.lock().clear.input(b"/clear\r", Some(""));
+        observer.process(b"\x1b[2");
+        assert!(rx.try_recv().is_err());
+        observer.process(b"J\x1b[3J");
+        assert!(matches!(rx.try_recv(), Ok(Inbound::CodexClear { session: id }) if id == session));
+        observer.process(b"\x1b[2J\x1b]9;Approval requested\x07");
+        assert!(rx.try_recv().is_err(), "approval detection remains opt-in");
+    }
     use serde_json::json;
 
     type States = DashMap<SessionId, SessionState>;
@@ -1309,7 +1486,9 @@ mod tests {
             .into_iter()
             .map(|inbound| match inbound {
                 Inbound::Frame(f) => f.event,
-                Inbound::Stale { .. } => panic!("a connection only ever carries frames"),
+                Inbound::Stale { .. } | Inbound::CodexClear { .. } => {
+                    panic!("a connection only ever carries frames")
+                }
             })
             .collect();
         assert_eq!(
@@ -1376,7 +1555,9 @@ mod tests {
                         assert_eq!(seen, long_ago, "the instant the applier re-checks");
                         (session, conversation)
                     }
-                    Inbound::Frame(_) => panic!("the sweep never makes frames"),
+                    Inbound::Frame(_) | Inbound::CodexClear { .. } => {
+                        panic!("the sweep only makes stale verdicts")
+                    }
                 })
                 .collect();
         released.sort_by_key(|(s, _)| s.to_string());

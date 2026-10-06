@@ -80,7 +80,7 @@ pub use harness_settings::{
 
 pub use settings::{
     Accent, AwaitingHighlight, ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections,
-    ClaudeSettings, CodexCli, CodexInjections, CodexSettings, ConsoleHarness,
+    ClaudeSettings, CodexCli, CodexInjections, CodexPermissionMode, CodexSettings, ConsoleHarness,
     DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
     GraphicsSettings, HighlightLevel, InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS,
     MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, OpenRunIn,
@@ -1153,3 +1153,6 @@ mod file_stamp_tests {
         );
     }
 }
+
+pub mod peer_chat;
+pub use peer_chat::{PeerChat, PeerChatReceipt, PeerChatSelection};
