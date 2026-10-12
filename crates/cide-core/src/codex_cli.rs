@@ -787,6 +787,11 @@ pub fn mcp_overrides(hook_bin: &str, env: &[(&str, String)]) -> Vec<String> {
         &format!("mcp_servers.{SERVER}.args"),
         r#"["mcp"]"#.to_string(),
     );
+    push_config(
+        &mut args,
+        &format!("mcp_servers.{SERVER}.tool_timeout_sec"),
+        "604800".to_owned(),
+    );
     for (name, value) in env {
         push_config(
             &mut args,
@@ -1358,6 +1363,8 @@ mod tests {
                 r#"mcp_servers.cide.command="/opt/cide/cide-hook""#,
                 "-c",
                 r#"mcp_servers.cide.args=["mcp"]"#,
+                "-c",
+                "mcp_servers.cide.tool_timeout_sec=604800",
                 "-c",
                 r#"mcp_servers.cide.env.CIDE_SESSION="abc""#,
             ]

@@ -287,7 +287,7 @@ pub(crate) fn counts_for(
             runs: 0,
             panes: 0,
             tabs: Vec::new(),
-            waiting: waiting_in(tasks),
+            waiting: crate::user_requests::waiting_count(app, project, tasks) as u32,
         };
     };
 
@@ -374,26 +374,13 @@ pub(crate) fn counts_for(
         runs: runs as u32,
         panes: panes as u32,
         tabs,
-        waiting: waiting_in(tasks),
+        waiting: crate::user_requests::waiting_count(app, project, tasks) as u32,
     }
 }
 
-/// Tasks waiting for the user (M132) — the Agents panel's *Waiting* list, one rule for the
-/// project tab's badge and the OS title: an open question, or a user-accepted task in review.
-pub(crate) fn waiting_in(tasks: &[TaskRow]) -> u32 {
-    tasks
-        .iter()
-        .filter(|row| {
-            row.question.is_some()
-                || (row.acceptance == Some(cide_ipc::Acceptance::User)
-                    && row.status == cide_ipc::TaskStatus::Review)
-        })
-        .count() as u32
-}
-
-/// [`waiting_in`] over a project's board, or `0` when its tracker has never been opened.
+/// Decisions still owed by the user, including standalone questions and tasks in review.
 pub(crate) fn waiting_for(app: &AppHandle, project: ProjectId) -> usize {
-    waiting_in(rows_of(&board_of(app, project))) as usize
+    crate::user_requests::waiting_count(app, project, rows_of(&board_of(app, project)))
 }
 
 /// Whether a console pane should turn its **tab's** spinner: [`pane_is_busy`]'s `Working`

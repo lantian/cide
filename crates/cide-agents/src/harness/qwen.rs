@@ -547,6 +547,7 @@ fn mcp_config(hook_bin: &str) -> Option<String> {
             SERVER: {
                 "command": hook_bin,
                 "args": ["mcp"],
+                "timeout": 604800000,
             }
         }
     }))

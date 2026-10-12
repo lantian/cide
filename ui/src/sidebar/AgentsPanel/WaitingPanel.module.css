@@ -1,0 +1,8 @@
+.content { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
+.message { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-ui-12); }
+.rowActions { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); }
+.details { display: flex; flex-direction: column; gap: var(--sp-5); }
+.relatedActions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-4) var(--sp-6); }
+.savedLabel { margin: 0 0 var(--sp-3); color: var(--dim); font-size: var(--fs-ui-12); }
+.savedChoices { margin: 0 0 var(--sp-3); padding-left: var(--sp-6); font-size: var(--fs-ui-12); }
+.error { color: var(--red); margin: 0; font-size: var(--fs-ui-12); }

@@ -129,6 +129,7 @@ function TaskDetailHostImpl() {
   const board = useTasks((s) => s.board)
   const project = useTasks((s) => s.project)
   const selected = useTasks((s) => s.selected)
+  const decisionBackStack = useTasks((s) => s.decisionBackStack)
   const select = useTasks((s) => s.select)
   const editTask = useTasks((s) => s.edit)
   const respondTask = useTasks((s) => s.respond)
@@ -697,11 +698,12 @@ function TaskDetailHostImpl() {
    * from a row and let the empty values speak) is four separate false claims about the task.
    */
   if (detail === null) {
-    return <TaskDetailPendingModal task={open} onClose={() => select(null)} />
+    return <TaskDetailPendingModal task={open} onClose={() => select(null)} onBack={decisionBackStack.length > 0 ? () => select(null) : undefined} />
   }
   return (
     <>
     <TaskDetailModal
+      onBack={decisionBackStack.length > 0 ? () => select(null) : undefined}
       /*
        * Keyed on project and task. Comment and answer drafts must not carry into a different
        * task, including a task with the same id in another project.
@@ -1079,6 +1081,7 @@ function TaskDetailHostImpl() {
         previews={previews}
         onClose={() => setLightbox(null)}
         onStep={setLightbox}
+        onRequestPreview={(image) => { if (project !== null) requestPreview(project, open.id, image) }}
         onOpen={(attachment) => {
           if (project !== null) guarded(attachmentsApi.open(project, open.id as never, attachment))
         }}

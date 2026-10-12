@@ -1413,6 +1413,8 @@ export const remote = {
 }
 
 export const events = {
+  onUserRequestsChanged: (handler: (payload: { project: ProjectId; view: import("./generated").UserRequestsView }) => void) =>
+    listen<{ project: ProjectId; view: import("./generated").UserRequestsView }>("cide://user-requests-changed", (event) => handler(event.payload)),
   /**
    * The remote listener's state or its device list moved. **No payload** — the panel asks.
    *
@@ -5657,4 +5659,11 @@ export const peerChat = {
   pause: (project: ProjectId, tab: TabId, paused: boolean) => invoke<void>('peer_chat_pause', { project, tab, paused }),
   receipts: (project: ProjectId, tab: TabId) => invoke<import('./generated').PeerChatReceipt[]>('peer_chat_receipts', { project, tab }),
   plan: (project: ProjectId, tab: TabId) => invoke<PaneRestore[]>('peer_chat_plan', { project, tab }),
+}
+
+/** User decisions are independent of the task board and retain their originating conversation. */
+export const userRequests = {
+  list: (project: ProjectId) => invoke<import('./generated').UserRequestsView>('user_requests_list', { project }),
+  respond: (project: ProjectId, id: string, response: import('./generated').UserRequestResponse) =>
+    invoke<import('./generated').UserRequestsView>('user_request_respond', { project, id, response }),
 }

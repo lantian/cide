@@ -69,6 +69,8 @@ interface TasksStore {
   board: Board
   /** Which task the panel has open, or `null` for the list. */
   selected: TaskId | null
+  decisionBackStack: (TaskId | null)[]
+  selectFromDecision: (task: TaskId) => void
   /**
    * The task being composed, or `null` when the compose dialog is not up. (M21)
    *
@@ -155,6 +157,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
   project: null,
   board: BOARD_UNKNOWN,
   selected: null,
+  decisionBackStack: [],
   compose: null,
   creating: false,
 
@@ -179,6 +182,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
       project,
       board: BOARD_UNKNOWN,
       selected: null,
+      decisionBackStack: [],
       compose: null,
       creating: false,
     })
@@ -222,7 +226,14 @@ export const useTasks = create<TasksStore>((set, get) => ({
     set({ board: next })
   },
 
-  select: (task) => set({ selected: task }),
+  selectFromDecision: (task) => set({ selected: task, decisionBackStack: [null] }),
+  select: (task) => {
+    const { selected, decisionBackStack } = get()
+    if (decisionBackStack.length === 0) { set({ selected: task }); return }
+    if (task === null) {
+      set({ selected: decisionBackStack[decisionBackStack.length - 1] ?? null, decisionBackStack: decisionBackStack.slice(0, -1) })
+    } else if (task !== selected) { set({ selected: task, decisionBackStack: [...decisionBackStack, selected] }) }
+  },
 
   /*
    * Idempotent, and that is the re-entrancy guard the boolean used to be: a second *New task*

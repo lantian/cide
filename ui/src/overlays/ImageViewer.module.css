@@ -1,0 +1,70 @@
+/* Above modal cards (60) and the switcher (70), below context menus (80). */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 75;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.9);
+  color: #f2f2f2;
+}
+
+.bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-5);
+  padding: var(--sp-4) var(--sp-6);
+  font-size: var(--fs-ui-13);
+}
+
+.caption {
+  flex: 1;
+  min-width: calc(80px * var(--ui-scale));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.meta { color: rgba(255, 255, 255, 0.7); }
+.zoom { display: flex; align-items: center; gap: var(--sp-3); }
+.percent { min-width: 5ch; text-align: center; font-variant-numeric: tabular-nums; }
+
+.action, .iconButton, .step {
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--r-2);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.action { padding: var(--sp-2) var(--sp-4); }
+.iconButton, .step { display: inline-flex; align-items: center; justify-content: center; padding: var(--sp-2); }
+.action:hover:not(:disabled), .iconButton:hover:not(:disabled), .step:hover:not(:disabled) { background: rgba(255, 255, 255, 0.18); }
+.action:focus-visible, .iconButton:focus-visible, .step:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.action:disabled, .iconButton:disabled, .step:disabled { opacity: 0.3; cursor: default; }
+
+.stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 var(--sp-6) var(--sp-6);
+}
+
+.viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; }
+.viewport[data-pan='true'] { cursor: grab; }
+.viewport[data-dragging='true'] { cursor: grabbing; }
+.image { position: absolute; left: 50%; top: 50%; max-width: none; max-height: none; box-shadow: var(--shadow-3); }
+.image[data-ready='false'] { visibility: hidden; }
+.step { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0, 0, 0, 0.7); }
+.prev { left: var(--sp-3); }
+.next { right: var(--sp-3); }
+.missing { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.7); font-size: var(--fs-ui-13); pointer-events: none; }

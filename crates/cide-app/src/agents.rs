@@ -1248,7 +1248,7 @@ struct Admission {
 /// How a resumed run's new child finds the old conversation. Built by [`admit_a_pass`] from
 /// what the snapshot preserved; which field carries the identity is the harness split
 /// [`cide_agents::SessionBinding`] names.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ResumePoint {
     /// For a `claude` run: reuse the old [`SessionId`] — it *is* the conversation id
     /// (`--resume <id>` keeps it), so hook routing, the row's session and a pane opened onto
@@ -1260,8 +1260,15 @@ struct ResumePoint {
     conversation: String,
 }
 
+enum RequestDelivery {
+    Waiting,
+    Delivered,
+    Send(SessionId, Harness),
+    Queued,
+}
+
 /// The child a stuck opening is replaced by. See [`AgentRegistry::abandon_unsubmitted`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Requeued {
     /// The conversation the lost child was continuing, as a **fork** (`rebind: None`), or
     /// `None` when it was starting one. A fork rather than the old id: the dying child is still
@@ -3025,6 +3032,113 @@ impl AgentRegistry {
         })
     }
 
+    /// Deliver only at an idle boundary, or requeue the exact ended conversation. The durable
+    /// request remains undelivered while queued, so a restart or failed spawn cannot lose it.
+    pub fn deliver_user_request(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        origin: &cide_ipc::sessions::SessionRecord,
+        line: &str,
+    ) -> Result<bool> {
+        let run = origin
+            .run
+            .ok_or_else(|| CoreError::Io("No originating run.".into()))?;
+        let planned =
+            self.plan_user_request_delivery(project, run, origin.harness, &origin.id, line)?;
+        match planned {
+            RequestDelivery::Waiting => Ok(false),
+            RequestDelivery::Delivered => Ok(true),
+            RequestDelivery::Send(session, harness) => {
+                self.send_prompt(app, project, run, session, line, harness)?;
+                self.mark_changed(app, project);
+                Ok(true)
+            }
+            RequestDelivery::Queued => {
+                self.save_snapshot();
+                self.mark_changed(app, project);
+                self.pump(app);
+                Ok(false)
+            }
+        }
+    }
+
+    fn plan_user_request_delivery(
+        &self,
+        project: ProjectId,
+        run: RunId,
+        harness: Harness,
+        conversation: &str,
+        line: &str,
+    ) -> Result<RequestDelivery> {
+        let mut inner = self.inner.lock();
+        let live = inner
+            .runs
+            .get(&run)
+            .filter(|live| live.project == project)
+            .ok_or_else(|| {
+                CoreError::Io("The original run is unavailable; the decision is saved.".into())
+            })?;
+        if live.harness != harness
+            || resume_point(live).is_none_or(|p| p.conversation != conversation)
+        {
+            return Err(CoreError::Io(
+                "The original conversation changed; the decision is saved.".into(),
+            ));
+        }
+        if live.prompt == line {
+            match live.state {
+                RunState::Running | RunState::Idle | RunState::Finished { .. } => {
+                    return Ok(RequestDelivery::Delivered);
+                }
+                RunState::Failed { .. } => {
+                    return Err(CoreError::Io(
+                        "Resuming the original conversation failed; the decision is saved.".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if live.stop.is_some() || live.frozen.is_some() {
+            return Ok(RequestDelivery::Waiting);
+        }
+        if let (RunState::Idle, Some(session)) = (&live.state, live.session) {
+            return Ok(RequestDelivery::Send(session, harness));
+        }
+        if holds_a_pair(&live.state) {
+            return Ok(RequestDelivery::Waiting);
+        }
+        if !live.reopenable {
+            return Err(CoreError::Io(
+                "The original transcript is unavailable; the decision is saved.".into(),
+            ));
+        }
+        if let Some(task) = &live.task
+            && holder_in(&inner, project, &live.agent, task).is_some()
+        {
+            return Err(CoreError::Io(
+                "Another run owns this task; the decision is saved for its original conversation."
+                    .into(),
+            ));
+        }
+        let live = inner.runs.get_mut(&run).expect("checked above");
+        live.requeued = Some(Requeued {
+            resume: resume_point(live),
+            prompt: line.to_owned(),
+        });
+        live.prompt = line.to_owned();
+        // Preserve the asking harness when current role settings or a pool have changed.
+        live.pool.clear();
+        if let RunPurpose::Work(options) = &mut live.purpose {
+            options.harness = Some(harness);
+        }
+        live.parked_at_quit = None;
+        move_to(live, RunState::Queued, now_unix_ms());
+        let key = live.key();
+        inner.queues.entry(key).or_default().push_back(run);
+        Ok(RequestDelivery::Queued)
+    }
+
     /// Say one more thing to a live run's conversation: now if its turn is over, else at its
     /// next hand-back (`LiveRun::follow_ups`). (M101)
     ///
@@ -4572,6 +4686,26 @@ impl AgentRegistry {
             if !resumes_at_launch(&config) {
                 continue;
             }
+            // A durable request owns the next turn, including for runs without a task.
+            if let Ok(requests) = crate::user_requests::store(app) {
+                let waiting: Vec<_> = requests
+                    .view(&root)
+                    .requests
+                    .into_iter()
+                    .filter(|r| r.wait && !r.delivered)
+                    .filter_map(|r| r.origin.run)
+                    .collect();
+                let mut inner = self.inner.lock();
+                for run in waiting {
+                    if let Some(live) = inner
+                        .runs
+                        .get_mut(&run)
+                        .filter(|live| live.state == RunState::Interrupted)
+                    {
+                        live.parked_at_quit = Some(ParkedAtQuit::Idle);
+                    }
+                }
+            }
             let settings_now = settings_now(app, project);
             let idle_tasks = app
                 .try_state::<Arc<crate::tasks_state::TasksStores>>()
@@ -5162,21 +5296,36 @@ impl AgentRegistry {
 
         let registry = Arc::clone(self);
         let app = app.clone();
-        let spawned = std::thread::Builder::new()
-            .name("cide-agents-thaw".into())
-            .spawn(move || {
-                std::thread::sleep(THAW_WATCH);
-                if let Some((pty, id)) = sink {
-                    pty.detach(id);
-                }
-                registry.inner.lock().life.remove(&session);
-                if alive.load(Ordering::Acquire) {
-                    return;
-                }
-                if registry.mark_stale(run) {
-                    registry.mark_changed(&app, project);
-                }
-            });
+        let spawned =
+            std::thread::Builder::new()
+                .name("cide-agents-thaw".into())
+                .spawn(move || {
+                    std::thread::sleep(THAW_WATCH);
+                    if let Some((pty, id)) = sink {
+                        pty.detach(id);
+                    }
+                    registry.inner.lock().life.remove(&session);
+                    if alive.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if crate::user_requests::store(&app)
+                        .ok()
+                        .is_some_and(|requests| {
+                            crate::user_requests::root(&app, project)
+                                .ok()
+                                .is_some_and(|root| {
+                                    requests.view(&root).requests.iter().any(|r| {
+                                        r.origin.run == Some(run) && r.wait && !r.delivered
+                                    })
+                                })
+                        })
+                    {
+                        return;
+                    }
+                    if registry.mark_stale(run) {
+                        registry.mark_changed(&app, project);
+                    }
+                });
         if let Err(error) = spawned {
             // The offer is lost; nothing else is. Worth a line because the user then has a run
             // that may be sitting on a dead turn with nothing on the row to say so.
@@ -6256,6 +6405,9 @@ struct SavedRun {
     harness_session: Option<String>,
     task: Option<TaskId>,
     task_title: Option<String>,
+    /// A queued continuation's prompt and conversation survive a restart before admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requeued: Option<Requeued>,
     prompt: String,
     started_unix_ms: u64,
     /// The run's worked total, with any interval that was open at shutdown already closed —
@@ -6864,6 +7016,7 @@ impl AgentRegistry {
                         task: live.task.clone(),
                         task_title: live.task_title.clone(),
                         prompt: live.prompt.clone(),
+                        requeued: live.requeued.clone(),
                         started_unix_ms: live.started_unix_ms,
                         // Closed here, not copied: a run that was `Running` when cide quit has
                         // an interval open, and `live.worked_ms` alone would throw away
@@ -7100,7 +7253,7 @@ impl AgentRegistry {
                     harness_session: saved.harness_session,
                     continuing: false,
                     parked_at_quit,
-                    requeued: None,
+                    requeued: saved.requeued,
                     follow_ups: Vec::new(),
                     opening_requeues: 0,
                     death_noted: false,
@@ -13093,6 +13246,109 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_user_decision_requeues_the_original_run_without_a_task_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("cide-decision-run-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-runs.json");
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut dispatch = spec(project, "developer", 1, 4);
+        dispatch.harness = Harness::Codex;
+        dispatch.task = None;
+        let run = registry.enqueue(dispatch);
+        registry.take_admissions();
+        registry.bind_session(run, SessionId::new());
+        {
+            let mut inner = registry.inner.lock();
+            let live = inner.runs.get_mut(&run).unwrap();
+            live.harness_session = Some("original-thread".into());
+            live.reopenable = true;
+        }
+        registry.set_state(None, run, RunState::Running);
+        assert!(matches!(
+            registry
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "original-thread",
+                    "User approved A"
+                )
+                .unwrap(),
+            RequestDelivery::Waiting
+        ));
+        registry.set_state(None, run, RunState::Finished { code: 0 });
+        assert!(
+            registry
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "another-thread",
+                    "User approved A"
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            registry
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "original-thread",
+                    "User approved A"
+                )
+                .unwrap(),
+            RequestDelivery::Queued
+        ));
+        assert!(matches!(
+            registry
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "original-thread",
+                    "User approved A"
+                )
+                .unwrap(),
+            RequestDelivery::Waiting
+        ));
+        registry.write_snapshot_now(&path);
+        let after = AgentRegistry::default();
+        after.restore_snapshot_from(&path, |_| true, |_| Some(dir.clone()), |_, _, _| true);
+        assert!(matches!(
+            after
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "original-thread",
+                    "User approved A"
+                )
+                .unwrap(),
+            RequestDelivery::Queued
+        ));
+        let admission = after.take_admissions().pop().unwrap();
+        assert_eq!(admission.run, run);
+        assert_eq!(admission.prompt, "User approved A");
+        assert_eq!(admission.resume.unwrap().conversation, "original-thread");
+        after.set_state(None, run, RunState::Running);
+        assert!(matches!(
+            after
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "original-thread",
+                    "User approved A"
+                )
+                .unwrap(),
+            RequestDelivery::Delivered
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// **A snapshot written before the worked clock existed still loads.**

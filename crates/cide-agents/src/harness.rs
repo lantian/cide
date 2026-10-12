@@ -173,10 +173,12 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
      time) leave one short comment of at most ten lines: the result, what changed (paths), how \
      you verified it (the command and pass or fail, no pasted output), what is left, anything \
      you noticed. A later comment supersedes the earlier one. Ask a question with \
-     {cide_task_update}, or set status to review for approval; never ask both. Done is the \
-     reviewer's or user's call. The task's touches \
-     is what cide holds for you so parallel runs do not collide, not a permission: if the work \
-     needs another file, add it with {cide_task_update} and carry on. Something wrong that is not \
+     {cide_user_request}; it waits by default. Use wait=false for independent work only. \
+     Reconnect after interruption with {cide_user_request_result}; timeout or cancellation \
+     is not approval. Propose inbox moves with kind=moveTasks. \
+     For work awaiting visual approval set status to review; never ask both. Done is the \
+     reviewer's or user's call. Touches holds paths for parallel work, not a permission: \
+     add needed files with {cide_task_update} and carry on. Something wrong that is not \
      this task: do not fix it here — file it with {cide_task_create} (it lands in the inbox, \
      outside every milestone) or name it in your report.";
 
@@ -187,6 +189,8 @@ pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.jso
 /// deliberately, because a brace left in a model's instructions is a name it cannot call, which is
 /// the failure this whole mechanism exists to remove.
 pub const TRACKER_TOOLS: &[&str] = &[
+    "cide_user_request_result",
+    "cide_user_request",
     "cide_task_get",
     "cide_task_list",
     "cide_task_create",

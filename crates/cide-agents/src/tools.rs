@@ -204,6 +204,9 @@ use cide_ipc::{
 /// The tool names. Constants rather than literals so a rename is one edit and a typo is a
 /// compile error.
 pub mod tool {
+    pub const USER_REQUEST: &str = "cide_user_request";
+    pub const USER_REQUEST_RESULT: &str = "cide_user_request_result";
+    pub const REQUESTS: &[&str] = &[USER_REQUEST, USER_REQUEST_RESULT];
     /// Every task, optionally filtered, summarised — no bodies, no comment text.
     pub const TASK_LIST: &str = "cide_task_list";
     /// One task in full: body and the whole comment log.
@@ -289,7 +292,7 @@ pub mod tool {
     /// Ask the project's window to run one registry command, as the palette would. (M134)
     pub const COMMAND_RUN: &str = "cide_command_run";
 
-    /// The task vocabulary, in the order `tools/list` advertises it.
+    /// The request and task vocabulary served to dispatched runs.
     ///
     /// Read → write, and inside each half the cheap call first: it is the order a model skims,
     /// and `cide_task_list` is the one it should reach for before anything else.
@@ -297,6 +300,20 @@ pub mod tool {
     /// **This is also the whole tool list a dispatched run is served.** Every name a subagent
     /// may call is in this slice, which is why the scoping in `cide_app::agent_rpc` is one
     /// comparison against it rather than a filter with a policy in it.
+    pub const RUN: &[&str] = &[
+        USER_REQUEST,
+        USER_REQUEST_RESULT,
+        TASK_LIST,
+        TASK_GET,
+        TASK_CREATE,
+        TASK_UPDATE,
+        TASK_COMMENT,
+        TASK_ASSIGN,
+        TASK_LINK,
+        TASK_UNLINK,
+        TASK_ATTACH,
+    ];
+
     pub const ALL: &[&str] = &[
         TASK_LIST,
         TASK_GET,
@@ -348,6 +365,8 @@ pub mod tool {
     /// is exactly what the switch exists to stop. `cide_agent_dispatch` and `cide_session_open`
     /// stay: both take work that is not on a board.
     pub const ORCHESTRATION_NO_TRACKER: &[&str] = &[
+        USER_REQUEST,
+        USER_REQUEST_RESULT,
         AGENTS_LIST,
         AGENT_CREATE,
         AGENT_UPDATE,
@@ -368,7 +387,7 @@ pub mod tool {
         COMMAND_RUN,
     ];
 
-    /// Both families, in advertised order: [`ALL`] then [`ORCHESTRATION`].
+    /// All families, in advertised order: [`REQUESTS`], [`ALL`], then [`ORCHESTRATION`].
     ///
     /// Spelled out rather than concatenated, because a `const fn` concatenation of two slices is
     /// not expressible and a `Vec` would give up the `&'static [&'static str]` that lets a
@@ -376,6 +395,8 @@ pub mod tool {
     /// keeps the three lists from drifting — a name added to either family and forgotten here is
     /// a test failure, not a tool nobody is served.
     pub const EVERY: &[&str] = &[
+        USER_REQUEST,
+        USER_REQUEST_RESULT,
         TASK_LIST,
         TASK_GET,
         TASK_CREATE,
@@ -1416,6 +1437,12 @@ pub fn descriptors() -> Vec<Value> {
 /// that leaves the choice between `cide_task_update` and `cide_task_assign` to chance.
 pub fn description(name: &str) -> &'static str {
     match name {
+        tool::USER_REQUEST => {
+            "Ask the user a question or propose moving existing tasks into a milestone. Waits for their answer in this conversation by default. Set wait=false only when you can continue independent work; cide delivers the decision to this same conversation. For moveTasks supply milestone, tasks and a question explaining why: the user can select a subset, and cide applies the approved moves. Never ask the user to move inbox tasks manually. Closing the dialog does not cancel the request. Cancellation or rejection is not approval. If interrupted, reconnect with cide_user_request_result and wait=true before continuing dependent work."
+        }
+        tool::USER_REQUEST_RESULT => {
+            "Read or reconnect to a saved user request in this conversation. Waits by default until the user answers or cancels. Set wait=false to read its current state. Reuse its id after a timeout; do not ask the same question again or treat interruption as approval."
+        }
         tool::MILESTONE_PROPOSALS => {
             "Propose a change to this project's milestones — what only the user may change — \
              ready to apply: the milestone plan \
@@ -1483,7 +1510,8 @@ pub fn description(name: &str) -> &'static str {
              `attachments` puts files on the task's body by path — the same as cide_task_attach; \
              files already attached stay. `touches`, `acceptance` and `question` set those fields \
              (null clears); only the user moves a task out of the inbox or accepts a task marked \
-             `acceptance: user`. An open question takes priority over approval. Ask with a text \
+             `acceptance: user`. An open question takes priority over approval. Setting a question waits for the user \
+             in this conversation; prefer the separate cide_user_request tool. Ask with a text \
              string or {text, selection: single|multiple, options: [{id, title, description?, \
              image?}]}; images are file paths or existing image attachment ids. There is no \
              option-count limit and the user can always add custom text. The answer is the task's summary line plus any comments \
@@ -1766,6 +1794,20 @@ pub fn input_schema(name: &str) -> Value {
     });
 
     match name {
+        tool::USER_REQUEST => json!({
+            "type": "object", "properties": {
+                "kind": { "type": "string", "enum": ["question", "moveTasks"], "default": "question" },
+                "title": { "type": "string" },
+                "task": { "type": "string" },
+                "question": input_schema(tool::TASK_UPDATE)["properties"]["question"],
+                "milestone": { "type": "string" },
+                "tasks": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+                "wait": { "type": "boolean", "default": true }
+            }, "required": ["question"], "additionalProperties": false
+        }),
+        tool::USER_REQUEST_RESULT => json!({
+            "type": "object", "properties": { "id": { "type": "string" }, "wait": { "type": "boolean", "default": true } }, "required": ["id"], "additionalProperties": false
+        }),
         tool::MILESTONE_PROPOSALS => json!({
             "type": "object",
             "properties": {
@@ -3256,8 +3298,7 @@ fn user_gesture_refusal(
         );
     if leaves_inbox && !caller.attended() {
         return Some(
-            "It is in the inbox, and only the user moves a task out of the inbox. Name it in your \
-             report, or ask the user with `question`."
+            "It is in the inbox, and only the user moves a task out of the inbox. Propose its activation with cide_user_request (kind: moveTasks) and wait for the user to approve."
                 .to_string(),
         );
     }
@@ -9900,8 +9941,9 @@ mod tests {
         );
         // `EVERY` is spelled out rather than concatenated (see its own doc), so this is what
         // stops the three lists drifting.
-        let joined: Vec<&str> = tool::ALL
+        let joined: Vec<&str> = tool::REQUESTS
             .iter()
+            .chain(tool::ALL)
             .chain(tool::ORCHESTRATION)
             .copied()
             .collect();
@@ -9909,8 +9951,9 @@ mod tests {
 
         // With the tracker off a pane is served the orchestration list minus every task and
         // milestone tool, and nothing else went missing with them.
-        let no_tracker: Vec<&str> = tool::ORCHESTRATION
+        let no_tracker: Vec<&str> = tool::REQUESTS
             .iter()
+            .chain(tool::ORCHESTRATION)
             .copied()
             .filter(|name| *name != tool::MILESTONES && *name != tool::MILESTONE_PROPOSALS)
             .collect();

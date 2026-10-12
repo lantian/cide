@@ -1,0 +1,541 @@
+//! User requests: durable decisions, task transactions, and delivery to the asking conversation.
+use crate::{
+    agents::AgentRegistry, state::SessionRegistry, tasks_state::TasksStores,
+    workspace_state::WorkspaceState,
+};
+use cide_core::{CoreError, Result, persist, user_requests::Requests};
+use cide_ipc::{
+    LinkType, ProjectId, RunId, SessionId, TaskAuthor, TaskId, TaskQuestion, UserRequest,
+    UserRequestKind, UserRequestResponse, UserRequestTask, UserRequestsView,
+};
+use serde_json::{Value, json};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tauri::{AppHandle, Manager};
+
+pub fn store(app: &AppHandle) -> Result<Arc<Requests>> {
+    app.try_state::<Arc<Requests>>()
+        .map(|s| Arc::clone(&s))
+        .ok_or_else(|| CoreError::Io("cide is shutting down".into()))
+}
+pub fn root(app: &AppHandle, project: ProjectId) -> Result<PathBuf> {
+    let workspace = app
+        .try_state::<WorkspaceState>()
+        .ok_or_else(|| CoreError::Io("cide is shutting down".into()))?;
+    crate::tasks_state::project_root(&workspace, project)
+}
+pub fn broadcast(app: &AppHandle, project: ProjectId) {
+    if let (Ok(root), Ok(store)) = (root(app, project), store(app)) {
+        crate::emit::user_requests_changed(app, project, store.view(&root));
+        crate::running::mark(app);
+    }
+}
+pub fn waiting_count(app: &AppHandle, project: ProjectId, tasks: &[cide_ipc::TaskRow]) -> usize {
+    let requests = root(app, project)
+        .ok()
+        .and_then(|root| store(app).ok().map(|s| s.view(&root).requests))
+        .unwrap_or_default();
+    cide_core::user_requests::waiting_count(&requests, tasks)
+}
+pub fn holds_planner(app: &AppHandle, project: ProjectId) -> bool {
+    if let (Ok(root), Ok(store)) = (root(app, project), store(app)) {
+        store.view(&root).requests.iter().any(|r| {
+            r.origin.kind == cide_ipc::sessions::SessionKind::Planner && r.wait && !r.delivered
+        })
+    } else {
+        false
+    }
+}
+
+pub fn create(
+    app: &AppHandle,
+    project: ProjectId,
+    session: Option<SessionId>,
+    run: Option<RunId>,
+    author: TaskAuthor,
+    args: &Value,
+) -> Result<UserRequest> {
+    let root = root(app, project)?;
+    let listing = crate::sessions_state::list(app, project)?;
+    let origin = listing.rows.into_iter().find(|row| {
+        run.is_some_and(|run| row.record.run == Some(run)) || (run.is_none() && session.is_some_and(|session| row.record.session == Some(session)))
+    }).map(|row| row.record).ok_or_else(|| CoreError::Io("The asking conversation is not yet in the session journal. Retry this call; do not finish or continue dependent work.".into()))?;
+    let question: TaskQuestion =
+        serde_json::from_value(args.get("question").cloned().unwrap_or(Value::Null))
+            .map_err(|e| CoreError::Io(format!("Invalid question: {e}")))?;
+    question.validate().map_err(CoreError::Io)?;
+    let wait = match args.get("wait") {
+        None => true,
+        Some(Value::Bool(v)) => *v,
+        _ => return Err(CoreError::Io("wait must be a boolean".into())),
+    };
+    let task = args
+        .get("task")
+        .and_then(Value::as_str)
+        .map(|id| TaskId(id.to_owned()));
+    let message = question.text().to_owned();
+    let kind = match args
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("question")
+    {
+        "question" => {
+            if question.options().iter().any(|o| o.image.is_some()) {
+                let tasks = app.state::<Arc<TasksStores>>();
+                let current = task
+                    .as_ref()
+                    .and_then(|id| tasks.get(project).and_then(|store| store.get(id)))
+                    .ok_or_else(|| {
+                        CoreError::Io(
+                            "Image choices must name a task containing their attachments.".into(),
+                        )
+                    })?;
+                if question
+                    .options()
+                    .iter()
+                    .filter_map(|o| o.image.as_ref())
+                    .any(|id| {
+                        !current
+                            .attachments
+                            .iter()
+                            .any(|a| &a.id == id && !a.deleted)
+                    })
+                {
+                    return Err(CoreError::Io(
+                        "A choice image is not attached to the linked task. Attach it first."
+                            .into(),
+                    ));
+                }
+            }
+            UserRequestKind::Question { question }
+        }
+        "moveTasks" => {
+            if !cide_agents::config::load_tracker(&root) {
+                return Err(CoreError::Io(
+                    "Task tracking is disabled in this project.".into(),
+                ));
+            }
+            let milestone = args
+                .get("milestone")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CoreError::Io("Name a target milestone.".into()))?;
+            let plan = cide_agents::config::load_milestones(&root);
+            let goal = plan
+                .items
+                .iter()
+                .find(|m| m.id == milestone)
+                .and_then(|m| m.task.clone())
+                .ok_or_else(|| CoreError::Io("That milestone has no existing goal task.".into()))?;
+            let ids: Vec<TaskId> =
+                serde_json::from_value(args.get("tasks").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| CoreError::Io(format!("Invalid task list: {e}")))?;
+            if ids.is_empty() {
+                return Err(CoreError::Io("Propose at least one task.".into()));
+            }
+            let tasks_store = app.state::<Arc<TasksStores>>().ensure(project, &root);
+            let mut tasks = Vec::new();
+            for (i, id) in ids.iter().enumerate() {
+                if ids[..i].contains(id) || plan.items.iter().any(|m| m.task.as_ref() == Some(id)) {
+                    return Err(CoreError::Io(
+                        "List each task once, excluding milestone goal tasks.".into(),
+                    ));
+                }
+                let current = tasks_store
+                    .get(id)
+                    .ok_or_else(|| CoreError::Io(format!("No task {id}.")))?;
+                let parents: Vec<_> = current
+                    .links
+                    .iter()
+                    .filter(|l| l.link == LinkType::SubtaskOf && !l.deleted)
+                    .map(|l| l.target.clone())
+                    .collect();
+                if parents.len() > 1 {
+                    return Err(CoreError::Io(format!(
+                        "{id} has several parents; resolve them before proposing its move."
+                    )));
+                }
+                tasks.push(UserRequestTask {
+                    id: id.clone(),
+                    title: current.title,
+                    status: current.status,
+                    parent: parents.into_iter().next(),
+                });
+            }
+            UserRequestKind::MoveTasks {
+                milestone: milestone.to_owned(),
+                goal,
+                tasks,
+            }
+        }
+        _ => return Err(CoreError::Io("kind must be question or moveTasks".into())),
+    };
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| message.chars().take(100).collect());
+    let request = store(app)?.create(
+        &root,
+        UserRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            title,
+            message,
+            task,
+            author,
+            request: kind,
+            origin,
+            wait,
+            created_unix_ms: persist::now_ms(),
+            response: None,
+            applying: false,
+            delivered: false,
+            delivery_error: None,
+        },
+    )?;
+    broadcast(app, project);
+    Ok(request)
+}
+
+pub fn result_value(request: &UserRequest) -> Value {
+    let (applied, excluded) = match (&request.request, &request.response) {
+        (
+            UserRequestKind::MoveTasks { tasks, .. },
+            Some(UserRequestResponse::Approve { selected_ids, .. }),
+        ) if !request.applying => (
+            selected_ids.clone(),
+            tasks
+                .iter()
+                .filter(|t| !selected_ids.contains(&t.id))
+                .map(|t| t.id.clone())
+                .collect(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+    json!({ "id": request.id, "request": request.request, "message": request.message, "response": request.response, "pending": request.response.is_none() || request.applying, "applied": applied, "excluded": excluded })
+}
+
+fn apply_response(app: &AppHandle, project: ProjectId, request: &UserRequest) -> Result<()> {
+    if matches!(request.request, UserRequestKind::MoveTasks { .. }) {
+        return apply_move(app, project, request);
+    }
+    static ANSWER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _answering = ANSWER.lock();
+    let root = root(app, project)?;
+    let requests = store(app)?;
+    let request = requests.get(&root, &request.id)?;
+    if !request.applying {
+        return Ok(());
+    }
+    if let (Some(task), UserRequestKind::Question { question }) = (&request.task, &request.request)
+    {
+        let tasks = app.state::<Arc<TasksStores>>().ensure(project, &root);
+        if tasks
+            .get(task)
+            .is_some_and(|t| t.question.as_ref() == Some(question))
+        {
+            match &request.response {
+                Some(UserRequestResponse::Answer { text, selected_ids }) => {
+                    tasks.answer_question(task, text, selected_ids, Some(question))?;
+                }
+                Some(UserRequestResponse::Cancel | UserRequestResponse::Reject { .. }) => {
+                    tasks.edit(
+                        task,
+                        cide_ipc::TaskEdit::SetQuestion { question: None },
+                        TaskAuthor::User,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        if tasks.get(task).is_some() {
+            tasks.write_now();
+            tasks.confirm_task_saved(task)?;
+            crate::tasks_state::broadcast(app, project, &tasks);
+        }
+    }
+    requests.complete_application(&root, &request.id)?;
+    Ok(())
+}
+
+fn apply_move(app: &AppHandle, project: ProjectId, request: &UserRequest) -> Result<()> {
+    static APPLY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _applying = APPLY.lock();
+    let fresh = store(app)?.get(&root(app, project)?, &request.id)?;
+    if !fresh.applying {
+        return Ok(());
+    }
+    let request = &fresh;
+    let (
+        UserRequestKind::MoveTasks {
+            milestone,
+            goal,
+            tasks,
+        },
+        Some(UserRequestResponse::Approve { selected_ids, .. }),
+    ) = (&request.request, &request.response)
+    else {
+        return Ok(());
+    };
+    let root = root(app, project)?;
+    let plan = cide_agents::config::load_milestones(&root);
+    if !plan
+        .items
+        .iter()
+        .any(|m| &m.id == milestone && m.task.as_ref() == Some(goal))
+    {
+        let error = "The target milestone changed. Request an updated proposal.";
+        store(app)?.reset_application(&root, &request.id, error.into())?;
+        return Err(CoreError::Io(error.into()));
+    }
+    let tasks_store = app.state::<Arc<TasksStores>>().ensure(project, &root);
+    let before = tasks_store.list();
+    let changed = match tasks_store.approve_moves(&request.id, goal, tasks, selected_ids) {
+        Ok(changed) => changed,
+        Err(error) => {
+            store(app)?.reset_application(&root, &request.id, error.to_string())?;
+            return Err(error);
+        }
+    };
+    tasks_store.write_now();
+    // The checkpoint remains until the complete transaction is durable.
+    tasks_store.confirm_moves_saved(&request.id, goal, selected_ids)?;
+    store(app)?.complete_application(&root, &request.id)?;
+    crate::tasks_state::broadcast(app, project, &tasks_store);
+    let mutations = changed
+        .into_iter()
+        .map(|after| crate::task_triggers::TaskMutation {
+            before: before
+                .iter()
+                .find(|t| t.id == after.id)
+                .map(|t| task_before(t, &after)),
+            after,
+            author: TaskAuthor::User,
+            assign_gesture: false,
+            fresh_text: Vec::new(),
+        })
+        .collect();
+    crate::task_triggers::consider(app, project, mutations, cide_ipc::RunNotify::Primary);
+    Ok(())
+}
+fn task_before(row: &cide_ipc::TaskRow, after: &cide_ipc::Task) -> cide_ipc::Task {
+    let mut task = after.clone();
+    task.status = row.status;
+    task.links = row.links.clone();
+    task
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn user_requests_list(app: AppHandle, project: ProjectId) -> Result<UserRequestsView> {
+    tauri::async_runtime::spawn_blocking(move || Ok(store(&app)?.view(&root(&app, project)?)))
+        .await
+        .map_err(|e| CoreError::Io(e.to_string()))?
+}
+#[tauri::command(rename_all = "camelCase")]
+pub async fn user_request_respond(
+    app: AppHandle,
+    project: ProjectId,
+    id: String,
+    response: UserRequestResponse,
+) -> Result<UserRequestsView> {
+    tauri::async_runtime::spawn_blocking(move || respond(&app, project, &id, response))
+        .await
+        .map_err(|e| CoreError::Io(e.to_string()))?
+}
+
+pub fn respond(
+    app: &AppHandle,
+    project: ProjectId,
+    id: &str,
+    response: UserRequestResponse,
+) -> Result<UserRequestsView> {
+    let root = root(app, project)?;
+    let requests = store(app)?;
+    let request = requests.decide(&root, id, response)?;
+    if request.applying
+        && let Err(error) = apply_response(app, project, &request)
+    {
+        let _ = requests.delivery_error(&root, id, error.to_string());
+        broadcast(app, project);
+        return Err(error);
+    }
+    broadcast(app, project);
+    Ok(requests.view(&root))
+}
+
+/// A profile-local loop retries delivery only at safe, idle boundaries, including after restart.
+pub fn start(app: AppHandle) {
+    std::thread::Builder::new()
+        .name("user-requests".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let Some(workspace) = app.try_state::<WorkspaceState>() else {
+                    break;
+                };
+                let projects = workspace.with(|ws| {
+                    ws.projects
+                        .values()
+                        .filter_map(|p| p.roots.first().map(|r| (p.id, r.path.clone())))
+                        .collect::<Vec<_>>()
+                });
+                for (project, root) in projects {
+                    let Ok(requests) = store(&app) else {
+                        return;
+                    };
+                    for mut request in requests.view(&root).requests {
+                        if !request.origin.known
+                            && !request.delivered
+                            && let Ok(listing) = crate::sessions_state::list(&app, project)
+                            && let Some(origin) =
+                                listing.rows.into_iter().map(|r| r.record).find(|r| {
+                                    r.known
+                                        && (r.session == request.origin.session
+                                            && r.session.is_some()
+                                            || r.run == request.origin.run && r.run.is_some())
+                                })
+                            && let Ok(updated) = requests.resolve_origin(&root, &request.id, origin)
+                        {
+                            request = updated;
+                            broadcast(&app, project);
+                        }
+
+                        if request.applying {
+                            if let Err(error) = apply_response(&app, project, &request) {
+                                let _ =
+                                    requests.delivery_error(&root, &request.id, error.to_string());
+                            }
+                            broadcast(&app, project);
+                            continue;
+                        }
+                        if request.response.is_none()
+                            || request.delivered
+                            || requests.has_waiter(&request.id)
+                        {
+                            continue;
+                        }
+                        if app
+                            .try_state::<Arc<AgentRegistry>>()
+                            .is_some_and(|agents| !agents.dispatching(project))
+                        {
+                            continue;
+                        }
+                        match deliver(&app, project, &request) {
+                            Ok(true) => {
+                                let _ = requests.delivered(&root, &request.id);
+                                broadcast(&app, project);
+                            }
+                            Ok(false) => {}
+                            Err(error)
+                                if request.delivery_error.as_deref()
+                                    != Some(&error.to_string()) =>
+                            {
+                                let _ =
+                                    requests.delivery_error(&root, &request.id, error.to_string());
+                                broadcast(&app, project);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        })
+        .expect("user request delivery thread");
+}
+
+fn deliver(app: &AppHandle, project: ProjectId, request: &UserRequest) -> Result<bool> {
+    let result = result_value(request);
+    let line = format!(
+        "The user resolved request {}: {}. Continue this conversation using this decision. Do not ask the same question again; rejection or cancellation does not authorize the proposed work.",
+        request.id, result
+    );
+    if request.origin.run.is_some() {
+        return app.state::<Arc<AgentRegistry>>().deliver_user_request(
+            app,
+            project,
+            &request.origin,
+            &line,
+        );
+    }
+    let listing = crate::sessions_state::list(app, project)?;
+    let origin = listing
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.record.id == request.origin.id
+                || (!request.origin.known && row.record.session == request.origin.session)
+        })
+        .map(|row| row.record)
+        .unwrap_or_else(|| request.origin.clone());
+    if let Some(session) = origin.session
+        && let Some(pty) = app
+            .try_state::<SessionRegistry>()
+            .and_then(|sessions| sessions.get(session))
+            .filter(|pty| !pty.has_exited())
+    {
+        let state = app
+            .try_state::<crate::hooks::HookServer>()
+            .map(|hooks| hooks.state(session));
+        if !matches!(
+            state,
+            Some(cide_ipc::SessionState::Idle | cide_ipc::SessionState::AwaitingInput)
+        ) {
+            return Ok(false);
+        }
+        let bytes =
+            crate::agent_rpc::submit(&line).ok_or_else(|| CoreError::Io("Empty answer.".into()))?;
+        crate::agents::type_submitted_line(app, session, &pty, bytes);
+        return Ok(true);
+    }
+    if !origin.known || !origin.cwd.is_dir() {
+        return Err(CoreError::Io("The original conversation or its working directory is unavailable. The answer is saved.".into()));
+    }
+    let harness = cide_agents::tools::SESSION_HARNESSES
+        .iter()
+        .find(|h| **h == origin.harness)
+        .ok_or_else(|| CoreError::Io("This harness has no resumable console.".into()))?;
+    let tab_harness = match harness {
+        cide_ipc::Harness::Claude => {
+            crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Claude)
+        }
+        cide_ipc::Harness::Codex => {
+            crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Codex)
+        }
+        _ => crate::claude_tab::TabHarness::Opencode,
+    };
+    let mode = cide_agents::config::load(&root(app, project)?)
+        .agents
+        .unattended();
+    crate::claude_tab::open_continuing(
+        app,
+        project,
+        crate::claude_tab::Open {
+            title: &origin.title,
+            session_name: None,
+            prompt: &line,
+            mode: crate::claude_tab::TabMode {
+                unattended: mode,
+                behind: true,
+            },
+            cwd: Some(origin.cwd.clone()),
+            harness: Some(tab_harness),
+            model: None,
+            voice: if origin.kind == cide_ipc::sessions::SessionKind::Worker {
+                crate::cmd::session::Voice::Worker
+            } else {
+                crate::cmd::session::Voice::Acting
+            },
+            origin: match origin.kind {
+                cide_ipc::sessions::SessionKind::Planner => Some(cide_ipc::PaneOrigin::Planner),
+                cide_ipc::sessions::SessionKind::Worker => Some(cide_ipc::PaneOrigin::Worker),
+                cide_ipc::sessions::SessionKind::Reviewer => Some(cide_ipc::PaneOrigin::Reviewer),
+                _ => None,
+            },
+        },
+        Some(cide_ipc::HarnessSession {
+            harness: origin.harness,
+            id: origin.id,
+            cwd: origin.cwd,
+        }),
+    )?;
+    Ok(true)
+}

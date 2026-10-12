@@ -2978,6 +2978,60 @@ impl TaskStore {
         })
     }
 
+    /// The user accepts a proposed batch. All statuses and edges change in one revision.
+    /// The receipt in each task's log makes interrupted persistence safely replayable.
+    pub fn approve_moves(
+        &self,
+        request: &str,
+        goal: &TaskId,
+        expected: &[cide_ipc::UserRequestTask],
+        selected: &[TaskId],
+    ) -> Result<Vec<Task>> {
+        let now = persist::now_ms();
+        let receipt = format!("**User approved request {request}:** added to milestone {goal}.");
+        // Reconcile out-of-process edits before validating the proposal snapshots.
+        self.write_now();
+        self.update(|file, cache| {
+            if selected.is_empty() { return Err(CoreError::Io("Select at least one task.".into())); }
+            if find(file, goal).is_none() { return Err(no_such_task(goal)); }
+            for (i, id) in selected.iter().enumerate() {
+                if selected[..i].contains(id) { return Err(CoreError::Io("Duplicate task selection.".into())); }
+                let snapshot = expected.iter().find(|t| &t.id == id).ok_or_else(|| CoreError::Io("Only proposed tasks may be selected.".into()))?;
+                let current = self.compose(file, cache, id)?;
+                let parent = current.links.iter().find(|l| l.link == LinkType::SubtaskOf && !l.deleted).map(|l| l.target.clone());
+                let receipted = current.comments.iter().any(|c| !c.deleted && c.text == receipt);
+                let desired_status = if snapshot.status == TaskStatus::Inbox { TaskStatus::Todo } else { snapshot.status };
+                if receipted && (current.status == snapshot.status || current.status == desired_status) && (parent == snapshot.parent || parent.as_ref() == Some(goal)) { continue; }
+                if current.status != snapshot.status || parent != snapshot.parent || current.title != snapshot.title {
+                    return Err(CoreError::Io(format!("{id} changed since it was proposed. Ask for an updated proposal before approving.")));
+                }
+            }
+            let mut changed = Vec::new();
+            for id in selected {
+                let mut task = self.compose(file, cache, id)?;
+                let receipted = task.comments.iter().any(|c| !c.deleted && c.text == receipt);
+                if receipted && task.status != TaskStatus::Inbox && task.links.iter().any(|l| l.link == LinkType::SubtaskOf && !l.deleted && &l.target == goal) { continue; }
+                if task.status == TaskStatus::Inbox {
+                    task.history.push(TaskStatusChange { from: TaskStatus::Inbox, to: TaskStatus::Todo, by: TaskAuthor::User, at_unix_ms: now });
+                    task.status = TaskStatus::Todo;
+                }
+                task.updated_unix_ms = now;
+                self.put(file, cache, &task);
+                let parents: Vec<_> = task.links.iter().filter(|l| l.link == LinkType::SubtaskOf && !l.deleted && &l.target != goal).map(|l| l.target.clone()).collect();
+                for parent in parents { apply_unlink(file, id, LinkType::SubtaskOf, &parent, now)?; }
+                if !find(file, id).is_some_and(|t| t.links.iter().any(|l| l.link == LinkType::SubtaskOf && !l.deleted && &l.target == goal)) {
+                    apply_link(file, id, LinkType::SubtaskOf, goal, now)?;
+                }
+                let mut task = self.compose(file, cache, id)?;
+                if !receipted { task.comments.push(new_comment(receipt.clone(), Vec::new(), TaskAuthor::User, now)); }
+                validate_content(id, &content_of(&task))?;
+                self.put(file, cache, &task);
+                changed.push(task);
+            }
+            Ok(changed)
+        })
+    }
+
     /// Apply one change to one task.
     ///
     /// `author` is used by exactly one variant — [`TaskEdit::Comment`] — and it is a parameter
@@ -3360,6 +3414,73 @@ impl TaskStore {
         } else {
             None
         }
+    }
+
+    /// Do not release a durable user decision until both pieces of its task edit are saved.
+    pub fn confirm_task_saved(&self, id: &TaskId) -> Result<()> {
+        let current = self.get(id).ok_or_else(|| no_such_task(id))?;
+        let index: TaskFile =
+            serde_json::from_slice(&fs::read(&self.path).map_err(CoreError::from)?)
+                .map_err(|e| CoreError::Io(e.to_string()))?;
+        // An untouched task legitimately has no content file; it represents empty content.
+        let content: TaskContent =
+            match fs::read(self.root.join(TASKS_DIR).join(&id.0).join(CONTENT_FILE)) {
+                Ok(bytes) => {
+                    serde_json::from_slice(&bytes).map_err(|e| CoreError::Io(e.to_string()))?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    TaskContent::default()
+                }
+                Err(error) => return Err(CoreError::from(error)),
+            };
+        let row = find(&index, id).ok_or_else(|| no_such_task(id))?;
+        if row.question != current.question
+            || row.status != current.status
+            || content.comments != current.comments
+            || content.history != current.history
+        {
+            return Err(CoreError::Io(
+                "The task answer is not yet durable. Its checkpoint is saved for recovery.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Confirm the batch's index and audit receipts reached disk before resolving its request.
+    pub fn confirm_moves_saved(
+        &self,
+        request: &str,
+        goal: &TaskId,
+        selected: &[TaskId],
+    ) -> Result<()> {
+        let index: TaskFile =
+            serde_json::from_slice(&fs::read(&self.path).map_err(CoreError::from)?)
+                .map_err(|e| CoreError::Io(e.to_string()))?;
+        let receipt = format!("**User approved request {request}:** added to milestone {goal}.");
+        for id in selected {
+            let row = find(&index, id).ok_or_else(|| no_such_task(id))?;
+            let content: TaskContent = serde_json::from_slice(
+                &fs::read(self.root.join(TASKS_DIR).join(&id.0).join(CONTENT_FILE))
+                    .map_err(CoreError::from)?,
+            )
+            .map_err(|e| CoreError::Io(e.to_string()))?;
+            if row.status == TaskStatus::Inbox
+                || !row
+                    .links
+                    .iter()
+                    .any(|l| l.link == LinkType::SubtaskOf && !l.deleted && &l.target == goal)
+                || !content
+                    .comments
+                    .iter()
+                    .any(|c| !c.deleted && c.text == receipt)
+            {
+                return Err(CoreError::Io(
+                    "The task move is not yet durable. Its checkpoint is saved for recovery."
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Write unconditionally, after reconciling with whatever is on disk.
@@ -5907,6 +6028,111 @@ mod tests {
         }]);
         assert!(store.create(&bad, TaskAuthor::User).is_err());
         assert_eq!(store.list().len(), before, "nothing half-created");
+    }
+
+    #[test]
+    fn approved_move_batch_is_atomic_selective_and_replayable() {
+        let dir = TempDir::new("approved-moves");
+        let store = TaskStore::open(&dir.0);
+        let goal = store.create(&new_task("goal"), TaskAuthor::User).unwrap();
+        let mut req = new_task("first");
+        req.status = Some(TaskStatus::Inbox);
+        let first = store.create(&req, TaskAuthor::User).unwrap();
+        req.title = "second".into();
+        let second = store.create(&req, TaskAuthor::User).unwrap();
+        let snapshot = |t: &Task| cide_ipc::UserRequestTask {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            status: t.status,
+            parent: None,
+        };
+        let expected = vec![snapshot(&first), snapshot(&second)];
+        store.write_now();
+        store.confirm_task_saved(&first.id).unwrap();
+
+        store
+            .edit(
+                &second.id,
+                TaskEdit::SetTitle {
+                    title: "changed".into(),
+                },
+                TaskAuthor::User,
+            )
+            .unwrap();
+        let rev = store.snapshot().rev;
+        assert!(
+            store
+                .approve_moves(
+                    "proposal",
+                    &goal.id,
+                    &expected,
+                    &[first.id.clone(), second.id.clone()]
+                )
+                .is_err()
+        );
+        assert_eq!(store.snapshot().rev, rev);
+        assert_eq!(store.get(&first.id).unwrap().status, TaskStatus::Inbox);
+        assert!(store.get(&first.id).unwrap().links.is_empty());
+        let changed = store
+            .approve_moves(
+                "proposal",
+                &goal.id,
+                &expected,
+                std::slice::from_ref(&first.id),
+            )
+            .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(store.snapshot().rev, rev + 1);
+        assert_eq!(store.get(&first.id).unwrap().status, TaskStatus::Todo);
+        assert_eq!(store.get(&second.id).unwrap().status, TaskStatus::Inbox);
+        store.write_now();
+        store
+            .confirm_moves_saved("proposal", &goal.id, std::slice::from_ref(&first.id))
+            .unwrap();
+        let restored = TaskStore::open(&dir.0);
+        assert!(
+            restored
+                .approve_moves(
+                    "proposal",
+                    &goal.id,
+                    &expected,
+                    std::slice::from_ref(&first.id)
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            restored.get(&first.id).unwrap().comments.len(),
+            store.get(&first.id).unwrap().comments.len()
+        );
+        // The content-first writer may leave the receipt on disk before the index changes.
+        let mut index: TaskFile =
+            serde_json::from_slice(&fs::read(dir.0.join(TASKS_RELATIVE)).unwrap()).unwrap();
+        let row = find_mut(&mut index, &first.id).unwrap();
+        row.status = TaskStatus::Inbox;
+        row.links.clear();
+        fs::write(
+            dir.0.join(TASKS_RELATIVE),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let interrupted = TaskStore::open(&dir.0);
+        interrupted
+            .approve_moves(
+                "proposal",
+                &goal.id,
+                &expected,
+                std::slice::from_ref(&first.id),
+            )
+            .unwrap();
+        interrupted.write_now();
+        interrupted
+            .confirm_moves_saved("proposal", &goal.id, std::slice::from_ref(&first.id))
+            .unwrap();
+        assert_eq!(
+            interrupted.get(&first.id).unwrap().comments.len(),
+            store.get(&first.id).unwrap().comments.len()
+        );
     }
 
     fn new_task(title: &str) -> TaskNew {

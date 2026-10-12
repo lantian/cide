@@ -583,6 +583,7 @@ export interface TaskMilestone {
 }
 
 export interface TaskDetailProps {
+  onBack?: (() => void) | undefined
   /** OpenSpec workflow conversations, independently of the implementation assignee. */
   workflowSessions?: readonly {
     run: string
@@ -925,6 +926,7 @@ export function TaskDetailModal(props: TaskDetailProps) {
  * row, and the *only* reason it is allowed to is that it draws no content field at all.
  */
 export interface TaskDetailPendingProps {
+  onBack?: (() => void) | undefined
   task: TaskView
   onClose: () => void
 }
@@ -942,11 +944,12 @@ export function TaskDetailPendingModal(props: TaskDetailPendingProps) {
   )
 }
 
-export function TaskDetailPending({ task, onClose }: TaskDetailPendingProps) {
+export function TaskDetailPending({ task, onClose, onBack }: TaskDetailPendingProps) {
   return (
     <>
       <div className={styles.taskCard} data-audit="tasksCardPending">
         <div className={styles.cardHead} data-audit="taskCardHead">
+          {onBack !== undefined && <Button size="sm" icon="chevron-left" data-audit="taskBack" onClick={onBack}>Back</Button>}
           {/* The loaded card's own glyph, tone class and all — the head is the part of the card
               that is entirely a function of the row, so it is drawn identically rather than
               approximated. */}
@@ -1142,6 +1145,7 @@ export function TaskDetail(props: TaskDetailProps) {
       }}
     >
       <div className={styles.cardHead} data-audit="taskCardHead">
+        {props.onBack !== undefined && <Button size="sm" icon="chevron-left" data-audit="taskBack" onClick={props.onBack}>Back</Button>}
         <span
           className={cx(styles.glyph, TONE_CLASS[statusTone(task.status)])}
           data-audit="tasksDetailGlyph"

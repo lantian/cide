@@ -95,6 +95,7 @@ pub mod task_triggers;
 // M18: one `.cide/tasks.json` store per open project, and the thread that ticks them.
 pub mod tasks_state;
 pub mod updater;
+pub mod user_requests;
 pub mod windows;
 pub mod workspace_state;
 
@@ -440,6 +441,7 @@ pub fn run() {
         // `State` hands out a reference, which a `thread::spawn` cannot keep.
         .manage(std::sync::Arc::new(positions_state::PositionsState::load()))
         .manage(std::sync::Arc::new(sessions_state::SessionsState::load()))
+        .manage(std::sync::Arc::new(cide_core::user_requests::Requests::load(cide_core::persist::state_dir().join("user-requests.json"))))
         // The Ctrl+Shift+T stack. Empty at launch by design — see `closed_tabs`'s note on why
         // it does not survive a restart — and managed here rather than in `setup` for the
         // plainer reason the two above are: `tab_close` pushes to it, and a command that cannot
@@ -745,6 +747,8 @@ pub fn run() {
             cmd::tasks::task_new_with_proposal,
             cmd::tasks::task_edit,
             cmd::tasks::task_respond,
+            user_requests::user_requests_list,
+            user_requests::user_request_respond,
             cmd::tasks::task_delete,
             // M39: attachments.
             cmd::tasks::task_attach,
@@ -1057,6 +1061,7 @@ pub fn run() {
             // first pass, so nothing here is racing it, but the ordering states the dependency
             // rather than relying on that.
             spinner::start(app.handle().clone());
+            user_requests::start(app.handle().clone());
 
             // One IDE server per restored project, for the same ordering reason as the hook
             // socket above and with the same consequence for getting it wrong: a pane spawns

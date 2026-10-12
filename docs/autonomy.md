@@ -154,19 +154,21 @@ It is one short turn:
 - It creates what **the plan names and the board lacks**, with steps, `touches`, `acceptance`
   and `subtaskOf`, and assigns a few at a time.
 - It brings the plan in the goal body up to date: what is done, what is next.
-- **It never touches the inbox.** It does not move a task out, and it does not link an inbox task
-  into a milestone. The tracker refuses a planner that tries.
+- **Inbox activation requires your approval.** The planner can propose existing tasks for an
+  existing milestone through `cide_user_request` with `kind: "moveTasks"`. You select the tasks;
+  cide moves approved inbox tasks to todo and links them into that milestone.
 - **Tasks in review are not its concern.** The batch reviewer has them.
 - **When the plan is done but the gate still fails, or the next step needs a decision about
-  taste, scope or design, it stops.** It asks with a `question` on the milestone's task and ends
-  its turn. You find the question in *Waiting for you*.
+  taste, scope or design, it waits.** It calls `cide_user_request`, which waits for your decision
+  by default. You find the question in *Waiting for you*, and the answer returns to this same
+  conversation. `wait: false` is available when independent work can continue.
 
 The planner timer does not wake it again while nothing changed. A latch compares the branch's
 HEAD and every non-goal task's (id, status, has-a-question) against the last plan. For the timer,
 open work is todo and doing tasks without a question. Work in review or waiting on you does not
-count as a reason to plan. Answering the active milestone's question releases the latch and
-restarts the quiet dwell. The next plan receives the answer in its changes since the last plan;
-the planner's own goal edits still do not cause repeated planning turns.
+count as a reason to plan. A blocking request holds off new planner sessions until its decision
+reaches the asking conversation. If that conversation ended or cide restarted, cide resumes it
+with the saved answer; it does not start a fresh planning conversation for the answer.
 
 An idle console that has not reported a hook does not hold off the timer unless its current
 child was given an opening prompt. This matters for a restored Codex console: it can wait at
@@ -256,17 +258,24 @@ you do:
   (todo without an assigned role), and continues the same role. Approval can be requested
   later when the work is finished.
 
-Questions can include any number of choices with a title, optional description, and optional
-image. The agent specifies single-select or multi-select; custom text is always available,
-alone or alongside selections. **Compare choices** opens a wider view; **View image** shows a
-render full size without losing your selections. A failed submission keeps your answer for retry.
+Every Waiting row opens one decision dialog: the question, approval, or proposed task moves are
+its main content, and the actions stay in the footer. Details and related tasks are expandable
+below. Opening a task or an image offers **Back** to the decision and keeps text and selections.
+Closing the dialog leaves the request waiting; **Cancel request** explicitly cancels it.
 
-Agents ask through `cide_task_update`. A plain string still asks a free-text question; a structured
-question supplies choices:
+Questions can include any number of choices with a title, optional description, and optional
+image. Single-select, multi-select and custom text are available. A failed submission preserves
+the draft. Images use the linked task's attachments.
+
+Agents ask through `cide_user_request`, independently of task updates. The optional `task` links
+the decision to a task. The tool waits by default; `wait: false` returns its durable ID while
+independent work continues. `cide_user_request_result` reconnects to that ID after interruption,
+with `wait: true` by default. Answers, rejection and cancellation go back to the original
+conversation. Setting `cide_task_update.question` remains compatible and also waits by default.
 
 ```json
 {
-  "id": "t-17",
+  "task": "t-17",
   "question": {
     "text": "Which renders do you prefer?",
     "selection": "multiple",
@@ -278,11 +287,17 @@ question supplies choices:
 }
 ```
 
+To propose a move, supply `kind: "moveTasks"`, `milestone`, `tasks` and `question` explaining why.
+All proposed tasks start selected; you can exclude any before **Accept selected**. Cide validates
+selected tasks against the proposal, applies the moves together, and returns exact `applied`
+and `excluded` IDs. Rejection and cancellation authorize no moves. A changed task or milestone
+requires an updated proposal. Requests and answers survive disconnects and restarts; approved
+moves carry a recovery checkpoint and a task receipt to prevent duplicate application.
+
 Selection defaults to `single`. Option IDs must be unique and titles nonempty. Image paths are
 relative to the calling agent's working directory (absolute paths also work); cide copies them
 into the task's attachments. An existing image attachment ID can be reused. Files use the normal
-32 MiB attachment limit; there is no limit on the number of choices. Ask a question or request
-approval in a hand-back, never both.
+32 MiB attachment limit; there is no limit on the number of choices.
 
 Before M132 both of these were comments in a log. A run would ask "which of these two sprites?"
 in a card nobody had open, and the project sat idle behind it with nothing on screen saying why.
@@ -386,10 +401,9 @@ enough for batches to form.
   so two branches green alone and red together can still both land on that road. The batch
   answer says when it fell back, and the next verify or gate is where it shows. Fix it
   as a task.
-- **The planner stopped.** It asked a question. Look in *Waiting for you*. Answer it, or update
-  the plan in the goal body and press **Plan tasks**. Answering the active goal's question
-  releases the latch; the timer wakes the planner after the project has been quiet for its
-  configured dwell. Other automatic wakes require the board or HEAD to move.
+- **The planner is waiting.** Open its decision in *Waiting for you* and answer it. The reply
+  returns to the original conversation, including after restart. If delivery is unavailable,
+  the saved decision stays visible with the reason instead of disappearing.
 - **Tasks sit in review after a restart.** The batch pending set is in memory. After a restart
   the tasks stay in review until something announces them again. Ask the console to review
   them (it has `cide_agent_integrate` with `tasks` too), or dispatch the role again.

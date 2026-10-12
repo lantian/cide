@@ -3104,11 +3104,11 @@ try {
       'the Waiting tab renders under the same strip, with Waiting on',
     )
     eq(waiting.waitingOpens, 2, 'both waiting tasks are listed, each a link to its card')
-    eq(waiting.waitingAccepts, 1, 'the task to accept offers Accept')
-    eq(waiting.waitingAnswers, 1, 'the question offers Answer')
+    eq(waiting.waitingAccepts, 0, 'acceptance actions belong to the decision dialog')
+    eq(waiting.waitingAnswers, 0, 'answer actions belong to the decision dialog')
     ok(
-      (waiting.text ?? '').includes('Redrew the head at 16px, re-exported the atlas.'),
-      'a review row carries its latest report',
+      (waiting.text ?? '').includes('Accept result') && (waiting.text ?? '').includes('Question'),
+      'uniform rows identify the decision type',
     )
     eq(waiting.unclassed, 0, 'every hooked element on the Waiting tab has a class that exists')
 
@@ -3138,8 +3138,8 @@ try {
     ok(!/WaitingPanel|waitingFor|waitingCount/.test(tasksHost), 'the Tasks panel host no longer wires the list')
     const agentsHost = src('../src/sidebar/AgentsPanel/AgentsPanelHost.tsx')
     ok(
-      /<WaitingPanel[\s\S]*?onOpenTask=\{\(task\) => revealTask\(task, project\)\}/.test(agentsHost),
-      'the Agents panel host mounts it, opening a task the way a run row’s task link does',
+      /<WaitingPanel[\s\S]*?onOpenTask=\{\(task\) => selectFromDecision\(task\)\}/.test(agentsHost),
+      'the Agents panel host opens task cards with a return path to the decision',
     )
     ok(
       /if \(panelTab !== 'waiting' \|\| project === null/.test(agentsHost),

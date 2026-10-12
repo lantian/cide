@@ -551,6 +551,18 @@ pub enum ClientBody {
         task: TaskId,
         response: crate::TaskResponse,
     },
+    /// Durable questions and move proposals, independent of the task tracker. Capability:
+    /// `userRequests`. A reconnect also receives this view with the project snapshot.
+    UserRequestsGet {
+        project: ProjectId,
+    },
+    /// Uses the desktop decision broker: the host records the answer and applies approved
+    /// moves, never the device. Answered with the saved view under the same envelope id.
+    UserRequestRespond {
+        project: ProjectId,
+        id: String,
+        response: crate::UserRequestResponse,
+    },
     /// Page the **view** of a session, up (negative) or down: PgUp/PgDn on a phone. (M91)
     ///
     /// Not [`Self::Input`]'s `PageUp`, which is `ESC[5~` handed to the program — ignored by a
@@ -773,6 +785,10 @@ pub enum ServerBody {
     TaskResponded {
         project: ProjectId,
         task: TaskId,
+    },
+    UserRequests {
+        project: ProjectId,
+        view: Option<crate::UserRequestsView>,
     },
     /// A requested paste reached the input watermark; unrequested typing remains silent.
     PasteAccepted {

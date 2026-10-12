@@ -165,8 +165,10 @@ pub const DEFAULT_SPIN_PROMPT: &str = "Nothing is running in this project and no
      assigned with mcp__cide__cide_task_assign so it starts — a few at a time. Never move a task \
      out of the inbox and never link an inbox task into a milestone: only the user does that. \
      When the plan is done but the gate still fails, or the next step needs a decision about \
-     taste, scope or design, do not invent work: ask it with mcp__cide__cide_task_update's \
-     `question` on the milestone's task and end your turn. Before you end, bring the plan in the \
+     taste, scope or design, do not invent work: ask it with mcp__cide__cide_user_request on the milestone's task and wait for its \
+     result in this conversation. For activation of existing inbox work use kind=moveTasks \
+     with the milestone id and task ids; the user chooses a subset and cide performs the moves. \
+     Do not ask them to move tasks manually. Before asking, bring the plan in the \
      milestone task's body up to date — what is done, what is next — and keep every comment \
      short.";
 

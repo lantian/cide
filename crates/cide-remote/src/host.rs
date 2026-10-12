@@ -209,6 +209,22 @@ pub trait RemoteHost: Send + Sync + 'static {
         Err("this cide cannot answer tasks from a device".to_owned())
     }
 
+    /// A safe projection of durable user decisions. `None` means the project is unavailable.
+    fn user_requests(&self, project: ProjectId) -> Option<cide_ipc::UserRequestsView> {
+        let _ = project;
+        None
+    }
+
+    fn user_request_respond(
+        &self,
+        project: ProjectId,
+        id: String,
+        response: cide_ipc::UserRequestResponse,
+    ) -> Result<cide_ipc::UserRequestsView, String> {
+        let _ = (project, id, response);
+        Err("this cide cannot answer user requests from a device".to_owned())
+    }
+
     /// This session has been looked at; clear its *finished and not yet seen* mark.
     ///
     /// One session. The set travels **to** a device whole and **from** one entry at a time, which

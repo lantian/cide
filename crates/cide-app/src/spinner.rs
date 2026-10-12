@@ -523,6 +523,11 @@ fn wake(
         return Err(why);
     }
     // Dated, and the same string names the tab and the session: see `plan_title`.
+    if crate::user_requests::holds_planner(app, project) {
+        return Err(
+            "The existing planner is waiting for a user decision; answer it in Waiting.".into(),
+        );
+    }
     let title = cide_agents::config::plan_title_now();
     crate::claude_tab::open_with_prompt(
         app,

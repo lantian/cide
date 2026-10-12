@@ -882,3 +882,35 @@ must use cached locations, never clear decorations or rescan history on every re
 **Touches:** added, renamed or moved any file
 
 `check:casing` — a name differing from a sibling's only in case is one path on macOS, and it cost a Mac build once (see `docs/platforms.md`)
+
+
+## Durable user requests and Waiting decisions
+
+Run `./test.sh`, including `check:task-questions` and `check:agents-render`. Focused backend checks
+are `cargo test -p cide-core user_requests`, `cargo test -p cide-tasks approved_move_batch`,
+`cargo test -p cide-app a_waiting_request_keeps` and
+`cargo test -p cide-app user_decision_requeues`. The request family is separate from task tools:
+workers receive eleven tools (two requests, nine task tools), or just the two requests when
+tracking is off; product owners receive thirty-one with tracking. A question blocks by default,
+while the socket continues serving ping and cancellation. Answers must be durable before a
+waiter returns. Test partial selections, stale task snapshots, interrupted persistence, duplicate
+replies, reconnecting, and continuing the original role run after restart. Closing a dialog
+must preserve the request and draft; only explicit cancellation cancels. Related-task and image
+navigation must return to that same decision with selections intact.
+The mounted question check also opens task IDs mentioned in the question, exercises the task
+header's Back button, and checks that the answer draft, selection and source focus survive the
+round trip. Saved answers show option titles and custom text; a nonblocking question explains
+that delivery can wait for the agent's current turn, and disappears once delivered.
+Saved decisions remain in the list with an `Answered` or `Decision saved` badge while delivery
+is pending, but no longer count as waiting for the user in the panel, tab or project indicators.
+The mounted check covers save failures, restored answers, delivery delays and reset decisions;
+the core request tests also verify durable counts and deduplication of linked tasks.
+
+The shared modal image viewer is covered by `pnpm --dir ui run check:image-viewer`:
+gallery order and boundaries, shared preview URLs, loading and refused images, fit and zoom
+limits, pointer anchoring, wheel suppression, captured dragging, resizing, focus trapping and
+restoration (including StrictMode), and the task-attachment adapter's external-open action.
+`check:task-questions` also walks images in both a Waiting question and a review report,
+verifying that Escape closes only the viewer and preserves selections, drafts and source focus.
+When changing viewport behavior, check wheel zoom and dragging in a real browser using a tall
+image, then resize to a narrow viewport; DOM-only checks cannot verify actual image layout.

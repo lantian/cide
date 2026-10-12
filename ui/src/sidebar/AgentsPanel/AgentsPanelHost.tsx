@@ -119,10 +119,14 @@ import { followMilestones, useMilestones } from '@/sidebar/milestonesStore'
 import { openTaskSession } from '@/sidebar/TasksPanel/openSession'
 import { useAgentsTab } from '@/sidebar/agentsTabStore'
 import { adaptDetail } from '@/sidebar/TasksPanel/adapt'
-import { latestReport, questionText, waitingCount, waitingFor, type TaskView } from '@/sidebar/TasksPanel/model'
+import { questionText, waitingFor, type TaskView } from '@/sidebar/TasksPanel/model'
 import { AgentsPanelView, type AgentsTab } from './AgentsPanel'
 import { AgentsPanelTabs } from './PanelTabs'
 import { WaitingPanel } from './WaitingPanel'
+import { waitingDecisionCount } from './waitingModel'
+import { useUserRequests } from '@/sidebar/userRequestsStore'
+import { sessionJournal } from '@/ipc/client'
+import { showOpenPlan } from './openRun'
 import { previewsSnapshot, subscribePreviews, requestPreview } from '@/sidebar/TasksPanel/attachmentPreviews'
 import { SessionsPanel } from './SessionsPanel'
 import { filterSessions, type SessionView } from './sessionsModel'
@@ -193,6 +197,13 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
    * builds arrays (`check:selectors`' rule for a derived value), and counted for the tab's badge
    * whichever tab is showing: the badge is how the user learns there is something there.
    */
+  const requestView = useUserRequests((s) => s.view)
+  const requestError = useUserRequests((s) => s.error)
+  const respondRequest = useUserRequests((s) => s.respond)
+  const selectedTask = useTasks((s) => s.selected)
+  const decisionBackStack = useTasks((s) => s.decisionBackStack)
+  const selectFromDecision = useTasks((s) => s.selectFromDecision)
+  const pendingRequests = useMemo(() => requestView?.requests.filter((r) => !r.delivered) ?? [], [requestView])
   const panelTab = useAgentsTab((s) => s.tab)
   const setPanelTab = useAgentsTab((s) => s.setTab)
   const waiting = useMemo(
@@ -200,8 +211,8 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     [board],
   )
   const waitingTotal = useMemo(
-    () => waitingCount(board.kind === 'ready' ? board.tasks : NO_TASKS),
-    [board],
+    () => waitingDecisionCount(pendingRequests, [...waiting.questions, ...waiting.review]),
+    [waiting, pendingRequests],
   )
   /*
    * Each review row's latest report. The board carries a comment *count*, not the comments (M68),
@@ -211,6 +222,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
    */
   const previews = useSyncExternalStore(subscribePreviews, previewsSnapshot, previewsSnapshot)
   const [reports, setReports] = useState<Readonly<Record<string, string | null>>>({})
+  const [reportAttachments, setReportAttachments] = useState<Readonly<Record<string, readonly import('@/sidebar/TasksPanel/model').AttachmentView[]>>>({})
   const reviewIds = waiting.review.map((t) => t.id).join(' ')
   useEffect(() => {
     if (panelTab !== 'waiting' || project === null || reviewIds === '') return
@@ -221,7 +233,9 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
         .then((wire) => {
           const detail = adaptDetail(wire)
           if (!live || detail === null) return
-          setReports((all) => ({ ...all, [id]: latestReport(detail.comments) }))
+          const report = detail.comments.filter((c) => !c.superseded).reduce<import('@/sidebar/TasksPanel/model').CommentView | null>((best, c) => best === null || c.atMs >= best.atMs ? c : best, null)
+          setReports((all) => ({ ...all, [id]: report?.text ?? null }))
+          setReportAttachments((all) => ({ ...all, [id]: report?.attachments ?? [] }))
         })
         // A failed read leaves the row without its line; the row itself and its buttons stand.
         .catch(() => {})
@@ -231,15 +245,14 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     }
   }, [panelTab, project, reviewIds, board])
   // A report read for one project is not a report of the next one's task with the same id.
-  useEffect(() => setReports({}), [project])
+  useEffect(() => { setReports({}); setReportAttachments({}) }, [project])
   /** Rows with a response in flight, so Accept cannot be pressed twice into two merges. */
   const [responding, setResponding] = useState<ReadonlySet<string>>(NO_IDS)
   const respondTask = useTasks((s) => s.respond)
   const respond = useCallback(
     (task: string, response: TaskResponse) => {
       setResponding((now) => new Set([...now, task]))
-      void respondTask(task, response)
-        .catch((reason: unknown) => notifyFailure(reason, { project }))
+      return respondTask(task, response)
         .finally(() =>
           setResponding((now) => {
             const next = new Set(now)
@@ -470,9 +483,15 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
         review={waiting.review}
         questions={waiting.questions}
         reports={reports}
+        reportAttachments={reportAttachments}
         busy={responding}
+        requests={pendingRequests}
+        requestError={requestError}
+        taskOpen={selectedTask !== null && decisionBackStack.length > 0}
+        onRespondRequest={respondRequest}
+        onOpenSession={(id) => { void sessionJournal.open(project, id).then((plan) => { if (plan.kind === 'unavailable') throw new Error(plan.reason); return showOpenPlan(plan, 'Request conversation', 'session') }).catch(notifyFailure) }}
         // The run row's task link, exactly — see `onRevealTask` below for the road and its refusals.
-        onOpenTask={(task) => revealTask(task, project)}
+        onOpenTask={(task) => selectFromDecision(task)}
         onAccept={(task) => respond(task, { kind: 'accept' })}
         onSendBack={(task, note) => respond(task, { kind: 'sendBack', note })}
         onAnswer={(task, response) => respondTask(task, response)}

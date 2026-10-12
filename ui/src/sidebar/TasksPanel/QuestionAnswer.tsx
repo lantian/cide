@@ -4,21 +4,31 @@ import { VisualChoices } from '@/kit/components/Choice'
 import { Textarea } from '@/kit/components/Field'
 import { Dialog } from '@/kit/components/Overlay'
 import { Modal } from '@/overlays/ModalShell'
+import { ImageViewer, type ImageGallery, type ViewerImage } from '@/overlays/ImageViewer'
 import { questionText, type TaskQuestion, type QuestionAnswer as Answer, type AttachmentPreview } from './model'
+import { TaskReferences, type OpenTaskReference } from './TaskReferences'
 import styles from './QuestionAnswer.module.css'
 
 export type AnswerHandler = (task: string, answer: Answer) => void | Promise<void>
 
+export function questionImages(question: TaskQuestion): readonly ViewerImage[] {
+  return typeof question === 'string' ? [] : question.options.flatMap((option) => option.image === undefined ? [] : [{ id: option.id, title: option.title, previewId: option.image }])
+}
+
 /** A pure view: image access and responses are supplied by the panel/card host. */
-export function QuestionAnswer({ task, title, question, busy = false, previews, onRequestPreview, onAnswer, onOpenTask, compact = false }: {
+export function QuestionAnswer({ task, title, question, busy = false, previews, onRequestPreview, onAnswer, onOpenTask, compact = false, embedded = false, formId, onValidityChange, onViewImage }: {
   task: string
   title?: string | undefined
   question: TaskQuestion
   busy?: boolean | undefined
   previews?: Readonly<Record<string, AttachmentPreview>> | undefined
+  onViewImage?: ((gallery: ImageGallery) => void) | undefined
   onRequestPreview?: ((task: string, image: string) => void) | undefined
   onAnswer?: AnswerHandler | undefined
-  onOpenTask?: ((task: string) => void) | undefined
+  onOpenTask?: OpenTaskReference | undefined
+  embedded?: boolean | undefined
+  formId?: string | undefined
+  onValidityChange?: ((valid: boolean) => void) | undefined
   compact?: boolean | undefined
 }) {
   const [text, setText] = useState('')
@@ -26,12 +36,14 @@ export function QuestionAnswer({ task, title, question, busy = false, previews, 
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
-  const [viewing, setViewing] = useState<{ url: string; title: string } | null>(null)
+  const [viewing, setViewing] = useState<ImageGallery | null>(null)
   const inFlight = useRef(false)
   const groupName = useId()
   const locked = busy || sending
   const options = typeof question === 'string' ? [] : question.options
+  const images = questionImages(question)
   const valid = selected.length > 0 || text.trim() !== ''
+  useEffect(() => { onValidityChange?.(valid && !locked) }, [valid, locked, onValidityChange])
   const send = async () => {
     if (!valid || locked || inFlight.current || onAnswer === undefined) return
     inFlight.current = true
@@ -50,8 +62,8 @@ export function QuestionAnswer({ task, title, question, busy = false, previews, 
     }
   }
   const form = (
-    <div className={styles.form} data-audit="questionAnswerForm">
-      <p className={compact && !expanded ? styles.summary : styles.text} data-audit="waitingQuestion">{questionText(question)}</p>
+    <form id={formId} className={styles.form} data-audit="questionAnswerForm" onSubmit={(event) => { event.preventDefault(); void send() }}>
+      <p className={compact && !expanded ? styles.summary : styles.text} data-audit="waitingQuestion"><TaskReferences text={questionText(question)} onOpenTask={onOpenTask} /></p>
       {options.length > 0 && (
         <VisualChoices label={typeof question !== 'string' && question.selection === 'multiple' ? 'Choose one or more' : 'Choose one'}
           name={`question-${task}-${groupName}`} multiple={typeof question !== 'string' && question.selection === 'multiple'}
@@ -61,7 +73,8 @@ export function QuestionAnswer({ task, title, question, busy = false, previews, 
             ...(option.description === undefined ? {} : { description: option.description }),
             ...(option.image === undefined ? {} : { art: <QuestionImage
               task={task} image={option.image} title={option.title} preview={previews?.[option.image]}
-              onRequest={onRequestPreview} onView={(url) => setViewing({ url, title: option.title })} /> }),
+              onRequest={onRequestPreview} onView={() => (onViewImage ?? setViewing)({ images, current: option.id,
+                returnFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null })} /> }),
           }))} />
       )}
       {selected.length > 0 && onAnswer !== undefined && <Button size="sm" variant="link" disabled={locked}
@@ -69,45 +82,41 @@ export function QuestionAnswer({ task, title, question, busy = false, previews, 
       {onAnswer !== undefined && (
         <>
           <Textarea aria-label={`Your answer to ${task}`} placeholder={options.length > 0 ? 'Custom answer or additional details' : 'Your answer — Ctrl+Enter sends'}
-            rows={3} value={text} disabled={locked} autoFocus={expanded} onChange={(e) => setText(e.target.value)}
+            rows={3} value={text} disabled={locked} autoFocus={expanded || embedded} onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send() }
             }} />
           {error !== null && <p className={styles.error} role="alert">{error}</p>}
-          <Button size="sm" variant="primary" busy={locked} disabled={!valid || locked}
-            data-audit="waitingAnswer" data-write="true" onClick={() => void send()}>Answer</Button>
+          {!embedded && <Button size="sm" variant="primary" busy={locked} disabled={!valid || locked}
+            data-audit="waitingAnswer" data-write="true" onClick={() => void send()}>Answer</Button>}
         </>
       )}
-    </div>
+    </form>
   )
   return (
     <div className={styles.response}>
       {expanded ? (
-        <Modal onDismiss={() => viewing === null && setExpanded(false)}>
+        <Modal suspended={viewing !== null} onDismiss={() => viewing === null && setExpanded(false)}>
           <Dialog title={title || `Question on ${task}`} width={options.length > 0 ? 'wide' : 'picker'}
             titleAside={onOpenTask === undefined ? undefined : <Button variant="link" size="sm"
-              data-audit="waitingDialogOpenTask" onClick={() => { setExpanded(false); onOpenTask(task) }}>{task}</Button>}
+              data-audit="waitingDialogOpenTask" onClick={(event) => { setExpanded(false); onOpenTask(task, event.currentTarget) }}>{task}</Button>}
             data-audit="waitingQuestionDialog" onClose={() => setExpanded(false)}
             onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setExpanded(false) } }}>{form}</Dialog>
         </Modal>
       ) : form}
-      {(compact || options.length > 0) && <Button size="sm" variant="link" data-audit="waitingReadAll" onClick={() => setExpanded(true)}>
+      {!embedded && (compact || options.length > 0) && <Button size="sm" variant="link" data-audit="waitingReadAll" onClick={() => setExpanded(true)}>
         {options.length > 0 ? 'Compare choices' : 'Read in full'}
       </Button>}
       {viewing !== null && (
-        <Modal onDismiss={() => setViewing(null)}>
-          <Dialog title={viewing.title} width="wide" onClose={() => setViewing(null)}
-            onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setViewing(null) } }}
-            actions={<Button autoFocus onClick={() => setViewing(null)}>Close</Button>}>
-            <img className={styles.fullImage} src={viewing.url} alt={viewing.title} />
-          </Dialog>
-        </Modal>
+        <ImageViewer {...viewing} images={images} previews={previews ?? {}} closeLabel={embedded ? 'Back' : 'Close'}
+          onClose={() => setViewing(null)} onStep={(current) => setViewing((gallery) => gallery && { ...gallery, current })}
+          onRequestPreview={(image) => onRequestPreview?.(task, image)} />
       )}
     </div>
   )
 }
 
-function QuestionImage({ task, image, title, preview, onRequest, onView }: {
+export function QuestionImage({ task, image, title, preview, onRequest, onView }: {
   task: string; image: string; title: string
   preview: AttachmentPreview | undefined
   onRequest: ((task: string, image: string) => void) | undefined
@@ -115,6 +124,8 @@ function QuestionImage({ task, image, title, preview, onRequest, onView }: {
 }) {
   const element = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState(false)
+  const url = preview?.kind === 'ready' ? preview.url : undefined
+  useEffect(() => { setFailed(false) }, [image, url])
   useEffect(() => {
     if (preview !== undefined || onRequest === undefined || element.current === null) return
     if (typeof IntersectionObserver === 'undefined') { onRequest(task, image); return }

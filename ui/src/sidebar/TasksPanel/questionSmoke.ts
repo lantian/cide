@@ -1,4 +1,7 @@
 export { QuestionAnswer } from './QuestionAnswer'
 export { QuestionField } from './TaskWaitFields'
 export { WaitingPanel } from '../AgentsPanel/WaitingPanel'
+export { AgentsPanelTabs } from '../AgentsPanel/PanelTabs'
+export { waitingDecisionCount } from '../AgentsPanel/waitingModel'
 export { waitingFor, waitingCount } from './model'
+export { TaskDetailPendingModal } from './TaskDetail'

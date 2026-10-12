@@ -333,7 +333,7 @@ expectScreen?: string, } | { "t": "paste", session: SessionId, text: string, seq
 /**
  * See [`Self::Input`]'s field of the same name.
  */
-expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "taskRespond", project: ProjectId, task: TaskId, response: TaskResponse, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "consoleClose", project: ProjectId, pane: PaneId, session: SessionId, } | { "t": "consoleUploadBegin", session: SessionId, name: string, size: number, } | { "t": "consoleUploadChunk", upload: string, offset: number, data: string, } | { "t": "consoleUploadFinish", upload: string, } | { "t": "consoleUploadCancel", upload: string, } | { "t": "ping" };
+expectScreen?: string, } | { "t": "scroll", session: SessionId, lines: number, seq: number, } | { "t": "acknowledge", session: SessionId, } | { "t": "watchScreen", session: SessionId, } | { "t": "unwatchScreen", session: SessionId, } | { "t": "scrollbackPage", session: SessionId, fromTop: number, rows: number, } | { "t": "runStop", project: ProjectId, run: RunId, reason?: string, force?: boolean, } | { "t": "runPause", project: ProjectId, run?: RunId, } | { "t": "runResume", project: ProjectId, run?: RunId, } | { "t": "dispatch", request: DispatchRequest, } | { "t": "taskNew", task: TaskNew, } | { "t": "taskEdit", project: ProjectId, task: TaskId, edit: TaskEdit, } | { "t": "taskGet", project: ProjectId, task: TaskId, } | { "t": "taskRespond", project: ProjectId, task: TaskId, response: TaskResponse, } | { "t": "userRequestsGet", project: ProjectId, } | { "t": "userRequestRespond", project: ProjectId, id: string, response: UserRequestResponse, } | { "t": "scrollView", session: SessionId, pages: number, seq: number, } | { "t": "milestonesGet", project: ProjectId, } | { "t": "gateRun", project: ProjectId, milestone: string, } | { "t": "milestoneAccept", project: ProjectId, milestone: string, } | { "t": "proposalAccept", project: ProjectId, id: string, } | { "t": "proposalReject", project: ProjectId, id: string, } | { "t": "checkLog", project: ProjectId, kind: string, key: string, } | { "t": "attachmentRead", project: ProjectId, task: TaskId, attachment: TaskAttachmentId, offset: number, len: number, } | { "t": "consoleClose", project: ProjectId, pane: PaneId, session: SessionId, } | { "t": "consoleUploadBegin", session: SessionId, name: string, size: number, } | { "t": "consoleUploadChunk", upload: string, offset: number, data: string, } | { "t": "consoleUploadFinish", upload: string, } | { "t": "consoleUploadCancel", upload: string, } | { "t": "ping" };
 
 /**
  * One frame from a device.
@@ -1160,7 +1160,7 @@ features: Array<string>, } | { "t": "paired", device: string, key: string,
  * placeholder shared by every typed pairing makes two machines look like one — so the
  * list would show one entry that connects to whichever answered last.
  */
-instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "pasteAccepted", session: SessionId, seq: number, } | { "t": "consoleClosed", pane: PaneId, } | { "t": "consoleUploadReady", upload: string, } | { "t": "consoleUploadProgress", upload: string, offset: number, } | { "t": "consoleUploadFinished", upload: string, path: string, } | { "t": "consoleUploadCancelled", upload: string, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
+instance: string, label: string, } | { "t": "projects", rev: number, projects: Array<RemoteProject>, } | { "t": "sessions", sessions: Array<RemoteSession>, } | { "t": "sessionState", session: SessionId, state: SessionState, } | { "t": "awaiting", entries: Array<AwaitingEntry>, } | { "t": "error", kind: string, detail: string, } | { "t": "prompt", session: SessionId, prompt: PermissionPrompt, } | { "t": "promptGone", session: SessionId, } | { "t": "dispatched", run: RunId, } | { "t": "taskResponded", project: ProjectId, task: TaskId, } | { "t": "userRequests", project: ProjectId, view: UserRequestsView | null, } | { "t": "pasteAccepted", session: SessionId, seq: number, } | { "t": "consoleClosed", pane: PaneId, } | { "t": "consoleUploadReady", upload: string, } | { "t": "consoleUploadProgress", upload: string, offset: number, } | { "t": "consoleUploadFinished", upload: string, path: string, } | { "t": "consoleUploadCancelled", upload: string, } | { "t": "screen", update: ScreenUpdate, } | { "t": "scrollback", session: SessionId, page: ScrollbackCapture, } | { "t": "screenGone", session: SessionId, } | { "t": "runs", project: ProjectId, runs: Array<AgentRun>, } | { "t": "roster", project: ProjectId, agents: Array<RemoteAgent>, 
 /**
  * Whether the queue will start anything new.
  *
@@ -1194,6 +1194,60 @@ id?: number, body: ServerBody, };
  * A PTY-backed session. For Claude panes this is the `--session-id` uuid.
  */
 export type SessionId = string;
+
+/**
+ * Where a conversation was hosted — the Sessions tab's filter.
+ *
+ * First seen wins, with one exception: a run kind outranks a pane kind, because a run's mirror
+ * tab is a pane of type [`Self::Tab`] showing a conversation that is a [`Self::Subagent`]'s.
+ */
+export type SessionKind = "console" | "consoleSplit" | "tab" | "worker" | "planner" | "reviewer" | "subagent" | "mrReview" | "openSpec";
+
+/**
+ * One conversation, as the journal remembers it. Durable, and outbound inside [`SessionRow`].
+ */
+export type SessionRecord = { 
+/**
+ * The harness's conversation id, or cide's session handle standing in until the harness
+ * names one — see [`Self::known`].
+ */
+id: string, 
+/**
+ * Whether [`Self::id`] is the harness's own id, the one a resume can use.
+ */
+known: boolean, kind: SessionKind, harness: Harness, 
+/**
+ * The pane's title, or the run's role label.
+ */
+title: string, 
+/**
+ * The name the user gave the conversation with `/rename`, read from its transcript. Drawn
+ * instead of [`Self::title`] when there is one; kept apart so a pane's next sighting, which
+ * knows only its own title, cannot overwrite it.
+ */
+name: string | null, 
+/**
+ * Where the harness was started — the directory it filed the transcript under, and the one
+ * a resume must start in (a worktree for a run, the project root for a console).
+ */
+cwd: string, 
+/**
+ * cide's handle when it was last seen, which is what "is it live" is asked with.
+ */
+session: SessionId | null, run: RunId | null, 
+/**
+ * The role's label for a run.
+ */
+agent: string | null, task: TaskId | null, taskTitle: string | null, 
+/**
+ * What it was first asked: a run's prompt, or the first user message of a transcript,
+ * clipped to [`PROMPT_CLIP`] characters.
+ */
+prompt: string | null, 
+/**
+ * The worktree it stands in, when it stands in one.
+ */
+branch: string | null, startedUnixMs: number, lastSeenUnixMs: number, };
 
 /**
  * Lifecycle of a session, driven by Claude Code hooks with a PTY-quiet fallback.
@@ -1779,6 +1833,16 @@ export type TaskStatusChange = { from: TaskStatus, to: TaskStatus, by: TaskAutho
  * Stamped by Rust when the change lands, for [`TaskComment::at_unix_ms`]'s reason.
  */
 atUnixMs: bigint, };
+
+export type UserRequest = { id: string, title: string, message: string, task: TaskId | null, author: TaskAuthor, request: UserRequestKind, origin: SessionRecord, wait: boolean, createdUnixMs: bigint, response: UserRequestResponse | null, applying: boolean, delivered: boolean, deliveryError: string | null, };
+
+export type UserRequestKind = { "kind": "question", question: TaskQuestion, } | { "kind": "moveTasks", milestone: string, goal: TaskId, tasks: Array<UserRequestTask>, };
+
+export type UserRequestResponse = { "kind": "answer", text: string, selectedIds: Array<string>, } | { "kind": "approve", selectedIds: Array<TaskId>, note: string, } | { "kind": "reject", note: string, } | { "kind": "cancel" };
+
+export type UserRequestTask = { id: TaskId, title: string, status: TaskStatus, parent: TaskId | null, };
+
+export type UserRequestsView = { rev: bigint, requests: Array<UserRequest>, };
 
 /**
  * Verify on one task's branch. Outbound.

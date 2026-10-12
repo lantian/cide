@@ -769,6 +769,7 @@ impl Flavor {
                     "type": "local",
                     "command": [hook.to_string_lossy(), "mcp"],
                     "enabled": true,
+                    "timeout": 604800000,
                 }),
             );
             config.insert("mcp".into(), Value::Object(servers));
@@ -3300,6 +3301,7 @@ fn config_json(flavor: &Flavor, plan: &RunPlan<'_>, generation: Generation) -> O
                 // knowledge of the vocabulary at all. See its module doc.
                 "command": [hook.to_string_lossy(), "mcp"],
                 "enabled": true,
+                    "timeout": 604800000,
             }),
         );
         config.insert("mcp".into(), Value::Object(servers));

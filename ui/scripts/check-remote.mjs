@@ -220,6 +220,8 @@ const KNOWN_CLIENT_FRAMES = [
   'taskNew',
   'taskRespond',
   'unwatchScreen',
+  'userRequestRespond',
+  'userRequestsGet',
   'watchScreen',
 ]
 const clientBody = protocol.match(/export type ClientBody = ([\s\S]*?);\n/)

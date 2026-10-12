@@ -310,6 +310,21 @@ pub async fn task_edit(
     edit: TaskEdit,
 ) -> Result<TaskBoard> {
     let root = tasks_state::project_root(&state, project)?;
+    // Older clients answer via a comment followed by clearing the question. Resolve the same
+    // broker request so its blocked MCP call returns instead of spawning a second turn.
+    if matches!(&edit, TaskEdit::SetQuestion { question: None })
+        && let Ok(requests) = crate::user_requests::store(&app)
+    {
+        let current = stores.ensure(project, &root).get(&task);
+        if let Some(request) = requests.view(&root).requests.into_iter().find(|r| r.task.as_ref() == Some(&task) && r.response.is_none() && matches!(&r.request, cide_ipc::UserRequestKind::Question { question } if current.as_ref().and_then(|t| t.question.as_ref()) == Some(question))) {
+                let text = current.as_ref().and_then(|t| t.comments.iter().rev().find(|c| !c.deleted && c.author == cide_ipc::TaskAuthor::User)).map(|c| c.text.clone())
+                    .unwrap_or_else(|| format!("The user cleared the question on {task}. Read its latest comments for the answer; missing detail is not approval."));
+                let app_for_request = app.clone();
+                blocking(move || crate::user_requests::respond(&app_for_request, project, &request.id, cide_ipc::UserRequestResponse::Answer { text, selected_ids: Vec::new() })).await?;
+                return Ok(answer(&app, project, &stores.ensure(project, &root)));
+            }
+    }
+
     let stores = Arc::clone(&stores);
     let task_for_handback = task.clone();
     let (store, mutation, continue_role) = blocking(move || {
@@ -503,6 +518,39 @@ pub async fn task_respond(
     response: cide_ipc::TaskResponse,
 ) -> Result<TaskBoard> {
     let root = tasks_state::project_root(&state, project)?;
+    if let cide_ipc::TaskResponse::Answer {
+        text,
+        selected_ids,
+        expected_question,
+    } = &response
+        && let Ok(requests) = crate::user_requests::store(&app)
+        && let Some(request) = requests.view(&root).requests.into_iter().find(|r| {
+            r.task.as_ref() == Some(&task)
+                && r.response.is_none()
+                && matches!(r.request, cide_ipc::UserRequestKind::Question { .. })
+        })
+    {
+        if let cide_ipc::UserRequestKind::Question { question } = &request.request
+            && expected_question
+                .as_ref()
+                .is_some_and(|shown| shown != question)
+        {
+            return Err(CoreError::Io(
+                "The question changed; review it before answering.".into(),
+            ));
+        }
+        let app_for_request = app.clone();
+        let response = cide_ipc::UserRequestResponse::Answer {
+            text: text.clone(),
+            selected_ids: selected_ids.clone(),
+        };
+        blocking(move || {
+            crate::user_requests::respond(&app_for_request, project, &request.id, response)
+        })
+        .await?;
+        let store = tracker(&stores, project, root);
+        return Ok(answer(&app, project, &store));
+    }
     let stores = Arc::clone(&stores);
     let for_thread = task.clone();
     let (store, continue_with) = blocking(move || {

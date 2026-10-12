@@ -37,5 +37,6 @@
   "cide://update-progress",
   "cide://update-ready",
   "cide://user-inputs-changed",
+  "cide://user-requests-changed",
   "cide://workspace-changed"
 ]

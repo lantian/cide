@@ -100,6 +100,7 @@ import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
 import { openCount, waitingCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
+import { useUserRequests } from '@/sidebar/userRequestsStore'
 import { followRunTab } from '@/sidebar/OpenSpecPanel/specRuns'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
@@ -945,6 +946,7 @@ export function App() {
   const waitingTasks = useTasks((s) =>
     s.board.kind === 'ready' ? waitingCount(s.board.tasks) : null,
   )
+  const attachRequests = useUserRequests((s) => s.attach)
   const attachTasks = useTasks((s) => s.attach)
   const adoptTasks = useTasks((s) => s.adopt)
   /*
@@ -958,8 +960,9 @@ export function App() {
   const taskSelected = useTasks((s) => s.selected)
 
   useEffect(() => {
+    void attachRequests(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
     void attachTasks(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
-  }, [attachTasks, activeProjectId, boot?.role.kind])
+  }, [attachTasks, attachRequests, activeProjectId, boot?.role.kind])
 
   useEffect(() => {
     /*

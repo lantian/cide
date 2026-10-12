@@ -371,6 +371,15 @@ enum Scope {
 pub(crate) trait ToolAccess: Send + Sync {
     fn names(&self) -> &[&'static str];
     fn call(&self, name: &str, arguments: &Value) -> ToolResult;
+    fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        _cancelled: &AtomicBool,
+    ) -> ToolResult {
+        self.call(name, arguments)
+    }
+    fn reply_written(&self, _reply: &Value, _success: bool) {}
 }
 
 /// Pair messages are available only on a connection bound to a paired pane.
@@ -399,6 +408,21 @@ impl ToolAccess for PeerTools {
             Err(message) => ToolResult::error(message),
         }
     }
+    fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &AtomicBool,
+    ) -> ToolResult {
+        if name == crate::peer_chat::TOOL {
+            self.call(name, arguments)
+        } else {
+            self.base.call_cancellable(name, arguments, cancelled)
+        }
+    }
+    fn reply_written(&self, reply: &Value, success: bool) {
+        self.base.reply_written(reply, success);
+    }
 }
 
 /// An unscoped connection: a real server, no tools.
@@ -419,6 +443,7 @@ impl ToolAccess for NoTools {
 
 /// A connection bound to one project's tracker.
 struct ProjectTools {
+    run: Option<RunId>,
     app: AppHandle,
     project: ProjectId,
     /// Who a comment written over this connection is from. Decided from the header, never from
@@ -455,12 +480,24 @@ impl ToolAccess for ProjectTools {
         match (self.orchestrator, self.tracker) {
             (true, true) => tools::tool::EVERY,
             (true, false) => tools::tool::ORCHESTRATION_NO_TRACKER,
-            (false, true) => tools::tool::ALL,
-            (false, false) => &[],
+            (false, true) => tools::tool::RUN,
+            (false, false) => tools::tool::REQUESTS,
         }
     }
 
     fn call(&self, name: &str, arguments: &Value) -> ToolResult {
+        self.call_cancellable(name, arguments, &AtomicBool::new(false))
+    }
+    fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &AtomicBool,
+    ) -> ToolResult {
+        if tools::tool::REQUESTS.contains(&name) {
+            return self.user_request(name, arguments, cancelled);
+        }
+
         let Some(store) = self.store() else {
             // The project closed while this agent was mid-turn. A sentence rather than a
             // JSON-RPC error, so the model reads it and stops rather than reporting a broken
@@ -552,8 +589,43 @@ impl ToolAccess for ProjectTools {
                 );
             }
         }
+        let asked = arguments
+            .get("question")
+            .filter(|q| !q.is_null())
+            .and_then(|_| {
+                mutations
+                    .iter()
+                    .find_map(|m| m.after.question.clone().map(|q| (m.after.id.clone(), q)))
+            });
         crate::task_triggers::consider(&self.app, self.project, mutations, notify);
+        if !result.is_error
+            && let Some((task, question)) = asked
+        {
+            let args = json!({ "kind": "question", "task": task, "question": question, "wait": arguments.get("questionWait").and_then(Value::as_bool).unwrap_or(true), "title": arguments.get("questionTitle").and_then(Value::as_str) });
+            return self.user_request(tools::tool::USER_REQUEST, &args, cancelled);
+        }
         result
+    }
+    fn reply_written(&self, reply: &Value, success: bool) {
+        if let Some(text) = reply
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            && let Ok(value) = serde_json::from_str::<Value>(text)
+            && let Some(id) = value.get("id").and_then(Value::as_str)
+            && let (Ok(root), Ok(requests)) = (
+                crate::user_requests::root(&self.app, self.project),
+                crate::user_requests::store(&self.app),
+            )
+        {
+            if requests.get(&root, id).is_err() {
+                return;
+            }
+            if success && value.get("pending") == Some(&Value::Bool(false)) {
+                let _ = requests.delivered(&root, id);
+            }
+            requests.release(id);
+            crate::user_requests::broadcast(&self.app, self.project);
+        }
     }
 }
 
@@ -565,6 +637,84 @@ impl ProjectTools {
             tools::CallerKind::Console
         } else {
             self.caller
+        }
+    }
+
+    fn user_request(&self, name: &str, args: &Value, cancelled: &AtomicBool) -> ToolResult {
+        if args.get("wait").is_some_and(|wait| !wait.is_boolean()) {
+            return ToolResult::error("wait must be a boolean");
+        }
+        if name == tools::tool::USER_REQUEST
+            && args
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("question")
+                == "question"
+            && let (Some(task), Some(question), Some(tasks)) = (
+                args.get("task").and_then(Value::as_str),
+                args.get("question"),
+                self.store(),
+            )
+            && let Ok(question_typed) =
+                serde_json::from_value::<cide_ipc::TaskQuestion>(question.clone())
+            && let Some(current) = tasks.get(&TaskId(task.to_owned()))
+            && question_typed
+                .options()
+                .iter()
+                .filter_map(|o| o.image.as_ref())
+                .any(|image| {
+                    !current
+                        .attachments
+                        .iter()
+                        .any(|a| &a.id == image && !a.deleted)
+                })
+        {
+            return self.call_cancellable(tools::tool::TASK_UPDATE, &json!({ "id": task, "question": question, "questionWait": args.get("wait").and_then(Value::as_bool).unwrap_or(true), "questionTitle": args.get("title") }), cancelled);
+        }
+        let work = || -> cide_core::Result<Value> {
+            let root = crate::user_requests::root(&self.app, self.project)?;
+            let requests = crate::user_requests::store(&self.app)?;
+            let request = if name == tools::tool::USER_REQUEST_RESULT {
+                let id = args.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    cide_core::CoreError::Io("Supply the saved request id.".into())
+                })?;
+                let request = requests.get(&root, id)?;
+                let listing = crate::sessions_state::list(&self.app, self.project)?;
+                let same = listing.rows.iter().any(|r| {
+                    (r.record.id == request.origin.id
+                        || (!request.origin.known && r.record.session == request.origin.session))
+                        && (self.run.is_some_and(|run| r.record.run == Some(run))
+                            || self
+                                .session
+                                .is_some_and(|session| r.record.session == Some(session)))
+                });
+                if !same {
+                    return Err(cide_core::CoreError::Io(
+                        "Only the asking conversation may read this result.".into(),
+                    ));
+                }
+                request
+            } else {
+                crate::user_requests::create(
+                    &self.app,
+                    self.project,
+                    self.session,
+                    self.run,
+                    self.author.clone(),
+                    args,
+                )?
+            };
+            let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(true);
+            let request = if wait {
+                requests.wait(&root, &request.id, || cancelled.load(Ordering::Acquire))?
+            } else {
+                request
+            };
+            Ok(crate::user_requests::result_value(&request))
+        };
+        match work() {
+            Ok(value) => ToolResult::text(value.to_string()),
+            Err(error) => ToolResult::error(error.to_string()),
         }
     }
 
@@ -1796,6 +1946,9 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                     Box::new(NoTools)
                 } else {
                     Box::new(ProjectTools {
+                        run: hello
+                            .and_then(|h| h.run.as_deref())
+                            .and_then(|r| r.parse().ok()),
                         app: app.clone(),
                         project,
                         author: TaskAuthor::Orchestrator,
@@ -1818,6 +1971,9 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
             Scope::Pane {
                 project, session, ..
             } => Box::new(ProjectTools {
+                run: hello
+                    .and_then(|h| h.run.as_deref())
+                    .and_then(|r| r.parse().ok()),
                 app: app.clone(),
                 project,
                 // The nearest honest fit for a session a person is driving in this project, and
@@ -1833,6 +1989,9 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 caller: tools::CallerKind::Console,
             }),
             Scope::CideTab { project, session } => Box::new(ProjectTools {
+                run: hello
+                    .and_then(|h| h.run.as_deref())
+                    .and_then(|r| r.parse().ok()),
                 app: app.clone(),
                 project,
                 // Signed as the orchestrator, like any pane cide opened before M132; what
@@ -1845,6 +2004,9 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 caller: tools::CallerKind::CideTab,
             }),
             Scope::Worker { project, session } => Box::new(ProjectTools {
+                run: hello
+                    .and_then(|h| h.run.as_deref())
+                    .and_then(|r| r.parse().ok()),
                 app: app.clone(),
                 project,
                 author: TaskAuthor::Agent {
@@ -1867,6 +2029,9 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 cwd,
                 board,
             } => Box::new(ProjectTools {
+                run: hello
+                    .and_then(|h| h.run.as_deref())
+                    .and_then(|r| r.parse().ok()),
                 app: app.clone(),
                 project,
                 // The run's own role, taken from the registry rather than from anything the child
@@ -1908,7 +2073,7 @@ fn serve(stream: UnixStream, bind: &Binder) {
         tracing::warn!(%error, "no write timeout on an agent connection; dropping it");
         return;
     }
-    let Ok(mut out) = stream.try_clone() else {
+    let Ok(out) = stream.try_clone() else {
         tracing::warn!("could not clone an agent connection for writing; dropping it");
         return;
     };
@@ -1949,24 +2114,56 @@ fn serve(stream: UnixStream, bind: &Binder) {
 
     // Bound **once**, here, and never re-derived per message — see the module header on why that
     // is a promise to a client holding a cached `tools/list`.
-    let access = bind(hello.as_ref());
-
+    let access: Arc<dyn ToolAccess> = Arc::from(bind(hello.as_ref()));
+    let out = Arc::new(Mutex::new(out));
+    let pending: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     for line in replay.into_iter().map(Ok).chain(lines) {
-        let Ok(line) = line else { return };
+        let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        let Some(reply) = respond(&classify(&line), access.as_ref()) else {
+        if let Ok(value) = serde_json::from_str::<Value>(&line)
+            && value["method"] == "notifications/cancelled"
+        {
+            if let Some(cancel) = pending
+                .lock()
+                .get(&value["params"]["requestId"].to_string())
+            {
+                cancel.store(true, Ordering::Release);
+            }
             continue;
-        };
-        if let Err(error) = write_line(&mut out, &reply) {
-            // Fatal to the connection and never retried: a write that failed part-way through a
-            // line cannot be resumed, and sending the next reply after a partial one would splice
-            // two JSON-RPC messages into one unparseable line. `cide_hook::mcp` states the same
-            // rule for the same framing.
-            tracing::debug!(%error, "an agent connection went away mid-reply");
-            return;
         }
+        let inbound = classify(&line);
+        if let Inbound::Request { id, method, params } = &inbound
+            && method == "tools/call"
+        {
+            let key = id.to_string();
+            let cancel = Arc::new(AtomicBool::new(false));
+            pending.lock().insert(key.clone(), Arc::clone(&cancel));
+            let (access, out, pending, id, params) = (
+                Arc::clone(&access),
+                Arc::clone(&out),
+                Arc::clone(&pending),
+                id.clone(),
+                params.clone(),
+            );
+            thread::spawn(move || {
+                let reply = call_tool_cancellable(&id, &params, access.as_ref(), &cancel);
+                let success = write_line(&mut *out.lock(), &reply).is_ok();
+                access.reply_written(&reply, success);
+                pending.lock().remove(&key);
+            });
+            continue;
+        }
+        if let Some(reply) = respond(&inbound, access.as_ref())
+            && write_line(&mut *out.lock(), &reply).is_err()
+        {
+            break;
+        }
+    }
+    for cancel in pending.lock().values() {
+        cancel.store(true, Ordering::Release);
     }
 }
 
@@ -2390,6 +2587,15 @@ fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
 }
 
 fn call_tool(id: &Value, params: &Value, access: &dyn ToolAccess) -> Value {
+    call_tool_cancellable(id, params, access, &AtomicBool::new(false))
+}
+
+fn call_tool_cancellable(
+    id: &Value,
+    params: &Value,
+    access: &dyn ToolAccess,
+    cancelled: &AtomicBool,
+) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return err(id, INVALID_PARAMS, "tools/call without a tool name");
     };
@@ -2405,7 +2611,12 @@ fn call_tool(id: &Value, params: &Value, access: &dyn ToolAccess) -> Value {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    ok(id, access.call(name, &arguments).to_json())
+    ok(
+        id,
+        access
+            .call_cancellable(name, &arguments, cancelled)
+            .to_json(),
+    )
 }
 
 fn initialize_result(params: &Value) -> Value {
@@ -5446,6 +5657,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_waiting_request_keeps_the_bridge_responsive_and_survives_cancellation() {
+        struct WaitingAccess {
+            store: Arc<cide_core::user_requests::Requests>,
+            root: PathBuf,
+            finished: std::sync::mpsc::Sender<()>,
+        }
+        impl ToolAccess for WaitingAccess {
+            fn names(&self) -> &'static [&'static str] {
+                tools::tool::REQUESTS
+            }
+            fn call(&self, _: &str, _: &Value) -> tools::ToolResult {
+                unreachable!("cancellable dispatch")
+            }
+            fn call_cancellable(
+                &self,
+                _: &str,
+                args: &Value,
+                cancel: &AtomicBool,
+            ) -> tools::ToolResult {
+                match self
+                    .store
+                    .wait(&self.root, args["id"].as_str().unwrap(), || {
+                        cancel.load(Ordering::Acquire)
+                    }) {
+                    Ok(request) => tools::ToolResult::text(
+                        crate::user_requests::result_value(&request).to_string(),
+                    ),
+                    Err(error) => tools::ToolResult::error(error.to_string()),
+                }
+            }
+            fn reply_written(&self, reply: &Value, _: bool) {
+                if let Some(text) = reply
+                    .pointer("/result/content/0/text")
+                    .and_then(Value::as_str)
+                    && let Ok(value) = serde_json::from_str::<Value>(text)
+                    && let Some(id) = value["id"].as_str()
+                {
+                    self.store.release(id);
+                }
+                self.finished.send(()).unwrap();
+            }
+        }
+        let root = std::env::temp_dir().join(format!("cide-waiting-rpc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(cide_core::user_requests::Requests::load(
+            root.join("requests.json"),
+        ));
+        for id in ["answer", "cancel", "disconnect"] {
+            let request = serde_json::from_value(json!({
+                "id": id, "title": id, "message": id, "task": null, "author": { "kind": "orchestrator" },
+                "request": { "kind": "question", "question": id },
+                "origin": { "id": "conversation", "known": true, "kind": "planner", "harness": "codex", "title": "Plan", "cwd": root, "startedUnixMs": 1, "lastSeenUnixMs": 1 },
+                "wait": true, "createdUnixMs": 1, "response": null, "applying": false, "delivered": false, "deliveryError": null,
+            })).unwrap();
+            store.create(&root, request).unwrap();
+        }
+        let path = root.join("rpc.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (finished, replies) = std::sync::mpsc::channel();
+        let (server_store, server_root) = (Arc::clone(&store), root.clone());
+        let server = thread::spawn(move || {
+            let bind: Box<Binder> = Box::new(move |_| {
+                Box::new(WaitingAccess {
+                    store: Arc::clone(&server_store),
+                    root: server_root.clone(),
+                    finished: finished.clone(),
+                })
+            });
+            serve(listener.accept().unwrap().0, bind.as_ref());
+        });
+        let mut client = Client::connect(&path);
+        client.send(json!({ "hello": HELLO, "v": HELLO_VERSION, "session": "console", "pid": 42 }));
+        let wait = |id, request| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": tools::tool::USER_REQUEST_RESULT, "arguments": { "id": request } } });
+        client.send(wait(1, "answer"));
+        client.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }));
+        assert_eq!(
+            client.recv()["id"],
+            2,
+            "ping is answered while the question is pending"
+        );
+        store
+            .decide(
+                &root,
+                "answer",
+                cide_ipc::UserRequestResponse::Answer {
+                    text: "Proceed".into(),
+                    selected_ids: vec![],
+                },
+            )
+            .unwrap();
+        let answer = client.recv();
+        assert_eq!(answer["id"], 1);
+        assert_eq!(answer["result"]["isError"], false);
+        replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        client.send(wait(3, "cancel"));
+        client.send(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 3 } }));
+        assert_eq!(client.recv()["result"]["isError"], true);
+        replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(store.get(&root, "cancel").unwrap().response.is_none());
+        client.send(wait(5, "disconnect"));
+        client.send(json!({ "jsonrpc": "2.0", "id": 6, "method": "ping" }));
+        assert_eq!(client.recv()["id"], 6);
+        drop(client);
+        server.join().unwrap();
+        replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!store.has_waiter("disconnect"));
+        let restored = cide_core::user_requests::Requests::load(root.join("requests.json"));
+        assert!(
+            restored
+                .get(&root, "disconnect")
+                .unwrap()
+                .response
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The whole protocol over a real socket: header, `initialize`, a notification that must not
     /// be answered, `tools/list`, `tools/call` — and a second connection whose header resolves to
     /// nothing, which must get a clean handshake and no tools at all.
@@ -5590,7 +5919,10 @@ mod tests {
         let bind: Arc<Binder> = Arc::new(|hello: Option<&Hello>| -> Box<dyn ToolAccess> {
             match hello {
                 Some(hello) if hello.run.as_deref().is_some_and(|run| !run.is_empty()) => {
-                    Box::new(FakeAccess::all())
+                    Box::new(FakeAccess {
+                        names: tools::tool::RUN.to_vec(),
+                        calls: Mutex::new(Vec::new()),
+                    })
                 }
                 Some(hello) if hello.session.as_deref() == Some("the-console") => {
                     Box::new(FakeAccess::every())
@@ -5613,7 +5945,7 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 29, "{names:?}");
+            assert_eq!(names.len(), 31, "{names:?}");
             assert_eq!(names, tools::tool::EVERY);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
@@ -5644,8 +5976,8 @@ mod tests {
 
             run.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(run.recv());
-            assert_eq!(names.len(), 9, "{names:?}");
-            assert_eq!(names, tools::tool::ALL);
+            assert_eq!(names.len(), 11, "{names:?}");
+            assert_eq!(names, tools::tool::RUN);
             for orchestration in tools::tool::ORCHESTRATION {
                 assert!(
                     !names.contains(orchestration),

@@ -754,6 +754,20 @@ impl RemoteHost for AppRemoteHost {
     }
 
     /// The same one producer the desk's Milestones tab reads. (M91)
+    fn user_requests(&self, project: ProjectId) -> Option<cide_ipc::UserRequestsView> {
+        let root = crate::user_requests::root(&self.app, project).ok()?;
+        Some(crate::user_requests::store(&self.app).ok()?.view(&root))
+    }
+
+    fn user_request_respond(
+        &self,
+        project: ProjectId,
+        id: String,
+        response: cide_ipc::UserRequestResponse,
+    ) -> Result<cide_ipc::UserRequestsView, String> {
+        crate::user_requests::respond(&self.app, project, &id, response).map_err(|e| e.to_string())
+    }
+
     fn milestones(&self, project: ProjectId) -> Option<cide_ipc::MilestonesView> {
         crate::milestones::view(&self.app, project)
     }

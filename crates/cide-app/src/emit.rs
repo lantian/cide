@@ -1333,6 +1333,19 @@ pub fn project_new_progress(app: &AppHandle, progress: &cide_ipc::NewProjectProg
     }
 }
 
+/// Decisions are profile-local durable state; every window adopts only increasing revisions.
+pub fn user_requests_changed(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    view: cide_ipc::UserRequestsView,
+) {
+    let _ = app.emit(
+        "cide://user-requests-changed",
+        serde_json::json!({ "project": project, "view": view }),
+    );
+    tee(|| cide_remote::RemoteEvent::UserRequestsChanged { project });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

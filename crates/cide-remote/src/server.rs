@@ -157,6 +157,7 @@ pub const FEATURES: &[&str] = &[
     // A task attachment's bytes, a slice at a time. (M136)
     "attachments",
     "taskRespond",
+    "userRequests",
     "consoleClose",
     "consoleUpload",
 ];
@@ -187,17 +188,28 @@ pub enum RemoteEvent {
     /// The project and nothing else, for `WorkspaceRev`'s reason — what a device is owed is a
     /// fresh projection, and re-reading the roster on every state change of every run would
     /// read the disk once per turn of every agent.
-    AgentsChanged { project: cide_ipc::ProjectId },
+    AgentsChanged {
+        project: cide_ipc::ProjectId,
+    },
     /// A project's task board moved. (M75)
-    TasksChanged { project: cide_ipc::ProjectId },
+    TasksChanged {
+        project: cide_ipc::ProjectId,
+    },
+    UserRequestsChanged {
+        project: cide_ipc::ProjectId,
+    },
     /// A project's milestones moved: a gate started or finished, one was accepted, a plan or a
     /// proposal changed. (M91) Marked dirty with the other per-project reads — the milestone view
     /// counts the board's tasks too, so it is stale whenever they are.
-    MilestonesChanged { project: cide_ipc::ProjectId },
+    MilestonesChanged {
+        project: cide_ipc::ProjectId,
+    },
     /// The tree changed. **The revision and nothing else** — see `cide-ipc`'s `remote` header for
     /// why a `Workspace` may not cross this wire. Each device re-asks for its projections, on a
     /// timer, and gets a projection back.
-    WorkspaceRev { rev: u64 },
+    WorkspaceRev {
+        rev: u64,
+    },
 }
 
 /// Something a connection did, for the panel to draw.
@@ -633,6 +645,7 @@ impl RemoteServer {
             }
             RemoteEvent::AgentsChanged { project }
             | RemoteEvent::TasksChanged { project }
+            | RemoteEvent::UserRequestsChanged { project }
             | RemoteEvent::MilestonesChanged { project } => {
                 // Marked, not sent: these are three host reads and one of them walks a tracker,
                 // and an agent mid-turn emits this many times a second. The coalescer decides.
@@ -731,10 +744,25 @@ async fn coalesce_workspace(inner: Arc<Inner>) {
             let runs = ask(&inner, move |host| host.runs(project)).await;
             let roster = ask(&inner, move |host| host.roster(project)).await;
             let tasks = ask(&inner, move |host| host.board(project)).await;
+            let requests = ask(&inner, move |host| host.user_requests(project)).await;
             let milestones = ask(&inner, move |host| host.milestones(project))
                 .await
                 .map(Box::new);
             for conn in watching {
+                if let Some(view) = &requests
+                    && conn
+                        .out
+                        .try_send(ServerFrame {
+                            id: None,
+                            body: ServerBody::UserRequests {
+                                project,
+                                view: Some(view.clone()),
+                            },
+                        })
+                        .is_err()
+                {
+                    conn.desynced.store(true, Ordering::Relaxed);
+                }
                 for body in [
                     ServerBody::Runs {
                         project,
@@ -1709,6 +1737,47 @@ async fn serve(
                 }
             }
 
+            (true, ClientBody::UserRequestsGet { project }) => {
+                let view = ask(&inner, move |host| host.user_requests(project)).await;
+                if say(&out_tx, id_of, ServerBody::UserRequests { project, view })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            (
+                true,
+                ClientBody::UserRequestRespond {
+                    project,
+                    id,
+                    response,
+                },
+            ) => {
+                let done = ask(&inner, move |host| {
+                    host.user_request_respond(project, id, response)
+                })
+                .await;
+                let sent = match done {
+                    Ok(view) => {
+                        say(
+                            &out_tx,
+                            id_of,
+                            ServerBody::UserRequests {
+                                project,
+                                view: Some(view),
+                            },
+                        )
+                        .await
+                    }
+                    Err(detail) => refused(&out_tx, id_of, Err(detail)).await,
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+
             (true, ClientBody::TaskGet { project, task }) => {
                 // Answered, never pushed. A device holds rows and asks for contents only when
                 // somebody opens one, which is why the board carries none.
@@ -2371,7 +2440,19 @@ async fn send_project(
     let view = ask(inner, move |host| host.milestones(project))
         .await
         .map(Box::new);
-    say(out, None, ServerBody::Milestones { project, view }).await
+    say(out, None, ServerBody::Milestones { project, view }).await?;
+    if let Some(view) = ask(inner, move |host| host.user_requests(project)).await {
+        say(
+            out,
+            None,
+            ServerBody::UserRequests {
+                project,
+                view: Some(view),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Ask the host something, off the runtime.
@@ -2457,6 +2538,7 @@ mod tests {
         runs: Mutex<Vec<cide_ipc::AgentRun>>,
         agents: Mutex<Vec<cide_ipc::remote::RemoteAgent>>,
         tasks: Mutex<Vec<cide_ipc::TaskRow>>,
+        requests: Mutex<std::collections::HashMap<ProjectId, cide_ipc::UserRequestsView>>,
         dispatching: Mutex<bool>,
         details: Mutex<std::collections::HashMap<String, cide_ipc::TaskDetail>>,
         refuse_writes: Mutex<Option<String>>,
@@ -2496,6 +2578,7 @@ mod tests {
                 runs: Mutex::new(Vec::new()),
                 agents: Mutex::new(Vec::new()),
                 tasks: Mutex::new(Vec::new()),
+                requests: Mutex::new(std::collections::HashMap::new()),
                 dispatching: Mutex::new(true),
                 details: Mutex::new(std::collections::HashMap::new()),
                 gate: Mutex::new(None),
@@ -2720,6 +2803,31 @@ mod tests {
         ) -> Result<(), String> {
             self.task_calls.lock().push(format!("edit {}", task.0));
             Ok(())
+        }
+
+        fn user_requests(&self, project: ProjectId) -> Option<cide_ipc::UserRequestsView> {
+            self.requests.lock().get(&project).cloned()
+        }
+
+        fn user_request_respond(
+            &self,
+            project: ProjectId,
+            id: String,
+            response: cide_ipc::UserRequestResponse,
+        ) -> Result<cide_ipc::UserRequestsView, String> {
+            let mut requests = self.requests.lock();
+            let view = requests.get_mut(&project).ok_or("no such project")?;
+            let request = view
+                .requests
+                .iter_mut()
+                .find(|request| request.id == id)
+                .ok_or("no such request")?;
+            if request.response.is_some() {
+                return Err("already answered".into());
+            }
+            request.response = Some(response);
+            view.rev += 1;
+            Ok(view.clone())
         }
 
         fn task_respond(
@@ -3494,6 +3602,7 @@ mod tests {
                 ServerBody::Runs { .. }
                 | ServerBody::Roster { .. }
                 | ServerBody::Board { .. }
+                | ServerBody::UserRequests { .. }
                 | ServerBody::Milestones { .. } => {
                     continue;
                 }
@@ -4923,6 +5032,141 @@ mod tests {
                 serde_json::to_string(&response).unwrap()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn user_decisions_survive_reconnect_and_confirm_only_the_selected_tasks() {
+        let (h, first, second) = harness().await;
+        let request: cide_ipc::UserRequest = serde_json::from_value(serde_json::json!({
+            "id": "decision-7", "title": "Move tasks?", "message": "Review t-7 and t-8.",
+            "task": null, "author": {"kind": "user"},
+            "request": {"kind": "moveTasks", "milestone": "look", "goal": "t-1", "tasks": [
+                {"id": "t-7", "title": "First", "status": "inbox", "parent": null},
+                {"id": "t-8", "title": "Second", "status": "inbox", "parent": null}
+            ]},
+            "origin": {"id": "conversation", "known": true, "kind": "planner", "harness": "codex",
+                "title": "Planner", "cwd": "/work/project", "startedUnixMs": 10, "lastSeenUnixMs": 20},
+            "wait": true, "createdUnixMs": 20, "response": null, "applying": false,
+            "delivered": false, "deliveryError": null
+        })).unwrap();
+        h.host.requests.lock().insert(
+            first,
+            cide_ipc::UserRequestsView {
+                rev: 1,
+                requests: vec![request],
+            },
+        );
+        let (device, key) = pair(&h).await;
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        let initial = loop {
+            let frame = heard_frame(&mut ws).await.unwrap();
+            if let ServerBody::UserRequests {
+                project,
+                view: Some(view),
+            } = frame.body
+            {
+                assert_eq!(project, first);
+                break view;
+            }
+        };
+        assert_eq!(initial.rev, 1);
+        let response = cide_ipc::UserRequestResponse::Approve {
+            selected_ids: vec!["t-8".to_owned().into()],
+            note: "Only second".into(),
+        };
+        for (id, project, request_id) in [
+            (81, first, "decision-7"),
+            (82, second, "decision-7"),
+            (83, first, "missing"),
+            (84, first, "decision-7"),
+        ] {
+            say(
+                &mut ws,
+                Some(id),
+                ClientBody::UserRequestRespond {
+                    project,
+                    id: request_id.into(),
+                    response: response.clone(),
+                },
+            )
+            .await;
+            let reply = loop {
+                let reply = heard_frame(&mut ws).await.unwrap();
+                if reply.id == Some(id) {
+                    break reply.body;
+                }
+            };
+            if id == 81 {
+                let ServerBody::UserRequests {
+                    project,
+                    view: Some(view),
+                } = reply
+                else {
+                    panic!("missing saved decision: {reply:?}");
+                };
+                assert_eq!(project, first);
+                assert_eq!(view.rev, 2);
+                assert_eq!(view.requests[0].response, Some(response.clone()));
+            } else {
+                assert!(
+                    matches!(reply, ServerBody::Error { kind, .. } if kind == error_kind::REFUSED)
+                );
+            }
+        }
+        drop(ws);
+        let mut ws = resumed(&h, &device, &key).await;
+        hello(&mut ws).await;
+        let view = loop {
+            let frame = heard_frame(&mut ws).await.unwrap();
+            if let ServerBody::UserRequests {
+                project,
+                view: Some(view),
+            } = frame.body
+            {
+                assert_eq!(project, first);
+                break view;
+            }
+        };
+        assert_eq!(view.rev, 2);
+        assert_eq!(view.requests[0].response, Some(response));
+        say(
+            &mut ws,
+            Some(85),
+            ClientBody::UserRequestsGet { project: second },
+        )
+        .await;
+        let reply = loop {
+            let reply = heard_frame(&mut ws).await.unwrap();
+            if reply.id == Some(85) {
+                break reply.body;
+            }
+        };
+        assert_eq!(
+            reply,
+            ServerBody::UserRequests {
+                project: second,
+                view: None
+            }
+        );
+        h.host.requests.lock().get_mut(&first).unwrap().requests[0].delivered = true;
+        h.host.requests.lock().get_mut(&first).unwrap().rev = 3;
+        h.server
+            .notify(RemoteEvent::UserRequestsChanged { project: first });
+        let view = loop {
+            let frame = heard_frame(&mut ws).await.unwrap();
+            if let ServerBody::UserRequests {
+                project,
+                view: Some(view),
+            } = frame.body
+            {
+                assert_eq!(project, first);
+                break view;
+            }
+        };
+        assert_eq!(view.rev, 3);
+        assert!(view.requests[0].delivered);
+        assert!(FEATURES.contains(&"userRequests"));
     }
 
     /// The three orchestration gestures a device may make, and the shape of their answers:

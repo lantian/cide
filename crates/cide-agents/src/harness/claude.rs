@@ -598,6 +598,7 @@ fn assemble(
         cli.env,
     ));
     spec = spec.apply(plan.proxy.changes().to_vec());
+    spec = spec.env("MCP_TOOL_TIMEOUT", "604800000");
     spec = spec.apply(plan.env.clone());
 
     // The IDE integration, switched off. See the module header — this is the run-hangs-for-ever

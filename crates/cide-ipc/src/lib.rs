@@ -145,6 +145,10 @@ pub use symbols::{
 // as an id precisely so `cide-agents` never has to hold a `Task`.
 pub mod agents;
 pub mod tasks;
+pub mod user_requests;
+pub use user_requests::{
+    UserRequest, UserRequestKind, UserRequestResponse, UserRequestTask, UserRequestsView,
+};
 
 pub use agents::{
     AgentDef, AgentRoster, AgentRun, DispatchRequest, ExternalWork, Harness, LlmLimitsProbe,

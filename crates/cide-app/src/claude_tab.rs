@@ -172,6 +172,15 @@ pub(crate) fn open(
     project: ProjectId,
     open: Open<'_>,
 ) -> Result<(SessionId, TabId), CoreError> {
+    open_continuing(app, project, open, None)
+}
+
+pub(crate) fn open_continuing(
+    app: &tauri::AppHandle,
+    project: ProjectId,
+    open: Open<'_>,
+    conversation: Option<cide_ipc::HarnessSession>,
+) -> Result<(SessionId, TabId), CoreError> {
     let Open {
         title,
         session_name,
@@ -300,7 +309,7 @@ pub(crate) fn open(
         resume: None,
         resume_picker: false,
         fork: None,
-        continues: None,
+        continues: conversation.clone(),
         pane: None,
         // **This tab is acting as the product owner, and has to be told so.** Inferring it from
         // the tree answers `Pane`, whose sentence is deliberately hedged — *you may act as one*
@@ -384,10 +393,12 @@ pub(crate) fn open(
                 codex_cleared: false,
                 harness_conversation: None,
                 // OpenCode's native conversation (and worktree directory) is recorded by the adapter.
-                continues: (in_worktree && !opencode).then(|| cide_ipc::HarnessSession {
-                    harness: harness.harness(),
-                    id: session.to_string(),
-                    cwd: cwd.clone(),
+                continues: conversation.clone().or_else(|| {
+                    (in_worktree && !opencode).then(|| cide_ipc::HarnessSession {
+                        harness: harness.harness(),
+                        id: session.to_string(),
+                        cwd: cwd.clone(),
+                    })
                 }),
                 // Written directly, as `session` is: this road never passes `pane_bind_session`.
                 harness: Some(harness.harness()),

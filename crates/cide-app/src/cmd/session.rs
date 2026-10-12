@@ -891,8 +891,8 @@ fn roster_paragraph(
          let the gate — a command cide runs, not your judgement — say when it is met. Work whose \
          quality is a matter of taste (art, the look of the UI) gets `acceptance: user`: cide \
          merges it once verify is green and the user accepts it by eye; feature work uses \
-         placeholders for it. A decision about taste, scope or design is the user's: set \
-         `question` on the task and it waits for the answer instead of being guessed. Never \
+         placeholders for it. Ask about taste, scope or design with `mcp__cide__cide_user_request`; \
+         it waits for the answer in this conversation by default. Never \
          rewrite the body of a task a run is working on — comment the correction or dispatch \
          the role with it. Assigning a todo or doing task to a role — with \
          `mcp__cide__cide_task_assign` or `mcp__cide__cide_task_update`, by creating the task \
@@ -933,8 +933,10 @@ fn roster_paragraph(
          the tracker: hold the goal in one task \
          and decompose from it, and when cide tells you a run ended, re-read that goal task and \
          the board before deciding what is next — the board, not your context, is the plan of \
-         record. When you need the user, end your turn with a direct question: cide marks the \
-         pane and the window title while you are awaiting input."
+         record. When you need the user, call `mcp__cide__cide_user_request`, which waits by default. \
+         Set wait=false only for independent work; cide returns the answer to this conversation. \
+         After interruption reconnect with `mcp__cide__cide_user_request_result`. Propose inbox \
+         activation with kind=moveTasks, a milestone and task IDs; cide applies the user's selected moves."
     )
 }
 
@@ -958,8 +960,9 @@ fn no_tracker_manual(limits: &str) -> String {
          it did in its branch, take work you accept with `mcp__cide__cide_agent_integrate`, or \
          dispatch it again with a one-line instruction saying what is still wrong. Watch runs \
          with `mcp__cide__cide_agent_runs`; stop one with `mcp__cide__cide_agent_stop`. When \
-         you need the user, end your turn with a direct question: cide marks the pane and the \
-         window title while you are awaiting input."
+         you need the user, call `mcp__cide__cide_user_request`; it waits by default. Set wait=false \
+         only for independent work; the answer returns to this conversation. Reconnect after \
+         interruption with `mcp__cide__cide_user_request_result`."
     )
 }
 
@@ -1997,6 +2000,9 @@ pub(crate) async fn spawn_session(
     // thing anybody said about this child, and the passes above are defaults: the proxy
     // environment, the toolchain `PATH`, the hook socket. Empty for every spawn the webview asks
     // for — `SpawnRequest::env` says why.
+    if is_claude {
+        spec = spec.env("MCP_TOOL_TIMEOUT", "604800000");
+    }
     for (key, value) in extra_env {
         spec = spec.env(key, value);
     }
@@ -3043,10 +3049,9 @@ mod tests {
             assert!(paragraph.contains(word), "{word} is not named: {paragraph}");
         }
 
-        // ...and the way to summon the user is to end the turn asking (`windows::set_awaiting`
-        // badges the pane and retitles the window).
+        // A decision stays in the asking conversation through the blocking request tool.
         assert!(
-            paragraph.contains("end your turn with a direct question"),
+            paragraph.contains("mcp__cide__cide_user_request"),
             "{paragraph}"
         );
     }

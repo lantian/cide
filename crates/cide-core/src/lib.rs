@@ -67,6 +67,7 @@ pub mod shell_history;
 pub mod toolchain;
 pub mod toolwindow;
 pub mod user_inputs;
+pub mod user_requests;
 pub mod workspace;
 
 pub use error::{CoreError, Result};

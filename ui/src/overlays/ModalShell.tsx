@@ -248,9 +248,9 @@ export function OverlayCard({
  * compares the target instead of stopping propagation in the card, which also keeps a drag
  * that began in a dialog's text field and ended outside it from closing the dialog.
  */
-export function Modal({ onDismiss, children }: { onDismiss: () => void; children: ReactNode }) {
+export function Modal({ onDismiss, children, suspended = false }: { onDismiss: () => void; children: ReactNode; suspended?: boolean | undefined }) {
   return createPortal(
-    <Scrim data-audit="overlayScrim" onDismiss={onDismiss}>
+    <Scrim data-audit="overlayScrim" onDismiss={onDismiss} style={suspended ? { display: 'none' } : undefined} inert={suspended}>
       {children}
     </Scrim>,
     document.body,

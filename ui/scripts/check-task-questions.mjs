@@ -16,13 +16,14 @@ let root
 try {
   execFileSync('node', ['node_modules/vite/bin/vite.js', 'build', '--ssr',
     'src/sidebar/TasksPanel/questionSmoke.ts', '--outDir', out, '--logLevel', 'error'], { stdio: 'inherit' })
-  const { QuestionAnswer, QuestionField, WaitingPanel, waitingFor, waitingCount } = await import(`file://${resolve(out, 'questionSmoke.js')}`)
+  const { QuestionAnswer, QuestionField, WaitingPanel, AgentsPanelTabs, waitingDecisionCount, TaskDetailPendingModal, waitingFor, waitingCount } = await import(`file://${resolve(out, 'questionSmoke.js')}`)
   root = createRoot(document.querySelector('#root'))
   const mount = async (component, props, key = 'test') => act(async () => root.render(React.createElement(component, { key, ...props })))
   const click = async (element) => { assert.ok(element); await act(async () => element.click()) }
-  const button = (text) => [...document.querySelectorAll('button')].find((b) => b.textContent === text)
+  const visible = (element) => !element.closest('[inert]')
+  const button = (text) => [...document.querySelectorAll('button')].find((b) => visible(b) && b.textContent === text)
   const type = async (text) => act(async () => {
-    const textarea = document.querySelector('textarea')
+    const textarea = [...document.querySelectorAll('textarea')].find(visible)
     Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(textarea, text)
     textarea.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
   })
@@ -31,46 +32,218 @@ try {
   assert.equal(groups.review.length, 0)
   assert.equal(groups.questions.length, 1)
   assert.equal(waitingCount([base]), 1)
-  await mount(WaitingPanel, { project: 'p', title: 'Waiting', ...groups, reports: {}, busy: new Set(),
-    onOpenTask() {}, onAccept() {}, onSendBack() {}, onAnswer() {} })
-  assert.equal(button('Accept'), undefined, 'only question actions are offered')
-  assert.ok(button('Answer'))
-
+  const decisionCalls = []
   const waitingProps = { project: 'p', title: 'Waiting', questions: [base],
-    review: [{ ...base, id: 't-2', question: null }], reports: {}, busy: new Set(),
-    onOpenTask() {}, onAccept() {}, onSendBack() {}, onAnswer() {} }
-  await mount(WaitingPanel, waitingProps, 'groups')
-  const [acceptGroup, questionGroup] = document.querySelectorAll('details')
-  assert.ok(acceptGroup.open && questionGroup.open, 'waiting groups start expanded')
-  const acceptTitle = acceptGroup.querySelector('summary')
-  const questionTitle = questionGroup.querySelector('summary')
+    review: [{ ...base, id: 't-2', title: 'Review result', question: null }],
+    reports: { 't-2': 'Full report with the implementation details.' }, busy: new Set(),
+    onOpenTask(id) { decisionCalls.push(['open', id]) },
+    onAccept(id) { decisionCalls.push(['accept', id]) },
+    onSendBack(id, note) { decisionCalls.push(['back', id, note]) },
+    onAnswer(id, answer) { decisionCalls.push(['answer', id, answer]) } }
+  await mount(WaitingPanel, waitingProps, 'decisions')
+  assert.equal(document.querySelector('[role="dialog"]'), null, 'rows do not open a task or show inline actions')
+  assert.equal(button('Answer'), undefined)
+  assert.equal(button('Accept'), undefined)
+  await click(button('Pick a color'))
+  assert.ok(button('Answer').disabled)
   await type('Keep this answer')
-  await click(questionTitle)
-  assert.equal(questionGroup.open, false, 'clicking the question group title collapses it')
-  assert.equal(acceptGroup.open, true, 'groups toggle independently')
-  assert.ok(questionTitle.textContent.includes('Questions1'), 'the collapsed group keeps its title and count')
-  await mount(WaitingPanel, { ...waitingProps, reports: { 't-2': 'Updated report' } }, 'groups')
-  assert.equal(questionGroup.open, false, 'board refreshes preserve collapsed groups')
-  await click(questionTitle)
-  assert.equal(questionGroup.open, true, 'clicking the title again expands it')
-  assert.equal(document.querySelector('textarea').value, 'Keep this answer', 'collapsing preserves answer drafts')
+  await click([...document.querySelectorAll('[aria-label="Close"]')].find(visible))
+  await click(button('Pick a color'))
+  assert.equal(document.querySelector('textarea').value, 'Keep this answer', 'closing the decision keeps its draft')
+  await click(button('Open task t-1'))
+  assert.deepEqual(decisionCalls.at(-1), ['open', 't-1'])
+  await mount(WaitingPanel, { ...waitingProps, taskOpen: true }, 'decisions')
+  assert.equal(document.querySelector('[data-audit="waitingDecisionDialog"]').closest('[inert]').style.display, 'none')
+  await mount(WaitingPanel, waitingProps, 'decisions')
+  assert.equal(document.querySelector('textarea').value, 'Keep this answer', 'returning from a task keeps the answer')
+  await click(button('Answer'))
+  assert.equal(decisionCalls.at(-1)[2].text, 'Keep this answer')
+  await click(button('Review result'))
+  assert.ok(document.body.textContent.includes('Full report with the implementation details.'))
   await click(button('Send back'))
-  await act(async () => {
-    const input = document.querySelector('[aria-label="Why t-2 goes back"]')
-    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set.call(input, 'Keep this reason')
-    input.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
-  })
-  await click(acceptTitle)
-  assert.equal(acceptGroup.open, false, 'clicking the acceptance group title collapses it')
-  assert.equal(questionGroup.open, true)
-  await click(acceptTitle)
-  assert.equal(acceptGroup.open, true)
-  assert.equal(document.querySelector('[aria-label="Why t-2 goes back"]').value, 'Keep this reason', 'collapsing preserves send-back drafts')
+  await type('Keep this reason')
+  await click([...document.querySelectorAll('[aria-label="Close"]')].find(visible))
+  await click(button('Review result'))
+  assert.equal([...document.querySelectorAll('textarea')].at(-1).value, 'Keep this reason')
+  await click([...document.querySelectorAll('button')].find((b) => b.textContent === 'Send back' && b.dataset.audit === 'waitingSendBackSubmit'))
+  assert.deepEqual(decisionCalls.at(-1), ['back', 't-2', 'Keep this reason'])
+
+  const origin = { id: 'conversation', known: true, kind: 'planner', harness: 'codex', title: 'Plan', cwd: '/project', startedUnixMs: 1, lastSeenUnixMs: 1 }
+  const referenceQuestion = { text: 'Вопрос: t-1388, (t-1231). Не xt-5 и t-7extra. <b>Текст</b>', selection: 'single', options: [{ id: 'wait_production', title: 'Обе иконки после production GLB' }] }
+  const referenceRequest = { id: 'reference-1', title: 'Choose model sources', message: referenceQuestion.text, task: 't-1', origin,
+    author: { kind: 'orchestrator' }, wait: false, createdUnixMs: 1, response: null, applying: false, delivered: false, deliveryError: null,
+    request: { kind: 'question', question: referenceQuestion } }
+  const referenceProps = { ...waitingProps, questions: [], review: [], requests: [referenceRequest], onOpenSession() {}, onRespondRequest: async () => {} }
+  const savedRequest = { ...referenceRequest, response: { kind: 'answer', text: 'Production only', selectedIds: ['wait_production'] } }
+  const countBadge = () => document.querySelector('[data-audit="waitingCount"]')
+  const answeredBadge = () => document.querySelector('[data-audit="waitingAnswered"]')
+  const headerCount = () => document.querySelector('[data-audit="waitingHeaderCount"]').textContent
+  function WaitingStatus(props) {
+    return React.createElement(WaitingPanel, { ...props, title: React.createElement(AgentsPanelTabs, {
+      tab: 'waiting', onTab() {}, waiting: waitingDecisionCount(props.requests, [...props.questions, ...props.review]),
+    }) })
+  }
+  let failResponse = true
+  function AnswerTransition() {
+    const [requests, setRequests] = React.useState([referenceRequest])
+    return React.createElement(WaitingStatus, { ...referenceProps, questions: [base], requests,
+      onRespondRequest: async (id, response) => {
+        if (failResponse) throw new Error('Answer was not saved')
+        setRequests((now) => now.map((request) => request.id === id ? { ...request, response } : request))
+      },
+    })
+  }
+  await mount(AnswerTransition, {}, 'answer-transition')
+  assert.equal(countBadge().textContent, '1', 'the linked task and its request count once')
+  assert.equal(headerCount(), '1')
+  assert.equal(answeredBadge(), null)
+  await click(button('Choose model sources'))
+  await click(document.querySelector('input[value="wait_production"]'))
+  await click(button('Answer'))
+  assert.equal(document.querySelector('[role="alert"]').textContent, 'Answer was not saved')
+  assert.equal(countBadge().textContent, '1', 'a failed save still needs an answer')
+  assert.equal(answeredBadge(), null)
+  failResponse = false
+  await click(button('Answer'))
+  assert.equal(answeredBadge().textContent, 'Answered')
+  assert.equal(answeredBadge().querySelector('[data-tone]').dataset.tone, 'blue')
+  assert.ok(answeredBadge().title.includes('waiting for the agent'))
+  assert.equal(countBadge(), null, 'the last saved answer hides the Waiting badge before delivery')
+  assert.equal(headerCount(), '', 'the panel header uses the same count')
+  assert.equal(document.querySelector('[data-audit="waitingEmpty"]'), null, 'answered rows remain available')
+  await click(button('Choose model sources'))
+  assert.ok(document.querySelector('[data-audit="waitingSavedDecision"]'))
+  assert.equal(button('Answer'), undefined, 'a saved answer cannot be submitted again')
+  await mount(WaitingStatus, { ...referenceProps, requests: [savedRequest], questions: [base] }, 'restored-answer')
+  assert.equal(countBadge(), null, 'a freshly mounted panel restores the saved-answer state')
+  assert.equal(answeredBadge().textContent, 'Answered')
+  await mount(WaitingStatus, { ...referenceProps, requests: [{ ...savedRequest, deliveryError: 'Agent busy', applying: true }], questions: [base] }, 'restored-answer')
+  assert.equal(countBadge(), null, 'application and delivery delays do not require another answer')
+  assert.equal(answeredBadge().textContent, 'Answered')
+  await mount(WaitingStatus, { ...referenceProps, requests: [{ ...referenceRequest, deliveryError: 'Try again' }], questions: [base] }, 'restored-answer')
+  assert.equal(countBadge().textContent, '1', 'resetting a saved decision restores the count')
+  assert.equal(answeredBadge(), null)
+  const mixedProps = { ...waitingProps, requests: [savedRequest, { ...referenceRequest, id: 'open', title: 'Another question', task: null }],
+    questions: [base, { ...base, id: 't-3', question: 'Standalone question' }] }
+  await mount(WaitingStatus, mixedProps, 'mixed-waiting')
+  assert.equal(countBadge().textContent, '3', 'only the open request, standalone question and review need the user')
+  assert.equal(headerCount(), '3')
+  assert.deepEqual([...document.querySelectorAll('[data-audit="waitingOpen"]')].map((row) => row.textContent),
+    ['Choose model sources', 'Another question', 'Standalone question', 'Review result'], 'saved answers stay in their original position')
+  const proposedMove = { kind: 'moveTasks', milestone: 'visuals', goal: 't-10', tasks: [{ id: 't-11', title: 'First task', status: 'inbox', parent: null }] }
+  for (const response of [{ kind: 'approve', selectedIds: ['t-11'], note: '' }, { kind: 'reject', note: '' }, { kind: 'cancel' }]) {
+    await mount(WaitingStatus, { ...referenceProps, requests: [{ ...referenceRequest, task: null, request: proposedMove, response }] }, 'other-decisions')
+    assert.equal(answeredBadge().textContent, 'Decision saved')
+    assert.equal(countBadge(), null)
+  }
+  await mount(WaitingStatus, { ...referenceProps, requests: [{ ...savedRequest, delivered: true }] }, 'other-decisions')
+  assert.equal(answeredBadge(), null)
+  assert.equal(document.querySelector('[data-audit="waitingOpen"]'), null, 'delivered answers leave the list')
+  assert.equal(countBadge(), null)
+  function ReferenceNavigation() {
+    const [task, setTask] = React.useState(null)
+    return React.createElement(React.Fragment, null,
+      React.createElement(WaitingPanel, { ...referenceProps, taskOpen: task !== null, onOpenTask: setTask }),
+      task === null ? null : React.createElement(TaskDetailPendingModal, { task: { ...base, id: task }, onClose: () => setTask(null), onBack: () => setTask(null) }))
+  }
+  await mount(ReferenceNavigation, {}, 'references')
+  await click(button('Choose model sources'))
+  const referenceLinks = [...document.querySelectorAll('[data-audit="questionTaskReference"]')]
+  assert.deepEqual(referenceLinks.map((b) => b.textContent), ['t-1388', 't-1231'], 'task IDs link without matching pieces of other words')
+  assert.equal(document.querySelector('[data-audit="waitingQuestion"] b'), null, 'question text is escaped')
+  await click(document.querySelector('input[value="wait_production"]'))
+  await type('Keep this draft while checking the task')
+  await click(referenceLinks[0])
+  assert.equal(document.querySelector('[data-audit="tasksDetailId"]').textContent.trim(), 't-1388')
+  assert.ok(button('Back').closest('[data-audit="taskCardHead"]'), 'Back belongs in the task header, including while loading')
+  await click(button('Back'))
+  assert.equal([...document.querySelectorAll('textarea')].find(visible).value, 'Keep this draft while checking the task')
+  assert.ok(document.querySelector('input[value="wait_production"]').checked)
+  assert.equal(document.activeElement, referenceLinks[0], 'returning focuses the reference that opened the task')
+  await mount(WaitingPanel, { ...referenceProps, requests: [{ ...referenceRequest, response: { kind: 'answer', text: 'Production only', selectedIds: ['wait_production'] } }] }, 'saved-answer')
+  await click(button('Choose model sources'))
+  assert.ok(document.querySelector('[role="status"]').textContent.includes('current turn ends'), 'nonblocking delivery explains why the saved answer waits')
+  const savedAnswer = document.querySelector('[data-audit="waitingSavedDecision"]')
+  assert.ok(savedAnswer.textContent.includes('Обе иконки после production GLB'))
+  assert.ok(savedAnswer.textContent.includes('Production only'))
+  assert.ok(!savedAnswer.textContent.includes('selectedIds') && !savedAnswer.textContent.includes('wait_production'), 'saved answers show choice labels instead of transport JSON')
+  await mount(WaitingPanel, { ...referenceProps, requests: [{ ...referenceRequest, delivered: true }] }, 'saved-answer')
+  assert.equal(document.querySelector('[data-audit="waitingDecisionDialog"]'), null, 'delivery removes the answered decision')
+
+  const moveRequest = { id: 'move-1', title: 'Approve the plan', message: 'Include the useful work?', task: null,
+    origin, author: { kind: 'orchestrator' }, wait: true, createdUnixMs: 1, response: null,
+    applying: false, delivered: false, deliveryError: null,
+    request: { kind: 'moveTasks', milestone: 'visuals', goal: 't-10', tasks: [
+      { id: 't-11', title: 'First task', status: 'inbox', parent: null },
+      { id: 't-12', title: 'Second task', status: 'todo', parent: 't-9' },
+    ] } }
+  const requestCalls = []
+  const moveProps = { ...waitingProps, questions: [], review: [], requests: [moveRequest],
+    onRespondRequest: async (id, response) => requestCalls.push([id, response]) }
+  await mount(WaitingPanel, moveProps, 'moves')
+  await click(button('Approve the plan'))
+  assert.equal(document.querySelectorAll('input:checked').length, 2, 'all proposed tasks start included')
+  await click([...document.querySelectorAll('label')].find((l) => l.textContent === 'Include t-12')?.querySelector('input'))
+  await type('Only the first one')
+  await click(button('View task'))
+  await mount(WaitingPanel, { ...moveProps, taskOpen: true }, 'moves')
+  await mount(WaitingPanel, moveProps, 'moves')
+  assert.equal(document.querySelectorAll('input:checked').length, 1)
+  assert.equal(document.querySelector('textarea').value, 'Only the first one')
+  await click(button('Accept selected (1)'))
+  assert.deepEqual(requestCalls.at(-1), ['move-1', { kind: 'approve', selectedIds: ['t-11'], note: 'Only the first one' }])
+  await click(button('Approve the plan'))
+  await click([...document.querySelectorAll('[aria-label="Close"]')].find(visible))
+  assert.equal(requestCalls.length, 1, 'closing is not cancellation')
+  await click(button('Approve the plan'))
+  await click(button('Cancel request'))
+  assert.deepEqual(requestCalls.at(-1), ['move-1', { kind: 'cancel' }])
 
   const question = { text: 'Which renders do you prefer?', selection: 'multiple', options: Array.from({ length: 10 }, (_, i) => ({
     id: `render-${i}`, title: `Render ${i}`, description: `Description ${i}`, image: `image-${i}`,
   })) }
   const previews = Object.fromEntries(question.options.map((o) => [o.image, { kind: 'ready', url: `https://cide.test/${o.image}.png` }]))
+  const viewer = () => document.querySelector('[data-audit="imageViewer"]')
+  const viewKey = async (key) => act(async () => document.activeElement.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })))
+  const choiceRequest = { ...referenceRequest, title: 'Compare image choices', request: { kind: 'question', question } }
+  await mount(WaitingPanel, { ...referenceProps, requests: [choiceRequest], previews }, 'image-decision')
+  await click(button('Compare image choices'))
+  await click(document.querySelector('input[value="render-2"]'))
+  await type('Keep the layout and this draft')
+  const imageOpener = document.querySelector('[aria-label="View Render 4 full size"]')
+  imageOpener.focus()
+  await click(imageOpener)
+  assert.equal(viewer().getAttribute('aria-label'), 'Render 4')
+  assert.ok(viewer().textContent.includes('5 / 10'), 'the decision supplies the whole gallery')
+  assert.ok(document.querySelector('[data-audit="waitingDecisionDialog"]').closest('[inert]'), 'the decision is suspended below the image')
+  await viewKey('ArrowRight')
+  assert.equal(viewer().getAttribute('aria-label'), 'Render 5')
+  await click(viewer().querySelector('[aria-label="Previous image"]'))
+  assert.equal(viewer().getAttribute('aria-label'), 'Render 4')
+  await viewKey('Escape')
+  assert.equal(viewer(), null)
+  assert.ok(document.querySelector('[data-audit="waitingDecisionDialog"]'), 'Escape closes only the image')
+  assert.equal([...document.querySelectorAll('textarea')].find(visible).value, 'Keep the layout and this draft')
+  assert.ok(document.querySelector('input[value="render-2"]').checked)
+  assert.equal(document.activeElement, imageOpener)
+
+  const reportAttachments = [
+    { id: 'report-a', name: 'First report image', kind: 'image' },
+    { id: 'report-file', name: 'Notes.txt', kind: 'file' },
+    { id: 'report-b', name: 'Second report image', kind: 'image' },
+  ]
+  await mount(WaitingPanel, { ...waitingProps, questions: [], reportAttachments: { 't-2': reportAttachments },
+    previews: { 'report-a': previews['image-0'], 'report-b': previews['image-1'] } }, 'report-images')
+  await click(button('Review result'))
+  await click(button('Send back'))
+  await type('Keep report feedback')
+  await click(document.querySelector('[aria-label="View Second report image full size"]'))
+  assert.equal(viewer().getAttribute('aria-label'), 'Second report image')
+  assert.ok(viewer().textContent.includes('2 / 2'), 'the report gallery excludes ordinary files')
+  await viewKey('ArrowLeft')
+  assert.equal(viewer().getAttribute('aria-label'), 'First report image')
+  await click(button('Back'))
+  assert.equal([...document.querySelectorAll('textarea')].find(visible).value, 'Keep report feedback')
   const calls = []
   let fail = true
   const onAnswer = async (task, payload) => { calls.push({ task, payload }); if (fail) throw new Error('Try again') }
@@ -87,6 +260,9 @@ try {
   assert.equal(document.querySelector('textarea').value, 'Darker background')
   await click(document.querySelector('[aria-label="View Render 0 full size"]'))
   assert.equal(document.querySelectorAll('img').length, 11, 'the full-size viewer opens')
+  await viewKey('ArrowRight')
+  assert.equal(viewer().getAttribute('aria-label'), 'Render 1', 'standalone comparison uses the same gallery')
+  await viewKey('ArrowLeft')
   await click(button('Close'))
   assert.equal(document.querySelectorAll('input:checked').length, 2, 'previewing preserves selections')
   await click(button('Answer'))
@@ -146,7 +322,7 @@ try {
   await mount(QuestionAnswer, { task: 't-1', question, previews: { 'image-0': { kind: 'refused', reason: 'Image missing' } }, onAnswer }, 'missing')
   assert.ok(document.body.textContent.includes('Image missing'))
   assert.equal(document.querySelectorAll('input[type="checkbox"]').length, 10, 'missing images keep their answer choices')
-  console.log('check-task-questions: ok (collapsible groups, exclusive actions, images, single/multiple/custom answers, retries, editing and duplicate submission)')
+  console.log('check-task-questions: ok (decision modals, answered badges and Waiting counts, task references and Back, preserved drafts and focus, saved-choice labels, subset approval, explicit cancellation, images, single/multiple/custom answers, retries, editing and duplicate submission)')
 } finally {
   if (root) await act(async () => root.unmount())
   dom.window.close()

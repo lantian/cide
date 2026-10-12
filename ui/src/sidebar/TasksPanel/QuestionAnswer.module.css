@@ -41,12 +41,6 @@
   border-radius: var(--r-2);
 }
 
-.fullImage {
-  width: 100%;
-  max-height: 75vh;
-  object-fit: contain;
-}
-
 .error {
   color: var(--red);
   font-size: var(--fs-ui-12);

@@ -18014,3 +18014,83 @@ CSS-prefix, attach, find and theme checks, TypeScript and the production fronten
 The kit specimen includes a scrollable output preview. This validates real xterm with local
 fixtures, not every installed CLI's fullscreen implementation. No backend change, live IDE
 restart or model call.
+
+
+## M172 — Durable user requests and decision dialogs
+
+The planner could put a question on a task and end its turn; answering then woke a fresh planning
+session. User decisions now have their own tools, `cide_user_request` and
+`cide_user_request_result`, and their own profile-local durable store. Calls wait by default;
+`wait: false` permits independent work. The transport serves ping and cancellation while a call
+waits. Disconnecting preserves the question and its ID. A reply returns through the original
+call, or resumes the original conversation after its turn ended or cide restarted. A missing
+conversation leaves the saved reply visible with the delivery error. Legacy task questions and
+replies from older clients use the same broker.
+
+Waiting uses uniform rows that open a decision dialog. Questions, full review reports and move
+proposals have their actions in the footer, with details and related tasks below. Task cards and
+image views offer Back, preserving answer drafts and selections. Closing a decision leaves it
+waiting; explicit cancellation returns a cancelled result.
+
+For `kind: "moveTasks"`, the agent proposes existing tasks and an existing milestone. All tasks
+start selected, and the user may exclude any. Cide validates the selected snapshots together,
+changes inbox to todo and replaces the parent with the milestone goal. A stale selected task
+refuses the package. Durable checkpoints and task receipts recover interrupted writes without
+applying the same move twice. The agent receives exact applied and excluded IDs.
+
+Verification covers durable answers, duplicate replies, cancellation, disconnect/reconnect,
+selected move transactions, stale snapshots, replay after a partial write, the real socket's
+ping/cancel behavior, and continuation of the original role run across restart. Mounted UI tests
+cover dialogs, selections, drafts, task return, image choices and failed submissions. The
+question and move dialogs were also rendered and inspected in headless Chromium on Linux.
+Live human replies through each installed CLI and desktop task navigation were not exercised.
+
+Follow-up: related links have wrapping space between them, and task Back is a secondary button
+in the header, including while the card loads. Task IDs in question text open a child task card;
+return restores the answer draft, selected choices and focus to the originating link. The
+mounted question check exercises that round trip through the real pending task modal.
+Saved decisions show choice titles and custom text instead of transport JSON. For `wait: false`,
+the dialog explains that delivery waits for the current agent turn to end. In the live
+terrastrike Artist transcript, the saved answer was delivered to the asking conversation when
+its turn ended and the agent acknowledged it; the apparent stuck question was a nonblocking
+delivery delay. Question, loaded task and saved-answer dialogs were inspected in headless
+Chromium on Linux. Desktop navigation remains untested.
+Follow-up verification: `./test.sh --only ui` passed all 124 checks, including typechecking,
+the mounted question navigation check and the production build.
+
+## M173 — Questions and approvals on the phone
+
+**Asked:** support the new Waiting decisions in cide-mobile and publish a ready APK on port 9990.
+
+The sealed remote protocol advertises the optional `userRequests` capability without changing
+the protocol version. Project snapshots, reconnects and coalesced changes carry the durable
+request view. Answer RPCs return the saved view with the caller's request ID; refusals keep
+that ID too. The desktop host uses the same validated decision and move transaction as the
+desktop dialog, so approving from a phone applies only selected task IDs and returns the
+result to the requesting conversation.
+
+The mobile instance has Waiting for you, with uniform decision rows, questions and image
+choices, user review acceptance, and selectable milestone move proposals. Inline task IDs and
+proposal rows open child task details with nested Back. Controlled answer drafts survive task
+inspection and closing/reopening the dialog. Explicit cancellation is separate from Close.
+Saved decisions show labels and feedback while delivery is pending; delivered requests leave
+the list. Older hosts retain legacy task questions and reviews. New decisions also appear in
+machine and project counts, and local notifications open the specific decision after reconnect
+or cold start independently of the console's turn marker.
+
+**Verified:** the applied mobile repository passes protocol sync, interop, typechecking and
+all 311 tests, including mounted dialog navigation, draft retention, partial approvals,
+duplicate submission prevention and the sealed real-server connection tests. The desktop
+Rust group passes all six checks; its socket test covers initial snapshots, selected IDs,
+refusals, reconnect and delivery updates. All 124 desktop UI checks pass across the full run
+and the corrected remote frame-list check. The initial sandbox UI run restricted two child
+processes; an unrestricted run passed those checks.
+
+The standalone universal Android release was built with Java 21 for arm64-v8a, armeabi-v7a,
+x86 and x86_64. Its existing signing identity was retained, the APK signature and archive
+integrity verified, and the bundled Hermes bytecode checked. The installed release launches
+in an Android 13 read-only emulator. A native smoke check paired it with the isolated example
+server, opened a question with an image, retained a selected answer through task Back, sent
+the answer and confirmed that it was absent after reconnect. Port 9990 serves
+`/tmp/cide-mobile-downloads/cide-mobile.apk`;
+an HTTP download returned the same SHA-256 as the built APK.
