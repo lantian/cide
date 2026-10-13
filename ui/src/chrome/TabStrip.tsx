@@ -626,7 +626,9 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
         shape: styles.shapeClaude,
         body: (
           <>
-            <span className={styles.swatch} data-audit="consoleSwatch" />
+            <span className={styles.harnessIcon} data-audit="consoleSwatch">
+              <Icon name="sparkles" size={1} />
+            </span>
             <span>{console}</span>
           </>
         ),
@@ -641,7 +643,9 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
         shape: styles.shapeClaude,
         body: (
           <>
-            <span className={styles.swatch} />
+            <span className={styles.harnessIcon}>
+              <Icon name="sparkles" size={1} />
+            </span>
             <span>{kind.title}</span>
           </>
         ),

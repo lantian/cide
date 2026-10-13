@@ -118,6 +118,8 @@ const ICONS = [
   'circle-minus', 'circle-x', 'arrow-up', 'arrow-down', 'ellipsis',
   // App header.
   'sun-moon', 'rows-2',
+  // Harness console tabs.
+  'sparkles',
   // Tool window.
   'panel-bottom-close',
   // Context menu, checkboxes, confirmations.

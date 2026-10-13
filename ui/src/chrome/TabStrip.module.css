@@ -421,11 +421,11 @@
   background: currentColor;
 }
 
-.swatch {
-  width: 14px;
-  height: calc(14px * var(--ui-scale));
-  border-radius: var(--r-1);
-  background: var(--accent);
+.harnessIcon {
+  display: inline-flex;
+  width: var(--icon-1);
+  height: var(--icon-1);
+  color: var(--accent);
   flex: none;
 }
 
