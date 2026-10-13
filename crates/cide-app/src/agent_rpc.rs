@@ -5629,7 +5629,10 @@ mod tests {
 
     impl Client {
         fn connect(path: &Path) -> Self {
-            let out = UnixStream::connect(path).expect("connect");
+            Self::new(UnixStream::connect(path).expect("connect"))
+        }
+
+        fn new(out: UnixStream) -> Self {
             let read = out.try_clone().expect("clone for reading");
             // Bounded, so a server that never answers fails this test instead of hanging CI on
             // it — which is the failure mode a socket test is most likely to introduce.
@@ -5714,8 +5717,10 @@ mod tests {
             })).unwrap();
             store.create(&root, request).unwrap();
         }
-        let path = root.join("rpc.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        // This test needs one real connection, not a filesystem address. macOS's long
+        // per-user temp directory plus the UUID fixture name exceeds sockaddr_un::sun_path;
+        // a socket pair exercises the same framing and disconnects without that path limit.
+        let (client_stream, server_stream) = UnixStream::pair().expect("socket pair");
         let (finished, replies) = std::sync::mpsc::channel();
         let (server_store, server_root) = (Arc::clone(&store), root.clone());
         let server = thread::spawn(move || {
@@ -5726,9 +5731,9 @@ mod tests {
                     finished: finished.clone(),
                 })
             });
-            serve(listener.accept().unwrap().0, bind.as_ref());
+            serve(server_stream, bind.as_ref());
         });
-        let mut client = Client::connect(&path);
+        let mut client = Client::new(client_stream);
         client.send(json!({ "hello": HELLO, "v": HELLO_VERSION, "session": "console", "pid": 42 }));
         let wait = |id, request| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": tools::tool::USER_REQUEST_RESULT, "arguments": { "id": request } } });
         client.send(wait(1, "answer"));
