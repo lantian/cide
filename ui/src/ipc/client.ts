@@ -18,6 +18,7 @@ import type {
   Bootstrap,
   Capabilities,
   ColorScheme,
+  ConsoleHarness,
   CompletionAnswer,
   CompletionResolveAnswer,
   DefinitionAnswer,
@@ -1104,6 +1105,13 @@ export const diagnostics = {
     }),
 }
 
+/** The effective default console's configured binary and raw --version output. */
+export interface HarnessCliVersion {
+  harness: ConsoleHarness
+  binary: string
+  version: string | null
+}
+
 /**
  * The Settings tab's surface.
  *
@@ -1123,6 +1131,7 @@ export const settings = {
   projectHarness: (project: ProjectId) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_get', { project }),
   setProjectHarness: (project: ProjectId, edit: import('./generated').ProjectHarnessEdit) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_set', { project, edit }),
   effective: (project: ProjectId) => invoke<SettingsDto>('project_harness_effective', { project }),
+  harnessVersion: (project: ProjectId | null = null) => invoke<HarnessCliVersion>('harness_cli_version', { project }),
   opencodeSupport: (project: ProjectId | null = null) => invoke<CodexCliSupport>('opencode_cli_support', { project }),
 
   /** `Settings::default()` — what Settings' Reset puts back. (M133) */

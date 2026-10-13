@@ -1,10 +1,12 @@
 import type { Bootstrap, Geometry, SessionExit, TreeStatusMap } from '../ipc/generated'
+import type { HarnessCliVersion } from '../ipc/client'
 import type { Args, Handler } from './fakeTauri'
 import type { SceneId } from './sceneIds'
 import { encode, screen, userInputs } from './transcripts'
 import { HOME, makeWorld, sessions, TREE_STATUS, treeRows, wire, type World } from './world'
 import { SCENES } from './sceneTable'
 import { BRANCHES, STATUS } from './data/git'
+import { CLAUDE_CLI, CODEX_CLI } from './data/harness'
 
 /**
  * `cide-headless demo-bootstrap`'s output, written here by `demo-shots.mjs` before every capture
@@ -48,6 +50,17 @@ function baseHandlers(world: World, theme: Theme): Handlers {
   const status = { indexing: false, files: 1843, dirs: 212, rows: rows.length, watch: { backend: 'native' as const, reason: null, watchedDirs: 212 } }
   return new Map<string, Handler>([
     ['app_get_bootstrap', () => world.boot],
+    ['harness_cli_version', (a: Args): HarnessCliVersion => {
+      const settings = world.boot.workspace.settings
+      const root = world.boot.workspace.projects[String(a['project'])]?.roots[0]?.path
+      const overrides = root === undefined ? undefined : world.boot.workspace.projectHarness[root]
+      const harness = overrides?.consoleHarness ?? settings.consoleHarness
+      return {
+        harness,
+        binary: overrides?.[harness]?.binary ?? settings[harness].cli.binary,
+        version: { claude: CLAUDE_CLI.version, codex: CODEX_CLI.version, opencode: null }[harness],
+      }
+    }],
     ['workspace_rev', () => world.boot.workspace.rev],
     ['ext_snapshot', () => ({ rev: wire(1), marketplaces: [], extensions: [], resolved: world.boot.extensions, problems: [] })],
     ['fs_index', () => status],

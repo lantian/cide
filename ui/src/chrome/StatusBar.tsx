@@ -48,7 +48,7 @@
  *
  * The trail is in the **left** group, after the branch: `⑂ master` and `src › lib.rs` answer the
  * same question, and the right group is then only the readouts a user watches — the caret line
- * and the Claude session. It arrived in the right group when the breadcrumb row was deleted and
+ * and the harness readout. It arrived in the right group when the breadcrumb row was deleted and
  * stayed there by inertia.
  *
  * Both file slots are gated on `editorFocused`, because the claim stack behind them never
@@ -67,6 +67,7 @@ import { crumbTargets } from '@/sidebar/rowPaths'
 import { BranchSelector } from './BranchSelector'
 import { GitOpIndicator } from './GitOpIndicator'
 import { Icon } from '@/icons/Icon'
+import { HARNESS_LOADING, type HarnessReadout } from './harnessReadout'
 
 import styles from './StatusBar.module.css'
 
@@ -84,7 +85,7 @@ export interface StatusBarProps {
    * one but shared it with the rail's ⚠ badge, which is nearer the eye and already there. See
    * the header.
    */
-  claude?: string | undefined
+  harnessReadout?: HarnessReadout | undefined
   /**
    * Every path the file tree can hang a row from — the project's roots plus each synthetic
    * group's top-level children, from `fs_reveal_roots` by way of `sidebar/treeStore.ts`. (M16)
@@ -140,25 +141,6 @@ export interface StatusBarProps {
   editorFocused?: boolean | undefined
 }
 
-const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.'
-
-/** Shown until a real readout exists, and the value the pending title keys off. */
-const CLAUDE_PLACEHOLDER = 'claude · —'
-
-/**
- * The same two for a codex console (M93): no statusline, so the readout is read off the
- * session's rollout once a turn has been taken — until then there is nothing to read.
- */
-export const CODEX_PLACEHOLDER = 'codex · —'
-const CODEX_PENDING = 'Session readout arrives from the codex rollout after the first turn.'
-
-/** The slot's tooltip: which CLI the readout is about, or why it is still empty. */
-function sessionTitle(readout: string): string {
-  if (readout === CLAUDE_PLACEHOLDER) return CLAUDE_PENDING
-  if (readout === CODEX_PLACEHOLDER) return CODEX_PENDING
-  return readout.startsWith('codex') ? 'Codex session' : 'Claude session'
-}
-
 /** The crumb half of the readout, which is the half that goes through React state. */
 type Crumbs = Pick<ReadoutLine, 'trail' | 'pathCount' | 'file'>
 
@@ -189,7 +171,7 @@ function isSelecting(): boolean {
 }
 
 export function StatusBar({
-  claude = CLAUDE_PLACEHOLDER,
+  harnessReadout = HARNESS_LOADING,
   revealRoots,
   onRevealSegment,
   editorFocused = true,
@@ -400,17 +382,18 @@ export function StatusBar({
          * therefore childless in JSX: giving React a child here would let the next render —
          * a branch change, a token tick — overwrite the live text.
          *
-         * Inboard of the Claude readout, so the four facts that move as the user types do not
+         * Inboard of the harness readout, so the four facts that move as the user types do not
          * push the session slot around: that one is the widest thing on the bar and the one
          * whose position should stay put.
          */}
         <span className={styles.readout} ref={readoutRef} data-audit="editorReadout" />
         <span
           className={`${styles.claude} ${styles.stat}`}
-          title={sessionTitle(claude)}
+          title={harnessReadout.title}
+          data-audit="harnessReadout"
         >
           <Icon name="message-square" size={1} />
-          {claude}
+          {harnessReadout.text}
         </span>
         {/* The mock's `rust-analyzer` slot sits here and stays out until one is running. */}
       </div>

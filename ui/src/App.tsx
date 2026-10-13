@@ -37,7 +37,9 @@ import {
   type SidebarState,
 } from '@/chrome/sidebarView'
 import { registerPanelHost, registerSettingsFrameHost } from '@/chrome/panelRequests'
-import { CODEX_PLACEHOLDER, StatusBar } from '@/chrome/StatusBar'
+import { StatusBar } from '@/chrome/StatusBar'
+import { useHarnessVersion } from '@/chrome/useHarnessVersion'
+import { statusHarnessReadout } from '@/chrome/harnessReadout'
 import {
   formatClaude,
   useSessionStatus,
@@ -1484,6 +1486,11 @@ export function App() {
   const claudeReadout = useSessionStatus((s) =>
     focusedSession ? formatClaude(s.bySession[focusedSession]) : undefined,
   )
+  const defaultHarness = useHarnessVersion(
+    activeProjectId,
+    boot?.workspace.settings ?? null,
+    boot?.workspace.projectHarness,
+  )
 
   /**
    * Ctrl+click on a file path in a terminal pane's output.
@@ -2445,14 +2452,7 @@ export function App() {
           * to it directly (see `chrome/StatusBar.tsx`), so nothing is passed for it here.
           */}
         <StatusBar
-          claude={
-            claudeReadout ??
-            // A codex console with nothing read yet says so, rather than showing the installed
-            // *claude*'s version under a pane that is not running it. (M93)
-            (focused?.pane.harness === 'codex'
-              ? CODEX_PLACEHOLDER
-              : (boot?.capabilities.claudeVersion ?? undefined))
-          }
+          harnessReadout={statusHarnessReadout(claudeReadout, defaultHarness)}
           revealRoots={revealRoots}
           /*
            * Whether the bar says anything about a file at all. The same expression

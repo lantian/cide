@@ -463,6 +463,7 @@ pub fn run() {
         // worker, so the first window's bootstrap is a cache hit instead of a fork on the
         // main loop — see `caps::ClaudeVersion`.
         .manage(caps::ClaudeVersion::default())
+        .manage(caps::HarnessVersions::default())
         .invoke_handler(tauri::generate_handler![
             cmd::gitlab::gitlab_request,
             cmd::gitlab::gitlab_open_document,
@@ -639,6 +640,7 @@ pub fn run() {
             cmd::settings::project_harness_get,
             cmd::settings::project_harness_set,
             cmd::settings::project_harness_effective,
+            cmd::settings::harness_cli_version,
             cmd::settings::opencode_cli_support,
             cmd::settings::settings_set,
             cmd::settings::tab_open_settings,

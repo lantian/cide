@@ -74,6 +74,47 @@ pub fn project_harness_effective(
     })
 }
 
+/// Hand-mirrored in ipc/client.ts, like the CLI support readouts below.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCliVersion {
+    harness: cide_ipc::ConsoleHarness,
+    binary: String,
+    version: Option<String>,
+}
+
+/// A version-only probe: no launch diagnostics or Codex sandbox preflight.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn harness_cli_version(
+    app: AppHandle,
+    project: Option<ProjectId>,
+) -> Result<HarnessCliVersion, CoreError> {
+    let (harness, binary) = app.state::<WorkspaceState>().with(|ws| {
+        if let Some(project) = project {
+            workspace::project(ws, project)?;
+        }
+        Ok::<_, CoreError>(cide_core::harness_settings::console_binary(
+            &cide_core::harness_settings::effective(ws, project),
+        ))
+    })?;
+    let versions = app.state::<crate::caps::HarnessVersions>().inner().clone();
+    let fallback = HarnessCliVersion {
+        harness,
+        binary: binary.clone(),
+        version: None,
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let version = versions.probe(harness, &binary);
+        HarnessCliVersion {
+            harness,
+            binary,
+            version,
+        }
+    })
+    .await
+    .unwrap_or(fallback))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn opencode_cli_support(app: AppHandle, project: Option<ProjectId>) -> CodexCliSupport {
     let state = app.state::<WorkspaceState>();

@@ -33,6 +33,18 @@ pub fn effective(ws: &Workspace, id: Option<ProjectId>) -> Settings {
         .resolve(&ws.settings)
 }
 
+/// The configured default console and its binary, independent of any existing pane.
+pub fn console_binary(settings: &Settings) -> (cide_ipc::ConsoleHarness, String) {
+    use cide_ipc::ConsoleHarness;
+    let harness = settings.console_harness;
+    let binary = match harness {
+        ConsoleHarness::Claude => &settings.claude.cli.binary,
+        ConsoleHarness::Codex => &settings.codex.cli.binary,
+        ConsoleHarness::Opencode => &settings.opencode.cli.binary,
+    };
+    (harness, binary.trim().to_string())
+}
+
 pub fn load(path: &Path) -> Result<Projects> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -52,6 +64,46 @@ pub fn save(path: &Path, projects: &Projects) -> Result<()> {
 mod tests {
     use super::*;
     use cide_ipc::{ConsoleHarness, ProjectHarnessEdit};
+
+    #[test]
+    fn console_version_uses_the_effective_default_and_its_binary() {
+        let mut ws = Workspace::default();
+        ws.settings.console_harness = ConsoleHarness::Codex;
+        ws.settings.codex.cli.binary = " /custom/codex ".into();
+        assert_eq!(
+            console_binary(&effective(&ws, None)),
+            (ConsoleHarness::Codex, "/custom/codex".into())
+        );
+        let project =
+            crate::workspace::open_project(&mut ws, vec!["/project".into()], None).unwrap();
+        let key = project_key(&ws, project).unwrap();
+        ws.project_harness.insert(
+            key.clone(),
+            ProjectHarnessSettings {
+                console_harness: Some(ConsoleHarness::Opencode),
+                opencode: Some(cide_ipc::OpencodeCli {
+                    binary: "/custom/opencode".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            console_binary(&effective(&ws, Some(project))),
+            (ConsoleHarness::Opencode, "/custom/opencode".into())
+        );
+        ws.project_harness.get_mut(&key).unwrap().console_harness = Some(ConsoleHarness::Claude);
+        ws.settings.claude.cli.binary = "/custom/claude".into();
+        assert_eq!(
+            console_binary(&effective(&ws, Some(project))),
+            (ConsoleHarness::Claude, "/custom/claude".into())
+        );
+        ws.project_harness.remove(&key);
+        assert_eq!(
+            console_binary(&effective(&ws, Some(project))),
+            (ConsoleHarness::Codex, "/custom/codex".into())
+        );
+    }
 
     #[test]
     fn inheritance_and_independent_overrides() {
