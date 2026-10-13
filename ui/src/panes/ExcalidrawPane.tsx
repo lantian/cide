@@ -62,7 +62,7 @@
  * codebase forbids.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { diag, events, file as fileApi, fileChanged, type ProjectId } from '@/ipc/client'
+import { clipboard, imageClipboard, diag, events, file as fileApi, fileChanged, type ProjectId } from '@/ipc/client'
 import type { FileStamp } from '@/ipc/generated'
 import { useWorkspace } from '@/store/workspace'
 import { autosaveDelay, shouldAutosave } from '@/editor/autosave'
@@ -87,6 +87,7 @@ import type {
   Viewport,
 } from './ExcalidrawSurface'
 import styles from './ExcalidrawPane.module.css'
+import { claimExcalidrawContextMenu, installExcalidrawClipboard } from './excalidrawClipboard'
 
 /*
  * Where Excalidraw fetches its fonts from. (M63)
@@ -261,6 +262,17 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen }: Excalidra
     apiRef.current = null
     savedRef.current = null
     currentFpRef.current = null
+    // Capability probes run during the engine import. Plain-browser demos keep their clipboard.
+    if ('__TAURI_INTERNALS__' in window) {
+      installExcalidrawClipboard({
+        writeText: (text) => clipboard.writeText(text).catch((error: unknown) => {
+          throw new Error(describe(error))
+        }),
+        writeImage: ({ width, height, rgba }) => imageClipboard.writeRgba(width, height, rgba).catch((error: unknown) => {
+          throw new Error(describe(error))
+        }),
+      })
+    }
     void Promise.all([import('./ExcalidrawSurface'), fileApi.readBytes(at)])
       .then(async ([surface, { head, bytes }]) => {
         if (!live) return
@@ -585,7 +597,7 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen }: Excalidra
           </button>
         </div>
       )}
-      <div className={styles.surface}>
+      <div className={styles.surface} onContextMenu={claimExcalidrawContextMenu}>
         {load.kind === 'loading' && <div className={styles.notice}>Opening {name}…</div>}
         {load.kind === 'failed' && (
           <div className={styles.notice}>

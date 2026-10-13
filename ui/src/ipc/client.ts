@@ -5676,3 +5676,11 @@ export const userRequests = {
   respond: (project: ProjectId, id: string, response: import('./generated').UserRequestResponse) =>
     invoke<import('./generated').UserRequestsView>('user_request_respond', { project, id, response }),
 }
+
+/** Native image writes use raw framed RGBA, avoiding JSON pixels and resource-table handles. */
+export const imageClipboard = {
+  writeRgba: (width: number, height: number, rgba: Uint8Array) => {
+    const head: import('./generated').ClipboardImageWrite = { width, height }
+    return invoke<void>('clipboard_write_image', packFrame(JSON.stringify(head), rgba))
+  },
+}

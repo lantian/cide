@@ -6,6 +6,7 @@
 //! crates that do not link a webview.
 
 pub mod app;
+pub mod clipboard;
 pub mod diag;
 pub mod file;
 pub mod git;

@@ -32,6 +32,7 @@
   "claude_headless",
   "claude_send_lines",
   "claude_session_names",
+  "clipboard_write_image",
   "codex_cli_support",
   "diag_bench_report",
   "diag_echo_bytes",

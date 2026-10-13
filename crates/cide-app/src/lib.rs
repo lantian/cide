@@ -653,6 +653,7 @@ pub fn run() {
             cmd::settings::claude_cli_support,
             cmd::settings::codex_cli_support,
             cmd::settings::app_open_log_dir,
+            cmd::clipboard::clipboard_write_image,
             cmd::settings::scheme_import,
             cmd::settings::scheme_remove,
             cmd::window::window_detach_pane,

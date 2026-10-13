@@ -18094,3 +18094,35 @@ server, opened a question with an image, retained a selected answer through task
 the answer and confirmed that it was absent after reconnect. Port 9990 serves
 `/tmp/cide-mobile-downloads/cide-mobile.apk`;
 an HTTP download returned the same SHA-256 as the built APK.
+
+## M174 — Native drawing copy and one context menu
+
+Copy as PNG and SVG in a drawing could report “Couldn't copy to clipboard”, and a right-click
+opened both Excalidraw's menu and cide's pane menu. Excalidraw's browser clipboard path did not
+use cide's native clipboard, and its canvas handler prevented the browser default without
+stopping the gesture from reaching the enclosing pane frame.
+
+The drawing surface now stops context-menu bubbling after the engine handles it. Its footer
+and pane controls retain cide's menu. A window-lifetime clipboard adapter installs before the
+engine's lazy import and capability probes, preserving the original export actions, selection
+and frame behavior. SVG markup goes through the existing native text writer. PNG is decoded
+by the webview and crosses IPC as framed RGBA with a `ClipboardImageWrite` header. The new
+`clipboard_write_image` handler validates dimensions and payload size, then writes through
+the registered plugin on the blocking pool, without allocating resource-table handles.
+Missing clipboard item support gets a minimal adapter; reads and unsupported browser write
+formats retain their original implementation. Plain-browser demos keep their browser APIs.
+
+Verified: the new clipboard/React bubbling check, Excalidraw, menus, menu model, commands,
+editor (5,460 checks), images, file clipboard, key gate, selectors, theme and panel boundary;
+TypeScript and the production build; clipboard parser tests, document and frame tests, and
+drawing raw-write parser tests; formatting, clippy for cide-app/cide-ipc, generated types and
+command contract. The editor check needed an unrestricted run because the sandbox reported
+EPERM on its child-process grep despite producing the expected output.
+
+A real WebKitGTK 2.52 harness exercised Excalidraw's built-in PNG/SVG context-menu actions for
+the full canvas, one selected element and one selected frame, plus the PNG keyboard shortcut.
+The clipboard plugin's underlying arboard writer served those images and SVG text to a
+separate xclip process on a private X display, and the enclosing React pane menu never opened.
+This verifies browser export/decode and native paste; it does not exercise the complete running
+cide IPC route, a detached cide tab, macOS or Wayland. Independent-window installation is
+covered by the automated adapter check.
