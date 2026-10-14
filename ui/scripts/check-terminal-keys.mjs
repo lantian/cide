@@ -36,6 +36,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { JSDOM } from 'jsdom'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-term-keys-'))
 let failed = 0
@@ -56,6 +57,7 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/terminal/keys.ts',
+      'src/terminal/clipboardHost.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -68,6 +70,7 @@ try {
 
   const { SHIFT_ENTER, terminalKeyBytes, terminalClipboardAction, terminalOpensFind } =
     await import(`file://${join(out, 'keys.js')}`)
+  const { attachTerminalClipboard } = await import(`file://${join(out, 'clipboardHost.js')}`)
 
   /** A `TerminalKeyEvent`, with every modifier off unless named. */
   const ev = (spec) => ({
@@ -117,38 +120,45 @@ try {
    */
   const SELECTION = 'lines the user dragged over'
   let swept = 0
-  for (const kind of ['claude', 'shell']) {
-    for (const selection of ['', SELECTION]) {
-      for (const childSelection of [false, true]) {
-        for (const key of ['c', 'v', 'C', 'x', 'Enter']) {
-          for (let bits = 0; bits < 16; bits++) {
-            const mods = {
-              ctrl: (bits & 1) !== 0,
-              alt: (bits & 2) !== 0,
-              shift: (bits & 4) !== 0,
-              meta: (bits & 8) !== 0,
-            }
-            const plainCtrl = mods.ctrl && !mods.alt && !mods.shift && !mods.meta
-            const letter = key.toLowerCase()
-            const expected =
-              !plainCtrl || (letter !== 'c' && letter !== 'v')
-                ? null
-                : letter === 'c'
-                  ? selection !== ''
-                    ? { kind: 'copy', text: selection }
-                    : childSelection
-                      ? { kind: 'swallow' }
-                      : null
-                  : { kind: 'paste' }
+  for (const macos of [false, true]) {
+    for (const kind of ['claude', 'shell']) {
+      for (const selection of ['', SELECTION, '\n', '   ']) {
+        for (const childSelection of [false, true]) {
+          for (const type of ['keydown', 'keyup', 'keypress']) {
+            for (const key of ['c', 'v', 'C', 'V', 'x', 'Enter']) {
+              for (let bits = 0; bits < 16; bits++) {
+                const mods = {
+                  ctrl: (bits & 1) !== 0,
+                  alt: (bits & 2) !== 0,
+                  shift: (bits & 4) !== 0,
+                  meta: (bits & 8) !== 0,
+                }
+                const plainCtrl = mods.ctrl && !mods.alt && !mods.shift && !mods.meta
+                const command = macos && mods.meta && !mods.ctrl && !mods.alt && !mods.shift
+                const letter = key.toLowerCase()
+                const expected =
+                  type !== 'keydown' || !(plainCtrl || command) || (letter !== 'c' && letter !== 'v')
+                    ? null
+                    : letter === 'c'
+                      ? (command ? selection !== '' : selection.trim() !== '')
+                        ? { kind: 'copy', text: selection }
+                        : command || childSelection
+                          ? { kind: 'swallow' }
+                          : null
+                      : { kind: 'paste' }
 
-            swept += 1
-            eq(
-              terminalClipboardAction(ev({ key, ...mods }), { selection, kind, childSelection }),
-              expected,
-              `${JSON.stringify(mods)} ${key} in a ${kind} pane with ` +
-                `${selection === '' ? 'no selection' : 'a selection'}` +
-                `${childSelection ? ' after a drag the child got' : ''}`,
-            )
+                swept += 1
+                eq(
+                  terminalClipboardAction(
+                    ev({ key, type, ...mods }), { selection, kind, childSelection }, macos,
+                  ),
+                  expected,
+                  `${macos ? 'macOS' : 'other OS'} ${type} ${JSON.stringify(mods)} ${key} in a ${kind} pane with ` +
+                    `${selection === '' ? 'no selection' : 'a selection'}` +
+                    `${childSelection ? ' after a drag the child got' : ''}`,
+                )
+              }
+            }
           }
         }
       }
@@ -156,9 +166,89 @@ try {
   }
   eq(
     swept,
-    2 * 2 * 2 * 5 * 16,
-    'swept both pane kinds × both selection states × child drag or not × the key set × 16',
+    2 * 2 * 4 * 2 * 3 * 6 * 16,
+    'swept platforms × pane kinds × selection states × child drag × event types × keys × modifiers',
   )
+
+  /* ------------------------------------------------------- native macOS clipboard events */
+
+  for (const macos of [false, true]) {
+    const dom = new JSDOM('<div id="host"><div id="terminal"><textarea></textarea></div></div><input>')
+    try {
+      const { document, Event, KeyboardEvent } = dom.window
+      const host = document.querySelector('#host')
+      const terminal = document.querySelector('#terminal')
+      const textarea = document.querySelector('textarea')
+      const other = document.querySelector('input')
+      const actions = []
+      const xterm = []
+      const handlers = { copy: () => actions.push('copy'), paste: () => actions.push('paste') }
+      const cleanup = attachTerminalClipboard(host, macos, handlers)
+      const nativeEvent = (type) => new Event(type, { bubbles: true, cancelable: true })
+      for (const target of [textarea, terminal]) {
+        for (const type of ['copy', 'paste']) {
+          target.addEventListener(type, (event) => {
+            xterm.push(type)
+            event.stopPropagation()
+          })
+        }
+      }
+
+      textarea.focus()
+      for (const target of [textarea, terminal]) {
+        for (const type of ['copy', 'paste']) {
+          const event = nativeEvent(type)
+          target.dispatchEvent(event)
+          eq(event.defaultPrevented, macos, `${type} native default is consumed only on macOS`)
+        }
+      }
+      eq(actions, macos ? ['copy', 'paste', 'copy', 'paste'] : [], 'each native event runs once')
+      eq(xterm, macos ? [] : ['copy', 'paste', 'copy', 'paste'], 'handled events never also reach xterm')
+
+      actions.length = 0
+      other.focus()
+      textarea.dispatchEvent(nativeEvent('paste'))
+      other.dispatchEvent(nativeEvent('copy'))
+      other.dispatchEvent(nativeEvent('paste'))
+      eq(actions, [], 'unfocused terminals and other text fields keep their own clipboard handling')
+
+      textarea.focus()
+      const handled = nativeEvent('paste')
+      handled.preventDefault()
+      textarea.dispatchEvent(handled)
+      eq(actions, [], 'a previously handled clipboard event is not run again')
+
+      // Browser clipboard defaults run only when the keydown was not cancelled. Exercise both
+      // delivery paths: a keydown handled here, or a native menu event with no keydown.
+      textarea.addEventListener('keydown', (event) => {
+        const action = terminalClipboardAction(event, { selection: 'selected', kind: 'shell' }, macos)
+        if (action === null) return
+        event.preventDefault()
+        if (action.kind === 'copy') handlers.copy()
+        if (action.kind === 'paste') handlers.paste()
+      })
+      if (macos) {
+        for (const [key, type] of [['c', 'copy'], ['v', 'paste']]) {
+          const keydown = new KeyboardEvent('keydown', { key, metaKey: true, bubbles: true, cancelable: true })
+          textarea.dispatchEvent(keydown)
+          ok(keydown.defaultPrevented, `Command+${key} cancels the browser's second clipboard path`)
+          if (!keydown.defaultPrevented) textarea.dispatchEvent(nativeEvent(type))
+        }
+        eq(actions, ['copy', 'paste'], 'a keyboard gesture performs exactly one clipboard action')
+      }
+
+      actions.length = 0
+      xterm.length = 0
+      cleanup()
+      cleanup()
+      textarea.dispatchEvent(nativeEvent('copy'))
+      textarea.dispatchEvent(nativeEvent('paste'))
+      eq(actions, [], 'host cleanup removes both clipboard listeners')
+      eq(xterm, ['copy', 'paste'], 'xterm receives events again after cleanup')
+    } finally {
+      dom.window.close()
+    }
+  }
 
   // opencode's own selection: a drag under mouse tracking goes to the child, xterm has no
   // selection, and Ctrl+C used to interrupt the program the user was copying from.

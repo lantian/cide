@@ -56,8 +56,17 @@ export const RELATIVE_DIFF_PATH =
 
 /** The half of `RecentEntry` this file needs. Structurally satisfied by the generated type. */
 export interface RecentLike {
-  readonly project: { readonly path: string; readonly displayPath: string }
+  readonly project: { readonly path: string; readonly displayPath: string; readonly name: string }
   readonly exists: boolean
+}
+
+/** Filtering never changes the backend's recency order or drops unavailable matches. */
+export function filterProjects<T extends RecentLike>(projects: readonly T[], query: string): readonly T[] {
+  const needle = query.trim().toLowerCase()
+  if (needle === '') return projects
+  return projects.filter(({ project }) =>
+    [project.name, project.path, project.displayPath].some((value) => value.toLowerCase().includes(needle)),
+  )
 }
 
 export interface RecentActions {
@@ -84,6 +93,7 @@ export interface RecentActions {
 export function recentEntries(
   recents: readonly RecentLike[],
   actions: RecentActions,
+  query = '',
 ): MenuEntry[] {
   const items: MenuEntry[] = [
     { id: 'browse', label: 'Open folder…', run: actions.browse },
@@ -96,7 +106,12 @@ export function recentEntries(
     return items
   }
 
-  for (const entry of recents) {
+  const matches = filterProjects(recents, query)
+  if (matches.length === 0) {
+    items.push({ id: 'no-matches', label: 'No matching projects', disabledReason: 'Try another name or path' })
+  }
+
+  for (const entry of matches) {
     items.push({
       // Keyed and labelled by the path, not the name: two checkouts of one repository share a
       // basename, and a menu with `cide` in it twice cannot be used. The display form is

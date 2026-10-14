@@ -65,6 +65,7 @@
     "check:log-render": "node scripts/check-log-render.mjs",
     "check:markdown": "node scripts/check-markdown.mjs",
     "check:menu-model": "node scripts/check-menu-model.mjs",
+    "audit:project-picker": "node scripts/audit-project-picker.mjs",
     "check:menus": "node scripts/check-menus.mjs",
     "check:merge": "node scripts/check-merge.mjs",
     "check:new-project": "node scripts/check-new-project.mjs",

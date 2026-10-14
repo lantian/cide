@@ -21,7 +21,7 @@
  * `projectPath`, none of which is in here, and it measures the live DOM of the running app
  * rather than this component in a fixture.
  */
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useContextMenu } from '@/menus'
 import { projectMenu, type RecentEntry } from '@/ipc/client'
 import { recentEntries } from './menuModel'
@@ -32,16 +32,9 @@ import { Icon } from '@/icons/Icon'
 import styles from './AppHeader.module.css'
 
 export function ProjectMenu() {
-  /*
-   * The fetched list, in a ref rather than in state.
-   *
-   * `useContextMenu`'s `items` is called synchronously at open time, and the open follows the
-   * fetch in the same async function — a `setState` there would not have been committed yet, so
-   * the first press of `▾` would build the menu from the *previous* answer. A ref is written and
-   * read in one turn, and nothing else renders from it: the menu is rebuilt from scratch on
-   * every open, so there is no stale copy for a missing re-render to leave on screen.
-   */
+  // The ref is also used by cleanup callbacks; phase commits a new render when loading ends.
   const recents = useRef<readonly RecentEntry[]>([])
+  const [phase, setPhase] = useState<'loading' | 'loaded' | 'failed'>('loading')
   /*
    * The popup hangs off the whole split button, not off the caret that opened it.
    *
@@ -52,17 +45,16 @@ export function ProjectMenu() {
    */
   const anchor = useRef<HTMLDivElement>(null)
 
-  // The picker itself lives in `chrome/projectOpen.ts`, because the palette's *Open project…*
-  // is the same gesture and two spellings of it is how one of them ends up on the plugin
-  // dialog that cannot be parented on Linux. That module's doc is where the why lives.
+  // The + button and the searchable modal's Open folder action share the parented picker.
   const browse = useCallback(() => {
     void browseForProject()
   }, [])
 
   const { openFor, isOpen, menu } = useContextMenu({
     label: 'Recent projects',
-    items: () =>
-      recentEntries(recents.current, {
+    search: { label: 'Filter recent projects', placeholder: 'Filter projects by name or path' },
+    items: (_at, query) => {
+      const entries = recentEntries(recents.current, {
         browse,
         create: requestNewProject,
         reopen: (path) => {
@@ -87,15 +79,35 @@ export function ProjectMenu() {
             recents.current = left
           })
         },
-      }),
+      }, query)
+      if (phase === 'loaded') return entries
+      return entries.map((entry) => entry.kind !== 'separator' && entry.id === 'empty' ? {
+        id: 'load-status',
+        label: phase === 'loading' ? 'Loading projects…' : 'Could not load projects',
+        disabledReason: phase === 'loading' ? 'Checking remembered folders' : 'Reopen this menu to retry',
+      } : entry)
+    },
   })
 
+  useEffect(() => {
+    if (!isOpen) return
+    let live = true
+    void projectMenu.recent().then(
+      (entries) => {
+        if (!live) return
+        recents.current = entries
+        setPhase('loaded')
+      },
+      () => { if (live) setPhase('failed') },
+    )
+    return () => { live = false }
+  }, [isOpen])
+
   const openRecents = useCallback(() => {
-    void (async () => {
-      recents.current = await projectMenu.recent()
-      const under = anchor.current
-      if (under) openFor(under)
-    })()
+    recents.current = []
+    setPhase('loading')
+    const under = anchor.current
+    if (under) openFor(under)
   }, [openFor])
 
   return (
@@ -121,7 +133,7 @@ export function ProjectMenu() {
         className={styles.recent}
         title="Recent projects"
         aria-label="Recent projects"
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={isOpen}
         onClick={openRecents}
       >

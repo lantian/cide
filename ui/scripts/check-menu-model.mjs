@@ -85,6 +85,7 @@ try {
     overflowEntries,
     pathOf,
     projectTabEntries,
+    filterProjects,
     recentEntries,
     rowGate,
     rowTarget,
@@ -97,6 +98,27 @@ try {
     project: { path, displayPath: path, name: path, openedAt: 0n },
     exists,
   })
+
+  {
+    const entries = [
+      { ...recent('/home/dev/work/atlas', true), project: { path: '/home/dev/work/atlas', displayPath: '~/work/atlas', name: 'Atlas app' } },
+      { ...recent('/mnt/archive/atlas', false), project: { path: '/mnt/archive/atlas', displayPath: '/mnt/archive/atlas', name: 'Atlas archive' } },
+      recent('/home/dev/beacon', true),
+    ]
+    eq(filterProjects(entries, '  ATLAS  ').map((e) => e.project.path), ['/home/dev/work/atlas', '/mnt/archive/atlas'], 'filter matches case-insensitively, trims whitespace and retains missing projects in recency order')
+    eq(filterProjects(entries, 'Atlas app').length, 1, 'project names are searchable')
+    eq(filterProjects(entries, '/home/dev/work').length, 1, 'full paths are searchable')
+    eq(filterProjects(entries, '~/work').length, 1, 'abbreviated display paths are searchable')
+    ok(filterProjects(entries, '  ') === entries, 'an empty filter restores all entries')
+    eq(filterProjects(entries, 'nowhere'), [], 'no matches is an empty result')
+    const filtered = recentEntries(entries, NOTHING, 'beacon')
+    ok(item(filtered, 'browse') && item(filtered, 'new'), 'creation and browsing stay available under a filter')
+    eq(item(filtered, 'forget-missing').label, 'Remove 1 missing project', 'cleanup counts hidden missing entries too')
+    ok(item(filtered, 'clear'), 'clear acts on the history even with a filter')
+    const unmatched = recentEntries(entries, NOTHING, 'nowhere')
+    ok(item(unmatched, 'no-matches') && !item(unmatched, 'empty'), 'no matching projects is distinct from an empty history')
+    ok(item(unmatched, 'forget-missing') && item(unmatched, 'clear'), 'cleanup remains available with zero matches')
+  }
 
   // =====================================================================================
   // 1. Recent projects — the entry whose folder has gone

@@ -62,6 +62,12 @@ export interface ContextMenuProps {
   /** Window coordinates of the pointer, or of the anchor for a keyboard invocation. */
   at: { x: number; y: number }
   onClose: () => void
+  search?: {
+    label: string
+    placeholder: string
+    value: string
+    onChange: (value: string) => void
+  } | undefined
   /**
    * The keychip source, for rows built *after* the menu opened — that is, submenu rows.
    *
@@ -112,8 +118,10 @@ export function ContextMenu({
   at,
   onClose,
   chipFor,
+  search,
 }: ContextMenuProps): React.ReactNode {
   const box = useRef<HTMLDivElement>(null)
+  const input = useRef<HTMLInputElement>(null)
   const items = useRef(new Map<number, HTMLButtonElement>())
   const [placement, setPlacement] = useState<Placement | null>(null)
   const [active, setActive] = useState<number | null>(null)
@@ -202,7 +210,8 @@ export function ContextMenu({
    */
   useLayoutEffect(() => {
     if (placement === null) return
-    box.current?.focus({ preventScroll: true })
+    if (search !== undefined) input.current?.focus({ preventScroll: true })
+    else box.current?.focus({ preventScroll: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [placement === null])
 
@@ -218,7 +227,7 @@ export function ContextMenu({
     // `scrollIntoView` with the block alignment a menu wants.
     const item = items.current.get(active)
     if (item === undefined) return
-    item.focus({ preventScroll: true })
+    if (input.current === null) item.focus({ preventScroll: true })
     item.scrollIntoView({ block: 'nearest' })
   }, [active, subActive])
 
@@ -491,9 +500,9 @@ export function ContextMenu({
             ? undefined
             : { left: placement.x, top: placement.y, maxHeight: placement.maxHeight }
         }
-        role="menu"
+        role={search === undefined ? 'menu' : 'dialog'}
         aria-label={label}
-        aria-orientation="vertical"
+        aria-orientation={search === undefined ? 'vertical' : undefined}
         tabIndex={-1}
         data-audit="contextMenu"
         data-flipped-x={placement?.flippedX === true ? 'true' : 'false'}
@@ -506,80 +515,113 @@ export function ContextMenu({
           ev.stopPropagation()
         }}
       >
-        {entries.map((entry, index) =>
-          entry.kind === 'separator' ? (
-            <div key={entry.id} className={styles.separator} role="separator" />
-          ) : (
-            <button
-              key={entry.id}
-              type="button"
-              ref={(el) => {
-                if (el === null) items.current.delete(index)
-                else items.current.set(index, el)
+        {search !== undefined && (
+          <div className={styles.search}>
+            <input
+              ref={input}
+              aria-label={search.label}
+              placeholder={search.placeholder}
+              value={search.value}
+              spellCheck={false}
+              autoComplete="off"
+              onChange={(ev) => {
+                setActive(null)
+                closeSubmenu()
+                search.onChange(ev.target.value)
               }}
-              className={[
-                styles.item,
-                entry.enabled ? '' : styles.disabled,
-                entry.danger ? styles.danger : '',
-                active === index ? styles.active : '',
-              ]
-                .filter((c) => c !== '')
-                .join(' ')}
-              role={entry.checked === null ? 'menuitem' : 'menuitemcheckbox'}
-              aria-checked={entry.checked === null ? undefined : entry.checked}
-              aria-haspopup={entry.submenu === null ? undefined : 'menu'}
-              aria-expanded={entry.submenu === null ? undefined : submenu?.index === index}
-              tabIndex={-1}
-              // Not the `disabled` attribute: a disabled <button> takes no pointer events, so
-              // its `title` never appears and the reason becomes unreadable on hover.
-              aria-disabled={entry.enabled ? undefined : true}
-              data-item={entry.id}
-              data-enabled={entry.enabled ? 'true' : 'false'}
-              data-submenu={entry.submenu === null ? undefined : 'true'}
-              title={entry.reason ?? undefined}
-              onClick={(ev) => {
-                // A parent row opens its list and does nothing else. Clicking it must not also
-                // dismiss the menu, which is what `run`'s `onClose` would do.
-                if (entry.submenu !== null) {
-                  return openSubmenu(index, ev.currentTarget, entry.submenu)
-                }
-                run(index)
+              onKeyDown={(ev) => {
+                // Leave spaces, caret movement and editing to the input. Menu navigation
+                // changes only the highlight, so the next character still filters.
+                ev.stopPropagation()
+                if (ev.nativeEvent.isComposing) return
+                if (['ArrowDown', 'ArrowUp', 'Enter', 'Escape', 'Tab'].includes(ev.key)) onKeyDown(ev)
               }}
-              // Hover moves the keyboard cursor too, so arrowing after reaching for the mouse
-              // continues from where the eye is rather than from where the keyboard was.
-              //
-              // And hover is the gesture the user asked for here: moving onto *Send … to
-              // Claude* shows the sessions without a click. Moving onto any other row closes
-              // whatever was open, so a submenu never outlives the row it belongs to.
-              onPointerEnter={(ev) => {
-                if (entry.enabled) setActive(index)
-                if (entry.enabled && entry.submenu !== null) {
-                  openSubmenu(index, ev.currentTarget, entry.submenu)
-                } else if (submenu !== null) {
-                  // Including for a *disabled* row, which is why this is not inside the
-                  // `enabled` guard: a submenu left standing beside a row the pointer has
-                  // moved off is a box pointing at nothing, and the greyed rows are exactly
-                  // the ones a pointer crosses on the way past.
-                  closeSubmenu()
-                }
-              }}
-            >
-              {hasToggle && (
-                <span className={styles.check} aria-hidden="true">
-                  {entry.checked === true ? <Icon name="check" size={0} /> : null}
-                </span>
-              )}
-              <span className={styles.label}>{entry.label}</span>
-              {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
-              {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
-              {entry.submenu !== null && (
-                <span className={styles.chevron} aria-hidden="true">
-                  <Icon name="chevron-right" size={1} />
-                </span>
-              )}
-            </button>
-          ),
+            />
+          </div>
         )}
+        <div
+          role={search === undefined ? undefined : 'menu'}
+          aria-label={search === undefined ? undefined : label}
+          aria-orientation={search === undefined ? undefined : 'vertical'}
+        >
+          {entries.map((entry, index) =>
+            entry.kind === 'separator' ? (
+              <div key={entry.id} className={styles.separator} role="separator" />
+            ) : (
+              <button
+                key={entry.id}
+                type="button"
+                ref={(el) => {
+                  if (el === null) items.current.delete(index)
+                  else items.current.set(index, el)
+                }}
+                className={[
+                  styles.item,
+                  entry.enabled ? '' : styles.disabled,
+                  entry.danger ? styles.danger : '',
+                  active === index ? styles.active : '',
+                ]
+                  .filter((c) => c !== '')
+                  .join(' ')}
+                role={entry.checked === null ? 'menuitem' : 'menuitemcheckbox'}
+                aria-checked={entry.checked === null ? undefined : entry.checked}
+                aria-haspopup={entry.submenu === null ? undefined : 'menu'}
+                aria-expanded={entry.submenu === null ? undefined : submenu?.index === index}
+                tabIndex={-1}
+                // Not the `disabled` attribute: a disabled <button> takes no pointer events, so
+                // its `title` never appears and the reason becomes unreadable on hover.
+                aria-disabled={entry.enabled ? undefined : true}
+                data-item={entry.id}
+                data-enabled={entry.enabled ? 'true' : 'false'}
+                data-submenu={entry.submenu === null ? undefined : 'true'}
+                title={entry.reason ?? undefined}
+                onMouseDown={(ev) => {
+                  if (search !== undefined) ev.preventDefault()
+                }}
+                onClick={(ev) => {
+                  // A parent row opens its list and does nothing else. Clicking it must not also
+                  // dismiss the menu, which is what `run`'s `onClose` would do.
+                  if (entry.submenu !== null) {
+                    return openSubmenu(index, ev.currentTarget, entry.submenu)
+                  }
+                  run(index)
+                }}
+                // Hover moves the keyboard cursor too, so arrowing after reaching for the mouse
+                // continues from where the eye is rather than from where the keyboard was.
+                //
+                // And hover is the gesture the user asked for here: moving onto *Send … to
+                // Claude* shows the sessions without a click. Moving onto any other row closes
+                // whatever was open, so a submenu never outlives the row it belongs to.
+                onPointerEnter={(ev) => {
+                  if (entry.enabled) setActive(index)
+                  if (entry.enabled && entry.submenu !== null) {
+                    openSubmenu(index, ev.currentTarget, entry.submenu)
+                  } else if (submenu !== null) {
+                    // Including for a *disabled* row, which is why this is not inside the
+                    // `enabled` guard: a submenu left standing beside a row the pointer has
+                    // moved off is a box pointing at nothing, and the greyed rows are exactly
+                    // the ones a pointer crosses on the way past.
+                    closeSubmenu()
+                  }
+                }}
+              >
+                {hasToggle && (
+                  <span className={styles.check} aria-hidden="true">
+                    {entry.checked === true ? <Icon name="check" size={0} /> : null}
+                  </span>
+                )}
+                <span className={styles.label}>{entry.label}</span>
+                {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
+                {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
+                {entry.submenu !== null && (
+                  <span className={styles.chevron} aria-hidden="true">
+                    <Icon name="chevron-right" size={1} />
+                  </span>
+                )}
+              </button>
+            ),
+          )}
+        </div>
       </div>
 
       {submenu !== null && (

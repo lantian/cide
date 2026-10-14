@@ -29,6 +29,10 @@
 import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from '@/terminal/xterm'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
+import { attachTerminalClipboard } from '@/terminal/clipboardHost'
+import { copyTerminalSelection, pasteIntoTerminal } from '@/terminal/clipboard'
+import { currentUserAgent, isMacUserAgent } from '@/chrome/windowControls'
+import { notify } from '@/chrome/notices'
 import { attachPathLinks } from '@/terminal/pathLinks'
 import { attachRunLinks } from '@/terminal/runLinkProvider'
 import { attachTaskLinks } from '@/terminal/taskLinkProvider'
@@ -412,6 +416,19 @@ export function openTerminal(paneId: string, kind: TerminalPaneKind): TerminalHa
     attachInputProbe(handle, host.el, paneId, (line) => void diag.log(line).catch(() => {})),
   )
   host.cleanup.push(attachInputRouting(handle, host.el))
+  const clipboardFailed = (error: unknown): void => {
+    notify(`The clipboard could not be reached: ${String(error)}`, { kind: 'error' })
+  }
+  host.cleanup.push(
+    attachTerminalClipboard(host.el, isMacUserAgent(currentUserAgent()), {
+      copy: () => {
+        void copyTerminalSelection(handle.term).catch(clipboardFailed)
+      },
+      paste: () => {
+        void pasteIntoTerminal(handle.term, kind).catch(clipboardFailed)
+      },
+    }),
+  )
 
   /*
    * The other half of the render watchdog's evidence.

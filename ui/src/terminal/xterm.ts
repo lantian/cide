@@ -19,6 +19,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { notify } from '@/chrome/notices'
+import { currentUserAgent, isMacUserAgent } from '@/chrome/windowControls'
 import { isWebUrl } from '@/chrome/webLinks'
 import { showLogDetail } from '@/chrome/logDetailStore'
 import { paneSession } from '@/ipc/client'
@@ -238,6 +239,7 @@ function watchChildDrags(term: Terminal): { take(): boolean } {
 }
 
 export function createTerminal(kind: TerminalPaneKind, paneId: string): TerminalHandle {
+  const macos = isMacUserAgent(currentUserAgent())
   const style = getComputedStyle(document.documentElement)
   const theme = readTheme(style)
 
@@ -473,7 +475,7 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
     if (!terminalKeyGate(ev)) return false
 
     /*
-     * Ctrl+C / Ctrl+V, decided by `terminalClipboardAction` and by nothing else.
+     * Ctrl+C/V and, on macOS, Command+C/V, decided by `terminalClipboardAction`.
      *
      * Here rather than in the keymap because this handler is the app's only *focus-scoped*
      * keyboard entry point: xterm consults it for a keydown delivered to this terminal's own
@@ -489,11 +491,11 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
      * That ordering is the whole of the interception: the bytes are stopped by the return
      * value, not by the promise, so nothing is racing the pty.
      */
-    const action = terminalClipboardAction(ev, {
-      selection: term.getSelection(),
-      kind,
-      childSelection,
-    })
+    const action = terminalClipboardAction(
+      ev,
+      { selection: term.getSelection(), kind, childSelection },
+      macos,
+    )
     if (action !== null) {
       ev.preventDefault()
       if (action.kind === 'swallow') return false

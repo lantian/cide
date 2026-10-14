@@ -112,8 +112,9 @@
  * passes the stroke down to here, so on every layout this rule and xterm still read the same
  * pair — which is the property matching `key` was chosen for, and the reason it stays.
  *
- * Ctrl only, with no `meta` spelling: nothing rewrites this module for macOS the way
- * `keymap::platform_layer` rewrites the keymap. A macOS port starts here.
+ * On macOS, Command+C/V are the primary clipboard gestures and Ctrl+C/V remain alternatives.
+ * Command+C never sends an interrupt, even with no selection. Ctrl+F stays Ctrl-only.
+ * Native Edit-menu clipboard events are handled separately by `clipboardHost.ts`.
  *
  * # Why this is a pure function
  *
@@ -226,7 +227,7 @@ function letter(ev: TerminalKeyEvent, name: string): boolean {
 }
 
 /**
- * Whether Ctrl+C / Ctrl+V should reach the clipboard instead of the child.
+ * Whether Ctrl+C/V, or Command+C/V on macOS, should reach the clipboard instead of the child.
  *
  * Pure, and driven by facts rather than by a `Terminal`, so `check-terminal-keys.mjs` can run
  * every branch — including the one that must never change, which is that an empty selection
@@ -235,14 +236,23 @@ function letter(ev: TerminalKeyEvent, name: string): boolean {
 export function terminalClipboardAction(
   ev: TerminalKeyEvent,
   facts: ClipboardFacts,
+  macos = false,
 ): ClipboardAction {
   // keydown only. xterm offers keypress and keyup to the same handler, and a copy on all
   // three would write the clipboard three times for one press — and, worse, would return
   // `false` for the keyup of an interrupt.
   if (ev.type !== 'keydown') return null
-  if (!plainCtrl(ev)) return null
+  const command = macos && ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey
+  if (!plainCtrl(ev) && !command) return null
 
   if (letter(ev, 'c')) {
+    // Command+C is copy only. Whitespace is a valid selection, and an empty selection must
+    // leave both the clipboard and the child alone, including after a child-owned drag.
+    if (command) {
+      return facts.selection === ''
+        ? { kind: 'swallow' }
+        : { kind: 'copy', text: facts.selection }
+    }
     // The interrupt, whenever nothing is selected. This is the branch the feature is allowed
     // to cost nothing: `null` means xterm sends `ETX` with its own side effects (scroll to
     // bottom, clear selection), which is what a mid-turn `claude` and a runaway command are

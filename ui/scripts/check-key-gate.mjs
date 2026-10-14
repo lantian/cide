@@ -250,6 +250,7 @@ try {
     { key: 'alt+left', command: 'pane.navigate.left', when: null },
     { key: 'alt+right', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+comma', command: 'settings.open', when: null },
+    { key: 'ctrl+alt+o', command: 'project.open', when: null },
     { key: 'ctrl+k ctrl+s', command: 'settings.keymap', when: null },
     { key: 'ctrl+k ctrl+w', command: 'tab.closeOthers', when: null },
     { key: 'ctrl+shift+c', command: 'terminal.clear', when: 'terminalFocused' },
@@ -439,6 +440,7 @@ try {
   /** Physical keys worth sweeping every modifier combination against. */
   const KEYS = [
     { code: 'KeyP', key: 'p' },
+    { code: 'KeyO', key: 'o' },
     { code: 'KeyS', key: 's' },
     { code: 'KeyW', key: 'w' },
     { code: 'KeyK', key: 'k' },
@@ -1565,7 +1567,7 @@ try {
      * `keymap::ctrl_f_is_not_bound_here_because_two_panes_mean_two_things_by_it` is the Rust end
      * of the same claim, and the sweep below is the half that measures it.
      */
-    for (const key of ['ctrl+c', 'ctrl+v', 'ctrl+f', 'ctrl+z', 'ctrl+y', 'ctrl+shift+z', 'ctrl+u', 'alt+u', 'f3', 'shift+f3']) {
+    for (const key of ['ctrl+c', 'ctrl+v', 'meta+c', 'meta+v', 'ctrl+f', 'ctrl+z', 'ctrl+y', 'ctrl+shift+z', 'ctrl+u', 'alt+u', 'f3', 'shift+f3']) {
       ok(
         !rustDefaults().some((b) => b.key === key),
         `${key} is bound by no default — the terminal or CodeMirror owns it, focus-scoped`,
@@ -1575,6 +1577,8 @@ try {
       for (const spec of [
         { code: 'KeyC', key: 'c', ctrl: true },
         { code: 'KeyV', key: 'v', ctrl: true },
+        { code: 'KeyC', key: 'c', meta: true },
+        { code: 'KeyV', key: 'v', meta: true },
         { code: 'KeyF', key: 'f', ctrl: true },
         { code: 'KeyZ', key: 'z', ctrl: true },
         { code: 'KeyY', key: 'y', ctrl: true },

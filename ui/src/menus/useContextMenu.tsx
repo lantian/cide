@@ -17,7 +17,8 @@
  * appears in the caller's tree has no effect on where it appears on screen, and an
  * `overflow: hidden` pane cannot clip it.
  *
- * `items` is a function, not an array, and is called at open time. That is what lets a tree
+ * `items` is a function, not an array, and is called at open time. Searchable menus also
+ * rebuild it as the query changes. That is what lets a tree
  * build its menu from the row that was actually clicked, and it is also why a menu never
  * shows stale enablement: nothing is computed until the gesture happens.
  */
@@ -34,6 +35,7 @@ import {
 } from './model'
 import { buildKeymap, type Keymap } from '@/keys/keymap'
 import { useWorkspace } from '@/store/workspace'
+import { useOverlays } from '@/overlays/store'
 
 /** What `items` is told about the gesture that opened the menu. */
 export interface MenuInvocation {
@@ -48,7 +50,9 @@ export interface UseContextMenuOptions {
   /** Accessible name for the menu, e.g. `File tree`. Not shown. */
   readonly label: string
   /** Built at open time. Return `[]` (or only separators) to decline to open at all. */
-  readonly items: (at: MenuInvocation) => readonly MenuEntry[]
+  readonly items: (at: MenuInvocation, query: string) => readonly MenuEntry[]
+  /** Opt in to a focused input; items are rebuilt when the query changes. */
+  readonly search?: { readonly label: string; readonly placeholder: string } | undefined
   /**
    * Where shortcut hints come from. Defaults to the window's own resolved keymap — the same
    * bindings the key gate dispatches from — so a rebind moves the hint with it. Pass one only
@@ -125,14 +129,21 @@ function useWindowKeymap(): Keymap {
 interface OpenMenu {
   readonly entries: readonly ResolvedEntry[]
   readonly at: { x: number; y: number }
+  readonly invocation: MenuInvocation
 }
 
 export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandle {
-  const { label, items, keymap, restoreFocus } = options
+  const { label, items, keymap, restoreFocus, search } = options
   const windowKeymap = useWindowKeymap()
   const chipFor = (keymap ?? windowKeymap).chipFor
 
   const [open, setOpen] = useState<OpenMenu | null>(null)
+  const [query, setQuery] = useState('')
+  const overlay = useOverlays((s) => s.open)
+  const entries = useMemo(() => {
+    if (open === null) return []
+    return search === undefined ? open.entries : resolveMenu(items(open.invocation, query), { chipFor })
+  }, [open, search, items, query, chipFor])
   /** Where focus was when the menu opened, so it can be handed back. */
   const returnTo = useRef<HTMLElement | null>(null)
   // In a ref so `close`'s identity does not change when a caller rebuilds the callback every
@@ -141,6 +152,14 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
   // every keystroke the surface handles.
   const restoreCb = useRef(restoreFocus)
   restoreCb.current = restoreFocus
+
+  useEffect(() => {
+    if (search === undefined || overlay === null) return
+    // A shortcut can replace a searchable dropdown with a modal. The modal already
+    // focused its own input in a layout effect; restoring the old button would steal it.
+    returnTo.current = null
+    setOpen(null)
+  }, [search, overlay])
 
   const close = useCallback(() => {
     /*
@@ -181,14 +200,16 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
 
   const openAt = useCallback(
     (x: number, y: number, target?: HTMLElement | null) => {
-      const entries = resolveMenu(items({ target: target ?? null, x, y }), { chipFor })
+      const invocation = { target: target ?? null, x, y }
+      const entries = resolveMenu(items(invocation, ''), { chipFor })
       // An empty box at the pointer is worse than no menu: it says the surface is broken
       // rather than that it has nothing to offer. All-disabled still opens — see
       // `isInertMenu` — because a reason is an answer.
       if (isEmptyMenu(entries)) return
       returnTo.current =
         document.activeElement instanceof HTMLElement ? document.activeElement : null
-      setOpen({ entries, at: { x, y } })
+      setQuery('')
+      setOpen({ entries, at: { x, y }, invocation })
     },
     [items, chipFor],
   )
@@ -244,7 +265,8 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
       open === null ? null : (
         <ContextMenu
           label={label}
-          entries={open.entries}
+          entries={entries}
+          search={search === undefined ? undefined : { ...search, value: query, onChange: setQuery }}
           at={open.at}
           onClose={close}
           // Handed down because a submenu's rows do not exist yet: they are built when the

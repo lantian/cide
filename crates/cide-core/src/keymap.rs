@@ -270,6 +270,8 @@ pub fn defaults() -> Vec<Binding> {
         ("alt+left", "pane.navigate.left"),
         ("alt+right", "pane.navigate.right"),
         ("ctrl+comma", "settings.open"),
+        // Search remembered projects, including in the empty shell. macOS gets Cmd+Option+O.
+        ("ctrl+alt+o", "project.open"),
         // M12. `ctrl+f12` is IDEA's own File Structure chord; `ctrl+alt+shift+n` is free in every
         // layer (`ctrl+shift+n` is `claude.split.newSession`, and the two normalise to different
         // keys).
@@ -1731,6 +1733,22 @@ mod tests {
         user: &[Binding],
     ) -> (Vec<ResolvedBinding>, Vec<KeymapDiagnostic>) {
         resolve_layers_reporting(&platform_layer(false), user)
+    }
+
+    #[test]
+    fn open_project_has_an_unscoped_shortcut_on_both_platforms() {
+        for (macos, key) in [(false, "ctrl+alt+o"), (true, "alt+meta+o")] {
+            let resolved = resolve_layers(&platform_layer(macos), &[]);
+            assert_eq!(command_for(&resolved, key), ["project.open"]);
+            let binding = resolved
+                .iter()
+                .find(|binding| binding.key == key)
+                .expect("bound");
+            assert_eq!(
+                binding.when, None,
+                "opening the first project must work too"
+            );
+        }
     }
 
     /// **Ctrl+C and Ctrl+V are not the keymap's, and must never become the keymap's.**

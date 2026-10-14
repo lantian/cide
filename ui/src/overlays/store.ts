@@ -37,6 +37,8 @@ import { create } from 'zustand'
 export type OverlayKind =
   | 'files'
   | 'commands'
+  /** Remembered projects; App mounts this outside the project-dependent OverlayHost. */
+  | 'projects'
   | 'branches'
   | 'structure'
   | 'symbols'

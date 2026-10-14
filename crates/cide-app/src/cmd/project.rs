@@ -261,7 +261,7 @@ fn forget_closed_layout(root: PathBuf) {
 
 /// Pair each remembered project with whether its directory is still there.
 ///
-/// One `is_dir` per entry, capped at [`persist::MAX_RECENT`] — sixteen stats, on the gesture
+/// One `is_dir` per entry, capped at [`persist::MAX_RECENT`] — up to a hundred stats, on the gesture
 /// that opens a menu. `is_dir` rather than `exists`: a file where a project used to be is not
 /// something `open_project` can do anything with, and reporting it as openable would move the
 /// failure to a place with no way to explain itself.
@@ -281,7 +281,7 @@ fn with_existence(list: Vec<RecentProject>) -> Vec<RecentEntry> {
 
 /// The recent-projects list, most recent first.
 ///
-/// Async over `spawn_blocking` because it reads a file and stats up to sixteen directories,
+/// Async over `spawn_blocking` because it reads a file and stats up to a hundred directories,
 /// and one of those directories can be an unmounted network share — a `stat` that takes the
 /// NFS timeout on the IPC thread would freeze every window, not just the menu that asked.
 #[tauri::command(rename_all = "camelCase")]

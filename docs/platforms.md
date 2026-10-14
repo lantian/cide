@@ -273,6 +273,20 @@ Seatbelt's equivalents are unknown. `cide_core::process_tree` (ending a run's wh
 worktree sweeps) reads `/proc`, so it is a no-op off Linux. There a stopped codex run can still
 leave its commands running, as every platform did before M119.
 
+## Terminal copy and paste on macOS
+
+Command+C and Command+V are the primary terminal clipboard shortcuts on macOS. Ctrl+C/V remain
+available with their existing behavior: Ctrl+C copies a text selection, or interrupts the child
+when there is no meaningful selection; Command+C only copies and never interrupts. Command+C
+also copies whitespace selections. Both paste shortcuts use the same bracketed-paste path and
+the existing Claude image-paste fallback.
+
+The terminal handles both keydowns and native Edit-menu copy/paste events, scoped to its own
+focus. The native macOS Edit menu is retained for editors and text fields. Linux and Windows
+keep their Ctrl shortcuts, and Ctrl+F is unchanged. Modifier, selection, native-event delivery,
+and listener cleanup checks run on Linux; actual AppKit/WKWebView delivery still needs a Mac
+smoke test, including Edit-menu actions and copy/paste in detached terminal windows.
+
 ## What needs a Mac at the keyboard
 
 Everything here is a decision, not a port, and each one has a consequence somebody has to look

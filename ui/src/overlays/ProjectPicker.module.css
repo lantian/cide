@@ -1,0 +1,46 @@
+.host {
+  display: contents;
+}
+
+.name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: var(--fs-ui-13);
+}
+
+.path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+}
+
+[aria-selected='true'] .name {
+  color: var(--text-hi);
+}
+
+[aria-disabled='true'] .name,
+[aria-disabled='true'] .path {
+  color: var(--faint);
+}
+
+.missing {
+  flex: none;
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+.footer {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+}

@@ -105,6 +105,7 @@ import { useTasks } from '@/sidebar/tasksStore'
 import { useUserRequests } from '@/sidebar/userRequestsStore'
 import { followRunTab } from '@/sidebar/OpenSpecPanel/specRuns'
 import { OverlayHost } from '@/overlays/OverlayHost'
+import { ProjectPicker } from '@/overlays/ProjectPicker'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
 import { notify, notifyFailure } from '@/chrome/notices'
@@ -1666,6 +1667,7 @@ export function App() {
         {/* New project (M97): in both window kinds, `PushDialog`'s reason, and outside
             `OverlayHost` because it must open with no project at all. */}
         <NewProjectWizard />
+        {overlay === 'projects' && <ProjectPicker onDismiss={closeOverlay} />}
         <ConflictsDialog />
         {/*
           * The properties card, and `onOpenHistory` is deliberately **not** passed here.
@@ -2347,6 +2349,7 @@ export function App() {
         {/* New project (M97): in both window kinds, `PushDialog`'s reason, and outside
             `OverlayHost` because it must open with no project at all. */}
         <NewProjectWizard />
+        {overlay === 'projects' && <ProjectPicker onDismiss={closeOverlay} />}
         <ConflictsDialog />
         {/* The shell has a tool window, so here the card may offer the way into it. The repo and
             the repo-relative path come off the answer the card already holds, so this route does

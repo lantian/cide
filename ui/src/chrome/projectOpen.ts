@@ -2,7 +2,7 @@
  * Ask for folders and open them as projects — the one road, for every surface that offers it.
  *
  * There are two callers and there will be more: the header's `+` (`ProjectMenu`) and the
- * palette's *Open project…* (`keys/dispatch.ts`). They are one function rather than two because
+ * project modal's *Open folder…* (`overlays/ProjectPicker.tsx`). They are one function rather than two because
  * of what the body has to get right and how quietly it fails if it does not:
  *
  * * **`projectMenu.browse()`, never `@tauri-apps/plugin-dialog`'s `open()`.** The plugin's

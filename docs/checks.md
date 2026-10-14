@@ -48,6 +48,18 @@ pnpm --dir ui build
 
 `check:keys`, `check:commands`, `check:switcher`, plus `cargo test -p cide-core commands`. **Every tier above `TIER_SUBSEQUENCE` matches at a word boundary, and there is deliberately no title-*substring* tier** — one existed and could only fire for a match strictly inside a word, which is an accident of spelling rather than a claim on the word. Adding `docker.compose.recreate` silently displaced *New branch…* as the first answer for `create`, because `Recreate` contains it and that tier outranked the keyword `git.branch.new` declares. The trap was dodged once before by renaming a command (`git.tag.create` → `git.tag.new`); when the word belongs to somebody else's vocabulary, renaming is not available and the tier is the thing that has to go
 
+### Opening and searching projects
+
+**Touches:** the header project menu, project picker, or remembered-project retention.
+
+Run `check:menu-model`, `check:menus`, `check:picker`, `check:keys`, `check:commands`, and
+`cargo test --locked -p cide-core --lib persist::tests` / `keymap::tests`. Run
+`pnpm --dir ui run audit:project-picker` for mounted Chromium checks with mocked IPC: focus
+on opening, continued typing after hover/navigation, palette and shortcut dispatch, late
+loads after dismissal, missing directories, and cleanup across filtered-out entries.
+The browser audit needs a Chromium executable (`CHROMIUM` overrides the default locations).
+Project history holds 100 lightweight records; closed-project layouts keep their own 16-entry cap.
+
 ### A non-Latin keyboard layout
 
 **Touches:** a non-Latin keyboard layout — `keys/latin.ts`, or anything that reads `KeyboardEvent.key`/`keyCode` for a chord

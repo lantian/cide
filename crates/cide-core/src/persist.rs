@@ -119,9 +119,9 @@ pub fn recent_path() -> PathBuf {
 /// makes one floor up and for the same moment: `close_project` takes the project out of the
 /// workspace, and that is exactly when its layout has to be kept somewhere. It is **not** in
 /// `recent.json`, although the identity is the same path, because [`RecentProject`] is a wire
-/// type the recents *menu* is drawn from — every `project_recent` would otherwise ship sixteen
-/// pane trees to a dropdown that shows sixteen names. The two files are kept consistent by
-/// `cmd::project`, which forgets a layout whenever it forgets a recent.
+/// type the recents *menu* is drawn from — every `project_recent` would otherwise ship
+/// pane trees to a dropdown that only needs names and paths. The two files are kept consistent
+/// by `cmd::project`, which forgets a layout whenever it forgets a recent.
 ///
 /// The sessions named in here are, by the time it is read, children of a process that has
 /// ended or of a project that was stopped — the point of the file is that a `SessionId` *is*
@@ -894,11 +894,13 @@ pub fn write_atomic_with_mode(path: &Path, json: &[u8], mode: u32) -> Result<()>
 
 /// How many projects `recent.json` remembers.
 ///
-/// A cap rather than an unbounded log, because this list is drawn as a menu: past roughly a
-/// screenful the entries stop being "the projects I was working on" and become a history file
-/// nobody reads, and the oldest entry in a long list is overwhelmingly a directory that no
-/// longer exists. Sixteen fits a menu on a short window without scrolling.
-pub const MAX_RECENT: usize = 16;
+/// Both the header and Open project modal search this list. Keep enough history to find
+/// older projects while bounding storage and filesystem existence checks on every opening.
+pub const MAX_RECENT: usize = 100;
+
+/// Layouts contain pane trees and session state, so their retention stays independent of
+/// the lightweight searchable project history.
+pub const MAX_CLOSED_PROJECTS: usize = 16;
 
 /// Read `recent.json`, most recent first.
 ///
@@ -1019,7 +1021,7 @@ pub fn load_closed(path: &Path) -> Vec<ClosedProject> {
         }
     };
     sort_closed(&mut list);
-    list.truncate(MAX_RECENT);
+    list.truncate(MAX_CLOSED_PROJECTS);
     list
 }
 
@@ -1032,9 +1034,9 @@ pub fn save_closed(path: &Path, list: &[ClosedProject]) -> Result<()> {
 ///
 /// Identity is the primary root, as it is for the recents: closing the same directory again
 /// replaces what was remembered, because the newer layout is by definition the one the user
-/// left. Capped at [`MAX_RECENT`] for the same reason the recents are — a project closed
-/// seventeen projects ago is one the menu no longer offers, so its layout has nobody to
-/// come back for.
+/// left. Capped at [`MAX_CLOSED_PROJECTS`] to bound saved pane trees independently of project
+/// history. An older project still appears in the picker and opens with a fresh layout when
+/// its saved layout has expired.
 ///
 /// A project with no root is refused silently: `validate` forbids one, so this is not a
 /// state a caller can reach, and a record with no identity could never be found again.
@@ -1051,7 +1053,7 @@ pub fn remember_closed(list: &mut Vec<ClosedProject>, project: Project, closed_a
             project,
         },
     );
-    list.truncate(MAX_RECENT);
+    list.truncate(MAX_CLOSED_PROJECTS);
 }
 
 /// Take the layout remembered for `path` out of `list`, if there is one.
@@ -1084,11 +1086,8 @@ fn sort_closed(list: &mut [ClosedProject]) {
 
 /// How many files remember where the user was.
 ///
-/// **Generous where [`MAX_RECENT`] is small, and the difference is the reason.** Sixteen is a
-/// cap on a list that is *drawn as a menu*: past a screenful the entries stop being useful and
-/// start being a history file nobody reads. Nothing ever draws this one. It is looked up by
-/// path, one entry at a time, so the only cost of a large cap is bytes — 256 records of roughly
-/// a hundred bytes is about 25 KB, which covers a week of files and is smaller than the
+/// Looked up by path, one entry at a time, so the only cost of a large cap is bytes — 256
+/// records of roughly a hundred bytes is about 25 KB, which covers a week of files and is smaller than the
 /// workspace it sits beside.
 ///
 /// There is deliberately **no TTL**. An expiry means the file you come back to on Monday opens
@@ -3810,13 +3809,16 @@ mod tests {
     }
 
     #[test]
-    fn the_closed_list_is_capped_like_the_recents() {
+    fn the_closed_layout_list_has_its_own_cap() {
         let mut list = Vec::new();
-        for n in 0..(MAX_RECENT + 3) {
+        for n in 0..(MAX_CLOSED_PROJECTS + 3) {
             remember_closed(&mut list, closed_project(&format!("/p{n}")), n as u64);
         }
-        assert_eq!(list.len(), MAX_RECENT);
-        assert_eq!(list[0].path, PathBuf::from(format!("/p{}", MAX_RECENT + 2)));
+        assert_eq!(list.len(), MAX_CLOSED_PROJECTS);
+        assert_eq!(
+            list[0].path,
+            PathBuf::from(format!("/p{}", MAX_CLOSED_PROJECTS + 2))
+        );
         assert!(!list.iter().any(|e| e.path == Path::new("/p0")));
     }
 
@@ -4115,6 +4117,49 @@ mod tests {
             loaded.iter().map(|e| e.path.as_path()).collect::<Vec<_>>(),
             [Path::new("/b"), Path::new("/c"), Path::new("/a")],
         );
+    }
+
+    #[test]
+    fn searchable_project_history_keeps_a_hundred_projects_across_a_restart() {
+        let dir = TempDir::new("recents-searchable");
+        let path = dir.join("recent.json");
+        let mut list = Vec::new();
+        for n in 0..101 {
+            remember_recent(&mut list, &PathBuf::from(format!("/p{n}")), "p", n as u64);
+        }
+        save_recent(&path, &list).expect("save");
+        let mut loaded = load_recent(&path);
+        assert_eq!(loaded.len(), 100);
+        assert_eq!(loaded[0].path, PathBuf::from("/p100"));
+        assert_eq!(loaded[99].path, PathBuf::from("/p1"));
+        remember_recent(&mut loaded, Path::new("/p1"), "renamed", 102);
+        assert_eq!(
+            loaded.len(),
+            100,
+            "reopening an old project must not duplicate it"
+        );
+        assert_eq!(loaded[0].name, "renamed");
+        assert_eq!(loaded[0].path, PathBuf::from("/p1"));
+    }
+
+    #[test]
+    fn oversized_project_history_keeps_the_newest_hundred_on_read() {
+        let dir = TempDir::new("recents-oversize");
+        let path = dir.join("recent.json");
+        let list = (0..105)
+            .map(|n| RecentProject {
+                path: PathBuf::from(format!("/p{n}")),
+                name: "p".into(),
+                display_path: "stale display path".into(),
+                opened_at: n,
+            })
+            .collect::<Vec<_>>();
+        save_recent(&path, &list).expect("save");
+        let loaded = load_recent(&path);
+        assert_eq!(loaded.len(), 100);
+        assert_eq!(loaded[0].path, PathBuf::from("/p104"));
+        assert_eq!(loaded[99].path, PathBuf::from("/p5"));
+        assert_eq!(loaded[0].display_path, "/p104");
     }
 
     #[test]

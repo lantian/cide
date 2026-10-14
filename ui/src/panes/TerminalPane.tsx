@@ -347,8 +347,8 @@ export function TerminalPane({
         label: 'Copy',
         // No `command`: there is no `edit.copy` in `cide-core::commands`, and naming one that
         // does not exist would put an empty chip slot beside the item for ever. Copy in a
-        // terminal is Ctrl+Shift+C by convention and is the terminal's own binding, not the
-        // key gate's.
+        // terminal uses Command+C on macOS, with Ctrl+C as an alternative when selected.
+        // These are the terminal's own bindings, not the key gate's.
         run:
           selection === ''
             ? undefined

@@ -38,8 +38,8 @@ use parking_lot::Mutex;
 
 /// How many closes are remembered, across all projects.
 ///
-/// The same number as `persist::MAX_RECENT`, and for the same reason: it is this codebase's
-/// existing answer to "how many things might I want back". The user asked for "another and
+/// The same number as `persist::MAX_CLOSED_PROJECTS`: layouts and undo keep short histories,
+/// independently of the searchable project list. The user asked for "another and
 /// another until the end of the list", so this is a stack rather than a slot — but past about a
 /// dozen the gesture has stopped being undo and become browsing, and Ctrl+P is the better tool
 /// for that. A record is a path plus a small tree, so the cap is about the gesture and not

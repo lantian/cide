@@ -57,7 +57,6 @@ import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
-import { browseForProject } from '@/chrome/projectOpen'
 import { requestNewProject } from '@/chrome/newProject/newProjectStore'
 // M22. The one seam into the extension host from the key layer: `invoke` posts to a worker and
 // answers whether one was there to hear it, which is what makes a contributed command reportable
@@ -823,22 +822,10 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       /* ---------------------------------------------------------------------- Projects */
 
-      /*
-       * Ask for a folder and open it. Until this arm the gesture was mouse-only — the header's
-       * `+` and the `▾` beside it were the whole of it — so it could be neither typed in the
-       * palette nor bound in a `keymap.json`. It carries no `when` clause; the registry's
-       * comment is where the argument for that lives.
-       *
-       * Through `browseForProject`, which is also what the header's `+` calls. Spelling the
-       * picker again here would mean reaching for `@tauri-apps/plugin-dialog` — the obvious
-       * import, and the one that opens the dialog *behind* the window on Linux because the
-       * plugin parents it only on Windows and macOS. One road, so the fix cannot ship off.
-       *
-       * `void` rather than awaited: the dispatcher answers synchronously, a cancel is a
-       * no-op by contract, and a real failure is `Failures`' job as it is everywhere else here.
-       */
+      // The searchable project picker also works with no active project. App mounts it in
+      // both window branches, outside OverlayHost, and it uses the usual overlay key context.
       case 'project.open':
-        return void browseForProject()
+        return void useOverlays.getState().toggle('projects')
 
       /*
        * The New project wizard (M97). Raised through its store, which both window kinds draw —
