@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A hook point Claude Code will call out at.
+/// A hook point a console harness will call out at.
 ///
 /// Serialised with the CLI's exact spelling, because these strings are keys in a config file
 /// the CLI parses — a rename here silently stops a hook firing rather than failing loudly.
@@ -52,6 +52,8 @@ pub enum HookEvent {
     /// **Codex only**: an approval is being evaluated, possibly by automatic review.
     /// This hook runs before a human prompt exists and cannot establish human waiting.
     PermissionRequest,
+    /// **Codex only**: the current turn was canceled; the TUI remains alive at its composer.
+    Interrupt,
     /// Internal event from Codex's live `approval-requested` OSC 9 notification.
     /// Never included in either CLI's hook subscriptions.
     CodexApprovalPrompt,
@@ -77,8 +79,9 @@ impl HookEvent {
     /// Measured on 0.155.1/0.156.1 rather than assumed from Claude's list, and the two differ in
     /// both directions: codex has no `PostToolBatch`, `SubagentStop` or `Notification` (a hook
     /// keyed on a name it does not know simply never fires), and it has
-    /// [`Self::PermissionRequest`], which Claude does not. `SessionEnd` is subscribed but did
-    /// not fire on `SIGTERM` in the probe; nothing depends on it — the PTY reaper reports exits.
+    /// [`Self::PermissionRequest`] and [`Self::Interrupt`], which Claude does not. Codex 0.162.1
+    /// emits `Interrupt`, without `Stop`, on Ctrl+C during a turn. `SessionEnd` is subscribed but
+    /// did not fire on `SIGTERM` in the probe; nothing depends on it — the PTY reaper reports exits.
     pub const CODEX: &'static [HookEvent] = &[
         Self::SessionStart,
         Self::UserPromptSubmit,
@@ -86,6 +89,7 @@ impl HookEvent {
         Self::PermissionRequest,
         Self::PostToolUse,
         Self::Stop,
+        Self::Interrupt,
         Self::PreCompact,
         Self::SessionEnd,
     ];
@@ -104,6 +108,7 @@ impl HookEvent {
             Self::SessionEnd => "SessionEnd",
             Self::Notification => "Notification",
             Self::PermissionRequest => "PermissionRequest",
+            Self::Interrupt => "Interrupt",
             Self::CodexApprovalPrompt => "CodexApprovalPrompt",
         }
     }
@@ -235,6 +240,16 @@ mod tests {
         // document is a hook that never fires at best — so the codex addition stays out of it.
         assert!(!HookEvent::ALL.contains(&HookEvent::PermissionRequest));
         assert!(HookEvent::CODEX.contains(&HookEvent::PermissionRequest));
+        assert!(!HookEvent::ALL.contains(&HookEvent::Interrupt));
+        assert!(HookEvent::CODEX.contains(&HookEvent::Interrupt));
+        assert_eq!(
+            serde_json::to_string(&HookEvent::Interrupt).unwrap(),
+            "\"Interrupt\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HookEvent>("\"Interrupt\"").unwrap(),
+            HookEvent::Interrupt
+        );
         assert!(!HookEvent::ALL.contains(&HookEvent::CodexApprovalPrompt));
         assert!(!HookEvent::CODEX.contains(&HookEvent::CodexApprovalPrompt));
         assert_eq!(

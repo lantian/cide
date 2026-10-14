@@ -87,6 +87,10 @@ pub fn next_state(current: SessionState, event: HookEvent) -> Option<SessionStat
             }
         }
 
+        // Codex cancels a turn with Interrupt rather than Stop. Its TUI remains alive at the
+        // composer, so clear activity without a finished-work attention marker.
+        HookEvent::Interrupt => SessionState::Idle,
+
         // Handled by the caller, which can see the payload: only a permission request means
         // `AwaitingPermission`, and an ordinary notification means nothing about liveness.
         HookEvent::Notification => return None,
@@ -122,6 +126,25 @@ pub fn is_permission_request(payload: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_interrupted_codex_turn_is_idle_without_a_finished_work_marker() {
+        for current in [
+            SessionState::Busy,
+            SessionState::AwaitingPermission,
+            SessionState::AwaitingInput,
+        ] {
+            let idle = next_state(current, HookEvent::Interrupt).expect("interrupted -> idle");
+            assert_eq!(idle, SessionState::Idle);
+            assert!(!idle.is_live());
+            assert_eq!(next_state(idle, HookEvent::Interrupt), None);
+            assert_eq!(next_state(idle, HookEvent::Stop), None);
+            assert_eq!(
+                next_state(idle, HookEvent::UserPromptSubmit),
+                Some(SessionState::Busy)
+            );
+        }
+    }
 
     #[test]
     fn a_prompt_starts_a_turn_and_stop_ends_it() {

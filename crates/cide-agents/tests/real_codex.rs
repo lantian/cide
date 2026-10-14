@@ -290,6 +290,171 @@ fn last_message(frames: &[cide_claude::HookFrame]) -> String {
         .to_lowercase()
 }
 
+/// Ctrl+C and Esc cancel a live turn without Stop or process exit. The provider is offline,
+/// with an isolated home and dummy credential: retries keep a turn open without model calls.
+#[test]
+#[ignore = "requires installed Codex; isolated home/provider, no model calls"]
+fn real_codex_interrupts_report_idle_and_keep_the_tui_alive() {
+    let dir = temp_dir("interrupt");
+    let result = std::panic::catch_unwind(|| probe_interrupts(&dir));
+    std::fs::remove_dir_all(&dir).unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn probe_interrupts(dir: &Path) {
+    use cide_claude::{HookEvent, next_state};
+    use cide_ipc::SessionState;
+    use cide_pty::{OutputObserver, PtySession, SpawnSpec};
+    use std::sync::{Arc, mpsc};
+    use std::time::Instant;
+
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let hook = recorder(dir);
+    let (tx, rx) = mpsc::channel();
+    let mut spec = SpawnSpec::new(codex().to_string_lossy(), dir)
+        .arg("-a")
+        .arg("never")
+        .arg("-s")
+        .arg("read-only")
+        .env("CODEX_HOME", dir.join("home").to_string_lossy())
+        .env("OPENAI_API_KEY", "unused-test-key")
+        .env("CIDE_INTERRUPT_TEST_KEY", "unused-test-key");
+    for setting in [
+        "check_for_update_on_startup=false",
+        "notice.hide_rate_limit_model_nudge=true",
+        "model_provider=\"interrupt-test\"",
+        "model=\"gpt-5\"",
+        "model_providers.interrupt-test.name=\"Interrupt test\"",
+        "model_providers.interrupt-test.base_url=\"http://127.0.0.1:9/v1\"",
+        "model_providers.interrupt-test.env_key=\"CIDE_INTERRUPT_TEST_KEY\"",
+        "model_providers.interrupt-test.wire_api=\"responses\"",
+        "model_providers.interrupt-test.request_max_retries=20",
+    ] {
+        spec = spec.arg("-c").arg(setting);
+    }
+    spec = spec.arg("-c").arg(format!(
+        "projects.{}.trust_level=\"trusted\"",
+        cide_core::codex_cli::toml_string(&dir.to_string_lossy())
+    ));
+    let events: Vec<&str> = HookEvent::CODEX
+        .iter()
+        .map(|event| event.as_str())
+        .collect();
+    for arg in cide_core::codex_cli::hook_overrides(&hook.to_string_lossy(), &events) {
+        spec = spec.arg(arg);
+    }
+    spec = spec.arg("Reply with OK.");
+    spec.output_observer = Some(OutputObserver::new(move |bytes| {
+        let _ = tx.send(bytes.to_vec());
+    }));
+    struct Child(Arc<PtySession>);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+    let child = Child(PtySession::spawn(spec).unwrap());
+    let pty = &child.0;
+    let mut output = Vec::new();
+    let mut conversation = None;
+    let mut previous_turn = None;
+    for (count, key) in [(1, b"\x03".as_slice()), (2, b"\x1b".as_slice())] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut sent = false;
+        loop {
+            assert!(
+                !pty.has_exited(),
+                "Codex exited: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                Instant::now() < deadline,
+                "no Interrupt #{count}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            if let Ok(bytes) = rx.recv_timeout(Duration::from_millis(50)) {
+                if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                    pty.write(b"\x1b[1;1R".to_vec());
+                }
+                output.extend(bytes);
+            }
+            let all = frames(dir);
+            if let Some(interrupted) = all
+                .iter()
+                .filter(|frame| frame.kind() == Some(HookEvent::Interrupt))
+                .nth(count - 1)
+            {
+                assert!(sent, "only the test's cancellation should interrupt");
+                let thread = interrupted
+                    .session_id()
+                    .expect("interrupt names its thread");
+                assert!(thread.parse::<SessionId>().is_ok());
+                if let Some(previous) = &conversation {
+                    assert_eq!(thread, previous, "the follow-up stays in the same thread");
+                }
+                conversation = Some(thread.to_string());
+                let turn = interrupted.payload["turn_id"]
+                    .as_str()
+                    .expect("interrupt names its turn");
+                assert_ne!(
+                    previous_turn.as_deref(),
+                    Some(turn),
+                    "a new prompt starts a new turn"
+                );
+                previous_turn = Some(turn.to_string());
+                assert!(
+                    !all.iter().any(|frame| frame.kind() == Some(HookEvent::Stop)
+                        && frame.payload["turn_id"] == turn)
+                );
+                assert_eq!(
+                    next_state(SessionState::Busy, interrupted.kind().unwrap()),
+                    Some(SessionState::Idle)
+                );
+                assert_eq!(
+                    CodexHarness.observe(RunState::Running, Observation::Hook(interrupted)),
+                    Some(RunState::Idle)
+                );
+                break;
+            }
+            let screen = pty.capture_screen();
+            let working = screen.lines.iter().any(|line| {
+                line.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+                    .contains("esc to interrupt")
+            });
+            if !sent && working {
+                pty.write(key.to_vec());
+                sent = true;
+            }
+        }
+        if count == 1 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(
+                    !pty.has_exited() && Instant::now() < deadline,
+                    "no composer after Ctrl+C"
+                );
+                if cide_pty::codex_clear::composer(&pty.capture_screen()).as_deref() == Some("") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let Delivery::Stdin(bytes) = CodexHarness.deliver("Try again.") else {
+                unreachable!()
+            };
+            pty.write(bytes);
+        }
+    }
+    assert!(
+        !pty.has_exited(),
+        "the interrupted TUI can accept another prompt"
+    );
+}
+
 /// One real TUI run: the command-line hook table fires, `SessionStart` names a uuid thread the
 /// harness captures, the frames walk the run `Idle → Running → Idle`, a typed follow-up is a
 /// second turn in the same thread, and `codex resume <thread>` continues it from another

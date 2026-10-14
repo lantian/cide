@@ -1864,6 +1864,14 @@ mod tests {
             Some(RunState::Running)
         );
         assert_eq!(observe(RunState::Running, "Stop"), Some(RunState::Idle));
+        for current in [RunState::Running, RunState::AwaitingPermission] {
+            assert_eq!(observe(current, "Interrupt"), Some(RunState::Idle));
+        }
+        assert_eq!(observe(RunState::Idle, "Interrupt"), None);
+        assert_eq!(
+            observe(RunState::Idle, "UserPromptSubmit"),
+            Some(RunState::Running)
+        );
         assert_eq!(
             CodexHarness.observe(
                 RunState::Running,

@@ -873,7 +873,13 @@ mod tests {
         super::decide(&start, &states, &conversations);
         console.invalidate(None);
         conversations.remove(&session);
-        for event in ["SessionEnd", "Stop", "PostToolUse", "SessionStart"] {
+        for event in [
+            "SessionEnd",
+            "Stop",
+            "Interrupt",
+            "PostToolUse",
+            "SessionStart",
+        ] {
             let mut late = frame(event, &old.to_string());
             late.spawned_as = Some(session.to_string());
             assert!(!console.accepts(&late), "{event} from the cleared thread");
@@ -916,7 +922,7 @@ mod tests {
             assert!(console.accepts(&start));
             assert!(super::decide(&start, &states, &conversations).iter().any(|effect|
                 matches!(effect, Effect::Conversation { conversation, .. } if *conversation == target)));
-            for event in ["Stop", "PostToolUse", "SessionEnd"] {
+            for event in ["Stop", "Interrupt", "PostToolUse", "SessionEnd"] {
                 let mut late = frame(event, &retired.to_string());
                 late.spawned_as = Some(session.to_string());
                 assert!(!console.accepts(&late));
@@ -943,6 +949,48 @@ mod tests {
     use serde_json::json;
 
     type States = DashMap<SessionId, SessionState>;
+
+    #[test]
+    fn a_codex_interrupt_clears_only_its_panes_activity_without_notifying() {
+        let pane = SessionId::new();
+        let conversation = SessionId::new();
+        let other = SessionId::new();
+        let states = States::new();
+        let conversations = DashMap::new();
+        states.insert(other, SessionState::Busy);
+        conversations.insert(pane, conversation);
+        let mut interrupted = frame("Interrupt", &conversation.to_string());
+        interrupted.spawned_as = Some(pane.to_string());
+
+        for current in [
+            SessionState::Busy,
+            SessionState::AwaitingPermission,
+            SessionState::AwaitingInput,
+        ] {
+            states.insert(pane, current);
+            assert_eq!(
+                super::decide(&interrupted, &states, &conversations),
+                vec![Effect::State {
+                    session: pane.to_string(),
+                    state: SessionState::Idle,
+                }]
+            );
+            assert_eq!(state_of(&states, pane), Some(SessionState::Idle));
+            assert_eq!(state_of(&states, conversation), None);
+            assert_eq!(state_of(&states, other), Some(SessionState::Busy));
+            assert!(super::decide(&interrupted, &states, &conversations).is_empty());
+
+            let mut prompt = frame("UserPromptSubmit", &conversation.to_string());
+            prompt.spawned_as = Some(pane.to_string());
+            assert_eq!(
+                super::decide(&prompt, &states, &conversations),
+                vec![Effect::State {
+                    session: pane.to_string(),
+                    state: SessionState::Busy,
+                }]
+            );
+        }
+    }
 
     #[test]
     fn codex_review_is_quiet_and_only_a_live_prompt_notifies_its_pane() {
