@@ -85,6 +85,7 @@ import {
   pasteTargetFor,
   pendingNote,
   type ClipMode,
+  type FileClip,
 } from './clipboardModel'
 import { fsMessage, isNoClipboardImage } from './fsError'
 import { ConfirmDestructive, type ConfirmState } from '@/chrome/ConfirmDestructive'
@@ -210,19 +211,20 @@ type RowKindAttr = TreeRow['kind']
  * operation: a clipboard cut is consumed by the paste it was made for, a dropped set never
  * touched the clipboard at all.
  */
-interface Transfer {
+type Transfer = {
   readonly sources: readonly string[]
   readonly destDir: string
   readonly mode: ClipMode
-  /** The sources came off the clipboard, so a successful cut consumes it. */
-  readonly fromClip: boolean
   /**
    * The project the clipboard was filled in, when it is not this one — a paste between
    * projects, which Rust checks against that project's roots. Absent for a drag, which never
    * leaves the tree it started in.
    */
   readonly from?: ProjectId | null
-}
+} & (
+  | { readonly fromClip: true; readonly clip: FileClip }
+  | { readonly fromClip: false; readonly clip?: never }
+)
 
 /**
  * Which colour class a status paints the name and the letter with.
@@ -457,6 +459,7 @@ export function FileTree({
    * flag is cleared by whatever ends the gesture — the paste settling, or the user cancelling.
    */
   const pasting = useRef(false)
+  const readingClip = useRef(false)
   /**
    * The collisions the user is being asked about, and the transfer they belong to.
    *
@@ -583,9 +586,11 @@ export function FileTree({
       }
       setProblem(null)
       setNote(null)
-      useFileClipboard.getState().take(mode, project, paths)
+      void useFileClipboard.getState()
+        .take(mode, project, paths)
+        .catch(fail(mode === 'cut' ? 'Cut' : 'Copy'))
     },
-    [project, roots],
+    [project, roots, fail],
   )
 
   /**
@@ -604,7 +609,7 @@ export function FileTree({
   const commitTransfer = useCallback(
     (project_: ProjectId, transfer: Transfer, decisions: ReturnType<typeof askDecisions>) => {
       const sent = transfer.fromClip
-        ? useFileClipboard.getState().paste(project_, transfer.destDir, decisions)
+        ? useFileClipboard.getState().paste(project_, transfer.destDir, decisions, transfer.clip)
         : pasteEntries(project_, transfer.sources, transfer.destDir, transfer.mode, decisions)
       void sent
         .finally(() => {
@@ -653,7 +658,7 @@ export function FileTree({
       pasting.current = true
       setProblem(null)
       setNote(null)
-      void planEntries(project, transfer.sources, transfer.destDir, transfer.mode, transfer.from)
+      void planEntries(project, transfer.sources, transfer.destDir, transfer.mode, transfer.from, transfer.clip?.id)
         .then((collisions) => {
           if (collisions.length === 0) {
             commitTransfer(project, transfer, [])
@@ -670,40 +675,12 @@ export function FileTree({
   )
 
   /**
-   * Paste the clipboard into `target`.
-   *
-   * The refusals are checked here rather than left to Rust so that they arrive as a sentence
-   * about folders — "“src” cannot be pasted into itself" — instead of as a rejected command.
-   * Rust checks all of it again, in `plan` as well as in the paste; see
-   * `clipboardModel.pasteRefusal`.
-   */
-  const runPaste = useCallback(
-    (target: NewEntryTarget | null) => {
-      if (project === null) return
-      const clip = useFileClipboard.getState().clip
-      const refusal = pasteRefusal(clip, project, target)
-      if (refusal !== null || target === null || clip === null) {
-        setProblem(refusal ?? 'There is nowhere to paste into.')
-        return
-      }
-      startTransfer({
-        sources: clip.paths,
-        destDir: target.parent,
-        mode: clip.mode,
-        fromClip: true,
-        from: sourceOf(clip, project),
-      })
-    },
-    [project, startTransfer],
-  )
-
-  /**
    * Write the system clipboard's image into `target` as a PNG, and select the new row. (M35)
    *
    * The *other* paste, and it is a different gesture wearing the same keystroke: `runPaste`
    * moves files that are already on disk, and this one turns a screenshot into a file that did
    * not exist. They cannot both act, so Ctrl+V asks this one only when the in-app file
-   * clipboard is empty — see the key handler — and the context menu offers it as its own item.
+   * clipboard, refreshed from the OS, is empty; the context menu offers it as its own item.
    *
    * `announce` is what separates the two callers. From a bare Ctrl+V, "there is no image on the
    * clipboard" is not a failure and must say nothing at all: that is the outcome every time
@@ -751,6 +728,39 @@ export function FileTree({
         })
     },
     [fail, project],
+  )
+
+  /** Refresh before choosing file/image paste, then freeze what the dialog will act on. */
+  const runPaste = useCallback(
+    (target: NewEntryTarget | null, imageFallback = false) => {
+      if (project === null || pasting.current || readingClip.current) return
+      readingClip.current = true
+      void useFileClipboard.getState().refresh()
+        .then((clip) => {
+          if (clip === null && imageFallback) {
+            pasteImage(target, false)
+            return
+          }
+          const refusal = pasteRefusal(clip, project, target)
+          if (refusal !== null || target === null || clip === null) {
+            setProblem(refusal ?? 'There is nowhere to paste into.')
+            return
+          }
+          startTransfer({
+            sources: clip.paths,
+            destDir: target.parent,
+            mode: clip.mode,
+            fromClip: true,
+            from: sourceOf(clip, project),
+            clip,
+          })
+        })
+        .catch(fail('Paste'))
+        .finally(() => {
+          readingClip.current = false
+        })
+    },
+    [project, startTransfer, pasteImage, fail],
   )
 
   /**
@@ -1293,18 +1303,8 @@ export function FileTree({
           } else {
             const anchor = row === undefined ? null : { path: row.path, isDir: row.kind === 'dir' }
             const target = pasteTargetFor(anchor, roots)
-            // **Two pastes share this chord, and which one runs is decided by the in-app
-            // clipboard alone.** With files on it, Ctrl+V means those files and nothing else
-            // may claim the keystroke. With nothing on it, Ctrl+V used to mean *nothing at
-            // all* — the branch simply refused — and that is the gap M35 fills: the system
-            // clipboard may be holding a screenshot, and pasting it here is what the user
-            // asked for.
-            //
-            // Never announced from here. Most presses with an empty file clipboard are somebody
-            // who copied text somewhere else, and a toast for each of those would be noise on a
-            // keystroke people use constantly. The menu item is the loud way in.
-            if (clipNow() === null) pasteImage(target, false)
-            else runPaste(target)
+            // The native clipboard can have changed in another process since focus arrived.
+            runPaste(target, true)
           }
           e.preventDefault()
           return
@@ -1428,7 +1428,7 @@ export function FileTree({
        */
       if (e.key === 'Escape') {
         if (escapeCancels(useFileClipboard.getState().clip, project)) {
-          useFileClipboard.getState().clear()
+          void useFileClipboard.getState().clear().catch(fail('Cancel Cut'))
           e.preventDefault()
           return
         }
@@ -1705,7 +1705,20 @@ export function FileTree({
    */
   const clipNow = () => useFileClipboard.getState().clip
 
-  const { onContextMenu, menu } = useContextMenu({
+  const onContextMenu = (event: React.MouseEvent<HTMLElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const target = event.target instanceof HTMLElement ? event.target : event.currentTarget
+    const { clientX: x, clientY: y } = event
+    void useFileClipboard.getState().refresh()
+      .catch(fail('Read Clipboard'))
+      .then(() => {
+        if (x === 0 && y === 0) openTreeMenuFor(target)
+        else openTreeMenuAt(x, y, target)
+      })
+  }
+
+  const { openAt: openTreeMenuAt, openFor: openTreeMenuFor, menu } = useContextMenu({
     label: 'File tree',
     items: ({ target }) => {
       const row = rowFacts(target)

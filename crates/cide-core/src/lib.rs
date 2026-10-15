@@ -29,6 +29,8 @@ pub mod commands;
 pub mod diagnostics;
 pub mod document;
 pub mod error;
+/// The versioned native file clipboard payload shared by independent cide instances.
+pub mod file_clip;
 pub mod format;
 pub mod handshake;
 pub mod harness_settings;

@@ -512,7 +512,7 @@ try {
     'a drop is a CUT into the destination, sent through the one transfer path',
   )
   ok(
-    /void planEntries\(project, transfer\.sources, transfer\.destDir, transfer\.mode(, transfer\.from)?\)[\s\S]{0,400}?setPendingPaste\(\{ transfer, ask: startAsk\(collisions\) \}\)/.test(
+    /void planEntries\(project, transfer\.sources, transfer\.destDir, transfer\.mode(, transfer\.from(, transfer\.clip\?\.id)?)?\)[\s\S]{0,400}?setPendingPaste\(\{ transfer, ask: startAsk\(collisions\) \}\)/.test(
       tree,
     ),
     'and it is PLANNED first, so a collision raises `PasteConfirm` instead of overwriting — the '
@@ -534,7 +534,7 @@ try {
     'the two calls a drop needs are free functions, reachable without going near the clipboard',
   )
   ok(
-    /const result = await pasteEntries\([\s\S]{0,300}?if \(clip\.mode === 'cut'\) set\(\{ clip: null \}\)/.test(
+    /const result = await pasteEntries\([\s\S]{0,300}?if \(clip\.mode === 'cut' && get\(\)\.clip\?\.id === clip\.id\) set\(\{ clip: null \}\)/.test(
       clipboard,
     ),
     'and the STORE still owns consuming the clip on a cut — the drag must not inherit that, or a '

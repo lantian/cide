@@ -103,8 +103,8 @@ gtk = { version = "0.18", features = ["v3_24"] }
 # from. The union with whatever tao and muda enable is what actually gets built, so this list is
 # a statement about *our* requirements rather than a saving.
 objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSObject"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSObject", "NSArray", "NSDictionary", "NSValue", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSPasteboard"] }
 
 # --- terminal ---
 portable-pty = "0.9.0"
@@ -290,6 +290,7 @@ parking_lot = "0.12.5"
 smallvec = "1"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 blake3 = "1.8.6"
+url = "2.5.8"
 # Standard base64: GitLab's file API, and a task attachment's bytes on their way to a phone
 # (`ServerBody::AttachmentChunk`), which `expo-file-system` writes without decoding in JS.
 base64 = "0.22.1"

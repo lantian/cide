@@ -132,10 +132,18 @@ pub async fn fs_close(
     clips: State<'_, FileClipState>,
     project: ProjectId,
 ) -> Result<bool, FsError> {
-    // A clip taken in the closing project can no longer be pasted anywhere — see
-    // `FileClipState::forget_project`. Cleared before the teardown so no window offers it.
-    if clips.forget_project(project) {
-        crate::emit::fs_clip_changed(&app, None);
+    // Serialize closure with Copy/Cut: a write already in flight must be cancelled too,
+    // and a later one must see NoIndex rather than rearming the closing project's clip.
+    let _clip_gate = clips.gate.lock().await;
+    // Only the instance that copied this project may cancel its clip. Imported project IDs
+    // may be identical across profiles; they are not local authority.
+    let native = clips
+        .get()
+        .filter(|c| c.instance == clips.instance && c.clip.project == Some(project));
+    if let Some(native) = native
+        && let Err(error) = clear_clip_locked(&app, &clips, native.clip.id).await
+    {
+        tracing::warn!(%error, "could not cancel the closing project's file clipboard");
     }
     // A log walk over a closing project is libgit2 reading a history nobody will see the rows
     // of — the same waste `searches.cancel` exists to stop, on the same disk the teardown below
@@ -1429,92 +1437,175 @@ fn relist_if_scratch(fs: &crate::files::ProjectFs, paths: &[PathBuf]) -> bool {
     true
 }
 
-/// The file tree's clipboard — what Copy or Cut took, for Paste in **any** window to read.
-///
-/// It used to be a zustand store inside each webview, which made two things impossible: a
-/// paste into another project from a *different* window (each window had its own clip, so the
-/// second one had nothing to paste), and a cut consumed in one window greying out Paste in the
-/// others. Rust holds it now and every window mirrors it through `cide://fs-clip-changed`.
-///
-/// In memory only. A clip is a gesture in progress; persisting a Cut across a restart would
-/// arm a move the user no longer remembers making.
-#[derive(Default)]
-pub struct FileClipState(std::sync::Mutex<Option<cide_ipc::FileClip>>);
+/// A process-local mirror of the native clipboard. The async gate orders reads, writes and
+/// broadcasts; no mutex guard is held while GTK calls back on the main loop.
+pub struct FileClipState {
+    gate: tokio::sync::Mutex<()>,
+    held: std::sync::Mutex<Option<cide_core::file_clip::NativeFileClip>>,
+    instance: String,
+}
+
+impl Default for FileClipState {
+    fn default() -> Self {
+        Self {
+            gate: tokio::sync::Mutex::new(()),
+            held: std::sync::Mutex::new(None),
+            instance: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
 
 impl FileClipState {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<cide_ipc::FileClip>> {
-        // A poisoned lock still holds a whole `Option`: nothing here panics half way through a
-        // write, so recovering the value is right and refusing every later Copy is not.
-        self.0
+    pub fn release_on_exit(&self) {
+        if let Some(native) = self.get().filter(|c| c.instance == self.instance) {
+            crate::file_clipboard::release_owned(native.clip.id);
+        }
+    }
+
+    fn get(&self) -> Option<cide_core::file_clip::NativeFileClip> {
+        self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    pub fn get(&self) -> Option<cide_ipc::FileClip> {
-        self.lock().clone()
-    }
-
-    pub fn set(&self, clip: Option<cide_ipc::FileClip>) -> bool {
-        let mut held = self.lock();
-        let changed = *held != clip;
-        *held = clip;
-        changed
-    }
-
-    /// Clear the clip when it is a **cut** of exactly `sources` — the paste that consumed it.
-    ///
-    /// Exactly, rather than "any cut": a drag-and-drop move goes through `fs_paste` with its
-    /// own sources and must not throw away what the user put on the clipboard ten seconds
-    /// earlier. A Copy is never consumed; pasting twice is how anyone makes two copies.
-    pub fn take_if_cut_of(&self, sources: &[PathBuf]) -> bool {
-        let mut held = self.lock();
-        let consumed = held.as_ref().is_some_and(|clip| {
-            clip.mode == cide_ipc::PasteMode::Cut && clip.paths.as_slice() == sources
-        });
-        if consumed {
-            *held = None;
+    fn publish(&self, app: &tauri::AppHandle, clip: Option<cide_core::file_clip::NativeFileClip>) {
+        let changed = {
+            let mut held = self
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = *held != clip;
+            *held = clip.clone();
+            changed
+        };
+        if changed {
+            crate::emit::fs_clip_changed(app, clip.as_ref().map(|c| &c.clip));
         }
-        consumed
-    }
-
-    /// Clear the clip when it was taken in `project`, which is closing. Its paths are checked
-    /// against that project's roots, and once the project is gone there are none — a Paste left
-    /// enabled would only fail with `NoIndex`.
-    pub fn forget_project(&self, project: ProjectId) -> bool {
-        let mut held = self.lock();
-        if held.as_ref().is_some_and(|clip| clip.project == project) {
-            *held = None;
-            return true;
-        }
-        false
     }
 }
 
-/// What the tree's clipboard is holding. A window asks once when its tree starts, so a window
-/// opened *after* the Copy can still paste it; from then on it follows the event.
-#[tauri::command(rename_all = "camelCase")]
-pub fn fs_clip_get(clips: State<'_, FileClipState>) -> Option<cide_ipc::FileClip> {
-    clips.get()
+async fn refresh_clip(
+    app: &tauri::AppHandle,
+) -> Result<Option<cide_core::file_clip::NativeFileClip>, FsError> {
+    let clips = app.state::<FileClipState>();
+    let _gate = clips.gate.lock().await;
+    let clip = crate::file_clipboard::read(app).await?;
+    clips.publish(app, clip.clone());
+    Ok(clip)
 }
 
-/// Copy or Cut in the tree: hold these paths for a Paste in any window. Writes nothing on disk —
-/// a Cut that is never pasted must cost exactly nothing.
+/// Refresh from the desktop, including Copies made in a different instance/profile.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_clip_set(
+pub async fn fs_clip_get(app: tauri::AppHandle) -> Result<Option<cide_ipc::FileClip>, FsError> {
+    Ok(refresh_clip(&app).await?.map(|c| c.clip))
+}
+
+/// Capture source roots in Rust, then atomically offer metadata and plain-text paths.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_clip_set(
     app: tauri::AppHandle,
+    registry: State<'_, FsRegistry>,
     clips: State<'_, FileClipState>,
     clip: cide_ipc::FileClip,
-) {
-    if clips.set(Some(clip.clone())) {
-        crate::emit::fs_clip_changed(&app, Some(&clip));
-    }
+) -> Result<cide_ipc::FileClip, FsError> {
+    let _gate = clips.gate.lock().await;
+    let fs = project_fs(&registry, clip.project.ok_or(FsError::NoIndex)?)?;
+    let native = cide_core::file_clip::NativeFileClip::new(
+        clips.instance.clone(),
+        clip,
+        fs.writable_paths(),
+    )
+    .map_err(FsError::InvalidPath)?;
+    crate::file_clipboard::write(&app, native.clone()).await?;
+    clips.publish(&app, Some(native.clone()));
+    Ok(native.clip)
 }
 
-/// Drop whatever the tree's clipboard holds — Escape on a pending cut.
+async fn clear_clip(app: &tauri::AppHandle, id: String) -> Result<(), FsError> {
+    let clips = app.state::<FileClipState>();
+    let _gate = clips.gate.lock().await;
+    clear_clip_locked(app, &clips, id).await
+}
+
+/// Caller holds `clips.gate`, including the project-close path.
+async fn clear_clip_locked(
+    app: &tauri::AppHandle,
+    clips: &FileClipState,
+    id: String,
+) -> Result<(), FsError> {
+    crate::file_clipboard::clear_if(app, id).await?;
+    let current = crate::file_clipboard::read(app).await?;
+    clips.publish(app, current);
+    Ok(())
+}
+
+/// Escape cancels exactly the cut the panel displayed, leaving a newer Copy alone.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_clip_clear(app: tauri::AppHandle, clips: State<'_, FileClipState>) {
-    if clips.set(None) {
-        crate::emit::fs_clip_changed(&app, None);
+pub async fn fs_clip_clear(app: tauri::AppHandle, id: String) -> Result<(), FsError> {
+    clear_clip(&app, id).await
+}
+
+/// A clipboard reference authorizes only the paths and mode captured by the native backend.
+/// Foreign project IDs never go through this process's registry. Drags retain the ordinary
+/// project-based path, and cannot acquire authority by sending arbitrary source roots.
+async fn paste_source(
+    app: &tauri::AppHandle,
+    registry: &FsRegistry,
+    project: ProjectId,
+    source_project: Option<ProjectId>,
+    clip_id: Option<&str>,
+    sources: &[PathBuf],
+    mode: cide_ipc::PasteMode,
+) -> Result<
+    (
+        Option<Arc<crate::files::ProjectFs>>,
+        Option<cide_core::file_clip::NativeFileClip>,
+    ),
+    FsError,
+> {
+    let Some(id) = clip_id else {
+        return Ok((source_fs(registry, project, source_project)?, None));
+    };
+    let native = refresh_clip(app)
+        .await?
+        .filter(|c| c.matches(id, sources, mode))
+        .ok_or_else(|| {
+            FsError::InvalidPath(
+                "The clipboard changed. Paste again to use its current contents.".into(),
+            )
+        })?;
+    let source = native_source_fs(
+        registry,
+        &app.state::<FileClipState>().instance,
+        project,
+        &native,
+    )?;
+    Ok((source, Some(native)))
+}
+
+fn native_source_fs(
+    registry: &FsRegistry,
+    instance: &str,
+    project: ProjectId,
+    native: &cide_core::file_clip::NativeFileClip,
+) -> Result<Option<Arc<crate::files::ProjectFs>>, FsError> {
+    if native.clip.project.is_none() && native.clip.mode == cide_ipc::PasteMode::Cut {
+        // An OS selection authorizes these exact source paths, but does not make an open
+        // project's root movable. Apply the same refusal as Explorer's own Cut.
+        for (_, roots) in registry.indexed() {
+            for path in &native.clip.paths {
+                ops::check_not_root(&roots, path)?;
+            }
+        }
+    }
+    if native.instance == instance {
+        // Even a same-project paste must refuse a source closed since Copy.
+        let source = native.clip.project.ok_or(FsError::NoIndex)?;
+        project_fs(registry, source)?;
+        source_fs(registry, project, Some(source))
+    } else {
+        Ok(None)
     }
 }
 
@@ -1530,19 +1621,33 @@ pub fn fs_clip_clear(app: tauri::AppHandle, clips: State<'_, FileClipState>) {
 /// `spawn_blocking` like every other handler here. The refusals arrive from this call as well
 /// as from the paste: a folder pasted into itself is refused *instead of* being asked about.
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
 pub async fn fs_paste_plan(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     source_project: Option<ProjectId>,
+    clip_id: Option<String>,
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     mode: cide_ipc::PasteMode,
 ) -> Result<Vec<cide_ipc::PasteCollision>, FsError> {
     let fs = project_fs(&registry, project)?;
-    let source_fs = source_fs(&registry, project, source_project)?;
+    let (source_fs, native) = paste_source(
+        &app,
+        &registry,
+        project,
+        source_project,
+        clip_id.as_deref(),
+        &sources,
+        mode,
+    )
+    .await?;
     blocking("fs_paste_plan", move || {
         let dest_roots = fs.writable_paths();
-        let source_roots = source_fs.map_or_else(|| dest_roots.clone(), |s| s.writable_paths());
+        let source_roots = native.map(|c| c.roots).unwrap_or_else(|| {
+            source_fs.map_or_else(|| dest_roots.clone(), |s| s.writable_paths())
+        });
         cide_fs::copy::plan_between(&source_roots, &dest_roots, &sources, &dest_dir, mode)
     })
     .await?
@@ -1616,22 +1721,43 @@ pub async fn fs_paste(
     positions: State<'_, Arc<crate::positions_state::PositionsState>>,
     project: ProjectId,
     source_project: Option<ProjectId>,
+    clip_id: Option<String>,
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     mode: cide_ipc::PasteMode,
     decisions: Vec<cide_ipc::PasteDecision>,
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
     let fs = project_fs(&registry, project)?;
-    let from = source_fs(&registry, project, source_project)?;
-    let consumed = sources.clone();
-    let pasted = blocking("fs_paste", move || {
-        paste_into(&fs, from.as_deref(), &sources, &dest_dir, mode, &decisions)
+    let (from, native) = paste_source(
+        &app,
+        &registry,
+        project,
+        source_project,
+        clip_id.as_deref(),
+        &sources,
+        mode,
+    )
+    .await?;
+    let pasted = blocking("fs_paste", move || match native {
+        Some(native) => paste_with_source_roots(
+            &fs,
+            from.as_deref(),
+            Some(&native.roots),
+            &sources,
+            &dest_dir,
+            mode,
+            &decisions,
+        ),
+        None => paste_into(&fs, from.as_deref(), &sources, &dest_dir, mode, &decisions),
     })
     .await??;
     if mode == cide_ipc::PasteMode::Cut {
-        let clips = app.state::<FileClipState>();
-        if clips.take_if_cut_of(&consumed) {
-            crate::emit::fs_clip_changed(&app, None);
+        if let Some(id) = clip_id
+            && let Err(error) = clear_clip(&app, id).await
+        {
+            // The move already succeeded. Do not turn a clipboard cleanup failure into a
+            // failed move or hide the successful result from the tree.
+            tracing::warn!(%error, "could not clear the consumed file cut");
         }
         // `entry.dest` and not the destination directory joined to the source's name: a
         // collision is renamed rather than refused, so the file the user cut may well have
@@ -1664,13 +1790,27 @@ pub(crate) fn paste_into(
     mode: cide_ipc::PasteMode,
     decisions: &[cide_ipc::PasteDecision],
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
+    paste_with_source_roots(fs, source, None, sources, dest_dir, mode, decisions)
+}
+
+fn paste_with_source_roots(
+    fs: &crate::files::ProjectFs,
+    source: Option<&crate::files::ProjectFs>,
+    source_roots: Option<&[PathBuf]>,
+    sources: &[PathBuf],
+    dest_dir: &std::path::Path,
+    mode: cide_ipc::PasteMode,
+    decisions: &[cide_ipc::PasteDecision],
+) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
     // `writable_paths`, so the drawer is a place things can be pasted into and out of. The
     // out-of direction is the one that matters: a scratch that turned out to be worth keeping
     // is copied into the project with the gesture the user already knows.
     let writable = fs.writable_paths();
     let source_writable = source.map(crate::files::ProjectFs::writable_paths);
     let pasted = cide_fs::copy::paste_between(
-        source_writable.as_deref().unwrap_or(&writable),
+        source_roots
+            .or(source_writable.as_deref())
+            .unwrap_or(&writable),
         &writable,
         sources,
         dest_dir,
@@ -1695,11 +1835,11 @@ pub(crate) fn paste_into(
 
     // Sources first so a rename that lands on the *same* directory reads as one rescan, and
     // because a cut's old row has to go in the same write that adds the new one.
-    let mut touched: Vec<PathBuf> = if source.is_none() {
-        sources.to_vec()
-    } else {
-        Vec::new()
-    };
+    let mut touched: Vec<PathBuf> = sources
+        .iter()
+        .filter(|path| writable.iter().any(|root| path.starts_with(root)))
+        .cloned()
+        .collect();
     touched.extend(pasted.iter().map(|entry| entry.dest.clone()));
     let change = cide_ipc::FsChange {
         paths: touched,
@@ -2638,6 +2778,22 @@ mod tests {
         assert!(added.is_empty(), "the watcher's event added the path again");
         assert_eq!(fs.with_index(|index| index.count()), before);
 
+        // Native snapshots also carry source roots for a same-project Cut. They must still
+        // fold the source directory immediately, just like the project-based drag path.
+        paste_with_source_roots(
+            &fs,
+            None,
+            Some(&fs.writable_paths()),
+            &[pasted[0].dest.clone()],
+            &dir.path().join("src"),
+            cide_ipc::PasteMode::Cut,
+            &[],
+        )
+        .unwrap();
+        assert!(fs.with_index(|index| index.contains(&dir.path().join("src/main.rs"))));
+        assert!(!fs.with_index(|index| index.contains(&dir.path().join("dest/main.rs"))));
+        assert_eq!(fs.with_index(|index| index.count()), before);
+
         drop(registry.remove(project));
     }
 
@@ -2818,29 +2974,201 @@ mod tests {
         drop(registry.remove(pb));
     }
 
-    /// Only the paste the clip was for consumes it: a drag's cut of other paths goes through
-    /// the same command and must leave the clipboard alone, and a Copy is never consumed.
-    #[test]
-    fn only_the_cut_on_the_clipboard_is_consumed_by_its_paste() {
+    /// The receiving process has only B indexed. A's UUID and roots arrive from the native
+    /// clipboard rather than a webview argument or an accidental lookup in B's registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_clipboard_pastes_without_a_registered_source_project() {
+        use cide_core::file_clip::NativeFileClip;
+        use cide_ipc::{FileClip, PasteMode};
+        let a = scratch("native-clip-source");
+        let b = scratch("native-clip-dest");
+        let outside = scratch("native-clip-outside");
+        std::fs::create_dir(a.path().join("folder")).unwrap();
+        std::fs::write(a.path().join("folder/a.txt"), "folder contents").unwrap();
+        std::fs::write(a.path().join("a b.txt"), "file contents").unwrap();
+        let registry = FsRegistry::default();
         let project = ProjectId::new();
-        let clip = |mode, path: &str| cide_ipc::FileClip {
-            mode,
+        index_project(
+            Arc::new(Counting::default()),
+            &registry,
             project,
-            paths: vec![PathBuf::from(path)],
-        };
-        let clips = FileClipState::default();
+            vec![b.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .unwrap();
+        let fs = registry.get(project).unwrap();
+        let receiver = uuid::Uuid::new_v4().to_string();
+        for mode in [PasteMode::Copy, PasteMode::Cut] {
+            let sent = NativeFileClip::new(
+                uuid::Uuid::new_v4().to_string(),
+                FileClip {
+                    id: String::new(),
+                    mode,
+                    project: Some(ProjectId::new()),
+                    paths: vec![a.path().join("folder"), a.path().join("a b.txt")],
+                },
+                vec![a.path().to_path_buf()],
+            )
+            .unwrap();
+            let native = NativeFileClip::decode(&sent.encode().unwrap()).unwrap();
+            assert!(
+                native_source_fs(&registry, &receiver, project, &native)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                native_source_fs(&registry, &native.instance, project, &native),
+                Err(FsError::NoIndex)
+            ));
+            assert!(
+                cide_fs::copy::plan_between(
+                    &native.roots,
+                    &fs.writable_paths(),
+                    &native.clip.paths,
+                    outside.path(),
+                    mode
+                )
+                .is_err()
+            );
+            assert!(
+                paste_with_source_roots(
+                    &fs,
+                    None,
+                    Some(&native.roots),
+                    &native.clip.paths,
+                    outside.path(),
+                    mode,
+                    &[]
+                )
+                .is_err()
+            );
+            let collisions = cide_fs::copy::plan_between(
+                &native.roots,
+                &fs.writable_paths(),
+                &native.clip.paths,
+                b.path(),
+                mode,
+            )
+            .unwrap();
+            if mode == PasteMode::Cut {
+                assert_eq!(collisions.len(), 2, "the previous copy created collisions");
+                assert!(
+                    native.clip.paths.iter().all(|p| p.exists()),
+                    "planning moved the files"
+                );
+            }
+            let pasted = paste_with_source_roots(
+                &fs,
+                None,
+                Some(&native.roots),
+                &native.clip.paths,
+                b.path(),
+                mode,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(pasted.len(), 2);
+            assert_eq!(
+                std::fs::read_to_string(pasted[0].dest.join("a.txt")).unwrap(),
+                "folder contents"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pasted[1].dest).unwrap(),
+                "file contents"
+            );
+            assert!(
+                pasted
+                    .iter()
+                    .all(|p| fs.with_index(|index| index.contains(&p.dest)))
+            );
+            assert_eq!(
+                native.clip.paths.iter().all(|p| p.exists()),
+                mode == PasteMode::Copy
+            );
+            if mode == PasteMode::Cut {
+                assert!(pasted.iter().all(|p| p.renamed));
+            }
+        }
+        drop(registry.remove(project));
+    }
 
-        assert!(clips.set(Some(clip(cide_ipc::PasteMode::Cut, "/p/a.rs"))));
-        assert!(!clips.take_if_cut_of(&[PathBuf::from("/p/dragged.rs")]));
-        assert!(clips.get().is_some(), "a drag threw the clipboard away");
-        assert!(clips.take_if_cut_of(&[PathBuf::from("/p/a.rs")]));
-        assert!(clips.get().is_none());
-
-        clips.set(Some(clip(cide_ipc::PasteMode::Copy, "/p/a.rs")));
-        assert!(!clips.take_if_cut_of(&[PathBuf::from("/p/a.rs")]));
-        assert!(!clips.forget_project(ProjectId::new()));
-        assert!(clips.forget_project(project));
-        assert!(clips.get().is_none());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn os_clipboard_imports_external_files_and_protects_open_project_roots() {
+        use cide_core::file_clip::NativeFileClip;
+        use cide_ipc::PasteMode;
+        let source = scratch("os-clip-source");
+        let dest = scratch("os-clip-dest");
+        std::fs::write(source.path().join("file.txt"), "from the file manager").unwrap();
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        index_project(
+            Arc::new(Counting::default()),
+            &registry,
+            project,
+            vec![dest.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .unwrap();
+        let fs = registry.get(project).unwrap();
+        let receiver = uuid::Uuid::new_v4().to_string();
+        let uri = format!("file://{}/file.txt", source.path().display());
+        for mode in [PasteMode::Copy, PasteMode::Cut] {
+            let native =
+                NativeFileClip::from_uri_list(uri.as_bytes(), mode, "file-manager-selection")
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                native_source_fs(&registry, &receiver, project, &native)
+                    .unwrap()
+                    .is_none()
+            );
+            let collisions = cide_fs::copy::plan_between(
+                &native.roots,
+                &fs.writable_paths(),
+                &native.clip.paths,
+                dest.path(),
+                mode,
+            )
+            .unwrap();
+            assert_eq!(collisions.len(), usize::from(mode == PasteMode::Cut));
+            assert!(
+                source.path().join("file.txt").exists(),
+                "planning changed the source"
+            );
+            let pasted = paste_with_source_roots(
+                &fs,
+                None,
+                Some(&native.roots),
+                &native.clip.paths,
+                dest.path(),
+                mode,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&pasted[0].dest).unwrap(),
+                "from the file manager"
+            );
+            assert!(fs.with_index(|index| index.contains(&pasted[0].dest)));
+            assert_eq!(
+                source.path().join("file.txt").exists(),
+                mode == PasteMode::Copy
+            );
+        }
+        let native = NativeFileClip::from_uri_list(
+            format!("file://{}", dest.path().display()).as_bytes(),
+            PasteMode::Cut,
+            "file-manager-selection",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            native_source_fs(&registry, &receiver, project, &native),
+            Err(FsError::IsRoot(_))
+        ));
+        drop(registry.remove(project));
     }
 
     /// The three refusals, driven through the command layer rather than through `ops`.

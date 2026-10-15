@@ -59,6 +59,7 @@ mod spec_triggers;
 /// five conditions, and `should_spin` is where the rules actually live.
 pub mod spinner;
 // M8: one file index, picker and watcher per project.
+mod file_clipboard;
 pub mod files;
 pub mod graphics;
 pub mod groups;
@@ -1258,6 +1259,7 @@ pub fn run() {
                     lifecycle::exit_requested(app, code, &api);
                 }
                 tauri::RunEvent::Exit => {
+                    app.state::<cmd::fs::FileClipState>().release_on_exit();
                     lifecycle::shutdown(app);
                     app.state::<image_snapshots::ImageSnapshots>().clear();
                 }

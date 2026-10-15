@@ -258,26 +258,23 @@ pub enum PasteMode {
     Cut,
 }
 
-/// What the file tree's Copy or Cut is holding, ready to be pasted — in **any** window.
-///
-/// Held in Rust (`cide-app`'s `FileClipState`) and broadcast as `cide://fs-clip-changed`
-/// rather than kept in each webview, because a clip is something the user takes from one
-/// project and puts into another, and the other project may be drawn by another window —
-/// detached, or in per-project window mode. Each webview used to keep its own, so a Copy in
-/// one window left Paste in the next saying nothing had been copied.
-///
-/// Not persisted: a clip is a gesture in progress, and one that survived a restart would be a
-/// Cut the user had long since forgotten, waiting to move a file the next time Ctrl+V is
-/// pressed anywhere.
+/// Explorer's Copy/Cut snapshot, shared across windows and independent cide instances.
+/// Rust offers it through a native clipboard format alongside plain-text paths. The native
+/// payload also carries the source instance and roots; those never come from the webview.
+/// `cide://fs-clip-changed` mirrors changes within a process; focus/paste refresh from the OS.
+/// No clipboard state is saved in the workspace, and source closure cancels its owned clip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct FileClip {
+    /// Identity of this Copy/Cut, used to bind confirmation and consumption to one gesture.
+    /// Empty only on input to `fs_clip_set`; the backend assigns the identity.
+    #[serde(default)]
+    pub id: String,
     pub mode: PasteMode,
-    /// The project the paths were copied in. A paste into another project sends it as
-    /// `sourceProject`, and the sources are checked against **its** roots — the destination
-    /// is checked against the project it lands in.
-    pub project: ProjectId,
+    /// The originating cide project, or null for files copied in an OS file manager.
+    /// A paste with `clipId` resolves the captured source context natively.
+    pub project: Option<ProjectId>,
     /// Absolute paths, in the order they were picked.
     #[ts(type = "string[]")]
     pub paths: Vec<PathBuf>,

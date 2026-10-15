@@ -2964,11 +2964,13 @@ export const fsClipboard = {
     destDir: string,
     mode: PasteMode,
     sourceProject: ProjectId | null = null,
+    clipId: string | null = null,
   ) =>
     invoke<PasteCollision[]>('fs_paste_plan', {
       project: projectId,
       // The project the sources were copied in, when it is not `projectId` — see `paste`.
       sourceProject,
+      clipId,
       sources: [...sources],
       destDir,
       mode,
@@ -2995,10 +2997,12 @@ export const fsClipboard = {
     mode: PasteMode,
     decisions: readonly PasteDecision[],
     sourceProject: ProjectId | null = null,
+    clipId: string | null = null,
   ) =>
     invoke<PastedEntry[]>('fs_paste', {
       project: projectId,
       sourceProject,
+      clipId,
       // A fresh array: `invoke` serialises what it is handed, and a `readonly string[]` from a
       // zustand store is the store's own array.
       sources: [...sources],
@@ -5573,19 +5577,16 @@ export const newProjectApi = {
 import type { FileClip } from './generated'
 
 /**
- * The file tree's Copy/Cut clipboard, held in Rust so every window reads the same one.
- *
- * A Copy in one window used to be invisible to the next — each webview kept its own store —
- * which made pasting into a project drawn by another window impossible. `sidebar/fileClipboard.ts`
- * is now a mirror of this: it seeds from `get` once and follows `onChanged` after that.
+ * Explorer's native Copy/Cut clipboard, shared by windows and independent processes.
+ * `get` refreshes from the OS; `onChanged` mirrors changes within this process.
  */
 export const fileClip = {
-  /** What is held right now, or `null`. Asked once per window, then the event takes over. */
+  /** Refresh before paste and on desktop focus; ordinary text/image clipboards return null. */
   get: () => invoke<FileClip | null>('fs_clip_get'),
-  /** Hold these paths. Writes nothing on disk. */
-  set: (clip: FileClip) => invoke<void>('fs_clip_set', { clip }),
+  /** Publish metadata and text together, returning the backend-assigned snapshot identity. */
+  set: (clip: Omit<FileClip, 'id'>) => invoke<FileClip>('fs_clip_set', { clip }),
   /** Drop the clip — Escape on a pending cut. A cut's paste clears it in Rust by itself. */
-  clear: () => invoke<void>('fs_clip_clear'),
+  clear: (id: string) => invoke<void>('fs_clip_clear', { id }),
   /**
    * `cide://fs-clip-changed`: taken, cleared, consumed by a cut's paste, or dropped because the
    * project it came from closed. To every window.

@@ -203,6 +203,12 @@ try {
   ok(!m.escapeCancels(clip('cut', ['/a/x.rs'], 'p2'), 'p1'),
     'nor a cut made in another project, whose strip and faded rows are in the other panel')
   ok(!m.escapeCancels(null, 'p1'), 'and an empty clipboard leaves Escape to whoever wants it')
+  ok(m.pendingNote(clip('cut', ['/outside/file'], null), 'p1').includes('file manager'),
+    'an OS Cut names its source without claiming it belongs to another cide project')
+  ok(!m.pendingNote(clip('cut', ['/outside/file'], null), 'p1').includes('Esc'),
+    'an OS Cut does not promise source-project Escape handling')
+  ok(!m.escapeCancels(clip('cut', ['/outside/file'], null), null),
+    'a project-less panel must not accidentally cancel an OS clipboard Cut')
 
   eq(m.clipboardText(['/a/x.rs', '/a/y.rs']), '/a/x.rs\n/a/y.rs',
     'Copy also puts the paths on the SYSTEM clipboard, one per line, so a copy in the tree '
@@ -408,3 +414,5 @@ try {
 } finally {
   rmSync(out, { recursive: true, force: true })
 }
+
+await import('./check-file-clipboard-store.mjs')

@@ -794,6 +794,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "ts-rs",
+ "url",
  "uuid",
  "zip",
 ]

@@ -22,20 +22,14 @@
  *
  * There are two, and conflating them is the bug this file exists to avoid.
  *
- * * The **file clipboard** is in-app state: a mode, a project and some paths (see [`FileClip`]).
- *   It is what Paste reads. Nothing is copied on disk when it is written — a Cut that is never
- *   pasted must cost nothing, which is only true if Ctrl+X touches no files at all.
- * * The **system clipboard** gets the paths as plain text, one per line ([`clipboardText`]), so
- *   that a Copy in the tree is also useful in a terminal pane, an editor, or a browser.
+ * * The **file clipboard** carries a mode, project and paths. Rust publishes it through a
+ *   cide-specific native clipboard format, with its source roots, so independent instances
+ *   and profiles can paste without opening the source project themselves.
+ * * The **system clipboard** also offers the paths as plain text, one per line, so a Copy
+ *   remains useful in a terminal pane or editor. Native metadata and text are one write.
  *
- * What this does **not** support, stated because a file manager user will expect it: pasting
- * *into* cide from Dolphin or Nautilus, and pasting cide's Copy into them as files rather than
- * as text. Those need the desktop's own clipboard flavours — `text/uri-list` plus
- * `x-special/gnome-copied-files` for GNOME, `application/x-kde-cutselection` for KDE — which a
- * webview cannot put on the clipboard: `navigator.clipboard.write` refuses custom MIME types,
- * and serving them properly means owning the X11/Wayland selection from the native side for as
- * long as the clipboard lives. That is a real feature, and it is not this one. Copy here is
- * cide-to-cide, plus text for everyone else.
+ * Native OS file lists are imported too, including GNOME/KDE Copy/Cut metadata. Plain text
+ * that merely looks like a path is never treated as a file operation. No files move until Paste.
  */
 import { basenameOf, targetFor, type AnchorRow, type NewEntryTarget } from './newEntry'
 
@@ -44,19 +38,17 @@ export type ClipMode = 'copy' | 'cut'
 
 /** What the tree is holding, ready to be pasted. */
 export interface FileClip {
+  /** Identity assigned by the copying backend, shared through the native clipboard. */
+  readonly id: string
   readonly mode: ClipMode
   /**
-   * The project the paths came from.
+   * The project the paths came from, or null for an OS file-manager selection.
    *
-   * Sent as `sourceProject` when the paste lands in a different project, so Rust checks the
-   * sources against *that* project's roots and the destination against the one being pasted
-   * into (`cide_fs::copy::paste_between`). Containment is not relaxed by a cross-project paste,
-   * only split: it is still the only thing standing between a webview-supplied path and `/etc`.
-   *
-   * Until then this field was the reason to *refuse* such a paste — "paste them where they came
-   * from" — because the command took one project and checked both ends against it.
+   * Used for pending-Cut styling. Paste sends `id` to resolve the source roots natively,
+   * including when this project belongs to another process. Destination containment is still
+   * checked against the receiving project's writable roots.
    */
-  readonly project: string
+  readonly project: string | null
   /**
    * Absolute paths, in the order they were picked.
    *
@@ -167,6 +159,9 @@ export function pendingNote(
   if (clip === null || clip.mode !== 'cut' || clip.paths.length === 0) return null
   const what =
     clip.paths.length === 1 ? `“${basenameOf(clip.paths[0] ?? '')}”` : `${clip.paths.length} items`
+  if (clip.project === null) {
+    return `${what}, cut in the file manager, will move here when you paste.`
+  }
   // Drawn in *another* project's panel too, now that a cut can be pasted there — and there it
   // must not promise Escape, which only cancels a cut from the panel it was made in
   // (`escapeCancels`). Saying "Esc cancels" in a panel where Esc does nothing is a dead control.
@@ -196,7 +191,7 @@ export function isCutPending(clip: FileClip | null, path: string): boolean {
  * Escape must cancel what the strip promises it cancels, and nothing else.
  */
 export function escapeCancels(clip: FileClip | null, project: string | null): boolean {
-  return clip !== null && clip.mode === 'cut' && clip.project === project
+  return clip !== null && clip.mode === 'cut' && clip.project !== null && clip.project === project
 }
 
 /** What Copy puts on the *system* clipboard: one absolute path per line. */
