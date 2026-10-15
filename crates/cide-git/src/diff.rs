@@ -21,6 +21,7 @@
 //! character only for context, addition and deletion — which is exactly the rule
 //! [`RawHunk::render`] follows.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use cide_ipc::git::{
@@ -296,6 +297,50 @@ fn build_paths<'r>(repo: &'r Repository, request: DiffRequest, paths: &[&str]) -
     Ok(diff)
 }
 
+/// Paths with a net HEAD-to-worktree change among these literal paths.
+///
+/// Status reports both sides of the index, even when they cancel. Loading the candidate
+/// content is essential: a combined delta can still say `Modified` even when the loaded
+/// blobs are identical. No patch text is sent to the caller.
+pub(crate) fn combined_changed_paths(
+    repo: &Repository,
+    paths: &[&str],
+) -> Result<BTreeSet<String>> {
+    let mut changed = BTreeSet::new();
+    // An empty pathspec means the entire repository to libgit2.
+    if paths.is_empty() {
+        return Ok(changed);
+    }
+    let diff = build_paths(repo, DiffRequest::new(DiffSide::Combined), paths)?;
+    // The patch supplies content identities, rather than only the original stat hints.
+    for index in 0..diff.deltas().len() {
+        let Some(patch) = Patch::from_diff(&diff, index).wrap()? else {
+            continue;
+        };
+        let delta = patch.delta();
+        if delta_has_change(&delta) {
+            changed.extend(path_of(&delta.old_file()));
+            changed.extend(path_of(&delta.new_file()));
+        }
+    }
+    Ok(changed)
+}
+
+fn delta_has_change(delta: &git2::DiffDelta<'_>) -> bool {
+    if delta.status() == Delta::Unmodified {
+        return false;
+    }
+    let old = delta.old_file();
+    let new = delta.new_file();
+    // Modified gitlinks can describe a dirty submodule with the same commit id. Renames,
+    // additions (including empty files), and mode changes are changes in their own right.
+    !(delta.status() == Delta::Modified
+        && old.mode() != git2::FileMode::Commit
+        && old.mode() == new.mode()
+        && !old.id().is_zero()
+        && old.id() == new.id())
+}
+
 /// `HEAD^{tree}`, or `None` on an unborn branch.
 pub fn head_tree(repo: &Repository) -> Result<Option<git2::Tree<'_>>> {
     match repo.head() {
@@ -328,12 +373,18 @@ pub fn raw_files(diff: &Diff<'_>) -> Result<Vec<RawFile>> {
 
 /// One delta in raw form. `None` when libgit2 has no patch for it (an unmodified entry).
 pub fn raw_file_at(diff: &Diff<'_>, index: usize) -> Result<Option<RawFile>> {
-    let Some(delta) = diff.get_delta(index) else {
+    if diff.get_delta(index).is_none() {
         return Ok(None);
-    };
+    }
     let Some(mut patch) = Patch::from_diff(diff, index).wrap()? else {
         return Ok(None);
     };
+    // Constructing the patch resolves content identity, even when its status remains
+    // Modified for identical HEAD and working-copy blobs.
+    let delta = patch.delta();
+    if !delta_has_change(&delta) {
+        return Ok(None);
+    }
 
     let mut file = RawFile {
         path: path_of(&delta.new_file())

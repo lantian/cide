@@ -788,15 +788,17 @@ export function useGitPanel(
   /**
    * Which operation the line under the toolbar is currently about.
    *
-   * Only that operation may clear it. Every write path ends in `await refresh()`, so a
-   * blanket "any success clears the line" would wipe *why the commit failed* a few
-   * milliseconds after showing it — the one message in this panel worth reading, replaced
+   * Only that operation or a successful manual refresh may clear it. Every write path ends
+   * in `await refresh()`, so a blanket "any success clears the line" would wipe *why the
+   * commit failed* a few milliseconds after showing it — the one message worth reading, replaced
    * by nothing at all because the status read that followed it went fine.
    */
   const shownFor = useRef<string | null>(null)
+  const noteRevision = useRef(0)
 
   const note = useCallback((what: string, line: string | null) => {
     if (line === null && shownFor.current !== what) return
+    noteRevision.current += 1
     shownFor.current = line === null ? null : what
     setUnavailable(line)
   }, [])
@@ -806,12 +808,13 @@ export function useGitPanel(
    *
    * Returns `undefined` on failure so callers branch on a value rather than on a `catch`.
    * That keeps every call site one line and makes an unguarded one visible in review.
+   * A superseded read can suppress its note through `current` without suppressing logs.
    */
   const guarded = useCallback(
-    async <T,>(what: string, call: () => Promise<T>) => {
+    async <T,>(what: string, call: () => Promise<T>, current?: () => boolean) => {
       try {
         const value = await call()
-        note(what, null)
+        if (current?.() !== false) note(what, null)
         return value
       } catch (e) {
         /*
@@ -831,7 +834,7 @@ export function useGitPanel(
          * that is not a recognisable wire error, so nothing that used to read well reads worse.
          */
         const detail = explain(e)
-        note(what, `${what} unavailable — ${detail}`)
+        if (current?.() !== false) note(what, `${what} unavailable — ${detail}`)
         // Also to the app's stderr: the panel shows one line, and the reason a command is
         // missing is usually longer than one line.
         void diag.log(`git panel: ${what} failed: ${detail}`)
@@ -1003,8 +1006,9 @@ export function useGitPanel(
    * `gitStatusStore`'s idiom, and `treeStore`'s, for the same two races.
    */
   const generation = useRef(0)
+  const refreshAcknowledgement = useRef<number | null>(null)
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (manual = false) => {
     if (story) return
     if (project === null) {
       adopt(EMPTY, false)
@@ -1012,9 +1016,14 @@ export function useGitPanel(
     }
     generation.current += 1
     const mine = generation.current
+    // A coalesced background read can supersede a manual one. Its fresh answer still
+    // completes the requested refresh, but it may acknowledge only the original note.
+    if (manual) refreshAcknowledgement.current = noteRevision.current
     setLoading(true)
-    const raw = await guarded('git status', () =>
-      gitApi.status(project, includeIgnoredRef.current, worktree),
+    const raw = await guarded(
+      'git status',
+      () => gitApi.status(project, includeIgnoredRef.current, worktree),
+      () => generation.current === mine,
     )
     if (generation.current !== mine) return
     setLoading(false)
@@ -1022,7 +1031,15 @@ export function useGitPanel(
     // Keeping the previous tree after a failure would show changes that may no longer
     // exist, so a failure empties the panel.
     if (raw === undefined) adopt(EMPTY, false)
-    else adopt(absorb(raw))
+    else {
+      adopt(absorb(raw))
+      // Background reads must leave a failed operation's explanation visible. A manual
+      // retry acknowledges it, but cannot acknowledge a newer failure raised in flight.
+      if (noteRevision.current === refreshAcknowledgement.current && shownFor.current !== null) {
+        note(shownFor.current, null)
+      }
+    }
+    refreshAcknowledgement.current = null
 
     /*
      * And the merge state, per repository, on the same refresh.
@@ -1050,7 +1067,7 @@ export function useGitPanel(
     // Remembered beside the tree it was probed with — see `lastMerges`.
     if (scope !== null) lastMerges.set(scope, found)
     setMerges(found)
-  }, [project, worktree, scope, story, guarded, adopt, absorb])
+  }, [project, worktree, scope, story, guarded, adopt, absorb, note])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
   const pending = useRef<number | null>(null)
@@ -2475,7 +2492,7 @@ export function useGitPanel(
     dialog,
     confirm,
     refresh: () => {
-      void refresh()
+      void refresh(true)
       void loadShelf()
     },
     /*

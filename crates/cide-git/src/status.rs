@@ -25,7 +25,7 @@ use cide_ipc::git::{
 };
 use git2::{Repository, Status, StatusOptions};
 
-use crate::{Result, Wrap, changelist, repo as repo_mod};
+use crate::{Result, Wrap, changelist, diff, repo as repo_mod};
 
 /// Whether ignored files are walked at all.
 ///
@@ -111,6 +111,36 @@ pub fn repo_changes(info: &RepoInfo, request: StatusRequest) -> Result<RepoChang
         }
     }
 
+    let branch = branch_info(&repo)?;
+    let staging_arm = sidecar.use_staging_area
+        || matches!(
+            branch.operation.as_deref(),
+            Some("merge" | "cherry-pick" | "revert")
+        );
+    if !staging_arm {
+        // A staged addition deleted by the Tasks panel (AD), or staged edits undone in
+        // an editor (MM), still exist in git status but cannot be committed from Combined.
+        // Reconcile against the raw entries above so their index content and changelist
+        // ownership remain available if the user switches to the staging-area model.
+        let candidates: BTreeSet<&str> = filed
+            .iter()
+            .filter(|entry| may_cancel_through_index(entry))
+            .flat_map(|entry| {
+                std::iter::once(entry.path.as_str()).chain(entry.orig_path.as_deref())
+            })
+            .collect();
+        let changed =
+            diff::combined_changed_paths(&repo, &candidates.into_iter().collect::<Vec<_>>())?;
+        filed.retain(|entry| {
+            !may_cancel_through_index(entry)
+                || changed.contains(&entry.path)
+                || entry
+                    .orig_path
+                    .as_ref()
+                    .is_some_and(|path| changed.contains(path))
+        });
+    }
+
     let changelists = sidecar
         .lists
         .iter()
@@ -129,7 +159,7 @@ pub fn repo_changes(info: &RepoInfo, request: StatusRequest) -> Result<RepoChang
 
     Ok(RepoChanges {
         repo: info.clone(),
-        branch: branch_info(&repo)?,
+        branch,
         changelists,
         unversioned,
         ignored,
@@ -137,6 +167,12 @@ pub fn repo_changes(info: &RepoInfo, request: StatusRequest) -> Result<RepoChang
         index_changed_externally: changelist::index_changed_externally(&info.root, &repo)?,
         use_staging_area: sidecar.use_staging_area,
     })
+}
+
+fn may_cancel_through_index(entry: &ChangeEntry) -> bool {
+    !entry.submodule
+        && entry.index != FileState::Unmodified
+        && entry.worktree != FileState::Unmodified
 }
 
 pub(crate) fn options(include_ignored: bool) -> StatusOptions {

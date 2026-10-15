@@ -35,6 +35,8 @@ const repo = (id, staged = false) => ({
   useStagingArea: staged,
 })
 let status = { repos: [repo('repo-a')] }
+const statusReads = []
+const shelfReads = []
 const calls = []
 let generation = deferred()
 let commit = deferred()
@@ -44,9 +46,9 @@ window.__TAURI_INTERNALS__ = {
   unregisterCallback: () => {},
   invoke: async (command, args) => {
     calls.push({ command, args })
-    if (command === 'git_status') return structuredClone(status)
+    if (command === 'git_status') return statusReads.shift()?.promise ?? structuredClone(status)
     if (command === 'git_conflicts') return null
-    if (command === 'git_shelf_list') return []
+    if (command === 'git_shelf_list') return shelfReads.shift()?.promise ?? []
     if (command === 'claude_commit_message') return generation.promise
     if (command === 'git_commit') return commit.promise
     if (command.startsWith('plugin:event|')) return 1
@@ -247,9 +249,115 @@ try {
   await act(async () => current.setAmend(true))
   assert.equal(generateButton().disabled, true, 'message-only amend has no changes')
 
+  // A task removed outside Changes must be recoverable without losing the rest of a commit.
+  await close()
+  clearAllPartials()
+  const taskPath = '.cide/tasks/t-1/task.json'
+  status = { repos: [repo('refresh-repo')] }
+  status.repos[0].changelists[0].changes.push(change(taskPath))
+  await mount('refresh-project')
+  await pick('picked.txt')
+  await pick(taskPath)
+  await type('keep this draft')
+  const hold = (path) => setPartial({ repo: 'refresh-repo', path, side: 'combined',
+    rev: `rev:${path}`, selection: { kind: 'lines', lines: [{ hunk: 0, line: 1 }] }, lines: 1 })
+  await act(async () => { hold(taskPath); hold('picked.txt') })
+  commit = deferred()
+  await click(document.querySelector('[data-audit="gitCommit"]'))
+  await act(async () => commit.reject({ kind: 'noSuchChange', detail: { path: taskPath } }))
+  assert.ok(current.unavailable.includes(taskPath), 'automatic post-failure refresh keeps the error')
+  const previousError = current.unavailable
+  status.repos[0].changelists[0].changes = status.repos[0].changelists[0].changes
+    .filter((entry) => entry.path !== taskPath)
+  const refreshButton = () => document.querySelector('button[aria-label="Refresh changes"]')
+  await click(refreshButton())
+  assert.equal(current.unavailable, null, 'a successful manual refresh clears the preceding error')
+  assert.equal(document.querySelector('[data-audit="gitUnavailable"]'), null)
+  assert.equal(current.rows.some((row) => row.entry?.path === taskPath), false)
+  assert.deepEqual(current.picked.map((entry) => entry.path), ['picked.txt'])
+  assert.equal(current.selected.size, 1, 'obsolete ticks are pruned without checking another file')
+  assert.deepEqual(current.partials.map((entry) => entry.path), ['picked.txt'])
+  assert.equal(textarea().value, 'keep this draft')
+
+  // A failed status read keeps the draft and held selections for the next good answer.
+  let read = deferred()
+  statusReads.push(read)
+  await click(refreshButton())
+  await act(async () => read.reject({ kind: 'git', detail: { detail: 'status locked' } }))
+  assert.ok(current.unavailable.includes('status locked'))
+  assert.notEqual(current.unavailable, previousError)
+  assert.equal(textarea().value, 'keep this draft')
+  assert.equal(current.selected.size, 1)
+  assert.equal(current.partials.length, 1)
+  await click(refreshButton())
+  assert.equal(current.unavailable, null)
+  assert.deepEqual(current.picked.map((entry) => entry.path), ['picked.txt'])
+
+  // An older read cannot resurrect a task after a later refresh removed it.
+  const older = deferred()
+  const newer = deferred()
+  statusReads.push(older, newer)
+  await click(refreshButton())
+  await click(refreshButton())
+  await act(async () => newer.resolve(structuredClone(status)))
+  const stale = structuredClone(status)
+  stale.repos[0].changelists[0].changes.push(change(taskPath))
+  await act(async () => older.resolve(stale))
+  assert.equal(current.rows.some((row) => row.entry?.path === taskPath), false)
+  assert.equal(current.loading, false)
+
+  const olderFailure = deferred()
+  const latest = deferred()
+  statusReads.push(olderFailure, latest)
+  await click(refreshButton())
+  await click(refreshButton())
+  await act(async () => latest.resolve(structuredClone(status)))
+  await act(async () => olderFailure.reject({ kind: 'git', detail: { detail: 'obsolete failure' } }))
+  assert.equal(current.unavailable, null, 'an older failed read cannot replace a successful refresh')
+
+  // An independent failure can arrive without superseding the pending status read.
+  read = deferred()
+  const shelfRead = deferred()
+  statusReads.push(read)
+  shelfReads.push(shelfRead)
+  await click(refreshButton())
+  await act(async () => shelfRead.reject({ kind: 'git', detail: { detail: 'new shelf failure' } }))
+  const shelfError = current.unavailable
+  assert.ok(shelfError.includes('new shelf failure'))
+  await act(async () => read.resolve(structuredClone(status)))
+  assert.equal(current.unavailable, shelfError, 'refresh acknowledges only the error it started with')
+  await click(refreshButton())
+  assert.equal(current.unavailable, null)
+
+  // A refresh started before a new commit failure must not hide that newer error.
+  read = deferred()
+  statusReads.push(read)
+  await click(refreshButton())
+  commit = deferred()
+  await click(document.querySelector('[data-audit="gitCommit"]'))
+  const afterFailure = deferred()
+  statusReads.push(afterFailure)
+  await act(async () => commit.reject({ kind: 'git', detail: { detail: 'new commit failure' } }))
+  const newerError = current.unavailable
+  assert.ok(newerError.includes('new commit failure'))
+  await act(async () => read.resolve(structuredClone(status)))
+  assert.equal(current.unavailable, newerError)
+  await act(async () => afterFailure.resolve(structuredClone(status)))
+  assert.equal(current.unavailable, newerError, 'background refresh leaves the newer failure visible')
+  assert.equal(textarea().value, 'keep this draft')
+  await click(refreshButton())
+  assert.equal(current.unavailable, null)
+
+  commit = deferred()
+  await click(document.querySelector('[data-audit="gitCommit"]'))
+  const refreshedCommit = calls.filter((call) => call.command === 'git_commit').at(-1)
+  assert.deepEqual(refreshedCommit.args.request.selections.map((entry) => entry.path), ['picked.txt'])
+  await act(async () => commit.resolve({ oid: 'after-refresh', files: 1 }))
+  assert.equal(textarea().value, '', 'the remaining checked changes can be committed')
+
   assert.equal(commitDrafts.get(commitDraftKey('project-b', null)).message, 'project b draft')
   assert.equal(commitDrafts.get(commitDraftKey('project-a', '/test/worktree')).message, 'worktree draft')
-  console.log('Commit messages: scoped drafts, partial-selection IPC, async retention, confirmation and commit clearing passed')
+  console.log('Commit panel: scoped drafts, partial selections, generation, refresh recovery and commit clearing passed')
 } finally {
   if (root) await act(async () => root.unmount())
   dom.window.close()
