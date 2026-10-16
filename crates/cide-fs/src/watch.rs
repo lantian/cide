@@ -729,15 +729,21 @@ impl Backend {
 
     fn refresh_directory(&mut self, path: &Path, filter: &Filter) {
         let previous = self.aliases.links.get(path).cloned();
+        let real = std::fs::canonicalize(path).ok();
+        // Polling watches compare paths, not inodes. Re-registering a still-present
+        // target replaces its snapshot and silently absorbs edits not yet polled.
+        // Rebuild the logical mappings while retaining this physical subtree's scans.
+        let polling = self.is_polling();
         for unused in self.aliases.remove_tree(path) {
-            if !self.guards.contains(&unused) {
+            let retained = polling && real.as_ref().is_some_and(|real| unused.starts_with(real));
+            if !retained && !self.guards.contains(&unused) {
                 self.unwatch_real(&unused);
             }
         }
         if path.is_dir() || path.is_file() {
-            // A target at the same physical name may now be a different inode.
-            if let Ok(real) = std::fs::canonicalize(path) {
-                self.unwatch_real(&real);
+            // Native watches must reattach if the same name now refers to a new inode.
+            if !polling && let Some(real) = &real {
+                self.unwatch_real(real);
             }
             self.watch_tree(path, filter);
         } else if path.is_symlink()
@@ -942,6 +948,74 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].kind.is_create(), "{events:?}");
         assert_eq!(events[0].paths, vec![link]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refreshing_polling_aliases_preserves_unreported_target_edits() {
+        let fixture = crate::testing::scratch("poll-alias-refresh");
+        let root = fixture.join("project");
+        let target = fixture.join("target");
+        let replacement = fixture.join("replacement");
+        for dir in [&root, &target, &replacement] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let seed = target.join("seed.rs");
+        std::fs::write(&seed, "initial").unwrap();
+        let one = root.join("one");
+        let two = root.join("two");
+        std::os::unix::fs::symlink(&target, &one).unwrap();
+        std::os::unix::fs::symlink(&target, &two).unwrap();
+        let filter = Filter::build(
+            std::slice::from_ref(&root),
+            [&root, &one, &two].into_iter().map(|p| p.as_path()),
+            crate::Visibility::CONSERVATIVE,
+        );
+        let config = WatchConfig {
+            roots: vec![root.clone()],
+            dirs: vec![root, one.clone(), two.clone()],
+            links: vec![one.clone(), two.clone()],
+            poll_interval: Duration::from_secs(1),
+            debounce: Duration::from_millis(10),
+            ..WatchConfig::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let (mut backend, _) = Backend::start_polling(&config, tx, "test".into());
+        let wait_for = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                let Ok(events) = rx.recv_timeout(left) else {
+                    break;
+                };
+                if events
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.paths.contains(&path.to_path_buf()))
+                {
+                    return;
+                }
+            }
+            panic!("polling missed {}", path.display());
+        };
+        // Observe a scan before editing, leaving a full interval for the refresh.
+        let marker = fixture.join("marker");
+        std::fs::write(&marker, "scan barrier").unwrap();
+        wait_for(&marker);
+        std::fs::remove_file(&one).unwrap();
+        std::os::unix::fs::symlink(&replacement, &one).unwrap();
+        backend.refresh_directory(&one, &filter);
+        std::fs::write(&seed, "pending edit").unwrap();
+        std::fs::File::open(&seed)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(10)),
+            )
+            .unwrap();
+        // A guard's metadata event can revalidate all links before the next target scan.
+        backend.refresh_directory(&two, &filter);
+        wait_for(&seed);
+        assert_eq!(backend.aliases.paths(&seed), vec![two.join("seed.rs")]);
     }
 
     fn coalescer() -> Coalescer {
