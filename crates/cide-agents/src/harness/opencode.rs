@@ -3155,6 +3155,12 @@ fn as_v2(document: Value) -> Value {
                     described.insert(key.into(), value.clone());
                 }
             }
+            // v2 splits startup, catalog and tool execution deadlines. Interactive IDE
+            // diffs can wait for a human; retain v1's execution timeout without turning
+            // a broken startup into a week-long wait (or passing v2 an invalid number).
+            if let Some(timeout) = server.get("timeout").and_then(Value::as_u64) {
+                described.insert("timeout".into(), json!({ "execution": timeout }));
+            }
             // The sense is inverted, so an untranslated `enabled` would not merely be ignored —
             // it would leave the server at 2.0's own default with cide believing it said so.
             if let Some(enabled) = server.get("enabled").and_then(Value::as_bool) {
@@ -4216,6 +4222,11 @@ mod tests {
             v1_doc["mcp"][SERVER]["command"]
         );
         assert_eq!(v2_doc["mcp"]["servers"][SERVER]["disabled"], json!(false));
+        assert_eq!(
+            v2_doc["mcp"]["servers"][SERVER]["timeout"]["execution"],
+            v1_doc["mcp"][SERVER]["timeout"]
+        );
+        assert!(v2_doc["mcp"]["servers"][SERVER]["timeout"]["startup"].is_null());
         // **The parity that must hold.** `harness.rs` pins that one role pointed at either CLI
         // reads the same brief; this pins that the same is true of either *generation* of one CLI.
         assert_eq!(

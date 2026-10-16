@@ -477,7 +477,9 @@ pub fn thread_policy(config: &Value, args: &[String]) -> Value {
         "default_permissions",
     ] {
         if let Some(value) = config.get(key).filter(|value| !value.is_null()) {
-            policy["config"][key] = value.clone();
+            let mut value = value.clone();
+            omit_null_config_fields(&mut value);
+            policy["config"][key] = value;
         }
     }
     let overrides = server_overrides(args);
@@ -493,6 +495,26 @@ pub fn thread_policy(config: &Value, args: &[String]) -> Value {
         policy["sandbox"] = json!(sandbox);
     }
     policy
+}
+
+/// config/read reports absent typed fields as JSON null. Thread config overrides
+/// are converted to TOML, where null becomes an empty string: forwarding a profile's
+/// workspace_roots:null makes even thread/start fail to deserialize the profile.
+fn omit_null_config_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.retain(|_, value| !value.is_null());
+            for value in fields.values_mut() {
+                omit_null_config_fields(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                omit_null_config_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn apply_policy(frame: &mut Value, policy: &Value) -> bool {
@@ -686,6 +708,21 @@ mod tests {
         let before = helper.clone();
         assert!(!apply_policy(&mut helper, &readonly));
         assert_eq!(helper, before);
+    }
+
+    #[test]
+    fn native_profile_overrides_omit_absent_typed_fields() {
+        let config = json!({"default_permissions":"cide-peer-reviewer","approval_policy":"never","permissions":{"cide-peer-reviewer":{"extends":":read-only","description":null,"workspace_roots":null,"network":null,"filesystem":{"/scratch":"write","glob_scan_max_depth":null}}}});
+        let policy = thread_policy(&config, &[]);
+        for method in ["thread/start", "thread/resume"] {
+            let mut frame = json!({"method":method,"params":{}});
+            assert!(apply_policy(&mut frame, &policy));
+            assert_eq!(frame["params"]["permissions"], "cide-peer-reviewer");
+            assert_eq!(
+                frame["params"]["config"]["permissions"]["cide-peer-reviewer"],
+                json!({"extends":":read-only","filesystem":{"/scratch":"write"}})
+            );
+        }
     }
 
     #[test]

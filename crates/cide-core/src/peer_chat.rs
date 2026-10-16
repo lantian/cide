@@ -1,4 +1,5 @@
 //! Pair configuration and addressing. No process or UI dependencies.
+pub mod reviewer;
 use crate::{CoreError, Result, layout, workspace};
 use cide_ipc::{
     Axis, ConsoleHarness, Pane, PaneId, PaneKind, PaneRole, PeerChat, PeerChatSelection, ProjectId,
@@ -133,6 +134,14 @@ pub fn for_session(
     })
 }
 
+/// The reviewer talks to the writer, so its prompt/permission states do not ask the user
+/// for attention. Keep those states intact for delivery and permission handling; only the
+/// attention surfaces suppress them. Role identity survives restart and does not depend
+/// on which harness or side of a rearranged split happens to render the session.
+pub fn is_reviewer(ws: &Workspace, session: SessionId) -> bool {
+    for_session(ws, session).is_some_and(|(_, _, pane, chat)| pane == chat.peer)
+}
+
 pub fn require_unpaired(ws: &Workspace, project: ProjectId, tab: TabId) -> Result<()> {
     if workspace::tab(ws, project, tab)?.peer_chat.is_some() {
         return Err(CoreError::Invariant(
@@ -156,7 +165,7 @@ pub fn instructions(harness: ConsoleHarness, reviewer: bool) -> String {
             "Main writer"
         },
         if reviewer {
-            "Stay read-only: inspect, run non-mutating checks, challenge and review. Do not edit shared files, commit, dispatch workers, or transfer write authority."
+            reviewer::INSTRUCTIONS
         } else {
             "You are the sole writer. Every direct user task in this tab involves your peer automatically: send the task and relevant context to the peer before implementation, consider its findings, and request review of your changes. The user need not name the peer. Stay within the user's requested task. If the peer is paused, unavailable, or delivery fails, tell the user and wait for the pair to be restored or resumed before writing."
         },
@@ -202,6 +211,32 @@ mod tests {
         assert!(configure(&mut ws, p, t, selection).is_err());
         workspace::validate(&ws).unwrap();
     }
+    #[test]
+    fn only_the_paired_reviewer_is_excluded_from_user_attention() {
+        let mut ws = Workspace::default();
+        let p = workspace::open_project(&mut ws, vec!["/attention".into()], None).unwrap();
+        let t = open(&mut ws, p).unwrap();
+        let chat = workspace::tab(&ws, p, t)
+            .unwrap()
+            .peer_chat
+            .clone()
+            .unwrap();
+        let writer = SessionId::new();
+        let reviewer = SessionId::new();
+        workspace::bind_session(&mut ws, p, t, chat.main, writer, None).unwrap();
+        workspace::bind_session(&mut ws, p, t, chat.peer, reviewer, None).unwrap();
+        for snapshot in [
+            ws.clone(),
+            serde_json::from_slice(&serde_json::to_vec(&ws).unwrap()).unwrap(),
+        ] {
+            assert!(is_reviewer(&snapshot, reviewer));
+            assert!(!is_reviewer(&snapshot, writer));
+            assert!(!is_reviewer(&snapshot, SessionId::new()));
+            let home = snapshot.projects[&p].primary_session;
+            assert!(!is_reviewer(&snapshot, home));
+        }
+    }
+
     #[test]
     fn routing_is_by_bound_session_and_roles_survive_json() {
         let mut ws = Workspace::default();

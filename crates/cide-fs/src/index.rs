@@ -100,6 +100,8 @@ struct Node {
     children: Vec<NodeId>,
     kind: TreeRowKind,
     symlink: bool,
+    /// Detect a retargeted link even when its name and directory kind did not change.
+    link_target: Option<PathBuf>,
     expanded: bool,
     /// Rows this node contributes when its parent is expanded: itself, plus its children's
     /// contribution when it is expanded. Maintained on every mutation.
@@ -163,7 +165,8 @@ impl Index {
                 parent: None,
                 children: Vec::new(),
                 kind: TreeRowKind::Dir,
-                symlink: false,
+                symlink: path.is_symlink(),
+                link_target: link_target(&path),
                 // A root is expanded from the start: with one root it is not even drawn, and
                 // with several a collapsed-by-default project looks empty on open.
                 expanded: true,
@@ -228,8 +231,28 @@ impl Index {
         self.by_path
             .iter()
             .filter(|&(_, &id)| matches!(self.nodes[id as usize].kind, TreeRowKind::Dir))
+            .filter(|(path, id)| {
+                filter.watchable(path, true)
+                    && !directory_cycle(
+                        path,
+                        &self.roots[self.nodes[**id as usize].root as usize].path,
+                    )
+            })
             .map(|(p, _)| p.clone())
-            .filter(|p| filter.watchable(p, true))
+            .collect()
+    }
+
+    /// Links need target-parent watches too, including links whose target is absent now.
+    pub fn watch_links(&self, filter: &Filter) -> Vec<PathBuf> {
+        self.by_path
+            .iter()
+            .filter(|(path, id)| {
+                let node = &self.nodes[**id as usize];
+                node.symlink
+                    && filter.watchable(path, matches!(node.kind, TreeRowKind::Dir))
+                    && !directory_cycle(path, &self.roots[node.root as usize].path)
+            })
+            .map(|(path, _)| path.clone())
             .collect()
     }
 
@@ -383,14 +406,11 @@ impl Index {
     /// It answers from the walked tree and touches no disk, which is what makes it affordable
     /// on a mouse hover: one hash lookup per candidate rather than a `stat` per candidate.
     ///
-    /// # Membership here is also the containment argument
-    ///
     /// The index is built from the project's roots, filtered by the same gitignore rules the
-    /// tree and the watcher use, and it does not descend through symlinked directories. So a
-    /// path this answers `Some` for is inside a root by construction — `target/debug/…`,
-    /// `node_modules/…`, `/etc/shadow` and `~/.claude/.credentials.json` are all simply absent.
-    /// That is the *first* of two locks, not the only one: the click re-checks in Rust, because
-    /// an answer the frontend was given earlier is not evidence about the path it sends back.
+    /// tree and the watcher use. Paths through directory links retain their spelling under
+    /// the root; their resolved targets can be outside it. Membership is therefore a logical
+    /// path check, not proof of physical containment. Terminal clicks still re-check their
+    /// canonical target in Rust before opening an external file.
     pub fn kind_of(&self, path: &Path) -> Option<TreeRowKind> {
         let id = *self.by_path.get(path)?;
         Some(self.nodes[id as usize].kind)
@@ -417,7 +437,7 @@ impl Index {
 
         for (i, root) in index.roots.clone().iter().enumerate() {
             let start = entries.len();
-            walk_root(root, i as u16, multi, opts, |batch| {
+            walk_root(root, &root.path, i as u16, multi, opts, true, |batch| {
                 sink(batch);
                 entries.extend_from_slice(batch);
             });
@@ -444,9 +464,8 @@ impl Index {
     /// nothing reveals into. `cide_fs::groups` draws the *External Libraries* rows, from the
     /// resolver's answer, and has since M13.
     ///
-    /// Everything else is deliberately identical: the same `WalkBuilder`, the same gitignore
-    /// rules, the same `rel` construction — so a path the picker offers is a path the tree would
-    /// have shown, had anybody asked it to walk there.
+    /// Uses the same ignore rules and `rel` construction as the project walk. Library
+    /// directory links remain leaves, matching the synthetic library tree's existing policy.
     ///
     /// # Threads, and the 20× trap
     ///
@@ -476,7 +495,9 @@ impl Index {
             // indices. Truncating is the right failure: the index is only used to attribute a
             // `WalkItem` to a root, no caller of this function reads it, and refusing to walk
             // would be a worse answer than an unread field being wrong.
-            walk_root(root, i as u16, multi, opts, |batch| sink(batch));
+            walk_root(root, &root.path, i as u16, multi, opts, false, |batch| {
+                sink(batch)
+            });
         }
     }
 
@@ -537,6 +558,11 @@ impl Index {
             children: Vec::new(),
             kind,
             symlink: item.symlink,
+            link_target: if item.symlink {
+                link_target(&item.path)
+            } else {
+                None
+            },
             expanded: false,
             visible: 1,
             depth,
@@ -633,13 +659,25 @@ impl Index {
         // quadratic in the size of the burst.
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut changed_subtrees = Vec::new();
         for path in &change.paths {
             // A `.git` write is reported to the UI but changes no row: the walk never put
             // anything under `.git` in the tree.
             if filter.is_git_path(path) {
                 continue;
             }
+            // An event naming a known directory can mean replacement at the same physical
+            // name. Reconcile every descendant while retaining unchanged nodes, so all
+            // aliases refresh and the picker is not injected twice.
+            if let Some(&id) = self.by_path.get(path)
+                && matches!(self.nodes[id as usize].kind, TreeRowKind::Dir)
+            {
+                changed_subtrees.push(path.clone());
+            }
             let dir = match self.by_path.get(path) {
+                Some(&id) if self.nodes[id as usize].symlink && !self.root_nodes.contains(&id) => {
+                    path.parent().unwrap_or(path).to_path_buf()
+                }
                 Some(&id) if matches!(self.nodes[id as usize].kind, TreeRowKind::Dir) => {
                     path.clone()
                 }
@@ -655,6 +693,9 @@ impl Index {
         let mut added = Vec::new();
         for dir in dirs {
             added.extend(self.rescan_dir(&dir, filter));
+        }
+        for path in changed_subtrees {
+            added.extend(self.refresh_subtree(&path, filter));
         }
         added
     }
@@ -700,6 +741,15 @@ impl Index {
         if !matches!(self.nodes[node as usize].kind, TreeRowKind::Dir) {
             return Vec::new();
         }
+        let root = self.nodes[node as usize].root;
+        if directory_cycle(dir, &self.roots[root as usize].path) {
+            let children = self.nodes[node as usize].children.clone();
+            for child in children {
+                self.remove_node(child);
+            }
+            return Vec::new();
+        }
+        filter.refresh_rules(dir);
 
         let read = match std::fs::read_dir(dir) {
             Ok(read) => read,
@@ -726,7 +776,7 @@ impl Index {
                 Ok(ft) => ft,
                 Err(_) => continue,
             };
-            let is_dir = meta.is_dir();
+            let is_dir = meta.is_dir() || (meta.is_symlink() && path.is_dir());
             if !filter.admits(&path, is_dir) {
                 continue;
             }
@@ -741,8 +791,27 @@ impl Index {
 
         let mut changed = false;
         let mut added = Vec::new();
+        let mut reopen = HashSet::new();
+        let mut retargeted = Vec::new();
         for (child, name) in &existing {
-            if !on_disk.contains_key(name) {
+            let same = on_disk.get(name).is_some_and(|(_, is_dir, symlink)| {
+                let old = &self.nodes[*child as usize];
+                matches!(old.kind, TreeRowKind::Dir) == *is_dir && old.symlink == *symlink
+            });
+            if same {
+                let (path, is_dir, symlink) = &on_disk[name];
+                let target = if *symlink { link_target(path) } else { None };
+                let old = &mut self.nodes[*child as usize];
+                if old.link_target != target {
+                    old.link_target = target;
+                    if *is_dir {
+                        retargeted.push(path.clone());
+                    }
+                }
+            } else {
+                if self.nodes[*child as usize].expanded {
+                    reopen.insert(name.clone());
+                }
                 changed |= self.remove_node(*child);
             }
         }
@@ -763,17 +832,24 @@ impl Index {
                 is_dir,
                 symlink,
             };
+            let expanded = reopen.contains(&name);
             let child = self.new_child(node, name, &item);
             self.by_path.insert(path.clone(), child);
             added.push(item);
             changed = true;
-            if is_dir && !symlink {
+            if is_dir && !directory_cycle(&path, &self.roots[root as usize].path) {
                 added.extend(self.graft_subtree(&path, root, filter));
+            }
+            if expanded {
+                self.expand(&path);
             }
         }
         if changed {
             self.sort_children(node);
             self.recompute_up(node);
+        }
+        for path in retargeted {
+            added.extend(self.refresh_subtree(&path, filter));
         }
         added
     }
@@ -814,6 +890,7 @@ impl Index {
     /// on whether a directory existed at index time, which is a difference no user could
     /// explain.
     fn graft_subtree(&mut self, path: &Path, root_index: u16, filter: &Filter) -> Vec<WalkItem> {
+        filter.refresh_rules(path);
         let root = Root::new(path);
         let mut entries = Vec::new();
         // The *index's* visibility, not the default: a project showing dotfiles that has just
@@ -822,9 +899,20 @@ impl Index {
             visibility: self.visibility,
             ..BuildOptions::default()
         };
-        walk_root(&root, root_index, false, opts, |batch| {
-            entries.extend_from_slice(batch);
-        });
+        walk_root(
+            &root,
+            &self.roots[root_index as usize].path,
+            root_index,
+            false,
+            opts,
+            true,
+            |batch| {
+                entries.extend_from_slice(batch);
+            },
+        );
+        for item in entries.iter().filter(|item| item.is_dir) {
+            filter.refresh_rules(&item.path);
+        }
         entries.retain(|item| filter.admits(&item.path, item.is_dir));
         // The walk made `rel` relative to the new directory; the picker wants it relative to
         // the project root.
@@ -1050,9 +1138,11 @@ fn name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// The `ignore` walk of one root, batching entries to `on_batch` as they are found.
 fn walk_root(
     root: &Root,
+    boundary: &Path,
     root_index: u16,
     multi: bool,
     opts: BuildOptions,
+    follow_links: bool,
     mut on_batch: impl FnMut(&[WalkItem]),
 ) {
     let mut builder = WalkBuilder::new(&root.path);
@@ -1078,9 +1168,9 @@ fn walk_root(
         // ignore it outside a repo, which surprises anyone who keeps a project in a plain
         // directory.
         .require_git(false)
-        // A symlinked directory is shown as a link and not descended into: following links
-        // is how a walk finds a cycle, and how one project's tree ends up containing another.
-        .follow_links(false)
+        // Keep the logical path while walking the target. `ignore` detects loops within
+        // this walk; the visitor also checks ancestors above an incremental walk's root.
+        .follow_links(follow_links)
         .threads(opts.threads);
 
     // `.git` is pruned here rather than left to `hidden(true)`, because with dotfiles shown
@@ -1094,6 +1184,7 @@ fn walk_root(
 
     let (tx, rx) = mpsc::channel::<Vec<WalkItem>>();
     let root_path = root.path.clone();
+    let boundary = boundary.to_path_buf();
     let label = root.label.clone();
     let batch = opts.batch;
 
@@ -1103,6 +1194,8 @@ fn walk_root(
             let mut visitors = Collector {
                 tx,
                 root: root_path,
+                boundary,
+                visibility,
                 label,
                 root_index,
                 multi,
@@ -1119,6 +1212,8 @@ fn walk_root(
 struct Collector {
     tx: mpsc::Sender<Vec<WalkItem>>,
     root: PathBuf,
+    boundary: PathBuf,
+    visibility: Visibility,
     label: String,
     root_index: u16,
     multi: bool,
@@ -1130,6 +1225,8 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for Collector {
         Box::new(Visitor {
             tx: self.tx.clone(),
             root: self.root.clone(),
+            boundary: self.boundary.clone(),
+            visibility: self.visibility,
             label: self.label.clone(),
             root_index: self.root_index,
             multi: self.multi,
@@ -1142,6 +1239,8 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for Collector {
 struct Visitor {
     tx: mpsc::Sender<Vec<WalkItem>>,
     root: PathBuf,
+    boundary: PathBuf,
+    visibility: Visibility,
     label: String,
     root_index: u16,
     multi: bool,
@@ -1161,7 +1260,11 @@ impl Visitor {
     }
 
     fn item(&self, entry: &DirEntry) -> Option<WalkItem> {
-        let path = entry.path();
+        let file_type = entry.file_type()?;
+        self.path_item(entry.path(), file_type.is_dir(), entry.path_is_symlink())
+    }
+
+    fn path_item(&self, path: &Path, is_dir: bool, symlink: bool) -> Option<WalkItem> {
         // Non-UTF-8 names are dropped rather than lossily converted. A row's path is the
         // identifier the frontend hands back to `fs.expand`, and `to_string_lossy` produces
         // a path that no longer names the file.
@@ -1176,13 +1279,12 @@ impl Visitor {
         } else {
             rel.to_string()
         };
-        let file_type = entry.file_type()?;
         Some(WalkItem {
             path: path.to_path_buf(),
             rel,
             root: self.root_index,
-            is_dir: file_type.is_dir(),
-            symlink: file_type.is_symlink(),
+            is_dir,
+            symlink,
         })
     }
 }
@@ -1191,21 +1293,82 @@ impl ignore::ParallelVisitor for Visitor {
     fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
         match entry {
             Ok(entry) => {
+                let cycle = entry.file_type().is_some_and(|t| t.is_dir())
+                    && directory_cycle(entry.path(), &self.boundary);
                 if let Some(item) = self.item(&entry) {
                     self.buf.push(item);
                     if self.buf.len() >= self.batch {
                         self.flush();
                     }
                 }
-                WalkState::Continue
+                if cycle {
+                    WalkState::Skip
+                } else {
+                    WalkState::Continue
+                }
             }
             Err(err) => {
+                // Following a dangling link or an ancestor loop produces an error before
+                // the walker yields its entry. Keep the link itself, subject to the same
+                // ignore rules (the walk checks those only after resolving a link).
+                if let Some(path) = error_path(&err)
+                    && path.is_symlink()
+                {
+                    let is_dir = path.is_dir();
+                    let dirs: Vec<_> = path
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|p| p.starts_with(&self.boundary))
+                        .collect();
+                    let filter =
+                        Filter::build(std::slice::from_ref(&self.boundary), dirs, self.visibility);
+                    if filter.admits(path, is_dir)
+                        && let Some(item) = self.path_item(path, is_dir, true)
+                    {
+                        self.buf.push(item);
+                        if self.buf.len() >= self.batch {
+                            self.flush();
+                        }
+                    }
+                }
                 // A permission error on one directory is not a reason to abandon the walk;
                 // an unreadable `node_modules` should cost that subtree and nothing else.
                 tracing::debug!(%err, "skipping an unreadable entry");
                 WalkState::Continue
             }
         }
+    }
+}
+
+fn link_target(path: &Path) -> Option<PathBuf> {
+    path.is_symlink()
+        .then(|| std::fs::canonicalize(path).ok())
+        .flatten()
+}
+
+/// A branch may contain aliases of the same target, but never an alias of its own ancestor.
+/// `boundary` keeps a link to an external parent browsable until the walk actually repeats.
+pub(crate) fn directory_cycle(path: &Path, boundary: &Path) -> bool {
+    if path == boundary {
+        return false;
+    }
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    path.ancestors()
+        .skip(1)
+        .take_while(|p| p.starts_with(boundary))
+        .any(|parent| std::fs::canonicalize(parent).is_ok_and(|real| real == target))
+}
+
+fn error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        _ => None,
     }
 }
 

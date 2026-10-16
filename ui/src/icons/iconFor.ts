@@ -47,6 +47,8 @@ export interface IconRow {
   readonly kind: 'dir' | 'file' | 'group' | 'note' | 'pin'
   /** Directories only. Absent or false draws the closed folder. */
   readonly expanded?: boolean | undefined
+  /** The entry itself is a symbolic link; its target still decides the base icon. */
+  readonly symlink?: boolean | undefined
 }
 
 /** What an unmatched file gets. Upstream's `fileIcons.defaultIcon`. */

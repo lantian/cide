@@ -4,8 +4,8 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { JSDOM } from 'jsdom'
 import React, { act } from 'react'
 
@@ -51,12 +51,20 @@ export async function checkPaneActionEvents() {
 
   let root
   try {
+    // One bundle keeps the real workspace/attention stores shared with the mounted frame.
+    const entry = join(out, 'audit.ts')
+    writeFileSync(entry, [
+      `export { PaneFrame } from ${JSON.stringify(resolve('src/layout/PaneTitleBar.tsx'))}`,
+      `export { useWorkspace } from ${JSON.stringify(resolve('src/store/workspace.ts'))}`,
+      `export { useAwaitingInTab, useAwaitingInProject } from ${JSON.stringify(resolve('src/panes/awaiting.ts'))}`,
+    ].join('\n'))
     execFileSync('node', [
       'node_modules/vite/bin/vite.js', 'build',
-      '--ssr', 'src/layout/PaneTitleBar.tsx',
-      '--outDir', out, '--logLevel', 'error',
+      '--ssr', entry,
+      '--outDir', join(out, 'bundle'), '--logLevel', 'error',
     ], { stdio: 'inherit' })
-    const { PaneFrame } = await import(`file://${resolve(out, 'PaneTitleBar.js')}`)
+    const { PaneFrame, useWorkspace, useAwaitingInTab, useAwaitingInProject } =
+      await import(`file://${resolve(out, 'bundle/audit.js')}`)
     const { createRoot } = await import('react-dom/client')
     root = createRoot(document.getElementById('root'))
     let mountId = 0
@@ -190,6 +198,73 @@ export async function checkPaneActionEvents() {
       assert.equal(waiting(), true, `${name} window control never acknowledges`)
     }
     assert.equal(acknowledgements().length, 0)
+
+    // A paired reviewer's raw prompt/permission states are still delivered, but only its
+    // writer can raise Waiting, tab/project counts or a true report to desktop attention.
+    dom.reconfigure({ url: 'https://cide.test' })
+    const writer = { ...pane, id: 'writer-pane', session: 'writer' }
+    let reviewer = { ...pane, id: 'reviewer-pane', session: 'reviewer' }
+    const makeProject = () => ({
+      tabs: [{
+        id: 'pair', peerChat: { main: writer.id, peer: reviewer.id, paused: true },
+        tree: { panes: { [writer.id]: writer, [reviewer.id]: reviewer } },
+      }],
+      detached: {},
+    })
+    let project = makeProject()
+    const snapshot = () => useWorkspace.setState({
+      boot: { workspace: { settings: {}, projects: { project } } },
+    })
+    const Counts = () => React.createElement('output', { id: 'attention-counts' },
+      `${useAwaitingInTab(project.tabs[0])}/${useAwaitingInProject(project)}`)
+    const renderPair = () => root.render(React.createElement(React.Fragment, null,
+      ...[writer, reviewer].map((pane) => React.createElement(PaneFrame, {
+        key: pane.id, pane, index: 1, focused: false, maximized: false,
+        onFocus() {}, onAddTile() {}, onMaximize() {}, onDetach() {}, onClose() {},
+      })), React.createElement(Counts)))
+    const frames = () => [...document.querySelectorAll('[data-audit="pane"]')]
+    const assertPair = (writerWaiting) => {
+      assert.deepEqual(frames().map((f) => f.dataset.awaiting === 'true'), [writerWaiting, false])
+      assert.equal(frames()[1].querySelector('[data-tone="accent"]'), null,
+        'the reviewer never renders the Waiting badge')
+      assert.equal(frames()[1].querySelector('[aria-label="This session is waiting for you"]'), null,
+        'the reviewer never raises the notification dot')
+      assert.equal(document.getElementById('attention-counts').textContent,
+        writerWaiting ? '1/1' : '0/0', 'tab/project counts include only the writer')
+      assert.equal(calls.some(([name, args]) => name === 'acknowledge' &&
+        args.session === reviewer.session && args.awaiting), false,
+      'no reviewer attention notification is sent to Rust')
+    }
+    const emitState = (session, state) => listeners.get('cide://session-state')({
+      payload: { session, state: { state } },
+    })
+    await act(async () => { snapshot(); renderPair() })
+    calls.length = 0
+    for (const phase of ['awaitingInput', 'awaitingPermission']) {
+      await act(async () => { emitState(writer.session, 'busy'); emitState(reviewer.session, 'busy') })
+      assertPair(false)
+      await act(async () => emitState(reviewer.session, phase))
+      assertPair(false)
+      await act(async () => emitState(writer.session, phase))
+      assertPair(true)
+      assert.ok(calls.some(([name, args]) => name === 'acknowledge' &&
+        args.session === writer.session && args.awaiting), 'writer still reports attention')
+    }
+    // A stale broadcast from another window is filtered before any surface reads it.
+    await act(async () => listeners.get('cide://session-awaiting')({
+      payload: { sessions: [writer.session, reviewer.session] },
+    }))
+    assertPair(true)
+    // State can outrun a workspace snapshot during restore/rebind. Binding must clear the
+    // stale marker immediately, without waiting for another state from the reviewer.
+    await act(async () => emitState('restored-reviewer', 'awaitingInput'))
+    reviewer = { ...reviewer, session: 'restored-reviewer' }
+    project = makeProject()
+    calls.length = 0
+    await act(async () => { snapshot(); renderPair() })
+    assertPair(true)
+    assert.ok(calls.some(([name, args]) => name === 'acknowledge' &&
+      args.session === reviewer.session && !args.awaiting), 'late binding withdraws stale attention')
   } finally {
     if (root) await act(async () => root.unmount())
     dom.window.close()

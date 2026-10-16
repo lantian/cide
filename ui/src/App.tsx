@@ -1318,6 +1318,18 @@ export function App() {
    * tree still on screen, which is the stale-`activeProject` bug the ref above exists to stop.
    */
   const pendingCommand = useRef<{ project: string; command: string; args: unknown } | null>(null)
+  // IDE file navigation targets one window; jumpTo also works before its editor mounts.
+  useEffect(() => {
+    const off = events.onEditorReveal(({ project, path, startLine, endLine }) => {
+      if (startLine === null) return
+      jumpTo(project, {
+        path, line: startLine, column: 1,
+        ...(endLine === null ? {} : { endLine, endColumn: Number.MAX_SAFE_INTEGER }),
+        focus: true, align: 'center',
+      })
+    })
+    return () => { void off.then((stop) => stop()) }
+  }, [])
   useEffect(() => {
     const off = events.onCommandRequested((request) => {
       if (request.project === activeProjectId) {

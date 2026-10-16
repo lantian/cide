@@ -28,6 +28,7 @@
  */
 import { iconFor, themed, type IconRow, type IconTheme } from './iconFor'
 import styles from './FileIcon.module.css'
+import { Icon } from './Icon'
 
 /**
  * `./icons/<stem>.svg`.
@@ -70,9 +71,9 @@ export interface FileIconProps {
 }
 
 export function FileIcon({ row, theme, className, stem }: FileIconProps) {
-  return (
+  const icon = (
     <img
-      className={className === undefined ? styles.icon : `${styles.icon} ${className}`}
+      className={className === undefined || row.symlink ? styles.icon : `${styles.icon} ${className}`}
       src={iconUrl(stem === undefined ? iconFor(row, theme) : themed(stem, theme))}
       /*
        * Decorative. The row already carries the filename as text and the git status as an
@@ -92,4 +93,14 @@ export function FileIcon({ row, theme, className, stem }: FileIconProps) {
       draggable={false}
     />
   )
+  return row.symlink ? (
+    <span
+      className={className === undefined ? styles.linked : `${styles.linked} ${className}`}
+      aria-hidden="true"
+      data-symlink="true"
+    >
+      {icon}
+      <Icon name="link" size={0} className={styles.linkBadge} />
+    </span>
+  ) : icon
 }

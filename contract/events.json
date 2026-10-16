@@ -6,6 +6,7 @@
   "cide://command-requested",
   "cide://diagnostics",
   "cide://docker-changed",
+  "cide://editor-reveal",
   "cide://ext-changed",
   "cide://fs-changed",
   "cide://fs-clip-changed",

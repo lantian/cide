@@ -276,6 +276,13 @@ both the OpenSpec panel and the change tab.
 
 **Touches:** the file tree, fs ops
 
+Directory links: `cargo test --locked -p cide-fs -p cide-search`,
+`cargo test --locked -p cide-app --lib cmd::fs::`, and `check:symlinks`. These cover logical
+paths, ancestor loops, retargeted ignore rules, dangling-target recovery, all watcher modes,
+multiple aliases, copying into a linked descendant, editor saves and the rendered link badge.
+Use a writable temporary `XDG_STATE_HOME` for command-layer checks: the scratch and notes
+cases create state files as well as their project fixtures.
+
 `check:tree-status`, `check:tree-flicker`, `check:fs-clipboard`, `check:new-entry`, plus `check:scratch` and `check:excalidraw` for the context menu's **New ▸** submenu — whose rows are `SCRATCH_TYPES`, the *New scratch file…* picker's list, so an extension's languages appear there and a literal array would be the second copy that silently stops growing. Picking one **seeds** the name box with `.rs` and puts the caret in front of it, and three things about that are silent: `checkName` takes the seed as a fourth argument so Enter on a bare `.rs` refuses down the same road as Enter on an empty box (in the pure module, because `check:new-entry` can drive it and a branch in a `useCallback` could only be grepped for) — `draftSeed` must therefore be in `commitDraft`'s dep array, and there is no `exhaustive-deps` lint here to say so; "untouched" is measured against the seed, or the box greets *New ▸ Rust* with the dot-file note; and `setSelectionRange(0, 0)` is what stops `parser` typed into `.rs` spelling `.rsparser`, which is a legal filename nothing refuses
 
 ### The properties card
@@ -784,7 +791,10 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 - **Codex `/clear` can precede the replacement thread's first hook.** Keep `Pane::codex_cleared` distinct from a missing identity, invalidate registry and continuation fallbacks, and reject late hooks from cleared threads. A live submitted command plus reset output is required; redraws and transcript mentions are insufficient. Run `cargo test --locked -p cide-pty --lib`, `cargo test --locked -p cide-app --lib -- hooks cmd::pane lifecycle cmd::session`, and `check:restore`. The free installed-CLI proof is `cargo test --locked -p cide-pty --test real_codex_clear -- --ignored`; it isolates Codex's home and submits no model prompt.
 - **Peer delivery must survive chunk boundaries and numeric wraps.** A trailing chunk space disappears from terminal captures when its witness is removed too early; UUID witnesses can wrap onto a line beginning with a digit. Run `cargo test --locked -p cide-core peer_composer`, the quota-free installed-Codex proof `cargo test --locked -p cide-app --test real_peer_composer -- --ignored`, and `cargo test --locked -p cide-app --lib opencode_console::peer_tests`. `python3 scripts/audit-opencode-peer-tools.py` uses isolated OpenCode and a local fake model to verify external read/glob, reply execution, and hidden mutation tools. Real CLI audits use temporary state and no paid endpoints; the OpenCode audit needs local socket access.
 - **A busy peer must not pause both directions.** Readiness waits keep a bounded queue pending, without holding the manual-input gate. User pause, close and session replacement cancel the wait. Run `cargo test --locked -p cide-app --lib peer_chat`. Its free wall-clock regression, `cargo test --locked -p cide-app --lib a_busy_receiver_can_take_longer_than_forty_seconds -- --ignored`, really waits 41 seconds and submits no prompts.
+- **Only the paired writer asks for user attention.** Run `check:awaiting`, `check:peer-chat`, `cargo test --locked -p cide-core --lib peer_chat` and `cargo test --locked -p cide-app --lib -- cmd::window peer_chat`. The mounted-pane check drives completion and permission states, stale attention broadcasts and late reviewer bindings through the real workspace/attention stores. The reviewer must show neither Waiting nor its dot, contribute no tab/project count and send no true attention report. The backend report gate also excludes the reviewer from desktop and remote attention. Keep raw session states intact: peer delivery and native permission controls still need them. Writer and ordinary-session notifications continue normally; reviewer identity must survive workspace serialization.
 - **Paired Codex delivery uses the native protocol.** Run `cargo test --locked -p cide-agents --lib harness::codex_console`, `cargo test --locked -p cide-app --lib codex_console` and the quota-free installed-CLI audit `cargo test --locked -p cide-app --lib codex_console::tests::real_codex_native -- --ignored`. The forwarder preserves native approvals, checks cancellation before writing and distinguishes rejection from an unconfirmed submission. Bootstrap clients and ephemeral structured-output helpers cannot replace the visible conversation. Remote resume carries the effective permission policy through native thread requests because the CLI rejects permission overrides there. The installed audit checks fresh delivery, long Unicode messages, busy gating, drafts, saved-thread discovery, resume without replay, `/new`, stale-reply rejection and server/credential cleanup using a temporary home and local fake provider. Socket tests need local network access.
+- **Read-only reviewers still need analysis and web tools.** Run `cargo test --locked -p cide-core peer_chat`, `cargo test --locked -p cide-app --lib opencode_console::peer_tests`, and the installed-harness audit `cargo test --locked -p cide-core --test real_peer_reviewer -- --ignored --nocapture`. The audit supplies production policy to real CLIs using fake local models. Verify scratch scripts execute, source/Git writes remain blocked by Codex, URL fetching works, and native search tools are exposed. Claude/OpenCode shell restrictions are instructions, while dedicated edits/delegation remain denied. Restored reviewers must receive fresh scratch paths and current instructions; Claude's system-prompt snapshot must be disabled. No paid model endpoints are used; public URL checks require internet access.
+- **An exposed search tool may still wait on setup.** OpenCode 2's first-use provider form can cancel or expire as `Web search cancelled`. Paired reviewers select the native automatic keyless pool invocation-locally. The OpenCode audit cancels the old first-use form to reproduce the report, then actually invokes websearch using the production pool setting and requires a native search response without a form. It removes provider keys and isolates native state; it does not spend paid model quota or save the provider choice globally. Run `cargo test --locked -p cide-core --test real_peer_reviewer real_opencode -- --ignored --nocapture` with internet/local socket access.
 - **Startup hooks can precede pane binding.** Keep their latest thread in the session registry and replay it inside the binding's workspace update, after stamping the harness. Resuming a continued pane prefers its latest conversation, falling back to the continuation's thread; cide's routing id never names a Codex thread. Missing identities wait for a session-picker choice. Run `check:restore` (launch decisions, rendered labels and both recovery buttons), `cargo test -p cide-app -- cmd::pane lifecycle hooks cmd::session`, and `cargo test -p cide-core -- workspace codex_cli persist`.
 - **The trust bypass travels with the hook table and only with it.** Drop `--dangerously-bypass-hook-trust` and codex silently ignores every hook: no state, no thread, and a typed line that waits for a readiness it never hears.
 - **The MCP server's environment is spelled into `mcp_servers.cide.env.*`.** Codex whitelists a server's environment, so `CIDE_SESSION` in the process environment alone leaves the bridge scoped to nothing.
@@ -946,3 +956,24 @@ restoration (including StrictMode), and the task-attachment adapter's external-o
 verifying that Escape closes only the viewer and preserves selections, drafts and source focus.
 When changing viewport behavior, check wheel zoom and dragging in a real browser using a tall
 image, then resize to a narrow viewport; DOM-only checks cannot verify actual image layout.
+
+### OpenCode IDE tools
+
+OpenCode uses the existing `cide-hook mcp` bridge for the five IDE tools. Keep descriptors,
+results, diff ownership and cancellation in `cide-ide-mcp`; do not duplicate the tools in
+the OpenCode adapter. Native editor discovery must read the lockfile token: both
+`CLAUDE_CODE_SSE_PORT` and `OPENCODE_EDITOR_SSE_PORT` are removed from OpenCode launches.
+OpenCode v2 needs `mcp.servers.cide.timeout.execution`, not v1's numeric `timeout`.
+
+Run `cargo test --locked -p cide-ide-mcp --lib`, the `agent_rpc`, `cmd::file`, `cmd::session`
+and `opencode_console` filters in `cide-app --lib`, and the `opencode_cli` and
+`harness::opencode::` filters in `cide-core` and `cide-agents`. UI checks are `check:editor`,
+`check:diff-render`, `check:boundary`, `check:commands` and `typecheck`.
+
+The installed-OpenCode proof is `cargo build --locked -p cide-hook`, then
+`cargo test --locked -p cide-ide-mcp real_opencode -- --ignored --nocapture`.
+It needs local sockets and a PTY. It uses temporary HOME/XDG directories, the real bridge,
+shared tool handlers and a local fake model. Both Code Mode and direct tools must invoke
+all five tools, preserve unsaved editor context without submitting on paste, and run for
+30 seconds per mode with an authenticated native connection and no authorization rejection.
+The desktop event consumer is a stand-in; this audit does not exercise a live Tauri window.

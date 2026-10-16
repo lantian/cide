@@ -22,6 +22,38 @@ use tauri::{AppHandle, Emitter, Manager};
 /// Sent after every accepted mutation, to every window.
 pub const WORKSPACE_CHANGED: &str = "cide://workspace-changed";
 
+pub const EDITOR_REVEAL: &str = "cide://editor-reveal";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorReveal<'a> {
+    window: &'a str,
+    project: cide_ipc::ProjectId,
+    path: &'a str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+}
+
+pub fn editor_reveal(
+    app: &AppHandle,
+    window: &cide_ipc::WindowLabel,
+    project: cide_ipc::ProjectId,
+    path: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) {
+    let payload = EditorReveal {
+        window: &window.0,
+        project,
+        path,
+        start_line,
+        end_line,
+    };
+    if let Err(error) = app.emit_to(window.0.as_str(), EDITOR_REVEAL, payload) {
+        tracing::debug!(%error, "editor-reveal reached no window");
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceChanged {

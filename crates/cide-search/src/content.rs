@@ -458,7 +458,7 @@ impl Search<'_> {
             .ignore(true)
             .parents(false)
             .require_git(false)
-            .follow_links(false)
+            .follow_links(true)
             .threads(self.limits.threads);
 
         // The filename globs, anchored at this root. Whitelist-only globs deliberately do not
@@ -638,6 +638,20 @@ impl ignore::ParallelVisitor for Visitor<'_, '_> {
         }
         match entry {
             Ok(entry) => {
+                // Match the file index's branch-local loop guard. A link to an outer
+                // parent can reach an ancestor again through an ordinary directory entry,
+                // which `ignore`'s symlink-only check does not prune at that entry.
+                if entry.file_type().is_some_and(|t| t.is_dir())
+                    && let Ok(real) = std::fs::canonicalize(entry.path())
+                    && entry
+                        .path()
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|p| p.starts_with(&self.root.path))
+                        .any(|p| std::fs::canonicalize(p).is_ok_and(|ancestor| ancestor == real))
+                {
+                    return WalkState::Skip;
+                }
                 // A directory the shared filter rejects is not descended into. `ignore` has
                 // already applied `.gitignore`, so this only bites where the filter is
                 // stricter — and pruning is the difference between skipping a `target/` and

@@ -52,7 +52,7 @@
 //! carried to the UI, because a 30-second poll interval is a real behaviour change and the
 //! fix (`sysctl fs.inotify.max_user_watches`) is one the user can act on.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +79,8 @@ pub struct WatchConfig {
     pub roots: Vec<PathBuf>,
     /// Every non-ignored directory, from the walk.
     pub dirs: Vec<PathBuf>,
+    /// Visible, watchable links, including dangling ones whose target may appear later.
+    pub links: Vec<PathBuf>,
     /// How long `notify-debouncer-full` holds a single path.
     pub debounce: Duration,
     /// How long the whole tree must be quiet before a burst is released.
@@ -105,6 +107,7 @@ impl Default for WatchConfig {
         Self {
             roots: Vec::new(),
             dirs: Vec::new(),
+            links: Vec::new(),
             debounce: Duration::from_millis(300),
             quiet: Duration::from_millis(300),
             max_wait: Duration::from_secs(2),
@@ -195,45 +198,38 @@ fn run(
                     ) {
                         continue;
                     }
-                    for path in &event.paths {
-                        let is_dir = path.is_dir();
-                        // `watchable`, not `admits`: with *show ignored files* on, the tree
-                        // contains `target/` and this loop still must not. See the note at the
-                        // top of `crate::filter` — one event per object file a build writes is
-                        // exactly the storm the two layers of coalescing below exist to
-                        // prevent, and the cheapest place to stop it is before it is queued.
-                        if !filter.watchable(path, is_dir) {
-                            continue;
-                        }
-                        // A directory that has just appeared needs its own watch, and so do
-                        // the directories under it: a `git clone` or a `mkdir -p a/b/c`
-                        // creates the whole tree before we hear about the top of it.
-                        if is_dir && backend.per_directory && !backend.watched.contains(path) {
-                            // A path that *asked* for recursion gets it here too, and not only
-                            // at startup. Both non-git watched paths are listed before they
-                            // exist — that is how their arrival becomes an event — so the one
-                            // that needs recursion is exactly the one most likely to be created
-                            // mid-session. Falling back to `watch_tree` left it walking a tree
-                            // an agent was still writing, and everything below the first new
-                            // directory went unseen until the next launch.
-                            if filter.is_recursive_watch(path) {
-                                if let Err(err) = backend.watch(path, RecursiveMode::Recursive) {
-                                    tracing::debug!(
-                                        path = %path.display(),
-                                        kind = ?err.kind,
-                                        "could not take the recursive watch this path asked for"
-                                    );
-                                    backend.watch_tree(path, &filter);
-                                }
-                            } else {
-                                backend.watch_tree(path, &filter);
+                    for physical in &event.paths {
+                        // Deleted entries cannot be canonicalized. Resolve against the stored
+                        // directory map first, then filter each logical alias independently.
+                        for path in backend.aliases.paths(physical) {
+                            let is_dir = path.is_dir();
+                            if !filter.watchable(&path, is_dir) {
+                                continue;
                             }
+                            let known = backend.aliases.directories.contains(&path);
+                            let linked =
+                                backend.aliases.links.contains_key(&path) || path.is_symlink();
+                            let replaced = matches!(
+                                event.kind,
+                                notify::EventKind::Create(_)
+                                    | notify::EventKind::Remove(_)
+                                    | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            );
+                            if linked || (known && replaced) {
+                                backend.refresh_directory(&path, &filter);
+                            } else if is_dir && !known {
+                                if filter.is_recursive_watch(&path) {
+                                    if let Err(err) = backend.watch(&path, RecursiveMode::Recursive)
+                                    {
+                                        tracing::debug!(path = %path.display(), %err, "could not take a recursive watch");
+                                        backend.watch_tree(&path, &filter);
+                                    }
+                                } else {
+                                    backend.watch_tree(&path, &filter);
+                                }
+                            }
+                            coalescer.push(path.clone(), filter.is_git_path(&path));
                         }
-                        // `is_git_path`, not `is_watched_path`: the flag becomes
-                        // `FsChange::git`, which is what makes the branch readout and the
-                        // git panel re-read. `.cide/` is on the same watch list and must
-                        // not raise it — a task write is not a commit.
-                        coalescer.push(path.clone(), filter.is_git_path(path));
                     }
                 }
             }
@@ -250,7 +246,10 @@ fn run(
                     // The old backend is dropped by the assignment, releasing the descriptors
                     // it did manage to take. A `PollWatcher` needs none of them, so the two
                     // being briefly alive together costs nothing.
-                    (backend, status) = Backend::start_polling(&config, tx.clone(), reason);
+                    let mut fallback = config.clone();
+                    fallback.dirs = backend.aliases.directories.iter().cloned().collect();
+                    fallback.links = backend.aliases.links.keys().cloned().collect();
+                    (backend, status) = Backend::start_polling(&fallback, tx.clone(), reason);
                     sink(WatchEvent::Status(status.clone()));
                 }
             }
@@ -298,6 +297,123 @@ struct Backend {
     /// False when the roots are watched recursively, in which case a new directory is
     /// already covered.
     per_directory: bool,
+    /// Kernel watches name physical directories. One inode can have many project paths;
+    /// inotify otherwise remembers only the last alias registered for that inode.
+    aliases: DirectoryAliases,
+    recursive: HashSet<PathBuf>,
+    guards: HashSet<PathBuf>,
+}
+
+/// Resolve as much of a dangling link's destination as exists, so its parent can be watched.
+fn link_destination(path: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(path).ok()?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        std::fs::canonicalize(path.parent()?).ok()?.join(target)
+    };
+    let mut parent = target.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(parent) {
+            for part in missing.iter().rev() {
+                real.push(part);
+            }
+            return Some(real);
+        }
+        let Some(name) = parent.file_name() else {
+            return Some(target);
+        };
+        missing.push(name.to_os_string());
+        parent = parent.parent()?;
+    }
+}
+
+#[derive(Default)]
+struct DirectoryAliases {
+    logical: HashMap<PathBuf, PathBuf>,
+    physical: HashMap<PathBuf, BTreeSet<PathBuf>>,
+    links: HashMap<PathBuf, PathBuf>,
+    directories: HashSet<PathBuf>,
+}
+
+impl DirectoryAliases {
+    fn insert(&mut self, path: &Path, real: &Path) {
+        if let Some(old) = self.logical.insert(path.to_path_buf(), real.to_path_buf())
+            && old != real
+            && let Some(paths) = self.physical.get_mut(&old)
+        {
+            paths.remove(path);
+            if paths.is_empty() {
+                self.physical.remove(&old);
+            }
+        }
+        self.physical
+            .entry(real.to_path_buf())
+            .or_default()
+            .insert(path.to_path_buf());
+        if path.is_symlink() {
+            self.links.insert(path.to_path_buf(), real.to_path_buf());
+        } else {
+            self.links.remove(path);
+        }
+        if path.is_dir() {
+            self.directories.insert(path.to_path_buf());
+        } else {
+            self.directories.remove(path);
+        }
+    }
+
+    fn paths(&self, path: &Path) -> Vec<PathBuf> {
+        let mut paths = BTreeSet::new();
+        for parent in path.ancestors() {
+            if let Some(aliases) = self.physical.get(parent) {
+                let suffix = path.strip_prefix(parent).expect("an ancestor is a prefix");
+                paths.extend(aliases.iter().map(|alias| {
+                    if suffix.as_os_str().is_empty() {
+                        alias.clone()
+                    } else {
+                        alias.join(suffix)
+                    }
+                }));
+            }
+        }
+        // A missing intermediate target directory may have appeared. Wake its link so
+        // the parent watch can move closer to the target.
+        paths.extend(
+            self.links
+                .iter()
+                .filter(|(_, target)| target.starts_with(path))
+                .map(|(link, _)| link.clone()),
+        );
+        if paths.is_empty() {
+            paths.insert(path.to_path_buf());
+        }
+        paths.into_iter().collect()
+    }
+
+    fn remove_tree(&mut self, path: &Path) -> Vec<PathBuf> {
+        let removed: Vec<_> = self
+            .logical
+            .keys()
+            .filter(|p| p.starts_with(path))
+            .cloned()
+            .collect();
+        let mut unused = Vec::new();
+        for logical in removed {
+            let real = self.logical.remove(&logical).expect("collected above");
+            self.links.remove(&logical);
+            self.directories.remove(&logical);
+            if let Some(aliases) = self.physical.get_mut(&real) {
+                aliases.remove(&logical);
+                if aliases.is_empty() {
+                    self.physical.remove(&real);
+                    unused.push(real);
+                }
+            }
+        }
+        unused
+    }
 }
 
 impl Backend {
@@ -320,7 +436,7 @@ impl Backend {
             None,
             tx.clone(),
             RecommendedCache::new(),
-            notify::Config::default(),
+            notify::Config::default().with_follow_symlinks(false),
         ) {
             Ok(d) => d,
             Err(err) => {
@@ -333,7 +449,12 @@ impl Backend {
             inner: Inner::Native(debouncer),
             watched: HashSet::new(),
             per_directory,
+            aliases: DirectoryAliases::default(),
+            recursive: HashSet::new(),
+            guards: HashSet::new(),
         };
+
+        backend.seed_aliases(config);
 
         let targets: Vec<(PathBuf, RecursiveMode)> = if per_directory {
             config
@@ -378,6 +499,17 @@ impl Backend {
                 .collect()
         };
 
+        let mut targets = targets;
+        targets.extend(backend.aliases.links.keys().cloned().map(|p| {
+            (
+                p,
+                if per_directory {
+                    RecursiveMode::NonRecursive
+                } else {
+                    RecursiveMode::Recursive
+                },
+            )
+        }));
         for (path, mode) in targets {
             if let Err(err) = backend.watch(&path, mode) {
                 if matches!(err.kind, ErrorKind::MaxFilesWatch) {
@@ -408,6 +540,7 @@ impl Backend {
         // on the large repositories that are the reason we are here at all.
         let notify_config = notify::Config::default()
             .with_poll_interval(config.poll_interval)
+            .with_follow_symlinks(false)
             .with_compare_contents(false);
         let debouncer = new_debouncer_opt::<_, notify::PollWatcher, RecommendedCache>(
             config.debounce,
@@ -422,10 +555,22 @@ impl Backend {
             inner: Inner::Polling(debouncer),
             watched: HashSet::new(),
             per_directory: false,
+            aliases: DirectoryAliases::default(),
+            recursive: HashSet::new(),
+            guards: HashSet::new(),
         };
+        // Polling must cover external targets as well as the project's physical roots.
+        // The same alias map translates events in both backends.
+        backend.seed_aliases(config);
         for root in &config.roots {
             if let Err(err) = backend.watch(root, RecursiveMode::Recursive) {
                 tracing::warn!(path = %root.display(), kind = ?err.kind, "could not poll-watch a root");
+            }
+        }
+        let links: Vec<_> = backend.aliases.links.keys().cloned().collect();
+        for link in links {
+            if let Err(err) = backend.watch(&link, RecursiveMode::Recursive) {
+                tracing::debug!(path = %link.display(), %err, "could not poll-watch a link target");
             }
         }
         let status = WatchStatus {
@@ -441,12 +586,119 @@ impl Backend {
     }
 
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        let real = std::fs::canonicalize(path)
+            .map_err(|e| notify::Error::io(e).add_path(path.to_path_buf()))?;
+        self.aliases.insert(path, &real);
+        let mode = if path.is_dir() {
+            mode
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        self.watch_real(&real, mode)
+    }
+
+    fn watch_real(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        if self.recursive.iter().any(|root| path.starts_with(root))
+            || (mode == RecursiveMode::NonRecursive && self.watched.contains(path))
+        {
+            return Ok(());
+        }
         match &mut self.inner {
             Inner::Native(d) => d.watch(path, mode)?,
             Inner::Polling(d) => d.watch(path, mode)?,
         }
         self.watched.insert(path.to_path_buf());
+        if mode == RecursiveMode::Recursive {
+            self.recursive.insert(path.to_path_buf());
+        }
         Ok(())
+    }
+
+    fn seed_aliases(&mut self, config: &WatchConfig) {
+        for path in config.dirs.iter().chain(&config.links) {
+            if config
+                .roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .is_some_and(|root| crate::index::directory_cycle(path, root))
+            {
+                continue;
+            }
+            if let Some(real) = std::fs::canonicalize(path)
+                .ok()
+                .or_else(|| link_destination(path))
+            {
+                self.aliases.insert(path, &real);
+            }
+        }
+        self.sync_guards();
+    }
+
+    fn sync_guards(&mut self) {
+        // Target parents report deletion and recreation of the target itself. Release
+        // parents no longer needed after a link is removed or retargeted.
+        let parents: HashSet<_> = self
+            .aliases
+            .links
+            .values()
+            .filter_map(|p| {
+                p.ancestors()
+                    .skip(1)
+                    .find(|parent| parent.is_dir())
+                    .map(Path::to_path_buf)
+            })
+            .collect();
+        let unused: Vec<_> = self.guards.difference(&parents).cloned().collect();
+        for parent in unused {
+            if !self.aliases.physical.contains_key(&parent) {
+                self.unwatch_real(&parent);
+            }
+        }
+        for parent in &parents {
+            let _ = self.watch_real(parent, RecursiveMode::NonRecursive);
+        }
+        self.guards = parents;
+    }
+
+    fn unwatch_real(&mut self, path: &Path) {
+        // A recursive backend also has internal child watches. Removing one we did not
+        // register would leave it blind while `recursive` still says its parent covers it.
+        if !self.watched.remove(path) {
+            return;
+        }
+        match &mut self.inner {
+            Inner::Native(d) => {
+                let _ = d.unwatch(path);
+            }
+            Inner::Polling(d) => {
+                let _ = d.unwatch(path);
+            }
+        }
+        self.recursive.remove(path);
+    }
+
+    fn refresh_directory(&mut self, path: &Path, filter: &Filter) {
+        let previous = self.aliases.links.get(path).cloned();
+        for unused in self.aliases.remove_tree(path) {
+            if !self.guards.contains(&unused) {
+                self.unwatch_real(&unused);
+            }
+        }
+        if path.is_dir() || path.is_file() {
+            // A target at the same physical name may now be a different inode.
+            if let Ok(real) = std::fs::canonicalize(path) {
+                self.unwatch_real(&real);
+            }
+            self.watch_tree(path, filter);
+        } else if path.is_symlink()
+            && let Some(real) = link_destination(path).or(previous)
+        {
+            // Keep the binding while the target is absent, so its parent's create event
+            // can restore the branch without requiring a project re-index.
+            self.aliases.insert(path, &real);
+        }
+        self.sync_guards();
     }
 
     /// Watch a newly created directory and everything non-ignored under it.
@@ -456,10 +708,19 @@ impl Backend {
     fn watch_tree(&mut self, path: &Path, filter: &Filter) {
         let mut stack = vec![path.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            if self.watched.contains(&dir) {
+            if filter
+                .root_of(&dir)
+                .is_some_and(|root| crate::index::directory_cycle(&dir, root))
+            {
                 continue;
             }
-            if let Err(err) = self.watch(&dir, RecursiveMode::NonRecursive) {
+            filter.refresh_rules(&dir);
+            let mode = if self.per_directory {
+                RecursiveMode::NonRecursive
+            } else {
+                RecursiveMode::Recursive
+            };
+            if let Err(err) = self.watch(&dir, mode) {
                 tracing::debug!(path = %dir.display(), kind = ?err.kind, "could not watch a new directory");
                 continue;
             }
@@ -474,11 +735,12 @@ impl Backend {
                 // `Filter::classify` refuses `crate::filter::GIT_NEVER` before it consults the
                 // watched list, so no entry on that list, present or future, can turn this
                 // descent loose on a 256-way object fanout.
-                if entry.file_type().is_ok_and(|t| t.is_dir()) && filter.watchable(&child, true) {
+                if child.is_dir() && filter.watchable(&child, true) {
                     stack.push(child);
                 }
             }
         }
+        self.sync_guards();
     }
 }
 

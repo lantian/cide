@@ -153,6 +153,7 @@ impl Console {
             _credentials: credentials,
         });
         let mut policy = Value::Null;
+        let mut policy_error = None;
 
         // Authenticate a disposable connection before starting the terminal. A CLI without
         // this protocol must fail setup explicitly, never quietly fall back to pasting.
@@ -171,12 +172,33 @@ impl Console {
                     };
                     match read_policy(&mut client, &spec.cwd) {
                         Ok(config) => {
+                            if let Some((_, scratch)) = spec.env.iter().rev().find(|(name, _)| {
+                                name == cide_core::peer_chat::reviewer::SCRATCH_ENV
+                            }) && let Err(error) =
+                                cide_core::peer_chat::reviewer::validate_codex_config(
+                                    &config,
+                                    std::path::Path::new(scratch),
+                                )
+                            {
+                                policy_error = Some(error);
+                                return false;
+                            }
                             policy = protocol::thread_policy(&config, &spec.args);
+                            if spec.env.iter().any(|(name, _)| {
+                                name == cide_core::peer_chat::reviewer::SCRATCH_ENV
+                            }) {
+                                // A resumed thread can carry an older disabled search
+                                // setting; apply the reviewer's current launch choice.
+                                policy["config"]["web_search"] = config["web_search"].clone();
+                            }
                             true
                         }
                         Err(_) => false,
                     }
                 });
+            if let Some(error) = policy_error.take() {
+                return Err(error);
+            }
             if connected {
                 break;
             }

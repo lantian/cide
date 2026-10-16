@@ -40,8 +40,8 @@ pub struct TreeRow {
     /// Whether to draw a twisty. A directory that walked to nothing (empty, or entirely
     /// ignored) gets none, so clicking it cannot appear to do nothing.
     pub has_children: bool,
-    /// A symlink is shown as a link rather than followed: the walk does not descend through
-    /// one, so its subtree is not in the index and must not be drawn as expandable.
+    /// The entry itself is a symbolic link. `kind` describes its target when accessible;
+    /// linked directories are browsable and retain their logical paths under the root.
     pub symlink: bool,
     /// Index into `Project::roots`. The tree colours and groups by root in a multi-root
     /// project, and needs this without re-deriving it from path prefixes on every row.

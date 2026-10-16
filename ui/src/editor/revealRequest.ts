@@ -57,6 +57,7 @@ export interface RevealTarget {
   readonly column: number
   /** 1-based and exclusive: the selection is `[column, endColumn)` on `line`. */
   readonly endColumn: number
+  readonly endLine?: number | undefined
   /**
    * Take the keyboard as well as the caret. Defaults to false, and the default is load-bearing.
    *
@@ -269,7 +270,8 @@ export function revealRange(doc: Text, target: RevealTarget): SelectionRange {
   const anchor = clamp(line.from + whole(target.column, 1) - 1, line.from, line.to)
   // From `anchor` up, so an `endColumn` before `column` — a reversed or empty match — is an
   // empty selection at the caret rather than a backwards range.
-  const head = clamp(line.from + whole(target.endColumn, 1) - 1, anchor, line.to)
+  const end = doc.line(clamp(whole(target.endLine ?? target.line, 1), line.number, doc.lines))
+  const head = clamp(end.from + whole(target.endColumn, 1) - 1, anchor, end.to)
   return EditorSelection.range(anchor, head)
 }
 

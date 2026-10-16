@@ -776,6 +776,12 @@ try {
   //    what it does draw, and nothing in the tree had ever asked for it.
   const rust = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
   const retitle = rust('crates/cide-app/src/cmd/window.rs')
+  const report = retitle.slice(retitle.indexOf('pub(crate) fn report_awaiting('))
+  const beforeAttentionSet = report.slice(0, report.indexOf('windows::set_awaiting('))
+  if (!/let awaiting = awaiting && !cide_core::peer_chat::is_reviewer\(/.test(beforeAttentionSet)) {
+    console.error('FAIL backend attention reports must exclude the paired reviewer before updating the shared set')
+    failed++
+  }
   const body = retitle.slice(retitle.indexOf('pub(crate) fn retitle'))
   // Both surfaces go through `apply_announcement`, which is the one place allowed to skip
   // the GTK calls when a window already wears the computed answer — the decision stays a

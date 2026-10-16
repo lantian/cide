@@ -1486,6 +1486,17 @@ pub(crate) async fn spawn_session(
                 continues.clone(),
             )
         });
+    let reviewer_scratch = if pair.as_ref().is_some_and(|p| p.1) {
+        Some(
+            cide_core::peer_chat::reviewer::Scratch::new().map_err(|error| {
+                SessionError::Pty(format!(
+                    "Cannot prepare peer analysis scratch directory: {error}"
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
     let pair_paragraph = if let Some((harness, reviewer, model)) = &pair {
         crate::cmd::peer_chat::validate_injections(&settings, *harness)
             .map_err(|e| SessionError::Pty(e.to_string()))?;
@@ -1495,55 +1506,18 @@ pub(crate) async fn spawn_session(
             settings.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::ReadOnly;
         }
         if *reviewer && *harness == cide_ipc::ConsoleHarness::Claude {
-            let mut args = Vec::new();
-            let mut source = settings.claude.cli.args.iter();
-            while let Some(arg) = source.next() {
-                if matches!(
-                    arg.as_str(),
-                    "--permission-mode"
-                        | "--allowedTools"
-                        | "--allowed-tools"
-                        | "--tools"
-                        | "--disallowedTools"
-                        | "--disallowed-tools"
-                ) {
-                    while source.clone().next().is_some_and(|v| !v.starts_with("--")) {
-                        source.next();
-                    }
-                    continue;
-                }
-                if [
-                    "--permission-mode=",
-                    "--allowedTools=",
-                    "--allowed-tools=",
-                    "--tools=",
-                    "--disallowedTools=",
-                    "--disallowed-tools=",
-                ]
-                .iter()
-                .any(|prefix| arg.starts_with(prefix))
-                    || arg == "--dangerously-skip-permissions"
-                {
-                    continue;
-                }
-                args.push(arg.clone());
-            }
-            args.extend([
-                "--permission-mode".into(),
-                "plan".into(),
-                "--allowedTools".into(),
-                "Read,Glob,Grep,mcp__cide__cide_peer_chat_send".into(),
-                "--tools".into(),
-                "Read,Glob,Grep".into(),
-                "--disallowedTools".into(),
-                "Edit,Write,NotebookEdit,Bash,Agent,Task,ExitPlanMode".into(),
-            ]);
-            settings.claude.cli.args = args;
+            settings.claude.cli.args =
+                cide_core::peer_chat::reviewer::claude_args(&settings.claude.cli.args);
         }
         if let Some(model) = model {
             spec.args.extend(["--model".into(), model.clone()]);
         }
-        Some(cide_core::peer_chat::instructions(*harness, *reviewer))
+        let mut instructions = cide_core::peer_chat::instructions(*harness, *reviewer);
+        if let Some(scratch) = &reviewer_scratch {
+            instructions.push(' ');
+            instructions.push_str(&scratch.instructions());
+        }
+        Some(instructions)
     } else {
         None
     };
@@ -1793,7 +1767,10 @@ pub(crate) async fn spawn_session(
         };
         codex_git_warning = git_permissions.warning().map(str::to_owned);
         let inject = codex_plan.inject;
-        let permission_args = if continues.is_none() {
+        let permission_args = if let Some(scratch) = &reviewer_scratch {
+            // Paired restorations must also replace the previous scratch grant.
+            scratch.codex_args()
+        } else if continues.is_none() {
             cide_core::codex_cli::default_permission_args(
                 &permission_cli,
                 &permission_cli.args,
@@ -1922,9 +1899,10 @@ pub(crate) async fn spawn_session(
     // falls back to disambiguating among every lockfile in a shared directory and may bind to
     // another editor entirely. See `cide-ide-mcp::lockfile`.
     //
-    // Set for every pane, not only Claude ones: a user who types `claude` into a cide shell
-    // should reach this project's server too.
-    if let Some(project) = project
+    // Shell panes keep this so a manually started Claude finds this project. OpenCode's
+    // port-only path omits authentication; its tools use the session-bound MCP bridge.
+    if !is_opencode
+        && let Some(project) = project
         && let Some(servers) = app.try_state::<crate::ide::IdeServers>()
         && let Some(port) = servers.port(project)
     {
@@ -2091,6 +2069,12 @@ pub(crate) async fn spawn_session(
     }
     for (key, value) in extra_env {
         spec = spec.env(key, value);
+    }
+    // Apply last so a launch override cannot point the reviewer at a project directory.
+    if let Some(scratch) = &reviewer_scratch {
+        for (key, value) in scratch.env() {
+            spec = spec.env(key, value);
+        }
     }
 
     // What a restored *shell* gets instead of a resume. `resume` on a non-Claude program has
@@ -2320,6 +2304,15 @@ pub(crate) async fn spawn_session(
         app.state::<crate::peer_chat::Runtime>()
             .note_codex_console(id, console.clone());
         console.observe(&session);
+    }
+    if let Some(scratch) = reviewer_scratch {
+        // Registered after native console shutdown, so their processes stop before
+        // the scratch files disappear. Failed launches retain the local RAII guard.
+        session.on_exit(move |_| {
+            let _ = std::thread::Builder::new()
+                .name("cide-peer-scratch-cleanup".into())
+                .spawn(move || drop(scratch));
+        });
     }
     // Which CLI this console session runs, for `pane_bind_session` to stamp on the pane. (M93)
     if let Some(console) = console {

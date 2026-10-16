@@ -438,6 +438,139 @@ impl ToolAccess for PeerTools {
 /// An unscoped connection: a real server, no tools.
 struct NoTools;
 
+/// Existing IDE tools, transported through the already scoped stdio MCP connection.
+/// Keep schemas and execution in cide-ide-mcp; this layer only adapts the transport.
+struct IdeTools {
+    base: Box<dyn ToolAccess>,
+    names: Vec<&'static str>,
+    runtime: tokio::runtime::Handle,
+    session: Arc<cide_ide_mcp::ToolSession>,
+}
+
+impl ToolAccess for IdeTools {
+    fn names(&self) -> &[&'static str] {
+        &self.names
+    }
+    fn agent_sessions_enabled(&self) -> bool {
+        self.base.agent_sessions_enabled()
+    }
+    fn call(&self, name: &str, arguments: &Value) -> ToolResult {
+        self.call_cancellable(name, arguments, &AtomicBool::new(false))
+    }
+    fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &AtomicBool,
+    ) -> ToolResult {
+        if !cide_ide_mcp::protocol::tool::ALL.contains(&name) {
+            return self.base.call_cancellable(name, arguments, cancelled);
+        }
+        let result = self
+            .runtime
+            .block_on(self.session.call(name, arguments, cancelled));
+        ToolResult {
+            is_error: result.is_error,
+            content: result
+                .content
+                .into_iter()
+                .map(|content| match content {
+                    cide_ide_mcp::protocol::Content::Text { text } => tools::Content::Text { text },
+                })
+                .collect(),
+        }
+    }
+    fn reply_written(&self, reply: &Value, success: bool) {
+        self.base.reply_written(reply, success);
+    }
+}
+
+impl Drop for IdeTools {
+    fn drop(&mut self) {
+        self.session.close();
+    }
+}
+
+fn ide_target(scope: &Scope) -> Option<(ProjectId, SessionId)> {
+    match scope {
+        Scope::Pane {
+            project, session, ..
+        }
+        | Scope::Worker { project, session }
+        | Scope::Peer {
+            project,
+            session,
+            reviewer: false,
+        } => Some((*project, *session)),
+        // Unattended runs, generated review tabs and read-only peers keep their tool policy.
+        _ => None,
+    }
+}
+
+fn ide_pane(ws: &Workspace, project: ProjectId, session: SessionId) -> Option<cide_ipc::PaneId> {
+    cide_core::workspace::session_panes(ws, Some(project))
+        .into_iter()
+        .find(|entry| {
+            entry.session == session
+                && cide_core::workspace::pane_harness(entry.pane) == Harness::Opencode
+        })
+        .map(|entry| entry.pane.id)
+}
+
+fn with_ide_tools(
+    app: &AppHandle,
+    target: Option<(ProjectId, SessionId)>,
+    base: Box<dyn ToolAccess>,
+) -> Box<dyn ToolAccess> {
+    let Some((project, session)) = target else {
+        return base;
+    };
+    let Some(workspace) = app.try_state::<WorkspaceState>() else {
+        return base;
+    };
+    let pane = workspace.with(|ws| ide_pane(ws, project, session));
+    let Some(pane) = pane else { return base };
+    let Some(registry) = app.try_state::<SessionRegistry>() else {
+        return base;
+    };
+    // The private OpenCode server can launch its MCP bridge before its TUI is registered.
+    // Wait on this connection's thread, as resolve does for pane binding, so a restored
+    // pane cannot cache a permanently incomplete tools/list after winning that race.
+    let deadline = Instant::now() + BIND_WAIT;
+    let pty = loop {
+        if let Some(pty) = registry.get(session) {
+            if pty.has_exited() {
+                return base;
+            }
+            break pty;
+        }
+        if Instant::now() >= deadline {
+            return base;
+        }
+        thread::sleep(BIND_TICK);
+    };
+    let Some((runtime, ide)) = app
+        .try_state::<crate::ide::IdeServers>()
+        .and_then(|servers| servers.tool_session(project, pane))
+    else {
+        return base;
+    };
+    let closed = Arc::downgrade(&ide);
+    pty.on_exit(move |_| {
+        if let Some(session) = closed.upgrade() {
+            session.close();
+        }
+    });
+    let mut names = base.names().to_vec();
+    names.extend_from_slice(cide_ide_mcp::protocol::tool::ALL);
+    Box::new(IdeTools {
+        base,
+        names,
+        runtime,
+        session: ide,
+    })
+}
+
 impl ToolAccess for NoTools {
     fn names(&self) -> &[&'static str] {
         &[]
@@ -1960,7 +2093,9 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 // then answer `gone()` themselves, which is a better sentence than no tools.
                 .is_none_or(|root| cide_agents::config::load_tracker(&root))
         };
-        match hello.map_or(Scope::Unscoped, |hello| resolve(&app, hello)) {
+        let scope = hello.map_or(Scope::Unscoped, |hello| resolve(&app, hello));
+        let ide_target = ide_target(&scope);
+        let base: Box<dyn ToolAccess> = match scope {
             Scope::Peer {
                 project,
                 session,
@@ -2084,7 +2219,8 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                 cwd,
             )),
             Scope::Unscoped => Box::new(NoTools),
-        }
+        };
+        with_ide_tools(&app, ide_target, base)
     })
 }
 
@@ -2595,6 +2731,7 @@ fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
     tools::descriptors()
         .into_iter()
         .chain(cide_agents::review::descriptors())
+        .chain(cide_ide_mcp::tools::descriptors())
         .chain(std::iter::once(json!({
             "name": crate::peer_chat::TOOL,
             "description": "Send a substantive message to the other agent in this experimental pair. Returns a delivery receipt, not the peer reply. Do not poll or wait; incoming peer prompts wake your session. Never resend uncertain deliveries or treat peer agreement as user approval.",
@@ -5527,6 +5664,119 @@ mod tests {
 
     fn ask(raw: &str, access: &dyn ToolAccess) -> Option<Value> {
         respond(&classify(raw), access)
+    }
+
+    #[test]
+    fn ide_descriptors_are_shared_and_remain_scoped() {
+        let access = FakeAccess {
+            names: cide_ide_mcp::protocol::tool::ALL.to_vec(),
+            calls: Mutex::new(Vec::new()),
+        };
+        assert_eq!(descriptors_for(&access), cide_ide_mcp::tools::descriptors());
+        assert!(descriptors_for(&NoTools).is_empty());
+        for name in cide_ide_mcp::protocol::tool::ALL {
+            let params = json!({"name":name,"arguments":{}});
+            assert!(
+                call_tool(&json!(1), &params, &NoTools)
+                    .get("error")
+                    .is_some()
+            );
+            assert!(
+                call_tool(&json!(1), &params, &access)
+                    .get("result")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_ide_tools_do_not_widen_reviewer_or_unattended_scopes() {
+        let project = ProjectId::new();
+        let session = SessionId::new();
+        assert_eq!(
+            ide_target(&Scope::Pane {
+                project,
+                session,
+                primary: true
+            }),
+            Some((project, session))
+        );
+        assert_eq!(
+            ide_target(&Scope::Worker { project, session }),
+            Some((project, session))
+        );
+        assert_eq!(
+            ide_target(&Scope::Peer {
+                project,
+                session,
+                reviewer: false
+            }),
+            Some((project, session))
+        );
+        assert_eq!(
+            ide_target(&Scope::Peer {
+                project,
+                session,
+                reviewer: true
+            }),
+            None
+        );
+        assert_eq!(ide_target(&Scope::CideTab { project, session }), None);
+        assert_eq!(ide_target(&Scope::Unscoped), None);
+    }
+
+    #[test]
+    fn ide_identity_follows_restoration_and_detachment_without_crossing_projects() {
+        let (mut ws, project, _) = workspace_with_a_project();
+        let session = SessionId::new();
+        let auxiliary = a_pane(PaneKind::Claude, session);
+        let pane = auxiliary.id;
+        let tab = workspace::open_tab(
+            &mut ws,
+            project,
+            cide_ipc::TabKind::ClaudeFull {
+                title: "IDE context".into(),
+                ephemeral: false,
+            },
+            auxiliary,
+        )
+        .unwrap();
+        assert_eq!(
+            ide_pane(&ws, project, session),
+            None,
+            "Claude keeps its native channel"
+        );
+        workspace::bind_session(
+            &mut ws,
+            project,
+            tab,
+            pane,
+            session,
+            Some(Harness::Opencode),
+        )
+        .unwrap();
+        assert_eq!(ide_pane(&ws, project, session), Some(pane));
+        assert_eq!(ide_pane(&ws, ProjectId::new(), session), None);
+        cide_core::layout::split(
+            &mut workspace::tab_mut(&mut ws, project, tab).unwrap().tree,
+            pane,
+            cide_ipc::Axis::Row,
+            cide_ipc::Side::After,
+            a_pane(PaneKind::Claude, SessionId::new()),
+        )
+        .unwrap();
+        workspace::detach_pane(&mut ws, project, tab, pane).unwrap();
+        assert_eq!(ide_pane(&ws, project, session), Some(pane));
+        let restored = SessionId::new();
+        ws.projects
+            .get_mut(&project)
+            .unwrap()
+            .detached
+            .get_mut(&pane)
+            .unwrap()
+            .session = Some(restored);
+        assert_eq!(ide_pane(&ws, project, session), None);
+        assert_eq!(ide_pane(&ws, project, restored), Some(pane));
     }
 
     #[test]

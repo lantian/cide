@@ -384,6 +384,12 @@ pub(crate) fn report_awaiting(
     awaiting: bool,
     by: AwaitingReporter,
 ) {
+    // All webviews and remote acknowledgements share this gate. A stale window must not
+    // put the paired reviewer into the desktop/remote attention set, even if it reports
+    // the raw AwaitingInput/Permission state as waiting. Binding assigns the pane's session
+    // before its child starts, so this also covers the first state emitted during startup.
+    // Coerce to false rather than returning: an existing stale marker must be removable.
+    let awaiting = awaiting && !cide_core::peer_chat::is_reviewer(&state.snapshot(), session);
     // Second of the attention-chain lines — see the note in `hooks.rs`. Logged BEFORE the early
     // return, because "the surface reported and the set did not move" is a different failure from
     // "the surface never reported" and the two are indistinguishable afterwards.

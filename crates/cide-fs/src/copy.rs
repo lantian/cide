@@ -493,7 +493,15 @@ fn check_source(roots: &[PathBuf], source: &Path, dest_dir: &Path, mode: PasteMo
     let meta = std::fs::symlink_metadata(source).map_err(|e| FsError::io(source, e))?;
     name_of(source)?;
 
-    if meta.is_dir() && dest_dir.starts_with(source) {
+    // A linked destination can be physically inside the source even though its displayed
+    // path is elsewhere. Refuse before copying creates an endlessly growing subtree.
+    let inside_source = meta.is_dir()
+        && (dest_dir.starts_with(source)
+            || std::fs::canonicalize(dest_dir)
+                .ok()
+                .zip(std::fs::canonicalize(source).ok())
+                .is_some_and(|(dest, source)| dest.starts_with(source)));
+    if inside_source {
         return Err(FsError::IntoItself(format!(
             "{} cannot be pasted into {}, which is inside it",
             source.display(),

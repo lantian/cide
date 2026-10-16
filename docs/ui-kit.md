@@ -142,6 +142,8 @@ on a panel is told apart from it by its border, not by a second fill.
 - **Icons:** `<Icon name size>` only, never a Unicode glyph (`check:ui-icons`). Sizes are 12,
   14 (rows and small buttons), 16 (toolbars and md buttons) and 20 (empty states). A missing
   mark is vendored with `scripts/vendor-ui-icons.mjs`.
+  File rows use the vendored `FileIcon`; its optional `row.symlink` flag adds the shared
+  `link` icon over the normal file or folder icon. The row supplies the symbolic-link label.
 
 ### State, the same way everywhere
 

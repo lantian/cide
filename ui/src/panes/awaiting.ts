@@ -70,6 +70,7 @@ import {
   type Tab,
 } from '@/ipc/client'
 import { paneSessionId } from '@/layout/paneHosts'
+import { useWorkspace } from '@/store/workspace'
 import {
   UNSEEN,
   adopt,
@@ -112,6 +113,34 @@ function trackOf(session: string): Track {
   return tracks.get(session) ?? UNSEEN
 }
 
+/** The right reviewer waits for its writer, not for the user. Keep raw session state intact. */
+function reviewerSessions(): Set<string> {
+  const sessions = new Set<string>()
+  for (const project of Object.values(useWorkspace.getState().boot?.workspace.projects ?? {})) {
+    for (const tab of project.tabs) {
+      if (!tab.peerChat) continue
+      const pane = tab.tree.panes[tab.peerChat.peer]
+      if (!pane) continue
+      const session = paneSessionId(pane.id) ?? pane.session
+      if (session) sessions.add(session)
+    }
+  }
+  return sessions
+}
+
+/** Apply role policy to broadcasts, catch-up and later workspace/session bindings alike. */
+function publish(next: Map<string, Track>): void {
+  for (const session of reviewerSessions()) {
+    const before = next.get(session)
+    if (!before?.awaiting) continue
+    const after = onAcknowledge(before)
+    next.set(session, after)
+    report(session, before, after)
+  }
+  tracks = next
+  changed()
+}
+
 /** Tell Rust, but only when the answer actually moved. */
 function report(session: string, before: Track, after: Track): void {
   if (before.awaiting === after.awaiting) return
@@ -123,7 +152,8 @@ function report(session: string, before: Track, after: Track): void {
 
 function applyState(session: string, phase: SessionPhase): void {
   const before = trackOf(session)
-  const after = onState(before, phase)
+  const state = onState(before, phase)
+  const after = reviewerSessions().has(session) ? onAcknowledge(state) : state
   if (after.gone) {
     // Dropped, not kept as `awaiting: false`. A dead session's entry would otherwise sit in
     // this map for the life of the window — and a pane's session id is reused when its child
@@ -163,6 +193,12 @@ function install(): void {
   if (installed) return
   installed = true
 
+  // A session-state/broadcast can arrive before its workspace binding in this webview.
+  // Reconcile on snapshots too, so late binding and restoration clear every marker/count.
+  useWorkspace.subscribe((state, previous) => {
+    if (state.boot?.workspace.projects !== previous.boot?.workspace.projects) publish(tracks)
+  })
+
   // Nothing else can supply the transitions, so a failure here leaves the feature off in this
   // window rather than wrong: no marker, and no report that could clear another window's.
   void events
@@ -170,8 +206,7 @@ function install(): void {
     .catch(() => {})
 
   void onSessionAwaiting((sessions) => {
-    tracks = mergeAuthoritative(tracks, sessions)
-    changed()
+    publish(mergeAuthoritative(tracks, sessions))
   })
     .catch(() => {
       /* Without the broadcast this window still tracks what it hears itself; it just will not
@@ -190,8 +225,7 @@ function install(): void {
   void awaitingApi
     .current()
     .then((sessions) => {
-      tracks = adopt(tracks, sessions)
-      changed()
+      publish(adopt(tracks, sessions))
     })
     .catch(() => {
       /* A window that cannot ask still tracks everything it hears from here on. */

@@ -15,7 +15,7 @@
 //! also has to keep reading the socket — the CLI sends `close_tab` down the same connection
 //! that is waiting on the diff.
 
-use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -64,6 +64,41 @@ impl ToolResult {
 /// Where a handler puts the work only the application can do: opening a tab, revealing a file.
 pub type Events = mpsc::Sender<ServerEvent>;
 
+/// Application file navigation, shared by every IDE transport. Lines are 1-based here.
+pub trait FileOpener: Send + Sync {
+    fn open(&self, path: &str, start: Option<u32>, end: Option<u32>) -> Result<(), String>;
+}
+
+/// A cancelled tool future must not leave a live diff behind. Kept in the shared
+/// handler so cancellation behaves the same for every transport.
+struct PendingDiff {
+    broker: DiffBroker,
+    events: Events,
+    id: String,
+}
+
+impl Drop for PendingDiff {
+    fn drop(&mut self) {
+        if self
+            .broker
+            .withdraw(&self.id, CancelReason::ClientClosed)
+            .is_some()
+        {
+            notify_withdrawn(&self.events, self.id.clone());
+        }
+    }
+}
+
+pub(crate) fn notify_withdrawn(events: &Events, request_id: String) {
+    let event = ServerEvent::DiffWithdrawn { request_id };
+    if let Err(mpsc::error::TrySendError::Full(event)) = events.try_send(event) {
+        let events = events.clone();
+        tokio::spawn(async move {
+            let _ = events.send(event).await;
+        });
+    }
+}
+
 /// Emit, and report whether anyone was still listening.
 ///
 /// A dropped receiver is not an error in itself — it means the app is going away — but
@@ -100,6 +135,11 @@ pub async fn open_diff(
     };
     let mut waiting = broker.open(request.clone(), connection);
     let id = request.id.clone();
+    let _pending = PendingDiff {
+        broker: broker.clone(),
+        events: events.clone(),
+        id: id.clone(),
+    };
 
     // The request is registered before it is announced, so a cancellation can land while the
     // announcement is still queued. `ServerEvent` is a bounded channel and a busy application
@@ -134,20 +174,20 @@ pub async fn open_diff(
 /// An unknown tab is **success**. The CLI closes its tabs from `beforeExit` and from an
 /// abort handler, both of which fire for tabs the user already dealt with; answering those
 /// with an error would put a failure in the transcript of an otherwise clean exit.
-pub async fn close_tab(arguments: &Value, broker: &DiffBroker, events: &Events) -> ToolResult {
+pub async fn close_tab(
+    arguments: &Value,
+    broker: &DiffBroker,
+    connection: u64,
+    events: &Events,
+) -> ToolResult {
     let params: CloseTabParams = match serde_json::from_value(arguments.clone()) {
         Ok(p) => p,
         Err(e) => return ToolResult::error(format!("close_tab: unusable arguments: {e}")),
     };
 
-    broker.cancel_tab(&params.tab_name, CancelReason::ClientClosed);
-    emit(
-        events,
-        ServerEvent::DiffWithdrawn {
-            tab_name: params.tab_name,
-        },
-    )
-    .await;
+    for request_id in broker.withdraw_tabs(connection, Some(&params.tab_name)) {
+        emit(events, ServerEvent::DiffWithdrawn { request_id }).await;
+    }
 
     // The CLI awaits this call and never inspects the body. An empty content array says so
     // honestly; anything else would look like a sentinel and invite someone to read it.
@@ -164,24 +204,8 @@ pub async fn close_all_diff_tabs(
     connection: u64,
     events: &Events,
 ) -> ToolResult {
-    // The broker keys cancellation by connection but does not expose the connection on the
-    // way out, so the tab names come from the difference between before and after. A racing
-    // resolution elsewhere can put one extra name in that difference; a `DiffWithdrawn` for
-    // a tab that has already gone is a no-op in the app, which is the harmless direction.
-    let before = broker.pending();
-    broker.cancel_connection(connection, CancelReason::ClientClosed);
-    let survivors: HashSet<String> = broker.pending().into_iter().map(|r| r.id).collect();
-
-    for request in before {
-        if !survivors.contains(&request.id) {
-            emit(
-                events,
-                ServerEvent::DiffWithdrawn {
-                    tab_name: request.params.tab_name,
-                },
-            )
-            .await;
-        }
+    for request_id in broker.withdraw_tabs(connection, None) {
+        emit(events, ServerEvent::DiffWithdrawn { request_id }).await;
     }
 
     ToolResult::ok(Vec::new())
@@ -271,6 +295,14 @@ struct OpenFileArgs {
 
 /// Reveal a file, optionally at a range.
 pub async fn open_file(arguments: &Value, events: &Events) -> ToolResult {
+    open_file_with(arguments, events, None).await
+}
+
+pub(crate) async fn open_file_with(
+    arguments: &Value,
+    events: &Events,
+    opener: Option<Arc<dyn FileOpener>>,
+) -> ToolResult {
     let args: OpenFileArgs = match serde_json::from_value(arguments.clone()) {
         Ok(a) => a,
         Err(e) => return ToolResult::error(format!("openFile: unusable arguments: {e}")),
@@ -280,10 +312,23 @@ pub async fn open_file(arguments: &Value, events: &Events) -> ToolResult {
     // the rest of the codebase from having to remember which it holds. `saturating_add`
     // rather than `+` because a line number at `u32::MAX` is malformed input, not a reason
     // to abort a release build differently from a debug one.
+    let start_line = args.start_line.map(|l| l.saturating_add(1));
+    let end_line = args.end_line.map(|l| l.saturating_add(1));
+    if let Some(opener) = opener {
+        return match tokio::task::spawn_blocking(move || {
+            opener.open(&args.file_path, start_line, end_line)
+        })
+        .await
+        {
+            Ok(Ok(())) => ToolResult::ok(Vec::new()),
+            Ok(Err(error)) => ToolResult::error(error),
+            Err(error) => ToolResult::error(format!("openFile: {error}")),
+        };
+    }
     let event = ServerEvent::OpenFile {
         path: args.file_path,
-        start_line: args.start_line.map(|l| l.saturating_add(1)),
-        end_line: args.end_line.map(|l| l.saturating_add(1)),
+        start_line,
+        end_line,
     };
 
     if !emit(events, event).await {
@@ -533,18 +578,16 @@ mod tests {
         let broker = DiffBroker::new();
         let (tx, mut rx) = mpsc::channel(4);
 
-        let result = close_tab(&json!({ "tab_name": "never-existed" }), &broker, &tx).await;
+        let result = close_tab(&json!({ "tab_name": "never-existed" }), &broker, 1, &tx).await;
 
         assert!(
             !result.is_error,
             "the CLI's beforeExit must not see a failure"
         );
-        // The app is still told, because a tab it is showing may have outlived the broker
-        // entry that created it.
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(ServerEvent::DiffWithdrawn { tab_name }) if tab_name == "never-existed"
-        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unknown tab cannot identify another pane's diff"
+        );
     }
 
     #[tokio::test]
@@ -562,7 +605,7 @@ mod tests {
             panic!("the app is told to open a tab before anything waits on it");
         };
 
-        close_tab(&json!({ "tab_name": "tab-1" }), &broker, &tx).await;
+        close_tab(&json!({ "tab_name": "tab-1" }), &broker, 1, &tx).await;
 
         let result = diff.await.expect("the handler task finished");
         assert_eq!(result.content, DiffOutcome::Rejected.to_content());
@@ -619,7 +662,7 @@ mod tests {
         let blocker = tx.clone();
         blocker
             .send(ServerEvent::DiffWithdrawn {
-                tab_name: "filler".into(),
+                request_id: "filler".into(),
             })
             .await
             .expect("the channel takes its one event");
@@ -756,7 +799,7 @@ mod tests {
                 .await
                 .is_error
         );
-        assert!(close_tab(&json!({}), &broker, &tx).await.is_error);
+        assert!(close_tab(&json!({}), &broker, 1, &tx).await.is_error);
         assert!(open_file(&json!({ "startLine": 3 }), &tx).await.is_error);
     }
 }

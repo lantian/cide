@@ -85,6 +85,9 @@ struct Pending {
 #[derive(Clone, Default)]
 pub struct DiffBroker {
     inner: Arc<Mutex<HashMap<String, Pending>>>,
+    // Completed requests can still have visible tabs. Retain their connection ownership
+    // until the UI closes them, or their client withdraws them.
+    tabs: Arc<Mutex<HashMap<String, (u64, String)>>>,
 }
 
 impl DiffBroker {
@@ -101,6 +104,10 @@ impl DiffBroker {
     /// agent can act on.
     pub fn open(&self, request: DiffRequest, connection: u64) -> oneshot::Receiver<DiffOutcome> {
         let (tx, rx) = oneshot::channel();
+        self.tabs.lock().insert(
+            request.id.clone(),
+            (connection, request.params.tab_name.clone()),
+        );
 
         let superseded: Vec<String> = {
             let map = self.inner.lock();
@@ -142,6 +149,41 @@ impl DiffBroker {
         };
         tracing::debug!(id, ?reason, "cancelling a pending diff");
         pending.reply.send(DiffOutcome::Rejected).is_ok()
+    }
+
+    /// Return the withdrawn request even if its receiver was already dropped. A tool
+    /// future's cancellation must still remove the corresponding tab from the UI.
+    pub(crate) fn withdraw(&self, id: &str, reason: CancelReason) -> Option<DiffRequest> {
+        let pending = self.inner.lock().remove(id)?;
+        self.forget_tab(id);
+        tracing::debug!(id, ?reason, "withdrawing a pending diff");
+        let _ = pending.reply.send(DiffOutcome::Rejected);
+        Some(pending.request)
+    }
+
+    pub fn forget_tab(&self, id: &str) {
+        self.tabs.lock().remove(id);
+    }
+
+    pub(crate) fn withdraw_tabs(&self, connection: u64, name: Option<&str>) -> Vec<String> {
+        let ids: Vec<String> = {
+            let mut tabs = self.tabs.lock();
+            let ids: Vec<String> = tabs
+                .iter()
+                .filter(|(_, (owner, tab_name))| {
+                    *owner == connection && name.is_none_or(|name| name == tab_name)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                tabs.remove(id);
+            }
+            ids
+        };
+        for id in &ids {
+            self.withdraw(id, CancelReason::ClientClosed);
+        }
+        ids
     }
 
     /// Cancel by tab name — what `close_tab` carries.

@@ -1433,12 +1433,15 @@ export const events = {
    */
   onRemoteChanged: (handler: () => void) =>
     listen<null>('cide://remote-changed', () => handler()),
-  /**
-   * `cide://command-requested`: the console's `cide_command_run` asked this window to run one
-   * registry command, as the palette would. (M134) Addressed to one shell window and filtered
-   * here by label for `onCheckRequested`'s reason — every webview hears `emit_to`, and each one
-   * that answered would open its own palette.
-   */
+  /** The shared IDE openFile tool asks the owning window to reveal a file range. */
+  onEditorReveal: (
+    handler: (request: { project: ProjectId; path: string; startLine: number | null; endLine: number | null }) => void,
+  ) =>
+    listen<{ window: string; project: ProjectId; path: string; startLine: number | null; endLine: number | null }>(
+      'cide://editor-reveal',
+      (e) => { if (e.payload.window === windowLabel()) handler(e.payload) },
+    ),
+  /** Run one palette command in the project's shell window, filtered by its label. */
   onCommandRequested: (
     handler: (request: { project: string; command: string; args: unknown }) => void,
   ) =>

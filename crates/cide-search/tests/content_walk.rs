@@ -33,6 +33,63 @@ use cide_search::content::{
 /// path, a `.gitignore` or the filler text.
 const NEEDLE: &str = "zqneedle";
 
+#[cfg(unix)]
+#[test]
+fn linked_folders_are_searched_under_each_alias_without_following_cycles() {
+    let root = scratch("search-links");
+    let target = scratch("search-link-target");
+    write(target.join("found.rs"), NEEDLE);
+    write(target.join("ignored.rs"), NEEDLE);
+    write(target.join(".gitignore"), "ignored.rs\n");
+    write(target.join(".git/objects/hidden"), NEEDLE);
+    std::os::unix::fs::symlink(target.path(), root.join("first")).unwrap();
+    std::os::unix::fs::symlink(target.path(), root.join("second")).unwrap();
+    std::os::unix::fs::symlink(".", root.join("cycle")).unwrap();
+    std::os::unix::fs::symlink("missing", root.join("broken")).unwrap();
+    let (hits, outcome) = run(
+        &[SearchRoot::new(root.path())],
+        &literal(NEEDLE),
+        Limits::default(),
+    );
+    let paths: std::collections::HashSet<_> = hits.iter().map(|h| PathBuf::from(&h.path)).collect();
+    assert_eq!(
+        paths,
+        [root.join("first/found.rs"), root.join("second/found.rs")]
+            .into_iter()
+            .collect()
+    );
+    assert!(!outcome.truncated);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_an_outer_parent_stops_before_reentering_the_project() {
+    let outer = scratch("search-parent-link");
+    let root = outer.join("project");
+    write(root.join("local.rs"), NEEDLE);
+    write(outer.join("sibling.rs"), NEEDLE);
+    std::os::unix::fs::symlink("..", root.join("parent")).unwrap();
+    let (hits, _) = run(
+        &[SearchRoot::new(&root)],
+        &literal(NEEDLE),
+        Limits::default(),
+    );
+    let paths: std::collections::HashSet<_> = hits.iter().map(|h| PathBuf::from(&h.path)).collect();
+    assert_eq!(
+        paths,
+        [root.join("local.rs"), root.join("parent/sibling.rs")]
+            .into_iter()
+            .collect()
+    );
+    let index = cide_fs::Index::build(
+        vec![cide_fs::Root::new(&root)],
+        cide_fs::BuildOptions::default(),
+        &|_| {},
+    );
+    assert!(!index.contains(&root.join("parent/project/local.rs")));
+    assert!(index.contains(&root.join("parent/sibling.rs")));
+}
+
 fn literal(pattern: &str) -> SearchQuery {
     SearchQuery {
         pattern: pattern.to_string(),

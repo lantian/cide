@@ -11,11 +11,43 @@ uses `provider/model`. Leave the model blank for the configured default. Both ag
 the same harness. Setup starts both children together and cleans up a partial startup failure.
 
 Enter an ordinary task on the left. The main agent's instructions tell it to consult the peer
-and request review automatically. The main agent is the writer; the peer has invocation-local
-read-only permissions and no cide dispatch/edit tools. Claude and OpenCode reviewers use file
-inspection tools, including sources outside the project; ask the main agent to run checks
-and share the results. External-directory access does not grant write or shell permissions.
-Project and global launch settings are not rewritten.
+and request review automatically. Only the left writer raises Waiting badges, notification
+dots, tab/project waiting counts and desktop attention. The right reviewer stays quiet when
+it finishes a turn or reaches a permission prompt; its native status and permission controls
+remain available inside the panel.
+
+The main agent is the writer; the peer has invocation-local
+reviewer permissions and no cide dispatch/edit tools. Reviewers can inspect files outside
+the project, execute inspection commands (Git status/diff, metadata, hashes, disk usage),
+open web URLs and search the internet using their harness's native tools and configured
+search integration. Claude exposes WebFetch/WebSearch, OpenCode exposes webfetch/websearch,
+and Codex enables live web search. Provider availability and managed network restrictions
+still apply.
+
+OpenCode 2 reviewers select OpenCode's native automatic keyless search-provider pool for
+their invocation. This avoids the first-use provider form, whose cancellation or one-minute
+timeout otherwise returns `Web search cancelled`. OpenCode handles provider selection and
+rate-limit failover. No API key, global provider selection, form auto-answering or permission
+bypass is added; other OpenCode sessions retain their usual search configuration.
+
+The reviewer may create and execute temporary analysis scripts, including Python scripts
+that scan large codebases or datasets. Each invocation gets a private directory outside
+the project, identified by `CIDE_PEER_SCRATCH` and the temporary-directory environment.
+Scripts, intermediate files and generated results belong there. It is removed on session
+exit or failed startup; a restored reviewer receives a fresh directory and updated
+instructions. Python bytecode writes beside source files and Git's optional index writes
+are disabled for the reviewer.
+
+Project/source/data edits, Git mutations, commits, builds, tests, dependency installation
+and worker dispatch remain outside the reviewer's role. Ask the main writer to perform
+builds or tests and share the results. Claude and OpenCode block dedicated edit/delegation
+tools; their shell/script restrictions follow reviewer instructions and are not an OS
+filesystem sandbox. Codex uses its native read-only profile with writes granted only to
+scratch and no approval escalation. Conflicting legacy Codex sandbox settings or additional
+write grants reject reviewer startup. Project and global launch settings are not rewritten.
+Claude reviewers require a CLI supporting `--system-prompt-snapshot off` (verified on
+2.1.301), so restored sessions receive current reviewer instructions and scratch paths.
+Restart existing paired sessions after updating Cide to receive the new tools and policy.
 
 Agents communicate through the pair-scoped `cide_peer_chat_send(message)` MCP tool. Messages
 are labelled by side and harness and routed to the currently bound peer session. A terminal
@@ -81,6 +113,23 @@ temporary local model endpoint and fake MCP server. It reproduces the missing re
 under Code Mode, then verifies direct visibility and execution while mutation tools remain
 hidden. It also reproduces the former external-directory denial and verifies external read/glob
 with the reviewer policy. It makes no paid model calls and sends no messages to real agents.
+It also verifies native shell execution of a temporary analysis script and URL fetching from
+`https://example.com`. It reproduces a cancelled first-use search-provider form, then executes
+`websearch` against the public internet and requires a successful search response without a
+selection form. Providers may return result URLs or a valid empty-result response. Search-provider
+keys are removed from its environment so this exercises the keyless pool.
+
+`cargo test --locked -p cide-core --test real_peer_reviewer -- --ignored --nocapture`
+passes production reviewer policies into installed OpenCode, Claude and Codex audits.
+Claude executes a scratch Python script and fetches a URL through a local fake model;
+its search tool must be exposed and edit/delegation tools hidden. Codex's native command
+API executes a scratch script and must reject writes to project files and Git metadata.
+Its effective configuration must enable live web search. These audits use temporary state,
+no account credentials and no paid model calls. Fetch checks read `https://example.com`.
+Local sockets, network access for URL fetching/search and Codex's OS sandbox support are
+required. OpenCode search results are
+exercised against real keyless providers; Claude/Codex search-provider results remain outside
+this audit.
 
 `cargo test --locked -p cide-app --test real_peer_composer -- --ignored` exercises the
 shared delivery chunks and screen verification against the installed Codex terminal. It
@@ -94,5 +143,7 @@ exercises the native Codex transport with the installed TUI, isolated temporary 
 local fake model provider. It verifies a fresh reviewer's first message, long Unicode replies,
 busy-turn gating, draft preservation and restoration without replay. It uses no paid endpoints.
 It also checks `/new`, stale-reply rejection and server/credential cleanup on close.
+Fresh and restored reviewers use the production scratch profile, receive current scratch
+instructions, and expose the live web-search tool to the local fake model.
 The ordinary `codex_console` tests also verify authentication, cancellation and native approval
 forwarding with fake protocol endpoints. These audits need permission to open local sockets.

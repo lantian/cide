@@ -164,12 +164,27 @@ impl PendingIdeServers {
 /// `McpDiagnostics` holds the *store*, not an `AppHandle`: `cide-ide-mcp` must not depend on
 /// tauri, and this is what keeps that true while still answering from live data.
 fn link_into(server: &cide_ide_mcp::IdeServer, app: &AppHandle, project: ProjectId) {
+    server.set_file_opener(std::sync::Arc::new(EditorFiles {
+        app: app.clone(),
+        project,
+    }));
     if let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>()
         && let Some(diagnostics) = registry.get(project)
     {
         server.set_diagnostics(std::sync::Arc::new(crate::lsp::McpDiagnostics::new(
             diagnostics.store(),
         )));
+    }
+}
+
+struct EditorFiles {
+    app: AppHandle,
+    project: ProjectId,
+}
+
+impl cide_ide_mcp::tools::FileOpener for EditorFiles {
+    fn open(&self, path: &str, start: Option<u32>, end: Option<u32>) -> Result<(), String> {
+        crate::cmd::file::open_ide_file(&self.app, self.project, path, start, end)
     }
 }
 
@@ -251,6 +266,19 @@ impl IdeServers {
     /// The broker, for answering a diff the user just resolved.
     pub fn broker(&self, project: ProjectId) -> Option<DiffBroker> {
         self.servers.get(&project).map(|e| e.broker.clone())
+    }
+
+    pub(crate) fn tool_session(
+        &self,
+        project: ProjectId,
+        pane: PaneId,
+    ) -> Option<(
+        tokio::runtime::Handle,
+        std::sync::Arc<cide_ide_mcp::ToolSession>,
+    )> {
+        let entry = self.servers.get(&project)?;
+        let session = entry.server.tool_session(pane.to_string())?;
+        Some((self.rt.handle().clone(), std::sync::Arc::new(session)))
     }
 
     /// Tell the server which pane a connected `claude` belongs to.
@@ -524,21 +552,23 @@ async fn pump(
             ServerEvent::DiffRequested(request) => {
                 open_diff_tab(&app, project, &broker, request);
             }
-            ServerEvent::DiffWithdrawn { tab_name } => {
+            ServerEvent::DiffWithdrawn { request_id } => {
                 // The CLI closed the diff itself — its `beforeExit` does this. The broker has
                 // already resolved the request; this only takes the tab off the screen.
-                close_diff_tab_by_name(&app, project, &tab_name);
+                close_diff_tab_by_name(&app, project, &request_id);
             }
             ServerEvent::Connected {
                 pid,
                 client_version,
+                client_name,
                 ..
             } => {
                 tracing::debug!(
                     %project,
                     pid,
                     version = client_version.as_deref().unwrap_or("unknown"),
-                    "a claude connected to the IDE server"
+                    client = client_name.as_deref().unwrap_or("unknown"),
+                    "a client connected to the IDE server"
                 );
                 // **The record is written here and nowhere else.**
                 //
@@ -552,7 +582,9 @@ async fn pump(
                 // Every rule about *whether* to write is in `cide_core::handshake::record` —
                 // this event fires once per Claude pane, in an app that may have four open,
                 // and a debounce written inline here would be a rule no test could reach.
-                record_handshake(client_version);
+                if client_name.as_deref() == Some("claude-code") {
+                    record_handshake(client_version);
+                }
                 // And work out *which pane* just connected, when the pid alone does not say.
                 // Here rather than only at send time so that a diff opened by a wrapper's
                 // `claude` is attributed to the right pane too — attribution is not only about
@@ -567,7 +599,11 @@ async fn pump(
                 end_line,
             } => {
                 // Line numbers arrive already converted to 1-based by `tools::open_file`.
-                tracing::debug!(%project, ?path, start_line, end_line, "openFile requested");
+                if let Err(error) =
+                    crate::cmd::file::open_ide_file(&app, project, &path, start_line, end_line)
+                {
+                    tracing::warn!(%project, %error, "openFile failed");
+                }
             }
         }
     }
@@ -839,6 +875,7 @@ pub fn resolve_or_cancel(
         }
         None => {
             broker.cancel(request_id, CancelReason::PaneClosed);
+            broker.forget_tab(request_id);
         }
     }
 }
@@ -858,6 +895,7 @@ pub fn cancel_for_tabs(
     };
     for id in request_ids {
         broker.cancel(&id, reason);
+        broker.forget_tab(&id);
     }
 }
 

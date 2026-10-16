@@ -62,6 +62,9 @@ impl Console {
             reviewer,
             paired,
         } = start;
+        // SpawnSpec applies sets after removals, so discard explicit port entries too.
+        spec.env
+            .retain(|(name, _)| !cide_core::opencode_cli::IDE_PORT_ENV.contains(&name.as_str()));
         let flavor = Flavor::of(harness).ok_or("This harness has no native console API")?;
         if harness == Harness::Mimo {
             settings.opencode.cli.binary = flavor.program().into();
@@ -152,9 +155,20 @@ impl Console {
             "--port".into(),
             port.to_string(),
         ]);
-        // The MCP bridge is a child of the server, so it needs the console's routing identity.
+        // The server executes commands and launches MCP children. Both must inherit
+        // the reviewer's scratch directory and read-only analysis environment.
         for (name, value) in &spec.env {
-            if name.starts_with("CIDE_") {
+            if name.starts_with("CIDE_")
+                || (reviewer
+                    && matches!(
+                        name.as_str(),
+                        "TMPDIR"
+                            | "TMP"
+                            | "TEMP"
+                            | "PYTHONDONTWRITEBYTECODE"
+                            | "GIT_OPTIONAL_LOCKS"
+                    ))
+            {
                 server_spec.env.push((name.clone(), value.clone()));
             }
         }
@@ -467,24 +481,24 @@ fn direct_peer_tools(document: &mut serde_json::Value, generation: Generation) {
 }
 
 fn reviewer_config(document: &mut serde_json::Value, generation: Generation) {
+    let rules = cide_core::peer_chat::reviewer::opencode_permissions(generation == Generation::V2);
+    let instructions = format!(
+        "{} Reply with cide_cide_peer_chat_send.",
+        cide_core::peer_chat::reviewer::INSTRUCTIONS
+    );
     if generation == Generation::V2 {
-        let mut rules = vec![json!({ "action": "*", "resource": "*", "effect": "deny" })];
-        for action in [
-            "read",
-            "glob",
-            "grep",
-            "list",
-            "external_directory",
-            "cide_cide_peer_chat_send",
-        ] {
-            rules.push(json!({ "action": action, "resource": "*", "effect": "allow" }));
-        }
-        document["permissions"] = json!(rules);
-        document["agents"]["cide-peer-reviewer"] = json!({ "system": "You are the read-only peer reviewer. Reply with cide_cide_peer_chat_send.", "permissions": rules });
+        // A private reviewer must be able to search without waiting for OpenCode's
+        // first-use provider form (which expires as "Web search cancelled"). Use
+        // its native keyless pool for this invocation; never persist a selection
+        // or answer the terminal's forms/permission dialogs on the user's behalf.
+        document["websearch"] =
+            json!({"provider":cide_core::peer_chat::reviewer::OPENCODE_SEARCH_PROVIDER});
+        document["permissions"] = rules.clone();
+        document["agents"]["cide-peer-reviewer"] =
+            json!({ "system": instructions, "permissions": rules });
     } else {
-        let rules = json!({ "*": "deny", "read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "external_directory": "allow", "cide_cide_peer_chat_send": "allow" });
         document["permission"] = rules.clone();
-        document["agent"]["cide-peer-reviewer"] = json!({ "mode": "primary", "description": "Read-only two-agent chat peer", "prompt": "Review without edits. Reply with cide_cide_peer_chat_send.", "permission": rules });
+        document["agent"]["cide-peer-reviewer"] = json!({ "mode": "primary", "description": "Read-only two-agent chat peer", "prompt": instructions, "permission": rules });
     }
 }
 
@@ -675,6 +689,7 @@ mod peer_tests {
         }}});
         direct_peer_tools(&mut doc, Generation::V2);
         reviewer_config(&mut doc, Generation::V2);
+        assert_eq!(doc["websearch"], json!({"provider":"random"}));
         assert_eq!(doc["mcp"]["servers"]["cide"]["codemode"], false);
         assert_eq!(
             doc["mcp"]["servers"]["cide"]["command"],
@@ -706,14 +721,20 @@ mod peer_tests {
             reviewer_config(&mut doc, generation);
             assert_eq!(doc["provider"]["local"]["name"], "Keep me");
             if generation == Generation::V1 {
+                assert!(doc.get("websearch").is_none());
                 assert_eq!(doc["permission"]["*"], "deny");
                 assert_eq!(doc["permission"]["cide_cide_peer_chat_send"], "allow");
                 assert_eq!(doc["permission"]["external_directory"], "allow");
+                assert_eq!(doc["permission"]["bash"], "allow");
+                assert_eq!(doc["permission"]["webfetch"], "allow");
+                assert_eq!(doc["permission"]["websearch"], "allow");
+                assert!(doc["permission"].get("edit").is_none());
                 assert_eq!(
                     doc["agent"]["cide-peer-reviewer"]["permission"],
                     doc["permission"]
                 );
             } else {
+                assert_eq!(doc["websearch"], json!({"provider":"random"}));
                 let rules = doc["permissions"].as_array().unwrap();
                 assert_eq!(rules[0]["effect"], "deny");
                 assert!(
@@ -728,8 +749,20 @@ mod peer_tests {
                 );
                 assert!(!rules.iter().any(|r| matches!(
                     r["action"].as_str(),
-                    Some("edit" | "bash" | "task")
+                    Some("edit" | "write" | "patch" | "execute" | "subagent" | "task")
                 ) && r["effect"] == "allow"));
+                assert!(
+                    rules
+                        .iter()
+                        .any(|r| r["action"] == "shell" && r["effect"] == "allow")
+                );
+                for action in ["webfetch", "websearch"] {
+                    assert!(
+                        rules
+                            .iter()
+                            .any(|r| r["action"] == action && r["effect"] == "allow")
+                    );
+                }
                 assert_eq!(
                     doc["agents"]["cide-peer-reviewer"]["permissions"],
                     doc["permissions"]

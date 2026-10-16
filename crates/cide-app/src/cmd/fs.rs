@@ -679,7 +679,7 @@ const MAX_PROBE: usize = 128;
 ///
 /// # What it deliberately cannot see
 ///
-/// The index is gitignore-filtered and does not descend through symlinked directories, so
+/// The index is gitignore-filtered and retains logical paths through linked directories, so
 /// `target/debug/…` and `node_modules/…` answer `None`. Terminal links fall back to
 /// [`fs_stat_paths`] for these misses, so file-tree visibility does not decide whether a file
 /// is openable. The click is re-checked in Rust — see `cmd::file::terminal_open_path` — because
@@ -1984,6 +1984,60 @@ mod tests {
         }
 
         fn changed(&self, _project: ProjectId, _change: &FsChange) {}
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linked_folders_are_searchable_editable_and_updated_by_the_project_watcher() {
+        let root = scratch("cmd-linked-folder");
+        let target = scratch("cmd-linked-target");
+        let link = root.path().join("linked");
+        let name = format!("{NEEDLE}.rs");
+        let path = link.join(&name);
+        std::fs::write(target.path().join(&name), "original").unwrap();
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        let missing = target.path().join("missing");
+        let broken = root.path().join("broken");
+        std::os::unix::fs::symlink(&missing, &broken).unwrap();
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        index_project(
+            Arc::new(Counting::default()),
+            &registry,
+            project,
+            vec![root.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .unwrap();
+        let fs = registry.get(project).unwrap();
+        assert!(fs.with_index_mut(|index| index.reveal(&path)).is_some());
+        assert_eq!(settled_matches(&registry, project, 1).await, 1);
+        let document = cide_core::document::read(&path).unwrap();
+        assert_eq!(document.path, path);
+        assert_eq!(document.text, "original");
+        cide_core::document::write(&path, "edited through the tree").unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(target.path().join(&name)).unwrap(),
+            "edited through the tree"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.status().watch.watched_dirs == 0 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(fs.status().watch.watched_dirs > 0);
+        std::fs::create_dir(&missing).unwrap();
+        std::fs::write(missing.join("created.rs"), "new target appeared").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs.with_index(|index| index.contains(&broken.join("created.rs")))
+            && Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        let created = broken.join("created.rs");
+        assert!(fs.with_index(|index| index.contains(&created)));
+        drop(registry.remove(project));
     }
 
     /// Ask the picker until it has scored `expected` matches, or give up.

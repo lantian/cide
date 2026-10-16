@@ -338,9 +338,11 @@ struct Native {
     console: Arc<Console>,
     tui: Arc<PtySession>,
     output: mpsc::Receiver<Vec<u8>>,
+    scratch: cide_core::peer_chat::reviewer::Scratch,
 }
 impl Native {
     fn start(dir: &Temp, provider: &Provider, resume: Option<&str>) -> Self {
+        let scratch = cide_core::peer_chat::reviewer::Scratch::new().unwrap();
         let mut spec =
             SpawnSpec::new("codex", &dir.0).apply(cide_core::child_env::terminal_child_env(
                 &Default::default(),
@@ -358,14 +360,12 @@ impl Native {
             spec.args.push("resume".into());
             spec.args.push("--include-non-interactive".into());
         }
-        spec.args.extend([
-            "-C".into(),
-            dir.0.to_string_lossy().into_owned(),
-            "-s".into(),
-            "read-only".into(),
-            "-a".into(),
-            "on-request".into(),
-        ]);
+        spec.args
+            .extend(["-C".into(), dir.0.to_string_lossy().into_owned()]);
+        spec.args.extend(scratch.codex_args());
+        for (key, value) in scratch.env() {
+            spec = spec.env(key, value);
+        }
         for config in [
             "check_for_update_on_startup=false".into(),
             "model_provider=\"peer-audit\"".into(),
@@ -379,7 +379,14 @@ impl Native {
             "model_providers.peer-audit.wire_api=\"responses\"".into(),
             "model_providers.peer-audit.request_max_retries=0".into(),
             "model_providers.peer-audit.stream_max_retries=0".into(),
-            "developer_instructions=\"Read-only native peer audit fixture.\"".into(),
+            format!(
+                "developer_instructions={}",
+                cide_core::codex_cli::toml_string(&format!(
+                    "Read-only native peer audit fixture. {} {}",
+                    cide_core::peer_chat::reviewer::INSTRUCTIONS,
+                    scratch.instructions()
+                ))
+            ),
         ] {
             spec.args.extend(["-c".into(), config]);
         }
@@ -397,6 +404,7 @@ impl Native {
             console,
             tui,
             output: receive,
+            scratch,
         }
     }
     fn pump(&self) {
@@ -461,7 +469,10 @@ fn real_codex_native_delivery_preserves_drafts_and_restores_the_thread() {
     let provider = Provider::new();
     let native = Native::start(&dir, &provider, None);
     native.wait("fresh terminal receiver", || {
-        native.console.receiver().unwrap().is_some()
+        native
+            .console
+            .receiver()
+            .is_ok_and(|receiver| receiver.is_some())
     });
     let original = native.console.receiver().unwrap().unwrap();
     let draft = "LOCAL_DRAFT_MUST_SURVIVE";
@@ -493,6 +504,16 @@ fn real_codex_native_delivery_preserves_drafts_and_restores_the_thread() {
     assert!(
         request
             .to_string()
+            .contains(&native.scratch.path().display().to_string())
+    );
+    assert!(request["tools"].as_array().unwrap().iter().any(|tool| {
+        tool["type"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("web_search"))
+    }));
+    assert!(
+        request
+            .to_string()
             .contains("Read-only native peer audit fixture.")
     );
     assert!(request["input"].as_array().unwrap().iter().any(|item| {
@@ -514,8 +535,11 @@ fn real_codex_native_delivery_preserves_drafts_and_restores_the_thread() {
         cide_core::codex_cli::rollout_of(&dir.0.join("state"), &thread).is_some(),
         "native peer conversations must remain discoverable by Cide's restore path"
     );
+    let old_scratch = native.scratch.path().to_owned();
     drop(native);
+    assert!(!old_scratch.exists());
     let restored = Native::start(&dir, &provider, Some(&thread));
+    assert_ne!(restored.scratch.path(), old_scratch);
     restored.wait("restored native thread", || {
         restored
             .console
@@ -540,6 +564,21 @@ fn real_codex_native_delivery_preserves_drafts_and_restores_the_thread() {
     restored.wait("second native turn", || {
         provider.requests.lock().len() == 2 && restored.console.receiver().unwrap().is_some()
     });
+    let resumed_request = provider.requests.lock()[1].clone();
+    assert!(
+        resumed_request
+            .to_string()
+            .contains(&restored.scratch.path().display().to_string())
+    );
+    assert!(
+        resumed_request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("web_search")))
+    );
     let retired = restored.console.receiver().unwrap().unwrap();
     restored.tui.write(b"/new".to_vec());
     restored.wait("new command", || restored.screen().contains("/new"));

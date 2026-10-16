@@ -3002,7 +3002,8 @@ function Row({
          synthetic row's `path` is a `cide://…` sentinel that names nothing, so it gets its own
          text instead — a tooltip reading `cide://group/externalLibraries` would look like a
          leaked internal, which is what it is. */
-      title={synthetic ? row.name : row.path}
+      title={synthetic ? row.name : row.symlink ? `${row.path}\nSymbolic link` : row.path}
+      aria-label={row.symlink ? `${row.name}, symbolic link` : undefined}
       /*
        * First, and deliberately separate from the click handling below: a press only becomes a
        * drag after 4px of movement, so every click rule keeps running exactly as it did and a

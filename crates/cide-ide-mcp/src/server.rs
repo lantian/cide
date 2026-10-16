@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -67,6 +68,10 @@ use crate::protocol::{
 };
 use crate::tools;
 use crate::{IdeError, Result};
+
+#[cfg(test)]
+#[path = "opencode_audit.rs"]
+mod opencode_audit;
 
 /// How many events may queue before a connection task waits for the application to catch up.
 ///
@@ -99,6 +104,7 @@ pub enum ServerEvent {
     Connected {
         connection: u64,
         pid: u32,
+        client_name: Option<String>,
         /// What the CLI called itself in `initialize`: `clientInfo.version`.
         ///
         /// # The only version cide has that names the binary that actually connected
@@ -129,7 +135,7 @@ pub enum ServerEvent {
     /// The CLI withdrew a diff. The pending request is already resolved by the time this
     /// arrives; what is left is a tab on screen that should go away.
     DiffWithdrawn {
-        tab_name: String,
+        request_id: String,
     },
     /// The CLI asked to reveal a file. Line numbers are 1-based here — the conversion from
     /// the wire's 0-based numbering happens in [`crate::tools::open_file`].
@@ -158,6 +164,7 @@ struct Conn {
     /// announce, this is already set. If a future CLI reversed them the field would simply be
     /// `None` and the record would say "unknown", which is the honest degradation.
     client_version: Option<String>,
+    client_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -178,6 +185,7 @@ struct Connections {
 
 struct Inner {
     broker: DiffBroker,
+    runtime: tokio::runtime::Handle,
     /// Behind a lock because [`IdeServer::events`] may replace it; see that method.
     events: Mutex<mpsc::Sender<ServerEvent>>,
     conns: Mutex<Connections>,
@@ -197,6 +205,7 @@ struct Inner {
     /// that was never given one answers `[]`, which is the true sentence it answered before
     /// this field existed.
     diagnostics: Mutex<Option<Arc<dyn tools::DiagnosticSource>>>,
+    file_opener: Mutex<Option<Arc<dyn tools::FileOpener>>>,
 }
 
 impl Inner {
@@ -221,6 +230,7 @@ impl Inner {
                 out,
                 pid: None,
                 client_version: None,
+                client_name: None,
             },
         );
         Some(id)
@@ -244,6 +254,12 @@ impl Inner {
         let version = version.map(str::trim).filter(|v| !v.is_empty());
         if let Some(conn) = self.conns.lock().open.get_mut(&connection) {
             conn.client_version = version.map(str::to_string);
+        }
+    }
+
+    fn set_client_name(&self, connection: u64, name: Option<&str>) {
+        if let Some(conn) = self.conns.lock().open.get_mut(&connection) {
+            conn.client_name = name.map(str::to_string);
         }
     }
 
@@ -386,6 +402,65 @@ pub struct IdeServer {
     lockfile: Option<Lockfile>,
 }
 
+/// A trusted, pane-bound client of the same tools served over WebSocket.
+/// The application creates this only after its MCP bridge has resolved the caller's
+/// session. It needs no second token, socket, or copy of the tool vocabulary.
+pub struct ToolSession {
+    inner: Arc<Inner>,
+    connection: u64,
+    pane: String,
+    closed: AtomicBool,
+}
+
+impl ToolSession {
+    pub async fn call(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &AtomicBool,
+    ) -> tools::ToolResult {
+        let stopped = || {
+            cancelled.load(Ordering::Acquire)
+                || self.closed.load(Ordering::Acquire)
+                || self.inner.conns.lock().closed
+        };
+        if stopped() {
+            return tools::ToolResult::error("the IDE request was cancelled or its session closed");
+        }
+        tokio::select! {
+            biased;
+            _ = async {
+                while !stopped() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            } => tools::ToolResult::error("the IDE request was cancelled or its session closed"),
+            result = execute_tool(&self.inner, self.connection, Some(self.pane.clone()), name, arguments) => {
+                result.unwrap_or_else(|| tools::ToolResult::error(format!("no such tool: {name}")))
+            }
+        }
+    }
+
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _entered = self.inner.runtime.enter();
+        let events = self.inner.events.lock().clone();
+        for id in self.inner.broker.withdraw_tabs(self.connection, None) {
+            tools::notify_withdrawn(&events, id);
+        }
+    }
+}
+
+impl Drop for ToolSession {
+    fn drop(&mut self) {
+        self.close();
+        self.inner
+            .broker
+            .cancel_connection(self.connection, CancelReason::Disconnected);
+    }
+}
+
 impl IdeServer {
     /// Bind a loopback port, publish a lockfile naming it, and start accepting.
     pub async fn start(workspace_folders: Vec<PathBuf>) -> Result<Self> {
@@ -421,11 +496,13 @@ impl IdeServer {
         let (alive_tx, drained_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             broker: DiffBroker::new(),
+            runtime: tokio::runtime::Handle::current(),
             events: Mutex::new(events_tx),
             conns: Mutex::new(Connections::default()),
             auth_token,
             alive: Mutex::new(Some(alive_tx)),
             diagnostics: Mutex::new(None),
+            file_opener: Mutex::new(None),
         });
 
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&inner)));
@@ -446,6 +523,24 @@ impl IdeServer {
 
     pub fn broker(&self) -> DiffBroker {
         self.inner.broker.clone()
+    }
+
+    pub fn set_file_opener(&self, opener: Arc<dyn tools::FileOpener>) {
+        *self.inner.file_opener.lock() = Some(opener);
+    }
+
+    pub fn tool_session(&self, pane: String) -> Option<ToolSession> {
+        let mut connections = self.inner.conns.lock();
+        if connections.closed {
+            return None;
+        }
+        connections.next_id += 1;
+        Some(ToolSession {
+            inner: Arc::clone(&self.inner),
+            connection: connections.next_id,
+            pane,
+            closed: AtomicBool::new(false),
+        })
     }
 
     /// Take the event stream.
@@ -879,11 +974,18 @@ async fn notification(inner: &Arc<Inner>, connection: u64, incoming: &Incoming) 
             Ok(hello) => {
                 inner.set_pid(connection, hello.pid);
                 let client_version = inner.client_version(connection);
+                let client_name = inner
+                    .conns
+                    .lock()
+                    .open
+                    .get(&connection)
+                    .and_then(|conn| conn.client_name.clone());
                 inner
                     .emit(ServerEvent::Connected {
                         connection,
                         pid: hello.pid,
                         client_version,
+                        client_name,
                     })
                     .await;
             }
@@ -911,6 +1013,13 @@ async fn request(inner: &Arc<Inner>, connection: u64, incoming: &Incoming, id: V
             // own comment — so this is a side effect on the connection rather than anything
             // the client is told about.
             inner.set_client_version(connection, client_version_of(&incoming.params));
+            inner.set_client_name(
+                connection,
+                incoming
+                    .params
+                    .pointer("/clientInfo/name")
+                    .and_then(Value::as_str),
+            );
             Response::ok(id, initialize_result(&incoming.params))
         }
         "tools/list" => Response::ok(id, json!({ "tools": tools::descriptors() })),
@@ -964,15 +1073,35 @@ async fn call_tool(inner: &Arc<Inner>, connection: u64, params: &Value, id: Valu
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    match execute_tool(
+        inner,
+        connection,
+        inner.pane_for(connection),
+        name,
+        &arguments,
+    )
+    .await
+    {
+        Some(result) => Response::ok(id, result.to_json()),
+        None => Response::err(id, METHOD_NOT_FOUND, format!("no such tool: {name}")),
+    }
+}
+
+async fn execute_tool(
+    inner: &Arc<Inner>,
+    connection: u64,
+    pane: Option<String>,
+    name: &str,
+    arguments: &Value,
+) -> Option<tools::ToolResult> {
     let events = inner.events.lock().clone();
     let broker = &inner.broker;
 
     let result = match name {
         protocol::tool::OPEN_DIFF => {
-            let pane = inner.pane_for(connection);
-            tools::open_diff(&arguments, broker, connection, pane, &events).await
+            tools::open_diff(arguments, broker, connection, pane, &events).await
         }
-        protocol::tool::CLOSE_TAB => tools::close_tab(&arguments, broker, &events).await,
+        protocol::tool::CLOSE_TAB => tools::close_tab(arguments, broker, connection, &events).await,
         protocol::tool::CLOSE_ALL_DIFF_TABS => {
             tools::close_all_diff_tabs(broker, connection, &events).await
         }
@@ -981,17 +1110,271 @@ async fn call_tool(inner: &Arc<Inner>, connection: u64, params: &Value, id: Valu
             // `parking_lot` guard held across the call would be held while the store's own lock
             // is taken, which is two locks in an order nothing else in this crate establishes.
             let source = inner.diagnostics.lock().clone();
-            tools::get_diagnostics(&arguments, source.as_deref())
+            tools::get_diagnostics(arguments, source.as_deref())
         }
-        protocol::tool::OPEN_FILE => tools::open_file(&arguments, &events).await,
+        protocol::tool::OPEN_FILE => {
+            let opener = inner.file_opener.lock().clone();
+            tools::open_file_with(arguments, &events, opener).await
+        }
         // A JSON-RPC error rather than a result: the caller asked for something that is not
         // in `tools/list`, which is a mistake about the server rather than about the work.
-        other => {
-            return Response::err(id, METHOD_NOT_FOUND, format!("no such tool: {other}"));
-        }
+        _ => return None,
     };
 
-    Response::ok(id, result.to_json())
+    Some(result)
+}
+
+#[cfg(test)]
+mod tool_sessions {
+    use super::*;
+    use crate::protocol::DiffOutcome;
+    use std::sync::atomic::AtomicBool;
+
+    async fn server() -> IdeServer {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        IdeServer::attach(listener, "test-only-token".into()).unwrap()
+    }
+
+    fn open(
+        session: Arc<ToolSession>,
+        path: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> JoinHandle<tools::ToolResult> {
+        let arguments = json!({"old_file_path":path,"new_file_path":path,"new_file_contents":"new", "tab_name":"same-name"});
+        tokio::spawn(async move {
+            session
+                .call(protocol::tool::OPEN_DIFF, &arguments, &cancelled)
+                .await
+        })
+    }
+
+    async fn next_diff(events: &mut mpsc::Receiver<ServerEvent>) -> DiffRequest {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ServerEvent::DiffRequested(request) => request,
+            event => panic!("expected a diff, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_keep_pane_identity_and_close_only_their_own_diffs() {
+        let server = server().await;
+        let mut events = server.events();
+        let a = Arc::new(server.tool_session("pane-a".into()).unwrap());
+        let b = Arc::new(server.tool_session("pane-b".into()).unwrap());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let first = open(a.clone(), "/repo/a", cancelled.clone());
+        let first_request = next_diff(&mut events).await;
+        let second = open(b.clone(), "/repo/b", cancelled.clone());
+        let second_request = next_diff(&mut events).await;
+        assert_eq!(first_request.pane.as_deref(), Some("pane-a"));
+        assert_eq!(second_request.pane.as_deref(), Some("pane-b"));
+        a.call(
+            protocol::tool::CLOSE_TAB,
+            &json!({"tab_name":"same-name"}),
+            &cancelled,
+        )
+        .await;
+        assert_eq!(
+            first.await.unwrap().content,
+            DiffOutcome::Rejected.to_content()
+        );
+        assert_eq!(server.broker().pending(), vec![second_request.clone()]);
+        assert_eq!(
+            events.recv().await,
+            Some(ServerEvent::DiffWithdrawn {
+                request_id: first_request.id
+            })
+        );
+        b.call(protocol::tool::CLOSE_ALL_DIFF_TABS, &json!({}), &cancelled)
+            .await;
+        assert_eq!(
+            second.await.unwrap().content,
+            DiffOutcome::Rejected.to_content()
+        );
+        assert_eq!(
+            events.recv().await,
+            Some(ServerEvent::DiffWithdrawn {
+                request_id: second_request.id
+            })
+        );
+        assert!(server.broker().is_empty());
+        // Tool clients are not notification destinations: sending a selection must not
+        // claim success merely because an MCP bridge is attached.
+        assert!(server.inner.addressable_panes().is_empty());
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_pane_close_withdraw_pending_diffs() {
+        let server = server().await;
+        let mut events = server.events();
+        for close in [false, true] {
+            let session = Arc::new(server.tool_session("pane".into()).unwrap());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pending = open(session.clone(), "/repo/a", cancelled.clone());
+            let request = next_diff(&mut events).await;
+            if close {
+                session.close();
+            } else {
+                cancelled.store(true, Ordering::Release);
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_error || result.content == DiffOutcome::Rejected.to_content());
+            assert!(server.broker().is_empty());
+            assert_eq!(
+                events.recv().await,
+                Some(ServerEvent::DiffWithdrawn {
+                    request_id: request.id
+                })
+            );
+            assert!(
+                session
+                    .call(protocol::tool::GET_DIAGNOSTICS, &json!({}), &cancelled)
+                    .await
+                    .is_error
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn diff_outcomes_and_shutdown_use_the_existing_broker() {
+        let server = server().await;
+        let mut events = server.events();
+        let session = Arc::new(server.tool_session("pane".into()).unwrap());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        for outcome in [
+            DiffOutcome::Saved {
+                contents: "edited by user".into(),
+            },
+            DiffOutcome::TabClosed,
+            DiffOutcome::Rejected,
+        ] {
+            let pending = open(session.clone(), "/repo/a", cancelled.clone());
+            let request = next_diff(&mut events).await;
+            assert!(server.broker().resolve(&request.id, outcome.clone()));
+            assert_eq!(pending.await.unwrap().content, outcome.to_content());
+            assert!(events.try_recv().is_err());
+        }
+        let diagnostics = session
+            .call(protocol::tool::GET_DIAGNOSTICS, &json!({}), &cancelled)
+            .await;
+        assert_eq!(diagnostics.content, vec![protocol::Content::text("[]")]);
+        let pending = open(session.clone(), "/repo/a", cancelled.clone());
+        next_diff(&mut events).await;
+        server.shutdown().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_error || result.content == DiffOutcome::Rejected.to_content());
+        assert!(
+            session
+                .call(protocol::tool::GET_DIAGNOSTICS, &json!({}), &cancelled)
+                .await
+                .is_error
+        );
+    }
+
+    type FileOpenRequest = (String, Option<u32>, Option<u32>);
+    struct FileRecorder(Mutex<Vec<FileOpenRequest>>);
+    impl tools::FileOpener for FileRecorder {
+        fn open(
+            &self,
+            path: &str,
+            start: Option<u32>,
+            end: Option<u32>,
+        ) -> std::result::Result<(), String> {
+            if path == "/denied" {
+                return Err("outside the project".into());
+            }
+            self.0.lock().push((path.into(), start, end));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn file_navigation_uses_shared_aliases_lines_and_error_results() {
+        let server = server().await;
+        let files = Arc::new(FileRecorder(Mutex::new(Vec::new())));
+        server.set_file_opener(files.clone());
+        let session = server.tool_session("pane".into()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        assert!(
+            !session
+                .call(
+                    protocol::tool::OPEN_FILE,
+                    &json!({"path":"/repo/a","start_line":0,"end_line":2}),
+                    &cancelled
+                )
+                .await
+                .is_error
+        );
+        assert_eq!(*files.0.lock(), vec![("/repo/a".into(), Some(1), Some(3))]);
+        let denied = session
+            .call(
+                protocol::tool::OPEN_FILE,
+                &json!({"filePath":"/denied"}),
+                &cancelled,
+            )
+            .await;
+        assert!(denied.is_error);
+        assert_eq!(
+            denied.content,
+            vec![protocol::Content::text("outside the project")]
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_saved_diff_can_be_closed_and_disconnect_does_not_leave_tabs() {
+        let server = server().await;
+        let mut events = server.events();
+        let session = Arc::new(server.tool_session("pane".into()).unwrap());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        for disconnect in [false, true] {
+            let pending = open(session.clone(), "/repo/a", cancelled.clone());
+            let request = next_diff(&mut events).await;
+            server.broker().resolve(
+                &request.id,
+                DiffOutcome::Saved {
+                    contents: "saved".into(),
+                },
+            );
+            assert_eq!(
+                pending.await.unwrap().content,
+                DiffOutcome::Saved {
+                    contents: "saved".into()
+                }
+                .to_content()
+            );
+            if disconnect {
+                session.close();
+            } else {
+                session
+                    .call(
+                        protocol::tool::CLOSE_TAB,
+                        &json!({"tab_name":"same-name"}),
+                        &cancelled,
+                    )
+                    .await;
+            }
+            assert_eq!(
+                events.recv().await,
+                Some(ServerEvent::DiffWithdrawn {
+                    request_id: request.id
+                })
+            );
+        }
+        server.shutdown().await;
+    }
 }
 
 #[cfg(test)]

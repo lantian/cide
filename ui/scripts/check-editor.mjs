@@ -2153,6 +2153,10 @@ try {
     ok(threw(() => doc.line(5)), 'and so does a line past the end of the document')
 
     eq(span(range(1, 1, 6)), [0, 5], 'a hit at the top of the file')
+    eq(span(reveal.revealRange(doc, { line: 2, column: 1, endLine: 4, endColumn: Number.MAX_SAFE_INTEGER })),
+      [doc.line(2).from, doc.line(4).to], 'IDE file navigation selects a multiline range')
+    eq(span(reveal.revealRange(doc, { line: 2, column: 1, endLine: 999, endColumn: Number.MAX_SAFE_INTEGER })),
+      [doc.line(2).from, doc.length], 'IDE ranges clamp to the current unsaved document')
     eq(span(range(1, 7, 11)), [6, 10], 'and one further along the line')
     // Line 4 is the last, and it has no trailing break: `from` 24, four characters.
     eq(span(range(4, 1, 5)), [24, 28], 'a hit on the last line')

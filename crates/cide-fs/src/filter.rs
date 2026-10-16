@@ -274,7 +274,7 @@ pub struct FilterInput<'a> {
 pub struct Filter {
     roots: Vec<PathBuf>,
     /// One entry per visited directory that contains a `.gitignore`.
-    per_dir: HashMap<PathBuf, Gitignore>,
+    per_dir: std::sync::RwLock<HashMap<PathBuf, Gitignore>>,
     /// `$root/.git/info/exclude`, keyed by root.
     excludes: HashMap<PathBuf, Gitignore>,
     /// `core.excludesFile` / `$XDG_CONFIG_HOME/git/ignore`.
@@ -444,7 +444,7 @@ impl Filter {
 
         Self {
             roots: roots.to_vec(),
-            per_dir,
+            per_dir: std::sync::RwLock::new(per_dir),
             excludes,
             global,
             watched_paths,
@@ -597,6 +597,29 @@ impl Filter {
             .any(|w| w.git && path.starts_with(&w.path))
     }
 
+    /// A retargeted directory link can bring a different set of ignore rules under an
+    /// existing logical path. Refresh on directory reads, without changing the shared roots.
+    pub(crate) fn refresh_rules(&self, dir: &Path) {
+        let file = dir.join(".gitignore");
+        let rules = file
+            .is_file()
+            .then(|| {
+                let mut builder = GitignoreBuilder::new(dir);
+                if let Some(err) = builder.add(&file) {
+                    tracing::debug!(%err, path = %file.display(), "could not refresh .gitignore");
+                    return None;
+                }
+                builder.build().ok()
+            })
+            .flatten();
+        let mut per_dir = self.per_dir.write().expect("ignore rules lock poisoned");
+        if let Some(rules) = rules {
+            per_dir.insert(dir.to_path_buf(), rules);
+        } else {
+            per_dir.remove(dir);
+        }
+    }
+
     /// Whether the tree should contain, and the watcher should report, this path.
     ///
     /// `is_dir` is what the caller believes: for a path that has just been deleted nobody
@@ -721,8 +744,9 @@ impl Filter {
             return false;
         };
         let mut dir = path.parent();
+        let per_dir = self.per_dir.read().expect("ignore rules lock poisoned");
         while let Some(d) = dir {
-            if let Some(gi) = self.per_dir.get(d) {
+            if let Some(gi) = per_dir.get(d) {
                 match matched_under(gi, path, is_dir) {
                     Match::Ignore(_) => return true,
                     Match::Whitelist(_) => return false,
@@ -755,7 +779,7 @@ impl Filter {
     /// The root this path belongs to, longest first so a nested root wins.
     ///
     /// `None` means "outside every root", which both public answers treat as a refusal.
-    fn root_of(&self, path: &Path) -> Option<&PathBuf> {
+    pub(crate) fn root_of(&self, path: &Path) -> Option<&PathBuf> {
         self.roots
             .iter()
             .filter(|r| path.starts_with(r))

@@ -130,6 +130,7 @@
     "check:tree-flicker": "node scripts/check-tree-flicker.mjs",
     "check:tree-select": "node scripts/check-tree-select.mjs",
     "check:tree-status": "node scripts/check-tree-status.mjs",
+    "check:symlinks": "node scripts/check-symlinks.mjs",
     "check:ui-icons": "node scripts/check-ui-icons.mjs",
     "check:ui-scale": "node scripts/check-ui-scale.mjs",
     "check:unlisten": "node scripts/check-unlisten.mjs",

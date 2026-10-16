@@ -297,6 +297,7 @@ impl Indexing {
         // watcher must not take a descriptor on — see `cide_fs::filter`'s module note, which
         // owns that trade — and `watch_dirs` is where the two lists are told apart.
         let watched = index.watch_dirs(&filter);
+        let links = index.watch_links(&filter);
 
         *fs.index.write() = index;
         *fs.filter.write() = Arc::clone(&filter);
@@ -305,6 +306,7 @@ impl Indexing {
         let config = WatchConfig {
             roots: root_paths,
             dirs: watched,
+            links,
             ..WatchConfig::default()
         };
         let watcher = Watcher::start(config, filter, {

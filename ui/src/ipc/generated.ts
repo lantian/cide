@@ -14026,8 +14026,8 @@ expanded: boolean,
  */
 hasChildren: boolean, 
 /**
- * A symlink is shown as a link rather than followed: the walk does not descend through
- * one, so its subtree is not in the index and must not be drawn as expandable.
+ * The entry itself is a symbolic link. `kind` describes its target when accessible;
+ * linked directories are browsable and retain their logical paths under the root.
  */
 symlink: boolean, 
 /**

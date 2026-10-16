@@ -100,6 +100,7 @@ export interface JumpTarget {
   readonly column: number
   /** 1-based and exclusive. Omitted is a bare caret, which is what a jump usually means. */
   readonly endColumn?: number | undefined
+  readonly endLine?: number | undefined
   /** Take the keyboard as well as the caret. See `RevealTarget.focus`. */
   readonly focus?: boolean | undefined
   /** Put the destination in the middle of the viewport. See `RevealTarget.align`. */
@@ -155,6 +156,7 @@ export function jumpTo(project: ProjectId | null, to: JumpTarget, record_ = true
     // A bare caret, not a selection: `revealRange` collapses an empty range to the anchor, and
     // that is what IDEA does on a jump — it puts you *at* the place, it does not highlight it.
     endColumn: to.endColumn ?? to.column,
+    ...(to.endLine === undefined ? {} : { endLine: to.endLine }),
     ...(to.focus === undefined ? {} : { focus: to.focus }),
     ...(to.align === undefined ? {} : { align: to.align }),
   }

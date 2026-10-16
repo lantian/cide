@@ -216,8 +216,15 @@ fn state_path_hint() -> String {
 ///
 /// The noisy targets are pinned to `Info` rather than raising the global floor: a
 /// `tracing::debug!` from this workspace is exactly the thing a user is asked to send back.
+/// The console receives only warnings and errors; the file keeps the detailed diagnostics.
 fn log_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_log::{Target, TargetKind};
+
     tauri_plugin_log::Builder::default()
+        .targets([
+            Target::new(TargetKind::Stdout).filter(|metadata| metadata.level() <= log::Level::Warn),
+            Target::new(TargetKind::LogDir { file_name: None }),
+        ])
         .level_for("notify", log::LevelFilter::Info)
         .level_for("notify_debouncer_full", log::LevelFilter::Info)
         // The third noisy target, and the only one cide names itself: everything a language

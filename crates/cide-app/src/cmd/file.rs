@@ -110,6 +110,53 @@ pub(crate) fn open_file_tab(
     })
 }
 
+/// An IDE tool uses the normal file guards and tab deduplication, then asks the owning
+/// window to reveal the requested range. No out-of-project approval is inferred.
+pub(crate) fn open_ide_file(
+    app: &tauri::AppHandle,
+    project: ProjectId,
+    path: &str,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> std::result::Result<(), String> {
+    let state = app.state::<WorkspaceState>();
+    let roots: Vec<PathBuf> = state
+        .with(|ws| {
+            workspace::project(ws, project)
+                .map(|p| p.roots.iter().map(|r| r.path.clone()).collect())
+        })
+        .map_err(|error| error.to_string())?;
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        roots.first().ok_or("The project has no folder")?.join(path)
+    };
+    openable(&roots, &path, None).map_err(|error| error.to_string())?;
+    let tab = open_file_tab(&state, project, path.clone()).map_err(|error| error.to_string())?;
+    let window = state
+        .with(|ws| {
+            workspace::detached_tab_window(ws, tab).or_else(|| {
+                ws.windows.iter().find_map(|(label, role)| match role {
+                    cide_ipc::WindowRole::Shell { projects, .. } if projects.contains(&project) => {
+                        Some(label.clone())
+                    }
+                    _ => None,
+                })
+            })
+        })
+        .ok_or("No open window is showing this project")?;
+    state
+        .update(|ws| {
+            workspace::activate_project(ws, project);
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    crate::emit::editor_reveal(app, &window, project, &path.to_string_lossy(), start, end);
+    crate::windows::raise(app, &window);
+    Ok(())
+}
+
 /// Reopen a file the navigation history remembers — the Back/Forward half of `tab_open_file`.
 ///
 /// # Why Back does not simply call `tab_open_file`
@@ -1868,6 +1915,9 @@ pub enum ClaudeSendError {
     /// which is a completely different thing to go looking for.
     #[error("{}", not_connected(*connections))]
     NotConnected { connections: usize },
+
+    #[error("{0}")]
+    Delivery(String),
 }
 
 /// The sentence for [`ClaudeSendError::NotConnected`].
@@ -2062,6 +2112,7 @@ impl serde::Serialize for ClaudeSendError {
         let kind = match self {
             Self::NoServer => "noServer",
             Self::NotConnected { .. } => "notConnected",
+            Self::Delivery(_) => "delivery",
         };
         use serde::ser::SerializeStruct;
         let mut st = s.serialize_struct("ClaudeSendError", 2)?;
@@ -2071,18 +2122,20 @@ impl serde::Serialize for ClaudeSendError {
     }
 }
 
-/// The `@`-mention for a codex console, typed rather than sent. (M93) `None` when `pane` is not
-/// a codex console, which leaves the IDE road to answer.
-fn mention_into_codex(
+/// Consoles without Claude's addressed WebSocket notifications receive a composer paste.
+/// `None` leaves the existing Claude notification path to answer.
+#[allow(clippy::too_many_arguments)]
+fn mention_into_composer(
     app: &tauri::AppHandle,
     state: &WorkspaceState,
     project: cide_ipc::ProjectId,
     pane: cide_ipc::PaneId,
     path: &str,
+    text: &str,
     line_start: Option<u32>,
     line_end: Option<u32>,
 ) -> Option<std::result::Result<ClaudeSendTarget, ClaudeSendError>> {
-    let (session, root, title) = state.with(|ws| {
+    let (session, root, title, harness) = state.with(|ws| {
         let project_ref = cide_core::workspace::project(ws, project).ok()?;
         let target = project_ref
             .tabs
@@ -2090,15 +2143,20 @@ fn mention_into_codex(
             .flat_map(|t| t.tree.panes.values())
             .chain(project_ref.detached.values())
             .find(|p| p.id == pane)?;
+        let harness = cide_core::workspace::pane_harness(target);
         (target.kind == cide_ipc::PaneKind::Claude
-            && cide_core::workspace::pane_harness(target) == cide_ipc::Harness::Codex)
-            .then(|| {
-                (
-                    target.session,
-                    project_ref.roots.first().map(|r| r.path.clone()),
-                    target.title.clone(),
-                )
-            })
+            && matches!(
+                harness,
+                cide_ipc::Harness::Codex | cide_ipc::Harness::Opencode
+            ))
+        .then(|| {
+            (
+                target.session,
+                project_ref.roots.first().map(|r| r.path.clone()),
+                target.title.clone(),
+                harness,
+            )
+        })
     })?;
     let pty = session.and_then(|session| {
         app.try_state::<crate::state::SessionRegistry>()?
@@ -2108,9 +2166,25 @@ fn mention_into_codex(
     let Some(pty) = pty else {
         // A codex pane with no live child: nothing can receive the mention, and "not connected"
         // is the honest sentence the webview already has.
-        return Some(Err(ClaudeSendError::NotConnected { connections: 0 }));
+        return Some(Err(ClaudeSendError::Delivery(
+            "The selected console is not running. Reopen it and send the context again.".into(),
+        )));
     };
-    pty.write(codex_mention(path, root.as_deref(), line_start, line_end));
+    let paste = if harness == cide_ipc::Harness::Opencode {
+        match cide_core::opencode_cli::editor_context(
+            std::path::Path::new(path),
+            root.as_deref(),
+            text,
+            line_start,
+            line_end,
+        ) {
+            Ok(paste) => paste,
+            Err(error) => return Some(Err(ClaudeSendError::Delivery(error))),
+        }
+    } else {
+        codex_mention(path, root.as_deref(), line_start, line_end)
+    };
+    pty.write(paste);
     Some(Ok(ClaudeSendTarget {
         pane,
         title,
@@ -2230,22 +2304,8 @@ pub fn claude_send_lines(
     line_end: Option<u32>,
     exact: bool,
 ) -> std::result::Result<ClaudeSendTarget, ClaudeSendError> {
-    let servers = app
-        .try_state::<crate::ide::IdeServers>()
-        .ok_or(ClaudeSendError::NoServer)?;
-
-    // The wire's 0-based numbering, applied once, to both notifications from the same source
-    // values — so the range Claude highlights and the range it is told about cannot disagree.
-    // A codex console (M93) has no IDE connection to receive a mention over — codex speaks no
-    // `claude --ide` protocol — so the mention is **typed into its composer** as codex's own
-    // `@path` reference, as a paste and without an Enter: what the IDE road does for claude,
-    // which inserts and does not submit. Only for the pane the user aimed at; the fallback below
-    // chooses among IDE-connected panes, which a codex pane never is.
-    if let Some(sent) = mention_into_codex(&app, &state, project, pane, &path, line_start, line_end)
-    {
-        return sent;
-    }
-
+    // Claude's notifications use 0-based lines; composer pastes retain the editor's
+    // 1-based range. Resolve one destination before delivering either form of context.
     let start = line_start.map(|l| l.saturating_sub(1));
     let end = line_end.map(|l| l.saturating_sub(1));
 
@@ -2258,11 +2318,26 @@ pub fn claude_send_lines(
     crate::ide::resolve_unbound_connections(&app, project);
 
     let ws = state.snapshot();
-    let reachable: std::collections::HashSet<String> = servers
-        .addressable_panes(project)
-        .ok_or(ClaudeSendError::NoServer)?
+    let servers = app.try_state::<crate::ide::IdeServers>();
+    let mut reachable: std::collections::HashSet<String> = servers
+        .as_ref()
+        .and_then(|servers| servers.addressable_panes(project))
+        .unwrap_or_default()
         .into_iter()
         .collect();
+    if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
+        for entry in cide_core::workspace::session_panes(&ws, Some(project)) {
+            if matches!(
+                cide_core::workspace::pane_harness(entry.pane),
+                cide_ipc::Harness::Codex | cide_ipc::Harness::Opencode
+            ) && registry
+                .get(entry.session)
+                .is_some_and(|pty| !pty.has_exited())
+            {
+                reachable.insert(entry.pane.id.to_string());
+            }
+        }
+    }
 
     /*
      * The asked-for pane when nothing is reachable, so the error names the pane the user
@@ -2291,6 +2366,16 @@ pub fn claude_send_lines(
             .find(|candidate| reachable.contains(&candidate.to_string()))
             .unwrap_or(pane)
     };
+
+    if let Some(sent) = mention_into_composer(
+        &app, &state, project, target, &path, &text, line_start, line_end,
+    ) {
+        return sent.map(|mut sent| {
+            sent.fallback = target != pane;
+            sent
+        });
+    }
+    let servers = servers.ok_or(ClaudeSendError::NoServer)?;
 
     if let (Some(start), Some(end)) = (start, end) {
         // To `target`, never to anyone else, and only once the target is known — a

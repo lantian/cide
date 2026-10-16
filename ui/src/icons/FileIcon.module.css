@@ -51,3 +51,22 @@
   -webkit-user-select: none;
   user-select: none;
 }
+
+.linked {
+  position: relative;
+  display: block;
+  flex: none;
+  width: var(--icon-2);
+  height: var(--icon-2);
+}
+
+.linkBadge {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  transform: translate(25%, 25%);
+  color: var(--text);
+  background: var(--panel);
+  border-radius: var(--r-1);
+  pointer-events: none;
+}

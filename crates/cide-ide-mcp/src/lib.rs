@@ -55,7 +55,7 @@
 //!
 //! `ServerEvent` is the whole outbound vocabulary: `Connected { connection, pid }`,
 //! `Disconnected { connection }`, `DiffRequested(DiffRequest)`,
-//! `DiffWithdrawn { tab_name }`, and `OpenFile { path, start_line, end_line }`.
+//! `DiffWithdrawn { request_id }`, and `OpenFile { path, start_line, end_line }`.
 
 pub mod diff_broker;
 pub mod lockfile;
@@ -69,7 +69,7 @@ pub use protocol::{
     AtMentioned, DiffOutcome, LspDiagnostic, LspPosition, LspRange, OpenDiffParams,
     SelectionChanged, UriDiagnostics,
 };
-pub use server::{Delivery, IdeServer, ServerEvent};
+pub use server::{Delivery, IdeServer, ServerEvent, ToolSession};
 pub use tools::DiagnosticSource;
 
 #[derive(Debug, thiserror::Error)]

@@ -11,6 +11,10 @@ pub struct Plan {
 
 pub fn plan(cli: &OpencodeCli) -> Plan {
     let mut plan = Plan::default();
+    // OpenCode's port-only editor path omits the lockfile's authorization token.
+    // Let its native discovery read the credential; cide routes tools by session.
+    plan.env
+        .extend(IDE_PORT_ENV.map(|name| (name.into(), None)));
     let mut skip_value = false;
     for (index, arg) in cli.args.iter().enumerate() {
         let key = arg.split('=').next().unwrap_or(arg);
@@ -62,6 +66,7 @@ pub fn plan(cli: &OpencodeCli) -> Plan {
             || name.contains('\0')
             || var.value.contains('\0')
             || name.starts_with("CIDE_")
+            || IDE_PORT_ENV.contains(&name)
             || matches!(
                 name,
                 "OPENCODE_CONFIG_CONTENT" | "OPENCODE_SERVER_PASSWORD" | "OPENCODE_SERVER_USERNAME"
@@ -78,6 +83,39 @@ pub fn plan(cli: &OpencodeCli) -> Plan {
     plan
 }
 
+pub const IDE_PORT_ENV: [&str; 2] = ["CLAUDE_CODE_SSE_PORT", "OPENCODE_EDITOR_SSE_PORT"];
+
+/// Insert editor context into the existing composer without submitting a turn.
+/// Keep unsaved text intact; terminal control bytes could end the paste and must be refused.
+pub fn editor_context(
+    path: &std::path::Path,
+    root: Option<&std::path::Path>,
+    text: &str,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<Vec<u8>, String> {
+    let shown = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    let lines = match (start, end) {
+        (Some(a), Some(b)) if a != b => format!(" (lines {a}-{b})"),
+        (Some(a), _) => format!(" (line {a})"),
+        _ => String::new(),
+    };
+    let mut context = format!("@{}{lines} ", shown.display());
+    if start.is_some() && !text.is_empty() {
+        context.push_str("\n\n");
+        context.push_str(text);
+    }
+    if context
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err("The selected context contains terminal control characters and cannot be pasted safely.".into());
+    }
+    Ok(format!("\x1b[200~{context}\x1b[201~").into_bytes())
+}
+
 /// Reuse the executable lookup, with a harness-specific settings hint.
 pub fn resolve(binary: &str) -> Result<std::path::PathBuf, String> {
     crate::claude_cli::resolve(binary).map_err(|e| {
@@ -91,6 +129,61 @@ pub fn resolve(binary: &str) -> Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_ports_cannot_override_authenticated_discovery() {
+        let cli = OpencodeCli {
+            env: IDE_PORT_ENV
+                .iter()
+                .map(|name| cide_ipc::ClaudeEnvVar {
+                    name: (*name).into(),
+                    value: "12345".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let launch = plan(&cli);
+        assert_eq!(launch.env_notes.len(), 2);
+        for name in IDE_PORT_ENV {
+            assert!(launch.env.contains(&(name.into(), None)));
+            assert!(
+                !launch
+                    .env
+                    .iter()
+                    .any(|(key, value)| key == name && value.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn editor_context_preserves_unsaved_lines_without_submitting() {
+        let paste = editor_context(
+            std::path::Path::new("/repo/src/a.rs"),
+            Some(std::path::Path::new("/repo")),
+            "  let value = 7;\n\tunsaved();",
+            Some(10),
+            Some(11),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(paste).unwrap(),
+            "\x1b[200~@src/a.rs (lines 10-11) \n\n  let value = 7;\n\tunsaved();\x1b[201~"
+        );
+        assert!(
+            editor_context(
+                std::path::Path::new("/repo/a"),
+                None,
+                "\x1b[201~\r",
+                Some(1),
+                Some(1)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            editor_context(std::path::Path::new("/repo/a"), None, "", None, None).unwrap(),
+            b"\x1b[200~@/repo/a \x1b[201~"
+        );
+    }
     #[test]
     fn reserved_routing_tokens_and_environment_are_filtered() {
         let cli = OpencodeCli {
@@ -120,8 +213,8 @@ mod tests {
         };
         let filtered = plan(&cli);
         assert_eq!(filtered.args, ["--log-level", "debug"]);
-        assert_eq!(filtered.env.len(), 1);
-        assert_eq!(filtered.env[0].0, "OPENAI_BASE_URL");
+        assert_eq!(filtered.env.len(), 3);
+        assert_eq!(filtered.env[2].0, "OPENAI_BASE_URL");
         assert_eq!(filtered.arg_notes.len(), 5);
         assert_eq!(filtered.env_notes.len(), 1);
     }

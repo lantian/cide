@@ -18219,3 +18219,141 @@ TypeScript, peer-chat, casing and boundary checks pass. The Chromium audit mount
 terminal components with mocked IPC and confirms layout and left-panel input. No paid model
 calls or complete two-agent conversation in the running Cide GUI were used. Ordinary consoles,
 Claude's composer delivery and OpenCode's existing API path keep their launch behavior.
+
+## M178 — Paired reviewers can analyze and read the web
+
+The right panel now retains command execution for independent inspection and temporary
+analysis scripts, including Python over large codebases or datasets. Each reviewer
+invocation owns a private scratch directory, exposed in its environment and instructions;
+failed startup and session termination clean it up, and restoration supplies a fresh one.
+The role still prohibits source/data edits, Git mutations, builds, tests, installation and
+delegation. Claude/OpenCode shell behavior follows reviewer instructions, while dedicated
+editing/delegation tools remain denied. Project and global settings are not rewritten.
+
+Claude uses normal permissions with Bash, WebFetch and WebSearch and disables prompt
+snapshots so restored sessions receive the current policy. OpenCode allows its native
+bash/shell and webfetch/websearch tools, retaining direct peer messaging and denying Code
+Mode's execute wrapper. Codex extends its native read-only profile with scratch-only writes,
+disables approval escalation and enables live web search. Effective-profile validation
+rejects conflicting legacy sandbox settings or additional write roots. Native profile
+forwarding omits absent JSON fields before thread config overrides become TOML, preventing
+fresh and resumed threads from failing on workspace_roots:null.
+
+**Validation:** core reviewer tests, affected application/session/peer tests, native Codex
+protocol tests, TypeScript, peer-chat, Claude CLI, boundary and casing checks pass. Formatting,
+bindings generation and scoped Clippy pass (with the existing type-complexity lint allowed).
+Installed CLI audits use production policies, isolated state and local fake models: Claude
+and OpenCode execute temporary Python scripts and fetch example.com; their search tools
+are exposed and editing/delegation tools hidden. Claude restoration receives fresh scratch
+and current instructions. Codex's native command API permits scratch analysis and rejects
+source/Git writes. Its paired TUI audit verifies fresh/resumed scratch profiles, live-search
+tool exposure, draft preservation, delivery and cleanup. Actual search-provider results,
+macOS runtime behavior and a paid two-agent conversation were not exercised. The debug
+binary was rebuilt. The live IDE was not restarted; existing pairs need a restart to
+receive the new launch policy.
+
+## M179 — Paired OpenCode search runs without a provider picker
+
+Exposing websearch was insufficient on OpenCode 2: an unset native search provider opens
+a first-use form, whose cancellation or one-minute timeout returns `Web search cancelled`.
+Paired reviewers now select OpenCode's native automatic keyless pool in their invocation
+configuration. The user selected this default. OpenCode retains its own provider selection
+and rate-limit failover; no setup forms are auto-answered, no permissions are bypassed,
+and the user's global OpenCode provider selection is not changed. Other sessions keep
+their normal configuration.
+
+**Validation:** the installed-OpenCode audit now actually invokes websearch. It reproduces
+the old error by cancelling the first-use provider form in isolated state, then verifies
+the production keyless-pool setting avoids the form and returns a native search response.
+The successful live query returned 17 result URLs. The audit strips search-provider keys,
+uses a local fake model endpoint and temporary native state, and verifies external reads,
+scratch Python analysis, URL fetching, peer replies and hidden mutation/delegation tools.
+Reviewer policy tests, formatting and whitespace checks pass. No paid model calls or
+messages to real peers were made. Existing paired sessions need a restart with the rebuilt
+backend to receive this invocation-local default.
+
+## M180 — Browse linked folders in the file tree
+
+Project directory symlinks now expand like ordinary folders, including targets outside the
+project. Indexing, the file picker, content search and reveal retain paths through the link.
+A small shared link icon marks linked folders and files; the tree tooltip and accessible
+name identify symbolic links. The existing `TreeRow.symlink` flag carries this information;
+no setting or persisted-data migration is needed.
+
+The walk stops at repeated ancestors and keeps cyclic, broken or unreadable links visible.
+Incremental rescans reconcile changes of entry kind and link target, refresh per-directory
+ignore rules, and preserve an expanded linked folder. Copying a directory into a linked
+alias of its own descendant is refused before writing anything; copying or trashing the
+link itself still acts on the link.
+
+Native, recursive-fallback and polling watches use physical targets and translate events
+back to every logical alias. Backend recursion does not follow links implicitly: explicit
+target watches avoid inotify's last-alias-wins behavior. Parent watches notice replacement
+and recreation of target directories, including initially dangling targets. Unused target
+and parent watches are released when links change.
+
+Validation: filesystem/search suites cover internal, external, relative and nested links,
+multiple aliases, linked project roots, visibility, loop and broken-link recovery, target
+replacement, retargeted ignore rules and copy/rename/trash behavior. The command-layer test
+indexes an external linked folder, finds and reveals its file, reads and saves through its
+logical path, and observes a previously missing linked target through the project watcher.
+`check:symlinks` renders the actual icon in both themes and expansion states. Tree status,
+flicker, selection, drag, clipboard, new-entry, icon, theme, scale and motion checks,
+TypeScript and the production UI build pass. Command-layer checks use an isolated temporary
+`XDG_STATE_HOME`; scratch/notes cases otherwise write to the user's state directory, which
+is read-only in the sandbox. No live Tauri/WebKitGTK display check was run.
+
+## OpenCode IDE integration — 2026-10-16
+
+OpenCode's port-only editor discovery sent no authorization token, then retried every ten
+seconds. Its launches now remove both editor port overrides so native discovery reads the
+existing lockfile and token. Claude and shell discovery keep their existing behavior.
+
+The existing stdio MCP bridge now exposes cide's five IDE tools to interactive OpenCode
+panes. A shared tool session binds calls to the bridge's project and pane, reuses the same
+handlers and diff broker as WebSocket clients, and cancels outstanding work on interruption,
+disconnect or pane shutdown. Reviewer and unattended scopes keep their restrictions.
+OpenCode v2's structured MCP execution timeout preserves the time needed for human diff
+review without extending startup timeouts.
+
+The existing editor-send action pastes file references and unsaved selections into the
+chosen OpenCode composer without submitting. The shared `openFile` handler now uses file
+validation, tab deduplication, window activation and range reveal instead of logging only.
+Diff withdrawal uses request IDs and connection ownership, including saved tabs; a dropped
+tool future cannot leave its diff behind. Non-Claude clients do not update Claude's verified
+handshake record. No new user-facing tools, settings or editor actions were added.
+
+Validation includes the Rust routing, launch, tools and lifecycle tests, editor and diff
+checks, TypeScript and the command/event contract check. The isolated installed-OpenCode
+audit exercises real `cide-hook` transport and shared tools with a fake local model in
+both Code Mode and direct mode. It verifies unsaved composer context and authenticated
+native discovery over 30 seconds per mode, with no authorization rejection or paid calls.
+The audit substitutes the desktop event consumer; a live Tauri window was not exercised.
+
+
+## M181 — Paired reviewer stays out of user attention
+
+Only the paired writer raises Waiting, the notification dot, tab/project waiting counts
+and desktop/remote attention. The frontend filters the reviewer by its durable pane role
+when folding session states, adopting initial attention, consuming broadcasts and applying
+workspace snapshots. Late bindings clear stale markers without waiting for another turn.
+The backend attention-report gate also coerces reviewer reports to false, so stale webviews
+cannot put the reviewer into the shared attention set. Raw session states and native
+permission controls remain available for peer delivery and inspection.
+
+Validation: `check:awaiting` mounts the real pane frames and attention/workspace stores,
+drives both completion and permission states, injects a stale broadcast and restores a
+reviewer session binding. The right pane has no Waiting badge or dot, neither count includes
+it and no true attention report is sent; the writer and ordinary panes still notify and
+acknowledge. Core tests verify reviewer identity across workspace serialization. Nine core
+pair tests and 13 app window/pair tests pass (one unrelated 41-second test remains ignored),
+as do `check:peer-chat`, TypeScript and the production UI build. Formatting, whitespace and
+scoped Clippy checks pass (with the existing type-complexity allowance). The Cide debug
+binary was rebuilt. No live Tauri/WebKitGTK window or OS urgency hint was exercised; the
+running IDE was not restarted.
+
+
+CI follow-up: the shared run reported 138 passes and one Clippy failure in the IDE server's
+file-navigation test recorder. Its nested request tuple now has the name
+`FileOpenRequest`. The full `cargo clippy --locked --workspace --all-targets -- -D warnings`
+check passes without lint allowances; formatting and whitespace checks also pass.
