@@ -572,6 +572,7 @@ fn orchestrator_paragraph(
     // rather than a widened predicate because `is_primary_console_spawn` answers a question
     // about the *console*, and this pane is not one and must not be mistaken for one.
     voice: Option<Voice>,
+    agent_sessions_enabled: bool,
 ) -> Option<String> {
     let state = app.try_state::<crate::workspace_state::WorkspaceState>()?;
     // One lock acquisition, and the disk read happens after it is released: `WorkspaceState::with`
@@ -629,7 +630,13 @@ fn orchestrator_paragraph(
     let agents = cide_agents::load_project(&root);
     let tracker = cide_agents::config::load_tracker(&root);
     if !agents.enabled() {
-        return Some(format!("{} {IDE_SENTENCE}", sessions_paragraph(tracker)));
+        return Some(project_paragraph(
+            None,
+            voice.unwrap_or(inferred),
+            None,
+            tracker,
+            agent_sessions_enabled,
+        ));
     }
 
     let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
@@ -650,16 +657,37 @@ fn orchestrator_paragraph(
                 total: cide_agents::overrides::capacity(ready.map(|(_, r)| r), project_max),
             }
         });
-    let paragraph = roster_paragraph(&roles, voice.unwrap_or(inferred), limits, tracker);
-    // Subagents on, but nobody can be dispatched right now — no roles, or every one refused:
-    // `cide_agent_dispatch` would refuse, and `cide_session_open` is the road (M104).
-    if roles.iter().all(|def| def.unavailable.is_some()) {
-        return Some(format!(
-            "{paragraph} {} {IDE_SENTENCE}",
-            sessions_paragraph(tracker)
-        ));
-    }
-    Some(format!("{paragraph} {IDE_SENTENCE}"))
+    Some(project_paragraph(
+        Some(&roles),
+        voice.unwrap_or(inferred),
+        limits,
+        tracker,
+        agent_sessions_enabled,
+    ))
+}
+
+/// The complete console instructions, testable without a Tauri application. `None` is
+/// subagents off, distinct from an enabled project that simply has no roles yet.
+fn project_paragraph(
+    roles: Option<&[&cide_ipc::AgentDef]>,
+    voice: Voice,
+    limits: Option<Limits>,
+    tracker: bool,
+    agent_sessions_enabled: bool,
+) -> String {
+    let roster = roles
+        .map(|roles| roster_paragraph(roles, voice, limits, tracker))
+        .unwrap_or_default();
+    let sessions = if roles.is_none_or(|roles| roles.iter().all(|def| def.unavailable.is_some())) {
+        sessions_paragraph(tracker, agent_sessions_enabled)
+    } else {
+        ""
+    };
+    [roster.as_str(), sessions, IDE_SENTENCE]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What every pane served the orchestration tools is told about cide itself. (M134)
@@ -747,7 +775,16 @@ const SESSIONS_PARAGRAPH_NO_TRACKER: &str = "This project in cide has no subagen
      CLI for that tab (claude, codex or opencode) when the user asks for one. Each session \
      commits on its own branch; you review the branch and merge it with git.";
 
-fn sessions_paragraph(tracker: bool) -> &'static str {
+fn sessions_paragraph(tracker: bool, agent_sessions_enabled: bool) -> &'static str {
+    // No announcement that the capability is disabled: that would advertise it just as
+    // effectively as naming the tool. Keep only the independent tracker constraint.
+    if !agent_sessions_enabled {
+        return if tracker {
+            ""
+        } else {
+            "This project does not use cide's task tracker: there is no board, and you create no tasks."
+        };
+    }
     if tracker {
         SESSIONS_PARAGRAPH
     } else {
@@ -1530,6 +1567,14 @@ pub(crate) async fn spawn_session(
         .as_ref()
         .is_some_and(|c| c.harness == cide_ipc::Harness::Qwen);
     let is_console = console.is_some() || is_opencode || is_qwen;
+    // One read for every harness, before building any instructions. The same value is
+    // published under the routing id before the child can connect to its MCP bridge.
+    let agent_sessions_enabled = project
+        .and_then(|project| {
+            app.try_state::<crate::workspace_state::WorkspaceState>()
+                .and_then(|state| crate::tasks_state::project_root(&state, project).ok())
+        })
+        .is_some_and(|root| cide_agents::config::load_agent_sessions(&root));
     if resume_picker && !codex_settings.cli.inject.resume {
         return Err(SessionError::Pty(
             "Codex session restoration is disabled in Settings → Harness → Codex.".into(),
@@ -1659,7 +1704,15 @@ pub(crate) async fn spawn_session(
         && plan.inject.has(cide_core::claude_cli::Injection::McpConfig)
         && let Some(project) = project
         && let Some(paragraph) = pair_paragraph.clone().or_else(|| {
-            orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+            orchestrator_paragraph(
+                &app,
+                registry,
+                project,
+                resume,
+                wants_fork(fork),
+                voice,
+                agent_sessions_enabled,
+            )
         })
     {
         if carries_append_system_prompt_file(&plan.args) {
@@ -1752,7 +1805,15 @@ pub(crate) async fn spawn_session(
         let paragraph = if inject.developer_instructions && inject.mcp_config {
             pair_paragraph.clone().or_else(|| {
                 project.and_then(|project| {
-                    orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+                    orchestrator_paragraph(
+                        &app,
+                        registry,
+                        project,
+                        resume,
+                        wants_fork(fork),
+                        voice,
+                        agent_sessions_enabled,
+                    )
                 })
             })
         } else {
@@ -2095,12 +2156,21 @@ pub(crate) async fn spawn_session(
     } else {
         None
     };
+    let agent_sessions_launch = registry.prepare_agent_sessions(id, agent_sessions_enabled);
     let opencode = if is_opencode {
         let instructions = pair_paragraph
             .clone()
             .or_else(|| {
                 project.and_then(|project| {
-                    orchestrator_paragraph(&app, registry, project, resume, wants_fork(fork), voice)
+                    orchestrator_paragraph(
+                        &app,
+                        registry,
+                        project,
+                        resume,
+                        wants_fork(fork),
+                        voice,
+                        agent_sessions_enabled,
+                    )
                 })
             })
             .map(|text| text.replace("mcp__cide__", "cide_"));
@@ -2200,6 +2270,7 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert_prompted(id, Arc::clone(&session), opening_prompt);
+    agent_sessions_launch.commit();
     if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork)) {
         registry.note_native_conversation(id, conversation.clone());
     }
@@ -2974,6 +3045,53 @@ mod tests {
     use super::*;
     use cide_core::claude_cli::Injected;
 
+    #[test]
+    fn agent_sessions_opt_out_removes_the_complete_console_guidance() {
+        let available = role("developer", "Develops.");
+        let mut unavailable = role("qa", "Checks.");
+        unavailable.unavailable = Some("not installed".into());
+        let enabled_roles = [&available];
+        let refused_roles = [&unavailable];
+        for tracker in [false, true] {
+            for voice in [Voice::ProductOwner, Voice::Pane, Voice::Acting] {
+                for roles in [
+                    None,
+                    Some([].as_slice()),
+                    Some(enabled_roles.as_slice()),
+                    Some(refused_roles.as_slice()),
+                ] {
+                    let text = project_paragraph(roles, voice, None, tracker, false);
+                    assert!(!text.contains("cide_session_open"), "{text}");
+                    assert!(
+                        !text.contains("you can still run work in parallel"),
+                        "{text}"
+                    );
+                    assert!(
+                        !text.contains("`harness` picks the CLI for that tab"),
+                        "{text}"
+                    );
+                    assert!(text.contains(IDE_SENTENCE));
+                    if roles.is_none() {
+                        assert!(!text.contains("cide_agent_dispatch"), "{text}");
+                    } else {
+                        assert!(text.contains("cide_agent_dispatch"), "{text}");
+                    }
+                    if !tracker {
+                        assert!(text.contains("create no tasks"), "{text}");
+                    }
+                    let enabled = project_paragraph(roles, voice, None, tracker, true);
+                    assert_eq!(
+                        enabled.contains("cide_session_open"),
+                        roles.is_none_or(|roles| roles
+                            .iter()
+                            .all(|role| role.unavailable.is_some())),
+                        "{enabled}"
+                    );
+                }
+            }
+        }
+    }
+
     // --- the roster paragraph ---------------------------------------------------------------
 
     fn role(id: &str, description: &str) -> cide_ipc::AgentDef {
@@ -3452,9 +3570,9 @@ mod tests {
             );
         }
         for needle in ["cide_task_", "board task"] {
-            assert!(!sessions_paragraph(false).contains(needle));
+            assert!(!sessions_paragraph(false, true).contains(needle));
         }
-        assert!(sessions_paragraph(true).contains("cide_task_list"));
+        assert!(sessions_paragraph(true, true).contains("cide_task_list"));
     }
 
     #[test]

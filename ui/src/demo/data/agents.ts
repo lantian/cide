@@ -189,6 +189,7 @@ export const CONFIG: OrchestrationConfig = {
   verifyRetries: 3,
   resumeAfterRestart: true,
   trackerEnabled: true,
+  agentSessionsEnabled: true,
   review: 'batch',
   reviewBatch: 3,
   reviewAfterSecs: 600,

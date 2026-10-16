@@ -7433,6 +7433,11 @@ resumeAfterRestart: boolean,
  */
 trackerEnabled: boolean, 
 /**
+ * `agentSessions.enabled`: permit ad hoc harness tabs independently of role dispatch.
+ * Captured when a harness launches; not exposed through agent configuration tools.
+ */
+agentSessionsEnabled: boolean, 
+/**
  * `agents.review`: one review tab per finished run, or one for a batch. (M132)
  */
 review: ReviewMode, 
@@ -7515,6 +7520,10 @@ resumeAfterRestart?: boolean,
  * tool, `enabled`'s reason: a model must not switch its own board back on.
  */
 trackerEnabled?: boolean, 
+/**
+ * The user's project switch for ad hoc harness tabs. Not writable through agent tools.
+ */
+agentSessionsEnabled?: boolean, 
 /**
  * `agents.review`. (M132)
  */

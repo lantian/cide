@@ -945,6 +945,7 @@ impl AgentsConfig {
             // ([`wire_for`]). False here is what a caller that forgot would draw — a hidden
             // board, which is loud — rather than a board the project switched off.
             tracker_enabled: false,
+            agent_sessions_enabled: true,
             review: self.review,
             review_batch: self.review_batch,
             review_after_secs: self.review_after_secs,
@@ -1211,7 +1212,27 @@ pub fn write_milestones(project_root: &Path, plan: &cide_ipc::MilestonePlan) -> 
 pub fn wire_for(project_root: &Path) -> OrchestrationConfig {
     let mut wire = load(project_root).agents.to_wire();
     wire.tracker_enabled = load_tracker(project_root);
+    wire.agent_sessions_enabled = load_agent_sessions(project_root);
     wire
+}
+
+/// Independent of `agents.enabled`: projects without roles may still use ad hoc sessions.
+/// Absent keys preserve the existing default-on behavior. Read separately, like the tracker,
+/// so an unrelated malformed agents block cannot undo an explicit opt-out.
+pub fn load_agent_sessions(project_root: &Path) -> bool {
+    std::fs::read(config_path(project_root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|doc| doc.get("agentSessions")?.get("enabled")?.as_bool())
+        .unwrap_or(true)
+}
+
+pub fn write_agent_sessions(project_root: &Path, enabled: bool) -> io::Result<()> {
+    write_key(
+        project_root,
+        "agentSessions",
+        Some(json!({ "enabled": enabled })),
+    )
 }
 
 /// Whether this project uses the task tracker and milestones: the `tracker` key of
@@ -1515,6 +1536,39 @@ mod tests {
     fn put(root: &Path, text: &str) {
         std::fs::create_dir_all(cide_dir(root)).expect("cide dir");
         std::fs::write(config_path(root), text).expect("config");
+    }
+
+    #[test]
+    fn agent_sessions_default_on_and_remain_independent_of_subagents() {
+        let root = temp("agent-sessions");
+        let other = temp("agent-sessions-other");
+        assert!(load_agent_sessions(&root));
+        assert!(wire_for(&root).agent_sessions_enabled);
+        for agents in [false, true] {
+            put(&root, &json!({ "agents": { "enabled": agents }, "tracker": { "enabled": true }, "future": 7 }).to_string());
+            assert!(load_agent_sessions(&root));
+            write_agent_sessions(&root, false).unwrap();
+            assert!(!load_agent_sessions(&root));
+            assert!(!wire_for(&root).agent_sessions_enabled);
+            // Other settings writes must not overwrite the opt-out.
+            write(&root, &load(&root)).unwrap();
+            write_tracker(&root, false).unwrap();
+            assert!(!load_agent_sessions(&root));
+            let doc: Value =
+                serde_json::from_slice(&std::fs::read(config_path(&root)).unwrap()).unwrap();
+            assert_eq!(doc["agents"]["enabled"], agents);
+            assert_eq!(doc["future"], 7);
+            assert!(load_agent_sessions(&other));
+            write_agent_sessions(&root, true).unwrap();
+            assert!(load_agent_sessions(&root));
+        }
+        put(
+            &root,
+            r#"{"agents":{"enabled":"typo"},"agentSessions":{"enabled":false}}"#,
+        );
+        assert!(!load_agent_sessions(&root));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
     }
 
     /// Absent key: on for a project that already has a board or milestones, off for a fresh one;

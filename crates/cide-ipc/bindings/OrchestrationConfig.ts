@@ -117,6 +117,11 @@ resumeAfterRestart: boolean,
  */
 trackerEnabled: boolean, 
 /**
+ * `agentSessions.enabled`: permit ad hoc harness tabs independently of role dispatch.
+ * Captured when a harness launches; not exposed through agent configuration tools.
+ */
+agentSessionsEnabled: boolean, 
+/**
  * `agents.review`: one review tab per finished run, or one for a batch. (M132)
  */
 review: ReviewMode, 

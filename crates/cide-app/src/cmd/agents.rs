@@ -194,6 +194,7 @@ pub async fn agents_config_set(
         // Not an `agents` key: written on its own, explicitly, so the derived default
         // (`config::load_tracker`) can never flip a switch the user set.
         let tracker = patch.tracker_enabled;
+        let agent_sessions = patch.agent_sessions_enabled;
         file.agents.apply(patch);
 
         // Only the *gesture that enables* is gated. A project already switched on by hand keeps
@@ -210,6 +211,9 @@ pub async fn agents_config_set(
         config::write(&root, &file)?;
         if let Some(enabled) = tracker {
             config::write_tracker(&root, enabled)?;
+        }
+        if let Some(enabled) = agent_sessions {
+            config::write_agent_sessions(&root, enabled)?;
         }
         // Built after the write, from the file that is now on disk, so the roster the other
         // windows are handed and the config this call answers with cannot disagree about what

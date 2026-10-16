@@ -1002,6 +1002,12 @@ pub enum Stopped {
 /// before any tool is served, so nothing here names a project and nothing here can reach another
 /// one. That is what makes the scoping structural rather than prompted.
 pub trait AgentSink: Send + Sync {
+    /// The calling harness's launch-time capability, shared with its prompt and MCP list.
+    /// This is deliberately not the current on-disk setting: existing processes keep access.
+    fn agent_sessions_enabled(&self) -> bool {
+        true
+    }
+
     /// Every role this project defines, with `unavailable` already answered by
     /// `cide_agents::dispatch_refusal` — so a role that cannot be dispatched right now carries
     /// the sentence saying why, and a caller here never re-derives that conjunction.
@@ -1714,8 +1720,7 @@ pub fn description(name: &str) -> &'static str {
              when it has an id or URL) instead of `task`, and still gets its own worktree. \
              `harness` and `model` run this one dispatch on another CLI or model without \
              changing the role. Every run opens in a tab of its own that the user can watch and \
-             type into; closing that tab does not stop the run. This is only for a project that \
-             has roles: without any, open a session per piece of work with cide_session_open."
+             type into; closing that tab does not stop the run."
         }
         tool::SESSION_OPEN => {
             "Open a new tab in cide running a coding agent on **one piece of work, in a git \
@@ -5069,6 +5074,13 @@ fn render_definition(draft: &AgentDraft) -> String {
 
 /// Patch `.cide/config.json`'s two settable keys. (M71)
 fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    // UI-only, and refused by name as well as absent from the schema. Do not turn a guessed
+    // field into a tutorial about a capability this harness was intentionally never given.
+    if arguments.get("agentSessionsEnabled").is_some() {
+        return ToolResult::error(
+            "This field cannot be changed through this tool. Nothing was written.",
+        );
+    }
     // Refused by name rather than ignored. A property this schema does not declare is still a
     // property most clients will send, and a model that asked to enable subagents and got a
     // cheerful answer about `maxConcurrent` would believe it had.
@@ -6263,13 +6275,13 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         // Appended rather than substituted, so the sink's own sentence — which says *why* this
         // role or this project cannot be dispatched — is never lost.
         Err(why) => ToolResult::error(match mode_of(&sink.agents()) {
-            Mode::Sessions => format!(
+            Mode::Sessions if sink.agent_sessions_enabled() => format!(
                 "{}: {why}\nThis project has no role that can be dispatched right now, so open a \
                  session per piece of work with {} instead.",
                 tool::AGENT_DISPATCH,
                 tool::SESSION_OPEN
             ),
-            Mode::Dispatch => format!("{}: {why}", tool::AGENT_DISPATCH),
+            _ => format!("{}: {why}", tool::AGENT_DISPATCH),
         }),
     }
 }
@@ -6336,6 +6348,9 @@ fn chosen_harness(
 
 /// `cide_session_open`: one tab, one worktree, one piece of work. (M104)
 fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    if !sink.agent_sessions_enabled() {
+        return ToolResult::error("no such tool");
+    }
     // The rule first, before anything is parsed: a caller on the wrong road is told which road
     // is right regardless of what it asked for.
     let roster = sink.agents();
@@ -11351,6 +11366,9 @@ mod tests {
     }
 
     impl AgentSink for FakeAgents {
+        fn agent_sessions_enabled(&self) -> bool {
+            self.config.lock().agent_sessions_enabled
+        }
         fn agents(&self) -> Result<Vec<AgentDef>, String> {
             match &self.broken {
                 Some(why) => Err(why.clone()),
@@ -11974,6 +11992,57 @@ mod tests {
         // The default is said back, so a caller that never thought about `notify` still knows
         // where to expect the knock.
         assert!(text.contains("announced here"), "{text}");
+    }
+
+    #[test]
+    fn agent_sessions_opt_out_blocks_work_and_hides_dispatch_fallbacks() {
+        for sink in [
+            roster(),
+            FakeAgents::broken("subagents are off for this project"),
+            FakeAgents {
+                defs: vec![],
+                ..roster()
+            },
+            FakeAgents {
+                defs: vec![def("qa", "QA", "Checks.", Some("not installed"))],
+                ..roster()
+            },
+        ] {
+            sink.config.lock().agent_sessions_enabled = false;
+            for args in [
+                json!({}),
+                json!({"title":"Do work", "brief":"Implement it"}),
+            ] {
+                let result = ask(tool::SESSION_OPEN, args, &sink);
+                assert!(result.is_error);
+                assert_eq!(text_of(&result), "no such tool");
+                assert!(sink.sessions.lock().is_empty());
+            }
+            let result = ask(
+                tool::AGENT_DISPATCH,
+                json!({"agent":"developer", "task":"t-7"}),
+                &sink,
+            );
+            assert!(!text_of(&result).contains(tool::SESSION_OPEN));
+            assert!(!description(tool::AGENT_DISPATCH).contains(tool::SESSION_OPEN));
+            // The tab opt-out does not switch working role dispatch off.
+            assert_eq!(result.is_error, sink.broken.is_some());
+            for name in [tool::AGENTS_LIST, tool::AGENTS_CONFIG] {
+                let result = ask(name, json!({}), &sink);
+                let text = text_of(&result);
+                assert!(!text.contains(tool::SESSION_OPEN), "{text}");
+                assert!(!text.contains("agentSessionsEnabled"), "{text}");
+            }
+            let before = sink.config.lock().clone();
+            let result = ask(
+                tool::AGENTS_CONFIG,
+                json!({"agentSessionsEnabled":true, "maxConcurrent":9}),
+                &sink,
+            );
+            assert!(result.is_error);
+            assert!(!text_of(&result).contains(tool::SESSION_OPEN));
+            assert_eq!(*sink.config.lock(), before);
+        }
     }
 
     /// The user's rule (M104): roles exist → dispatch, and only dispatch.

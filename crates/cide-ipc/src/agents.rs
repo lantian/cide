@@ -740,6 +740,9 @@ pub struct OrchestrationConfig {
     /// default rule (absent: on only when the project already has a board or milestones). Off,
     /// agents are not told about the board and get none of its tools.
     pub tracker_enabled: bool,
+    /// `agentSessions.enabled`: permit ad hoc harness tabs independently of role dispatch.
+    /// Captured when a harness launches; not exposed through agent configuration tools.
+    pub agent_sessions_enabled: bool,
     /// `agents.review`: one review tab per finished run, or one for a batch. (M132)
     pub review: ReviewMode,
     /// `agents.reviewBatch`: how many finished tasks open a batch review. (M132)
@@ -786,6 +789,7 @@ impl Default for OrchestrationConfig {
             verify_retries: 3,
             resume_after_restart: true,
             tracker_enabled: false,
+            agent_sessions_enabled: true,
             review: ReviewMode::Batch,
             review_batch: 3,
             review_after_secs: 600,
@@ -853,6 +857,9 @@ pub struct OrchestrationPatch {
     /// tool, `enabled`'s reason: a model must not switch its own board back on.
     #[ts(optional)]
     pub tracker_enabled: Option<bool>,
+    /// The user's project switch for ad hoc harness tabs. Not writable through agent tools.
+    #[ts(optional)]
+    pub agent_sessions_enabled: Option<bool>,
     /// `agents.review`. (M132)
     #[ts(optional)]
     pub review: Option<ReviewMode>,
@@ -2105,6 +2112,7 @@ mod tests {
         // The default that keeps an upgrade from spawning anything in somebody's repository.
         let cfg = OrchestrationConfig::default();
         assert!(!cfg.enabled);
+        assert!(cfg.agent_sessions_enabled);
         assert_eq!(cfg.max_concurrent, 2);
         assert_eq!(cfg.harness, Harness::Claude);
     }

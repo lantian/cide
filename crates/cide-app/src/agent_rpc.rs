@@ -370,6 +370,13 @@ enum Scope {
 /// same reason, and it is why [`respond`] has tests at all.
 pub(crate) trait ToolAccess: Send + Sync {
     fn names(&self) -> &[&'static str];
+    fn agent_sessions_enabled(&self) -> bool {
+        true
+    }
+    fn allows(&self, name: &str) -> bool {
+        self.names().contains(&name)
+            && (name != tools::tool::SESSION_OPEN || self.agent_sessions_enabled())
+    }
     fn call(&self, name: &str, arguments: &Value) -> ToolResult;
     fn call_cancellable(
         &self,
@@ -390,6 +397,9 @@ struct PeerTools {
     names: Vec<&'static str>,
 }
 impl ToolAccess for PeerTools {
+    fn agent_sessions_enabled(&self) -> bool {
+        self.base.agent_sessions_enabled()
+    }
     fn names(&self) -> &[&'static str] {
         &self.names
     }
@@ -476,6 +486,10 @@ struct ProjectTools {
 }
 
 impl ToolAccess for ProjectTools {
+    fn agent_sessions_enabled(&self) -> bool {
+        self.session
+            .is_some_and(|session| agent_sessions_enabled(&self.app, session))
+    }
     fn names(&self) -> &[&'static str] {
         match (self.orchestrator, self.tracker) {
             (true, true) => tools::tool::EVERY,
@@ -1051,6 +1065,9 @@ impl RegistrySink {
 }
 
 impl AgentSink for RegistrySink {
+    fn agent_sessions_enabled(&self) -> bool {
+        agent_sessions_enabled(&self.app, self.session)
+    }
     fn agents(&self) -> Result<Vec<AgentDef>, String> {
         // `project_roster` and not `cide_agents::load_project`, so the `unavailable` sentence a
         // role carries here is the same string the Agents panel is drawing — one wording for one
@@ -1926,6 +1943,13 @@ fn gone() -> &'static str {
 /// `None` means the connection sent no usable header, which is a scope of its own — see [`serve`].
 type Binder = dyn Fn(Option<&Hello>) -> Box<dyn ToolAccess> + Send + Sync;
 
+/// Read the launch snapshot, including on a reconnect. Never re-read the project's current
+/// switch here: the prompt and a client's cached tool list belong to the process that launched.
+fn agent_sessions_enabled(app: &AppHandle, session: SessionId) -> bool {
+    app.try_state::<crate::state::SessionRegistry>()
+        .is_some_and(|registry| registry.agent_sessions_enabled(session))
+}
+
 /// The production binder: resolve the header against the live workspace.
 fn app_binder(app: AppHandle) -> Arc<Binder> {
     Arc::new(move |hello: Option<&Hello>| -> Box<dyn ToolAccess> {
@@ -2566,7 +2590,6 @@ fn respond(inbound: &Inbound, access: &dyn ToolAccess) -> Option<Value> {
 /// client then shows a server with no tools, which is the honest picture and the one state
 /// `cide_hook::mcp` degrades into on its own when cide is not running at all.
 fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
-    let allowed = access.names();
     // The review vocabulary is a family of its own (M85) and joins the list here, where the
     // per-connection filter already is — one place deciding what a connection sees.
     tools::descriptors()
@@ -2581,7 +2604,7 @@ fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
         .filter(|entry| {
             entry["name"]
                 .as_str()
-                .is_some_and(|name| allowed.contains(&name))
+                .is_some_and(|name| access.allows(name))
         })
         .collect()
 }
@@ -2604,7 +2627,7 @@ fn call_tool_cancellable(
     // `tools/list`, which is a mistake about the server rather than about the work. It is also
     // the enforcement half of the scoping — an unscoped connection that guesses a tool name gets
     // nothing, whatever it guesses.
-    if !access.names().contains(&name) {
+    if !access.allows(name) {
         return err(id, METHOD_NOT_FOUND, &format!("no such tool: {name}"));
     }
     let arguments = params
@@ -5504,6 +5527,55 @@ mod tests {
 
     fn ask(raw: &str, access: &dyn ToolAccess) -> Option<Value> {
         respond(&classify(raw), access)
+    }
+
+    #[test]
+    fn agent_sessions_opt_out_hides_the_tool_and_rejects_guessed_calls() {
+        struct Access {
+            base: FakeAccess,
+            enabled: bool,
+        }
+        impl ToolAccess for Access {
+            fn names(&self) -> &[&'static str] {
+                self.base.names()
+            }
+            fn agent_sessions_enabled(&self) -> bool {
+                self.enabled
+            }
+            fn call(&self, name: &str, arguments: &Value) -> ToolResult {
+                self.base.call(name, arguments)
+            }
+        }
+        for tracker in [false, true] {
+            for enabled in [false, true] {
+                let access = Access {
+                    base: FakeAccess {
+                        names: if tracker {
+                            tools::tool::EVERY
+                        } else {
+                            tools::tool::ORCHESTRATION_NO_TRACKER
+                        }
+                        .to_vec(),
+                        calls: Mutex::new(Vec::new()),
+                    },
+                    enabled,
+                };
+                let listed =
+                    ask(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &access).unwrap();
+                let text = listed.to_string();
+                assert_eq!(text.contains(tools::tool::SESSION_OPEN), enabled);
+                assert!(!text.contains("agentSessionsEnabled"));
+                assert!(text.contains(tools::tool::AGENT_DISPATCH));
+                let result = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cide_session_open","arguments":{"title":"Work","brief":"Do it"}}}"#, &access).unwrap();
+                if enabled {
+                    assert!(result.get("result").is_some());
+                    assert_eq!(access.base.calls.lock().len(), 1);
+                } else {
+                    assert_eq!(result["error"]["code"], METHOD_NOT_FOUND);
+                    assert!(access.base.calls.lock().is_empty());
+                }
+            }
+        }
     }
 
     #[test]

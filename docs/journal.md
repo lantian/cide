@@ -18126,3 +18126,31 @@ separate xclip process on a private X display, and the enclosing React pane menu
 This verifies browser export/decode and native paste; it does not exercise the complete running
 cide IPC route, a detached cide tab, macOS or Wayland. Independent-window installation is
 covered by the automated adapter check.
+
+## M175 — Project control of ad hoc harness tabs
+
+Settings → Agents → Project now has **Allow agents to open harness tabs**, on by default.
+It writes `agentSessions.enabled` beside `agents` in `.cide/config.json`; projects without
+the key keep their existing behavior. This is independent of the subagents switch, which
+still gates dispatching configured roles.
+
+Off means a newly launched harness gets no `cide_session_open` tool or prompt guidance for
+ad hoc tabs. Guessed calls are rejected before creating a worktree, tab or child. Dispatch
+errors stop suggesting that fallback, and the dispatch tool's unconditional cross-reference
+is gone. The setting is absent from agent-facing schemas and configuration output, and an
+agent cannot change it through the configuration tool.
+
+The capability is captured once for a harness launch and shared by its injected instructions
+and MCP authorization. It is published before the child can connect, survives MCP reconnects
+and conversation clears, and is rolled back if launching fails. Running processes retain
+their captured access; a subsequent launch reads the new setting. Resuming an old conversation
+cannot erase guidance already in its transcript; use a fresh conversation for clean history.
+
+Verified: configuration defaults, project independence and preservation; the prompt matrix
+across tracker states, roles and console identities; tool-list omission, guessed-call refusal,
+configuration output and dispatch fallbacks; launch/reconnect/cleanup policy; 165 application
+tests and 467 agent unit tests (five deliberate ignores); IPC tests and generated bindings;
+TypeScript and the Settings/UI checks. The local HTTP test and editor check passed when rerun
+outside the sandbox. Strict clippy remains blocked by existing `large_enum_variant`,
+`type_complexity` and `collapsible_if` findings in the conversation, remote and hooks code.
+The Settings toggle has not been exercised in a running GUI.

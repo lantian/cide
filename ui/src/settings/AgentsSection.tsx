@@ -1058,6 +1058,24 @@ function AgentsEditor({
             checked={config.trackerEnabled}
             onChange={(next) => patchConfig({ trackerEnabled: next })}
           />
+          <ToggleRow
+            label="Allow agents to open harness tabs"
+            hint="Let agents start ad hoc work in a new harness tab."
+            info={
+              <>
+                <InfoPara>
+                  Off: newly launched harness sessions receive no tool or instructions for
+                  opening ad hoc harness tabs. Changes apply on the next harness launch;
+                  running sessions keep their current access.
+                </InfoPara>
+                <InfoPara>
+                  Configured role dispatch is controlled separately by this project’s subagents switch.
+                </InfoPara>
+              </>
+            }
+            checked={config.agentSessionsEnabled}
+            onChange={(next) => patchConfig({ agentSessionsEnabled: next })}
+          />
           <SettingRow
             label="Concurrent runs"
             hint="Subagent runs live across this project at once."

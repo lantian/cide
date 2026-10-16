@@ -113,6 +113,7 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   // --- Agents ---
   // Agents — This project
   { section: 'agents', tab: 'project', label: 'Task tracker & milestones', keywords: 'board tasks milestones openspec config.json tracker' },
+  { section: 'agents', tab: 'project', label: 'Allow agents to open harness tabs', keywords: 'session ad hoc new tab harness parallel agentSessions config.json' },
   { section: 'agents', tab: 'project', label: 'Concurrent runs', keywords: 'parallel max concurrent subagents runs at once limit' },
   { section: 'agents', tab: 'project', label: 'Comment limit, characters', keywords: 'comment length report task subagent' },
   { section: 'agents', tab: 'project', label: 'Continue interrupted runs when cide starts', keywords: 'resume restart relaunch interrupted runs' },

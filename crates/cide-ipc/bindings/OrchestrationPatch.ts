@@ -62,6 +62,10 @@ resumeAfterRestart?: boolean,
  */
 trackerEnabled?: boolean, 
 /**
+ * The user's project switch for ad hoc harness tabs. Not writable through agent tools.
+ */
+agentSessionsEnabled?: boolean, 
+/**
  * `agents.review`. (M132)
  */
 review?: ReviewMode, 

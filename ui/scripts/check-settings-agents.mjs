@@ -207,6 +207,9 @@ try {
   const sectionsTsx = read('../src/settings/sections.tsx')
   const sectionTsx = read('../src/settings/AgentsSection.tsx')
   const sectionCode = stripComments(sectionTsx)
+  ok(sectionCode.includes('checked={config.agentSessionsEnabled}') &&
+    sectionCode.includes('patchConfig({ agentSessionsEnabled: next })'),
+    'the project harness-tab switch displays and patches the backend value')
   const clientTs = read('../src/ipc/client.ts')
   const storeTs = read('../src/sidebar/agentsStore.ts')
   const storeCode = stripComments(storeTs)

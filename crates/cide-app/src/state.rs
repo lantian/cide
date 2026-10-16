@@ -33,6 +33,39 @@ pub struct SessionRegistry {
     conversations: DashMap<SessionId, Conversation>,
     native_conversations: DashMap<SessionId, cide_ipc::HarnessSession>,
     resume_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Ad hoc tab access captured before a harness launches. Kept across MCP reconnects,
+    /// replaced by the next launch, never persisted with a conversation's history.
+    agent_sessions: DashMap<SessionId, bool>,
+}
+
+/// A child may connect before its PTY is published. Publish the capability first, but undo
+/// that publication on any launch error so a failed restart cannot change the old process.
+pub(crate) struct AgentSessionsLaunch<'a> {
+    registry: &'a SessionRegistry,
+    session: SessionId,
+    previous: Option<bool>,
+    committed: bool,
+}
+
+impl AgentSessionsLaunch<'_> {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AgentSessionsLaunch<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            match self.previous {
+                Some(enabled) => {
+                    self.registry.agent_sessions.insert(self.session, enabled);
+                }
+                None => {
+                    self.registry.agent_sessions.remove(&self.session);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +144,25 @@ pub struct AttachmentKey {
 }
 
 impl SessionRegistry {
+    pub(crate) fn prepare_agent_sessions(
+        &self,
+        session: SessionId,
+        enabled: bool,
+    ) -> AgentSessionsLaunch<'_> {
+        AgentSessionsLaunch {
+            registry: self,
+            session,
+            previous: self.agent_sessions.insert(session, enabled),
+            committed: false,
+        }
+    }
+
+    pub(crate) fn agent_sessions_enabled(&self, session: SessionId) -> bool {
+        self.agent_sessions
+            .get(&session)
+            .is_some_and(|enabled| *enabled)
+    }
+
     pub fn insert(&self, id: SessionId, session: Arc<PtySession>) {
         self.insert_prompted(id, session, false);
     }
@@ -292,6 +344,7 @@ impl SessionRegistry {
         self.harnesses.remove(&id);
         self.conversations.remove(&id);
         self.native_conversations.remove(&id);
+        self.agent_sessions.remove(&id);
         self.sessions.remove(&id).map(|(_, v)| v)
     }
 
@@ -361,6 +414,39 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_sessions_policy_lasts_until_the_next_successful_launch() {
+        let registry = SessionRegistry::default();
+        let session = SessionId::new();
+        assert!(!registry.agent_sessions_enabled(session));
+        {
+            let _failed = registry.prepare_agent_sessions(session, true);
+            assert!(
+                registry.agent_sessions_enabled(session),
+                "visible before the child connects"
+            );
+        }
+        assert!(!registry.agent_sessions_enabled(session));
+        registry.prepare_agent_sessions(session, true).commit();
+        // MCP reconnects read the same snapshot, rather than a changed project config.
+        assert!(registry.agent_sessions_enabled(session));
+        registry.note_codex_clear(session);
+        assert!(
+            registry.agent_sessions_enabled(session),
+            "clearing a conversation is not a new process"
+        );
+        {
+            let _failed_restart = registry.prepare_agent_sessions(session, false);
+            assert!(!registry.agent_sessions_enabled(session));
+        }
+        assert!(registry.agent_sessions_enabled(session));
+        registry.prepare_agent_sessions(session, false).commit();
+        assert!(!registry.agent_sessions_enabled(session));
+        registry.prepare_agent_sessions(session, true).commit();
+        registry.remove(session);
+        assert!(!registry.agent_sessions_enabled(session));
+    }
     #[test]
     fn continuation_admission_is_shared_by_identity_and_separate_between_harnesses() {
         let registry = SessionRegistry::default();
