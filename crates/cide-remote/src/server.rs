@@ -2385,6 +2385,11 @@ async fn send_snapshot(
     // again behind them rather than overwritten by them. See `Ordered`.
     let mark = inner.mark();
     let (rev, open) = ask(inner, |host| host.projects()).await;
+    let projects = if projects.is_empty() {
+        open.iter().map(|project| project.id).collect()
+    } else {
+        projects
+    };
     say(
         out,
         None,
@@ -2406,30 +2411,10 @@ async fn send_snapshot(
     // project's consoles could not show any project's agents, and the two screens disagreed
     // about what the device was looking at. A device filters by project locally, exactly as it
     // already does for sessions.
-    for project in interests(inner, &projects).await {
+    for project in projects {
         send_project(out, inner, project).await?;
     }
     Ok(())
-}
-
-/// Which projects a subscription covers.
-///
-/// An empty subscription means *everything*, which is `sessions(None)`'s rule and has to stay
-/// the same rule here — two spellings of "all" is how one screen ends up showing a project the
-/// other does not.
-async fn interests(
-    inner: &Arc<Inner>,
-    subscribed: &[cide_ipc::ProjectId],
-) -> Vec<cide_ipc::ProjectId> {
-    if !subscribed.is_empty() {
-        return subscribed.to_vec();
-    }
-    ask(inner, |host| host.projects())
-        .await
-        .1
-        .into_iter()
-        .map(|project| project.id)
-        .collect()
 }
 
 /// The three per-project reads, together.
@@ -4197,7 +4182,15 @@ mod tests {
         for _ in 0..3 {
             heard(&mut ws).await.expect("the snapshot");
         }
+        // Hello also sends per-project frames after the awaiting set. A reply on the
+        // same connection establishes that the entire snapshot has finished.
+        say(&mut ws, Some(2), ClientBody::Ping).await;
+        assert!(matches!(heard(&mut ws).await, Some(ServerBody::Pong)));
         let after_snapshot = h.host.projects_asked.load(Ordering::Relaxed);
+        assert_eq!(
+            after_snapshot, 1,
+            "the snapshot should reuse its projects read"
+        );
 
         for rev in 1..=8 {
             h.server.notify(RemoteEvent::WorkspaceRev { rev });

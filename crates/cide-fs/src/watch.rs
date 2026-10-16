@@ -285,8 +285,56 @@ fn enospc_reason(watched: usize) -> String {
 /// and the two instantiations are different types; there are exactly two and there will not
 /// be a third.
 enum Inner {
-    Native(Debouncer<RecommendedWatcher, RecommendedCache>),
+    Native(Debouncer<LiveCreates<RecommendedWatcher>, RecommendedCache>),
     Polling(Debouncer<notify::PollWatcher, RecommendedCache>),
+}
+
+/// FSEvents can repeat an old create flag alongside a removal. Debouncer 0.7
+/// cancels create/remove pairs, swallowing the deletion even for an existing watch.
+/// Discard creates for entries already gone before they reach the debouncer.
+/// See https://github.com/notify-rs/notify/pull/900.
+struct LiveCreates<W>(W);
+
+impl<W: notify::Watcher> notify::Watcher for LiveCreates<W> {
+    fn new<F: notify::EventHandler>(
+        mut handler: F,
+        config: notify::Config,
+    ) -> notify::Result<Self> {
+        W::new(
+            move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = &event
+                    && event.kind.is_create()
+                    && !event.paths.is_empty()
+                    && event.paths.iter().all(|path| {
+                        // A dangling symlink is still a newly created entry.
+                        std::fs::symlink_metadata(path)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    })
+                {
+                    return;
+                }
+                handler.handle_event(event);
+            },
+            config,
+        )
+        .map(Self)
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        self.0.watch(path, mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.0.unwatch(path)
+    }
+
+    fn configure(&mut self, config: notify::Config) -> notify::Result<bool> {
+        self.0.configure(config)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        W::kind()
+    }
 }
 
 struct Backend {
@@ -431,19 +479,20 @@ impl Backend {
         }
 
         let per_directory = config.dirs.len() <= config.max_dir_watches;
-        let debouncer = match new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
-            config.debounce,
-            None,
-            tx.clone(),
-            RecommendedCache::new(),
-            notify::Config::default().with_follow_symlinks(false),
-        ) {
-            Ok(d) => d,
-            Err(err) => {
-                let reason = format!("The native file watcher could not start ({err}).");
-                return Self::start_polling(config, tx, reason);
-            }
-        };
+        let debouncer =
+            match new_debouncer_opt::<_, LiveCreates<RecommendedWatcher>, RecommendedCache>(
+                config.debounce,
+                None,
+                tx.clone(),
+                RecommendedCache::new(),
+                notify::Config::default().with_follow_symlinks(false),
+            ) {
+                Ok(d) => d,
+                Err(err) => {
+                    let reason = format!("The native file watcher could not start ({err}).");
+                    return Self::start_polling(config, tx, reason);
+                }
+            };
 
         let mut backend = Self {
             inner: Inner::Native(debouncer),
@@ -823,6 +872,77 @@ impl Coalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replay FSEvents' create flag, followed by its remove flag when the entry is gone.
+    struct ReplayWatcher(Box<dyn notify::EventHandler>);
+
+    impl notify::Watcher for ReplayWatcher {
+        fn new<F: notify::EventHandler>(handler: F, _: notify::Config) -> notify::Result<Self> {
+            Ok(Self(Box::new(handler)))
+        }
+
+        fn watch(&mut self, path: &Path, _: RecursiveMode) -> notify::Result<()> {
+            self.0
+                .handle_event(Ok(notify::Event::new(notify::EventKind::Create(
+                    notify::event::CreateKind::Any,
+                ))
+                .add_path(path.to_path_buf())));
+            if std::fs::symlink_metadata(path).is_err() {
+                self.0
+                    .handle_event(Ok(notify::Event::new(notify::EventKind::Remove(
+                        notify::event::RemoveKind::Any,
+                    ))
+                    .add_path(path.to_path_buf())));
+            }
+            Ok(())
+        }
+
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    fn replay_create(path: &Path) -> Vec<notify_debouncer_full::DebouncedEvent> {
+        let (tx, rx) = mpsc::channel();
+        let mut debouncer = new_debouncer_opt::<_, LiveCreates<ReplayWatcher>, RecommendedCache>(
+            Duration::from_millis(10),
+            None,
+            tx,
+            RecommendedCache::new(),
+            notify::Config::default(),
+        )
+        .unwrap();
+        debouncer.watch(path, RecursiveMode::NonRecursive).unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_replayed_create_does_not_cancel_a_target_deletion() {
+        let fixture = crate::testing::scratch("watch-replayed-create");
+        let target = fixture.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        let events = replay_create(&target);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].kind.is_remove(), "{events:?}");
+        assert_eq!(events[0].paths, vec![target]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_create_is_still_delivered() {
+        let fixture = crate::testing::scratch("watch-dangling-create");
+        let link = fixture.join("link");
+        std::os::unix::fs::symlink("missing", &link).unwrap();
+        let events = replay_create(&link);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].kind.is_create(), "{events:?}");
+        assert_eq!(events[0].paths, vec![link]);
+    }
 
     fn coalescer() -> Coalescer {
         Coalescer::new(Duration::from_millis(300), Duration::from_secs(2), 4)
