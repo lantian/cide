@@ -140,6 +140,8 @@ export interface PaneBodyProps {
   onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
   /** Ctrl+click on a directory. Absent in a window with no file tree — see `TerminalPane`. */
   onRevealPath?: ((path: string) => void) | undefined
+  /** File history is available only when the host has the bottom tool window. */
+  onShowHistory?: ((path: string) => void) | undefined
   /**
    * Whether this pane's **tab** is the one in front. (M16)
    *
@@ -166,6 +168,7 @@ export function PaneBody({
   roots,
   onOpenPath,
   onRevealPath,
+  onShowHistory,
   onSessionBound,
   onScreen,
 }: PaneBodyProps): ReactNode {
@@ -296,6 +299,7 @@ export function PaneBody({
     return (
       <EditorPane
         path={editor.path}
+        onShowHistory={onShowHistory}
         root={cwd}
         project={project}
         tab={editor.tab}

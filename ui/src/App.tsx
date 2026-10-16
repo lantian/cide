@@ -1414,6 +1414,10 @@ export function App() {
     (path: string) => runCommand('git.history.file', { path }),
     [runCommand],
   )
+  const onShowFolderHistory = useCallback(
+    (path: string) => runCommand('git.log', { path }),
+    [runCommand],
+  )
   const onSelectOpened = useCallback(() => runCommand('file.reveal', null), [runCommand])
   const onExpandAll = useCallback(() => runCommand('file.expandAll', null), [runCommand])
   const onCollapseAll = useCallback(() => runCommand('file.collapseAll', null), [runCommand])
@@ -1915,6 +1919,7 @@ export function App() {
                    * dispatch case, and the tab strip's copy of this item already goes through it.
                    */
                   onShowHistory={onShowHistory}
+                  onShowFolderHistory={onShowFolderHistory}
                   onOpenFile={onOpenTreeFile}
                 />
               </PanelBoundary>
@@ -2839,6 +2844,10 @@ const TabPane = memo(function TabPane({
   const bindSession = useWorkspace((s) => s.bindSession)
   const detachPane = useWorkspace((s) => s.detachPane)
   const detachTab = useWorkspace((s) => s.detachTab)
+  const onShowHistory = useCallback(
+    (path: string) => runCommand('git.history.file', { path }),
+    [runCommand],
+  )
   // The same object for as long as the path is: `PaneBody` hands it on, and a literal here
   // would be a new prop every render — the thing this component exists to stop.
   const filePath = tabKind.kind === 'file' ? tabKind.path : null
@@ -3001,6 +3010,7 @@ const TabPane = memo(function TabPane({
          * would refuse.
          */
         onRevealPath={(path) => runCommand('file.reveal', { path })}
+        onShowHistory={tabWindow ? undefined : onShowHistory}
         onSessionBound={(session) =>
           void bindSession(project, tab, pane.id, session)
         }

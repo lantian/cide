@@ -121,6 +121,7 @@ export interface EditorPaneProps {
    * `pane.navigate.*`, which is the state every editor was in before the registry existed.
    */
   pane?: string | undefined
+  onShowHistory?: ((path: string) => void) | undefined
 }
 
 /**
@@ -193,6 +194,7 @@ export function EditorPane({
   tab,
   onScreen,
   pane,
+  onShowHistory,
 }: EditorPaneProps): ReactNode {
   /*
    * This file's structure, for the status bar's symbol trail.
@@ -1479,6 +1481,7 @@ export function EditorPane({
         >
         <EditorSurface
           path={path}
+          onShowHistory={onShowHistory}
           root={root}
           project={project}
           onScreen={onScreen}

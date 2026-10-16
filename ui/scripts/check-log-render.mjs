@@ -108,6 +108,9 @@ try {
       'failed',
       'filtered',
       'filteredEmpty',
+      'folder',
+      'folderEmpty',
+      'folderRoot',
       'graphOff',
       'history',
       'loading',
@@ -428,6 +431,15 @@ try {
       + 'rows would otherwise be the only thing saying which one the range is in',
   )
   eq(byName.received.clear, true, '…and it is a filter, so *Clear filters* is the way back')
+  eq(byName.folder.folder, 'src/nested', 'the selected folder is visible in a removable chip')
+  eq(byName.folder.branch, 'head', 'folder history selects the current branch')
+  eq(byName.folder.branchLabel, 'Current branch in hub-core', 'folder history identifies its repository in a multi-root project')
+  eq(byName.folder.detailFiles, byName.detail.detailFiles, 'folder history keeps normal commit details')
+  eq(byName.folderRoot.folder, '/', 'the repository root also has a visible chip')
+  eq(byName.folderEmpty.folder, 'untracked-folder', 'an empty folder history retains its filter')
+  eq(byName.folderEmpty.status, 'No commit matches these filters.', 'empty folder history has a truthful empty state')
+  eq(byName.folderEmpty.clear, true, 'empty folder history offers a way to clear the restriction')
+  eq(byName.mock.folder, null, 'the unfiltered Log has no folder chip')
   eq(byName.mock.clear, false, 'no *Clear filters* until something is set')
   eq(byName.filtered.clear, true, 'and one as soon as something is')
   ok(

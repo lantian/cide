@@ -58,6 +58,7 @@ import {
   chipTarget,
   chipTitle,
   clearFilters,
+  clearFolderFilter,
   compareTitle,
   isFiltered,
   laneColor,
@@ -77,6 +78,7 @@ import {
   type SelectMods,
 } from './logModel'
 import { Icon } from '@/icons/Icon'
+import { Button } from '@/kit/components/Button'
 
 import styles from './LogView.module.css'
 
@@ -1315,6 +1317,22 @@ function FilterBar({
         value={filter.text}
         onChange={(e) => onFilter({ ...filter, text: e.target.value })}
       />
+      {filter.path !== null && (
+        <span className={styles.folderFilter}>
+          <Button
+            size="sm"
+            variant="secondary"
+            icon="folder"
+            trailingIcon="x"
+            data-audit="logFolder"
+            title={`Remove folder filter: ${filter.path || '/'}`}
+            aria-label={`Remove folder filter: ${filter.path || '/'}`}
+            onClick={() => onFilter(clearFolderFilter(filter))}
+          >
+            <span className={styles.folderPath}>{filter.path || '/'}</span>
+          </Button>
+        </span>
+      )}
       {filtered && (
         <button
           type="button"

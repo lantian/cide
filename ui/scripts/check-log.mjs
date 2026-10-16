@@ -801,7 +801,7 @@ try {
 
   eq(
     m.NO_FILTER,
-    { branch: { kind: 'head' }, author: '', text: '', repo: null },
+    { branch: { kind: 'head' }, author: '', text: '', repo: null, path: null },
     'the unfiltered value',
   )
   eq(m.isFiltered(m.NO_FILTER), false, 'and it is not a filter')
@@ -817,8 +817,8 @@ try {
   )
 
   {
-    const set = { branch: { kind: 'all' }, author: 'ivan', text: 'fix', repo: 'r1' }
-    eq(m.clearFilters(set), m.NO_FILTER, 'Clear clears all four, the branch and the repository included')
+    const set = { branch: { kind: 'all' }, author: 'ivan', text: 'fix', repo: 'r1', path: 'src' }
+    eq(m.clearFilters(set), m.NO_FILTER, 'Clear clears every field, including the folder and repository')
     ok(
       m.clearFilters(m.NO_FILTER) === m.NO_FILTER,
       'and clearing an already-clear bar returns the *same object*, so `LogTab`’s reference '
@@ -827,6 +827,24 @@ try {
   }
 
   eq(m.sameFilter(m.NO_FILTER, { ...m.NO_FILTER }), true, 'two clear filters ask the same question')
+  {
+    const folder = m.folderFilter('r1', 'src/nested')
+    eq(folder, { ...m.NO_FILTER, repo: 'r1', path: 'src/nested' }, 'folder history starts on the current branch with no old author or text filter')
+    ok(m.isFiltered(folder), 'a folder is visibly filtered')
+    eq(m.sameFilter(folder, m.folderFilter('r1', 'src/nested-sibling')), false, 'changing folders restarts the query even in the same repository')
+    eq(m.sameFilter(folder, m.folderFilter('r2', 'src/nested')), false, 'the same folder name in another repository is a different question')
+    eq(m.filterOverrides(folder), { refs: { kind: 'head' }, author: null, text: null, path: 'src/nested', follow: false }, 'folder queries use the subtree path without file rename following')
+    const root = m.folderFilter('r1', '')
+    ok(m.isFiltered(root), 'the repository root remains a visible folder restriction')
+    eq(m.filterOverrides(root).path, null, 'the repository-root query has no path restriction')
+    eq(root.repo, 'r1', 'the repository-root query still pins the chosen repository')
+    const changed = { ...folder, branch: { kind: 'branch', name: 'release' }, author: 'mira', text: 'fix' }
+    eq(m.clearFolderFilter(changed), { ...changed, path: null, repo: null }, 'removing the chip preserves subsequently selected branch, author and text')
+    ok(m.clearFolderFilter(m.NO_FILTER) === m.NO_FILTER, 'removing an absent folder is a no-op')
+    const file = m.filterOverrides(folder, 'src/main.rs')
+    eq(file.path, 'src/main.rs', 'a file-history tab keeps its own path even when a folder filter exists')
+    eq(file.follow, true, 'file history still follows renames')
+  }
   eq(
     m.sameFilter({ ...m.NO_FILTER, branch: { kind: 'branch', name: 'a' } }, { ...m.NO_FILTER, branch: { kind: 'branch', name: 'b' } }),
     false,
@@ -863,20 +881,19 @@ try {
 
   eq(
     Object.keys(m.filterOverrides(m.NO_FILTER)).sort(),
-    ['author', 'refs', 'text'],
-    'the bar sets exactly three fields of the query. A fourth appearing here would be spread over '
-      + '`logQuery`’s default and change a query nobody asked to change',
+    ['author', 'follow', 'path', 'refs', 'text'],
+    'the filter and file-history path set exactly these query fields',
   )
   eq(
     m.filterOverrides(m.NO_FILTER),
-    { refs: { kind: 'head' }, author: null, text: null },
+    { refs: { kind: 'head' }, author: null, text: null, path: null, follow: false },
     'an empty box is `null` and not `""` — the two mean the same thing to `cide_git::log::needle`, '
       + 'but `LogResume`’s query fingerprint hashes the field, so two spellings of one question '
       + 'would produce two incompatible resume tokens',
   )
   eq(
-    m.filterOverrides({ branch: { kind: 'all' }, author: '  Ivan  ', text: '  fix  ' }),
-    { refs: { kind: 'all' }, author: 'Ivan', text: 'fix' },
+    m.filterOverrides({ ...m.NO_FILTER, branch: { kind: 'all' }, author: '  Ivan  ', text: '  fix  ' }),
+    { refs: { kind: 'all' }, author: 'Ivan', text: 'fix', path: null, follow: false },
     'and the needles are trimmed exactly once, here, on the way to the wire',
   )
 
@@ -1114,7 +1131,7 @@ try {
 
     eq(
       m.findCommitFilter(OID),
-      { branch: { kind: 'rev', spec: OID }, author: '', text: '', repo: null },
+      { branch: { kind: 'rev', spec: OID }, author: '', text: '', repo: null, path: null },
       'the button clears both boxes AND re-roots the walk at the commit. Clearing alone would not '
         + 'be enough and would look like it should be: the commit is below the page, not hidden by '
         + 'a filter, so an unfiltered page one still starts at HEAD and lands the user back on the '
@@ -1142,7 +1159,7 @@ try {
     const RANGE = `${'a'.repeat(40)}..${'b'.repeat(40)}`
     eq(
       m.receivedFilter(RANGE, 'r1'),
-      { branch: { kind: 'rev', spec: RANGE }, author: '', text: '', repo: 'r1' },
+      { branch: { kind: 'rev', spec: RANGE }, author: '', text: '', repo: 'r1', path: null },
       '*View commits* re-roots the walk at the pull’s range, in the pull’s repository, with '
         + 'nothing else set. The repository is not optional: a full oid lives in one object '
         + 'database, and a bare range under a multi-root tab’s merged scope fails every other root',
@@ -1264,6 +1281,31 @@ try {
       'the worktree list is the Log tab’s alone: a History tab is one file in one repository',
     )
     const dispatch = stripComments(readFileSync(join(UI, 'src', 'keys', 'dispatch.ts'), 'utf8'))
+    const app = stripComments(readFileSync(join(UI, 'src', 'App.tsx'), 'utf8'))
+    const body = stripComments(readFileSync(join(UI, 'src', 'panes', 'PaneBody.tsx'), 'utf8'))
+    const surface = stripComments(readFileSync(join(UI, 'src', 'editor', 'EditorSurface.tsx'), 'utf8'))
+    const folderTree = stripComments(readFileSync(join(UI, 'src', 'sidebar', 'FileTree.tsx'), 'utf8'))
+    const explorer = stripComments(readFileSync(join(UI, 'src', 'sidebar', 'Explorer.tsx'), 'utf8'))
+    const folderView = stripComments(readFileSync(join(UI, 'src', 'gitlog', 'LogView.tsx'), 'utf8'))
+    for (const [source, child, value] of [
+      [app, 'PaneBody', 'tabWindow ? undefined : onShowHistory'],
+      [body, 'EditorPane', 'onShowHistory'],
+      [pane, 'EditorSurface', 'onShowHistory'],
+    ]) {
+      const jsx = source.slice(source.indexOf(`<${child}`)).split('/>')[0]
+      ok(jsx.includes(`onShowHistory={${value}}`), `${child} receives the file-history callback; a missing optional prop used to disable the editor menu silently`)
+    }
+    ok(/onShowHistory === undefined \? \{\} : \{ onShowHistory \}/.test(surface), 'the editor surface supplies history to its code menu')
+    ok(/onShowFolderHistory=\{onShowFolderHistory\}/.test(app) && /onShowFolderHistory=\{onShowFolderHistory\}/.test(explorer), 'the folder callback reaches the tree from its shell host')
+    ok(/\(path: string\) => runCommand\('git\.log', \{ path \}\)/.test(app), 'folder gestures pass the clicked absolute path to the Log command')
+    ok(/label: row\.isDir \? 'Show Folder History' : 'Show File History'/.test(folderTree), 'folders offer history rather than the old directory refusal')
+    ok(/command: row\.isDir \? 'git\.log' : 'git\.history\.file'/.test(folderTree), 'folder and file menus name their distinct commands')
+    ok(/\(row\.isDir \? onShowFolderHistory : onShowHistory\)\?\.\(row\.path\)/.test(folderTree), 'history acts on the right-clicked row rather than the selection')
+    ok(!/A directory has no file history/.test(folderTree), 'the false directory refusal is removed')
+    ok(/requestLogFilter\(project, folderFilter\(found\.repo, found\.path\)\)/.test(dispatch), 'the Log command resolves and applies the folder filter through the parked-request seam')
+    ok(/navigation === logNavigation/.test(dispatch) && /const navigation = \+\+logNavigation/.test(dispatch), 'late folder lookups cannot overwrite a newer gesture')
+    ok(/filterOverrides\(applied, path\)/.test(tab), 'the page and refresh query includes the folder filter without replacing file-history paths')
+    ok(/onClick=\{\(\) => onFilter\(clearFolderFilter\(filter\)\)\}/.test(folderView), 'the rendered chip actually removes the folder restriction')
     ok(
       /requestLogFilter\(project, receivedFilter\(/.test(dispatch),
       'and the pull’s notice is the producer, through `receivedFilter` and not a hand-built object',

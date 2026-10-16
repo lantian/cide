@@ -482,10 +482,12 @@ export interface LogFilter {
    * `LogTab` narrows its scope to it for as long as this is set.
    */
   readonly repo: RepoId | null
+  /** Repo-relative folder; an empty string names the repository root. */
+  readonly path: string | null
 }
 
 /** The unfiltered state: HEAD, no author, no text, every repository. */
-export const NO_FILTER: LogFilter = { branch: { kind: 'head' }, author: '', text: '', repo: null }
+export const NO_FILTER: LogFilter = { branch: { kind: 'head' }, author: '', text: '', repo: null, path: null }
 
 /** Whether anything is set — which is what decides whether *Clear filters* is offered. */
 export function isFiltered(f: LogFilter): boolean {
@@ -493,7 +495,8 @@ export function isFiltered(f: LogFilter): boolean {
     f.branch.kind !== 'head' ||
     f.author.trim() !== '' ||
     f.text.trim() !== '' ||
-    f.repo !== null
+    f.repo !== null ||
+    f.path !== null
   )
 }
 
@@ -510,12 +513,23 @@ export function clearFilters(f: LogFilter): LogFilter {
   return isFiltered(f) ? NO_FILTER : f
 }
 
+/** Remove the folder and its repository pin, retaining the other controls. */
+export function clearFolderFilter(f: LogFilter): LogFilter {
+  return f.path === null ? f : { ...f, path: null, repo: null }
+}
+
+/** A folder gesture starts a fresh question on the current branch. */
+export function folderFilter(repo: RepoId, path: string): LogFilter {
+  return { ...NO_FILTER, repo, path }
+}
+
 /** Whether two filters ask the same question — the guard on the debounce. */
 export function sameFilter(a: LogFilter, b: LogFilter): boolean {
   return (
     a.author === b.author &&
     a.text === b.text &&
     a.repo === b.repo &&
+    a.path === b.path &&
     sameBranch(a.branch, b.branch)
   )
 }
@@ -614,13 +628,17 @@ export function applyLocalText(rows: readonly CommitRow[], text: string): Commit
  * it is what [`LogResume`]'s query fingerprint hashes, so sending `''` from one call site and
  * `null` from another would make two identical questions produce two incompatible resume tokens.
  */
-export function filterOverrides(f: LogFilter): Partial<LogQuery> {
+export function filterOverrides(f: LogFilter, filePath: string | null = null): Partial<LogQuery> {
   const author = f.author.trim()
   const text = f.text.trim()
   return {
     refs: f.branch,
     author: author === '' ? null : author,
     text: text === '' ? null : text,
+    // File-history tabs own their path. Folder filters belong to the main Log tab and do
+    // not follow renames; a repository-root folder keeps its pin but needs no path filter.
+    path: filePath ?? (f.path === '' ? null : f.path),
+    follow: filePath !== null,
   }
 }
 
@@ -918,7 +936,7 @@ export function revealFindable(reveal: LogReveal): boolean {
  * the backend saying the same thing about the same gesture.
  */
 export function findCommitFilter(oid: string): LogFilter {
-  return { branch: { kind: 'rev', spec: oid }, author: '', text: '', repo: null }
+  return { ...NO_FILTER, branch: { kind: 'rev', spec: oid } }
 }
 
 /**
@@ -931,7 +949,7 @@ export function findCommitFilter(oid: string): LogFilter {
  * tab.
  */
 export function receivedFilter(spec: string, repo: RepoId): LogFilter {
-  return { branch: { kind: 'rev', spec }, author: '', text: '', repo }
+  return { ...NO_FILTER, branch: { kind: 'rev', spec }, repo }
 }
 
 // --- comparing two commits ---------------------------------------------------------------------

@@ -75,6 +75,7 @@ export interface LogDigest {
   repoChips: string[]
   /** A *Clear filters* control in the bar, and the second one beside an empty state's sentence. */
   clear: boolean
+  folder: string | null
   clearEmpty: boolean
   /** Which filter controls the bar drew, in document order. */
   controls: string[]
@@ -382,6 +383,7 @@ const digests: LogDigest[] = LOG_STORIES.map((story) => {
     repoStrip: all(html, 'logRepo', 'span').length > 0,
     repoChips: all(html, 'logRepo', 'span').map(text),
     clear: /data-audit="logClear"/.test(html),
+    folder: mapText(one(html, 'logFolder', 'button')),
     clearEmpty: /data-audit="logClearEmpty"/.test(html),
     controls: [...html.matchAll(/data-audit="(logBranch|logAuthor|logText|logRefresh)"/g)].map(
       (m) => m[1] ?? '',

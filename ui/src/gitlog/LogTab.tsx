@@ -638,7 +638,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
     [repo],
   )
   /*
-   * The scope a filter narrows to — `LogFilter.repo`, set by *View commits* on a pull. (M37)
+   * The scope a filter narrows to — `LogFilter.repo`, set by folder history or *View commits*.
    *
    * `applied` and not `typed`: the scope keys the fetch effect, and a scope that moved on the
    * keystroke would start the walk the debounce exists to hold back. The History tab's own
@@ -705,9 +705,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
           project,
           tab,
           logQuery(scope, {
-            path,
             cursor,
-            follow: path !== null,
             /*
              * How deep to re-walk, and it is only ever non-zero on a **soft refresh**.
              *
@@ -733,7 +731,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
             ...(keepDepth > 0 ? { limit: keepDepth } : {}),
             // Spread last so the bar wins over the defaults, and built by the model so the
             // needle the wire is asked for and the needle `matchesText` uses cannot diverge.
-            ...filterOverrides(applied),
+            ...filterOverrides(applied, path),
           }),
         )
         .then((next) => {
@@ -1124,7 +1122,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
   }, [pending, project, path, busy, typed, applied, rows, onSelect, selectOnly])
 
   /*
-   * A parked filter — *View commits* on a pull's notice. (M37)
+   * A parked filter — a folder's history, or *View commits* on a pull's notice.
    *
    * Simpler than the reveal above because it asks less: nothing to find on a page, only a filter
    * to set, and the branch half of a filter applies at once. The guards it does share: this
@@ -2116,7 +2114,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
           noRepo: repos !== null && repos.length === 0,
           rows: visible.length,
           filtered: isFiltered(typed),
-          path,
+          path: path ?? applied.path,
           stop: page?.stop ?? null,
         })}
         page={page}

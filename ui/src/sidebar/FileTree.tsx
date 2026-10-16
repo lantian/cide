@@ -304,6 +304,8 @@ export interface FileTreeProps {
    * disabled with the reason on it.
    */
   onShowHistory?: ((path: string) => void) | undefined
+  /** Open the main Log tab filtered to this absolute folder path. */
+  onShowFolderHistory?: ((path: string) => void) | undefined
 }
 
 export function FileTree({
@@ -312,6 +314,7 @@ export function FileTree({
   onOpenToSide,
   onOpenPin,
   onShowHistory,
+  onShowFolderHistory,
 }: FileTreeProps) {
   const count = useFileTree((s) => s.count)
   const chunks = useFileTree((s) => s.chunks)
@@ -2149,7 +2152,7 @@ export function FileTree({
         },
         {
           /*
-           * *Show File History*. (M18)
+           * File history opens a per-file tab; folder history filters the main Log tab.
            *
            * Carries the command id, so the row draws whatever chord the live keymap has for it
            * — nothing today, which is correct: this is the same *act* as the palette row and as
@@ -2173,22 +2176,14 @@ export function FileTree({
            * …"*, which is the true answer and is computed at the moment it is shown.
            */
           id: 'history',
-          label: 'Show File History',
-          command: 'git.history.file',
-          ...(!row.isDir && rowRefusal === null && onShowHistory !== undefined
-            ? { run: () => onShowHistory(row.path) }
+          label: row.isDir ? 'Show Folder History' : 'Show File History',
+          command: row.isDir ? 'git.log' : 'git.history.file',
+          ...(rowRefusal === null && (row.isDir ? onShowFolderHistory : onShowHistory) !== undefined
+            ? { run: () => (row.isDir ? onShowFolderHistory : onShowHistory)?.(row.path) }
             : {
-                // Three ways to be unavailable and three different sentences, because "not
-                // available" tells the user nothing they can act on — the same discipline the
-                // tab strip's copy of this item follows. The directory case is the one worth
-                // wording carefully: a folder *does* have a history in git's sense, and the
-                // tool window's tabs are per file, so the sentence says where to click instead
-                // rather than claiming there is nothing there.
-                disabledReason: row.isDir
-                  ? 'A directory has no file history — open a file inside it'
-                  : rowRefusal !== null
-                    ? 'This file is outside the project, so it is in no repository cide has opened'
-                    : NO_HOST,
+                disabledReason: rowRefusal !== null
+                  ? 'This path is outside the project, so it is in no repository cide has opened'
+                  : NO_HOST,
               }),
         },
         /*
@@ -2263,10 +2258,8 @@ export function FileTree({
          * *Show File History* above take it for the same stated reason, and it is stronger here:
          * a card is about one path, and there is no such thing as the properties of four files.
          *
-         * **Offered on directories too**, unlike *Show File History* twenty lines up, and the
-         * difference is not an inconsistency. That row is disabled on a folder because the tool
-         * window's history *tabs* are per file — a limitation of the tab, not of git. This card
-         * has no such constraint: it walks the same path filter git does, which is happy with a
+         * **Offered on directories too**, like the folder history action above. This card
+         * walks the same path filter git does, which is happy with a
          * directory prefix, and it adds the two rows a folder is usually right-clicked for
          * (how many entries, and how large). `cide_git`'s own
          * `a_directory_path_has_a_history_too` is what pins that.

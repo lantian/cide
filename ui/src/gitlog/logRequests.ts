@@ -9,7 +9,7 @@
  *
  * # Why this is its own module and not beside `requestLogReveal`
  *
- * The producer is `keys/dispatch.ts` — the pull's notice — and `LogTab.tsx` imports
+ * The producer is `keys/dispatch.ts` — folder history and the pull's notice — and `LogTab.tsx` imports
  * `openTagDialog` *from* `keys/dispatch.ts`. A `requestLogFilter` exported from `LogTab.tsx` would
  * close that cycle: harmless for two functions called at runtime, and a trap for the first
  * module-level value either side adds. This file imports nothing of cide's but two types, so it can

@@ -53,11 +53,29 @@
  */
 .filters {
   display: flex;
+  flex-wrap: wrap;
   flex: none;
   align-items: center;
   gap: var(--sp-3);
   padding: 5px 10px;
   border-bottom: 1px solid var(--border);
+}
+
+.folderFilter {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.folderPath {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderFilter > button {
+  min-width: 0;
+  max-width: 100%;
 }
 
 /*

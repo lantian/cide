@@ -56,6 +56,7 @@ import {
   comparePair,
   graphOffReason,
   isFiltered,
+  folderFilter,
   logStatus,
   NO_FILTER,
   receivedFilter,
@@ -75,6 +76,9 @@ export type LogStoryName =
   | 'history'
   | 'multi'
   | 'received'
+  | 'folder'
+  | 'folderRoot'
+  | 'folderEmpty'
   | 'failed'
   | 'loading'
   | 'detail'
@@ -673,6 +677,18 @@ export const LOG_STORIES: readonly LogStory[] = [
   story('received', {
     repos: [CIDE, VENDOR, DOCS],
     filter: receivedFilter(RECEIVED_RANGE, VENDOR_ID),
+  }),
+
+  story('folder', {
+    repos: [CIDE, VENDOR, DOCS],
+    filter: folderFilter(VENDOR_ID, 'src/nested'),
+    selected: full('a1b2c3d'),
+    detail: DETAIL,
+  }),
+  story('folderRoot', { filter: folderFilter(CIDE_ID, '') }),
+  story('folderEmpty', {
+    filter: folderFilter(CIDE_ID, 'untracked-folder'),
+    page: page({ commits: [], graph: { kind: 'off', reason: 'filtered' } }),
   }),
 
   // A `GitError` that reached the panel as a sentence. The string is what

@@ -84,6 +84,7 @@ export interface ExplorerProps {
    * documentation in `FileTree.tsx`.
    */
   onShowHistory?: ((path: string) => void) | undefined
+  onShowFolderHistory?: ((path: string) => void) | undefined
 }
 
 /**
@@ -105,6 +106,7 @@ function ExplorerImpl({
   onCollapseAll,
   onOpenPin,
   onShowHistory,
+  onShowFolderHistory,
 }: ExplorerProps) {
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
@@ -327,6 +329,7 @@ function ExplorerImpl({
         onOpenToSide={onOpenFileToSide}
         onOpenPin={onOpenPin}
         onShowHistory={onShowHistory}
+        onShowFolderHistory={onShowFolderHistory}
       />
     </div>
   )

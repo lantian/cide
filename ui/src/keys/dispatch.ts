@@ -63,7 +63,7 @@ import { requestNewProject } from '@/chrome/newProject/newProjectStore'
 // as unavailable rather than silently inert.
 import { invoke as invokeExtension } from '@/ext/host'
 import { explain, pullReport, receivedLinks, type RepoFetch } from '@/chrome/branchModel'
-import { receivedFilter } from '@/gitlog/logModel'
+import { folderFilter, receivedFilter } from '@/gitlog/logModel'
 import { requestLogFilter } from '@/gitlog/logRequests'
 import {
   divergenceOf,
@@ -543,6 +543,10 @@ export function __clearParkedTag(): void {
 function split(target: { project: ProjectId; tab: TabId; pane: PaneId }, axis: Axis, intent: SplitIntent | null): void {
   void useWorkspace.getState().splitPane(target.project, target.tab, target.pane, axis, 'after', intent)
 }
+
+// The dispatcher is rebuilt on render. Keep navigation ordering across those instances so
+// a slow repository lookup cannot replace a newer folder gesture's filter.
+let logNavigation = 0
 
 /**
  * Build the dispatcher.
@@ -1539,8 +1543,30 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * blank panel it has to interpret. This is also why no `when` clause claims to know:
          * that was the `repoOpen` mistake.
          */
+        const navigation = ++logNavigation
+        const path = pathArg(args)
         withRepos(command, (project) => {
-          void toolWindowApi.activate(project, null).catch(() => {})
+          const current = () =>
+            navigation === logNavigation && activeProjectOf(boot())?.id === project
+          if (!current()) return
+          if (path === null) {
+            void toolWindowApi.activate(project, null).catch(notifyFailure)
+            return
+          }
+          void historyApi
+            .locate(project, path)
+            .then(async (found) => {
+              if (!current()) return
+              if (found === null) {
+                notify('That folder is not inside any repository in this project.', { kind: 'warn' })
+                return
+              }
+              await toolWindowApi.activate(project, null)
+              if (current()) requestLogFilter(project, folderFilter(found.repo, found.path))
+            })
+            .catch((error: unknown) => {
+              if (current()) notifyFailure(error)
+            })
         })
         return
       }
