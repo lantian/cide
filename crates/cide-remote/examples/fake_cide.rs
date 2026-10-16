@@ -359,7 +359,7 @@ impl RemoteHost for Constants {
                 };
                 let revision = messages.len().to_string();
                 Ok(ConversationResponse::Read {
-                    page: ConversationPage {
+                    page: Box::new(ConversationPage {
                         conversation: summary,
                         generation: "example-generation".into(),
                         revision: revision.clone(),
@@ -370,7 +370,7 @@ impl RemoteHost for Constants {
                         available: true,
                         detail: None,
                         prompt: None,
-                    },
+                    }),
                 })
             }
             ConversationRequest::Detail { .. } => Ok(ConversationResponse::Detail {

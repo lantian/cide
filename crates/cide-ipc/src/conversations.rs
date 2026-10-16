@@ -111,7 +111,7 @@ pub enum ConversationResponse {
         conversations: Vec<ConversationSummary>,
     },
     Read {
-        page: ConversationPage,
+        page: Box<ConversationPage>,
     },
     Detail {
         text: String,

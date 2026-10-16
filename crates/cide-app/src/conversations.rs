@@ -15,10 +15,11 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 type Key = (ProjectId, String);
+type CachedAction = (String, String, Result<ConversationResponse, String>);
 #[derive(Default)]
 pub(crate) struct Runtime {
     caches: Mutex<HashMap<Key, Arc<Mutex<Cache>>>>,
-    actions: Mutex<VecDeque<(String, String, Result<ConversationResponse, String>)>>,
+    actions: Mutex<VecDeque<CachedAction>>,
     pub consoles: dashmap::DashMap<SessionId, Arc<crate::opencode_console::Console>>,
 }
 struct Cache {
@@ -215,7 +216,7 @@ pub(crate) fn handle(
                 crate::remote::AppRemoteHost::new(app.clone()).prompt(session)
             });
             Ok(ConversationResponse::Read {
-                page: ConversationPage {
+                page: Box::new(ConversationPage {
                     conversation,
                     generation: current,
                     revision: transcript.revision.to_string(),
@@ -226,7 +227,7 @@ pub(crate) fn handle(
                     available: cache.available,
                     detail: cache.error.clone(),
                     prompt,
-                },
+                }),
             })
         }
         ConversationRequest::Detail {
@@ -327,10 +328,11 @@ pub(crate) fn handle(
 
 fn cache(runtime: &Runtime, project: ProjectId, id: &str) -> Arc<Mutex<Cache>> {
     let mut caches = runtime.caches.lock();
-    if caches.len() >= 32 && !caches.contains_key(&(project, id.into())) {
-        if let Some(key) = caches.keys().next().cloned() {
-            caches.remove(&key);
-        }
+    if caches.len() >= 32
+        && !caches.contains_key(&(project, id.into()))
+        && let Some(key) = caches.keys().next().cloned()
+    {
+        caches.remove(&key);
     }
     caches.entry((project, id.into())).or_default().clone()
 }

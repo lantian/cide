@@ -664,10 +664,9 @@ fn apply(
             .payload
             .get("transcript_path")
             .and_then(|v| v.as_str()),
-    ) {
-        if let Some(sessions) = crate::sessions_state::handle(app) {
-            sessions.note_source(cwd.into(), id.into(), path.into());
-        }
+    ) && let Some(sessions) = crate::sessions_state::handle(app)
+    {
+        sessions.note_source(cwd.into(), id.into(), path.into());
     }
     for effect in decide(frame, states, conversations) {
         match effect {
