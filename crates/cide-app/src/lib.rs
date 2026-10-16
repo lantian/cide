@@ -23,6 +23,7 @@ mod claude_tab;
 pub mod cli;
 pub mod closed_tabs;
 pub mod cmd;
+mod codex_console;
 mod conversations;
 /// The macOS dock icon's own menu: every open project, one click from the front.
 ///

@@ -18154,3 +18154,68 @@ TypeScript and the Settings/UI checks. The local HTTP test and editor check pass
 outside the sandbox. Strict clippy remains blocked by existing `large_enum_variant`,
 `type_complexity` and `collapsible_if` findings in the conversation, remote and hooks code.
 The Settings toggle has not been exercised in a running GUI.
+
+
+## M176 — Keep open drawing sessions across project switches
+
+Returning to an open Excalidraw tab reset its editing session. Tabs in one project already
+stay mounted, but switching projects removes that project's React tree. `ExcalidrawHost`
+now attaches a window-local, pane-keyed React root to a layout slot and parks it when the
+slot leaves. Keeping the actual engine also keeps its private undo history, unsaved scene,
+selection, active tool, zoom and pan, along with the pane's dirty baseline and saver.
+
+Parking stays hidden and connected at the last measured dimensions. Reattaching refreshes
+canvas offsets even when the new slot has the same dimensions, so pointer coordinates do
+not retain the parking area's origin. The registry follows all projects assigned to this
+window, including inactive ones, updates parked paths on rename, and releases sessions on
+close, a non-drawing rename or a window ownership change. Claude splits in a File tab are
+not drawing sessions. Open drawings are retained without eviction; this is session memory,
+not restart recovery or cross-window undo transfer.
+
+Tool notifications now check the file stamp rather than unconditionally remounting a clean
+drawing or raising a dirty conflict. Reading an unchanged drawing leaves its history and
+selection alone. Real disk changes retain the clean reload / dirty conflict behavior, and
+explicit reload still clears history while carrying the viewport across.
+
+Verified: `check:excalidraw-session` exercises the real host, pane, workspace reconciliation
+and save registry under React/jsdom, substituting IPC and the engine. It covers StrictMode
+slot replay, tab/project switching, private undo/redo, unsaved edits, parked saves and idle
+autosave, no-op notifications, disk conflicts, stale stat responses, reload, rename, ownership,
+focus capture, menu isolation and cleanup. The drawing/clipboard, editor (5,460 checks),
+image, command, detached-window, row-layout, selector, menu, casing, path, boundary, theme,
+UI-scale and demo checks passed, as did TypeScript and the production build. The editor
+check needed an unsandboxed rerun because its nested `grep` failed with `EPERM`.
+
+A headless Chromium run used the real app's drawing demo and Excalidraw engine. After tab
+and project switches, the same editor and history instances retained the view, selection,
+arrow tool and an unsaved element edit. Ctrl+Z and Ctrl+Shift+Z undid and redid the edit after
+returning; stored pointer offsets matched the reattached canvas's bounds. This browser check
+used the demo backend, not native Tauri file IO or WebKitGTK.
+
+## M177 — Peer replies reach Codex through its native protocol
+
+Paired Codex consoles now use a private authenticated app-server and the real terminal UI.
+Peer messages use `turn/start` after the current turn finishes, without pasting into the
+composer. Delivery requires an acknowledgement; rejection, cancellation and uncertain
+acceptance retain distinct receipts. Late acknowledgements are consumed without replay.
+The native composer stays usable and keeps a person's draft.
+
+The forwarder tracks the terminal's selected persistent thread and keeps approvals and
+questions on its own connection. Codex's resume bootstrap clients and temporary structured
+helpers cannot replace the visible thread, change its readiness or resume a paused pair.
+Remote resume refuses permission overrides in its CLI arguments, so the adapter reads
+the server's effective project policy and carries it
+through native thread requests, including the reviewer's read-only sandbox. Native events
+enter Cide's ordered hook applier for conversation identity, status, usage and file reloads;
+duplicate CLI hooks cannot overwrite them. Changing conversations cancels pending messages
+and pauses the pair. Closing a paired pane stops its server and removes its credentials.
+
+Verified on Codex 0.162.1 with isolated state and a local fake provider: first delivery to
+a fresh reviewer, a long Unicode reply, busy-turn gating, preserved drafts, saved-thread
+discovery, resume without replay, `/new`, stale-reply rejection and cleanup. Fake protocol
+tests cover authentication, cancellation, native approval forwarding, explicit rejection,
+late acknowledgements and disconnect after writing. Core, agent and application unit suites,
+TypeScript, peer-chat, casing and boundary checks pass. The Chromium audit mounts both real
+terminal components with mocked IPC and confirms layout and left-panel input. No paid model
+calls or complete two-agent conversation in the running Cide GUI were used. Ordinary consoles,
+Claude's composer delivery and OpenCode's existing API path keep their launch behavior.

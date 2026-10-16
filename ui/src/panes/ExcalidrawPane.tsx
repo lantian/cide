@@ -61,7 +61,7 @@
  * are hidden, because a wry webview drops `<a download>` and an inert button is the state this
  * codebase forbids.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { clipboard, imageClipboard, diag, events, file as fileApi, fileChanged, type ProjectId } from '@/ipc/client'
 import type { FileStamp } from '@/ipc/generated'
 import { useWorkspace } from '@/store/workspace'
@@ -125,6 +125,8 @@ export interface ExcalidrawPaneProps {
   tab?: string | undefined
   /** Whether this pane's tab is the one in front — `ImagePane` and `EditorPane`'s input. */
   onScreen?: boolean | undefined
+  /** Changes when a retained host moves, even if its visibility and dimensions stay equal. */
+  attachment?: object | undefined
 }
 
 /** What the pane is showing. `ready` carries the scene the surface mounts with. */
@@ -139,7 +141,7 @@ function basename(path: string): string {
   return cut >= 0 ? path.slice(cut + 1) : path
 }
 
-export function ExcalidrawPane({ path, root, project, tab, onScreen }: ExcalidrawPaneProps): ReactNode {
+export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment }: ExcalidrawPaneProps): ReactNode {
   const theme = useWorkspace((s) => s.theme)
   /** `settings.editor.autosave`, from the mirror — the editor's own default before bootstrap. */
   const autosaveOn = useWorkspace((s) => s.boot?.workspace.settings.editor.autosave ?? true)
@@ -250,6 +252,14 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen }: Excalidra
   useEffect(() => {
     if (onScreen === true) slot.current?.focus()
   }, [onScreen])
+
+  useLayoutEffect(() => {
+    // ResizeObserver sees dimensions, not a same-sized move between slots. Refresh the
+    // canvas offsets after reattaching so pointer coordinates cannot use the parking area
+    // or the old split's origin. This does not change the scene, viewport or history.
+    const api = apiRef.current
+    if (onScreen !== false && api !== null) surfaceRef.current?.refreshSurface(api)
+  }, [onScreen, attachment])
 
   /* ------------------------------------------------------------------------- loading */
 
@@ -490,9 +500,30 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen }: Excalidra
 
   /* -------------------------------------------------------- following the disk */
 
+  /**
+   * Events name a file a tool touched, not proof that its bytes changed. In particular,
+   * reading a clean drawing must not remount its editor and erase selection or undo.
+   * Compare stamps before either notification road decides to reload. Ignore a stat whose
+   * path or baseline moved while it was in flight (a rename, save or explicit reload).
+   */
+  const recheckOnDisk = useCallback(() => {
+    if (apiRef.current === null) return
+    const at = pathRef.current
+    const baseline = stampRef.current
+    void fileApi
+      .stat(at)
+      .then((stamp) => {
+        if (!aliveRef.current || apiRef.current === null || at !== pathRef.current
+          || !sameStamp(baseline, stampRef.current) || sameStamp(stamp, stampRef.current)) return
+        if (dirtyRef.current) setConflict(true)
+        else reload()
+      })
+      .catch(() => {})
+  }, [reload])
+
   /*
    * `cide://session-tool` — an agent's tool call completed and named this file. Clean drawing
-   * reloads silently; a dirty one asks. `EditorPane` carries the argument and the caveat: a
+   * reloads silently if it changed; a dirty one asks. `EditorPane` carries the caveat: a
    * `sed -i` in a shell pane never sends this, which is what the git-status recheck is for.
    */
   useEffect(() => {
@@ -501,8 +532,8 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen }: Excalidra
     void events
       .onSessionTool((_session, paths) => {
         if (dropped || !paths.includes(pathRef.current)) return
-        if (dirtyRef.current) setConflict(true)
-        else reload()
+        if (!onScreenRef.current) setGitStale(true)
+        else recheckOnDisk()
       })
       .then((fn) => {
         if (dropped) fn()
@@ -513,23 +544,7 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen }: Excalidra
       dropped = true
       unlisten?.()
     }
-  }, [reload])
-
-  /**
-   * Compare the stamp on disk with the one the drawing was read under, by **value** — two
-   * answers are two objects. `file.stat` and not a re-read: a two-megabyte PNG must not be
-   * read again on every status event to answer a question its `stat` answers.
-   */
-  const recheckOnDisk = useCallback(() => {
-    void fileApi
-      .stat(pathRef.current)
-      .then((stamp) => {
-        if (!aliveRef.current || sameStamp(stamp, stampRef.current)) return
-        if (dirtyRef.current) setConflict(true)
-        else reload()
-      })
-      .catch(() => {})
-  }, [reload])
+  }, [recheckOnDisk])
 
   useEffect(() => {
     let unlisten: (() => void) | null = null

@@ -23,17 +23,30 @@ reply alone is not sent. Receipts distinguish queued, writing, delivered, failed
 uncertain delivery; delivered means the harness accepted the prompt, not that it answered.
 The header tracks **Main → Peer** and **Peer → Main** separately. **No reply sent yet**
 means no peer message has been queued; text printed in the peer terminal is not forwarded.
-Queues are bounded to 16 messages per direction. Messages wait while the recipient is
-working or its input is occupied, then deliver automatically when ready. A long turn
+Queues are bounded to 16 messages per direction. Messages wait until the recipient is
+ready; Claude delivery also requires an empty input. They deliver automatically. A long turn
 does not time out or pause the pair. Pause or close the tab to cancel pending messages.
 If an older build already paused the pair after its former 40-second timeout, restart
 with the updated build and submit a continuation task on the left to resume it. A reply
 rejected before queueing needs to be requested again; it is not replayed automatically.
 
-Claude/Codex delivery waits for a recognized empty composer, keeps a visible witness between
+Paired Codex consoles attach their native TUI to a private authenticated local app-server.
+Peer messages use `turn/start` directly and wait for the current turn to finish; they are
+never pasted into the composer. The terminal keeps its draft and handles its own approvals
+and questions. Delivery is confirmed by the server's acknowledgement. Native protocol events
+keep Cide's thread identity, status and file reloads current even when remote Codex does not
+emit invocation-local CLI hooks. Changing the native conversation pauses the pair and cancels
+pending messages. Both the TUI and its server stop when the paired pane closes.
+
+This requires a Codex version supporting `--remote`, `--remote-auth-token-env` and authenticated
+`app-server` connections (verified on 0.162.1). Unsupported versions fail setup with an upgrade
+message. Restart existing paired Codex consoles after updating Cide. An older reply already
+left in a composer is not submitted or replayed automatically.
+
+Claude delivery waits for a recognized empty composer, keeps a visible witness between
 UTF-8 chunks so trailing spaces can be verified, then removes it and
 submits separately. Unknown layouts, drafts, shell mode and permission dialogs are refused.
-Manual input is briefly suspended while composing a peer message. OpenCode uses its private
+Manual input is briefly suspended while composing a Claude peer message. OpenCode uses its private
 authenticated API. A failed or uncertain delivery pauses the pair; inspect the recipient before
 resuming. A partially composed body is left visible for manual recovery. It is never retried
 blindly or cleared automatically.
@@ -75,3 +88,11 @@ checks complete long replies, wrapped numeric witnesses, Unicode and a follow-up
 provider is unavailable, then confirms submitted text in Codex's input history. Its state
 is temporary and its only model provider points at
 an unused loopback port; no paid model endpoint is contacted.
+
+`cargo test --locked -p cide-app --lib codex_console::tests::real_codex_native -- --ignored`
+exercises the native Codex transport with the installed TUI, isolated temporary state and a
+local fake model provider. It verifies a fresh reviewer's first message, long Unicode replies,
+busy-turn gating, draft preservation and restoration without replay. It uses no paid endpoints.
+It also checks `/new`, stale-reply rejection and server/credential cleanup on close.
+The ordinary `codex_console` tests also verify authentication, cancellation and native approval
+forwarding with fake protocol endpoints. These audits need permission to open local sockets.

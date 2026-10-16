@@ -69,6 +69,7 @@ pub struct HookServer {
 
 #[derive(Default)]
 struct CodexConsole {
+    native: bool,
     clear: cide_pty::codex_clear::ClearObserver,
     active: Option<SessionId>,
     invalidated: std::collections::HashSet<SessionId>,
@@ -83,6 +84,14 @@ impl CodexConsole {
     }
 
     fn accepts(&mut self, frame: &HookFrame) -> bool {
+        // A paired remote console has one authoritative native event stream. Persisted
+        // hook trust can also make the CLI emit hooks; applying those late duplicates would
+        // turn a completed native turn back to Busy or adopt an unrelated helper thread.
+        if self.native
+            && frame.payload.get("cide_native_protocol") != Some(&serde_json::Value::Bool(true))
+        {
+            return false;
+        }
         // Teardown can report every thread this process visited, including cleared ones.
         // It is never evidence that the user switched back to one of those conversations.
         if frame.kind() == Some(HookEvent::SessionEnd) {
@@ -321,6 +330,32 @@ impl HookServer {
     /// The value for a child's `CIDE_HOOK_SOCK`.
     pub fn socket(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Remote Codex supplies native lifecycle events instead of invocation-local CLI hooks.
+    /// Keep them on the same ordered applier as local hooks so conversation identity, file
+    /// reloads and turn completion cannot race each other on the forwarding thread.
+    pub(crate) fn codex_native_frame(
+        &self,
+        session: SessionId,
+        kind: &str,
+        mut payload: serde_json::Value,
+    ) {
+        payload["cide_native_protocol"] = serde_json::Value::Bool(true);
+        let mut frame = HookFrame::new(kind, payload);
+        frame.spawned_as = Some(session.to_string());
+        let _ = self.frames.send(Inbound::Frame(frame));
+    }
+
+    pub(crate) fn codex_native(&self, session: SessionId, thread: Option<SessionId>) {
+        self.codex_consoles.insert(
+            session,
+            Arc::new(parking_lot::Mutex::new(CodexConsole {
+                native: true,
+                active: thread,
+                ..Default::default()
+            })),
+        );
     }
 
     /// Observe only live output from a Codex child launched with approval-only OSC 9
@@ -866,6 +901,20 @@ fn decide(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_native_codex_console_ignores_duplicate_cli_hook_frames() {
+        let mut console = super::CodexConsole {
+            native: true,
+            ..Default::default()
+        };
+        let mut native = cide_claude::HookFrame::new(
+            "Stop",
+            serde_json::json!({"session_id": cide_ipc::SessionId::new()}),
+        );
+        assert!(!console.accepts(&native));
+        native.payload["cide_native_protocol"] = serde_json::Value::Bool(true);
+        assert!(console.accepts(&native));
+    }
     use super::*;
 
     #[test]

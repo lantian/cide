@@ -23,7 +23,7 @@ import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
 import { ImagePane } from './ImagePane'
 import { imageKindFor } from './imageKinds'
-import { ExcalidrawPane } from './ExcalidrawPane'
+import { ExcalidrawHost } from './ExcalidrawHost'
 import { drawingKindFor } from './excalidrawKinds'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
 // Not lazy-loaded, for the reason `ImagePane` below is not: a pane that renders nothing for a
@@ -277,14 +277,15 @@ export function PaneBody({
      * `imageKindFor` for that reason alone, and `check:excalidraw` pins the order. Same rule
      * as the image fork in every other respect: by name, on the pane kind, nothing in Rust.
      *
-     * `ExcalidrawPane` is a static import, honouring the rule above — it paints its full-size
+     * `ExcalidrawHost` is a static import, honouring the rule above — it paints its full-size
      * root on the first frame. What *is* lazy is the drawing engine behind it: 2.7 MB of
      * JavaScript that the pane `import()`s after mounting, in parallel with the file read, and
      * that no window pays for until somebody opens a drawing.
      */
     if (drawingKindFor(editor.path) !== null) {
       return (
-        <ExcalidrawPane
+        <ExcalidrawHost
+          pane={pane.id}
           path={editor.path}
           root={cwd}
           project={project}

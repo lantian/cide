@@ -97,6 +97,11 @@ export function captureViewport(api: ExcalidrawImperativeAPI): Viewport {
   return { scrollX, scrollY, zoom }
 }
 
+/** Re-read the canvas's DOM offset after its retained host moves to another layout slot. */
+export function refreshSurface(api: ExcalidrawImperativeAPI): void {
+  api.refresh()
+}
+
 /**
  * The bytes a save writes, in the format the file's **name** asks for.
  *

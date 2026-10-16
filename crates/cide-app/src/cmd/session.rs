@@ -1952,8 +1952,15 @@ pub(crate) async fn spawn_session(
                     .args
                     .iter()
                     .any(|arg| arg == r#"tui.notifications=["approval-requested"]"#);
-            spec.output_observer =
-                Some(server.codex_observer(id, console.as_ref().and_then(|c| c.thread), approvals));
+            if pair.is_some() {
+                server.codex_native(id, console.as_ref().and_then(|c| c.thread));
+            } else {
+                spec.output_observer = Some(server.codex_observer(
+                    id,
+                    console.as_ref().and_then(|c| c.thread),
+                    approvals,
+                ));
+            }
         }
         if is_claude {
             // The routing key for every frame this child's hooks send. Set only for Claude
@@ -2207,6 +2214,18 @@ pub(crate) async fn spawn_session(
         None
     };
 
+    let codex = if is_codex && pair.is_some() {
+        let observer = crate::codex_console::observer(app.clone(), id);
+        let (prepared, console) = blocking(move || {
+            crate::codex_console::Console::start(spec, observer).map_err(SessionError::Pty)
+        })
+        .await?;
+        spec = prepared;
+        Some(console)
+    } else {
+        None
+    };
+
     let qwen_events = if is_qwen {
         Some(
             crate::event_tap::ConsoleEvents::prepare(&mut spec)
@@ -2296,6 +2315,11 @@ pub(crate) async fn spawn_session(
         }
         registry.note_native_conversation(id, observer.conversation());
         observer.observe(app.clone(), id, &session);
+    }
+    if let Some(console) = codex {
+        app.state::<crate::peer_chat::Runtime>()
+            .note_codex_console(id, console.clone());
+        console.observe(&session);
     }
     // Which CLI this console session runs, for `pane_bind_session` to stamp on the pane. (M93)
     if let Some(console) = console {

@@ -62,6 +62,8 @@ dashmap = { workspace = true }
 log = { workspace = true }
 # The IDE server is async; `ide.rs` owns a runtime for it rather than making the app async.
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

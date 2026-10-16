@@ -66,6 +66,7 @@ use crate::defs::{LoadedAgent, harness_name};
 
 pub mod claude;
 pub mod codex;
+pub mod codex_console;
 pub mod opencode;
 pub mod opencode_console;
 pub mod qwen;

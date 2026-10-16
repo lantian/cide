@@ -76,7 +76,10 @@ export function PeerChatPane(props: PaneBodyProps & { tab: Tab }): ReactNode {
     return () => { alive = false; clearTimeout(timer) }
   }, [chat.selection?.harness, project, tab.id])
 
-  const writing = receipts.some((r) => r.sender !== pane.id && r.status === 'writing')
+  // Codex submits through its protocol without composing terminal text. Keep the
+  // native composer usable while that submission is acknowledged.
+  const writing = (main ? chat.mainHarness : chat.selection?.harness) !== 'codex'
+    && receipts.some((r) => r.sender !== pane.id && r.status === 'writing')
   useEffect(() => {
     const term = peekHost(pane.id)?.terminal?.term
     if (term) term.options.disableStdin = writing

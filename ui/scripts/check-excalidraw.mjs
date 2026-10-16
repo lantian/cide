@@ -220,12 +220,12 @@ try {
       + 'would show the file the drawing pane exists to edit as a picture',
   )
   const drawingBranch = paneBody.slice(drawingAt, imageAt)
-  ok(/<ExcalidrawPane\b/.test(drawingBranch), 'the branch renders the drawing pane')
+  ok(/<ExcalidrawHost\b/.test(drawingBranch), 'the branch renders a retained drawing host')
   for (const prop of ['onScreen={onScreen}', 'tab={editor.tab}', 'project={project}', 'root={cwd}']) {
     ok(drawingBranch.includes(prop), `and passes ${prop} — a prop that stops one component short`)
   }
   ok(
-    /^import \{ ExcalidrawPane \} from '\.\/ExcalidrawPane'/m.test(paneBody),
+    /^import \{ ExcalidrawHost \} from '\.\/ExcalidrawHost'/m.test(paneBody),
     'the pane is a STATIC import: a lazy pane renders nothing for a frame and is measured at zero',
   )
 

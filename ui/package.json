@@ -36,6 +36,7 @@
     "check:exit": "node scripts/check-exit-marker.mjs",
     "check:excalidraw": "node scripts/check-excalidraw.mjs",
     "check:excalidraw-clipboard": "node scripts/check-excalidraw-clipboard.mjs",
+    "check:excalidraw-session": "node scripts/check-excalidraw-session.mjs",
     "check:ext": "node scripts/check-ext.mjs",
     "check:ext-render": "node scripts/check-ext-render.mjs",
     "check:fonts": "node scripts/check-fonts.mjs",

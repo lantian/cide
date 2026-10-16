@@ -90,6 +90,7 @@ pub(crate) struct Runtime {
     paired: DashSet<SessionId>,
     receipts: Mutex<VecDeque<(TabId, PeerChatReceipt)>>,
     consoles: DashMap<SessionId, Arc<crate::opencode_console::Console>>,
+    codex_consoles: DashMap<SessionId, Arc<crate::codex_console::Console>>,
     prompt_armed: DashMap<SessionId, Instant>,
 }
 #[derive(Default)]
@@ -116,6 +117,9 @@ impl Runtime {
     }
     pub fn note_console(&self, id: SessionId, console: Arc<crate::opencode_console::Console>) {
         self.consoles.insert(id, console);
+    }
+    pub fn note_codex_console(&self, id: SessionId, console: Arc<crate::codex_console::Console>) {
+        self.codex_consoles.insert(id, console);
     }
     fn lane(&self, id: SessionId) -> Arc<Mutex<Lane>> {
         self.lanes.entry(id).or_default().clone()
@@ -179,6 +183,9 @@ impl Runtime {
         }
         for id in sessions {
             if let Some((_, console)) = self.consoles.remove(id) {
+                console.stop();
+            }
+            if let Some((_, console)) = self.codex_consoles.remove(id) {
                 console.stop();
             }
         }
@@ -407,6 +414,7 @@ fn deliver(app: &AppHandle, lane: &Mutex<Lane>, m: &Message) -> Result<(), (bool
     enum Receiver {
         Terminal,
         OpenCode(Arc<crate::opencode_console::Console>),
+        Codex(Arc<crate::codex_console::Console>),
     }
     let receiver = wait_for_receiver(
         || check().map(|_| ()),
@@ -422,6 +430,12 @@ fn deliver(app: &AppHandle, lane: &Mutex<Lane>, m: &Message) -> Result<(), (bool
                     lane.lock().writing = true;
                     runtime.receipt(m, "writing", "Delivering to OpenCode");
                     return Ok(Some(Receiver::OpenCode(console)));
+                }
+            } else if harness == ConsoleHarness::Codex {
+                let console = app.state::<Runtime>().codex_consoles.get(&m.target)
+                    .map(|c| c.clone()).ok_or("Codex native delivery is unavailable. Restart this pair with an updated Codex CLI.")?;
+                if console.receiver()?.is_some() {
+                    return Ok(Some(Receiver::Codex(console)));
                 }
             } else {
                 // The readiness wait never holds the manual input gate. Once empty,
@@ -452,6 +466,44 @@ fn deliver(app: &AppHandle, lane: &Mutex<Lane>, m: &Message) -> Result<(), (bool
                 format!("OpenCode submission is uncertain; do not resend: {e}"),
             )
         });
+    }
+    if let Receiver::Codex(console) = receiver {
+        loop {
+            check().map_err(|e| (false, e))?;
+            if let Some(receiver) = console.receiver().map_err(|e| (false, e))? {
+                // The forwarding loop rechecks readiness alongside native user requests.
+                // A manual submit that wins the race leaves this message queued, untouched.
+                app.state::<Runtime>()
+                    .receipt(m, "writing", "Submitting directly to Codex");
+                let delivery_app = app.clone();
+                let lane = app.state::<Runtime>().lane(m.target);
+                let pinned = Message {
+                    id: m.id.clone(),
+                    project: m.project,
+                    tab: m.tab,
+                    sender: m.sender,
+                    pane: m.pane,
+                    target: m.target,
+                    body: String::new(),
+                    generation: m.generation,
+                };
+                let valid = Box::new(move || {
+                    if lane.lock().generation != pinned.generation {
+                        return Err("Pending message cancelled".into());
+                    }
+                    target(&delivery_app, &pinned).map(|_| ())
+                });
+                match console.peer_prompt(receiver, m.body.clone(), valid)? {
+                    true => return Ok(()),
+                    false => app.state::<Runtime>().receipt(
+                        m,
+                        "queued",
+                        "Waiting for Codex to finish its current turn",
+                    ),
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
     let mut marker = format!("[cide:{}]", SessionId::new());
     while m.body.contains(&marker) {
@@ -533,6 +585,11 @@ fn wait_body(
 
 /// Only a non-empty normal composer submit on the main side resumes a restored pair.
 pub(crate) fn note_input(app: &AppHandle, session: SessionId, data: &str, pty: &PtySession) {
+    // Native Codex confirms an actual user turn over its protocol. A newline in a
+    // permission dialog or draft is never evidence that a task was submitted.
+    if app.state::<Runtime>().codex_consoles.contains_key(&session) {
+        return;
+    }
     if !data.contains('\r') {
         return;
     }
@@ -566,6 +623,40 @@ pub(crate) fn note_input(app: &AppHandle, session: SessionId, data: &str, pty: &
             .state::<WorkspaceState>()
             .update(|ws| domain::set_paused(ws, project, tab, false));
     }
+}
+
+/// Only an acknowledged native user turn on the writer side resumes the pair.
+pub(crate) fn note_codex_prompt(app: &AppHandle, session: SessionId) {
+    let _ = app.state::<WorkspaceState>().update(|ws| {
+        if let Some((project, tab, pane, chat)) = domain::for_session(ws, session)
+            && pane == chat.main
+            && chat.paused
+            && !chat.starting
+        {
+            domain::set_paused(ws, project, tab, false)?;
+        }
+        Ok(())
+    });
+}
+
+pub(crate) fn conversation_changed(app: &AppHandle, session: SessionId) {
+    let sessions = app
+        .state::<WorkspaceState>()
+        .update(|ws| {
+            let Some((project, tab, _, _)) = domain::for_session(ws, session) else {
+                return Ok(Vec::new());
+            };
+            let ids = workspace::tab(ws, project, tab)?
+                .tree
+                .panes
+                .values()
+                .filter_map(|p| p.session)
+                .collect::<Vec<_>>();
+            domain::set_paused(ws, project, tab, true)?;
+            Ok(ids)
+        })
+        .unwrap_or_default();
+    app.state::<Runtime>().cancel(&sessions);
 }
 
 /// Native OpenCode user-message events are evidence of a new task, not a dialog answer.

@@ -172,6 +172,12 @@ Its thread id is never cide's `SessionId`: it arrives by hook into `Pane::conver
 `cide_core::codex_cli` holds the launch rules; codex agent runs use the same TUI hosting
 (`harness/codex.rs`).
 
+The experimental two-agent tab hosts paired Codex consoles on a private authenticated
+app-server, with the native TUI connected through a local protocol forwarder. The forwarder
+tracks the terminal's successful thread start/resume replies, submits peer turns directly,
+and leaves all approvals and questions to the terminal. Native lifecycle and file-change
+events enter the existing ordered hook applier. Ordinary Codex consoles keep their launch path.
+
 OpenCode consoles attach a real TUI to a private authenticated loopback server. The adapter in
 `cide-app/src/opencode_console.rs` creates or resumes a native `ses_…` conversation and records
 it in `Pane::harness_conversation`, separately from cide's routing UUID. The API adapter in
