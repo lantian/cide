@@ -284,6 +284,12 @@ pub(crate) fn console_close_target(
 }
 
 impl RemoteHost for AppRemoteHost {
+    fn conversation(
+        &self,
+        request: cide_ipc::conversations::ConversationRequest,
+    ) -> Result<cide_ipc::conversations::ConversationResponse, String> {
+        crate::conversations::handle(&self.app, request)
+    }
     fn instance(&self) -> InstanceInfo {
         instance_info()
     }
@@ -536,7 +542,9 @@ impl RemoteHost for AppRemoteHost {
         // error: the guard exists so that re-sending after a dropped socket is safe, and
         // reporting a refusal would make a device try to "fix" a keystroke that already landed.
         if registry.accept_write(session, writer, Some(epoch), Some(seq)) {
-            pty.write(bytes);
+            self.app
+                .state::<crate::peer_chat::Runtime>()
+                .manual_write(&self.app, session, &pty, bytes)?;
         }
         Ok(())
     }

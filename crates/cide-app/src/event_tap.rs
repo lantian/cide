@@ -35,13 +35,116 @@ use std::time::Duration;
 use cide_agents::Observation;
 use cide_ipc::{RunId, SessionId};
 use cide_pty::PtySession;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::agents::{AgentRegistry, RUN_LOG_CAP, RunLog, after_transition, run_logs_dir};
 
 /// How long the reader sleeps when the file has nothing for it. Latency on a state change, so
 /// short; every sleep is one wakeup per run, so not shorter.
 const POLL: Duration = Duration::from_millis(100);
+
+/// Qwen continuations need the same state channel as runs, without inventing a run owner.
+pub(crate) struct ConsoleEvents {
+    path: PathBuf,
+    key: RunId,
+}
+impl Drop for ConsoleEvents {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+impl ConsoleEvents {
+    pub(crate) fn prepare(spec: &mut cide_pty::SpawnSpec) -> std::io::Result<Self> {
+        let key = RunId::new();
+        let path = path_for(None, key);
+        make_fifo(&path)?;
+        spec.args
+            .extend(["--json-file".into(), path.to_string_lossy().into_owned()]);
+        Ok(Self { path, key })
+    }
+    pub(crate) fn observe(self, app: AppHandle, session: SessionId, pty: Arc<PtySession>) {
+        let _ = std::thread::Builder::new()
+            .name("cide-qwen-console-events".into())
+            .spawn(move || {
+                use cide_agents::harness::Harness as _;
+                let mut current = cide_ipc::RunState::Starting;
+                let mut turns = cide_agents::harness::qwen::TurnTracker::default();
+                read_lines(
+                    &self.path,
+                    || pty.has_exited(),
+                    &mut |line, _| {
+                        let over = turns.feed(line);
+                        for event in std::iter::once(line).chain(over) {
+                            let value = serde_json::from_str::<serde_json::Value>(event).ok();
+                            let started = value.as_ref().is_some_and(|v| {
+                                v["type"] == "system" && v["subtype"] == "session_start"
+                            });
+                            if started
+                                && value
+                                    .as_ref()
+                                    .is_some_and(|v| v["parent_tool_use_id"].is_null())
+                                && let Some(id) = value.as_ref().and_then(|v| {
+                                    v["session_id"]
+                                        .as_str()
+                                        .or_else(|| v["data"]["session_id"].as_str())
+                                })
+                            {
+                                let conversation = cide_ipc::HarnessSession {
+                                    harness: cide_ipc::Harness::Qwen,
+                                    id: id.into(),
+                                    cwd: pty.spawn_cwd().into(),
+                                };
+                                if let Some(registry) =
+                                    app.try_state::<crate::state::SessionRegistry>()
+                                {
+                                    registry
+                                        .note_native_conversation(session, conversation.clone());
+                                }
+                                if let Some(workspace) =
+                                    app.try_state::<crate::workspace_state::WorkspaceState>()
+                                {
+                                    let _ = workspace.update(|ws| {
+                                        cide_core::workspace::note_native_conversation(
+                                            ws,
+                                            session,
+                                            &conversation,
+                                        );
+                                        Ok(())
+                                    });
+                                }
+                            }
+                            let next = if started {
+                                Some(cide_ipc::RunState::Idle)
+                            } else {
+                                cide_agents::QwenHarness
+                                    .observe(current.clone(), Observation::Line(event))
+                            };
+                            if let Some(next) = next {
+                                let state = match next {
+                                    cide_ipc::RunState::Idle => {
+                                        cide_ipc::SessionState::AwaitingInput
+                                    }
+                                    cide_ipc::RunState::AwaitingPermission => {
+                                        cide_ipc::SessionState::AwaitingPermission
+                                    }
+                                    _ => cide_ipc::SessionState::Busy,
+                                };
+                                current = next;
+                                if !pty.has_exited()
+                                    && crate::emit::last_session_states().get(&session)
+                                        != Some(&cide_ipc::SessionState::Paused)
+                                {
+                                    crate::emit::session_state(&app, &session.to_string(), state);
+                                }
+                            }
+                        }
+                    },
+                    self.key,
+                );
+                drop(self);
+            });
+    }
+}
 
 /// Where a run's event file goes: beside the agent socket, so it lives in this cide's runtime
 /// directory and dies with it, or under the temp dir when there is no socket (a test).

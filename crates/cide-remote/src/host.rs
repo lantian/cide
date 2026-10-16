@@ -38,6 +38,13 @@ use cide_ipc::screen::{ScreenCapture, ScrollbackCapture};
 /// to draw its lists. The screen, the input and the writes arrive with the phases that serve
 /// them, so there is never a method on this trait that a host has to implement with a lie.
 pub trait RemoteHost: Send + Sync + 'static {
+    fn conversation(
+        &self,
+        request: cide_ipc::conversations::ConversationRequest,
+    ) -> Result<cide_ipc::conversations::ConversationResponse, String> {
+        let _ = request;
+        Err("this cide cannot read conversations".into())
+    }
     /// Which cide this is. Read once per connection, immediately after the handshake.
     fn instance(&self) -> InstanceInfo;
 

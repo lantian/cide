@@ -319,7 +319,7 @@ head?: string, };
 /**
  * What a device may say.
  */
-export type ClientBody = { "t": "pair", code: string, client: ClientInfo, } | { "t": "hello", protocol: number, client: ClientInfo, } | { "t": "subscribe", projects: Array<ProjectId>, } | { "t": "answerPrompt", session: SessionId, option: number, expectScreen: string, } | { "t": "input", session: SessionId, key: KeyEvent, seq: number, 
+export type ClientBody = { "t": "conversation", request: ConversationRequest, } | { "t": "pair", code: string, client: ClientInfo, } | { "t": "hello", protocol: number, client: ClientInfo, } | { "t": "subscribe", projects: Array<ProjectId>, } | { "t": "answerPrompt", session: SessionId, option: number, expectScreen: string, } | { "t": "input", session: SessionId, key: KeyEvent, seq: number, 
 /**
  * The digest of the prompt on screen, **required while a session is awaiting
  * permission** and ignored otherwise.
@@ -388,6 +388,28 @@ export type CommentId = string;
  * A console's desktop location, independent of its harness or pane role.
  */
 export type ConsoleLocation = "main" | "tab" | "detached";
+
+export type ConversationItem = { id: string, ordinal: number, 
+/**
+ * user, assistant, tool, error, or notice. Unknown kinds remain readable.
+ */
+kind: string, text: string, tool: string | null, status: string | null, detailAvailable: boolean, };
+
+export type ConversationPage = { conversation: ConversationSummary, 
+/**
+ * Source identity. A change invalidates every old cursor and item.
+ */
+generation: string, revision: string, items: Array<ConversationItem>, before: string | null, after: string, reset: boolean, available: boolean, detail: string | null, prompt: PermissionPrompt | null, };
+
+export type ConversationRequest = { "action": "list", project: ProjectId, } | { "action": "read", project: ProjectId, id: string, 
+/**
+ * Session views follow /clear and /resume; archived views stay on the named conversation.
+ */
+followSession?: SessionId, generation: string | null, before: string | null, after: string | null, } | { "action": "detail", project: ProjectId, id: string, generation: string, item: string, offset: number, } | { "action": "send", project: ProjectId, id: string, session: SessionId, operation: string, text: string, } | { "action": "resume", project: ProjectId, id: string, operation: string, };
+
+export type ConversationResponse = { "action": "list", conversations: Array<ConversationSummary>, } | { "action": "read", page: ConversationPage, } | { "action": "detail", text: string, next: number | null, } | { "action": "receipt", operation: string, status: string, session: SessionId | null, };
+
+export type ConversationSummary = { project: ProjectId, id: string, harness: Harness, title: string, preview: string, updatedUnixMs: number, session: SessionId | null, state: SessionState | null, writable: boolean, canResume: boolean, };
 
 /**
  * Where the cursor is. Absent from a capture means hidden, not at the origin.
@@ -1145,7 +1167,7 @@ depth: number, lines: Array<ScreenLine>, };
 /**
  * What cide may say.
  */
-export type ServerBody = { "t": "welcome", protocol: number, instance: InstanceInfo, 
+export type ServerBody = { "t": "conversation", response: ConversationResponse, } | { "t": "welcome", protocol: number, instance: InstanceInfo, 
 /**
  * Capability names, for a device that wants to ask *can you* rather than *are you new
  * enough*. See [`PROTOCOL_VERSION`].

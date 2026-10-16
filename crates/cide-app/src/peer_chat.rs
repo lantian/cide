@@ -15,6 +15,75 @@ use tauri::{AppHandle, Manager};
 
 pub(crate) const TOOL: &str = "cide_peer_chat_send";
 
+/// A mobile prompt is one transaction with the same gate as desktop keystrokes.
+pub(crate) fn submit_mobile(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &PtySession,
+    harness: cide_ipc::Harness,
+    text: &str,
+) -> Result<(), String> {
+    let runtime = app.state::<Runtime>();
+    let lane = runtime.lane(session);
+    {
+        let mut held = lane.lock();
+        if held.writing {
+            return Err("Another message is being delivered. Try again after it finishes.".into());
+        }
+        if !cide_core::conversations::composer(harness, &pty.capture_screen())
+            .is_some_and(|body| body.trim().is_empty())
+        {
+            return Err(
+                "The desktop input contains a draft or menu. Finish it in Terminal first.".into(),
+            );
+        }
+        held.writing = true;
+    }
+    struct Release<'a>(&'a Mutex<Lane>);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.lock().writing = false;
+        }
+    }
+    let _release = Release(&lane);
+    let capture = pty.capture_screen();
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if text.contains('\n') && !capture.info.bracketed_paste {
+        return Err(
+            "This harness cannot safely accept a multiline paste here. Use Terminal.".into(),
+        );
+    }
+    pty.write(cide_remote::keys::paste(&text, &capture.info));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    // The paste and submit must reach distinct reads, and a long paste must be visible first.
+    thread::sleep(Duration::from_millis(120));
+    loop {
+        if pty.has_exited() {
+            return Err("Submission is uncertain because the harness stopped. Check history before resending.".into());
+        }
+        if matches!(
+            crate::emit::last_session_states().get(&session),
+            Some(cide_ipc::SessionState::AwaitingPermission | cide_ipc::SessionState::Paused)
+        ) {
+            return Err("Submission is uncertain because the session changed state. Check Terminal before resending.".into());
+        }
+        if cide_core::conversations::composer(harness, &pty.capture_screen())
+            .is_some_and(|body| cide_core::conversations::submitted_body_matches(&body, &text))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("The prompt was pasted, but submission could not be verified. Check Terminal before resending.".into());
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
+        hooks.note_codex_input(session, b"\r", pty);
+    }
+    pty.write(vec![b'\r']);
+    Ok(())
+}
+
 #[derive(Default)]
 pub(crate) struct Runtime {
     lanes: DashMap<SessionId, Arc<Mutex<Lane>>>,

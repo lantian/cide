@@ -656,6 +656,19 @@ fn apply(
     conversations: &DashMap<SessionId, SessionId>,
 ) {
     codex_status(frame, app);
+    // The hook knows custom storage homes. Remember its path without doing disk I/O here.
+    if let (Some(cwd), Some(id), Some(path)) = (
+        frame.payload.get("cwd").and_then(|v| v.as_str()),
+        frame.payload.get("session_id").and_then(|v| v.as_str()),
+        frame
+            .payload
+            .get("transcript_path")
+            .and_then(|v| v.as_str()),
+    ) {
+        if let Some(sessions) = crate::sessions_state::handle(app) {
+            sessions.note_source(cwd.into(), id.into(), path.into());
+        }
+    }
     for effect in decide(frame, states, conversations) {
         match effect {
             Effect::Status { session, payload } => {

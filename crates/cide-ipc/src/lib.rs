@@ -8,6 +8,7 @@
 //! This crate must never depend on `tauri`.
 
 pub mod clipboard;
+pub mod conversations;
 pub mod git;
 pub mod gitlab;
 pub mod headless;

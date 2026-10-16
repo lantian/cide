@@ -1,6 +1,6 @@
 //! One private OpenCode server per interactive console. The TUI and cide observe the same session.
 use cide_agents::harness::{
-    opencode::{Generation, OPENCODE_CLI},
+    opencode::{Flavor, Generation, OPENCODE_CLI},
     opencode_console::Api,
 };
 use cide_ipc::{Harness, HarnessSession, SessionId, SessionState, Settings};
@@ -30,6 +30,7 @@ pub(crate) struct Console {
 }
 
 pub(crate) struct Start {
+    pub harness: Harness,
     pub settings: Settings,
     pub spec: SpawnSpec,
     pub routing: SessionId,
@@ -48,7 +49,8 @@ pub(crate) struct Start {
 impl Console {
     pub fn start(start: Start) -> Result<(SpawnSpec, Arc<Self>), String> {
         let Start {
-            settings,
+            harness,
+            mut settings,
             mut spec,
             routing,
             resume,
@@ -60,9 +62,20 @@ impl Console {
             reviewer,
             paired,
         } = start;
+        let flavor = Flavor::of(harness).ok_or("This harness has no native console API")?;
+        if harness == Harness::Mimo {
+            settings.opencode.cli.binary = flavor.program().into();
+            settings.opencode.cli.args.clear();
+            settings.opencode.cli.env.clear();
+        }
+        let prefix = if harness == Harness::Mimo {
+            "MIMOCODE"
+        } else {
+            "OPENCODE"
+        };
         let cli = &settings.opencode.cli;
         cide_core::opencode_cli::resolve(&cli.binary)?;
-        let flags = OPENCODE_CLI.probe_with_cli(cli);
+        let flags = flavor.probe_with_cli(cli);
         let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
         let port = socket.local_addr().map_err(|e| e.to_string())?.port();
         drop(socket);
@@ -85,7 +98,7 @@ impl Console {
         let unattended = !reviewer && (unattended || launch.args.iter().any(|arg| arg == "--auto"));
         launch.args.retain(|arg| arg != "--auto");
         let hook = crate::agents::cide_hook_binary();
-        let mut document: serde_json::Value = OPENCODE_CLI
+        let mut document: serde_json::Value = flavor
             .tab_config(
                 &settings.llm,
                 cli.inject.mcp_config.then_some(hook.as_deref()).flatten(),
@@ -147,9 +160,9 @@ impl Console {
         }
         server_spec = server_spec
             .env("CIDE_SESSION", routing.to_string())
-            .env("OPENCODE_SERVER_PASSWORD", password.clone())
-            .env("OPENCODE_SERVER_USERNAME", "opencode")
-            .env("OPENCODE_CONFIG_CONTENT", document.to_string());
+            .env(format!("{prefix}_SERVER_PASSWORD"), password.clone())
+            .env(format!("{prefix}_SERVER_USERNAME"), "opencode")
+            .env(format!("{prefix}_CONFIG_CONTENT"), document.to_string());
         let server = match PtySession::spawn(server_spec) {
             Ok(server) => server,
             Err(error) => {
@@ -163,7 +176,7 @@ impl Console {
             server,
             api,
             conversation: Mutex::new(HarnessSession {
-                harness: Harness::Opencode,
+                harness,
                 id: String::new(),
                 cwd: spec.cwd.clone(),
             }),
@@ -223,7 +236,7 @@ impl Console {
             console.api.instructions(&id, instructions)?;
         }
         let attachment =
-            OPENCODE_CLI.attach_spec_with(&console.conversation(), &console.api_url(port), flags);
+            flavor.attach_spec_with(&console.conversation(), &console.api_url(port), flags);
         spec.program = cli.binary.trim().into();
         spec.args = launch.args;
         spec.args.extend(attachment.args);
@@ -240,8 +253,8 @@ impl Console {
         }
         spec = spec
             .apply(launch.env)
-            .env("OPENCODE_SERVER_PASSWORD", password)
-            .env("OPENCODE_SERVER_USERNAME", "opencode");
+            .env(format!("{prefix}_SERVER_PASSWORD"), password)
+            .env(format!("{prefix}_SERVER_USERNAME"), "opencode");
         // Submit after the TUI attaches. Passing --prompt also makes the opening turn visible in the TUI.
         if let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) {
             spec.args.extend(["--prompt".into(), prompt]);
@@ -374,7 +387,8 @@ impl Console {
                             }
                             if kind == "message.updated" || kind == "message.created" {
                                 let info = payload.get("info").unwrap_or(payload);
-                                if info["role"].as_str() == Some("user")
+                                if info["role"].as_str().or_else(|| info["type"].as_str())
+                                    == Some("user")
                                     && info["sessionID"].as_str()
                                         == Some(this.conversation().id.as_str())
                                 {

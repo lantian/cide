@@ -44,6 +44,9 @@ const SEEN_GRANULARITY_MS: u64 = 60_000;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Journal {
+    /// Private storage locators. Kept out of SessionRecord, which can cross the remote wire.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub projects: BTreeMap<String, Vec<SessionRecord>>,
 }
@@ -483,6 +486,23 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_locators_are_private_to_the_journal_and_old_journals_load() {
+        let old: Journal = serde_json::from_value(serde_json::json!({"projects": {}})).unwrap();
+        assert!(old.sources.is_empty());
+        let mut journal = old;
+        journal.sources.insert(
+            "conversation".into(),
+            PathBuf::from("/private/custom-home/session.jsonl"),
+        );
+        let row = record("conversation", SessionKind::Console);
+        assert!(!serde_json::to_string(&row).unwrap().contains("/private/"));
+        assert!(
+            serde_json::to_string(&journal)
+                .unwrap()
+                .contains("/private/")
+        );
+    }
 
     #[test]
     fn the_head_skips_wrappers_and_meta_lines_and_finds_the_title() {

@@ -1,0 +1,83 @@
+{
+  "info": {
+    "id": "ses_cide_mobile_fixture",
+    "slug": "cide-mobile-fixture",
+    "projectID": "global",
+    "directory": "/tmp/cide-conversation-native/project",
+    "title": "Mobile fixture",
+    "titleSource": "user",
+    "titleRevision": 0,
+    "version": "0.1.15",
+    "time": {
+      "created": 1792091744778,
+      "updated": 1792091744778
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1792091744778,
+          "completed": 1792091744778
+        },
+        "parentID": "msg_cide_user",
+        "modelID": "fixture",
+        "providerID": "fixture",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/tmp/cide-conversation-native/project",
+          "root": "/tmp/cide-conversation-native/project"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "id": "msg_cide_assistant",
+        "sessionID": "ses_cide_mobile_fixture",
+        "agentID": "main"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Fixture answer",
+          "id": "prt_msg_cide_assistant",
+          "sessionID": "ses_cide_mobile_fixture",
+          "messageID": "msg_cide_assistant"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1792091744778
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "fixture",
+          "modelID": "fixture"
+        },
+        "id": "msg_cide_user",
+        "sessionID": "ses_cide_mobile_fixture",
+        "agentID": "main"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Fixture prompt",
+          "id": "prt_msg_cide_user",
+          "sessionID": "ses_cide_mobile_fixture",
+          "messageID": "msg_cide_user"
+        }
+      ]
+    }
+  ]
+}

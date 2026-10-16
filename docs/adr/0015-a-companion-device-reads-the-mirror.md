@@ -92,6 +92,15 @@ The tee is therefore inside `emit.rs`, one line after each `app.emit`, and it is
 
 ## Consequences
 
+### Conversation view addition
+
+AI sessions may also be read through a structured conversation projection; see
+[`docs/conversations.md`](../conversations.md). Native transcripts/exports provide paginated
+messages and tool details while the existing state events report activity. Foreground phones
+poll changes on demand. This adds no PTY sink and no back-pressure path into a harness. The
+mirror remains the source for shells, the optional Terminal view, and permission/input guards
+whose harness exposes no structured equivalent. Opening history does not start a model turn.
+
 * A remote client's view can lag the desktop's by up to a tick, and a burst faster than the tick
   is coalesced. Both are wanted.
 * `cide-pty` gains a second reader of its mirror, so the scrollback walk's viewport restore is now

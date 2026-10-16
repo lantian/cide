@@ -362,6 +362,10 @@ pub struct ClientFrame {
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "t")]
 #[ts(export)]
 pub enum ClientBody {
+    /// Read or control a conversation without watching its terminal grid.
+    Conversation {
+        request: crate::conversations::ConversationRequest,
+    },
     /// Redeem a pairing code. **The only frame an unauthenticated connection may send**, and it
     /// may send it once: anything else, or a second attempt, closes the socket. A short code is
     /// only strong against a single guess, so a retry budget is exactly what would make it
@@ -702,6 +706,9 @@ pub struct ServerFrame {
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "t")]
 #[ts(export)]
 pub enum ServerBody {
+    Conversation {
+        response: crate::conversations::ConversationResponse,
+    },
     /// The answer to a `Hello`: which cide this is, and what it can do.
     Welcome {
         protocol: u32,

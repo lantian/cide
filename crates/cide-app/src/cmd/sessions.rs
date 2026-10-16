@@ -94,7 +94,8 @@ pub async fn sessions_search(
             .into_iter()
             .filter(|row| row.searchable)
             .filter_map(|row| {
-                crate::sessions_state::transcript_path(&row.record).map(|p| (row.record.id, p))
+                crate::sessions_state::transcript_path_for(&app, &row.record)
+                    .map(|p| (row.record.id, p))
             })
             .collect();
         let capped = files.len() > SEARCH_FILES;
@@ -185,7 +186,7 @@ pub async fn sessions_open(
         conversation.harness,
         cide_ipc::Harness::Claude | cide_ipc::Harness::Qwen | cide_ipc::Harness::Codex
     );
-    if transcript_kept && crate::sessions_state::transcript_path(&record).is_none() {
+    if transcript_kept && crate::sessions_state::transcript_path_for(&app, &record).is_none() {
         return Ok(unavailable(
             "Its transcript is no longer on disk, so the conversation cannot be resumed.",
         ));

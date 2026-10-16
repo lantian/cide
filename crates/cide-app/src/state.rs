@@ -32,6 +32,7 @@ pub struct SessionRegistry {
     /// Latest hook identity, retained even when its pane has not bound yet.
     conversations: DashMap<SessionId, Conversation>,
     native_conversations: DashMap<SessionId, cide_ipc::HarnessSession>,
+    resume_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -209,14 +210,26 @@ impl SessionRegistry {
         self.native_conversations.insert(id, conversation);
     }
     pub fn native_in_use(&self, conversation: &cide_ipc::HarnessSession) -> Option<SessionId> {
-        self.native_conversations.iter().find_map(|row| {
-            (row.value().harness == conversation.harness
-                && row.value().id == conversation.id
-                && self
-                    .get(*row.key())
-                    .is_some_and(|session| !session.has_exited()))
-            .then_some(*row.key())
+        self.ids().into_iter().find(|id| {
+            if self.get(*id).is_none_or(|pty| pty.has_exited()) || self.codex_cleared(*id) {
+                return false;
+            }
+            if let Some((current, _)) = self.conversation_of(*id) {
+                return current.to_string() == conversation.id
+                    && self.harness_of(*id) == Some(conversation.harness);
+            }
+            self.native_conversation(*id)
+                .is_some_and(|c| c.harness == conversation.harness && c.id == conversation.id)
         })
+    }
+    pub fn resume_gate(
+        &self,
+        conversation: &cide_ipc::HarnessSession,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.resume_locks
+            .entry(format!("{:?}:{}", conversation.harness, conversation.id))
+            .or_default()
+            .clone()
     }
     pub fn native_conversation(&self, id: SessionId) -> Option<cide_ipc::HarnessSession> {
         self.native_conversations.get(&id).map(|v| v.clone())
@@ -348,6 +361,77 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuation_admission_is_shared_by_identity_and_separate_between_harnesses() {
+        let registry = SessionRegistry::default();
+        let mut conversation = cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Claude,
+            id: SessionId::new().to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        let first = registry.resume_gate(&conversation);
+        let _held = first.try_lock().unwrap();
+        assert!(registry.resume_gate(&conversation).try_lock().is_err());
+        conversation.harness = cide_ipc::Harness::Qwen;
+        assert!(registry.resume_gate(&conversation).try_lock().is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn every_harness_recognizes_a_live_continuation_and_codex_switches_override_stale_identity() {
+        let registry = SessionRegistry::default();
+        let id = SessionId::new();
+        let pty = PtySession::spawn(
+            cide_pty::SpawnSpec::new("sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("read pending"),
+        )
+        .unwrap();
+        struct Stop(Arc<PtySession>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _stop = Stop(pty.clone());
+        registry.insert(id, pty);
+        for harness in [
+            cide_ipc::Harness::Claude,
+            cide_ipc::Harness::Codex,
+            cide_ipc::Harness::Qwen,
+            cide_ipc::Harness::Opencode,
+            cide_ipc::Harness::Mimo,
+        ] {
+            let conversation = cide_ipc::HarnessSession {
+                harness,
+                id: SessionId::new().to_string(),
+                cwd: std::env::temp_dir(),
+            };
+            registry.note_harness(id, harness);
+            registry.note_native_conversation(id, conversation.clone());
+            assert_eq!(
+                registry.native_in_use(&conversation),
+                Some(id),
+                "{harness:?}"
+            );
+        }
+        let old = cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: SessionId::new().to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        registry.note_harness(id, old.harness);
+        registry.note_native_conversation(id, old.clone());
+        let new_id = SessionId::new();
+        registry.note_conversation(id, new_id, 1);
+        assert_eq!(registry.native_in_use(&old), None);
+        let current = cide_ipc::HarnessSession {
+            id: new_id.to_string(),
+            ..old
+        };
+        assert_eq!(registry.native_in_use(&current), Some(id));
+        registry.note_codex_clear(id);
+        assert_eq!(registry.native_in_use(&current), None);
+    }
     use cide_pty::{Sink, SpawnSpec};
 
     /// A child that produces nothing and stays alive, so the assertions are about the

@@ -195,6 +195,7 @@ const KNOWN_CLIENT_FRAMES = [
   'consoleUploadCancel',
   'consoleUploadChunk',
   'consoleUploadFinish',
+  'conversation',
   'dispatch',
   'gateRun',
   'hello',

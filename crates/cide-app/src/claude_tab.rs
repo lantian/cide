@@ -507,7 +507,7 @@ fn stance_args(
 /// `@`-mention belongs to. `ide::resolve_unbound_connections` would recover it by walking
 /// ancestry, but both facts are in hand wherever this is called, so the answer is given rather
 /// than reconstructed.
-fn bind_ide_pane(
+pub(crate) fn bind_ide_pane(
     app: &tauri::AppHandle,
     registry: &crate::state::SessionRegistry,
     project: ProjectId,

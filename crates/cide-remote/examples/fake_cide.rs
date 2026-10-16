@@ -137,6 +137,10 @@ fn main() {
 /// reported as verified when nothing had been verified at all.
 #[derive(Default)]
 struct Constants {
+    conversation_messages: std::sync::Mutex<Vec<cide_ipc::conversations::ConversationItem>>,
+    conversation_operations: std::sync::Mutex<
+        std::collections::HashMap<String, cide_ipc::conversations::ConversationResponse>,
+    >,
     upload_root: PathBuf,
     closed: std::sync::Mutex<std::collections::HashSet<cide_ipc::SessionId>>,
     answered_task: std::sync::Mutex<Option<cide_ipc::TaskDetail>>,
@@ -300,6 +304,117 @@ impl Constants {
 }
 
 impl RemoteHost for Constants {
+    fn conversation(
+        &self,
+        request: cide_ipc::conversations::ConversationRequest,
+    ) -> Result<cide_ipc::conversations::ConversationResponse, String> {
+        use cide_ipc::conversations::*;
+        let session = self.sessions(None)[0].session;
+        let summary = ConversationSummary {
+            project: project(),
+            id: "example-conversation".into(),
+            harness: cide_ipc::Harness::Claude,
+            title: "Example conversation".into(),
+            preview: "hello".into(),
+            updated_unix_ms: 1,
+            session: Some(session),
+            state: Some(cide_ipc::SessionState::Busy),
+            writable: true,
+            can_resume: false,
+        };
+        let requested = match &request {
+            ConversationRequest::List { project }
+            | ConversationRequest::Read { project, .. }
+            | ConversationRequest::Detail { project, .. }
+            | ConversationRequest::Send { project, .. }
+            | ConversationRequest::Resume { project, .. } => *project,
+        };
+        if requested != project() {
+            return Err("no such project".into());
+        }
+        let mut messages = self.conversation_messages.lock().unwrap();
+        if messages.is_empty() {
+            messages.push(ConversationItem {
+                id: "first".into(),
+                ordinal: 0,
+                kind: "assistant".into(),
+                text: "Hello from saved history".into(),
+                tool: None,
+                status: None,
+                detail_available: false,
+            });
+        }
+        match request {
+            ConversationRequest::List { .. } => Ok(ConversationResponse::List {
+                conversations: vec![summary],
+            }),
+            ConversationRequest::Read {
+                generation, after, ..
+            } => {
+                let reset = generation.as_deref() != Some("example-generation");
+                let start = if reset {
+                    0
+                } else {
+                    after.and_then(|s| s.parse().ok()).unwrap_or(0)
+                };
+                let revision = messages.len().to_string();
+                Ok(ConversationResponse::Read {
+                    page: ConversationPage {
+                        conversation: summary,
+                        generation: "example-generation".into(),
+                        revision: revision.clone(),
+                        items: messages.iter().skip(start).cloned().collect(),
+                        before: None,
+                        after: revision,
+                        reset,
+                        available: true,
+                        detail: None,
+                        prompt: None,
+                    },
+                })
+            }
+            ConversationRequest::Detail { .. } => Ok(ConversationResponse::Detail {
+                text: "Example tool output".into(),
+                next: None,
+            }),
+            ConversationRequest::Send {
+                operation,
+                text,
+                session: target,
+                ..
+            } => {
+                if session != target {
+                    return Err("wrong session".into());
+                }
+                let mut operations = self.conversation_operations.lock().unwrap();
+                if let Some(response) = operations.get(&operation) {
+                    return Ok(response.clone());
+                }
+                let ordinal = messages.len() as u32;
+                messages.push(ConversationItem {
+                    id: operation.clone(),
+                    ordinal,
+                    kind: "user".into(),
+                    text,
+                    tool: None,
+                    status: None,
+                    detail_available: false,
+                });
+                let response = ConversationResponse::Receipt {
+                    operation: operation.clone(),
+                    status: "submitted".into(),
+                    session: Some(session),
+                };
+                operations.insert(operation, response.clone());
+                Ok(response)
+            }
+            ConversationRequest::Resume { operation, .. } => Ok(ConversationResponse::Receipt {
+                operation,
+                status: "resumed".into(),
+                session: Some(session),
+            }),
+        }
+    }
     fn instance(&self) -> InstanceInfo {
         InstanceInfo {
             id: "i-example".to_owned(),

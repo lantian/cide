@@ -1,0 +1,80 @@
+{
+  "info": {
+    "id": "ses_cide_mobile_fixture",
+    "projectID": "d953c140ec5a67eff600ee746457175e15fbf178",
+    "model": {
+      "id": "fixture",
+      "providerID": "fixture",
+      "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1792091744778,
+      "updated": 1792092312185
+    },
+    "title": "Mobile fixture",
+    "location": {
+      "directory": "/tmp/cide-conversation-native/project"
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_cide_user",
+      "time": {
+        "created": 1792091744778
+      },
+      "text": "Fixture prompt",
+      "type": "user"
+    },
+    {
+      "id": "msg_cide_assistant",
+      "time": {
+        "created": 1792091744778,
+        "completed": 1792091744778
+      },
+      "type": "assistant",
+      "agent": "build",
+      "model": {
+        "id": "fixture",
+        "providerID": "fixture"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Fixture answer"
+        },
+        {
+          "type": "tool",
+          "id": "call_fixture",
+          "name": "bash",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "pwd"
+            },
+            "content": [
+              {
+                "type": "text",
+                "text": "/tmp/fixture"
+              }
+            ]
+          },
+          "time": {
+            "created": 1792091744778,
+            "completed": 1792091744778
+          }
+        }
+      ],
+      "finish": "stop"
+    }
+  ]
+}

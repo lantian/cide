@@ -160,6 +160,9 @@ pub const FEATURES: &[&str] = &[
     "userRequests",
     "consoleClose",
     "consoleUpload",
+    "conversations",
+    "conversationInput",
+    "conversationResume",
 ];
 
 /// Something that happened in cide, on its way to whichever devices care.
@@ -1300,6 +1303,23 @@ async fn serve(
             }
 
             // --- authenticated ----------------------------------------------------------
+            (true, ClientBody::Conversation { request }) => {
+                match ask(&inner, move |host| host.conversation(request)).await {
+                    Ok(response) => {
+                        if say(&out_tx, id_of, ServerBody::Conversation { response })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if refused(&out_tx, id_of, Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
             (
                 true,
                 ClientBody::ConsoleClose {

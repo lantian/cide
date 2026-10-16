@@ -47,6 +47,7 @@ use crate::workspace_state::WorkspaceState;
 const POLL: Duration = Duration::from_millis(500);
 
 pub struct SessionsState {
+    pub(crate) conversations: crate::conversations::Runtime,
     journal: Mutex<Journal>,
     path: PathBuf,
     debounce: Debouncer,
@@ -75,6 +76,7 @@ impl SessionsState {
     pub fn load() -> Self {
         let path = journal_path();
         Self {
+            conversations: Default::default(),
             journal: Mutex::new(persist::read_or_quarantine(&path)),
             path,
             debounce: Debouncer::default(),
@@ -117,7 +119,18 @@ impl SessionsState {
 
     /// Write unconditionally. The flusher's write, and the shutdown's.
     pub fn write_now(&self) {
-        let bytes = match serde_json::to_vec_pretty(&*self.journal.lock()) {
+        let encoded = {
+            let mut journal = self.journal.lock();
+            let retained: BTreeSet<_> = journal
+                .projects
+                .values()
+                .flatten()
+                .map(|r| source_key(&r.cwd, &r.id))
+                .collect();
+            journal.sources.retain(|key, _| retained.contains(key));
+            serde_json::to_vec_pretty(&*journal)
+        };
+        let bytes = match encoded {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::error!(%error, "could not encode the session journal");
@@ -265,7 +278,7 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
             .get(&record.id)
             .or_else(|| record.session.and_then(|s| panes.get(&s.to_string())))
             .copied();
-        let transcript = transcript_path(&record);
+        let transcript = sessions.input_path(&record);
         let pointless = !record.known || (keeps_transcript(record.harness) && transcript.is_none());
         if !is_live && pane.is_none() && pointless {
             continue;
@@ -306,16 +319,42 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
 }
 
 impl SessionsState {
-    fn input_path(&self, record: &SessionRecord) -> Option<PathBuf> {
+    pub(crate) fn input_path(&self, record: &SessionRecord) -> Option<PathBuf> {
         let key = (record.cwd.clone(), record.id.clone());
-        if let Some(path) = self.input_paths.lock().get(&key).cloned()
+        let cached = self.input_paths.lock().get(&key).cloned();
+        if let Some(path) = cached
             && path.is_file()
         {
+            self.remember_path(&record.cwd, &record.id, &path);
             return Some(path);
         }
-        let path = transcript_path(record)?;
+        let saved = self
+            .journal
+            .lock()
+            .sources
+            .get(&source_key(&record.cwd, &record.id))
+            .cloned();
+        let path = saved
+            .filter(|p| p.is_file())
+            .or_else(|| transcript_path(record))?;
         self.input_paths.lock().insert(key, path.clone());
+        self.remember_path(&record.cwd, &record.id, &path);
         Some(path)
+    }
+
+    fn remember_path(&self, cwd: &Path, id: &str, path: &Path) {
+        let key = source_key(cwd, id);
+        let mut journal = self.journal.lock();
+        if journal.sources.get(&key).map(PathBuf::as_path) != Some(path) {
+            journal.sources.insert(key, path.into());
+            self.debounce.note_change();
+        }
+    }
+    pub(crate) fn note_source(&self, cwd: PathBuf, id: String, path: PathBuf) {
+        self.input_paths
+            .lock()
+            .insert((cwd.clone(), id.clone()), path.clone());
+        self.remember_path(&cwd, &id, &path);
     }
 
     /// Hooks may precede the transcript append; the ordinary poll retries that race. Waking
@@ -497,9 +536,19 @@ impl SessionsState {
             .into_iter()
             .find(|r| r.id == id)
     }
+    pub(crate) fn records(&self, root: &Path) -> Vec<SessionRecord> {
+        self.journal.lock().list(root)
+    }
 }
 
 /// The managed state, for the commands.
 pub(crate) fn handle(app: &AppHandle) -> Option<Arc<SessionsState>> {
     state(app)
+}
+
+fn source_key(cwd: &Path, id: &str) -> String {
+    serde_json::to_string(&(cwd.to_string_lossy(), id)).expect("strings serialize")
+}
+pub(crate) fn transcript_path_for(app: &AppHandle, record: &SessionRecord) -> Option<PathBuf> {
+    state(app).and_then(|s| s.input_path(record))
 }

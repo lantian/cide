@@ -1222,6 +1222,18 @@ pub(crate) async fn spawn_session(
         prompt: opening,
         task_tools,
     } = request;
+    // Desktop and mobile continuations share one admission gate, held until the new
+    // child's identity is registered. Forks deliberately create a separate conversation.
+    let _resume_guard = if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork))
+    {
+        let guard = registry.resume_gate(conversation).lock_owned().await;
+        if let Some(held) = registry.native_in_use(conversation) {
+            return Err(SessionError::AlreadyOpen(held));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let app = app.clone();
     // Read before the blocking closure: `WorkspaceState` is Tauri-managed state and the
     // closure below is `spawn_blocking`, which cannot hold a `State<'_, _>` across the await.
@@ -1418,7 +1430,7 @@ pub(crate) async fn spawn_session(
                 });
                 let native = continues
                     .clone()
-                    .filter(|c| c.harness == cide_ipc::Harness::Opencode)
+                    .filter(|c| c.harness.reads_provider_document())
                     .or_else(|| {
                         resume.and_then(|id| {
                             cide_core::workspace::native_conversation_holding(ws, id)
@@ -1502,7 +1514,10 @@ pub(crate) async fn spawn_session(
     let claude_settings = settings.claude.clone();
     let codex_settings = settings.codex.clone();
     let job_notify_after = crate::lifecycle::job_notify_after(&settings);
-    let is_opencode = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Opencode);
+    let is_opencode = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Opencode)
+        || native
+            .as_ref()
+            .is_some_and(|c| c.harness == cide_ipc::Harness::Mimo);
     if is_opencode && let Some(native) = &native {
         spec.cwd = native.cwd.clone();
     }
@@ -1511,7 +1526,10 @@ pub(crate) async fn spawn_session(
     // Either CLI. Everything that is about "a console" rather than about claude's own argv —
     // the proxy scope, `CIDE_SESSION`, the task tools' socket, *not* watching jobs or rewriting
     // output — keys on this.
-    let is_console = console.is_some();
+    let is_qwen = continues
+        .as_ref()
+        .is_some_and(|c| c.harness == cide_ipc::Harness::Qwen);
+    let is_console = console.is_some() || is_opencode || is_qwen;
     if resume_picker && !codex_settings.cli.inject.resume {
         return Err(SessionError::Pty(
             "Codex session restoration is disabled in Settings → Harness → Codex.".into(),
@@ -2093,6 +2111,10 @@ pub(crate) async fn spawn_session(
             .map(|pair| pair[1].clone());
         let unattended = spec.args.iter().any(|arg| arg == "--auto");
         let start = crate::opencode_console::Start {
+            harness: native
+                .as_ref()
+                .map(|c| c.harness)
+                .unwrap_or(cide_ipc::Harness::Opencode),
             settings,
             spec,
             routing: id,
@@ -2115,6 +2137,14 @@ pub(crate) async fn spawn_session(
         None
     };
 
+    let qwen_events = if is_qwen {
+        Some(
+            crate::event_tap::ConsoleEvents::prepare(&mut spec)
+                .map_err(|e| SessionError::Pty(e.to_string()))?,
+        )
+    } else {
+        None
+    };
     let session = blocking(move || {
         if local_login_shell
             && let Some(pane) = pane
@@ -2170,10 +2200,25 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert_prompted(id, Arc::clone(&session), opening_prompt);
+    if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork)) {
+        registry.note_native_conversation(id, conversation.clone());
+    }
+    if let Some(events) = qwen_events {
+        events.observe(app.clone(), id, Arc::clone(&session));
+    }
     if let (Some(project), Some(text)) = (project, codex_git_warning) {
         crate::emit::codex_git_permissions_notice(&app, project, text);
     }
     if let Some(observer) = opencode {
+        if let Some(sessions) = crate::sessions_state::handle(&app) {
+            sessions.conversations.consoles.insert(id, observer.clone());
+            let weak = Arc::downgrade(&sessions);
+            session.on_exit(move |_| {
+                if let Some(sessions) = weak.upgrade() {
+                    sessions.conversations.consoles.remove(&id);
+                }
+            });
+        }
         if pair.is_some() {
             app.state::<crate::peer_chat::Runtime>()
                 .note_console(id, observer.clone());

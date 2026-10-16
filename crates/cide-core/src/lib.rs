@@ -26,6 +26,7 @@ pub mod codex_active;
 pub mod codex_cli;
 pub mod codex_permissions;
 pub mod commands;
+pub mod conversations;
 pub mod diagnostics;
 pub mod document;
 pub mod error;
