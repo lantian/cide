@@ -62,6 +62,15 @@ impl Selection {
     }
 }
 
+#[derive(Clone)]
+struct ForwardContext {
+    server_url: String,
+    token: String,
+    selected: Arc<Mutex<Selection>>,
+    observe: Observe,
+    policy: Value,
+}
+
 struct Credentials(PathBuf);
 impl Credentials {
     fn new(token: &str) -> Result<Self, String> {
@@ -191,13 +200,15 @@ impl Console {
                     .and_then(|runtime| {
                         runtime.block_on(forward(
                             proxy,
-                            server_url,
-                            token,
-                            protocol,
+                            ForwardContext {
+                                server_url,
+                                token,
+                                selected: protocol,
+                                observe,
+                                policy,
+                            },
                             receive,
                             shutdown_rx,
-                            observe,
-                            policy,
                         ))
                     });
                 if let Err(error) = outcome {
@@ -361,13 +372,9 @@ fn supports_remote(spec: &SpawnSpec) -> Result<(), String> {
 
 async fn forward(
     listener: TcpListener,
-    server_url: String,
-    token: String,
-    selected: Arc<Mutex<Selection>>,
+    context: ForwardContext,
     mut submissions: channel::UnboundedReceiver<Submission>,
     mut shutdown: watch::Receiver<bool>,
-    observe: Observe,
-    policy: Value,
 ) -> Result<(), String> {
     let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
     let mut connections = HashMap::new();
@@ -391,14 +398,11 @@ async fn forward(
                 let id = next;
                 let (send, receive) = channel::unbounded_channel();
                 connections.insert(id, send);
-                let server_url = server_url.clone();
-                let token = token.clone();
-                let selected = selected.clone();
+                let context = context.clone();
+                let selected = context.selected.clone();
                 let shutdown = shutdown.clone();
-                let observe = observe.clone();
-                let policy = policy.clone();
                 workers.spawn(async move {
-                    let result = forward_connection(stream, id, server_url, token, selected.clone(), receive, shutdown, observe, policy).await;
+                    let result = forward_connection(stream, id, context, receive, shutdown).await;
                     let mut selected = selected.lock();
                     if selected.connection == Some(id) {
                         selected.connection = None;
@@ -411,7 +415,7 @@ async fn forward(
                 // Native resume first opens a short-lived metadata connection, then its
                 // interactive client. Route only to the connection selecting the visible
                 // persistent thread, never to a bootstrap or ephemeral helper connection.
-                if selected.lock().connection != Some(submission.receiver.connection) {
+                if context.selected.lock().connection != Some(submission.receiver.connection) {
                     let _ = submission.reply.send(Ok(false));
                     continue;
                 }
@@ -430,14 +434,17 @@ async fn forward(
 async fn forward_connection(
     stream: tokio::net::TcpStream,
     connection: u64,
-    server_url: String,
-    token: String,
-    selected: Arc<Mutex<Selection>>,
+    context: ForwardContext,
     mut submissions: channel::UnboundedReceiver<Submission>,
     mut shutdown: watch::Receiver<bool>,
-    observe: Observe,
-    policy: Value,
 ) -> Result<(), String> {
+    let ForwardContext {
+        server_url,
+        token,
+        selected,
+        observe,
+        policy,
+    } = context;
     let credential = format!("Bearer {token}");
     let handshake = accept_hdr_async(
         stream,

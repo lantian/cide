@@ -35,13 +35,15 @@ fn forwarding_preserves_native_approvals_and_consumes_only_peer_acknowledgements
             .unwrap()
             .block_on(forward(
                 proxy,
-                upstream_url,
-                "test-secret".into(),
-                protocol,
+                ForwardContext {
+                    server_url: upstream_url,
+                    token: "test-secret".into(),
+                    selected: protocol,
+                    observe: Arc::new(|_| {}),
+                    policy: json!({}),
+                },
                 receive,
                 shutdown,
-                Arc::new(|_| {}),
-                json!({}),
             ))
     });
     let server = std::thread::spawn(move || {
