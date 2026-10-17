@@ -16,6 +16,15 @@ dots, tab/project waiting counts and desktop attention. The right reviewer stays
 it finishes a turn or reaches a permission prompt; its native status and permission controls
 remain available inside the panel.
 
+The writer gives brief progress updates while work or review continues. It yields when only
+review remains, then resumes automatically when the reviewer replies. Its final answer must
+contain the complete result, relevant validation and review findings together, rather than
+an early result followed by additions. An idle reviewer or a delivered request does not
+mean review is complete. The left panel shows **Waiting for peer review before the final
+answer** and does not raise completed-work attention during that wait. Blockages, including
+permission prompts in the right panel, are explained on the left and can raise its Waiting
+indicator. The final result is withheld until review resumes, unless you explicitly skip it.
+
 The main agent is the writer; the peer has invocation-local
 reviewer permissions and no cide dispatch/edit tools. Reviewers can inspect files outside
 the project, execute inspection commands (Git status/diff, metadata, hashes, disk usage),
@@ -53,6 +62,26 @@ Agents communicate through the pair-scoped `cide_peer_chat_send(message)` MCP to
 are labelled by side and harness and routed to the currently bound peer session. A terminal
 reply alone is not sent. Receipts distinguish queued, writing, delivered, failed, cancelled and
 uncertain delivery; delivered means the harness accepted the prompt, not that it answered.
+For review, the writer sends `kind=request`; the returned receipt ID identifies that review.
+There can be one open review per pair. The reviewer sends `kind=progress` for interim
+findings or clarification and `kind=reply` for its complete findings, always including
+`request_id`. An explicit “no issues found” reply completes a review too. Only delivery of
+that final reply back to the writer releases review. A message-only call remains an ordinary
+note for compatibility and never completes review.
+
+The writer-only `cide_peer_chat_status` tool reads the current request, reviewer runtime
+state, blockage reason and `readyToFinalize`. It never consumes or resends a message. The
+writer must check it before its final answer and yield while review remains pending, rather
+than repeatedly polling or blocking the receiving session. A short wait can finish an already
+in-flight delivery acknowledgment; this does not wait for the reviewer to perform its work.
+The writer can retire a superseded review with `kind=cancel`, or use `kind=skip` only on
+explicit user instruction, including the request ID and reason. A skipped review must be
+disclosed in the final answer. Replaced sessions, stale/duplicate replies and cancellation
+cannot complete a different review. Review records are invocation-local; restart does not
+restore pending requests or replay them. Restart existing pairs after updating to receive
+the new instructions and schemas. Restored Claude writers also disable old system-prompt
+snapshots while keeping their normal permission settings.
+
 The header tracks **Main → Peer** and **Peer → Main** separately. **No reply sent yet**
 means no peer message has been queued; text printed in the peer terminal is not forwarded.
 Queues are bounded to 16 messages per direction. Messages wait until the recipient is
@@ -97,7 +126,9 @@ The panels stay together: split, mirror, detach, move, maximize and individual c
 
 This is experimental. CLI composer layouts can change, and the conservative recognizer may
 withhold a message that needs manual recovery. Collaboration follows harness instructions;
-peer agreement does not grant user approval. Paid end-to-end model conversations are not part
+the review protocol supplies authoritative status, but Cide does not buffer or rewrite native
+terminal text to hide an agent that disregards those instructions.
+Peer agreement does not grant user approval. Paid end-to-end model conversations are not part
 of the automated checks.
 
 The concept is adapted from [agterm's two-agent chat cookbook](https://github.com/umputun/agterm/tree/master/cookbook/two-agent-chat).

@@ -18,6 +18,7 @@
   "cide://keymap-changed",
   "cide://milestones-changed",
   "cide://mouse-nav",
+  "cide://peer-chat-reviews",
   "cide://pool-notice",
   "cide://project-new-progress",
   "cide://project-running",

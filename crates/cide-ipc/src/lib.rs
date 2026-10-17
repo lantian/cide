@@ -1161,4 +1161,7 @@ mod file_stamp_tests {
 }
 
 pub mod peer_chat;
-pub use peer_chat::{PeerChat, PeerChatReceipt, PeerChatSelection};
+pub use peer_chat::{
+    PeerChat, PeerChatReceipt, PeerChatReviewState, PeerChatReviewStatus, PeerChatReviews,
+    PeerChatSelection,
+};

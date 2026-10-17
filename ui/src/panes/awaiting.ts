@@ -71,6 +71,7 @@ import {
 } from '@/ipc/client'
 import { paneSessionId } from '@/layout/paneHosts'
 import { useWorkspace } from '@/store/workspace'
+import { reviewSnapshot, subscribeReviews } from './peerReviews'
 import {
   UNSEEN,
   adopt,
@@ -94,6 +95,7 @@ import {
 const phaseOf = (state: SessionState): SessionPhase => state.state
 
 let tracks = new Map<string, Track>()
+const phases = new Map<string, SessionPhase>()
 const subscribers = new Set<() => void>()
 
 /**
@@ -128,9 +130,27 @@ function reviewerSessions(): Set<string> {
   return sessions
 }
 
+/** Waiting on review is not waiting on the user. Own permission prompts still need them. */
+function quietReviewWriters(): Set<string> {
+  const quiet = new Set<string>()
+  const projects = useWorkspace.getState().boot?.workspace.projects ?? {}
+  for (const review of reviewSnapshot().reviews) {
+    if (review.blockedReason || !['requestQueued', 'awaitingReply', 'replyQueued'].includes(review.state)) continue
+    const phase = phases.get(review.writer) ?? review.writerState.state
+    if (['awaitingPermission', 'paused', 'exited'].includes(phase)) continue
+    const tab = Object.values(projects).flatMap((p) => p.tabs).find((t) => t.id === review.tab)
+    if (!tab?.peerChat) continue
+    const writer = tab.tree.panes[tab.peerChat.main]
+    const reviewer = tab.tree.panes[tab.peerChat.peer]
+    if (writer && reviewer && (paneSessionId(writer.id) ?? writer.session) === review.writer
+      && (paneSessionId(reviewer.id) ?? reviewer.session) === review.reviewer) quiet.add(review.writer)
+  }
+  return quiet
+}
+
 /** Apply role policy to broadcasts, catch-up and later workspace/session bindings alike. */
 function publish(next: Map<string, Track>): void {
-  for (const session of reviewerSessions()) {
+  for (const session of [...reviewerSessions(), ...quietReviewWriters()]) {
     const before = next.get(session)
     if (!before?.awaiting) continue
     const after = onAcknowledge(before)
@@ -151,9 +171,11 @@ function report(session: string, before: Track, after: Track): void {
 }
 
 function applyState(session: string, phase: SessionPhase): void {
+  if (phase === 'exited') phases.delete(session)
+  else phases.set(session, phase)
   const before = trackOf(session)
   const state = onState(before, phase)
-  const after = reviewerSessions().has(session) ? onAcknowledge(state) : state
+  const after = reviewerSessions().has(session) || quietReviewWriters().has(session) ? onAcknowledge(state) : state
   if (after.gone) {
     // Dropped, not kept as `awaiting: false`. A dead session's entry would otherwise sit in
     // this map for the life of the window — and a pane's session id is reused when its child
@@ -192,6 +214,8 @@ let installed = false
 function install(): void {
   if (installed) return
   installed = true
+
+  subscribeReviews(() => publish(tracks))
 
   // A session-state/broadcast can arrive before its workspace binding in this webview.
   // Reconcile on snapshots too, so late binding and restoration clear every marker/count.

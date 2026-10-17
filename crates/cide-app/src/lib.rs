@@ -623,6 +623,7 @@ pub fn run() {
             cmd::peer_chat::peer_chat_configure,
             cmd::peer_chat::peer_chat_pause,
             cmd::peer_chat::peer_chat_receipts,
+            cmd::peer_chat::peer_chat_reviews,
             cmd::peer_chat::peer_chat_plan,
             cmd::project::tab_activate,
             cmd::project::tab_close,

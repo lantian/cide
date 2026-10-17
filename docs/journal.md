@@ -18357,3 +18357,52 @@ CI follow-up: the shared run reported 138 passes and one Clippy failure in the I
 file-navigation test recorder. Its nested request tuple now has the name
 `FileOpenRequest`. The full `cargo clippy --locked --workspace --all-targets -- -D warnings`
 check passes without lint allowances; formatting and whitespace checks also pass.
+
+
+## M182 — One complete writer answer after peer review
+
+Paired messages now distinguish ordinary notes, review requests, progress, final review
+replies, cancellation and explicit user-directed skip. One invocation-local request is open
+per pair, pinned to both bound sessions and its request ID. Transport delivery and runtime
+idle/busy never substitute for a final review. Only a correlated final reply accepted by
+the writer completes it; old and duplicate replies cannot release a replacement request.
+
+The paired writer has a read-only `cide_peer_chat_status` tool. Updated instructions require
+it to request consultation and final review, check readiness before concluding, yield with
+brief progress while review is pending, and produce one self-contained result after review.
+Reviewer instructions require an explicit final reply even for no issues; progress and
+clarification leave review open. A short condition-variable wait handles a reply already
+being submitted whose native turn starts before its transport acknowledgment arrives. It
+does not hold the writer open while the reviewer works or wait for receiver readiness.
+
+The left panel shows a review-wait or actionable blockage notice. Pending-review yields
+stay out of Waiting badges/counts and OS/remote attention, while the writer's own permission
+prompts and review blockages still notify on the left. The right remains quiet. A versioned
+review snapshot, change event and initial pull keep pane notices and attention consistent
+across windows and reject stale pull responses. Session states themselves remain intact.
+Pause, close, replacement and conversation reset invalidate review; restore replays nothing.
+Both paired Claude roles receive current instructions without reusing system snapshots;
+the writer's permissions are preserved. No persistent workspace migration is required.
+
+Validation: protocol/state and role/schema tests, the native-acceptance race test,
+TypeScript, and mounted pane/attention checks pass. The UI checks cover pending and queued
+replies, progress/idle, own permission prompts, left-only review blockage, final completion,
+stale initial snapshots and late bindings. Review attention membership is serialized with
+its snapshot so an older blocked state cannot re-raise a newer cleared marker; the final
+Rust build, workspace tests, strict Clippy and generated-contract checks pass. The full shared
+CI run passes all 139 checks with isolated temporary application state. Installed Claude,
+Codex and OpenCode reviewer audits also pass against local fake models and isolated native
+state. They verify restored instructions, scratch analysis, URL fetching, protected source/
+Git writes, and native search configuration; OpenCode returned six live search result URLs.
+No paid model conversation or live Tauri/OS attention check was made. The protocol provides authoritative review state; native terminal text still streams and
+answer sequencing depends on the harness following the updated instructions.
+
+
+The first full CI run passed 138 checks but hit the existing one-shot Markdown linearity
+measurement. An isolated retry failed too. Repeated timings showed allocation-related
+variation, and a fixed young-generation heap plus explicit collections outside timed
+parses restored expected scaling without changing parser code. The check now warms both
+sizes and takes the median of seven paired measurements, keeping the original 8× input /
+16× time bound and fast-input allowance. A deliberate quadratic array-splice control still
+fails that bound (59.4× at the 8× step). All 245 Markdown checks pass in isolation and in the final
+serial CI run: `target/ci-checks/run-ccFcmso6` reports 139 passed, 0 failed.

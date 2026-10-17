@@ -21,13 +21,18 @@ globalThis.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.win
 globalThis.cancelAnimationFrame = dom.window.cancelAnimationFrame.bind(dom.window)
 const calls = []
 let plan = [], failure = null, receipts = []
+const callbacks = new Map(), listeners = new Map()
+let callbackId = 0
 window.__TAURI_INTERNALS__ = {
   metadata: { currentWindow: { label: 'shell:test' } },
+  transformCallback: (callback) => { callbacks.set(++callbackId, callback); return callbackId },
   invoke: async (command, args) => {
     calls.push({ command, args })
     if (command === 'agents_models') return { models: args.harness === 'opencode' ? ['local/model-one', 'cloud/model-two'] : ['sonnet', 'opus'], problem: null }
     if (command === 'peer_chat_plan') return plan
     if (command === 'peer_chat_receipts') return receipts
+    if (command === 'peer_chat_reviews') return { revision: 0, reviews: [] }
+    if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)); return args.handler }
     if (command === 'peer_chat_configure' && failure) throw failure
   },
 }
@@ -120,6 +125,24 @@ try {
   assert.equal(document.querySelector('[data-terminal]'), null)
   await click(button('Start a fresh peer'))
   assert.equal(document.querySelector('[data-terminal]').dataset.fresh, 'fresh')
+  const review = {
+    tab: 'tab', writer: 'writer-session', reviewer: 'peer-session', requestId: 'request',
+    state: 'awaitingReply', writerState: { state: 'awaitingInput' }, reviewerState: { state: 'busy' },
+    blockedReason: null, readyToFinalize: false,
+  }
+  await mount(props(true, { ...configured, paused: false }, review.writer))
+  await act(async () => listeners.get('cide://peer-chat-reviews')({ payload: { revision: 1, reviews: [review] } }))
+  assert(document.body.textContent.includes('Waiting for peer review before the final answer'))
+  const blocked = { ...review, reviewerState: { state: 'awaitingPermission' }, blockedReason: 'Needs permission' }
+  await act(async () => listeners.get('cide://peer-chat-reviews')({ payload: { revision: 2, reviews: [blocked] } }))
+  assert(document.body.textContent.includes('Review is blocked'))
+  assert(document.body.textContent.includes('Handle the permission prompt in the right panel'))
+  await mount(props(false, { ...configured, paused: false }, review.reviewer))
+  assert(!document.body.textContent.includes('Review is blocked'), 'blockage notice belongs only to the left panel')
+  await mount(props(true, { ...configured, paused: false }, review.writer))
+  await act(async () => listeners.get('cide://peer-chat-reviews')({ payload: { revision: 3, reviews: [{ ...review, state: 'completed', readyToFinalize: true }] } }))
+  assert(!document.body.textContent.includes('Waiting for peer review before the final answer'))
+  assert(!document.body.textContent.includes('Review is blocked'))
   console.log('peer chat: picker, native selection, startup failure, directional receipts, paused resume and explicit fresh recovery pass')
 } finally {
   if (root) await act(async () => root.unmount())

@@ -79,6 +79,7 @@ pub fn workspace_changed(app: &AppHandle, workspace: &Workspace) {
     // The revision only. See the tee's own header.
     let rev = workspace.rev;
     tee(|| cide_remote::RemoteEvent::WorkspaceRev { rev });
+    crate::peer_chat::refresh_reviews(app);
 }
 
 // --- session events ---------------------------------------------------------------------
@@ -180,6 +181,20 @@ pub fn session_state(app: &AppHandle, session: &str, state: cide_ipc::SessionSta
     // `mark` is one mutex and two `Option<Instant>`s, which it has to stay: the hook applier is
     // a single ordered thread whose ordering is a correctness requirement, and this is on it.
     crate::running::mark(app);
+    if app
+        .try_state::<crate::peer_chat::Runtime>()
+        .is_some_and(|r| session.parse().is_ok_and(|id| r.is_paired(id)))
+    {
+        crate::peer_chat::refresh_reviews(app);
+    }
+}
+
+/// Full versioned review snapshot, with a matching pull for new/restored webviews.
+pub const PEER_CHAT_REVIEWS: &str = "cide://peer-chat-reviews";
+pub fn peer_chat_reviews(app: &AppHandle, snapshot: &cide_ipc::PeerChatReviews) {
+    if let Err(error) = app.emit(PEER_CHAT_REVIEWS, snapshot) {
+        tracing::debug!(%error, "peer review status reached no window");
+    }
 }
 
 pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value) {

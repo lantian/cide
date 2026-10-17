@@ -35,10 +35,24 @@
  *
  * Run: `pnpm --dir ui run check:markdown`
  */
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// Measure parser scaling with the same allocation conditions at both sizes. With Node's
+// default small nursery, the 160k emphasis case collects repeatedly while the 20k case
+// fits, yielding 20–25x even for this linear parser. A fixed nursery fits either parse;
+// explicit collections below happen outside timed sections. The 16x scaling bound stays.
+const BENCH_HEAP = '--min-semi-space-size=64'
+if (!process.execArgv.includes(BENCH_HEAP) || typeof globalThis.gc !== 'function') {
+  const result = spawnSync(process.execPath, [
+    '--expose-gc', BENCH_HEAP, '--max-semi-space-size=64', fileURLToPath(import.meta.url),
+  ], { stdio: 'inherit' })
+  if (result.error) throw result.error
+  process.exit(result.status ?? 1)
+}
 
 const out = resolve('node_modules/.cache/cide-markdown')
 let failed = 0
@@ -401,25 +415,35 @@ const LINEAR = [
   ['prose', (n) => 'the quick brown fox jumps over what a lazy dog. '.repeat(Math.floor(n / 48))],
 ]
 const time = (source) => {
+  globalThis.gc()
   const start = process.hrtime.bigint()
   parseMarkdown(source)
   return Number(process.hrtime.bigint() - start) / 1e6
 }
 for (const [name, make] of LINEAR) {
-  // Warm, so the first run's JIT does not count as the small input's cost.
-  time(make(20_000))
-  const small = time(make(20_000))
-  const large = time(make(160_000))
+  const smallSource = make(20_000), largeSource = make(160_000)
+  // Warm both sizes: the large case can take a different optimized/allocation path.
+  time(smallSource)
+  time(largeSource)
+  // A single GC pause in the large parse, or an unusually fast small parse, used to
+  // report quadratic scaling for the unchanged linear underscore parser (16–25x on
+  // isolated runs, versus a median near 8x). Keep the same 16x bound, but compare the
+  // median of seven paired ratios so one allocation/JIT/scheduling outlier cannot fail CI.
+  const samples = Array.from({ length: 7 }, () => {
+    const small = time(smallSource), large = time(largeSource)
+    return { ratio: large / Math.max(small, 0.05), large }
+  })
+  const ratio = samples.map((s) => s.ratio).sort((a, b) => a - b)[3]
+  const large = samples.map((s) => s.large).sort((a, b) => a - b)[3]
   /*
    * `|| large < 5` is not a loosening. Several of these inputs parse the 160,000-character case
    * in under two milliseconds, where the *small* measurement is mostly timer granularity and the
    * ratio is measuring noise — `stars` reported 21x one run and 4x the next, from 0.3ms and
    * 1.4ms. A run that fast is not quadratic; a quadratic one at 160,000 characters is not fast.
    */
-  const ratio = large / Math.max(small, 0.05)
   ok(
     ratio < 16 || large < 5,
-    `parsing ${name} is linear: 8x the input took ${ratio.toFixed(1)}x the time (${large.toFixed(1)}ms)`,
+    `parsing ${name} is linear: median 8x the input took ${ratio.toFixed(1)}x the time (${large.toFixed(1)}ms)`,
   )
 }
 

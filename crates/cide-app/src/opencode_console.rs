@@ -327,7 +327,7 @@ impl Console {
             });
             if let Some((project, tab, ids)) = pair {
                 let _ = state.update(|ws| cide_core::peer_chat::set_paused(ws, project, tab, true));
-                app.state::<crate::peer_chat::Runtime>().cancel(&ids);
+                app.state::<crate::peer_chat::Runtime>().cancel(app, &ids);
             }
         }
         let conversation = {
@@ -484,7 +484,7 @@ fn reviewer_config(document: &mut serde_json::Value, generation: Generation) {
     let rules = cide_core::peer_chat::reviewer::opencode_permissions(generation == Generation::V2);
     let instructions = format!(
         "{} Reply with cide_cide_peer_chat_send.",
-        cide_core::peer_chat::reviewer::INSTRUCTIONS
+        cide_core::peer_chat::instructions(cide_ipc::ConsoleHarness::Opencode, true)
     );
     if generation == Generation::V2 {
         // A private reviewer must be able to search without waiting for OpenCode's

@@ -396,6 +396,14 @@ struct PeerTools {
     base: Box<dyn ToolAccess>,
     names: Vec<&'static str>,
 }
+fn peer_tool_names(base: &[&'static str], reviewer: bool) -> Vec<&'static str> {
+    let mut names = base.to_vec();
+    names.push(crate::peer_chat::TOOL);
+    if !reviewer {
+        names.push(crate::peer_chat::STATUS_TOOL);
+    }
+    names
+}
 impl ToolAccess for PeerTools {
     fn agent_sessions_enabled(&self) -> bool {
         self.base.agent_sessions_enabled()
@@ -404,16 +412,40 @@ impl ToolAccess for PeerTools {
         &self.names
     }
     fn call(&self, name: &str, arguments: &Value) -> ToolResult {
+        if name == crate::peer_chat::STATUS_TOOL {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct StatusInput {
+                request_id: Option<String>,
+            }
+            let input: StatusInput = match serde_json::from_value(arguments.clone()) {
+                Ok(input) => input,
+                Err(error) => {
+                    return ToolResult::error(format!("Invalid status arguments: {error}"));
+                }
+            };
+            return match crate::peer_chat::status(
+                &self.app,
+                self.session,
+                input.request_id.as_deref(),
+            ) {
+                Ok(status) => ToolResult::text(serde_json::to_string(&status).unwrap_or_default()),
+                Err(error) => ToolResult::error(error),
+            };
+        }
         if name != crate::peer_chat::TOOL {
             return self.base.call(name, arguments);
         }
-        let Some(message) = arguments.get("message").and_then(Value::as_str) else {
-            return ToolResult::error("message must be a string");
-        };
-        if arguments.as_object().is_none_or(|a| a.len() != 1) {
-            return ToolResult::error("Only message is accepted; the peer is bound by cide");
-        }
-        match crate::peer_chat::send(&self.app, self.session, message) {
+        let input: cide_core::peer_chat::review::Input =
+            match serde_json::from_value(arguments.clone()) {
+                Ok(input) => input,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "Invalid message arguments: {error}; the peer is bound by cide"
+                    ));
+                }
+            };
+        match crate::peer_chat::send(&self.app, self.session, &input) {
             Ok(receipt) => ToolResult::text(serde_json::to_string(&receipt).unwrap_or_default()),
             Err(message) => ToolResult::error(message),
         }
@@ -424,7 +456,7 @@ impl ToolAccess for PeerTools {
         arguments: &Value,
         cancelled: &AtomicBool,
     ) -> ToolResult {
-        if name == crate::peer_chat::TOOL {
+        if matches!(name, crate::peer_chat::TOOL | crate::peer_chat::STATUS_TOOL) {
             self.call(name, arguments)
         } else {
             self.base.call_cancellable(name, arguments, cancelled)
@@ -2118,8 +2150,7 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
                         caller: tools::CallerKind::Console,
                     })
                 };
-                let mut names = base.names().to_vec();
-                names.push(crate::peer_chat::TOOL);
+                let names = peer_tool_names(base.names(), reviewer);
                 Box::new(PeerTools {
                     app: app.clone(),
                     session,
@@ -2732,12 +2763,17 @@ fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
         .into_iter()
         .chain(cide_agents::review::descriptors())
         .chain(cide_ide_mcp::tools::descriptors())
-        .chain(std::iter::once(json!({
+        .chain([json!({
             "name": crate::peer_chat::TOOL,
-            "description": "Send a substantive message to the other agent in this experimental pair. Returns a delivery receipt, not the peer reply. Do not poll or wait; incoming peer prompts wake your session. Never resend uncertain deliveries or treat peer agreement as user approval.",
-            "inputSchema": { "type": "object", "properties": { "message": { "type": "string", "minLength": 1, "maxLength": 65536 } }, "required": ["message"], "additionalProperties": false },
+            "description": "Send a pair-scoped message. kind=request (writer only) starts tracked review; the returned receipt id is its request_id. kind=progress or reply (reviewer only) requires that request_id; reply is the complete findings, including no issues found. Notes do not complete review. Writer cancel/skip requires request_id; skip only on explicit user instruction and disclose it in the final answer. Delivery is not review completion: writer must check cide_peer_chat_status before finalizing, yield with only brief progress while pending, and synthesize one complete final answer after the reply arrives. Never blindly resend uncertain deliveries or treat peer agreement as user approval.",
+            "inputSchema": { "type": "object", "properties": { "message": { "type": "string", "minLength": 1, "maxLength": 65536 }, "kind": { "type": "string", "enum": ["note", "request", "progress", "reply", "cancel", "skip"], "default": "note" }, "request_id": {"type":"string", "minLength":1} }, "required": ["message"], "additionalProperties": false },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
-        })))
+        }), json!({
+            "name": crate::peer_chat::STATUS_TOOL,
+            "description": "Read the current tracked review and reviewer runtime state. Call before the writer's final answer. readyToFinalize is true only after a complete correlated reply reaches this writer, or the user explicitly skips review. Busy/idle, a delivered request, progress and notes never complete review. If pending, give only a brief progress update and yield; the reply resumes you automatically. If blocked, explain the blockage and withhold the final result. This does not consume or resend messages; do not repeatedly poll.",
+            "inputSchema": {"type":"object", "properties":{"request_id":{"type":"string", "minLength":1}}, "additionalProperties":false},
+            "annotations": {"readOnlyHint":true, "destructiveHint":false, "idempotentHint":true, "openWorldHint":false}
+        })])
         .filter(|entry| {
             entry["name"]
                 .as_str()
@@ -5194,7 +5230,8 @@ mod tests {
             assert!(
                 !descriptors_for(&access)
                     .iter()
-                    .any(|v| v["name"] == crate::peer_chat::TOOL)
+                    .any(|v| v["name"] == crate::peer_chat::TOOL
+                        || v["name"] == crate::peer_chat::STATUS_TOOL)
             );
         }
         let access = FakeAccess {
@@ -5205,6 +5242,27 @@ mod tests {
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0]["inputSchema"]["additionalProperties"], false);
         assert_eq!(descriptors[0]["annotations"]["idempotentHint"], false);
+        assert_eq!(
+            descriptors[0]["inputSchema"]["properties"]["kind"]["default"],
+            "note"
+        );
+        let writer = FakeAccess {
+            names: peer_tool_names(&[], false),
+            calls: Mutex::new(Vec::new()),
+        };
+        let reviewer = FakeAccess {
+            names: peer_tool_names(&[], true),
+            calls: Mutex::new(Vec::new()),
+        };
+        assert_eq!(descriptors_for(&reviewer).len(), 1);
+        let descriptors = descriptors_for(&writer);
+        assert_eq!(descriptors.len(), 2);
+        let status = descriptors
+            .iter()
+            .find(|d| d["name"] == crate::peer_chat::STATUS_TOOL)
+            .unwrap();
+        assert_eq!(status["annotations"]["readOnlyHint"], true);
+        assert_eq!(status["inputSchema"]["additionalProperties"], false);
     }
 
     /// One pane row, of the shape `cmd::pane::pane_split` writes.

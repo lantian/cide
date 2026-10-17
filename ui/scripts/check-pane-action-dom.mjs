@@ -30,6 +30,7 @@ export async function checkPaneActionEvents() {
   const calls = []
   const session = 'waiting-session'
   let nextCallback = 0
+  let initialReviews
   window.__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label: 'shell:test' } },
     transformCallback: (callback) => {
@@ -42,6 +43,7 @@ export async function checkPaneActionEvents() {
         return args.handler
       }
       if (command === 'window_awaiting_sessions') return [session]
+      if (command === 'peer_chat_reviews') return new Promise((resolve) => { initialReviews = resolve })
       if (command === 'plugin:window|is_maximized') return false
       if (command === 'window_set_awaiting') calls.push(['acknowledge', args])
       else calls.push([command])
@@ -255,6 +257,46 @@ export async function checkPaneActionEvents() {
       payload: { sessions: [writer.session, reviewer.session] },
     }))
     assertPair(true)
+    // Review status is independent of busy/idle and transport receipts. A yielded writer
+    // must stay quiet through request delivery, reviewer progress and a reply still queued.
+    let revision = 0
+    const review = {
+      tab: 'pair', writer: writer.session, reviewer: reviewer.session, requestId: 'request',
+      writerState: { state: 'awaitingInput' }, reviewerState: { state: 'busy' },
+      blockedReason: null, readyToFinalize: false,
+    }
+    const emitReview = (state, extra = {}) => listeners.get('cide://peer-chat-reviews')({
+      payload: { revision: ++revision, reviews: [{ ...review, state, ...extra }] },
+    })
+    for (const state of ['requestQueued', 'awaitingReply', 'replyQueued']) {
+      await act(async () => emitReview(state))
+      await act(async () => emitState(writer.session, 'awaitingInput'))
+      assertPair(false)
+      await act(async () => emitState(reviewer.session, 'awaitingInput'))
+      assertPair(false)
+      await act(async () => listeners.get('cide://session-awaiting')({ payload: { sessions: [writer.session] } }))
+      assertPair(false)
+    }
+    await act(async () => emitState(writer.session, 'awaitingPermission'))
+    assertPair(true) // A native prompt in the writer still needs the user.
+    await act(async () => emitState(writer.session, 'busy'))
+    assertPair(false)
+    await act(async () => {
+      emitReview('awaitingReply', { blockedReason: 'The reviewer needs permission', reviewerState: { state: 'awaitingPermission' } })
+      emitState(writer.session, 'awaitingInput')
+      listeners.get('cide://session-awaiting')({ payload: { sessions: [writer.session] } })
+    })
+    assertPair(true) // Actionable review blockages surface only on the writer.
+    await act(async () => emitReview('awaitingReply'))
+    assertPair(false)
+    await act(async () => {
+      emitReview('completed', { readyToFinalize: true })
+      emitState(writer.session, 'busy')
+      emitState(writer.session, 'awaitingInput')
+    })
+    assertPair(true)
+    await act(async () => initialReviews({ revision: 1, reviews: [{ ...review, state: 'requestQueued' }] }))
+    assertPair(true) // A late initial pull cannot restore old suppression after the final answer.
     // State can outrun a workspace snapshot during restore/rebind. Binding must clear the
     // stale marker immediately, without waiting for another state from the reviewer.
     await act(async () => emitState('restored-reviewer', 'awaitingInput'))

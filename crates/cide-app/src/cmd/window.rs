@@ -390,6 +390,7 @@ pub(crate) fn report_awaiting(
     // before its child starts, so this also covers the first state emitted during startup.
     // Coerce to false rather than returning: an existing stale marker must be removable.
     let awaiting = awaiting && !cide_core::peer_chat::is_reviewer(&state.snapshot(), session);
+    let awaiting = awaiting && !crate::peer_chat::quiet_writer(app, session);
     // Second of the attention-chain lines — see the note in `hooks.rs`. Logged BEFORE the early
     // return, because "the surface reported and the set did not move" is a different failure from
     // "the surface never reported" and the two are indistinguishable afterwards.
@@ -406,6 +407,12 @@ pub(crate) fn report_awaiting(
         // put one round trip per window per tool call in front of the user's keystrokes.
         return;
     }
+    awaiting_changed(app, state);
+}
+
+/// Announce the current set, never a caller's old snapshot. Review-driven changes update
+/// membership under the review snapshot lock, then use this same announcement path.
+pub(crate) fn awaiting_changed(app: &AppHandle, state: &WorkspaceState) {
     retitle(app, &state.snapshot());
     crate::emit::session_awaiting(app, windows::awaiting_sessions());
 }

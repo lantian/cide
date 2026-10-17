@@ -1505,6 +1505,10 @@ pub(crate) async fn spawn_session(
                 cide_core::codex_cli::strip_permission_args(&settings.codex.cli.args);
             settings.codex.cli.permission_mode = cide_ipc::CodexPermissionMode::ReadOnly;
         }
+        if *harness == cide_ipc::ConsoleHarness::Claude {
+            settings.claude.cli.args =
+                cide_core::peer_chat::fresh_claude_args(&settings.claude.cli.args);
+        }
         if *reviewer && *harness == cide_ipc::ConsoleHarness::Claude {
             settings.claude.cli.args =
                 cide_core::peer_chat::reviewer::claude_args(&settings.claude.cli.args);

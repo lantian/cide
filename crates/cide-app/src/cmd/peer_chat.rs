@@ -5,6 +5,11 @@ use cide_ipc::{PeerChatReceipt, PeerChatSelection, ProjectId, TabId};
 use tauri::{Manager, State};
 
 #[tauri::command(rename_all = "camelCase")]
+pub fn peer_chat_reviews(app: tauri::AppHandle) -> cide_ipc::PeerChatReviews {
+    crate::peer_chat::review_snapshot(&app)
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub fn peer_chat_open(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
@@ -207,7 +212,8 @@ pub fn peer_chat_pause(
     })?;
     state.update(|ws| domain::set_paused(ws, project, tab, paused))?;
     if paused {
-        app.state::<crate::peer_chat::Runtime>().cancel(&sessions);
+        app.state::<crate::peer_chat::Runtime>()
+            .cancel(&app, &sessions);
     }
     Ok(())
 }

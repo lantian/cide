@@ -5671,6 +5671,9 @@ export const peerChat = {
   configure: (project: ProjectId, tab: TabId, selection: import('./generated').PeerChatSelection) => invoke<void>('peer_chat_configure', { project, tab, selection }),
   pause: (project: ProjectId, tab: TabId, paused: boolean) => invoke<void>('peer_chat_pause', { project, tab, paused }),
   receipts: (project: ProjectId, tab: TabId) => invoke<import('./generated').PeerChatReceipt[]>('peer_chat_receipts', { project, tab }),
+  reviews: () => invoke<import('./generated').PeerChatReviews>('peer_chat_reviews'),
+  onReviews: (handler: (snapshot: import('./generated').PeerChatReviews) => void) =>
+    listen<import('./generated').PeerChatReviews>('cide://peer-chat-reviews', (e) => handler(e.payload)),
   plan: (project: ProjectId, tab: TabId) => invoke<PaneRestore[]>('peer_chat_plan', { project, tab }),
 }
 

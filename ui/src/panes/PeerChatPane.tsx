@@ -10,6 +10,7 @@ import { explain } from '@/chrome/branchModel'
 import { peekHost } from '@/layout/paneHosts'
 import { focusPaneDom } from './paneFocus'
 import { TerminalPane } from './TerminalPane'
+import { usePeerReview } from './peerReviews'
 import type { PaneBodyProps } from './PaneBody'
 import styles from './PeerChatPane.module.css'
 
@@ -25,6 +26,7 @@ export function PeerChatPane(props: PaneBodyProps & { tab: Tab }): ReactNode {
   const { pane, tab, project } = props
   const chat = tab.peerChat!
   const main = pane.id === chat.main
+  const review = usePeerReview(tab.id, main ? pane.session : null)
   const [harness, setHarness] = useState<ConsoleHarness>('claude')
   const [models, setModels] = useState<string[]>([])
   const [provider, setProvider] = useState('')
@@ -141,6 +143,19 @@ export function PeerChatPane(props: PaneBodyProps & { tab: Tab }): ReactNode {
       {main && <Button size="sm" busy={busy} onClick={() => { void togglePause() }}>{chat.paused ? 'Resume conversation' : 'Pause conversation'}</Button>}
     </div>
     {chat.paused && <div className={styles.notice}>Conversation paused. Resume or submit a task on the left.</div>}
+    {main && review?.blockedReason && <Note tone="warn" title="Review is blocked">{
+      review.reviewerState.state === 'awaitingPermission'
+        ? 'Handle the permission prompt in the right panel to continue review.'
+        : review.reviewerState.state === 'exited'
+          ? 'The reviewer has exited. Restore both panels and request review again.'
+          : chat.paused
+            ? 'Resume the conversation and request review again.'
+            : ['failed', 'uncertain'].includes(review.state)
+              ? 'Delivery was not confirmed. Inspect the receiving panel before trying again.'
+              : 'Review was interrupted. Request a new review to continue.'
+    }</Note>}
+    {main && review && !review.blockedReason && ['requestQueued', 'awaitingReply', 'replyQueued'].includes(review.state)
+      && <Note>Waiting for peer review before the final answer.</Note>}
     <div className={styles.notice} role="status">
       <div>Main → Peer: {toPeer ? `${toPeer.status}: ${toPeer.detail}` : 'No messages sent yet'}</div>
       <div>Peer → Main: {toMain ? `${toMain.status}: ${toMain.detail}` : 'No reply sent yet'}</div>

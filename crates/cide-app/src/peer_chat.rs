@@ -1,5 +1,6 @@
 //! Experimental pair delivery. Every route is pinned to a live pair and recipient session.
 use crate::{state::SessionRegistry, workspace_state::WorkspaceState};
+use cide_core::peer_chat::review::{Book, Input, Kind};
 use cide_core::{peer_chat as domain, peer_composer as composer, workspace};
 use cide_ipc::{ConsoleHarness, PaneId, PeerChatReceipt, ProjectId, SessionId, TabId};
 use cide_pty::PtySession;
@@ -14,6 +15,9 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 pub(crate) const TOOL: &str = "cide_peer_chat_send";
+pub(crate) const STATUS_TOOL: &str = "cide_peer_chat_status";
+mod reviews;
+pub(crate) use reviews::{quiet_writer, refresh_reviews, review_snapshot, status};
 
 /// A mobile prompt is one transaction with the same gate as desktop keystrokes.
 pub(crate) fn submit_mobile(
@@ -92,6 +96,9 @@ pub(crate) struct Runtime {
     consoles: DashMap<SessionId, Arc<crate::opencode_console::Console>>,
     codex_consoles: DashMap<SessionId, Arc<crate::codex_console::Console>>,
     prompt_armed: DashMap<SessionId, Instant>,
+    reviews: Mutex<Book>,
+    review_changed: parking_lot::Condvar,
+    review_snapshot: Mutex<cide_ipc::PeerChatReviews>,
 }
 #[derive(Default)]
 struct Lane {
@@ -109,6 +116,8 @@ struct Message {
     target: SessionId,
     body: String,
     generation: u64,
+    kind: Kind,
+    request_id: Option<String>,
 }
 
 impl Runtime {
@@ -125,6 +134,12 @@ impl Runtime {
         self.lanes.entry(id).or_default().clone()
     }
     fn receipt(&self, m: &Message, status: &str, detail: &str) {
+        if let Some(request) = &m.request_id {
+            self.reviews
+                .lock()
+                .receipt(m.tab, request, m.kind, &m.id, status, detail);
+        }
+        self.review_changed.notify_all();
         let mut receipts = self.receipts.lock();
         if let Some((_, r)) = receipts.iter_mut().find(|(_, r)| r.id == m.id) {
             r.status = status.into();
@@ -168,15 +183,23 @@ impl Runtime {
         }
         detail
     }
-    pub fn cancel(&self, sessions: &[SessionId]) {
+    pub fn cancel(&self, app: &AppHandle, sessions: &[SessionId]) {
         for id in sessions {
             if let Some(lane) = self.lanes.get(id) {
                 lane.lock().generation += 1;
             }
         }
+        self.reviews.lock().cancel(sessions);
+        self.review_changed.notify_all();
+        refresh_reviews(app);
     }
-    pub fn forget(&self, sessions: &[SessionId]) {
-        self.cancel(sessions);
+    pub fn forget(&self, app: &AppHandle, sessions: &[SessionId]) {
+        self.cancel(app, sessions);
+        self.reviews
+            .lock()
+            .current
+            .retain(|_, r| !sessions.contains(&r.writer) && !sessions.contains(&r.reviewer));
+        refresh_reviews(app);
         for id in sessions {
             self.paired.remove(id);
             self.prompt_armed.remove(id);
@@ -214,13 +237,14 @@ impl Runtime {
 pub(crate) fn send(
     app: &AppHandle,
     sender: SessionId,
-    message: &str,
+    input: &Input,
 ) -> Result<PeerChatReceipt, String> {
-    let line = composer::normalize(message)?;
-    let (project, tab, pane, target, label) = app.state::<WorkspaceState>().with(|ws| {
+    let line = composer::normalize(&input.message)?;
+    let local = matches!(input.kind, Kind::Cancel | Kind::Skip);
+    let (project, tab, pane, target, label, pair) = app.state::<WorkspaceState>().with(|ws| {
         let (project, tab, pane, chat) = domain::for_session(ws, sender)
             .ok_or("This session is no longer in a two-agent chat")?;
-        if chat.paused || chat.starting {
+        if (chat.paused || chat.starting) && !local {
             return Err(app.state::<Runtime>().paused_error(tab, chat.starting));
         }
         let other = if pane == chat.main {
@@ -252,24 +276,61 @@ pub(crate) fn send(
                         .program()
                 )
             },
+            if pane == chat.main {
+                (sender, target)
+            } else {
+                (target, sender)
+            },
         ))
     })?;
     let runtime = app.state::<Runtime>();
     let lane = runtime.lane(target);
     let mut guard = lane.lock();
-    if guard.queue.len() + usize::from(guard.running) >= 16 {
+    if !local && guard.queue.len() + usize::from(guard.running) >= 16 {
         return Err("The peer message queue is full".into());
     }
+    let id = SessionId::new().to_string();
+    runtime
+        .reviews
+        .lock()
+        .apply(tab, pair, sender, &id, input)?;
+    let request_id = if input.kind == Kind::Request {
+        Some(id.clone())
+    } else {
+        input.request_id.clone()
+    };
+    let correlation = request_id.as_ref().map_or(String::new(), |id| {
+        format!(" [review request_id={id}; kind={:?}]", input.kind)
+    });
     let m = Message {
-        id: SessionId::new().to_string(),
+        id,
         project,
         tab,
         sender,
         pane,
         target,
-        body: format!("Chat from {label}: {line}"),
+        body: format!("Chat from {label}{correlation}: {line}"),
         generation: guard.generation,
+        kind: input.kind,
+        request_id,
     };
+    if local {
+        runtime.review_changed.notify_all();
+        let receipt = PeerChatReceipt {
+            id: m.request_id.unwrap(),
+            sender: pane,
+            status: if input.kind == Kind::Skip {
+                "skipped"
+            } else {
+                "cancelled"
+            }
+            .into(),
+            detail: line,
+        };
+        drop(guard);
+        refresh_reviews(app);
+        return Ok(receipt);
+    }
     runtime.receipt(
         &m,
         "queued",
@@ -281,8 +342,13 @@ pub(crate) fn send(
         .find(|r| r.id == m.id)
         .ok_or("Could not record peer message")?;
     guard.queue.push_back(m);
-    if !guard.running {
+    let start = !guard.running;
+    if start {
         guard.running = true;
+    }
+    drop(guard);
+    refresh_reviews(app);
+    if start {
         let app = app.clone();
         let lane = lane.clone();
         thread::spawn(move || drain(app, lane));
@@ -313,7 +379,10 @@ fn drain(app: AppHandle, lane: Arc<Mutex<Lane>>) {
                 "Accepted by the receiving agent; a reply is not guaranteed",
             ),
             Err((uncertain, detail)) => {
-                let cancelled = lane.lock().generation != m.generation;
+                let cancelled = lane.lock().generation != m.generation
+                    || m.request_id
+                        .as_ref()
+                        .is_some_and(|id| !runtime.reviews.lock().valid(m.tab, id, m.kind, &m.id));
                 runtime.receipt(
                     &m,
                     if uncertain {
@@ -347,14 +416,24 @@ fn drain(app: AppHandle, lane: Arc<Mutex<Lane>>) {
                             Ok(ids)
                         })
                         .unwrap_or_default();
-                    runtime.cancel(&sessions);
+                    runtime.cancel(&app, &sessions);
                 }
             }
         }
+        refresh_reviews(&app);
     }
 }
 
 fn target(app: &AppHandle, m: &Message) -> Result<(Arc<PtySession>, ConsoleHarness), String> {
+    if let Some(request) = &m.request_id
+        && !app
+            .state::<Runtime>()
+            .reviews
+            .lock()
+            .valid(m.tab, request, m.kind, &m.id)
+    {
+        return Err("Review request was cancelled, skipped or replaced; message withheld".into());
+    }
     let harness = app.state::<WorkspaceState>().with(|ws| {
         let (_, tab, pane, chat) =
             domain::for_session(ws, m.sender).ok_or("The sender no longer belongs to this pair")?;
@@ -486,6 +565,8 @@ fn deliver(app: &AppHandle, lane: &Mutex<Lane>, m: &Message) -> Result<(), (bool
                     target: m.target,
                     body: String::new(),
                     generation: m.generation,
+                    kind: m.kind,
+                    request_id: m.request_id.clone(),
                 };
                 let valid = Box::new(move || {
                     if lane.lock().generation != pinned.generation {
@@ -656,7 +737,7 @@ pub(crate) fn conversation_changed(app: &AppHandle, session: SessionId) {
             Ok(ids)
         })
         .unwrap_or_default();
-    app.state::<Runtime>().cancel(&sessions);
+    app.state::<Runtime>().cancel(app, &sessions);
 }
 
 /// Native OpenCode user-message events are evidence of a new task, not a dialog answer.
@@ -724,7 +805,7 @@ impl Binding {
                 Ok((project, tab, previous, retired))
             })
             .map_err(|e| e.to_string())?;
-        app.state::<Runtime>().cancel(&retired);
+        app.state::<Runtime>().cancel(app, &retired);
         app.state::<Runtime>().paired.insert(session);
         Ok(Self {
             app: app.clone(),
@@ -763,7 +844,7 @@ impl Drop for Binding {
 
 /// Capture descendants while the paired child still owns them; never sweep unrelated work.
 pub(crate) fn stop_pair(app: &AppHandle, sessions: &[SessionId]) {
-    app.state::<Runtime>().forget(sessions);
+    app.state::<Runtime>().forget(app, sessions);
     for id in sessions {
         if let Some(pty) = app.state::<SessionRegistry>().get(*id) {
             let tree = pty
