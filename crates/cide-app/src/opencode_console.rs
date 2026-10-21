@@ -671,8 +671,9 @@ pub(crate) fn headless(
     settings: Settings,
     cwd: PathBuf,
     request: cide_ipc::HeadlessRequest,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<cide_ipc::HeadlessResult, cide_ipc::HeadlessError> {
-    use cide_core::child_env::{FilterError, run_filter_with};
+    use cide_core::child_env::{FilterError, run_filter_with, run_filter_with_cancel};
     use cide_ipc::{HeadlessError, HeadlessResult};
     if request.max_budget_usd.is_some() {
         return Err(HeadlessError::Malformed {
@@ -725,13 +726,30 @@ pub(crate) fn headless(
             command.env_remove(key);
         }
     }
-    let output = run_filter_with(
-        command,
-        Some(prompt.as_bytes()),
-        Duration::from_secs(180),
-        &[],
-    )
+    let output = if let Some(cancel) = &cancel {
+        run_filter_with_cancel(
+            command,
+            Some(prompt.as_bytes()),
+            Duration::from_secs(180),
+            &[],
+            cancel,
+        )
+    } else {
+        run_filter_with(
+            command,
+            Some(prompt.as_bytes()),
+            Duration::from_secs(180),
+            &[],
+        )
+    }
     .map_err(|error| match error {
+        FilterError::Timeout
+            if cancel
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::Acquire)) =>
+        {
+            HeadlessError::TimedOut { seconds: 0 }
+        }
         FilterError::Timeout => HeadlessError::TimedOut { seconds: 180 },
         other => HeadlessError::NotInstalled {
             detail: format!("OpenCode: {other:?}"),

@@ -26,6 +26,7 @@
   "app_restore_plan",
   "claude_cli_support",
   "claude_commit_message",
+  "claude_commit_message_cancel",
   "claude_diff_content",
   "claude_diff_result",
   "claude_explain_selection",

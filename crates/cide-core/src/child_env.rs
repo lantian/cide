@@ -709,7 +709,19 @@ pub fn run_filter_with(
     deadline: std::time::Duration,
     extra_path: &[std::path::PathBuf],
 ) -> Result<Filtered, FilterError> {
-    run_filter_inner(command, stdin, deadline, Some(extra_path))
+    run_filter_inner(command, stdin, deadline, Some(extra_path), None)
+}
+
+/// A cancellable filter for model one-shots. Existing formatter and Git callers keep their
+/// ordinary timeout-only contract.
+pub fn run_filter_with_cancel(
+    command: Command,
+    stdin: Option<&[u8]>,
+    deadline: std::time::Duration,
+    extra_path: &[std::path::PathBuf],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Filtered, FilterError> {
+    run_filter_inner(command, stdin, deadline, Some(extra_path), Some(cancel))
 }
 
 /// [`run_filter`] for the one child that must **not** be handed cide's `PATH`.
@@ -722,7 +734,7 @@ pub fn run_filter_bare(
     stdin: Option<&[u8]>,
     deadline: std::time::Duration,
 ) -> Result<Filtered, FilterError> {
-    run_filter_inner(command, stdin, deadline, None)
+    run_filter_inner(command, stdin, deadline, None, None)
 }
 
 /// `extra_path` of `None` means "skip the `PATH` pass entirely" — see [`run_filter_bare`].
@@ -731,6 +743,7 @@ fn run_filter_inner(
     stdin: Option<&[u8]>,
     deadline: std::time::Duration,
     extra_path: Option<&[std::path::PathBuf]>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Filtered, FilterError> {
     use std::io::{Read, Write};
     use std::process::Stdio;
@@ -780,8 +793,24 @@ fn run_filter_inner(
         text
     });
 
-    let received = rx.recv_timeout(deadline);
-    if received.is_err() {
+    let started = std::time::Instant::now();
+    let received = loop {
+        if cancel.is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire)) {
+            break Err(FilterError::Timeout);
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break Err(FilterError::Timeout);
+        }
+        match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
+            Ok(value) => break Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(FilterError::Unreadable);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    if let Err(error) = received {
         // Kill first, then join: both reader threads end when their pipes close, and the writer
         // ends with `EPIPE`. Rust's runtime ignores `SIGPIPE`, so that write returns an error
         // rather than killing this process.
@@ -792,7 +821,7 @@ fn run_filter_inner(
         if let Some(writer) = writer {
             let _ = writer.join();
         }
-        return Err(FilterError::Timeout);
+        return Err(error);
     }
 
     let (read_ok, stdout) = received.expect("checked above");
@@ -1324,6 +1353,32 @@ pub fn signal_group(_pid: u32, _signal: i32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_filter_reaps_a_running_child() {
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = std::sync::Arc::clone(&token);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let start = std::time::Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("10");
+        assert!(matches!(
+            run_filter_with_cancel(
+                command,
+                None,
+                std::time::Duration::from_secs(10),
+                &[],
+                &token
+            ),
+            Err(FilterError::Timeout)
+        ));
+        setter.join().unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     /// The mount point of a running AppImage, in the shape the runtime actually produces.
     const APPDIR: &str = "/tmp/.mount_cide_0OOoGFm";

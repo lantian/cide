@@ -222,9 +222,10 @@ The script does not install OS packages or change the machine's default Rust too
 ## Packaging
 
 ```sh
-./build.sh                # one artefact for this host (AppImage on Linux), installed into ~/bin
+./build.sh                # one artefact for this host (AppImage on Linux), no installation
 ./build.sh --all          # the host's whole default set
 ./build.sh --plan         # build nothing, print what would happen
+./build.sh --install      # copy the AppImage to ~/bin/cide (or CIDE_INSTALL_DIR/cide)
 cargo xtask package [--appimage|--deb|--flatpak|--tarball|--app|--dmg|--src] [--check|--write|--run]
 ```
 

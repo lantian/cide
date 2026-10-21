@@ -50,6 +50,7 @@ window.__TAURI_INTERNALS__ = {
     if (command === 'git_conflicts') return null
     if (command === 'git_shelf_list') return shelfReads.shift()?.promise ?? []
     if (command === 'claude_commit_message') return generation.promise
+    if (command === 'claude_commit_message_cancel') return true
     if (command === 'git_commit') return commit.promise
     if (command.startsWith('plugin:event|')) return 1
     if (command === 'diag_log') return
@@ -90,6 +91,43 @@ try {
   await running
   assert.equal(drafts.get(a).message, 'newer edit')
   assert.equal(drafts.get(a).generated, 'generated replacement')
+  pending = deferred()
+  let reportProgress
+  const progressRun = drafts.generate(b, (_id, report) => {
+    reportProgress = report
+    report('analyzing', 2, 5)
+    return pending.promise
+  }, () => { calls.push({ command: 'cancelled-store' }) })
+  assert.equal(drafts.get(b).progress, 'Analyzing changes 2/5…')
+  drafts.cancel(b)
+  reportProgress('analyzing', 3, 5)
+  assert.equal(drafts.get(b).progress, 'Cancelling generation…')
+  assert.ok(calls.some(call => call.command === 'cancelled-store'))
+  pending.reject({ kind: 'cancelled', message: 'cancelled' })
+  await progressRun
+  assert.equal(drafts.get(b).message, 'worktree draft')
+  assert.equal(drafts.get(b).error, null)
+  pending = deferred()
+  let startedAfterCancel = false
+  const earlyCancel = drafts.generate(b, async (_id, _progress, isCancelled) => {
+    await pending.promise
+    if (isCancelled()) throw { kind: 'cancelled', message: 'cancelled' }
+    startedAfterCancel = true
+    return answer('should not appear')
+  })
+  drafts.cancel(b)
+  pending.resolve()
+  await earlyCancel
+  assert.equal(startedAfterCancel, false)
+  assert.equal(drafts.get(b).error, null)
+  drafts.setSelection(b, 'old-selection')
+  pending = deferred()
+  const staleSelection = drafts.generate(b, () => pending.promise, undefined, 'old-selection')
+  drafts.setSelection(b, 'new-selection')
+  pending.resolve(answer('stale result'))
+  await staleSelection
+  assert.equal(drafts.get(b).message, 'worktree draft')
+  assert.ok(drafts.get(b).error.includes('selected files or hunks changed'))
   const oldRevision = drafts.get(a).revision
   drafts.setMessage(a, 'latest edit')
   drafts.replaceGenerated(a, oldRevision)
@@ -194,6 +232,14 @@ try {
   await act(async () => generation.resolve(answer('accepted generated draft')))
   await click(byText('Replace'))
   assert.equal(textarea().value, 'accepted generated draft')
+  generation = deferred()
+  await click(generateButton())
+  const activeRequest = calls.filter(call => call.command === 'claude_commit_message').at(-1).args.requestId
+  await click(byText('Cancel'))
+  assert.equal(calls.filter(call => call.command === 'claude_commit_message_cancel').at(-1).args.requestId, activeRequest)
+  await act(async () => generation.reject({ kind: 'cancelled', message: 'cancelled' }))
+  assert.equal(textarea().value, 'accepted generated draft')
+  assert.equal(current.draft.error, null)
   await mount('project-b')
   assert.equal(textarea().value, '')
   await type('project b draft')
@@ -222,6 +268,8 @@ try {
   // A successful generation into an empty draft is inserted without confirmation.
   generation = deferred()
   await click(generateButton())
+  assert.ok(document.querySelector('button[aria-label="Cancel commit message generation"]'))
+  assert.ok(document.querySelector('[data-audit="gitSummary"]').textContent.includes('Reading selected changes'))
   await act(async () => generation.resolve(answer('automatic draft')))
   assert.equal(textarea().value, 'automatic draft')
   assert.equal(document.querySelector('[data-audit="gitReplaceMessage"]'), null)

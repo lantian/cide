@@ -352,7 +352,9 @@ export function GitPanelView({
           generating={git.draft.generating}
           generateDisabledReason={git.generateDisabledReason}
           generationError={git.draft.error}
+          generationProgress={git.draft.progress}
           onGenerate={git.generateMessage}
+          onCancelGeneration={git.cancelGeneration}
           amend={git.amend}
           /* The log's abbreviation, straight through — `null` for the checkbox's own meaning.
              See `CommitBoxProps.amendOf` for why it is on the label rather than hidden. */

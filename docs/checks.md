@@ -122,8 +122,12 @@ Project history holds 100 lightweight records; closed-project layouts keep their
 `check:commit-message`, plus `cargo test --locked -p cide-git --test commit_message` and
 `cargo test --locked -p cide-app --lib cmd::settings::tests` for message generation. The
 message check mounts the panel with deferred IPC: drafts survive full unmounts, late results
-cannot overwrite edits, and selection payloads match Commit. Backend tests cover read-only
-diff collection and both console harnesses using fake CLIs, without paid model calls.
+cannot overwrite edits, cancellation and progress stay scoped to one generation, and selection
+payloads match Commit. Backend tests cover read-only diff collection and both console harnesses
+using fake CLIs, without paid model calls. `cargo test --locked -p cide-app --lib commit_message`
+checks large-diff segmentation and coverage; `cargo test --locked -p cide-claude cancelling_a_headless_wait`
+and `cargo test --locked -p cide-core cancellable_filter_reaps_a_running_child` check that
+cancellation stops active model processes.
 
 ### The diff surface
 

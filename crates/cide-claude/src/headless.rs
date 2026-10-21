@@ -33,6 +33,10 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use cide_core::proxy::ProxyEnv;
@@ -110,6 +114,7 @@ pub struct Headless {
     pub args: Vec<String>,
     /// Resolved launch settings for the Codex lane; ignored by the Claude lane.
     pub codex_cli: Option<cide_ipc::CodexCli>,
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Headless {
@@ -127,6 +132,7 @@ impl Headless {
             env: Vec::new(),
             args: Vec::new(),
             codex_cli: None,
+            cancel: None,
         }
     }
 
@@ -158,6 +164,11 @@ impl Headless {
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn cancel(mut self, token: Option<Arc<AtomicBool>>) -> Self {
+        self.cancel = token;
         self
     }
 }
@@ -278,7 +289,7 @@ pub fn run(program: &Path, run: &Headless) -> Result<HeadlessResult, HeadlessErr
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
 
-    let status = wait_with_deadline(&mut child, run.timeout)?;
+    let status = wait_with_deadline(&mut child, run.timeout, run.cancel.as_deref())?;
     let _ = writer.join();
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
@@ -324,9 +335,15 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<St
 fn wait_with_deadline(
     child: &mut Child,
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> Result<std::process::ExitStatus, HeadlessError> {
     let deadline = Instant::now() + timeout;
     loop {
+        if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HeadlessError::TimedOut { seconds: 0 });
+        }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
@@ -461,6 +478,26 @@ fn tail(text: &str, keep: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_headless_wait_kills_the_active_child() {
+        let token = Arc::new(AtomicBool::new(false));
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let trigger = Arc::clone(&token);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            trigger.store(true, Ordering::Release);
+        });
+        let start = Instant::now();
+        assert!(matches!(
+            wait_with_deadline(&mut child, Duration::from_secs(10), Some(&token)),
+            Err(HeadlessError::TimedOut { seconds: 0 })
+        ));
+        setter.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_some());
+    }
 
     fn run_of(request: HeadlessRequest) -> Headless {
         Headless::new(request, "/tmp")
@@ -743,7 +780,7 @@ fn run_codex_with(
     });
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let status = wait_with_deadline(&mut child, run.timeout)?;
+    let status = wait_with_deadline(&mut child, run.timeout, run.cancel.as_deref())?;
     let _ = writer.join();
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();

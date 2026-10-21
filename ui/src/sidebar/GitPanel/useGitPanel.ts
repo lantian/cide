@@ -323,6 +323,7 @@ export interface GitPanelModel {
   message: string
   draft: CommitDraft
   generateDisabledReason: string | null
+  cancelGeneration: () => void
   amend: boolean
   /**
    * The commit the *log* asked to amend, or `null` for the checkbox's own meaning.
@@ -1417,6 +1418,12 @@ export function useGitPanel(
     () => commitUnits(view, selected, rewordRepo),
     [view, selected, rewordRepo],
   )
+  const generationScopes = units.map(unit => ({
+    repo: unit.repo,
+    selections: commitSelections(unit.repo, unit.paths),
+  }))
+  const selectionFingerprint = JSON.stringify(generationScopes)
+  useEffect(() => draftStore.setSelection(draftScope, selectionFingerprint), [draftStore, draftScope, selectionFingerprint])
 
   const hasChangesToDescribe = units.some((unit) => {
     const repo = repoOf(view, unit.repo)
@@ -1441,12 +1448,29 @@ export function useGitPanel(
 
   const generateMessage = useCallback(() => {
     if (project === null || generateDisabledReason !== null || story !== null) return
-    const scopes = units.map((unit) => ({
-      repo: unit.repo,
-      selections: commitSelections(unit.repo, unit.paths),
-    }))
-    void draftStore.generate(draftScope, () => claudeTasks.commitMessage(project, scopes))
-  }, [project, generateDisabledReason, story, units, draftStore, draftScope])
+    const scopes = generationScopes
+    draftStore.setSelection(draftScope, selectionFingerprint)
+    void draftStore.generate(draftScope, async (requestId, progress, isCancelled) => {
+      const off = await claudeTasks.onCommitMessageProgress(event => {
+        if (event.requestId === requestId) progress(event.phase, event.done, event.total)
+      })
+      try {
+        if (isCancelled()) throw { kind: 'cancelled', message: 'cancelled' }
+        return await claudeTasks.commitMessage(project, scopes, requestId)
+      }
+      finally { off() }
+    }, requestId => {
+      void (async () => {
+        for (let attempt = 0; attempt < 10 && draftStore.get(draftScope).generating; attempt++) {
+          try {
+            if (await claudeTasks.cancelCommitMessage(requestId)) return
+          } catch { return }
+          await new Promise(resolve => setTimeout(resolve, 100))
+        }
+      })()
+    }, selectionFingerprint)
+  }, [project, generateDisabledReason, story, selectionFingerprint, draftStore, draftScope])
+  const cancelGeneration = useCallback(() => draftStore.cancel(draftScope), [draftStore, draftScope])
 
   /** Repos whose index moved under us and whose bar has not been answered yet. */
   const diverged = useMemo(
@@ -2482,6 +2506,7 @@ export function useGitPanel(
     message,
     draft,
     generateDisabledReason,
+    cancelGeneration,
     amend,
     /** Non-null exactly when Commit would reword — see the `useMemo` that computes it. */
     rewordRepo,

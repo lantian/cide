@@ -34,10 +34,13 @@ Icon drift is checked separately: `scripts/gen-icons.sh --check`.
 
 ## `./build.sh`
 
-The wrapper for daily use: one artefact for the host (AppImage on Linux, `.dmg` on macOS), then
-installs it into `$CIDE_INSTALL_DIR` (default `~/bin`, Linux only — a `.dmg` is opened, not put on
-PATH). `--all` for the host's whole default set, `--plan` to build nothing, `--no-install` to stop
-after building.
+The wrapper for daily use builds one artefact for the host (AppImage on Linux, `.dmg` on macOS)
+without installing it. `--install` copies the Linux AppImage to `$CIDE_INSTALL_DIR/cide` (default
+`~/bin/cide`), replacing that same file on subsequent installs. On macOS, `--install` requires
+`CIDE_INSTALL_DIR` and copies the `.dmg` there as `cide.dmg`; the `.dmg` is opened, not put on PATH.
+`--all` builds the host's whole default set but still installs only the primary bundle, and
+`--plan` builds and installs nothing. Packaging and release artefacts keep their versioned names;
+the stable name applies only to the installed copy.
 
 ## Releases
 

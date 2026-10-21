@@ -24,6 +24,7 @@ pub mod cli;
 pub mod closed_tabs;
 pub mod cmd;
 mod codex_console;
+mod commit_message;
 mod conversations;
 mod decision;
 /// The macOS dock icon's own menu: every open project, one click from the front.
@@ -674,6 +675,7 @@ pub fn run() {
             cmd::settings::graphics_status,
             cmd::settings::claude_headless,
             cmd::settings::claude_commit_message,
+            cmd::settings::claude_commit_message_cancel,
             cmd::settings::claude_explain_selection,
             cmd::settings::claude_cli_support,
             cmd::settings::codex_cli_support,

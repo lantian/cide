@@ -22,7 +22,9 @@ export interface CommitBoxProps {
   generating: boolean
   generateDisabledReason: string | null
   generationError: string | null
+  generationProgress: string | null
   onGenerate: () => void
+  onCancelGeneration: () => void
   amend: boolean
   /** `2 modified`, already formatted by `summarize`. */
   summary: string
@@ -106,9 +108,10 @@ export function CommitBox(props: CommitBoxProps) {
               the two differ exactly when it matters, which is when HEAD moved underneath. */}
           {props.amendOf ? `Amend ${props.amendOf}` : 'Amend'}
         </label>
-        <span className={styles.summary} id={summaryId} data-audit="gitSummary">
-          {props.busy ?? props.summary}
+        <span className={styles.summary} id={summaryId} data-audit="gitSummary" role={props.generating ? 'status' : undefined}>
+          {props.generationProgress ?? props.busy ?? props.summary}
         </span>
+        {props.generating && <button className={styles.cancelGeneration} type="button" onClick={props.onCancelGeneration} aria-label="Cancel commit message generation" disabled={props.generationProgress === 'Cancelling generation…'}>Cancel</button>}
         <IconButton
           icon={props.generating ? 'loader-circle' : 'pencil'}
           label={props.generating

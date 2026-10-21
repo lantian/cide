@@ -19,6 +19,26 @@ use cide_ipc::Workspace;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+pub const COMMIT_MESSAGE_PROGRESS: &str = "cide://commit-message-progress";
+
+pub fn commit_message_progress(
+    window: &tauri::WebviewWindow,
+    request_id: &str,
+    phase: &str,
+    done: usize,
+    total: usize,
+) {
+    let _ = window.emit(
+        COMMIT_MESSAGE_PROGRESS,
+        serde_json::json!({
+            "requestId": request_id,
+            "phase": phase,
+            "done": done,
+            "total": total,
+        }),
+    );
+}
+
 /// Sent after every accepted mutation, to every window.
 pub const WORKSPACE_CHANGED: &str = "cide://workspace-changed";
 

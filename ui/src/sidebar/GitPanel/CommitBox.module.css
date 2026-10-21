@@ -50,6 +50,11 @@
   text-overflow: ellipsis;
 }
 
+.cancelGeneration {
+  composes: button sm quiet from '../../kit/components/Button.module.css';
+  flex: none;
+}
+
 /*
  * 104px, outlined --accent, from the mock. Fixed height rather than auto-growing: the
  * buttons below must not move while someone types, and a box that grows into the tree

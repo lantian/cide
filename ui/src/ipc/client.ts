@@ -2373,8 +2373,12 @@ export const claudeTasks = {
    * Rejects with `{kind: 'nothingToDescribe'}` when there is no diff, which is a disabled
    * button rather than an error toast.
    */
-  commitMessage: (projectId: ProjectId, scopes: import('./generated').CommitMessageScope[]) =>
-    invoke<HeadlessResult>('claude_commit_message', { project: projectId, scopes }),
+  commitMessage: (projectId: ProjectId, scopes: import('./generated').CommitMessageScope[], requestId?: string) =>
+    invoke<HeadlessResult>('claude_commit_message', { project: projectId, scopes, requestId }),
+  cancelCommitMessage: (requestId: string) =>
+    invoke<boolean>('claude_commit_message_cancel', { requestId }),
+  onCommitMessageProgress: (handler: (progress: { requestId: string; phase: string; done: number; total: number }) => void) =>
+    listen<{ requestId: string; phase: string; done: number; total: number }>('cide://commit-message-progress', e => handler(e.payload)),
 
   /**
    * Explain a selection. The *text* travels, not a path and a range: the buffer on screen may

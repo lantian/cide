@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# Build a distributable cide bundle for THIS host, and put it where you can run it.
+# Build a distributable cide bundle for THIS host, optionally installing it.
 #
 # `cargo xtask package` is the whole packaging brain: it reads `rustc -vV` to learn the host,
 # preflights the configuration, and refuses a target the machine cannot produce, because nothing
 # here cross-compiles (docs/adr/0007). This script is the convenience layer over it — pick the one
-# artefact a person actually wants on this platform, build it, and install it:
+# artefact a person actually wants on this platform, build it, and optionally install it:
 #
-#   Linux  →  target/release/bundle/appimage/cide_<version>_<arch>.AppImage, copied into
-#             $CIDE_INSTALL_DIR (default ~/bin). An AppImage is a single executable file, so a
-#             directory on PATH is the whole of "installing" it.
-#   macOS  →  target/release/bundle/dmg/cide_<version>_<arch>.dmg, and copied nowhere by default:
-#             a .dmg is an installer you open, not a binary for PATH. Set CIDE_INSTALL_DIR to
-#             have it copied somewhere as well.
+#   Linux  →  target/release/bundle/appimage/cide_<version>_<arch>.AppImage; --install copies it
+#             to $CIDE_INSTALL_DIR/cide (default ~/bin/cide). An AppImage is a single executable
+#             file, so a directory on PATH is the whole of "installing" it.
+#   macOS  →  target/release/bundle/dmg/cide_<version>_<arch>.dmg; --install copies it to
+#             $CIDE_INSTALL_DIR/cide.dmg. A .dmg is an installer you open, not a binary for PATH,
+#             so the caller must name the destination directory.
 #
 # **macOS has never been built or run.** `docs/platforms.md` is the record and this script
 # does not pretend otherwise. The Darwin branch is the documented plan and not an observation:
@@ -29,7 +29,7 @@
 #   ./build.sh --all          # everything this host is responsible for — on Linux that adds the
 #                             #   .deb, the Flatpak and the source tarball
 #   ./build.sh --plan         # preflight and print the plan; build nothing
-#   ./build.sh --no-install   # build, but do not copy the result anywhere
+#   ./build.sh --install      # build and copy the primary bundle to a stable path
 #
 # Not `set -e`: every step below is checked by hand, so each failure can say what it means for
 # the artefact rather than exiting on a line number.
@@ -42,19 +42,19 @@ usage() {
   ./build.sh                # the artefact this host is for: AppImage on Linux, .dmg on macOS
   ./build.sh --all          # everything this host is responsible for
   ./build.sh --plan         # preflight and print the plan; build nothing
-  ./build.sh --no-install   # build, but do not copy the result anywhere
+  ./build.sh --install      # build and copy the primary bundle to a stable path
 EOF
 }
 
 all=0
 plan_only=0
-install=1
+install=0
 
 for arg in "$@"; do
   case "$arg" in
     --all)        all=1 ;;
     --plan)       plan_only=1 ;;
-    --no-install) install=0 ;;
+    --install)    install=1 ;;
     -h|--help)    usage; exit 0 ;;
     *) echo "[build] unknown option: $arg" >&2; usage; exit 2 ;;
   esac
@@ -72,14 +72,15 @@ case "$host" in
     bundle_dir=target/release/bundle/appimage
     pattern='*.AppImage'
     install_dir=${CIDE_INSTALL_DIR:-$HOME/bin}
+    install_name=cide
     ;;
   Darwin)
     target_flag=--dmg
     bundle_dir=target/release/bundle/dmg
     pattern='*.dmg'
-    # No default, for the reason in the header. Honoured when the caller names one, because then
-    # where a .dmg lands is their decision rather than this script's guess.
+    # No default: where a .dmg lands is the caller's decision.
     install_dir=${CIDE_INSTALL_DIR:-}
+    install_name=cide.dmg
     ;;
   *)
     echo "[build] $host is not a platform cide targets." >&2
@@ -105,6 +106,11 @@ if [ "$plan_only" = 1 ]; then
   exec "${package[@]}"
 fi
 
+if [ "$install" = 1 ] && [ -z "$install_dir" ]; then
+  echo "[build] --install on macOS needs CIDE_INSTALL_DIR set to an existing directory." >&2
+  exit 2
+fi
+
 # --- build ------------------------------------------------------------------------------
 #
 # A marker file, stamped before the build, to compare the artefact against afterwards.
@@ -128,7 +134,7 @@ trap cleanup EXIT
 
 echo "[build] ${package[*]} --run"
 if ! "${package[@]}" --run; then
-  echo "[build] REFUSING to install: the packaging run failed, so nothing new was produced." >&2
+  echo "[build] the packaging run failed, so nothing new was produced." >&2
   echo "[build] Its own output is above, and nothing was copied anywhere." >&2
   exit 1
 fi
@@ -169,14 +175,10 @@ echo "[build] built $artefact"
 # --- install ----------------------------------------------------------------------------
 
 if [ "$install" = 0 ]; then
-  echo "[build] --no-install: left in $bundle_dir"
-  exit 0
-fi
-
-if [ -z "$install_dir" ]; then
-  # macOS with no CIDE_INSTALL_DIR: say what to do with the thing rather than nothing at all.
-  echo "[build] open it with:  open \"$artefact\""
-  echo "[build] (set CIDE_INSTALL_DIR to have the .dmg copied there too)"
+  echo "[build] left in $bundle_dir"
+  if [ "$host" = Darwin ]; then
+    echo "[build] open it with:  open \"$artefact\""
+  fi
   exit 0
 fi
 
@@ -188,7 +190,7 @@ if [ ! -d "$install_dir" ]; then
   exit 1
 fi
 
-dest=$install_dir/$(basename "$artefact")
+dest=$install_dir/$install_name
 
 # Written beside the destination and renamed onto it, rather than copied over it. A running
 # AppImage holds its own file open, and writing into a busy executable fails with ETXTBSY

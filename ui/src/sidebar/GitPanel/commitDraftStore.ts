@@ -8,12 +8,13 @@ export interface CommitDraft {
   readonly message: string
   readonly revision: number
   readonly generating: boolean
+  readonly progress: string | null
   readonly generated: string | null
   readonly error: string | null
 }
 
 export const EMPTY_DRAFT: CommitDraft = {
-  message: '', revision: 0, generating: false, generated: null, error: null,
+  message: '', revision: 0, generating: false, progress: null, generated: null, error: null,
 }
 
 /** Shared with the panel's status/tick caches: each worktree owns a separate commit. */
@@ -25,6 +26,13 @@ export function commitDraftKey(project: string | null, worktree: string | null):
 export class CommitDraftStore {
   private drafts = new Map<string, CommitDraft>()
   private listeners = new Map<string, Set<() => void>>()
+  private cancellations = new Map<string, () => void>()
+  private cancellationRequested = new Set<string>()
+  private selections = new Map<string, string>()
+
+  setSelection(scope: string | null, fingerprint: string): void {
+    if (scope !== null) this.selections.set(scope, fingerprint)
+  }
 
   get(scope: string | null): CommitDraft {
     return scope === null ? EMPTY_DRAFT : (this.drafts.get(scope) ?? EMPTY_DRAFT)
@@ -81,31 +89,57 @@ export class CommitDraftStore {
 
   async generate(
     scope: string | null,
-    run: () => Promise<{ text: string; isError: boolean; subtype: string }>,
+    run: (requestId: string, progress: (phase: string, done: number, total: number) => void, isCancelled: () => boolean) => Promise<{ text: string; isError: boolean; subtype: string }>,
+    cancel?: (requestId: string) => void,
+    selection?: string,
   ): Promise<void> {
     if (scope === null) return
     const before = this.get(scope)
     if (before.generating || before.generated !== null) return
-    this.write(scope, { ...before, generating: true, error: null })
+    const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+    this.write(scope, { ...before, generating: true, progress: 'Reading selected changes…', error: null })
+    if (cancel) this.cancellations.set(scope, () => cancel(requestId))
     try {
-      const result = await run()
+      const result = await run(requestId, (phase, done, total) => {
+        const current = this.get(scope)
+        if (!current.generating || this.cancellationRequested.has(scope)) return
+        const progress = phase === 'analyzing' ? `Analyzing changes ${done}/${total}…` : 'Combining change summaries…'
+        this.write(scope, { ...current, progress })
+      }, () => this.cancellationRequested.has(scope))
+      if (this.cancellationRequested.has(scope)) throw { kind: 'cancelled', message: 'cancelled' }
       if (result.isError) throw new Error(result.text || `Generation failed (${result.subtype})`)
       const text = result.text.trim()
       if (text === '') throw new Error('The model returned an empty commit message. Try Generate again.')
+      if (selection !== undefined && this.selections.get(scope) !== selection) {
+        throw new Error('The selected files or hunks changed while generating. Generate again.')
+      }
       const current = this.get(scope)
       // Even an edit back to empty is work made since the click: ask before replacing it.
       if (current.message !== '' || current.revision !== before.revision) {
-        this.write(scope, { ...current, generating: false, generated: text })
+        this.write(scope, { ...current, generating: false, progress: null, generated: text })
       } else {
         this.write(scope, {
-          ...current, generating: false, message: text, revision: current.revision + 1,
+          ...current, generating: false, progress: null, message: text, revision: current.revision + 1,
         })
       }
     } catch (error) {
+      const cancelled = error !== null && typeof error === 'object' && 'kind' in error && error.kind === 'cancelled'
       const detail = error !== null && typeof error === 'object' && 'message' in error
         ? String(error.message) : String(error)
-      this.write(scope, { ...this.get(scope), generating: false, error: detail })
+      this.write(scope, { ...this.get(scope), generating: false, progress: null, error: cancelled ? null : detail })
+    } finally {
+      this.cancellations.delete(scope)
+      this.cancellationRequested.delete(scope)
     }
+  }
+
+  cancel(scope: string | null): void {
+    if (scope === null) return
+    if (!this.get(scope).generating) return
+    this.cancellationRequested.add(scope)
+    this.cancellations.get(scope)?.()
+    const draft = this.get(scope)
+    if (draft.generating) this.write(scope, { ...draft, progress: 'Cancelling generation…' })
   }
 }
 
