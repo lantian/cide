@@ -1675,18 +1675,6 @@ async fn generate_commit_message(
     })
 }
 
-#[cfg(test)]
-fn commit_message_request(
-    roots: &[PathBuf],
-    scopes: &[cide_ipc::headless::CommitMessageScope],
-) -> Result<(PathBuf, HeadlessRequest), ClaudeTaskError> {
-    let (root, text, branch_hint) = commit_message_source(roots, scopes)?;
-    Ok((
-        root,
-        cide_claude::prompt::commit_message(&text, branch_hint.as_deref()),
-    ))
-}
-
 fn commit_message_source(
     roots: &[PathBuf],
     scopes: &[cide_ipc::headless::CommitMessageScope],
@@ -2376,6 +2364,17 @@ pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
 mod tests {
     use super::*;
     use cide_ipc::{RepoId, SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
+
+    fn commit_message_request(
+        roots: &[PathBuf],
+        scopes: &[cide_ipc::headless::CommitMessageScope],
+    ) -> Result<(PathBuf, HeadlessRequest), ClaudeTaskError> {
+        let (root, text, branch_hint) = commit_message_source(roots, scopes)?;
+        Ok((
+            root,
+            cide_claude::prompt::commit_message(&text, branch_hint.as_deref()),
+        ))
+    }
 
     /// The section a project's one Settings tab is showing, and how many Settings tabs it has.
     fn settings_tabs(ws: &Workspace, project: ProjectId) -> Vec<SettingsSection> {

@@ -1761,6 +1761,11 @@ mod tests {
             let mut seen = Vec::new();
             while seen.len() < 5 {
                 let message = rx.recv_timeout(Duration::from_secs(5)).expect("written");
+                // A one-millisecond deadline can enqueue `$/cancelRequest` before this
+                // receiver drains the five requests. Notifications have no top-level id.
+                if message["method"] == "$/cancelRequest" {
+                    continue;
+                }
                 seen.push(message["id"].as_i64().expect("an id"));
             }
             seen.sort_unstable();

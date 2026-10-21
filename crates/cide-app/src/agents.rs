@@ -3293,7 +3293,13 @@ impl AgentRegistry {
         let Some((session, kind, line)) = self.plan_follow_up(project, run, line)? else {
             return Ok(());
         };
-        if !recovering && let Some(handle) = crate::native_plan::get(app, session) {
+        // A follow-up on an implemented assignment continues in its execution mode.
+        // Re-entering Plan mode here swallowed user send-back feedback in Codex's
+        // native plan composer after the first implementation had already finished.
+        if !recovering
+            && let Some(handle) = crate::native_plan::get(app, session)
+            && handle.pending()
+        {
             let state = cide_agents::native_plan::State::default();
             if let Some(live) = self.inner.lock().runs.get_mut(&run) {
                 live.planning = Some(state.clone());
@@ -5823,6 +5829,39 @@ impl AgentRegistry {
         prompt: &str,
         kind: Harness,
     ) -> Result<()> {
+        if kind == Harness::Codex
+            && let Some(console) = app
+                .state::<crate::peer_chat::Runtime>()
+                .codex_console(session)
+        {
+            let receiver = console
+                .receiver()
+                .map_err(CoreError::Io)?
+                .ok_or_else(|| CoreError::Io("Codex is not ready for a follow-up turn".into()))?;
+            let registry = Arc::clone(self);
+            let valid = Box::new(move || {
+                registry
+                    .inner
+                    .lock()
+                    .runs
+                    .get(&run)
+                    .filter(|live| {
+                        live.project == project
+                            && live.session == Some(session)
+                            && live.stop.is_none()
+                            && live.frozen.is_none()
+                    })
+                    .map(|_| ())
+                    .ok_or_else(|| "The Codex run changed before submission".to_string())
+            });
+            return match console.peer_prompt(receiver, prompt.to_owned(), valid) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(CoreError::Io(
+                    "Codex became busy before the follow-up was submitted".into(),
+                )),
+                Err((_, error)) => Err(CoreError::Io(error)),
+            };
+        }
         if let Some(plan) = crate::native_plan::get(app, session) {
             if kind.reads_provider_document()
                 && let Some(console) = app

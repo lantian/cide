@@ -4099,6 +4099,13 @@ fn hand_back_to_run_with_view(
             }
             Err(error) => {
                 tracing::warn!(agent = %agent, %task, %error, "a red verify could not go back to the role");
+                crate::emit::pool_notice(
+                    &app,
+                    project,
+                    format!(
+                        "Task {task} is Doing, but its feedback could not reach {agent}: {error}"
+                    ),
+                );
             }
         }
     });
