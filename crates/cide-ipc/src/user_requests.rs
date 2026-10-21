@@ -2,7 +2,37 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{TaskAuthor, TaskId, TaskQuestion, TaskStatus, sessions::SessionRecord};
+use crate::{SessionId, TaskAuthor, TaskId, TaskQuestion, TaskStatus, sessions::SessionRecord};
+
+/// Identifies a pending native operation, rather than a new user turn to deliver later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NativeQuestionSource {
+    pub session: SessionId,
+    pub generation: SessionId,
+    pub conversation: String,
+    pub request: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UserRequestQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: TaskQuestion,
+    pub custom: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UserRequestAnswer {
+    pub id: String,
+    pub text: String,
+    pub selected_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +55,10 @@ pub enum UserRequestKind {
     Question {
         question: TaskQuestion,
     },
+    Questions {
+        questions: Vec<UserRequestQuestion>,
+        source: NativeQuestionSource,
+    },
     MoveTasks {
         milestone: String,
         goal: TaskId,
@@ -43,6 +77,9 @@ pub enum UserRequestResponse {
     Answer {
         text: String,
         selected_ids: Vec<String>,
+    },
+    Answers {
+        answers: Vec<UserRequestAnswer>,
     },
     Approve {
         selected_ids: Vec<TaskId>,

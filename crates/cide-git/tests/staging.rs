@@ -366,7 +366,7 @@ fn a_rename_with_edits_refuses_partial_staging() {
     repo.write("a.txt", b"one\ntwo\nthree\nfour\nfive\nsix\n");
     repo.commit_all("base");
     repo.git(&["mv", "a.txt", "b.txt"]);
-    repo.write("b.txt", b"one\nTWO\nthree\nfour\nfive\nSIX\n");
+    repo.rewrite("b.txt", b"one\nTWO\nthree\nfour\nfive\nSIX\n");
 
     let git_repo = git2::Repository::open(&repo.root).unwrap();
     let request = DiffRequest::new(DiffSide::Combined).renames(true);

@@ -33,6 +33,7 @@
   "cide://spec-changed",
   "cide://spec-runs-changed",
   "cide://task-apply-started",
+  "cide://task-dispatch-feedback",
   "cide://tasks-changed",
   "cide://update-available",
   "cide://update-check-requested",

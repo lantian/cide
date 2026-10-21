@@ -56,6 +56,10 @@ with work nobody wanted.
 - **`max-concurrent` 1–2 per role** (role front matter), and **`agents.maxConcurrent` 2–3** for
   the project. More parallelism mostly buys conflicts and a machine divided into slices too thin
   to run a game's tests. `CIDE_CPUS` (below) is the machine's cores divided by this number.
+- A role's `permission-mode` and the project's harness permission settings still govern what its
+  child may run. `auto` can refuse migrations, database commands, or other privileged actions;
+  the task body cannot grant permission. Choose the appropriate mode before dispatch if a task
+  requires those actions, or handle a refusal in the primary session.
 - **The expensive model on the feature builder, cheap ones on mechanical work.** The review is
   batched and no longer re-runs checks, so the reviewer can be a mid-tier model too.
 
@@ -129,7 +133,9 @@ worktree, verify and reviewer, and each seeing a quarter of the context. Each ta
 - **`touches`**: the files and directories it will change (`game/enemies/`,
   `game/combat/projectile.gd`, `art/enemies/**`). cide never runs two tasks whose touches
   overlap. **A task with no touches is read as the whole repository and runs alone**, so write
-  them. Precise touches are what let several runs work at once.
+  them. Precise touches are what let several runs work at once. `touches` must stay within this
+  repository; cide rejects `../` and absolute paths because its worktree would not isolate a
+  neighboring checkout.
 - **`acceptance: "user"`** when its quality is a matter of taste: art, the look of a screen, the
   feel of a control. cide merges such a task when its verify is green, and it waits for you.
 - **`subtaskOf`** the goal task.
@@ -267,11 +273,17 @@ Questions can include any number of choices with a title, optional description, 
 image. Single-select, multi-select and custom text are available. A failed submission preserves
 the draft. Images use the linked task's attachments.
 
-Agents ask through `cide_user_request`, independently of task updates. The optional `task` links
+Dispatched agents, delegated worker sessions, and automatic planner/reviewer tabs ask through
+`cide_user_request`, independently of task updates. Main consoles and user-opened panes use
+their harness's own question flow: cide exposes neither request tools nor task-update question
+fields to them. The optional `task` links
 the decision to a task. The tool waits by default; `wait: false` returns its durable ID while
 independent work continues. `cide_user_request_result` reconnects to that ID after interruption,
 with `wait: true` by default. Answers, rejection and cancellation go back to the original
-conversation. Setting `cide_task_update.question` remains compatible and also waits by default.
+conversation. For delegated and automatic sessions, setting `cide_task_update.question` remains
+compatible and also waits by default. Later answers are delivered only to the saved conversation;
+cide confirms native submission or checks the original transcript before marking them delivered.
+Uncertain submissions remain saved and visible across restarts without being sent twice.
 
 ```json
 {
@@ -386,6 +398,13 @@ enough for batches to form.
 
 ## Troubleshooting
 
+- **Assigning a task or @mentioning a role did not start it.** The task card explains all
+  current restrictions under its assignee, and a user gesture shows a notification with
+  *Open task*. Follow the dependency or milestone links to inspect the cause. A dependency
+  must be done, not merely in review; a task in a later milestone also waits for that milestone
+  to become active. Queue and pause explanations describe an existing run waiting to start.
+  *Can be started* means the restrictions are gone: reassign or @mention the role to request
+  another launch if no existing automatic trigger has done so.
 - **The queue is stuck on paths.** Look at the run rows' notes. `this task declares no
   touches, so it runs alone` or `it declares no touches, so nothing runs beside it`: give the
   tasks touches. `waiting: t-N holds <path>` where t-N is in review: its branch still holds those

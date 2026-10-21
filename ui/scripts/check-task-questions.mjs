@@ -322,7 +322,45 @@ try {
   await mount(QuestionAnswer, { task: 't-1', question, previews: { 'image-0': { kind: 'refused', reason: 'Image missing' } }, onAnswer }, 'missing')
   assert.ok(document.body.textContent.includes('Image missing'))
   assert.equal(document.querySelectorAll('input[type="checkbox"]').length, 10, 'missing images keep their answer choices')
-  console.log('check-task-questions: ok (decision modals, answered badges and Waiting counts, task references and Back, preserved drafts and focus, saved-choice labels, subset approval, explicit cancellation, images, single/multiple/custom answers, retries, editing and duplicate submission)')
+  const nativeCalls = []
+  let rejectNative = true
+  let releaseNative
+  const nativePending = new Promise((resolve) => { releaseNative = resolve })
+  const batchRequest = { ...referenceRequest, id: 'native-batch', task: null, title: 'Planning choices', request: { kind: 'questions',
+    source: { session: 'worker', generation: 'assignment', conversation: 'native-thread', request: 'call-1' },
+    questions: [
+      { id: 'language', header: 'Language', custom: false, question: { text: 'Which language?', selection: 'single', options: [{ id: '0', title: 'Русский', description: 'Native labels survive the round trip' }] } },
+      { id: 'features', header: 'Features', custom: true, question: { text: 'Which features?', selection: 'multiple', options: [{ id: '0', title: 'Search' }, { id: '1', title: 'Export' }] } },
+    ] } }
+  await mount(WaitingPanel, { ...referenceProps, requests: [batchRequest], onRespondRequest: async (id, response) => {
+    nativeCalls.push({ id, response })
+    if (rejectNative) throw new Error('Answer could not be saved')
+    await nativePending
+  } }, 'native-batch')
+  await click(button('Planning choices'))
+  assert.equal(document.querySelectorAll('[data-audit="nativeQuestionsForm"]').length, 1)
+  assert.ok(button('Answer').disabled, 'a batch never submits recommended defaults automatically')
+  assert.equal(document.querySelectorAll('textarea').length, 1, 'custom input follows each native question capability')
+  await click(document.querySelector('input[type="radio"]'))
+  assert.ok(button('Answer').disabled, 'every question in the native call must have an answer')
+  await click(document.querySelector('input[type="checkbox"][value="0"]'))
+  await click(document.querySelector('input[type="checkbox"][value="1"]'))
+  await type('Custom details\nSecond line')
+  await click(button('Answer'))
+  assert.ok(document.body.textContent.includes('Answer could not be saved'))
+  assert.equal(document.querySelectorAll('input:checked').length, 3)
+  assert.equal(document.querySelector('textarea').value, 'Custom details\nSecond line')
+  await click([...document.querySelectorAll('[aria-label="Close"]')].find(visible))
+  await click(button('Planning choices'))
+  assert.equal(document.querySelector('textarea').value, 'Custom details\nSecond line', 'dismissal preserves the entire batch draft')
+  rejectNative = false
+  await act(async () => { button('Answer').click(); button('Answer').click() })
+  assert.equal(nativeCalls.length, 2, 'a pending batch is submitted once')
+  assert.deepEqual(nativeCalls.at(-1), { id: 'native-batch', response: { kind: 'answers', answers: [
+    { id: 'language', text: '', selectedIds: ['0'] }, { id: 'features', text: 'Custom details\nSecond line', selectedIds: ['0', '1'] },
+  ] } })
+  await act(async () => releaseNative())
+  console.log('check-task-questions: ok (native grouped questions, complete batches, preserved drafts, capability-aware custom input, retries and duplicate submission; legacy decisions, images and task questions)')
 } finally {
   if (root) await act(async () => root.unmount())
   dom.window.close()

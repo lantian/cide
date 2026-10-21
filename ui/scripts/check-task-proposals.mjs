@@ -75,7 +75,8 @@ try {
           const t = globalThis.__taskProposalChecks;
           export const tasks = t.tasks, attachments = {}, specEvents = {};
           export const settings = { effective: async (project) => ({ consoleHarness: t.projectHarness?.[project] ?? t.consoleHarness ?? 'codex' }) };
-          export const specSessions = t.specSessions, agentRuns = t.agentRuns, spec = t.spec, events = t.events;`
+          export const specSessions = t.specSessions, agentRuns = t.agentRuns, spec = t.spec, events = t.events;
+          export const tab = { openConversation: async (...args) => { t.opened.push(args); return 'conversation-tab-42' } };`
         if (id === '\0workspace') return `
           import { create } from 'zustand';
           export const useWorkspace = create(() => ({ boot: null,

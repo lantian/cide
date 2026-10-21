@@ -2800,7 +2800,7 @@ try {
         + 'unsaved edits — on every tab switch',
     )
     ok(
-      /useEffect\(\(\) => \{\s*if \(onScreen\) slotRef\.current\?\.focus\(\)\s*\}, \[onScreen\]\)/
+      /useEffect\(\(\) => \{\s*if \(onScreen && !embedded\) slotRef\.current\?\.focus\(\)\s*\}, \[onScreen, embedded\]\)/
         .test(surface),
       'and a tab coming forward takes the slot. Ctrl+Tab, a tab-strip click and `file.open` on '
         + 'an already-open file produce no mount and no DOM focus, so without this effect the '
@@ -5049,6 +5049,8 @@ try {
         // ten presses would be ten entries the merge rule cannot collapse. `navHistory.ts`'s
         // header carries the whole list of what is and is not recorded.
         'src/keys/dispatch.ts',
+        // An embedded reader's local Go to Line must never record its synthetic reveal key.
+        'src/overlays/GoToLine.tsx',
         // Fixtures and the surface that answers a reveal rather than making one.
         'src/editor/EditorSurface.tsx',
       ])
@@ -5203,7 +5205,7 @@ try {
         'whatever the 500 ms debounce last managed to send',
     )
     ok(
-      /planRestore\(\s*remembered,\s*view\.state\.doc\.lines,\s*pendingReveals\(\)\.includes\(identity\),?\s*\)/.test(
+      /planRestore\(\s*remembered,\s*view\.state\.doc\.lines,\s*pendingReveals\(\)\.includes\(embedded\?\.revealKey \?\? identity\),?\s*\)/.test(
         surfaceSrc,
       ),
       'the restore consults planRestore, and hands it the parked-reveal answer — the veto is ' +
@@ -6395,13 +6397,13 @@ try {
         + 'every call site has to get right',
     )
     ok(
-      /registerReveal\(identity/.test(surfaceSrc),
+      /registerReveal\(embedded\?\.revealKey \?\? identity/.test(surfaceSrc),
       '…and the reveal registry is keyed on it. A prop that exists and does not reach '
         + '`registerReveal` is the collision with a name on it: `requestReveal` would still '
         + 'find this buffer live under the real path and a search click would stop working',
     )
     ok(
-      /pendingReveals\(\)\.includes\(identity\)/.test(surfaceSrc),
+      /pendingReveals\(\)\.includes\(embedded\?\.revealKey \?\? identity\)/.test(surfaceSrc),
       '…and so is the veto that asks whether a reveal is parked for this buffer. Asking under '
         + 'one name and registering under another would let the remembered position win over a '
         + 'request that is about to be delivered, which is the ordering `planRestore` exists to '
@@ -6456,7 +6458,7 @@ try {
         + 'silently stops working',
     )
     eq(
-      KEYED_ON_IDENTITY.filter((fn) => !takes(fn, 'identity')),
+      KEYED_ON_IDENTITY.filter((fn) => !takes(fn, fn === 'registerReveal' ? String.raw`embedded\?\.revealKey \?\? identity` : 'identity')),
       [],
       '…and every one of them is still called, with the identity. Without this half the sweep '
         + 'above would be satisfied by deleting a registration, which is a worse outcome than '

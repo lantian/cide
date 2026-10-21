@@ -402,6 +402,7 @@ pub(crate) fn open_continuing(
                 }),
                 // Written directly, as `session` is: this road never passes `pane_bind_session`.
                 harness: Some(harness.harness()),
+                harness_choice: None,
                 title: format!(
                     "{name} : {}",
                     if opencode {

@@ -76,6 +76,12 @@ impl ConsoleEvents {
                         let over = turns.feed(line);
                         for event in std::iter::once(line).chain(over) {
                             let value = serde_json::from_str::<serde_json::Value>(event).ok();
+                            if let Some(handle) = crate::native_plan::get(&app, session)
+                                && let Some(value) = &value
+                            {
+                                handle.observe(value);
+                                crate::native_questions::qwen_event(&app, session, value, &pty);
+                            }
                             let started = value.as_ref().is_some_and(|v| {
                                 v["type"] == "system" && v["subtype"] == "session_start"
                             });
@@ -202,6 +208,12 @@ pub fn spawn(
                 let over = turns.feed(line);
                 for line in std::iter::once(line).chain(over) {
                     log.append(line);
+                    if let Some(handle) = crate::native_plan::get(&app, session)
+                        && let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                    {
+                        handle.observe(&value);
+                        crate::native_questions::qwen_event(&app, session, &value, &pty);
+                    }
                     if let Some((moved, _)) =
                         registry.observe(Some(&app), session, Observation::Line(line))
                     {

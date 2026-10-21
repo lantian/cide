@@ -52,6 +52,18 @@
   flex: none;
 }
 
+.diagnostics {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.divider {
+  height: 12px;
+  border-left: 1px solid var(--border);
+  margin: 0 var(--sp-2);
+}
+
 /*
  * The trail is the exception, and it has to be spelled out here rather than left to `.path`'s
  * own `flex: 0 1 auto`: `.left > *` above is (0,2,0) and `.path` is (0,1,0), so the blanket

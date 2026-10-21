@@ -183,6 +183,8 @@ export const CONFIG: OrchestrationConfig = {
   autoSpinAfterSecs: 90,
   autoSpinPrompt: 'Check the board: pick up anything assigned to you that is unblocked.',
   reviewPrompt: 'Review {task} against its body and CLAUDE.md, then move it to done or back to doing.',
+  taskStartPrompt: 'Implement {task_id}: {task_title}. Read the task with {cide_task_get}.',
+  workerInstructions: 'Commit each completed step and report the result with {cide_task_comment}.',
   isolateEnv: ['CARGO_TARGET_DIR', 'VITE_PORT'],
   isolateEnvShare: ['RUSTC_WRAPPER'],
   verifyExclusive: true,

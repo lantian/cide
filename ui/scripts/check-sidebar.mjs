@@ -114,7 +114,7 @@ try {
   eq(selectView(SIDEBAR_INITIAL, 'git'), { view: 'git', last: 'git' }, 'another switches')
   eq(
     selectView({ view: null, last: 'git' }, 'search'),
-    { view: 'search', last: 'search' },
+    { view: null, last: 'git' },
     'and a click while hidden opens the one clicked, not the one remembered',
   )
 
@@ -380,9 +380,9 @@ try {
     )
     const app = readFileSync('src/App.tsx', 'utf8')
     ok(
-      /registerPanelHost\(\(view\) => setSidebar\(\(s\) => showPanel\(s, view\)\)\)/.test(app)
+      /registerPanelHost\(\(view\) => \{\s*if \(view === 'search'\) \{ openSearch\('text'\); return \}\s*if \(view === 'problems'\) \{ runCommand\('sidebar.problems', null\); return \}\s*setSidebar\(\(s\) => showPanel\(s, view\)\)/.test(app)
         && /return \(\) => registerPanelHost\(null\)/.test(app),
-      'App fills the slot with the same `showPanel` every other reveal goes through, and empties ' +
+      'App routes search to the modal and other reveals to `showPanel`, and empties ' +
         'it on unmount — a root that went away while registered leaves `requestPanel` calling ' +
         'into a dead React tree',
     )

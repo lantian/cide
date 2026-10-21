@@ -918,3 +918,48 @@ pub enum FormatAnswer {
     /// verbatim, so it is a sentence and not a code.
     Unavailable { reason: String },
 }
+
+/// Runtime language-server state, independent of diagnostic severity/source filters.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LanguageServerSnapshot {
+    pub source: DiagnosticSourceId,
+    pub label: String,
+    pub status: SourceStatus,
+    pub stopped: bool,
+    pub attached: bool,
+    pub version: Option<String>,
+    #[ts(type = "number | null")]
+    pub memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum LanguageServerAction {
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LanguageServerLog {
+    #[ts(type = "number")]
+    pub sequence: u64,
+    #[ts(type = "number")]
+    pub timestamp: u64,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LanguageServerLogs {
+    pub entries: Vec<LanguageServerLog>,
+    #[ts(type = "number")]
+    pub cursor: u64,
+    pub truncated: bool,
+}

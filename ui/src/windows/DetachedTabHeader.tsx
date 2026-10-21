@@ -42,6 +42,8 @@ function tabTitle(kind: TabKind, console: string): string {
       return console
     case 'claudeFull':
       return kind.title
+    case 'conversation':
+      return kind.title
     case 'file':
       return kind.path.split('/').at(-1) ?? kind.path
     case 'diff':

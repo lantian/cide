@@ -1,62 +1,7 @@
-/**
- * The 24px status bar along the bottom of the window.
- *
- * # The four counters are gone
- *
- * The left group used to carry `⊕ — ⊖ — ✗ 0 ⚠ 2` beside the branch: a working-tree diff
- * stat and the diagnostics pair. The diff half never had a source at all — there is no
- * working-tree line count on the wire — so it spent every launch printing a dash, and the
- * diagnostics half is a second rendering of a figure the ⚠ Problems rail button already
- * badges two rows up. The user asked for the row back, and both slots went with it. What is
- * *not* lost is the snapshot behind them: `App.tsx` still derives `diagCounts` and still feeds
- * the rail's badge, so the count has one renderer instead of two.
- *
- * Every field is a prop with a placeholder default, and *this component* reads nothing from the
- * store — so it stays a pure render target that a screenshot test can drive directly.
- *
- * # Two children are the documented exception, and the rule is about this file
- *
- * `<BranchSelector />` and, since M65, `<GitOpIndicator />` each own a module store and subscribe
- * to it themselves. That is not a hole in the rule above, it is the shape the rule takes for
- * state `App.tsx` does not hold: the branch is data the selector must already have to draw its
- * popup, and a running push is started from `keys/dispatch.ts`, the branch popup and the Git
- * panel, none of which `App.tsx` sits on the path of. Threading either through as a prop would
- * put a producer's plumbing in a component with no other use for it — and the property that
- * actually catches bugs, rules living in a module a check script can compile, is kept by both
- * (`chrome/branchModel.ts`, `chrome/gitOpModel.ts`).
- *
- * What the rule still forbids is *this file* growing a subscription. Each such child is one line
- * here and is separately renderable, so `chrome/auditFixture.ts` keeps its handle on the bar.
- *
- * The open file is the one thing that does not arrive as a prop. It comes from
- * `editor/statusReadout.ts`, which the editor pane feeds, and it arrives in two pieces
- * because they change at different rates:
- *
- * * `crates › cide-core › src › lib.rs` — the trail, in React state. It moves when the user
- *   switches file, which is rare, and it wants real markup: one element per segment, so the
- *   `›` separators can be their own colour, each segment can carry its own bidi direction
- *   inside a box that clips from the left, and — since M16 — a segment that leads somewhere can
- *   be a control while one that does not is plain text with no handler at all.
- * * `Rust · UTF-8 · LF · Ln 7, Col 48` — written straight into a DOM node this component
- *   owns. It moves on every caret move, which under a held arrow key is 30 times a second,
- *   and no version of re-rendering the bar that often is worth having.
- *
- * Both used to be a 28px row above every buffer. See `statusReadout.ts` for why they moved,
- * and `editor/EditorSurface.tsx` for the row that is no longer there.
- *
- * # Where they sit, and when they say anything (M34)
- *
- * The trail is in the **left** group, after the branch: `⑂ master` and `src › lib.rs` answer the
- * same question, and the right group is then only the readouts a user watches — the caret line
- * and the harness readout. It arrived in the right group when the breadcrumb row was deleted and
- * stayed there by inertia.
- *
- * Both file slots are gated on `editorFocused`, because the claim stack behind them never
- * demotes: a terminal pane holds no editor, claims nothing, and so left the previous buffer's
- * path and caret standing on the bar while the user typed somewhere else entirely. See that
- * prop for why this hides rather than releases.
- */
-import { useEffect, useRef, useState } from 'react'
+/** The bottom status bar. Project diagnostics and server controls sit beside Git;
+ * editor breadcrumbs are the shrinkable slot, while caret updates avoid React renders.
+ * Children own their subscriptions; the bar itself remains fixture-renderable. */
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   sameTrail,
   statusReadout,
@@ -72,18 +17,12 @@ import { HARNESS_LOADING, type HarnessReadout } from './harnessReadout'
 import styles from './StatusBar.module.css'
 
 export interface StatusBarProps {
+  diagnosticsControl?: ReactNode
+
   /*
    * No `branch` prop. It was here, defaulted to `'—'`, and nothing ever passed one — so the
    * slot printed a dash forever. `BranchSelector` reads the repository itself; a prop would be
    * a second source of truth for a value it already holds to draw its list.
-   */
-  /*
-   * No `added`/`removed` and no `diagnostics` either, for the same reason and one more.
-   *
-   * The diff pair had no producer anywhere in the workspace — there is no working-tree line
-   * count on the wire, so the slot could only ever draw a dash — and the diagnostics pair had
-   * one but shared it with the rail's ⚠ badge, which is nearer the eye and already there. See
-   * the header.
    */
   harnessReadout?: HarnessReadout | undefined
   /**
@@ -171,6 +110,7 @@ function isSelecting(): boolean {
 }
 
 export function StatusBar({
+  diagnosticsControl,
   harnessReadout = HARNESS_LOADING,
   revealRoots,
   onRevealSegment,
@@ -285,6 +225,11 @@ export function StatusBar({
           * here. Its header says why, and `chrome/gitOpModel.ts` holds the rules a check drives.
           */}
         <GitOpIndicator />
+        {diagnosticsControl && <div className={styles.diagnostics}>
+          <span className={styles.divider} aria-hidden="true" />
+          {diagnosticsControl}
+          {crumbs.trail.length > 0 && <span className={styles.divider} aria-hidden="true" data-audit="diagnosticsNavigationDivider" />}
+        </div>}
 
         {/*
          * `crates › cide-core › src › lib.rs › Workspace › open_project`. Empty — and gone, along

@@ -18,6 +18,7 @@ import {
   agentRuns,
   events,
   specSessions,
+  tab as tabApi,
   type ProjectId,
 } from '@/ipc/client'
 import type {
@@ -185,6 +186,13 @@ export function followRunTab(project: ProjectId, run: RunId, title: string): voi
 export async function openRunTab(project: ProjectId, run: RunId, title: string, shouldOpen?: () => boolean): Promise<boolean> {
   const plan = await agentRuns.open(project, run)
   if (plan.kind === 'unavailable') return false
+  if (shouldOpen && !shouldOpen()) return false
+  if (plan.kind === 'readOnly') {
+    const { useWorkspace } = await import('@/store/workspace')
+    await tabApi.openConversation(project, plan.conversation.id, title)
+    await useWorkspace.getState().synced()
+    return true
+  }
   const intent: SplitIntent =
     plan.kind === 'continue'
       ? { kind: 'continue', conversation: plan.conversation }
@@ -192,7 +200,6 @@ export async function openRunTab(project: ProjectId, run: RunId, title: string, 
         ? { kind: 'mirror', session: plan.session, continues: plan.continues }
         : { kind: 'mirror', session: plan.session }
   const { useWorkspace } = await import('@/store/workspace')
-  if (shouldOpen && !shouldOpen()) return false
   await useWorkspace.getState().newRunTab(project, title, intent)
   return true
 }

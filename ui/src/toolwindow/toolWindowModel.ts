@@ -83,6 +83,8 @@ export interface ToolWindowTabs {
    * extension store rather than from the workspace snapshot. Defaulted, so every existing caller
    * that builds a `ToolWindowTabs` from a `ToolWindowState` alone keeps working.
    */
+  readonly search?: readonly { id: string; title: string }[]
+  readonly logs?: readonly { source: string; label: string }[]
   readonly ext?: readonly ExtTab[]
   /** `null` is the Log tab. A `ext:…` string is a contributed tab. */
   readonly active: string | null
@@ -150,6 +152,7 @@ export function tabRow(tabs: ToolWindowTabs): TabRow[] {
   // enabled, so it must not push the user's own history tabs along; Docker is a fixture of the
   // panel like Log, and a fixture that moved as history tabs came and went would be a target that
   // is never in the same place twice. Not closable, for the same reason Log is not.
+  rows.push({ id: 'problems', label: 'Problems', title: 'Project diagnostics', active: tabs.active === 'problems', closable: false })
   rows.push({
     id: DOCKER_TAB,
     label: 'Docker',
@@ -173,6 +176,12 @@ export function tabRow(tabs: ToolWindowTabs): TabRow[] {
   // something they put there. Not closable: a contributed tab is a property of which extensions
   // are enabled, and a close that only lasted until the next launch is a control that does not
   // do what it says.
+  for (const tab of tabs.logs ?? []) {
+    rows.push({ id: `lsp-log:${tab.source}`, label: `${tab.label} Logs`, title: `${tab.label} logs`, active: tabs.active === `lsp-log:${tab.source}`, closable: true })
+  }
+  for (const tab of tabs.search ?? []) {
+    rows.push({ id: tab.id, label: tab.title, title: tab.title, active: tabs.active === tab.id, closable: true })
+  }
   for (const tab of tabs.ext ?? []) {
     rows.push({
       id: tab.view,

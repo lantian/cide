@@ -22,7 +22,7 @@ writeFileSync(join(dir, 'main.tsx'), `
 import React from 'react'; import {createRoot} from 'react-dom/client';
 import {ProjectMenu} from '@/chrome/ProjectMenu';
 import {ProjectPicker} from '@/overlays/ProjectPicker';
-import {CommandPalette} from '@/overlays/CommandPalette';
+import {SearchEverywhere} from '@/search/SearchEverywhere';
 import {useOverlays,closeOverlay} from '@/overlays/store';
 import {useContextMenu} from '@/menus';
 import {contextMenuOpen} from '@/menus/menuState';
@@ -49,7 +49,7 @@ function Fixture(){const overlay=useOverlays(s=>s.open);const ordinary=useContex
 return <><input id="behind" aria-label="Background editor"/><ProjectMenu/>
 <button id="ordinary" onClick={e=>ordinary.openFor(e.currentTarget)}>Ordinary menu</button>{ordinary.menu}
 {overlay==='projects'&&<ProjectPicker onDismiss={closeOverlay}/>}
-{overlay==='commands'&&<CommandPalette commands={commands} keymap={buildKeymap(bindings)} context={{}} onDismiss={closeOverlay} onRun={id=>run(id,null)} onRunInNewSession={id=>run(id,null)}/>}</>;}
+{overlay==='search'&&<SearchEverywhere project={null} commands={commands} keymap={buildKeymap(bindings)} context={{}} onDismiss={closeOverlay} actions={{runCommand:id=>run(id,null),runCommandInNewSession:id=>run(id,null)}}/>}</>;}
 createRoot(document.getElementById('root')).render(<Fixture/>);window.ready=true;
 `)
 
@@ -150,7 +150,7 @@ try {
     assert.equal(await evaluate('window.opened.at(-1)'), '/mnt/atlas')
 
     await key('p', 10)
-    await until('document.querySelector("[role=dialog][aria-label=\\"Show all commands\\"]")')
+    await until('document.querySelector("[role=dialog][aria-label=\\"Search Everywhere\\"]")')
     await type('Open project');await key('Enter')
     await until('document.querySelector('+JSON.stringify(modal)+')')
     assert(await focused('Open project'), 'palette transition must focus the project input')

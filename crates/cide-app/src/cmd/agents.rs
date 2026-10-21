@@ -1610,7 +1610,22 @@ fn duplicate_refusal(agent: &AgentId, task: Option<&TaskId>, held: &HeldPair) ->
         Some(detail) => format!(" — {detail}"),
         None => String::new(),
     };
+    let same_pair = held.agent == *agent && held.task.as_ref() == task;
     let task = task.map_or_else(|| "this task".to_string(), TaskId::to_string);
+    if !same_pair {
+        let owner = held.task.as_ref().map_or_else(
+            || format!("`{}`", held.agent),
+            |id| format!("`{}` on {id}", held.agent),
+        );
+        return format!(
+            "The OpenSpec change `{}` is already held by {owner}: run {} [{}]{detail}. \
+             This dispatch of `{agent}` on {task} did not start. Wait for that Apply run to end \
+             or stop it before dispatching again.",
+            held.change.as_deref().unwrap_or("unknown"),
+            held.run,
+            cide_agents::tools::run_state_wire(&held.state),
+        );
+    }
     format!(
         "`{agent}` is already on {task}: run {} [{}]{detail}. A role gets one run per task, \
          because a second wants the same worktree. To give that run more work, dispatch again \
@@ -1735,6 +1750,15 @@ fn plan_dispatch(
         .transpose()?;
 
     if let Some(task) = task.as_ref()
+        && let Some(entry) = cide_tasks::invalid_touch(root, &task.touches)
+    {
+        return Err(CoreError::Io(format!(
+            "task {} declares `touches` entry `{entry}` outside this repository; dispatch is refused because that repository has no isolated worktree",
+            task.id
+        )));
+    }
+
+    if let Some(task) = task.as_ref()
         && let Some(why) = task_refusal(root, store, task)
     {
         return Err(CoreError::Io(why));
@@ -1752,7 +1776,12 @@ fn plan_dispatch(
     let harness = cide_agents::harness::for_kind(kind);
     let prompt = match request.external.as_ref() {
         Some(work) => external_prompt(work, request.prompt.as_deref(), harness),
-        None => opening_prompt(task.as_ref(), request.prompt.as_deref(), harness),
+        None => opening_prompt(
+            task.as_ref(),
+            request.prompt.as_deref(),
+            harness,
+            project.config.agents.task_start_template(),
+        ),
     };
     if prompt.is_empty() {
         // Refused here as well as in `ClaudeHarness::spawn_spec`, which has the same guard for the
@@ -1765,6 +1794,7 @@ fn plan_dispatch(
     }
 
     Ok(DispatchSpec {
+        planning: Some(Default::default()),
         project: request.project,
         agent: agent.def.id.clone(),
         agent_label: agent.def.label.clone(),
@@ -1832,98 +1862,14 @@ fn plan_dispatch(
 /// Three rules, in the order a caller can act on them: the inbox, the active milestone, and the
 /// blockers.
 pub(crate) fn task_refusal(root: &Path, store: &TaskStore, task: &Task) -> Option<String> {
-    /*
-     * An inbox task is not work yet, so nothing dispatches it. (M83)
-     *
-     * The quiet half is `autodispatch`, which starts `Todo | Doing` only; this is the named one,
-     * for the same reason the blocking rule below has one — an explicit gesture's refusal must
-     * say why and what to do instead. Moving a task out of the inbox is the decision that it is
-     * worth doing now, and a dispatch that skipped it would make the inbox a place tasks run from.
-     */
-    if task.status == cide_ipc::TaskStatus::Inbox {
-        return Some(format!(
-            "{} is in the inbox, which is where noticed work waits until the user decides it is \
-             work now: only the user moves a task out of the inbox — name it in your report, or \
-             ask the user.",
-            task.id
-        ));
-    }
-
-    /*
-     * A task with an open question waits for the user's answer. (M132)
-     *
-     * The question is the run's or the planner's way of saying "the next step is a decision about
-     * taste, scope or design that is not mine". Starting the task again before the answer is the
-     * loop the planner used to spin on: the same role re-reads the same ambiguity and invents an
-     * answer. The Waiting-for-you list's answer box clears it and re-dispatches.
-     */
-    if let Some(question) = task.question.as_deref() {
-        return Some(format!(
-            "{} is waiting for the user's answer to its question (\"{}\"); it starts again when the \
-             user answers.",
-            task.id,
-            question.lines().next().unwrap_or_default()
-        ));
-    }
-
-    /*
-     * Work on a later milestone waits for the current one. (M83)
-     *
-     * A task under milestone P3 started while the slice is still red is effort spent on a goal the
-     * project has not reached, and it competes for the same concurrency the current goal needs.
-     * A task under no milestone is not caught: that is the orchestrator's call, and the placement
-     * rule already sends new loose work to the inbox.
-     */
-    {
-        let plan = cide_agents::config::load_milestones(root);
-        if let Some(why) = cide_agents::milestones::outside_active(&plan, &store.list(), &task.id) {
-            return Some(why);
-        }
-    }
-
-    /*
-     * The named refusal half of the blocking rule. (M30)
-     *
-     * The quiet half is `autodispatch::trigger`'s early return — an assignment on a blocked task
-     * records intent and starts nothing, with a debug line. But an *explicit* dispatch (the
-     * panel's button, `cide_agent_dispatch`, and auto-dispatch re-entering through
-     * `agents_dispatch`) is a gesture whose refusal must say why, and this function is the single
-     * funnel all three pass through — so neither path can be forgotten alone.
-     *
-     * Refused only while a blocker is live and not done: a blocker that no longer exists cannot
-     * gate (it can never become done, and its id is never reused — `blocker_statuses` has the
-     * argument). A run already *queued* when its task became blocked still spawns; the gate is at
-     * dispatch decision time, the same line the enqueue-vs-spawn note above draws.
-     */
-    {
-        let board = store.list();
-        let blockers: Vec<String> = task
-            .links
-            .iter()
-            .filter(|l| l.link == cide_ipc::LinkType::BlockedBy && !l.deleted)
-            .filter_map(|l| board.iter().find(|t| t.id == l.target))
-            .filter(|t| t.status != cide_ipc::TaskStatus::Done)
-            .map(|t| {
-                let status = match t.status {
-                    cide_ipc::TaskStatus::Inbox => "inbox",
-                    cide_ipc::TaskStatus::Todo => "todo",
-                    cide_ipc::TaskStatus::Doing => "doing",
-                    cide_ipc::TaskStatus::Review => "review",
-                    cide_ipc::TaskStatus::Done => "done",
-                };
-                format!("{} ({status})", t.id)
-            })
-            .collect();
-        if !blockers.is_empty() {
-            return Some(format!(
-                "{} is blocked by {}: a task is dispatched only once every task it is blocked \
-                 by is done. Finish or dispatch the blockers first, or remove the link.",
-                task.id,
-                blockers.join(", ")
-            ));
-        }
-    }
-    None
+    cide_agents::task_dispatch::task_reasons(
+        task,
+        &store.list(),
+        &cide_agents::config::load_milestones(root),
+    )
+    .into_iter()
+    .next()
+    .map(|reason| reason.text)
 }
 
 /// The first line for work that is **not on this board**. (M104)
@@ -2020,6 +1966,7 @@ pub(crate) fn opening_prompt(
     task: Option<&Task>,
     extra: Option<&str>,
     tools: Option<&dyn Harness>,
+    template: &str,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = task {
@@ -2032,21 +1979,25 @@ pub(crate) fn opening_prompt(
         // rides every run's system prompt in `cide_agents::harness::TRACKER_PREAMBLE`, and the
         // orchestrator's side of the loop is taught in `roster_paragraph`.
         parts.push(match tools {
-            Some(harness) => format!(
-                "Work on task {} ({}). Read it with {get}, and record what you do \
-                 with the {bare} tools rather than by editing the tracker file; commit each \
-                 coherent step as you go — your branch is the record that survives if this run \
-                 dies — and do not comment while you work. When the work is complete, set the \
-                 task's status to review with {update} and leave one short comment saying what \
-                 you did and where.",
-                task.id,
-                one_line(&task.title),
-                get = harness.tool_name("cide_task_get"),
-                update = harness.tool_name("cide_task_update"),
-                // The wildcard the sentence gestures at, in this harness's own shape — the
-                // bare `cide_task_*` that used to stand here named nothing on either CLI.
-                bare = harness.tool_name("cide_task_*"),
-            ),
+            Some(harness) => {
+                let tool_values: Vec<_> = cide_agents::harness::TRACKER_TOOLS
+                    .iter()
+                    .copied()
+                    .chain(["cide_task_*"])
+                    .map(|tool| (tool, harness.tool_name(tool)))
+                    .collect();
+                let mut values: Vec<_> = tool_values
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_str()))
+                    .collect();
+                values.extend([("task_id", task.id.0.as_str()), ("task_title", &task.title)]);
+                let template = if template.trim().is_empty() {
+                    cide_agents::config::DEFAULT_TASK_START_PROMPT
+                } else {
+                    template
+                };
+                cide_agents::config::fill_review_prompt(template, &values)
+            }
             // No bridge, so no sentence naming a tool: `TRACKER_PREAMBLE`'s rule, applied to the
             // one line that lands in the run's first turn. Every broken run in the terrastrike
             // audit was told to "Read it with mcp__cide__cide_task_get" and then reported some
@@ -2615,6 +2566,9 @@ mod tests {
         HeldPair {
             run: RunId::new(),
             state,
+            agent: AgentId("game-designer".into()),
+            task: Some(TaskId("t-904".into())),
+            change: None,
         }
     }
 
@@ -3054,7 +3008,12 @@ mod tests {
             touches: Vec::new(),
         };
 
-        let prompt = opening_prompt(Some(&task), Some("and\nmind the\ttabs"), claude());
+        let prompt = opening_prompt(
+            Some(&task),
+            Some("and\nmind the\ttabs"),
+            claude(),
+            cide_agents::config::DEFAULT_TASK_START_PROMPT,
+        );
         assert!(!prompt.contains('\n'), "{prompt}");
 
         // …and with a change on it, which is one more sentence in the same flattened string.
@@ -3064,7 +3023,12 @@ mod tests {
             change: Some(cide_ipc::ChangeName("add-dark\nmode".into())),
             ..task.clone()
         };
-        let prompt_with_change = opening_prompt(Some(&with_change), None, claude());
+        let prompt_with_change = opening_prompt(
+            Some(&with_change),
+            None,
+            claude(),
+            cide_agents::config::DEFAULT_TASK_START_PROMPT,
+        );
         assert!(!prompt_with_change.contains('\n'), "{prompt_with_change}");
         assert!(
             prompt_with_change.contains("openspec/changes/add-dark mode/"),
@@ -3096,12 +3060,33 @@ mod tests {
         assert!(prompt.contains("mind the tabs"), "{prompt}");
 
         // An ad-hoc run with neither is refused rather than started — see `plan_dispatch`.
-        assert!(opening_prompt(None, None, claude()).is_empty());
-        assert!(opening_prompt(None, Some("   "), claude()).is_empty());
+        assert!(
+            opening_prompt(
+                None,
+                None,
+                claude(),
+                cide_agents::config::DEFAULT_TASK_START_PROMPT
+            )
+            .is_empty()
+        );
+        assert!(
+            opening_prompt(
+                None,
+                Some("   "),
+                claude(),
+                cide_agents::config::DEFAULT_TASK_START_PROMPT
+            )
+            .is_empty()
+        );
         // And one with an instruction is told exactly that, flattened: the where-it-stands
         // paragraph is the system prompt's (`ADHOC_PREAMBLE`), not this line's. (M40)
         assert_eq!(
-            opening_prompt(None, Some(" run the tests\n and say what fails "), claude()),
+            opening_prompt(
+                None,
+                Some(" run the tests\n and say what fails "),
+                claude(),
+                cide_agents::config::DEFAULT_TASK_START_PROMPT
+            ),
             "run the tests and say what fails"
         );
     }
@@ -3149,8 +3134,18 @@ mod tests {
         let task = plain_task();
         let opencode: Option<&dyn Harness> = Some(&cide_agents::harness::OpencodeHarness);
 
-        let by_claude = opening_prompt(Some(&task), None, claude());
-        let by_opencode = opening_prompt(Some(&task), None, opencode);
+        let by_claude = opening_prompt(
+            Some(&task),
+            None,
+            claude(),
+            cide_agents::config::DEFAULT_TASK_START_PROMPT,
+        );
+        let by_opencode = opening_prompt(
+            Some(&task),
+            None,
+            opencode,
+            cide_agents::config::DEFAULT_TASK_START_PROMPT,
+        );
 
         assert!(
             by_claude.contains("mcp__cide__cide_task_get"),
@@ -3193,7 +3188,12 @@ mod tests {
     #[test]
     fn with_no_bridge_the_opening_line_names_no_tool() {
         let task = plain_task();
-        let prompt = opening_prompt(Some(&task), Some("and hurry"), None);
+        let prompt = opening_prompt(
+            Some(&task),
+            Some("and hurry"),
+            None,
+            cide_agents::config::DEFAULT_TASK_START_PROMPT,
+        );
 
         assert!(!prompt.contains("cide_task_"), "{prompt}");
         assert!(!prompt.contains("mcp__"), "{prompt}");
@@ -3205,6 +3205,50 @@ mod tests {
         // Capital, because with no tracker sentence in front of it this one opens the line.
         assert!(prompt.contains("Commit each coherent step"), "{prompt}");
         assert!(!prompt.contains('\n'), "{prompt}");
+    }
+
+    #[test]
+    fn custom_task_opening_templates_expand_once_and_keep_dispatch_context() {
+        let task = Task {
+            title: "Literal {cide_task_get}\n{task_id}".into(),
+            change: Some(cide_ipc::ChangeName("add-prompt-settings".into())),
+            ..plain_task()
+        };
+        for harness in cide_agents::harness::registry() {
+            let prompt = opening_prompt(
+                Some(&task),
+                Some("Keep this\nsmall."),
+                Some(*harness),
+                "Custom {task_id}: {task_title}\nRead {cide_task_get}, {cide_task_*}. {unknown}",
+            );
+            assert!(prompt.starts_with("Custom t-9: Literal {cide_task_get} {task_id}"));
+            assert!(prompt.contains(&format!(
+                "Read {}, {}.",
+                harness.tool_name("cide_task_get"),
+                harness.tool_name("cide_task_*")
+            )));
+            assert!(prompt.contains("{unknown}"));
+            assert!(prompt.contains("openspec/changes/add-prompt-settings/"));
+            assert!(prompt.ends_with("Keep this small."));
+            assert!(!prompt.contains('\n'));
+            assert!(!prompt.contains("do not comment while you work"));
+        }
+        assert_eq!(
+            opening_prompt(Some(&plain_task()), None, claude(), " \n"),
+            opening_prompt(
+                Some(&plain_task()),
+                None,
+                claude(),
+                cide_agents::config::DEFAULT_TASK_START_PROMPT
+            ),
+        );
+        let no_bridge = opening_prompt(Some(&task), None, None, "Custom {cide_task_get}");
+        assert!(!no_bridge.contains("Custom"));
+        assert!(no_bridge.starts_with("Work on task t-9"));
+        assert_eq!(
+            opening_prompt(None, Some("Only the brief"), claude(), "Custom"),
+            "Only the brief"
+        );
     }
 
     /// The refusal that is the reason `Isolation` has a second variant at all: no repository means

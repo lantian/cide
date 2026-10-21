@@ -35,7 +35,10 @@ use super::RenderState;
 pub(super) fn absorbs(current: &RunState) -> bool {
     matches!(
         current,
-        RunState::Paused { .. } | RunState::Finished { .. } | RunState::Failed { .. }
+        RunState::Paused { .. }
+            | RunState::Finished { .. }
+            | RunState::Cancelled { .. }
+            | RunState::Failed { .. }
     )
 }
 

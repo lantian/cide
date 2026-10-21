@@ -19,7 +19,8 @@ export const HARNESSES: readonly { value: ConsoleHarness; label: string }[] = [
  *
  * Read at one moment only — when a console spawns a *fresh* conversation — so the hint says
  * exactly that: an open console keeps the CLI it was started with, and so does its Resume, and
- * Restart session is how a user moves one over. Agent runs are not governed by it: a role runs
+ * Restart session follows this choice unless that pane was switched from its context menu.
+ * Agent runs are not governed by it: a role runs
  * the harness its definition names.
  */
 export function HarnessChoice({ settings, patch, projectHarness, editProjectHarness }: SectionProps) {
@@ -41,9 +42,9 @@ export function HarnessChoice({ settings, patch, projectHarness, editProjectHarn
                 opens by itself, and the one-shots behind Generate commit message.
               </InfoPara>
               <InfoPara>
-                A console that is already running keeps its CLI and its Resume; Restart session
-                starts the one chosen here. Roles keep the harness their definition names; matching roles
-                use this project’s launch configuration.
+                A console that is already running keeps its CLI and its Resume. Restart session
+                starts the one chosen here unless you switched that pane’s harness from its context menu.
+                Roles keep the harness their definition names; matching roles use this project’s launch configuration.
               </InfoPara>
             </>
           }

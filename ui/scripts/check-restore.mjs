@@ -16,6 +16,7 @@ try {
     import { ResumeSplash } from '${join(UI, 'src/windows/ResumeSplash.tsx')}'
     export { ResumeSplash }
     export { specFor, restartSpec } from '${join(UI, 'src/panes/terminalSpec.ts')}'
+    export { harnessSwitchEntry } from '${join(UI, 'src/panes/harnessSwitch.ts')}'
     export const splash = (props) => renderToStaticMarkup(createElement(ResumeSplash, props))
   `)
   await build({
@@ -23,7 +24,7 @@ try {
     logLevel: 'error',
     build: { ssr: entry, outDir: join(out, 'bundle'), emptyOutDir: true },
   })
-  const { specFor, restartSpec, splash, ResumeSplash } = await import(pathToFileURL(join(out, 'bundle/restore.js')))
+  const { specFor, restartSpec, harnessSwitchEntry, splash, ResumeSplash } = await import(pathToFileURL(join(out, 'bundle/restore.js')))
   const pane = {
     id: 'pane', kind: 'claude', role: 'primary', title: 'test9 : codex',
     session: 'routing-id', harness: 'codex', conversation: null, continues: null,
@@ -64,6 +65,24 @@ try {
   const resumedNative = restartSpec({ ...launch, program: 'claude' }, 'claude', 'resume', 'routing-id')
   assert.equal(resumedNative.resume, 'routing-id', 'the backend resolves the native conversation from the pane')
   assert.equal(resumedNative.continues, undefined)
+  const selectedPane = { ...pane, harnessChoice: 'opencode' }
+  assert.equal(specFor(selectedPane, '/project').harness, 'opencode', 'a fresh restored pane keeps its choice')
+  assert.equal(restartSpec(specFor(selectedPane, '/project'), 'claude', 'fresh', 'routing-id', 'opencode').harness, 'opencode')
+  assert.equal(restartSpec(specFor(selectedPane, '/project'), 'claude', 'resume', 'routing-id', 'opencode').harness, undefined, 'resume follows the conversation owner')
+  assert.equal(restartSpec(specFor(pane, '/project'), 'claude', 'fresh', 'routing-id').harness, undefined, 'an ordinary pane still follows the project default')
+  const picked = []
+  const menu = harnessSwitchEntry(pane, false, 'codex', true, false, (h) => picked.push(h))
+  assert.equal(menu.label, 'Switch to another harness')
+  const choices = menu.submenu()
+  assert.deepEqual(choices.map((item) => item.label), ['Claude Code', 'Codex', 'OpenCode'])
+  assert.deepEqual(choices.map((item) => item.checked), [false, true, false])
+  assert.equal(choices[1].run, undefined, 'the current harness is not offered as a switch')
+  choices[2].run()
+  assert.deepEqual(picked, ['opencode'], 'the chosen item targets this pane')
+  assert.equal(harnessSwitchEntry({ ...pane, kind: 'shell' }, false, 'claude', true, false, () => {}), null)
+  assert.equal(harnessSwitchEntry({ ...pane, continues: { harness: 'claude', id: 'run', cwd: '/run' } }, false, 'claude', true, false, () => {}), null)
+  assert.equal(harnessSwitchEntry(pane, true, 'claude', true, false, () => {}), null)
+  assert.equal(harnessSwitchEntry(pane, false, 'claude', true, true, () => {}).submenu()[2].run, undefined, 'another switch waits for the restart')
   assert.equal(specFor(pane, '/project').resume, undefined)
   assert.equal(specFor({ ...pane, kind: 'editor' }, '/project'), null)
   const shell = specFor({ ...pane, kind: 'shell' }, '/project', 'project', plan({ kind: 'fresh' }))

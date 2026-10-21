@@ -26,7 +26,7 @@ import type { ReactNode } from 'react'
 import { WindowFrame } from '@/chrome/WindowFrame'
 import { PaneFrame } from '@/layout/PaneTitleBar'
 import { TerminalPane } from '@/panes/TerminalPane'
-import type { Pane, PaneRestore } from '@/ipc/client'
+import type { ConsoleHarness, Pane, PaneRestore } from '@/ipc/client'
 import { detachedContent } from './detachedPane'
 import styles from './DetachedPaneWindow.module.css'
 
@@ -43,7 +43,7 @@ export interface DetachedPaneWindowProps {
    *
    * Optional because the audit driver mounts this window without a workspace to write back to.
    */
-  onSessionBound?: ((session: string) => void) | undefined
+  onSessionBound?: ((session: string, choice?: ConsoleHarness) => Promise<void> | void) | undefined
   /** The project's primary root, passed through to the pane unchanged. */
   cwd: string
   /**

@@ -125,6 +125,37 @@ pub async fn task_get(
     .await
 }
 
+/// Current reasons an assignment or mention would not start this task. Read-only.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_dispatch_status(
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    registry: State<'_, Arc<crate::agents::AgentRegistry>>,
+    project: ProjectId,
+    task: TaskId,
+    agent: Option<cide_ipc::AgentId>,
+) -> Result<Option<cide_ipc::TaskDispatchStatus>> {
+    let root = tasks_state::project_root(&state, project)?;
+    let llm = state.with(|ws| ws.settings.llm.clone());
+    let stores = Arc::clone(&stores);
+    let registry = Arc::clone(&registry);
+    blocking(move || {
+        let store = tracker(&stores, project, root.clone());
+        Ok(store.get(&task).map(|task| {
+            crate::task_dispatch::status(
+                &root,
+                &registry,
+                project,
+                &task,
+                &store.list(),
+                agent.as_ref(),
+                &llm,
+            )
+        }))
+    })
+    .await
+}
+
 /// Which tasks match the search box: ids, in the file's own order. (M68)
 ///
 /// Searching moved out of the webview because the text moved out of the board — `cide_tasks::search`
@@ -327,6 +358,7 @@ pub async fn task_edit(
 
     let stores = Arc::clone(&stores);
     let task_for_handback = task.clone();
+    let app_for_edit = app.clone();
     let (store, mutation, continue_role) = blocking(move || {
         let store = tracker(&stores, project, root.clone());
         // The prose this mutation introduces, read before `edit` is consumed. Everything else —
@@ -346,6 +378,17 @@ pub async fn task_edit(
         // anyway) and corrupts nothing; holding one lock across both would mean a closure API
         // the store deliberately does not offer for edits.
         let before = store.get(&task);
+        if let (TaskEdit::Assign { agent: next }, Some(current)) = (&edit, before.as_ref())
+            && current.agent.as_ref() != next.as_ref()
+            && let Some(old) = current.agent.as_ref()
+            && let Some(registry) = app_for_edit.try_state::<Arc<crate::agents::AgentRegistry>>()
+            && let Some(held) = registry.active_assignment(project, old, &task)
+        {
+            return Err(CoreError::Io(format!(
+                "cannot reassign {task} while `{old}` has run {} [{:?}] working on it; stop that run first",
+                held.run, held.state
+            )));
+        }
         // The milestone half of the inbox rule (M132), on the user's road as on the model's:
         // linking an inbox task into a milestone is refused, and moving a milestone's task into
         // the inbox takes it out of the milestone — its `subtaskOf` becomes `related`.

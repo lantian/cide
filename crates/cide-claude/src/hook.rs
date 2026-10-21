@@ -57,6 +57,8 @@ pub enum HookEvent {
     /// Internal event from Codex's live `approval-requested` OSC 9 notification.
     /// Never included in either CLI's hook subscriptions.
     CodexApprovalPrompt,
+    /// Internal native Codex terminal failure; never registered as a CLI hook.
+    CideTurnFailed,
 }
 
 impl HookEvent {
@@ -110,12 +112,16 @@ impl HookEvent {
             Self::PermissionRequest => "PermissionRequest",
             Self::Interrupt => "Interrupt",
             Self::CodexApprovalPrompt => "CodexApprovalPrompt",
+            Self::CideTurnFailed => "CideTurnFailed",
         }
     }
 
     /// Either CLI's spelling. A frame is parsed without knowing which CLI sent it — the socket
     /// is shared — so this answers for both subscription lists and Cide's internal events.
     pub fn parse(s: &str) -> Option<Self> {
+        if s == Self::CideTurnFailed.as_str() {
+            return Some(Self::CideTurnFailed);
+        }
         if s == Self::CodexApprovalPrompt.as_str() {
             return Some(Self::CodexApprovalPrompt);
         }

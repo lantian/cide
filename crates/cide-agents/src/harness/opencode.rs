@@ -3235,7 +3235,7 @@ fn config_json(flavor: &Flavor, plan: &RunPlan<'_>, generation: Generation) -> O
                 let mut prompt = format!(
                     "{}\n\n{}",
                     def.system_prompt,
-                    tracker_preamble(flavor.harness())
+                    tracker_preamble(flavor.harness(), plan.worker_instructions.as_deref())
                 );
                 if let Some(change) = plan.change.as_deref() {
                     prompt.push_str("\n\n");
@@ -3412,7 +3412,7 @@ mod tests {
     /// The tracker paragraph as *this* harness renders it — `cide_cide_task_get`, not
     /// `mcp__cide__cide_task_get`. Derived from the one definition, never quoted.
     fn tracker() -> String {
-        tracker_preamble(&OpencodeHarness)
+        tracker_preamble(&OpencodeHarness, None)
     }
 
     /// The run's server and the turns attached to it (M104 follow-up): one environment for both,
@@ -3677,6 +3677,8 @@ mod tests {
             // and the plan actually said; the skip default has tests of its own.
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            worker_instructions: None,
+            planning: None,
             review: false,
             server: None,
             git_dirs: Vec::new(),

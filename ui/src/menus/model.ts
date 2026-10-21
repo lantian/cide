@@ -38,6 +38,9 @@ export interface MenuSeparator {
  * from the same resolved keymap the key gate dispatches from, or is not shown at all.
  */
 export interface MenuItem {
+  readonly information?: boolean
+  readonly status?: 'ready' | 'scanning' | 'unavailable' | 'stopped'
+
   readonly kind?: 'item' | undefined
   /** Unique within one menu; it is the React key and the handle a check script asserts on. */
   readonly id: string
@@ -96,6 +99,9 @@ export type MenuEntry = MenuItem | MenuSeparator
 // ---------------------------------------------------------------------------------------
 
 export interface ResolvedItem {
+  readonly information?: boolean
+  readonly status?: 'ready' | 'scanning' | 'unavailable' | 'stopped'
+
   readonly kind: 'item'
   readonly id: string
   readonly label: string
@@ -178,10 +184,12 @@ export function resolveMenu(
     // A submenu is an action for this purpose: the row does something when it is clicked —
     // it opens a list — so it is not the wired-to-nothing shape `NO_ACTION_REASON` names.
     const inert = entry.run === undefined && entry.submenu === undefined
-    const reason = entry.disabledReason ?? (inert ? NO_ACTION_REASON : null)
-    const enabled = reason === null
+    const reason = entry.information ? null : entry.disabledReason ?? (inert ? NO_ACTION_REASON : null)
+    const enabled = !entry.information && reason === null
     out.push({
       kind: 'item',
+      ...(entry.information ? { information: true } : {}),
+      ...(entry.status ? { status: entry.status } : {}),
       id: entry.id,
       label: entry.label,
       enabled,

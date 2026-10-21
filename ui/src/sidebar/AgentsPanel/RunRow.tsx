@@ -421,7 +421,7 @@ function RunControls({
           className={styles.control}
           data-audit="agentsOpen"
           onClick={() => onOpen(run.run)}
-          title="Open this run's conversation in a pane: the live session while its child works, or the real harness re-opened on it once the child has ended. A live run keeps going either way."
+          title="Open this run's conversation: watch its live session, continue it in the harness when its directory exists, or read its saved history when the worktree is gone."
         >
           Open
         </button>

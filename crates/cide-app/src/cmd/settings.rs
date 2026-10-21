@@ -197,6 +197,9 @@ pub fn project_harness_set(
     project: ProjectId,
     edit: cide_ipc::ProjectHarnessEdit,
 ) -> Result<cide_ipc::ProjectHarnessSettings, CoreError> {
+    if let cide_ipc::ProjectHarnessEdit::Decision(Some(ref value)) = edit {
+        cide_core::decision::validate_project(value).map_err(CoreError::Serde)?;
+    }
     state.update(|ws| {
         let key = cide_core::harness_settings::project_key(ws, project)?;
         let path = persist::config_dir().join("harness-settings.json");
@@ -250,6 +253,9 @@ pub fn settings_set(
     // Refused before the update rather than inside it: `apply_patch` is infallible by design (it
     // is the fold every test drives), and a refusal must leave *every* field of the patch
     // unapplied — half a patch landing is a form that shows one thing and saves another.
+    if let Some(value) = &patch.decision {
+        cide_core::decision::validate_connection(value).map_err(CoreError::Serde)?;
+    }
     if let Some(AccentPatch::Set { base }) = &patch.accent {
         cide_core::accent::fit(base).map_err(|e| CoreError::AccentRefused(e.to_string()))?;
     }
@@ -427,6 +433,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     let SettingsPatch {
         theme,
         ui_font_size,
+        search_modal_layout,
         accent,
         awaiting_highlight,
         each_project_keeps_claude_tab,
@@ -443,6 +450,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         codex,
         opencode,
         proxy,
+        decision,
         sidebar,
         explorer,
         inspections,
@@ -455,6 +463,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
     // and forgetting to apply it here is a toggle that moves on screen, saves nothing, and
     // springs back on the next snapshot. This way the compiler names the omission.
+    if let Some(v) = decision {
+        settings.decision = v;
+    }
     if let Some(v) = theme {
         settings.theme = v;
     }
@@ -465,6 +476,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // *divisor* by the time CSS sees it, so a `NaN` does not merely paint something odd — it
     // invalidates every `calc()` in the size ladder at once, and an invalid `calc()` drops the
     // declaration. That is 405 rules with no `font-size` and a window of UA-default serif.
+    if let Some(v) = search_modal_layout {
+        settings.search_modal_layout = v;
+    }
     if let Some(v) = ui_font_size {
         settings.ui_font_size = cide_ipc::clamp_ui_font_size(v);
     }
@@ -666,6 +680,7 @@ fn open_settings_tab(
             harness_conversation: None,
             continues: None,
             harness: None,
+            harness_choice: None,
             title: "settings".into(),
             docker: None,
             origin: None,
@@ -2218,6 +2233,19 @@ mod tests {
             serde_json::to_value(settings.open_run_in).expect("json"),
             serde_json::json!("split")
         );
+    }
+
+    #[test]
+    fn search_modal_layout_defaults_and_round_trips_through_patch() {
+        use cide_ipc::settings::SearchModalLayout;
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.search_modal_layout, SearchModalLayout::SideBySide);
+        let patch: SettingsPatch =
+            serde_json::from_str(r#"{"searchModalLayout":"stacked"}"#).unwrap();
+        apply_patch(&mut settings, patch);
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored.search_modal_layout, SearchModalLayout::Stacked);
     }
 
     #[test]

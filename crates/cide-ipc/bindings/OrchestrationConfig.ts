@@ -87,6 +87,14 @@ autoSpinPrompt: string,
  */
 reviewPrompt: string, 
 /**
+ * Effective task opening template, including the shipped default when no override exists.
+ */
+taskStartPrompt: string, 
+/**
+ * Effective cide tracker instructions; separate from a role's own system prompt.
+ */
+workerInstructions: string, 
+/**
  * `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
  * Empty when the project isolates nothing, which is the default. (M92)
  */

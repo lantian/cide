@@ -1,7 +1,7 @@
 import { ReviewPanel } from '@/gitlab/ReviewPanel'
 import { GitLabDialogs } from '@/gitlab/Dialogs'
 import { GitLabInbox } from '@/gitlab/Inbox'
-import { startGitLab, useGitLabReviews } from '@/gitlab/store'
+import { startGitLab, useGitLabReviews, useGitLabConfigured } from '@/gitlab/store'
 import { PushMRPrompt } from '@/gitlab/PushMRPrompt'
 /**
  * The shell.
@@ -61,13 +61,12 @@ import { TabContent } from '@/layout/TabContent'
 import { PROJECT_NOTES } from '@/sidebar/groupRows'
 import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
-import { SearchPanel } from '@/sidebar/SearchPanel'
-import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
-import { ALL_VISIBLE, anyScanning, applyFilters, statusBarCounts } from '@/sidebar/ProblemsPanel/model'
+import { openSearch, useSearchSessions, EMPTY_DRAFT } from '@/search/store'
+import { DiagnosticsStatus } from '@/chrome/DiagnosticsStatus'
+import { useProblemsState } from '@/toolwindow/problemsState'
+import { ALL_VISIBLE, applyFilters } from '@/sidebar/ProblemsPanel/model'
 import {
-  isDiagnosticSourceId,
   refreshDiagnostics,
-  restartDiagnosticSource,
 } from '@/sidebar/ProblemsPanel/actions'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { AgentsPanel } from '@/sidebar/AgentsPanel'
@@ -88,6 +87,7 @@ import { liveCount } from '@/sidebar/AgentsPanel/model'
 import { useAgents } from '@/sidebar/agentsStore'
 import { TasksPanel, TaskDetailHost } from '@/sidebar/TasksPanel'
 import { DockerFilesPane } from '@/panes/DockerFilesPane'
+import { ConversationArchivePane } from '@/panes/ConversationArchivePane'
 import { DockerInspectPane } from '@/panes/DockerInspectPane'
 import { DocsPane } from '@/panes/DocsPane'
 import { useDocker } from '@/sidebar/dockerStore'
@@ -109,6 +109,7 @@ import { ProjectPicker } from '@/overlays/ProjectPicker'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
 import { notify, notifyFailure } from '@/chrome/notices'
+import { dispatchNotice } from '@/sidebar/TasksPanel/dispatchFeedback'
 import { Switcher } from '@/chrome/Switcher'
 import { SidebarSplitter } from '@/chrome/SidebarSplitter'
 import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
@@ -324,6 +325,7 @@ export function App() {
   // detached-pane branch — still dispatches.
   const splitPane = useWorkspace((st) => st.splitPane)
   const contextMenuOpen = useContextMenuOpen()
+  const problemsFocused = useProblemsState(s => s.focused)
   /*
    * Whether a change-walkable diff surface holds the slot, for the `diffFocused` key-context
    * flag below.
@@ -369,17 +371,18 @@ export function App() {
   // The reviews alone, not `useGitLab()`: the whole snapshot is replaced on every patch, and
   // this component is the whole shell. See `useGitLabReviews`.
   const gitLabReviews = useGitLabReviews()
+  const gitLabConfigured = useGitLabConfigured()
   function hideToolWindow() {
     void toolWindowApi.setLayout(activeProject?.id ?? null, {open:false}).catch(() => {})
   }
   useEffect(() => {
     startGitLab()
-    const show = () => setSidebar(st => showPanel(st, 'gitlab'))
-    const review = (event: Event) => setSidebar(st => showPanel(st, `mr:${(event as CustomEvent<string>).detail}`))
+    const show = () => { if (gitLabConfigured) setSidebar(st => showPanel(st, 'gitlab')) }
+    const review = (event: Event) => { if (gitLabConfigured) setSidebar(st => showPanel(st, `mr:${(event as CustomEvent<string>).detail}`)) }
     window.addEventListener('cide:gitlab-inbox', show)
     window.addEventListener('cide:gitlab-review', review)
     return () => { window.removeEventListener('cide:gitlab-inbox', show); window.removeEventListener('cide:gitlab-review', review) }
-  }, [])
+  }, [gitLabConfigured])
 
   const [sidebar, setSidebar] = useState<SidebarState>(
     tabWindow ? { view: null, last: SIDEBAR_INITIAL.last } : SIDEBAR_INITIAL,
@@ -406,7 +409,11 @@ export function App() {
   const paneWindow = boot?.role.kind === 'detachedPane'
   useEffect(() => {
     if (paneWindow || tabWindow) return
-    registerPanelHost((view) => setSidebar((s) => showPanel(s, view)))
+    registerPanelHost((view) => {
+      if (view === 'search') { openSearch('text'); return }
+      if (view === 'problems') { runCommand('sidebar.problems', null); return }
+      setSidebar((s) => showPanel(s, view))
+    })
     return () => registerPanelHost(null)
   }, [paneWindow, tabWindow])
   /**
@@ -899,15 +906,15 @@ export function App() {
           },
     [inspections],
   )
+  const problemFiles = useRef(new Map<string, string>())
+  const currentProblemFile = focusedTabPath(boot)
+  if (activeProjectId && currentProblemFile) problemFiles.current.set(activeProjectId, currentProblemFile)
+  const rememberedProblemFile = activeProjectId ? problemFiles.current.get(activeProjectId) ?? null : null
+  const problemFile = currentProblemFile ?? (activeProject?.tabs.some(tab => tab.kind.kind === 'file' && tab.kind.path === rememberedProblemFile) ? rememberedProblemFile : null)
   const diagnostics = useMemo(
     () => applyFilters(rawDiagnostics, diagnosticFilters),
     [rawDiagnostics, diagnosticFilters],
   )
-  // The rail's ⚠ badge, and since M28 its only consumer: the status bar's `✗ n ⚠ n` pair was
-  // a second rendering of this figure one row down and went with the diff counters beside it.
-  // Still a memo — `statusBarCounts` builds a fresh object, so an inline call would hand the
-  // rail a new identity on every render of the shell.
-  const diagCounts = useMemo(() => statusBarCounts(diagnostics.snapshot), [diagnostics])
 
   useEffect(() => {
     void attachDiagnostics(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
@@ -984,9 +991,20 @@ export function App() {
       if (error) notifyFailure(error, { project })
       if (run) followRunTab(project, run, `Apply · ${change}`)
     })
+    const offDispatch = taskEvents.onDispatchFeedback((status) => {
+      const notice = dispatchNotice(status)
+      notify(notice.text, {
+        ...notice,
+        actions: [{ label: 'Open task', run: () => {
+          if (useTasks.getState().project !== status.project) return
+          useTasks.setState({ selected: status.task, dispatchAgent: status.agent, decisionBackStack: [] })
+        } }],
+      })
+    })
     return () => {
       void off.then((stop) => stop())
       void offApply.then((stop) => stop())
+      void offDispatch.then((stop) => stop())
     }
   }, [adoptTasks])
 
@@ -1176,10 +1194,11 @@ export function App() {
   useEffect(() => {
     setSidebar(old => {
       const alive = (view: string) => !view.startsWith('mr:') || gitLabReviews.some(r => `mr:${r.id}` === view)
-      if (old.view && !alive(old.view)) return { view: 'gitlab', last: 'gitlab' }
-      return alive(old.last) ? old : { ...old, last: 'gitlab' }
+      if (!gitLabConfigured && (old.view === 'gitlab' || old.view?.startsWith('mr:'))) return { view: 'files', last: 'files' }
+      if (old.view && !alive(old.view)) return { view: gitLabConfigured ? 'gitlab' : 'files', last: gitLabConfigured ? 'gitlab' : 'files' }
+      return alive(old.last) && (gitLabConfigured || old.last !== 'gitlab') ? old : { ...old, last: gitLabConfigured ? 'gitlab' : 'files' }
     })
-  }, [gitLabReviews])
+  }, [gitLabReviews, gitLabConfigured])
   /*
    * The ones the user took off the strip. They still reach the rail — as menu entries under
    * `···` rather than as buttons — because a rail button is the only route into a contributed
@@ -1262,6 +1281,7 @@ export function App() {
    * how a binding fires in a state its `when` clause excludes — worse than the arithmetic it
    * would save.
    */
+  const searchDraft = useSearchSessions(s => s.drafts[activeProjectId ?? ''] ?? EMPTY_DRAFT)
   const keyContext = {
     projectOpen: activeProjectId !== null,
     overlayOpen: overlay !== null,
@@ -1270,7 +1290,7 @@ export function App() {
     // in the palette, the symbol picker, the branch popup and every terminal pane in every
     // window. The gate is a *capture* listener, so an `overlayOpen` clause would have taken
     // readline's `downcase-word` from a shell any time a modal happened to be up.
-    filePickerOpen: overlay === 'files',
+    filePickerOpen: overlay === 'files' || (overlay === 'search' && (searchDraft.mode === 'files' || searchDraft.mode === 'all')),
     // `gate.ts` listens on window capture, so it sees a keystroke before an open menu does.
     // Nothing collides today — every default binding is a modified chord — but this is what
     // stops a user who rebinds a bare key from having it swallowed while a menu is up.
@@ -1280,6 +1300,7 @@ export function App() {
     // Gates `claude.fork`, `claude.mirror` and `claude.split.newSession` — all three act on
     // the focused session, so none of them means anything without a Claude pane to act on.
     claudePaneFocused: focused?.pane.kind === 'claude',
+    problemsFocused,
     sidebarFiles: sidebar.view === 'files',
     sidebarGit: sidebar.view === 'git',
     // A diff surface is mounted and in front — a git diff tab, the log tool window's revision
@@ -1462,21 +1483,14 @@ export function App() {
     (path: string, line: number, column: number) => {
       if (!activeProjectId) return
       jumpTo(activeProjectId, { path, line, column })
-      void fileApi.open(activeProjectId, path)
+      void fileApi.open(activeProjectId, path).catch(notifyFailure)
     },
     [activeProjectId],
   )
   const onRefreshProblems = useCallback(() => {
     if (activeProjectId !== null) refreshDiagnostics(activeProjectId)
   }, [activeProjectId])
-  const onRestartSource = useCallback(
-    (id: string, label: string) => {
-      if (activeProjectId !== null && isDiagnosticSourceId(id)) {
-        restartDiagnosticSource(activeProjectId, id, label)
-      }
-    },
-    [activeProjectId],
-  )
+
   /*
    * Entry point 2 of the key gate: the window listener.
    *
@@ -1658,7 +1672,7 @@ export function App() {
           // window is where a long turn is watched and therefore where a restart happens, and
           // `bind_session` reaches `project.detached` precisely so this call has somewhere to
           // land. Without it the workspace keeps naming the dead child.
-          onSessionBound={(session) => void bindSession(project, homeTab, pane, session)}
+          onSessionBound={(session, choice) => bindSession(project, homeTab, pane, session, choice)}
           onRedock={() => void redockPane(boot.window)}
         />
         {/*
@@ -1773,14 +1787,10 @@ export function App() {
               does not render, and the sidebar state was initialised closed to match. */}
           {!tabWindow && (
           <ActivityRail
+            gitLabConfigured={gitLabConfigured}
             active={sidebar.view}
             changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
-            errors={diagCounts?.errors ?? null}
-            /* "Something is looking right now" — the panel-model rule (`anyScanning`), not a
-               local re-derivation: the first pass and a later re-index report it through
-               different arms of the snapshot, and this is the one place that must not
-               disagree with the panel about whether work is happening. */
-            busy={anyScanning(diagnostics.snapshot)}
+
             /* `openCount` answers `null` for every board arm but `ready` — including `absent`,
                because a project with no tracker has no count, it has no tracker. The rail draws
                nothing for `null` and nothing for `0`, and those are two different claims: nobody
@@ -1960,48 +1970,7 @@ export function App() {
                 />
               </PanelBoundary>
             )}
-            {sidebar.view === 'search' && (
-              <PanelBoundary name="Search" onClose={() => setSidebar((st) => selectView(st, 'search'))}>
-                <SearchPanel
-                  project={activeProjectId}
-                  // The caret, which is the half the user reported missing — a search result
-                  // that opens the file at the top has not gone to the found place. `jumpTo`
-                  // also records the visit, so the mouse's Back button returns here — and it is
-                  // requested BEFORE the open, which is the design rather than a preference:
-                  // the editor for this path usually does not exist yet, so the request is
-                  // parked and spent by the mount the `file.open` causes. A file already open
-                  // is revealed immediately instead. See `editor/revealRequest.ts` — the parked
-                  // request expires, so one for a file that never opens cannot fire when the
-                  // user opens it by hand an hour later.
-                  onOpenHit={onOpenHit}
-                />
-              </PanelBoundary>
-            )}
-            {sidebar.view === 'problems' && (
-              <PanelBoundary name="Problems" onClose={() => setSidebar((st) => selectView(st, 'problems'))}>
-                <ProblemsPanel
-                  project={activeProjectId}
-                  snapshot={diagnostics.snapshot}
-                  hidden={diagnostics.hidden}
-                  // The two controls the M18 report asked for. Both go through
-                  // `sidebar/ProblemsPanel/actions.ts`, which `keys/dispatch.ts` also calls for
-                  // `problems.refresh` — one implementation, so the button and the palette row cannot
-                  // drift into doing different things.
-                  onRefresh={activeProjectId === null ? undefined : onRefreshProblems}
-                  // `onRestartSource` checks rather than casts its id: `SourceRow.id` is a
-                  // plain string because `model.ts` imports nothing, so the pinned handler is
-                  // where the two meet. The set is open since M22 — an extension may
-                  // contribute a server — so what is asserted is the one property the id must
-                  // have, and `sourceRows` decides which rows offer the button at all.
-                  onRestartSource={activeProjectId === null ? undefined : onRestartSource}
-                  // Requested BEFORE the open — the editor for this path usually does not
-                  // exist yet, so the request is parked and spent by the mount the open
-                  // causes. The same ordering the search panel's `onOpenHit` uses; see
-                  // `editor/revealRequest.ts`.
-                  onOpenLocation={onOpenLocation}
-                />
-              </PanelBoundary>
-            )}
+
             {/*
               * Tasks. (M18)
               *
@@ -2187,7 +2156,7 @@ export function App() {
                 name="the git tool window"
                 onClose={hideToolWindow}
               >
-                <ToolWindowHost project={activeProject?.id ?? null} />
+                <ToolWindowHost project={activeProject?.id ?? null} onOpenHit={onOpenHit} problems={{ snapshot: diagnostics.snapshot, file: problemFile, onOpenLocation, onRefresh: activeProjectId ? onRefreshProblems : undefined }} />
               </PanelBoundary>
             )}
           </div>
@@ -2472,6 +2441,7 @@ export function App() {
           * to it directly (see `chrome/StatusBar.tsx`), so nothing is passed for it here.
           */}
         <StatusBar
+          diagnosticsControl={paneWindow || tabWindow ? undefined : <DiagnosticsStatus project={activeProjectId} projectName={activeProject?.name ?? ''} snapshot={diagnostics.snapshot} onOpenProblems={() => runCommand('sidebar.problems', null)} />}
           harnessReadout={statusHarnessReadout(claudeReadout, defaultHarness)}
           revealRoots={revealRoots}
           /*
@@ -2657,7 +2627,7 @@ const WorkspaceContent = memo(function WorkspaceContent({
                       // a shell in the pinned console, a new session in a ClaudeFull tab.
                       // Which intent that is belongs to the domain, so `null` asks for it.
                       const tab = activeProject.tabs.find((t) => t.id === activeProject.activeTab)
-                      if (!tab) return
+                      if (!tab || tab.kind.kind === 'conversation') return
                       void splitPane(activeProject.id, tab.id, tab.tree.focused, 'row', 'after')
                     }}
                   />
@@ -2688,7 +2658,14 @@ const WorkspaceContent = memo(function WorkspaceContent({
                     // A settings tab has a pane tree — every tab does, which is the invariant
                     // that makes "promote pane to tab" one code path — but nothing to render
                     // into it. The screen replaces the tree rather than living inside a pane.
-                    tab.kind.kind === 'settings' ? (
+                    tab.kind.kind === 'conversation' ? (
+                      <ConversationArchivePane
+                        project={activeProject.id}
+                        id={tab.kind.id}
+                        title={tab.kind.title}
+                        active={active}
+                      />
+                    ) : tab.kind.kind === 'settings' ? (
                       <SettingsTab project={activeProject.id} section={tab.kind.section} />
                     ) : tab.kind.kind === 'extension' ? (
                       /*
@@ -3023,8 +3000,8 @@ const TabPane = memo(function TabPane({
          */
         onRevealPath={(path) => runCommand('file.reveal', { path })}
         onShowHistory={tabWindow ? undefined : onShowHistory}
-        onSessionBound={(session) =>
-          void bindSession(project, tab, pane.id, session)
+        onSessionBound={(session, choice) =>
+          bindSession(project, tab, pane.id, session, choice)
         }
         /*
          * Which tab is in front, which `TabContent` computes and has offered

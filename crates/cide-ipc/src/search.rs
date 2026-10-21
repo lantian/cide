@@ -4,6 +4,53 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// Actions are ranked in the webview against its current command context. These are the
+/// code providers whose jobs and pinned snapshots belong to the process instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SearchSource {
+    All,
+    Files,
+    Symbols,
+    Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SearchDescriptor {
+    pub source: SearchSource,
+    pub query: SearchQuery,
+    pub libraries: bool,
+}
+
+/// Small enough to list all pinned tabs without retransmitting their result sets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchSession {
+    pub id: crate::SearchSessionId,
+    pub project: crate::ProjectId,
+    pub descriptor: SearchDescriptor,
+    pub generation: u32,
+    pub pinned: bool,
+}
+
+/// File and symbol results are bounded ranked sets; text results are append-only pages.
+/// The generation prevents a page from the old run being appended after Refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchSessionFrame {
+    pub session: SearchSession,
+    pub files: Option<PickerFrame>,
+    pub symbols: Option<crate::SymbolFrame>,
+    pub text: Option<SearchFrame>,
+    pub running: bool,
+    pub errors: Vec<String>,
+}
+
 /// One frame of picker results.
 ///
 /// A frame, not "the results": the file index streams in while the user is already typing,

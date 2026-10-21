@@ -494,6 +494,7 @@ impl Capability {
 /// instead, and extending it touches [`store_from`] and nothing else.
 #[derive(Default)]
 struct Caps {
+    monitor: Arc<crate::monitor::Monitor>,
     /// `textDocument/references` — see [`LspHandle::supports_references`].
     references: std::sync::atomic::AtomicU8,
     /// `textDocument/implementation` — see [`LspHandle::supports_implementation`].
@@ -534,6 +535,7 @@ struct Caps {
 impl Caps {
     /// Back to "nobody has said yet", which is what a new life of a server means.
     fn forget(&self) {
+        *self.monitor.version.lock() = None;
         self.references
             .store(Capability::Unknown as u8, Ordering::Release);
         self.implementation
@@ -637,8 +639,20 @@ impl LspHandle {
         choice: cide_ipc::settings::ServerBinaryChoice,
         tuning: crate::config::Tuning,
     ) -> Result<Self, LspError> {
-        let candidates =
-            crate::discover::locate(server, &roots, choice).map_err(LspError::Unavailable)?;
+        Self::start_monitored(server, roots, choice, tuning, Arc::default())
+    }
+
+    pub fn start_monitored(
+        server: Server,
+        roots: Vec<PathBuf>,
+        choice: cide_ipc::settings::ServerBinaryChoice,
+        tuning: crate::config::Tuning,
+        monitor: Arc<crate::monitor::Monitor>,
+    ) -> Result<Self, LspError> {
+        let candidates = crate::discover::locate(server, &roots, choice).map_err(|error| {
+            monitor.record("error", &error);
+            LspError::Unavailable(error)
+        })?;
         if let Some(first) = candidates.first() {
             // The one place the resolution is stated. Without this line, "which build am I
             // actually running" has no answer short of `ls /proc/<pid>/exe` — and that is the
@@ -657,7 +671,10 @@ impl LspHandle {
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<LspEvent>();
         let stop = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let caps = Arc::new(Caps::default());
+        let caps = Arc::new(Caps {
+            monitor,
+            ..Caps::default()
+        });
         let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let supervisor = {
@@ -1027,6 +1044,10 @@ fn supervise_lives(
          * answering `Yes` from the corpse of the old one.
          */
         caps.forget();
+        caps.monitor.record(
+            "info",
+            &format!("Starting {} ({})", server.binary(), candidate.target),
+        );
 
         // Every exit inside `run_once` ends this life, so the waiters go here — once, around the
         // call, rather than at each of its four exits, which is how one of them gets missed.
@@ -1037,6 +1058,13 @@ fn supervise_lives(
         // The life is over, whatever `outcome` says, so the pid must not outlive it: a
         // watchdog reading a stale pid would measure whatever process the kernel has since
         // handed that number to.
+        caps.monitor.record(
+            "info",
+            &match &outcome {
+                Ok(()) => "Server stopped".to_string(),
+                Err(failure) => format!("Server disconnected: {}", failure.reason),
+            },
+        );
         pid.store(0, Ordering::Release);
         cancel_pending(pending, RequestError::ServerGone);
         match outcome {
@@ -1281,6 +1309,7 @@ fn open(
     tuning: crate::config::Tuning,
     pid: &std::sync::atomic::AtomicU32,
     inbound: Sender<Value>,
+    monitor: &Arc<crate::monitor::Monitor>,
 ) -> Result<Opened, Failure> {
     match &candidate.target {
         Target::Process {
@@ -1325,6 +1354,7 @@ fn open(
             // stderr drain. Never parsed — a server's stderr is human prose — but the tail of it
             // is the only evidence a crash report can carry.
             let stderr_thread = {
+                let monitor = Arc::clone(monitor);
                 let tail = Arc::clone(&tail);
                 let stopping = Arc::clone(&stopping);
                 std::thread::Builder::new()
@@ -1344,6 +1374,7 @@ fn open(
                             } else {
                                 tracing::debug!(target: "cide::lsp", "{}", text.trim_end());
                             }
+                            monitor.record("stderr", &text);
                             let mut tail = tail.lock();
                             tail.push_str(&text);
                             if tail.len() > KEEP_STDERR {
@@ -1435,7 +1466,15 @@ fn run_once(
     pid: &std::sync::atomic::AtomicU32,
 ) -> Result<(), Failure> {
     let (inbound_tx, inbound_rx) = crossbeam_channel::unbounded::<Value>();
-    let (link, mut writer, reader) = open(server, candidate, roots, tuning, pid, inbound_tx)?;
+    let (link, mut writer, reader) = open(
+        server,
+        candidate,
+        roots,
+        tuning,
+        pid,
+        inbound_tx,
+        &caps.monitor,
+    )?;
     let transport = match link {
         Link::Child { .. } => Transport::Stdio,
         Link::Socket { .. } => Transport::Socket,
@@ -1524,6 +1563,13 @@ fn run_once(
                     // `drain()` has exactly one consumer and a command reaching into it to find
                     // its own reply would swallow the `Published` events the diagnostics pump
                     // needed.
+                    if matches!(message.get("method").and_then(Value::as_str), Some("window/logMessage" | "window/showMessage"))
+                        && let Some(text) = message.pointer("/params/message").and_then(Value::as_str) {
+                        let level = match message.pointer("/params/type").and_then(Value::as_u64) {
+                            Some(1) => "error", Some(2) => "warning", _ => "info",
+                        };
+                        caps.monitor.record(level, text);
+                    }
                     if take_reply(pending, &message) {
                         continue;
                     }
@@ -1535,6 +1581,8 @@ fn run_once(
                     // nobody asked a second time. `Handshook` rides the same transition, so the
                     // app's replay of open documents lands on a server that can take them.
                     if !handshook_before && session.ever_handshook() {
+                        *caps.monitor.version.lock() = message.pointer("/result/serverInfo/version").and_then(Value::as_str).map(str::to_string);
+                        caps.monitor.record("info", "Initialization completed");
                         caps.store_from(&session);
                         let _ = events.send(LspEvent::Handshook);
                     }
@@ -2375,10 +2423,13 @@ mod tests {
                     &serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": init["id"],
-                        "result": { "capabilities": { "textDocumentSync": 1 } },
+                        "result": { "capabilities": { "textDocumentSync": 1 }, "serverInfo": { "name": "fake", "version": "1.2.3" } },
                     }),
                 )
                 .expect("reply");
+                codec::write_message(&mut output, &serde_json::json!({
+                    "jsonrpc": "2.0", "method": "window/logMessage", "params": { "type": 3, "message": "fake server ready" }
+                })).expect("log notification");
                 while let Ok(message) = codec::read_message(&mut input) {
                     let Some(method) = message.get("method").and_then(Value::as_str) else {
                         continue;
@@ -2408,6 +2459,7 @@ mod tests {
 
     /// A supervisor over one socket candidate, on a test thread.
     struct Attached {
+        monitor: Arc<crate::monitor::Monitor>,
         events: Receiver<LspEvent>,
         outbox: Option<Sender<Value>>,
         stop: Arc<AtomicBool>,
@@ -2417,11 +2469,13 @@ mod tests {
 
     impl Attached {
         fn start(addr: std::net::SocketAddr) -> Self {
+            let monitor = Arc::new(crate::monitor::Monitor::default());
             let (outbox_tx, outbox_rx) = crossbeam_channel::bounded::<Value>(OUTBOX);
             let (events_tx, events_rx) = crossbeam_channel::unbounded::<LspEvent>();
             let stop = Arc::new(AtomicBool::new(false));
             let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             let supervisor = {
+                let monitor = Arc::clone(&monitor);
                 let stop = Arc::clone(&stop);
                 let pending = Arc::clone(&pending);
                 std::thread::spawn(move || {
@@ -2437,12 +2491,16 @@ mod tests {
                         events_tx,
                         stop,
                         pending,
-                        Arc::new(Caps::default()),
+                        Arc::new(Caps {
+                            monitor,
+                            ..Caps::default()
+                        }),
                         Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     )
                 })
             };
             Self {
+                monitor,
                 events: events_rx,
                 outbox: Some(outbox_tx),
                 stop,
@@ -2545,6 +2603,15 @@ mod tests {
 
         let attached = Attached::start(addr);
         attached.ready(Duration::from_secs(10));
+        assert_eq!(attached.monitor.version.lock().as_deref(), Some("1.2.3"));
+        assert!(
+            attached
+                .monitor
+                .read(0)
+                .entries
+                .iter()
+                .any(|entry| entry.message == "fake server ready")
+        );
         let took = attached.stop();
         let _ = fake.join();
         let methods = seen.lock().methods.clone();

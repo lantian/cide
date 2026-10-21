@@ -164,24 +164,21 @@ pub const SERVER: &str = "cide";
 /// `question` asking whether it might edit it, and the task sat waiting for the user. The field
 /// exists for the scheduler (`cide_app::agents`' path gate), and a run widening its own claim
 /// is exactly what the gate wants to hear about — so it is told to do that and go on.
-pub const TRACKER_PREAMBLE: &str = "This project's tasks live in .cide/tasks.json, and cide holds \
-     the only writer for it: editing the file directly is refused. Read with {cide_task_get} and \
-     {cide_task_list}; change a task's status or fields with {cide_task_update}, comment with \
-     {cide_task_comment}, set its role with {cide_task_assign}, open one with {cide_task_create}. \
-     Comments are how you report back, and you report once: do not comment a plan, progress, \
-     logs or measurements while you work — commit each coherent step instead, because your \
-     branch's commits are the record if the run dies. When you stop (done, blocked or out of \
-     time) leave one short comment of at most ten lines: the result, what changed (paths), how \
-     you verified it (the command and pass or fail, no pasted output), what is left, anything \
-     you noticed. A later comment supersedes the earlier one. Ask a question with \
-     {cide_user_request}; it waits by default. Use wait=false for independent work only. \
-     Reconnect after interruption with {cide_user_request_result}; timeout or cancellation \
-     is not approval. Propose inbox moves with kind=moveTasks. \
-     For work awaiting visual approval set status to review; never ask both. Done is the \
-     reviewer's or user's call. Touches holds paths for parallel work, not a permission: \
-     add needed files with {cide_task_update} and carry on. Something wrong that is not \
-     this task: do not fix it here — file it with {cide_task_create} (it lands in the inbox, \
-     outside every milestone) or name it in your report.";
+pub const TRACKER_PREAMBLE: &str = "Tasks live in .cide/tasks.json; cide is its only writer, so \
+     direct edits are refused. Read with {cide_task_get} and {cide_task_list}; update fields \
+     with {cide_task_update}, comment with {cide_task_comment}, assign with {cide_task_assign}, \
+     create with {cide_task_create}. Comments report back: do not post plans, progress, logs or \
+     measurements while working. Commit coherent steps; integration takes branch commits. The \
+     task body may skip optional commands such as builds. If it forbids commits, report the \
+     conflict before editing. When done, blocked or out of time, leave one short comment (at \
+     most ten lines): result, changed paths, verification command and result, remaining work, \
+     and findings. A later comment supersedes it. Ask with {cide_user_request}; it waits by \
+     default. Use wait=false only for independent work. Reconnect with \
+     {cide_user_request_result}; timeout or cancellation is not approval. Propose inbox moves \
+     with kind=moveTasks. For visual approval set status to review; never ask both. Done is the \
+     reviewer’s or user’s call. Touches schedules parallel work, not permission: add needed \
+     paths with {cide_task_update}. Something wrong that is not this task: do not fix it here; \
+     create an inbox task with {cide_task_create} or name it in your report.";
 
 /// Every tracker tool cide's prose is allowed to name.
 ///
@@ -205,11 +202,11 @@ pub const TRACKER_TOOLS: &[&str] = &[
 /// The one place the paragraph becomes text. Both harnesses call it rather than reading the
 /// const, so a harness whose namespacing differs cannot be told the other one's spelling — see
 /// [`Harness::tool_name`], which is required for the same reason.
-pub fn tracker_preamble(harness: &dyn Harness) -> String {
-    format!(
-        "{}\n\n{WAITING_PREAMBLE}",
-        fill_tools(TRACKER_PREAMBLE, harness)
-    )
+pub fn tracker_preamble(harness: &dyn Harness, template: Option<&str>) -> String {
+    let template = template
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(TRACKER_PREAMBLE);
+    format!("{}\n\n{WAITING_PREAMBLE}", fill_tools(template, harness))
 }
 
 /// How a run waits for its own long command. Rides with [`TRACKER_PREAMBLE`], in every harness's
@@ -244,11 +241,17 @@ pub const WAITING_PREAMBLE: &str = "Wait for a long command — a build, a test 
 /// Shared by the tracker and spec paragraphs and by the app's two prompts, so one rule about what
 /// a placeholder means covers all four.
 pub fn fill_tools(text: &str, harness: &dyn Harness) -> String {
-    let mut out = text.to_string();
-    for tool in TRACKER_TOOLS {
-        out = out.replace(&format!("{{{tool}}}"), &harness.tool_name(tool));
-    }
-    out
+    let values: Vec<_> = TRACKER_TOOLS
+        .iter()
+        .copied()
+        .chain(["cide_task_*"])
+        .map(|tool| (tool, harness.tool_name(tool)))
+        .collect();
+    let values: Vec<_> = values
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    crate::config::fill_prompt(text, &values)
 }
 
 /// What a run working an OpenSpec change is told, on top of [`TRACKER_PREAMBLE`]. (M28)
@@ -750,6 +753,8 @@ pub enum StepEdge {
 /// nothing.
 #[derive(Debug, Clone)]
 pub struct RunPlan<'a> {
+    /// Native planning progress for this assignment. Absent for legacy runs and reviewers.
+    pub planning: Option<crate::native_plan::State>,
     /// This run's own identity, for the whole of its life. `CIDE_RUN` in the child.
     pub run: RunId,
     /// The session the child will be filed under, and — for `claude` — the value passed to
@@ -895,6 +900,8 @@ pub struct RunPlan<'a> {
     /// attached (it is `hook_bin`'s question, not this one); such a run's whole brief is its
     /// role's own system prompt.
     pub tracker_paragraphs: bool,
+    /// Project override of cide's tracker instructions. The role's own prompt is separate.
+    pub worker_instructions: Option<String>,
     /// This run is a merge-request review (`RunPurpose::MrReview`). Its own field since the
     /// tracker switch: `tracker_paragraphs` used to answer *is this a review* by implication,
     /// and codex's review permissions read it that way — which would have handed every role run
@@ -1484,6 +1491,8 @@ mod tests {
                     harness: kind,
                     unattended: crate::config::Unattended::Ask,
                     tracker_paragraphs: true,
+                    worker_instructions: None,
+                    planning: None,
                     review: false,
                     server: None,
                     git_dirs: Vec::new(),
@@ -1713,7 +1722,7 @@ mod tests {
     #[test]
     fn the_tracker_preamble_names_the_tools_in_the_spelling_they_arrive_in() {
         for harness in registry() {
-            let rendered = tracker_preamble(*harness);
+            let rendered = tracker_preamble(*harness, None);
             let kind = harness.kind();
 
             for tool in TRACKER_TOOLS {
@@ -1822,7 +1831,7 @@ mod tests {
     /// inline agent's `prompt` out of opencode's configuration document, and codex's
     /// `developer_instructions` override (M44). `task` is the only knob, because the paragraphs
     /// a run is told differ on exactly that (M40).
-    fn told_by_all(task: Option<&TaskId>) -> (String, String, String) {
+    fn told_by_all(task: Option<&TaskId>, instructions: Option<&str>) -> (String, String, String) {
         use cide_ipc::{AgentDef, AgentId};
 
         fn role(harness: cide_ipc::Harness) -> LoadedAgent {
@@ -1850,7 +1859,11 @@ mod tests {
             }
         }
 
-        fn plan<'a>(agent: &'a LoadedAgent, task: Option<&TaskId>) -> RunPlan<'a> {
+        fn plan<'a>(
+            agent: &'a LoadedAgent,
+            task: Option<&TaskId>,
+            instructions: Option<&str>,
+        ) -> RunPlan<'a> {
             RunPlan {
                 run: RunId::new(),
                 session: SessionId::new(),
@@ -1884,6 +1897,8 @@ mod tests {
                 // and the plan actually said; the skip default has tests of its own.
                 unattended: crate::config::Unattended::Ask,
                 tracker_paragraphs: true,
+                worker_instructions: instructions.map(str::to_string),
+                planning: None,
                 review: false,
                 server: None,
                 git_dirs: Vec::new(),
@@ -1897,7 +1912,7 @@ mod tests {
         // claude: the value of the one `--append-system-prompt` the argv carries.
         let agent = role(cide_ipc::Harness::Claude);
         let args = ClaudeHarness
-            .spawn_spec(&plan(&agent, task))
+            .spawn_spec(&plan(&agent, task, instructions))
             .expect("a spawnable claude plan")
             .spec
             .args;
@@ -1910,7 +1925,7 @@ mod tests {
         // opencode: the inline agent's `prompt`, out of the configuration document.
         let agent = role(cide_ipc::Harness::Opencode);
         let spec = OpencodeHarness
-            .spawn_spec(&plan(&agent, task))
+            .spawn_spec(&plan(&agent, task, instructions))
             .expect("a spawnable opencode plan")
             .spec;
         let document = spec
@@ -1937,7 +1952,7 @@ mod tests {
 
         // codex: the brief the `-c developer_instructions=` override carries, before encoding.
         let agent = role(cide_ipc::Harness::Codex);
-        let told_by_codex = codex::developer_brief(&plan(&agent, task));
+        let told_by_codex = codex::developer_brief(&plan(&agent, task, instructions));
 
         (told_by_claude, told_by_opencode, told_by_codex)
     }
@@ -1964,7 +1979,7 @@ mod tests {
     #[test]
     fn a_role_is_told_the_same_thing_whichever_binary_runs_it() {
         let (told_by_claude, told_by_opencode, told_by_codex) =
-            told_by_all(Some(&TaskId("t-14".into())));
+            told_by_all(Some(&TaskId("t-14".into())), None);
 
         // The one licensed difference: the tool names, and nothing else.
         assert_eq!(
@@ -1997,11 +2012,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn custom_worker_instructions_replace_the_preamble_without_replacing_the_role() {
+        let template = "Custom workflow.\n\nReport using {cide_task_comment}. {unknown}";
+        let (claude, opencode, codex) = told_by_all(Some(&TaskId("t-14".into())), Some(template));
+        for (rendered, harness) in [
+            (claude, &ClaudeHarness as &dyn Harness),
+            (opencode, &OpencodeHarness),
+            (codex, &CodexHarness),
+        ] {
+            assert!(
+                rendered.starts_with(BRIEF),
+                "the role's own prompt survives"
+            );
+            assert!(rendered.contains(&fill_tools(template, harness)));
+            assert!(rendered.ends_with(WAITING_PREAMBLE));
+            assert!(!rendered.contains("do not comment a plan"));
+            assert!(!rendered.contains("This project's tasks live"));
+        }
+        for harness in registry() {
+            let custom = tracker_preamble(*harness, Some(template));
+            assert!(custom.contains(&harness.tool_name("cide_task_comment")));
+            assert!(custom.contains("{unknown}"));
+            assert_eq!(
+                tracker_preamble(*harness, Some(" \n")),
+                tracker_preamble(*harness, None)
+            );
+        }
+    }
+
     /// The task-less twin (M40): the correction to the tracker paragraph is the third paragraph,
     /// after it, on both binaries — asserted from [`ADHOC_PREAMBLE`] itself, never a quoted copy.
     #[test]
     fn an_adhoc_run_is_told_the_same_thing_whichever_binary_runs_it() {
-        let (told_by_claude, told_by_opencode, told_by_codex) = told_by_all(None);
+        let (told_by_claude, told_by_opencode, told_by_codex) = told_by_all(None, None);
         assert_eq!(
             unfill_tools(&told_by_claude, &ClaudeHarness),
             unfill_tools(&told_by_opencode, &OpencodeHarness),

@@ -39,10 +39,31 @@ pub const OPAQUE: &[&str] = &[
     "inspections.serverBinaries",
     "remote.bind",
     "llm",
+    "decision.profiles",
 ];
 
 /// Every global setting. Grouped as `Settings` declares them.
 pub const SETTING_DOCS: &[SettingDoc] = &[
+    doc(
+        "decision.url",
+        "string (HTTP URL)",
+        "Ollama System One base URL. Project enablement is separate and defaults off.",
+    ),
+    doc(
+        "decision.model",
+        "string",
+        "Decision model served by Ollama, for example d1.",
+    ),
+    doc(
+        "decision.timeoutMs",
+        "number 100–30000",
+        "Maximum duration of a decision request in milliseconds.",
+    ),
+    doc(
+        "decision.profiles",
+        "array",
+        "Named Codex/OpenCode model and effort profiles. A project explicitly permits each profile before routing can use it.",
+    ),
     // --- top level -----------------------------------------------------------------------
     doc(
         "windowMode",
@@ -104,6 +125,11 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "taskProposalRunMode",
         "enum background | tab",
         "How proposals requested during task creation are shown. Background keeps focus; tab opens the proposal run. Applies across projects.",
+    ),
+    doc(
+        "searchModalLayout",
+        "enum sideBySide | stacked",
+        "How Search Everywhere arranges results and preview in its modal.",
     ),
     // --- editor --------------------------------------------------------------------------
     doc("editor.fontSize", "number 6–40", "Editor font size."),

@@ -370,7 +370,9 @@ export function tabMenuEntries(
       id: 'split',
       label: 'Split pane right',
       command: 'pane.split.right',
-      ...(split && active ? { run: split } : { disabledReason: active ? NO_HOST : NOT_ACTIVE }),
+      ...(split && active && tab.kind.kind !== 'conversation'
+        ? { run: split }
+        : { disabledReason: tab.kind.kind === 'conversation' ? 'Saved conversations are read only' : active ? NO_HOST : NOT_ACTIVE }),
     },
     {
       id: 'detach',

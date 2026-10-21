@@ -52,6 +52,7 @@ import { useEscapeClose } from './escapeClose'
 import { TONE_CLASS, cx } from './TaskDetail'
 import { statusGlyph, statusTone } from './model'
 import { ProposalModal } from './ProposalModal'
+import { isOpenMilestoneTask, openTasksAndParents } from './milestoneTaskFilter'
 import panelStyles from './TasksPanel.module.css'
 import styles from './MilestonesPanel.module.css'
 
@@ -592,6 +593,8 @@ function MilestoneModal({
   const [tab, setTab] = useState<'overview' | 'tasks' | 'log'>(
     initialTab === 'log' && index !== null ? 'log' : 'overview',
   )
+  const [taskFilter, setTaskFilter] = useState<'open' | 'all'>('open')
+  const visibleTasks = taskFilter === 'open' ? openTasksAndParents(tasks) : tasks
 
   // Run this milestone's gate, whichever it is. The header's Run gate only ever runs the active
   // one, and an accepted milestone whose gate went red afterwards had no way to a fresh verdict
@@ -680,7 +683,7 @@ function MilestoneModal({
         )}
 
         {tab === 'tasks' && index !== null && (
-          <div className={styles.taskTab} data-audit="milestoneTasks">
+          <div className={styles.taskPane} data-audit="milestoneTasks">
             {original.task !== undefined && (
               <p className={styles.quiet}>
                 Work joins this milestone by being a subtask of{' '}
@@ -694,11 +697,32 @@ function MilestoneModal({
                 , at any depth.
               </p>
             )}
-            {tasks.length === 0 ? (
-              <p className={styles.quiet}>Nothing is linked to this milestone yet.</p>
-            ) : (
-              <MilestoneTaskList tasks={tasks} onOpen={(t) => openTask(t, onClose)} />
+            {tasks.length > 0 && (
+              <div className={styles.taskFilters} role="group" aria-label="Filter milestone tasks">
+                {(['open', 'all'] as const).map((filter) => (
+                  <button
+                    key={filter}
+                    type="button"
+                    className={styles.taskFilter}
+                    aria-pressed={taskFilter === filter}
+                    data-audit="milestoneTaskFilter"
+                    data-filter={filter}
+                    onClick={() => setTaskFilter(filter)}
+                  >
+                    {filter === 'open' ? 'Open + parents' : 'All'}
+                  </button>
+                ))}
+              </div>
             )}
+            <div className={styles.taskTab}>
+              {tasks.length === 0 ? (
+                <p className={styles.quiet}>Nothing is linked to this milestone yet.</p>
+              ) : visibleTasks.length === 0 ? (
+                <p className={styles.quiet}>No open tasks in this milestone. Select All to see every task.</p>
+              ) : (
+                <MilestoneTaskList tasks={visibleTasks} onOpen={(t) => openTask(t, onClose)} />
+              )}
+            </div>
           </div>
         )}
 
@@ -1028,7 +1052,7 @@ function countLine(tasks: readonly MilestoneTask[]): string {
  * an inbox task is never part of a milestone (M132).
  */
 function openWork(tasks: readonly MilestoneTask[]): number {
-  return tasks.filter((t) => t.status !== 'done' && t.status !== 'inbox').length
+  return tasks.filter(isOpenMilestoneTask).length
 }
 
 /**

@@ -32,6 +32,78 @@ use tauri::State;
 
 use crate::files::FsRegistry;
 
+#[path = "search_sessions.rs"]
+mod sessions;
+pub use sessions::*;
+
+/// Folder completion reads the same index as Explorer, including collapsed directories.
+/// Only the bounded suggestions cross IPC; no new walk or per-window index is created.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn search_scope_suggest(
+    fs: State<'_, FsRegistry>,
+    project: ProjectId,
+    input: String,
+    limit: Option<u32>,
+) -> Result<Vec<String>, String> {
+    let fs = fs.get(project).ok_or("Project files are still opening.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let roots: Vec<_> = fs
+            .roots
+            .iter()
+            .map(|root| SearchRoot {
+                path: root.path.clone(),
+                label: root.label.clone(),
+            })
+            .collect();
+        let paths = fs.with_index(|index| index.dir_paths());
+        scope_suggestions(&roots, paths, &input, limit.unwrap_or(20).min(50) as usize)
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn scope_suggestions(
+    roots: &[SearchRoot],
+    paths: Vec<PathBuf>,
+    input: &str,
+    limit: usize,
+) -> Vec<String> {
+    let needle = input.trim().to_lowercase();
+    let mut matches: Vec<_> = paths
+        .iter()
+        .filter_map(|path| {
+            let root = roots
+                .iter()
+                .filter(|root| path.starts_with(&root.path))
+                .max_by_key(|root| root.path.components().count())?;
+            let rel = path
+                .strip_prefix(&root.path)
+                .ok()?
+                .to_str()?
+                .replace('\\', "/");
+            let label = if rel.is_empty() {
+                root.label.clone()
+            } else if roots.len() > 1 {
+                format!("{}/{rel}", root.label)
+            } else {
+                rel
+            };
+            let folded = label.to_lowercase();
+            if !folded.contains(&needle) {
+                return None;
+            }
+            Some((!folded.starts_with(&needle), label))
+        })
+        .collect();
+    matches.sort();
+    matches.dedup();
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, label)| label)
+        .collect()
+}
+
 /// Hits one poll may carry. The panel draws about thirty rows and prefetches past them.
 const DEFAULT_LIMIT: u32 = 200;
 
@@ -44,6 +116,9 @@ const MAX_LIMIT: u32 = 1_000;
 #[derive(Default)]
 pub struct SearchRegistry {
     jobs: DashMap<ProjectId, Arc<Job>>,
+    /// New searches have independent lifetimes. The old project-keyed API above remains
+    /// available for clients which still use `search_query`.
+    sessions: Mutex<Vec<Arc<sessions::Session>>>,
 }
 
 impl SearchRegistry {
@@ -74,6 +149,7 @@ impl SearchRegistry {
 
     /// Drop the search a project is running, if it has one.
     pub fn cancel(&self, project: ProjectId) -> bool {
+        self.cancel_project_sessions(project);
         match self.jobs.remove(&project) {
             Some((_, job)) => {
                 job.cancel();
@@ -86,6 +162,9 @@ impl SearchRegistry {
     /// Drop every search. [`crate::lifecycle::shutdown`] — the quit path — and
     /// [`crate::cmd::fs::close_all`], which currently has no caller of its own.
     pub fn cancel_all(&self) {
+        for session in self.sessions.lock().drain(..) {
+            session.cancel();
+        }
         self.jobs.retain(|_, job| {
             job.cancel();
             false
@@ -386,6 +465,44 @@ fn pattern_error(error: &PatternError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directory_suggestions_are_relative_root_qualified_ranked_and_bounded() {
+        let roots = vec![SearchRoot {
+            path: "/project".into(),
+            label: "project".into(),
+        }];
+        let paths = vec![
+            "/project",
+            "/project/game",
+            "/project/game/ui",
+            "/project/addons/game",
+            "/outside/game",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            scope_suggestions(&roots, paths.clone(), "ga", 2),
+            vec!["game", "game/ui"]
+        );
+        assert_eq!(
+            scope_suggestions(&roots, paths.clone(), "GAME/UI", 20),
+            vec!["game/ui"]
+        );
+        assert!(scope_suggestions(&roots, paths.clone(), "absent", 20).is_empty());
+        let roots = vec![
+            roots[0].clone(),
+            SearchRoot {
+                path: "/other".into(),
+                label: "other".into(),
+            },
+        ];
+        assert_eq!(
+            scope_suggestions(&roots, paths, "game/ui", 20),
+            vec!["project/game/ui"]
+        );
+    }
+
     use super::*;
     use cide_ipc::SearchMode;
 

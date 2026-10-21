@@ -35,12 +35,12 @@
  *   what makes this module correct under either reading — and the type is the thing to trust,
  *   because the day a payload does arrive as a `bigint` the subtraction in `elapsed` throws.
  *
- * * **`RunState` flattened.** The wire carries a tagged union with three payload-bearing arms;
+ * * **`RunState` flattened.** The wire carries a tagged union with payload-bearing arms;
  *   `RunView` carries a `phase` plus `pausedSinceMs`, `exitCode` and `failure`, each `null` in
  *   every phase but its own. `model.ts`'s own comment argues why: a row that had to `switch` on
  *   the union to find out which of four sections it belongs in would be four `switch`es that
  *   can disagree. The flattening happens **here**, once, and the `switch` below is exhaustive so
- *   an eighth `RunState` variant added in Rust is a compile error in this file.
+ *   a new `RunState` variant added in Rust is a compile error in this file.
  *
  * * **`T | null` on the wire against the model's own optionality.** Every outbound optional in
  *   `cide-ipc` is `T | null` rather than an absent field, because `#[ts(optional)]` changes only
@@ -117,7 +117,7 @@ function def(from: WireDef): AgentDefView {
 }
 
 /**
- * `RunState`'s eight arms into `RunView`'s `phase` plus its three payload fields.
+ * `RunState` into `RunView`'s `phase` plus its payload fields.
  *
  * The `switch` is exhaustive and returns from every arm, so adding a variant in Rust and
  * regenerating fails this file rather than silently producing a run with no phase. The payload
@@ -138,6 +138,8 @@ function state(from: WireState): {
       return { phase: 'starting', ...none }
     case 'running':
       return { phase: 'running', ...none }
+    case 'blocked':
+      return { ...none, phase: 'blocked', failure: from.reason }
 
     // Turn handed back, child alive — deliberately not `finished`, which would put an
     // exit code on the wire for a process that has not exited. `RunState::Idle`'s own doc
@@ -156,6 +158,8 @@ function state(from: WireState): {
       return { ...none, phase: 'finished', exitCode: from.code }
     case 'failed':
       return { ...none, phase: 'failed', failure: from.reason }
+    case 'cancelled':
+      return { ...none, phase: 'cancelled', failure: from.reason }
   }
 }
 

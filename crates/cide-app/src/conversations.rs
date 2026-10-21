@@ -70,7 +70,7 @@ fn record(app: &AppHandle, project: ProjectId, id: &str) -> Result<SessionRecord
 }
 
 /// Conversation identity always wins over an old PTY handle retained after /clear or /resume.
-fn live(app: &AppHandle, record: &SessionRecord) -> Option<SessionId> {
+pub(crate) fn live(app: &AppHandle, record: &SessionRecord) -> Option<SessionId> {
     let registry = app.try_state::<SessionRegistry>()?;
     let matches = |session| {
         if registry.get(session).is_none_or(|s| s.has_exited()) {
@@ -93,6 +93,29 @@ fn live(app: &AppHandle, record: &SessionRecord) -> Option<SessionId> {
         .or_else(|| registry.ids().into_iter().find(|s| matches(*s)))
 }
 
+/// Only a user message in the saved conversation proves a later answer reached it.
+/// The same id appearing in a tool call/result is not a submission receipt.
+pub(crate) fn received_answer(
+    app: &AppHandle,
+    project: ProjectId,
+    record: &SessionRecord,
+    marker: &str,
+) -> bool {
+    let Some(sessions) = crate::sessions_state::handle(app) else {
+        return false;
+    };
+    let cache = cache(&sessions.conversations, project, &record.id);
+    let mut cache = cache.lock();
+    refresh(app, project, record, &mut cache, None);
+    transcript_has_answer(transcript(&cache, record.harness), marker)
+}
+
+fn transcript_has_answer(transcript: &Transcript, marker: &str) -> bool {
+    transcript.entries.iter().any(|entry| {
+        entry.item.as_ref().is_some_and(|item| item.kind == "user") && entry.detail.contains(marker)
+    })
+}
+
 fn policy_allows_resume(settings: &cide_ipc::Settings, harness: Harness) -> bool {
     match harness {
         Harness::Claude => settings.claude.cli.inject.resume.enabled,
@@ -102,7 +125,7 @@ fn policy_allows_resume(settings: &cide_ipc::Settings, harness: Harness) -> bool
     }
 }
 
-fn resume_enabled(app: &AppHandle, project: ProjectId, harness: Harness) -> bool {
+pub(crate) fn resume_enabled(app: &AppHandle, project: ProjectId, harness: Harness) -> bool {
     app.try_state::<WorkspaceState>().is_some_and(|workspace| {
         workspace.with(|ws| {
             policy_allows_resume(
@@ -660,6 +683,7 @@ fn resume(
                 harness_conversation: Some(conversation.clone()),
                 continues: Some(conversation.clone()),
                 harness: Some(record.harness),
+                harness_choice: None,
                 title: record.title.clone(),
                 docker: None,
                 origin: None,
@@ -681,6 +705,57 @@ fn resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_receipts_require_a_user_message_in_the_original_transcript() {
+        let marker = "The user resolved request req-1:";
+        let mut transcript = Transcript::default();
+        transcript.feed(
+            &serde_json::json!({
+                "type":"assistant", "uuid":"a", "message":{"content":marker}
+            }),
+            "a",
+        );
+        transcript.feed(&serde_json::json!({
+            "type":"user", "uuid":"tool", "message":{"content":[{"type":"tool_result","tool_use_id":"call","content":marker}]}
+        }), "tool");
+        assert!(!transcript_has_answer(&transcript, marker));
+        transcript.feed(
+            &serde_json::json!({
+                "type":"user", "uuid":"answer", "message":{"content":format!("{marker} blue")}
+            }),
+            "answer",
+        );
+        assert!(transcript_has_answer(&transcript, marker));
+        assert!(!transcript_has_answer(
+            &transcript,
+            "The user resolved request req-2:"
+        ));
+        let mut codex = Transcript::default();
+        codex.feed(&serde_json::json!({
+            "type":"response_item", "payload":{"type":"message","role":"user", "content":[{"type":"input_text","text":marker}]}
+        }), "codex");
+        assert!(
+            !transcript_has_answer(&codex, marker),
+            "an internal model-input mirror is not a receipt"
+        );
+        codex.feed(
+            &serde_json::json!({
+                "type":"event_msg", "payload":{"type":"user_message", "message":marker}
+            }),
+            "codex-user",
+        );
+        assert!(transcript_has_answer(&codex, marker));
+        let mut codex = Transcript::default();
+        codex.feed(&serde_json::json!({
+            "type":"event_msg", "payload":{"type":"item_completed", "item":{"type":"UserMessage","id":"u","content":[{"type":"text","text":marker}]}}
+        }), "codex-completed-user");
+        assert!(transcript_has_answer(&codex, marker));
+        let opencode = Transcript::export(&serde_json::json!({
+            "messages":[{"info":{"id":"m","role":"user"},"parts":[{"id":"p","type":"text","text":marker}]}]
+        }));
+        assert!(transcript_has_answer(&opencode, marker));
+    }
     #[test]
     fn restoration_uses_each_harnesses_own_resume_policy() {
         let mut settings = cide_ipc::Settings::default();

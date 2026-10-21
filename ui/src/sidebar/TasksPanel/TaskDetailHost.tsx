@@ -76,6 +76,7 @@ import {
   claudeSend,
   file,
   type ChangeName,
+  type TaskDispatchStatus,
 } from '@/ipc/client'
 import { AttachmentLightbox } from './AttachmentLightbox'
 import { forgetPreview, previewsSnapshot, requestPreview, subscribePreviews } from './attachmentPreviews'
@@ -129,6 +130,7 @@ function TaskDetailHostImpl() {
   const board = useTasks((s) => s.board)
   const project = useTasks((s) => s.project)
   const selected = useTasks((s) => s.selected)
+  const dispatchAgent = useTasks((s) => s.dispatchAgent)
   const decisionBackStack = useTasks((s) => s.decisionBackStack)
   const select = useTasks((s) => s.select)
   const editTask = useTasks((s) => s.edit)
@@ -667,6 +669,24 @@ function TaskDetailHostImpl() {
    */
   useEffect(() => followMilestones(), [])
   const milestonesView = useMilestones((state) => state.view)
+  const dispatchKey = `${project}:${selected}:${dispatchAgent ?? open?.agent ?? ''}`
+  const [dispatchRead, setDispatchRead] = useState<{ key: string; status: TaskDispatchStatus | null; error: string | null } | null>(null)
+  useEffect(() => {
+    let live = true
+    setDispatchRead(null)
+    if (project === null || selected === null || open?.change !== null) return
+    // Coalesce roster bursts. Guard replies and the render before effects by project/task/role.
+    const timer = setTimeout(() => {
+      void tasksApi.dispatchStatus(project, selected, dispatchAgent).then((status) => {
+        if (live) setDispatchRead({ key: dispatchKey, status, error: null })
+      }).catch((error: unknown) => {
+        if (live) setDispatchRead({ key: dispatchKey, status: null, error: errorText(error) })
+      })
+    }, 150)
+    return () => { live = false; clearTimeout(timer) }
+  }, [project, selected, dispatchAgent, dispatchKey, rev, roster, milestonesView, open?.change])
+  const dispatchStatus = dispatchRead?.key === dispatchKey ? dispatchRead.status : null
+  const dispatchError = dispatchRead?.key === dispatchKey ? dispatchRead.error : null
   const [verifyLog, setVerifyLog] = useState(false)
   // A log opened for one task must not greet the next card that opens.
   const openId = open === null ? null : String(open.id)
@@ -710,6 +730,8 @@ function TaskDetailHostImpl() {
        */
       key={`${project}:${open.id}`}
       task={detail}
+      dispatchStatus={dispatchStatus}
+      dispatchError={dispatchError}
       milestone={milestone}
       milestoneChoices={milestoneChoices}
       onSetMilestone={(target) => {

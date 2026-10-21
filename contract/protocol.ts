@@ -748,6 +748,11 @@ proposals: Array<Proposal>, };
 export type MouseReporting = "off" | "legacy" | "sgr";
 
 /**
+ * Identifies a pending native operation, rather than a new user turn to deliver later.
+ */
+export type NativeQuestionSource = { session: SessionId, generation: SessionId, conversation: string, request: string, };
+
+/**
  * One leaf in a tab's pane tree.
  */
 export type PaneId = string;
@@ -1056,7 +1061,11 @@ export type RunNotify = { "kind": "primary" } | { "kind": "session", session: Se
  * reach `SessionState`, because a paused *session* is a fact a pane must draw; what does not
  * reach it is the queue.)
  */
-export type RunState = { "state": "queued" } | { "state": "starting" } | { "state": "running" } | { "state": "idle" } | { "state": "awaitingPermission" } | { "state": "paused", sinceUnixMs: bigint, } | { "state": "interrupted" } | { "state": "finished", code: number, } | { "state": "failed", reason: string, };
+export type RunState = { "state": "queued" } | { "state": "starting" } | { "state": "running" } | { "state": "blocked", reason: string, } | { "state": "idle" } | { "state": "awaitingPermission" } | { "state": "paused", sinceUnixMs: bigint, } | { "state": "interrupted" } | { "state": "finished", code: number, } | { "state": "cancelled", reason: string, 
+/**
+ * The child exit status, when cancellation reached a child.
+ */
+code?: number, } | { "state": "failed", reason: string, };
 
 /**
  * One cell colour, or the terminal's default when absent.
@@ -1858,9 +1867,13 @@ atUnixMs: bigint, };
 
 export type UserRequest = { id: string, title: string, message: string, task: TaskId | null, author: TaskAuthor, request: UserRequestKind, origin: SessionRecord, wait: boolean, createdUnixMs: bigint, response: UserRequestResponse | null, applying: boolean, delivered: boolean, deliveryError: string | null, };
 
-export type UserRequestKind = { "kind": "question", question: TaskQuestion, } | { "kind": "moveTasks", milestone: string, goal: TaskId, tasks: Array<UserRequestTask>, };
+export type UserRequestAnswer = { id: string, text: string, selectedIds: Array<string>, };
 
-export type UserRequestResponse = { "kind": "answer", text: string, selectedIds: Array<string>, } | { "kind": "approve", selectedIds: Array<TaskId>, note: string, } | { "kind": "reject", note: string, } | { "kind": "cancel" };
+export type UserRequestKind = { "kind": "question", question: TaskQuestion, } | { "kind": "questions", questions: Array<UserRequestQuestion>, source: NativeQuestionSource, } | { "kind": "moveTasks", milestone: string, goal: TaskId, tasks: Array<UserRequestTask>, };
+
+export type UserRequestQuestion = { id: string, header: string, question: TaskQuestion, custom: boolean, };
+
+export type UserRequestResponse = { "kind": "answer", text: string, selectedIds: Array<string>, } | { "kind": "answers", answers: Array<UserRequestAnswer>, } | { "kind": "approve", selectedIds: Array<TaskId>, note: string, } | { "kind": "reject", note: string, } | { "kind": "cancel" };
 
 export type UserRequestTask = { id: TaskId, title: string, status: TaskStatus, parent: TaskId | null, };
 

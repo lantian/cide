@@ -62,6 +62,8 @@ pub struct SettingsPatch {
     /// [`crate::settings::clamp_ui_font_size`] for what that would paint.
     #[ts(optional)]
     pub ui_font_size: Option<f32>,
+    #[ts(optional)]
+    pub search_modal_layout: Option<crate::settings::SearchModalLayout>,
     /// Pick or reset the accent. Carries only the picked colour: the fitted variants are
     /// computed where this lands, so no caller can store an illegible one. See
     /// [`crate::settings::Accent`].
@@ -106,6 +108,8 @@ pub struct SettingsPatch {
     /// about the value once it is at rest.
     #[ts(optional)]
     pub proxy: Option<ProxySettings>,
+    #[ts(optional)]
+    pub decision: Option<crate::DecisionSettings>,
     /// Both sidebar widths, sent together.
     ///
     /// Per the rule above: a patch is per top-level field, so the splitter that just moved

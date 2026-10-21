@@ -133,6 +133,7 @@ pub fn open_project(
             harness_conversation: None,
             continues: None,
             harness: None,
+            harness_choice: None,
             title: format!("{name} : claude"),
             docker: None,
             origin: None,
@@ -517,6 +518,7 @@ pub fn tab_outlives_close(kind: &TabKind) -> bool {
         // draws its sentence and nothing worse — there is no id here that stops resolving.
         TabKind::Docs { .. } => true,
         TabKind::ClaudeHome
+        | TabKind::Conversation { .. }
         | TabKind::ClaudeFull { .. }
         | TabKind::File { .. }
         | TabKind::Revision { .. }
@@ -1907,6 +1909,58 @@ pub fn bind_session(
     Ok(())
 }
 
+/// Bind a console session and remember an explicit choice for this pane's future fresh starts.
+/// Validation precedes the binding so a refused choice cannot leave a half-updated workspace.
+pub fn bind_session_with_choice(
+    ws: &mut Workspace,
+    project_id: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    session: SessionId,
+    harness: Option<cide_ipc::Harness>,
+    choice: Option<cide_ipc::ConsoleHarness>,
+) -> Result<()> {
+    if let Some(choice) = choice {
+        if harness != Some(choice.harness()) {
+            return Err(CoreError::Invariant(
+                "The selected harness did not start".into(),
+            ));
+        }
+        let owner = project(ws, project_id)?;
+        let current = owner
+            .tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .and_then(|t| t.tree.panes.get(&pane))
+            .or_else(|| owner.detached.get(&pane))
+            .ok_or(CoreError::NoSuchPane(pane))?;
+        if current.kind != PaneKind::Claude
+            || current.continues.is_some()
+            || current.origin.is_some()
+        {
+            return Err(CoreError::Invariant(
+                "Only an ordinary console pane can switch harness".into(),
+            ));
+        }
+    }
+
+    bind_session(ws, project_id, tab, pane, session, harness)?;
+    if let Some(choice) = choice {
+        if let Ok(t) = tab_mut(ws, project_id, tab)
+            && let Some(p) = t.tree.panes.get_mut(&pane)
+        {
+            p.harness_choice = Some(choice);
+        } else {
+            project_mut(ws, project_id)?
+                .detached
+                .get_mut(&pane)
+                .ok_or(CoreError::NoSuchPane(pane))?
+                .harness_choice = Some(choice);
+        }
+    }
+    Ok(())
+}
+
 fn prepare_session_binding(
     pane: &mut Pane,
     session: SessionId,
@@ -2874,6 +2928,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         harness_conversation: None,
         continues: None,
         harness: None,
+        harness_choice: None,
         title: title.to_string(),
         docker: None,
         origin: None,
@@ -3068,6 +3123,71 @@ mod tests {
         assert_eq!(pane.session, Some(p.primary_session));
         assert_eq!(tree.focused, pane.id);
         validate(&ws).expect("a fresh project is valid");
+    }
+
+    #[test]
+    fn a_console_harness_choice_is_per_pane_and_survives_binding_and_persistence() {
+        let mut ws = Workspace::default();
+        let project_id = open(&mut ws, "/tmp/pane-harness-choice");
+        let tab = console_tab(&ws, project_id).expect("console tab");
+        let primary = project(&ws, project_id).unwrap().tabs[0].tree.focused;
+        let other = split_console(&mut ws, project_id);
+        ws.settings.console_harness = cide_ipc::ConsoleHarness::Codex;
+        let session = SessionId::new();
+
+        bind_session_with_choice(
+            &mut ws,
+            project_id,
+            tab,
+            primary,
+            session,
+            Some(cide_ipc::Harness::Opencode),
+            Some(cide_ipc::ConsoleHarness::Opencode),
+        )
+        .unwrap();
+        let panes = &project(&ws, project_id).unwrap().tabs[0].tree.panes;
+        assert_eq!(
+            panes[&primary].harness_choice,
+            Some(cide_ipc::ConsoleHarness::Opencode)
+        );
+        assert_eq!(panes[&other].harness_choice, None);
+        assert_eq!(ws.settings.console_harness, cide_ipc::ConsoleHarness::Codex);
+
+        bind_session(
+            &mut ws,
+            project_id,
+            tab,
+            primary,
+            SessionId::new(),
+            Some(cide_ipc::Harness::Opencode),
+        )
+        .unwrap();
+        let saved = serde_json::to_vec(&ws).unwrap();
+        let restored: Workspace = serde_json::from_slice(&saved).unwrap();
+        let pane = &project(&restored, project_id).unwrap().tabs[0].tree.panes[&primary];
+        assert_eq!(
+            pane.harness_choice,
+            Some(cide_ipc::ConsoleHarness::Opencode)
+        );
+
+        let before = serde_json::to_value(&ws).unwrap();
+        assert!(
+            bind_session_with_choice(
+                &mut ws,
+                project_id,
+                tab,
+                primary,
+                SessionId::new(),
+                Some(cide_ipc::Harness::Claude),
+                Some(cide_ipc::ConsoleHarness::Opencode),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&ws).unwrap(),
+            before,
+            "a refused choice changes nothing"
+        );
     }
 
     /// A restarted console keeps being the console — which is what `eager` is read from.
@@ -6447,6 +6567,10 @@ mod tests {
     #[test]
     fn the_tabs_that_outlive_a_close_are_the_documents_and_the_queries() {
         assert!(tab_outlives_close(&TabKind::ClaudeHome));
+        assert!(tab_outlives_close(&TabKind::Conversation {
+            id: "saved-thread".into(),
+            title: "Developer · t-1".into(),
+        }));
         assert!(tab_outlives_close(&TabKind::ClaudeFull {
             title: "t".into(),
             ephemeral: false
@@ -6466,5 +6590,32 @@ mod tests {
             },
             preview: false,
         }));
+    }
+
+    #[test]
+    fn a_saved_conversation_tab_survives_restore_without_a_session() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/home/dev/archive");
+        let before = session_panes(&ws, Some(project)).len();
+        let opened = open_tab(
+            &mut ws,
+            project,
+            TabKind::Conversation {
+                id: "saved-thread".into(),
+                title: "Developer · t-1".into(),
+            },
+            demo_pane(PaneKind::Diff, "Developer · t-1", false),
+        )
+        .expect("open archive");
+        validate(&ws).expect("valid archive tab");
+        assert_eq!(session_panes(&ws, Some(project)).len(), before);
+        let restored: Workspace =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        validate(&restored).expect("valid restored archive tab");
+        assert!(matches!(
+            &tab(&restored, project, opened).unwrap().kind,
+            TabKind::Conversation { .. }
+        ));
+        assert_eq!(session_panes(&restored, Some(project)).len(), before);
     }
 }

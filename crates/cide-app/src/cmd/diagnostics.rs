@@ -251,6 +251,7 @@ pub async fn tab_open_docs(
                 harness_conversation: None,
                 continues: None,
                 harness: None,
+                harness_choice: None,
                 title: "docs".into(),
                 docker: None,
                 origin: None,
@@ -711,4 +712,48 @@ pub async fn diagnostics_restart(
     tauri::async_runtime::spawn_blocking(move || diagnostics.restart(&app, source))
         .await
         .map_err(|error| format!("the restart did not finish: {error}"))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn language_servers_get(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+) -> Result<Vec<cide_ipc::diagnostics::LanguageServerSnapshot>, String> {
+    let diagnostics = registry
+        .get(project)
+        .ok_or("This project is no longer open.")?;
+    tauri::async_runtime::spawn_blocking(move || diagnostics.language_servers())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn language_servers_control(
+    app: tauri::AppHandle,
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    source: Option<DiagnosticSourceId>,
+    action: cide_ipc::diagnostics::LanguageServerAction,
+) -> Result<(), String> {
+    let diagnostics = registry
+        .get(project)
+        .ok_or("This project is no longer open.")?;
+    tauri::async_runtime::spawn_blocking(move || diagnostics.server_action(&app, source, action))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn language_servers_logs(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    source: DiagnosticSourceId,
+    after: u64,
+) -> Result<cide_ipc::diagnostics::LanguageServerLogs, String> {
+    let diagnostics = registry
+        .get(project)
+        .ok_or("This project is no longer open.")?;
+    tauri::async_runtime::spawn_blocking(move || diagnostics.server_logs(source, after))
+        .await
+        .map_err(|e| e.to_string())?
 }

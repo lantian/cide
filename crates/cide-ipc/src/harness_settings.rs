@@ -59,6 +59,9 @@ impl Default for OpencodeInjections {
 pub struct ProjectHarnessSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub decision: Option<crate::ProjectDecisionSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub console_harness: Option<ConsoleHarness>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -76,6 +79,7 @@ pub struct ProjectHarnessSettings {
 #[serde(rename_all = "camelCase", tag = "field", content = "value")]
 #[ts(export)]
 pub enum ProjectHarnessEdit {
+    Decision(Option<crate::ProjectDecisionSettings>),
     ConsoleHarness(Option<ConsoleHarness>),
     Claude(Option<ClaudeCli>),
     Codex(Option<CodexCli>),
@@ -84,6 +88,7 @@ pub enum ProjectHarnessEdit {
 impl ProjectHarnessSettings {
     pub fn apply(&mut self, edit: ProjectHarnessEdit) {
         match edit {
+            ProjectHarnessEdit::Decision(v) => self.decision = v,
             ProjectHarnessEdit::ConsoleHarness(v) => self.console_harness = v,
             ProjectHarnessEdit::Claude(v) => self.claude = v,
             ProjectHarnessEdit::Codex(v) => self.codex = v,

@@ -1,3 +1,4 @@
+import { DecisionSection } from './DecisionSection'
 import { GitLabSettings } from '@/gitlab/GitLabSettings'
 /**
  * The sections of the Settings tab, grouped for the nav (see [`SECTIONS`]).
@@ -116,6 +117,7 @@ export interface SectionMeta {
  * `check:settings-copy` holds every id to exactly one group.
  */
 export const SECTIONS: readonly SectionMeta[] = [
+  { id: 'decision', group: 'ai', title: 'Decision assistance', description: 'Experimental per-project assistance and window-local insights.' },
   {
     id: 'appearance',
     group: 'general',
@@ -229,11 +231,13 @@ export const SECTION_TABS: Partial<Record<SettingsSection, readonly { value: str
     { value: 'roles', label: 'Roles' },
     { value: 'overrides', label: 'Local overrides' },
     { value: 'spawn', label: 'Review & wake' },
+    { value: 'prompts', label: 'Prompts' },
   ],
 }
 
 export interface SectionProps {
   settings: Settings
+  testDecision?: (settings: import('@/ipc/generated').DecisionSettings) => Promise<string>
   projectHarness?: ProjectHarnessSettings
   editProjectHarness?: (edit: ProjectHarnessEdit) => void
   opencodeSupport?: CodexCliSupport | null
@@ -329,6 +333,11 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir, version }: 
           being visible at all.
         */}
         <ColorSchemeRow theme={settings.theme} editor={settings.editor} patch={patch} />
+        <Row label="Search modal layout" hint="Arrange the search modal’s results and preview. Bottom tabs keep their layout."
+          {...resetTo(settings.searchModalLayout, def?.searchModalLayout, searchModalLayout => patch({ searchModalLayout }))}
+          control={<Segmented label="Search modal layout" value={settings.searchModalLayout}
+            options={[{ value: 'sideBySide', label: 'Side by side' }, { value: 'stacked', label: 'Stacked (preview below)' }]}
+            onChange={searchModalLayout => patch({ searchModalLayout })} />} />
         {/* After the scheme rather than between it and Theme, which are a pair (above). */}
         <AccentRow accent={settings.accent} />
         <Row
@@ -1262,6 +1271,8 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       // `SettingsPatch` or `workspace.json`. These values are declared by third-party manifests
       // and stored in `extensions.json`, so the component reads the extension store directly.
       return <ExtensionSettings />
+    case 'decision':
+      return <DecisionSection settings={props.settings.decision} patch={decision=>props.patch({decision})} project={props.projectHarness} edit={props.editProjectHarness} probe={props.testDecision} />
     case 'models':
       return (
         <ModelsSection

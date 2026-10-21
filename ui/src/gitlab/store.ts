@@ -455,3 +455,12 @@ export async function navigateReviewFile(key: GitLabDocument, delta: number) {
       refs: versionRefs(review.version),
     })
 }
+
+/** Account presence changes navigation; review edits must not repaint the shell. */
+export function useGitLabConfigured(): boolean {
+  return useSyncExternalStore(
+    listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
+    () => snapshot.board.accounts.length > 0,
+    () => false,
+  )
+}

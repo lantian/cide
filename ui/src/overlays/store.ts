@@ -35,6 +35,7 @@ import { create } from 'zustand'
  * mount it, which is the "control wired to nothing" shape this app keeps producing.
  */
 export type OverlayKind =
+  | 'search'
   | 'files'
   | 'commands'
   /** Remembered projects; App mounts this outside the project-dependent OverlayHost. */
@@ -58,6 +59,7 @@ export type OverlayKind =
    * Reads `Bootstrap.capabilities` off the boot the host was mounted with and asks Rust nothing.
    */
   | 'about'
+  | 'decisionInsights'
   /**
    * The model-pool state card (`overlays/PoolStateCard.tsx`): every pool's entries, their load
    * and benches, and why recent runs started where they did. Asks Rust `llm_pool_state`. (M90)

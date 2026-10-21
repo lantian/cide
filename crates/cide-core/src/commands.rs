@@ -140,6 +140,7 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     // is a *capture* listener and would otherwise swallow it.
     "filePickerOpen",
     "contextMenuOpen",
+    "problemsFocused",
     "sidebarFiles",
     "sidebarGit",
     // A diff surface is mounted and in front — the git diff tab, the log tool window's revision
@@ -652,6 +653,13 @@ fn build() -> Vec<Command> {
         // tier falls to registry order, and this row sits above that one — so `create` would have
         // started answering with a project wizard, which the two tests pinning `create` to *New
         // branch…* exist to prevent. `new` is in the title and reaches it a tier higher anyway.
+        Command::new(
+            "experimental.decisionInsights",
+            "Experimental: Decision Insights",
+            HARNESS,
+        )
+        .when("projectOpen")
+        .keywords(&["decision", "statistics", "experiment", "ollama"]),
         Command::new(
             "experimental.peerChat",
             "Experimental: Open Two-Agent Chat",
@@ -1420,6 +1428,7 @@ fn build() -> Vec<Command> {
                 "up",
             ]),
         // View.
+        Command::new("search.everywhere", "Search Everywhere", VIEW).when("shellWindow"),
         Command::new("picker.files", "Go to file", VIEW).when("projectOpen"),
         /*
          * The file picker's library scope. (M16)
@@ -1599,13 +1608,17 @@ fn build() -> Vec<Command> {
         // put the caret in its box without a mouse. `projectOpen` rather than bare
         // `shellWindow` because `SearchStore.setQuery` returns without asking anything when
         // there is no project, so the panel would open onto a box that cannot search.
-        Command::new("sidebar.search", "Show search sidebar", VIEW)
+        Command::new("sidebar.search", "Search in files", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["find", "grep", "in files"]),
         // The ⚑ rail button has emitted `'problems'` since M3 and `App.tsx` has handled it since
         // M11, but there was no command and no binding — so the view was mouse-only. Exactly the
         // gap `sidebar.search` had, one view later, and closing it is two lines.
-        Command::new("sidebar.problems", "Show problems sidebar", VIEW)
+        Command::new("languageServers.open", "Language Servers", VIEW)
+            .when("shellWindow && projectOpen"),
+        Command::new("problems.jumpToSource", "Jump to problem source", VIEW)
+            .when("problemsFocused"),
+        Command::new("sidebar.problems", "Show Problems", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["diagnostics", "errors", "warnings", "inspections"]),
         /*

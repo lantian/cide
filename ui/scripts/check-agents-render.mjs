@@ -359,6 +359,16 @@ try {
     )
   }
 
+  {
+    const d = a('role-blocked')
+    const dev = d.roles?.find((r) => r.id === 'developer')
+    eq(dev?.status, 'Blocked', 'a failed Codex turn remains visible as blocked')
+    eq(dev?.opens, 1, 'Open preserves manual recovery in the same conversation')
+    eq(d.meta, '0', 'blocked turns release their working slot')
+    ok(d.text.includes('Selected model is at capacity.'), 'the provider error is visible')
+    ok(!d.text.includes('Finished'), 'a failed turn is not shown as successful completion')
+  }
+
   /*
    * The third state that draws no Open, and it must stay a *different* reason from the two
    * above: the role is doing something, there is a line on screen for it, and there is still no

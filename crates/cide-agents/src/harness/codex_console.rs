@@ -7,7 +7,7 @@
 //! bypass is needed to learn whether this conversation can receive another turn.
 use cide_ipc::SessionId;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receiver {
@@ -28,9 +28,13 @@ pub struct Protocol {
     active: Option<String>,
     generation: u64,
     ready: bool,
+    turn: Option<String>,
+    turn_ended: bool,
+    completed_turns: VecDeque<String>,
     initialized: bool,
     pending: HashMap<String, Request>,
-    questions: HashSet<String>,
+    // Every server request blocks peer delivery; only human questions block inference.
+    questions: HashMap<String, bool>,
     last_answer: String,
     model: Option<String>,
     cwd: Option<String>,
@@ -44,6 +48,12 @@ struct Request {
 }
 
 impl Protocol {
+    pub fn current_thread(&self) -> Option<&str> {
+        self.active.as_deref()
+    }
+    pub fn current_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
     pub fn new(connection: u64) -> Self {
         Self {
             connection,
@@ -66,6 +76,26 @@ impl Protocol {
         })
     }
 
+    /// Unlike `receiver`, ownership remains true while the visible turn is busy.
+    /// Helpers and subagents can share its connection, but not its observations.
+    pub fn owns_thread(&self, frame: &Value) -> bool {
+        self.active.is_some() && frame["params"]["threadId"].as_str() == self.active.as_deref()
+    }
+
+    /// Inspect before applying the frame. Unrelated replies and partial approval
+    /// resolution must not reopen an observer's inference/delivery gate.
+    pub fn resolves_last_question(&self, frame: &Value) -> bool {
+        let id = match frame["method"].as_str() {
+            None => frame.get("id"),
+            Some("serverRequest/resolved") if self.owns_thread(frame) => {
+                frame["params"].get("requestId")
+            }
+            _ => None,
+        };
+        self.questions.values().filter(|&&human| human).count() == 1
+            && id.is_some_and(|id| self.questions.get(&id.to_string()) == Some(&true))
+    }
+
     /// Observe native requests before forwarding them. A manual submit or conversation
     /// switch must close the delivery gate before the server has time to acknowledge it.
     pub fn from_terminal(&mut self, frame: &Value) {
@@ -80,6 +110,9 @@ impl Protocol {
                     self.generation += 1;
                     self.ready = false;
                     self.active = None;
+                    self.turn = None;
+                    self.turn_ended = false;
+                    self.completed_turns.clear();
                     self.questions.clear();
                     self.pending.clear();
                     self.pending.insert(
@@ -90,10 +123,7 @@ impl Protocol {
                         },
                     );
                 }
-                "turn/start" | "turn/steer"
-                    if self.active.is_some()
-                        && frame["params"]["threadId"].as_str() == self.active.as_deref() =>
-                {
+                "turn/start" | "turn/steer" if self.owns_thread(frame) => {
                     self.ready = false;
                     let user_prompt = method == "turn/start"
                         && frame["params"]["input"].as_array().is_some_and(|input| {
@@ -112,9 +142,7 @@ impl Protocol {
                         },
                     );
                 }
-                "thread/unsubscribe"
-                    if frame["params"]["threadId"].as_str() == self.active.as_deref() =>
-                {
+                "thread/unsubscribe" if self.owns_thread(frame) => {
                     self.generation += 1;
                     self.active = None;
                     self.ready = false;
@@ -170,6 +198,8 @@ impl Protocol {
                     hooks.extend(self.status(&thread["status"]));
                 }
             } else if request.method == "turn/start" {
+                self.turn = frame["result"]["turn"]["id"].as_str().map(str::to_owned);
+                self.turn_ended = false;
                 self.ready = false;
                 if request.user_prompt {
                     hooks.extend(self.hook("CideUserPrompt"));
@@ -179,11 +209,11 @@ impl Protocol {
             }
         }
         let params = &frame["params"];
-        if params["threadId"].as_str() != self.active.as_deref() || self.active.is_none() {
+        if !self.owns_thread(frame) {
             return hooks;
         }
         if let Some(id) = frame.get("id").map(Value::to_string) {
-            self.questions.insert(id);
+            self.questions.insert(id, requests_user_input(frame));
             self.ready = false;
             hooks.extend(
                 self.hook(
@@ -201,17 +231,53 @@ impl Protocol {
         match frame["method"].as_str().unwrap_or("") {
             "thread/status/changed" => hooks.extend(self.status(&params["status"])),
             "turn/started" => {
+                if params["turn"]["id"]
+                    .as_str()
+                    .is_some_and(|id| self.completed_turns.iter().any(|old| old == id))
+                {
+                    return hooks;
+                }
+                self.turn = params["turn"]["id"].as_str().map(str::to_owned);
+                self.turn_ended = false;
                 self.ready = false;
                 self.last_answer.clear();
                 hooks.extend(self.hook("UserPromptSubmit"));
             }
             "turn/completed" => {
+                let id = params["turn"]["id"].as_str();
+                if self.turn_ended
+                    || self
+                        .turn
+                        .as_deref()
+                        .is_some_and(|current| Some(current) != id)
+                    || id.is_some_and(|id| self.completed_turns.iter().any(|old| old == id))
+                {
+                    return hooks;
+                }
+                if let Some(id) = id {
+                    self.completed_turns.push_back(id.to_owned());
+                    if self.completed_turns.len() > 64 {
+                        self.completed_turns.pop_front();
+                    }
+                }
+                self.turn = None;
+                self.turn_ended = true;
                 self.ready = true;
-                hooks.extend(self.hook(if params["turn"]["status"] == "interrupted" {
-                    "Interrupt"
+                if params["turn"]["status"] == "failed" {
+                    let mut payload = self.payload();
+                    payload["turn_id"] = params["turn"]["id"].clone();
+                    payload["error"] = params["turn"]["error"].clone();
+                    hooks.push(Hook {
+                        kind: "CideTurnFailed",
+                        payload,
+                    });
                 } else {
-                    "Stop"
-                }));
+                    hooks.extend(self.hook(if params["turn"]["status"] == "interrupted" {
+                        "Interrupt"
+                    } else {
+                        "Stop"
+                    }));
+                }
             }
             "serverRequest/resolved" => {
                 if let Some(id) = params.get("requestId") {
@@ -253,6 +319,7 @@ impl Protocol {
             // AwaitingInput attention marker by moving it back to Idle. Status supplies
             // readiness; only the turn event establishes that work finished.
             Some("idle") => return Vec::new(),
+            Some("active") if self.turn_ended => return Vec::new(),
             Some("active")
                 if status["activeFlags"]
                     .as_array()
@@ -319,8 +386,19 @@ impl Protocol {
             return false;
         }
         self.ready = false;
+        self.turn_ended = false;
         true
     }
+}
+
+pub fn requests_user_input(frame: &Value) -> bool {
+    frame["method"].as_str().is_some_and(|method| {
+        method.ends_with("/requestApproval")
+            || matches!(
+                method,
+                "item/tool/requestUserInput" | "mcpServer/elicitation/request"
+            )
+    })
 }
 
 pub fn turn_request(id: &str, receiver: &Receiver, body: &str) -> Value {
@@ -768,7 +846,91 @@ mod tests {
         assert_eq!(hooks[0].kind, "Stop");
         assert!(p.from_server(&json!({"method":"thread/status/changed","params":{"threadId":THREAD,"status":{"type":"idle"}}})).is_empty());
         assert!(p.receiver().is_some());
+        p.from_server(&json!({"method":"turn/started","params":{"threadId":THREAD}}));
         let hooks = p.from_server(&json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"status":"interrupted"}}}));
         assert_eq!(hooks[0].kind, "Interrupt");
+    }
+
+    #[test]
+    fn terminal_capacity_failure_is_reported_once_and_only_for_the_active_turn() {
+        let mut p = opened();
+        let start =
+            |id| json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":id}}});
+        let failed = |id| json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":id,"status":"failed","error":{"message":"Selected model is at capacity. Please try a different model.","codexErrorInfo":"serverOverloaded"}}}});
+        p.from_server(&start("planning"));
+        assert!(p.from_server(&json!({"method":"error","params":{"threadId":THREAD,"willRetry":true,"error":{"message":"retrying"}}})).is_empty());
+        assert!(
+            p.receiver().is_none(),
+            "internal retries still hold the turn"
+        );
+        let mut helper = failed("planning");
+        helper["params"]["threadId"] = json!("helper");
+        assert!(p.from_server(&helper).is_empty());
+        let hooks = p.from_server(&failed("planning"));
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].kind, "CideTurnFailed");
+        assert_eq!(
+            hooks[0].payload["error"]["codexErrorInfo"],
+            "serverOverloaded"
+        );
+        assert!(
+            p.receiver().is_some(),
+            "the composer is available for manual recovery"
+        );
+        assert!(p.from_server(&failed("planning")).is_empty());
+        assert!(p.from_server(&json!({"method":"thread/status/changed","params":{"threadId":THREAD,"status":{"type":"active","activeFlags":[]}}})).is_empty());
+        assert_eq!(p.from_server(&start("retry"))[0].kind, "UserPromptSubmit");
+        assert!(
+            p.from_server(&failed("planning")).is_empty(),
+            "old completion cannot end a retry"
+        );
+        assert!(p.receiver().is_none());
+        assert_eq!(p.from_server(&json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"retry","status":"completed"}}}))[0].kind, "Stop");
+    }
+
+    #[test]
+    fn failed_native_turn_remains_recoverable_and_never_becomes_a_clean_exit() {
+        use crate::{Harness, Observation};
+        use cide_claude::HookFrame;
+        use cide_ipc::RunState;
+        let harness = super::super::CodexHarness;
+        let frame = HookFrame::new("CideTurnFailed", json!({"error":{"message":"at capacity"}}));
+        let blocked = harness
+            .observe(RunState::Running, Observation::Hook(&frame))
+            .unwrap();
+        assert_eq!(
+            blocked,
+            RunState::Blocked {
+                reason: "at capacity".into()
+            }
+        );
+        for event in ["Stop", "Interrupt", "PostToolUse", "SessionStart"] {
+            assert!(
+                harness
+                    .observe(
+                        blocked.clone(),
+                        Observation::Hook(&HookFrame::new(event, json!({})))
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            harness.observe(
+                blocked.clone(),
+                Observation::Hook(&HookFrame::new("UserPromptSubmit", json!({})))
+            ),
+            Some(RunState::Running)
+        );
+        assert!(
+            matches!(harness.observe(blocked, Observation::Exit(0)), Some(RunState::Failed { reason }) if reason.contains("at capacity"))
+        );
+        assert!(
+            harness
+                .observe(
+                    RunState::Paused { since_unix_ms: 1 },
+                    Observation::Hook(&frame)
+                )
+                .is_none()
+        );
     }
 }

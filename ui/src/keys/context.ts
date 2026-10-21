@@ -79,12 +79,13 @@ export const HOST_FLAGS = [
   'overlayOpen',
   'filePickerOpen',
   'contextMenuOpen',
+  'problemsFocused',
   'sidebarFiles',
   'sidebarGit',
   'diffFocused',
 ] as const
 
-/** Flags [`deriveContext`] computes. Every one is a fact about the workspace mirror. */
+/** Flags derived from the workspace and the focused editor surface. */
 export const DERIVED_FLAGS = [
   'gitlabReviewActive',
   'paneFocused',
@@ -115,6 +116,7 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
   const project = activeProjectOf(boot)
   const focused = focusTarget(boot)
   const kind = focused?.pane.kind
+  const embeddedEditor = typeof document !== 'undefined' && !!document.activeElement?.closest('[data-cide-embedded-reader]')
   /*
    * The focused pane is a file tab's editor pane and the file is an Excalidraw drawing. (M63)
    *
@@ -135,15 +137,15 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
   return {
     gitlabReviewActive: kind === 'diff' && focused?.tab.kind.kind === 'diff' && focused.tab.kind.spec.origin.kind === 'gitLab',
     paneFocused: focused !== null,
-    claudePaneFocused: kind === 'claude',
+    claudePaneFocused: !embeddedEditor && kind === 'claude',
     // A Claude pane is an xterm too, so "a terminal has focus" is true for both — and false
     // for a diff pane, which has no terminal at all and which `App.tsx`'s
     // `kind !== 'editor'` spelling counted as one.
-    terminalFocused: kind === 'claude' || kind === 'shell',
+    terminalFocused: !embeddedEditor && (kind === 'claude' || kind === 'shell'),
     // An editor pane that is a **text buffer**: the drawing pane is excluded above, and the
     // status bar's own `editorFocused` in `App.tsx` deliberately is not — it wants the readout
     // shown for a drawing, and the gate wants the chords let through. Two flags, two questions.
-    editorFocused: kind === 'editor' && !drawing,
+    editorFocused: embeddedEditor || (kind === 'editor' && !drawing),
     drawingFocused: drawing,
 
     projectOpen: project !== null,

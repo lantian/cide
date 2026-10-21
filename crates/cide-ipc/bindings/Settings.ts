@@ -4,6 +4,7 @@ import type { AwaitingHighlight } from "./AwaitingHighlight";
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { CodexSettings } from "./CodexSettings";
 import type { ConsoleHarness } from "./ConsoleHarness";
+import type { DecisionSettings } from "./DecisionSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { ExplorerSettings } from "./ExplorerSettings";
 import type { GitSettings } from "./GitSettings";
@@ -14,6 +15,7 @@ import type { OpenRunIn } from "./OpenRunIn";
 import type { OpencodeSettings } from "./OpencodeSettings";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
+import type { SearchModalLayout } from "./SearchModalLayout";
 import type { SidebarSettings } from "./SidebarSettings";
 import type { TaskProposalRunMode } from "./TaskProposalRunMode";
 import type { TerminalSettings } from "./TerminalSettings";
@@ -52,6 +54,10 @@ windowMode: WindowMode, theme: Theme,
  * [`clamp_ui_font_size`].
  */
 uiFontSize: number, 
+/**
+ * Arrangement of results and source in Search Everywhere; pinned tabs keep their layout.
+ */
+searchModalLayout: SearchModalLayout, 
 /**
  * The brand colour every accent token is drawn in — primary buttons, focus rings, the
  * active tab, the awaiting counter. `None` is the shipped red, and it is `None` rather than
@@ -114,8 +120,8 @@ confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: Terminal
  * its Resume: the harness a pane runs is stamped on the pane itself
  * ([`crate::Pane::harness`]) the moment the spawn binds, because resuming a codex thread
  * with `claude --resume` (or the other way round) is a conversation the other CLI has never
- * heard of. Restart session is a fresh spawn, which is how a user moves an open console onto
- * the harness this now names.
+ * heard of. Restart session is a fresh spawn and follows this default unless that pane has
+ * a context-menu harness choice of its own.
  *
  * **Not a default for agent runs.** A role runs the harness its definition (or the
  * project's `agents.harness`) names, which stays Claude when nothing names one — codex runs
@@ -139,7 +145,7 @@ codex: CodexSettings,
 /**
  * OpenCode launch configuration, shared by consoles, runs and one-shots.
  */
-opencode: OpencodeSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, 
+opencode: OpencodeSettings, decision: DecisionSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, 
 /**
  * Which models an opencode run may use, and in what order. (M45) See [`crate::llm`].
  *

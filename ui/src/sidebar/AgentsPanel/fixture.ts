@@ -500,6 +500,7 @@ export type AgentsStoryName =
   | 'roles-resting'
   | 'role-running'
   | 'role-idle'
+  | 'role-blocked'
   | 'role-gate-running'
   | 'role-gate-handed-back'
   | 'role-in-review'
@@ -570,6 +571,16 @@ export const AGENTS_STORIES: Record<AgentsStoryName, AgentsPanelViewProps> = {
    * exited, and the row can still be given another turn.
    */
   'role-idle': story({ roster: ready([IDLE]) }),
+  'role-blocked': story({
+    roster: ready([
+      {
+        ...IDLE,
+        phase: 'blocked',
+        harness: 'codex',
+        failure: 'Selected model is at capacity. Please try a different model.',
+      },
+    ]),
+  }),
 
   /*
    * M114: an idle run is idle for a reason the row now says. The run set its task to review and

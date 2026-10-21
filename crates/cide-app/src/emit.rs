@@ -162,6 +162,9 @@ pub fn last_session_states()
 }
 
 pub fn session_state(app: &AppHandle, session: &str, state: cide_ipc::SessionState) {
+    if let Ok(id) = session.parse() {
+        crate::decision::baseline_state(app, id, state);
+    }
     last_states().lock().insert(session.to_owned(), state);
     let payload = SessionStateChanged {
         session: session.to_owned(),
@@ -198,6 +201,9 @@ pub fn peer_chat_reviews(app: &AppHandle, snapshot: &cide_ipc::PeerChatReviews) 
 }
 
 pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value) {
+    if let Ok(id) = session.parse() {
+        crate::decision::usage(app, id, &status);
+    }
     let payload = SessionStatus {
         session: session.to_owned(),
         status,
@@ -875,6 +881,13 @@ pub const SPEC_RUNS_CHANGED: &str = "cide://spec-runs-changed";
 /// A status gesture started (or reused) Apply. The shell showing this project opens its run;
 /// failures are reported separately from the status edit that already succeeded.
 pub const TASK_APPLY_STARTED: &str = "cide://task-apply-started";
+
+/// A user gesture was saved, but its agent did not start. No synthetic task comments.
+pub fn task_dispatch_feedback(app: &AppHandle, status: cide_ipc::TaskDispatchStatus) {
+    if let Err(error) = app.emit("cide://task-dispatch-feedback", status) {
+        tracing::debug!(%error, "task-dispatch-feedback reached no window");
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

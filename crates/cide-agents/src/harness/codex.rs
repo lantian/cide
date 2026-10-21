@@ -186,13 +186,34 @@ impl Harness for CodexHarness {
     fn observe(&self, current: RunState, ob: Observation<'_>) -> Option<RunState> {
         match ob {
             Observation::Exit(code) => {
+                if let RunState::Blocked { reason } = current {
+                    return Some(RunState::Failed {
+                        reason: format!("{reason} (Codex exited with code {code})"),
+                    });
+                }
                 let next = RunState::Finished { code };
                 (next != current).then_some(next)
             }
             Observation::Line(_) => None,
             Observation::Hook(frame) => {
                 let event = frame.kind()?;
+                // Only a real accepted prompt may recover a failed turn. Late tool/status
+                // traffic must not erase the failure while the TUI sits at its composer.
+                if matches!(current, RunState::Blocked { .. })
+                    && event != HookEvent::UserPromptSubmit
+                {
+                    return None;
+                }
                 let session: SessionState = session_state_of(&current)?;
+                if event == HookEvent::CideTurnFailed {
+                    let reason = frame.payload["error"]["message"]
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or("Codex could not complete this turn.");
+                    return Some(RunState::Blocked {
+                        reason: reason.to_owned(),
+                    });
+                }
                 let next = run_state_of(cide_claude::next_state(session, event)?)?;
                 (next != current).then_some(next)
             }
@@ -598,7 +619,10 @@ pub(crate) fn developer_brief(plan: &RunPlan<'_>) -> String {
     say(plan.agent.def.system_prompt.clone());
     // `&& tracker_paragraphs`: an MR review keeps the bridge and hears none of this (M85).
     if plan.hook_bin.is_some() && plan.tracker_paragraphs {
-        say(tracker_preamble(&CodexHarness));
+        say(tracker_preamble(
+            &CodexHarness,
+            plan.worker_instructions.as_deref(),
+        ));
         if let Some(change) = &plan.change {
             say(spec_preamble(
                 change,
@@ -1088,6 +1112,8 @@ mod tests {
             harness: agent.def.harness,
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            worker_instructions: None,
+            planning: None,
             review: false,
             server: None,
             git_dirs: Vec::new(),
@@ -1181,6 +1207,7 @@ mod tests {
         let mut plan = plan_for(&agent, session);
         plan.tracker_paragraphs = false;
         plan.review = true;
+        plan.worker_instructions = Some("Custom tracker workflow".into());
         plan.codex.cli.inject.permissions = false;
         plan.codex.cli.inject.review_permissions = true;
 
@@ -1189,6 +1216,19 @@ mod tests {
         assert_eq!(config_value(&args, "approvals_reviewer"), "\"auto_review\"");
         assert!(!args.iter().any(|arg| arg == "--approve-for-me"));
         assert!(!args.iter().any(|arg| arg == "-s"));
+        assert!(!developer_brief(&plan).contains("Custom tracker workflow"));
+    }
+
+    #[test]
+    fn custom_worker_instructions_are_excluded_without_the_tracker_bridge() {
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.worker_instructions = Some("Custom tracker workflow".into());
+        assert!(developer_brief(&plan).contains("Custom tracker workflow"));
+        plan.hook_bin = None;
+        let brief = developer_brief(&plan);
+        assert!(!brief.contains("Custom tracker workflow"));
+        assert!(brief.contains(&agent.def.system_prompt));
     }
 
     /// The hook table: one override per codex event, then the trust bypass without which none
@@ -1252,7 +1292,7 @@ mod tests {
             brief,
             format!(
                 "You are the developer agent. Finish the task.\n\n{}",
-                tracker_preamble(&CodexHarness)
+                tracker_preamble(&CodexHarness, None)
             )
         );
         assert!(brief.contains("mcp__cide__cide_task_get"), "{brief}");

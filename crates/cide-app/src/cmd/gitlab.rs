@@ -658,6 +658,7 @@ async fn plan_review(
         };
         let config = cide_agents::load_project(&root).config.agents;
         Ok::<_, String>(crate::agents::DispatchSpec {
+            planning: None,
             project,
             agent: cide_ipc::AgentId(crate::mr_review::REVIEW_AGENT.into()),
             agent_label: format!("Review !{}", mr["iid"]),

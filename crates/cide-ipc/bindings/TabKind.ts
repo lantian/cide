@@ -8,7 +8,7 @@ import type { RepoId } from "./RepoId";
 import type { SettingsSection } from "./SettingsSection";
 import type { SpecSubject } from "./SpecSubject";
 
-export type TabKind = { "kind": "claudeHome" } | { "kind": "claudeFull", title: string, 
+export type TabKind = { "kind": "claudeHome" } | { "kind": "conversation", id: string, title: string, } | { "kind": "claudeFull", title: string, 
 /**
  * Whether closing this tab **ends** the `claude` in it. (M79)
  *

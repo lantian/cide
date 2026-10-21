@@ -198,6 +198,7 @@ impl HookServer {
         // prompts, not at the rate a terminal prints.
         let (frames, inbox) = std::sync::mpsc::channel::<Inbound>();
         let submit = frames.clone();
+        let question_app = app.clone();
 
         thread::Builder::new()
             .name("cide-hook-apply".into())
@@ -307,13 +308,14 @@ impl HookServer {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
                     let frames = frames.clone();
+                    let question_app = question_app.clone();
                     // One thread per connection, each one short-lived, and each one *reading*
                     // only. A hook that connects and never writes therefore blocks only
                     // itself — while the frames that do arrive are applied in the order they
                     // were parsed, by the one thread above. See the module comment.
                     let _ = thread::Builder::new()
                         .name("cide-hook-conn".into())
-                        .spawn(move || handle(stream, &frames));
+                        .spawn(move || handle(stream, &frames, Some(&question_app)));
                 }
             })?;
 
@@ -523,10 +525,13 @@ fn socket_path() -> PathBuf {
 ///
 /// Parsing stays here, on the connection's own thread, so a malformed or enormous payload
 /// costs that hook and nothing else. Only the decision is serialised.
-fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<Inbound>) {
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let Ok(line) = line else { return };
+fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<Inbound>, app: Option<&AppHandle>) {
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -536,6 +541,12 @@ fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<Inbound>) {
             // A send that fails means the applier thread has gone, which only happens on the
             // way out. Nothing to report and nowhere left to report it.
             Ok(frame) => {
+                if frame.event == "CideNativeQuestion" {
+                    if let Some(app) = app {
+                        crate::native_questions::claude_hook(app, &frame, reader.get_ref());
+                    }
+                    return;
+                }
                 let _ = frames.send(Inbound::Frame(frame));
             }
             Err(error) => tracing::debug!(%error, "unparseable hook frame"),
@@ -690,6 +701,16 @@ fn apply(
     states: &DashMap<SessionId, SessionState>,
     conversations: &DashMap<SessionId, SessionId>,
 ) {
+    crate::decision::baseline_hook(app, frame);
+    crate::native_plan::observe_hook(app, frame);
+    crate::native_questions::observe_hook(app, frame);
+    // A failure can arrive while the session is already AwaitingInput. Its run must
+    // still learn the terminal verdict even when no session-state edge is emitted.
+    if frame.kind() == Some(HookEvent::CideTurnFailed)
+        && let Some(session) = frame.owner()
+    {
+        crate::agents::note_hook(app, session, frame);
+    }
     codex_status(frame, app);
     // The hook knows custom storage homes. Remember its path without doing disk I/O here.
     if let (Some(cwd), Some(id), Some(path)) = (
@@ -723,7 +744,9 @@ fn apply(
                 // run forked — happens on the coalescer's thread or on a task. See
                 // `crate::agents::note_hook`, which also says why the *frame* travels rather than
                 // the `SessionState` beside it.
-                crate::agents::note_hook(app, &session, frame);
+                if frame.kind() != Some(HookEvent::CideTurnFailed) {
+                    crate::agents::note_hook(app, &session, frame);
+                }
                 // And the second hop, under the same cheapness contract: a nudge held for a busy
                 // orchestrator is re-armed on any session's turn-end edge. The common case is
                 // one mutex and an `is_empty` — see `note_session_ready`'s own doc.
@@ -857,7 +880,7 @@ fn decide(
             .payload
             .get("tool_name")
             .and_then(|name| name.as_str())
-            == Some("request_user_input")
+            .is_some_and(|name| matches!(name, "request_user_input" | "AskUserQuestion"))
     {
         (current != SessionState::AwaitingInput).then_some(SessionState::AwaitingInput)
     } else {
@@ -1652,7 +1675,7 @@ mod tests {
         // EOF, so `handle` returns rather than blocking this thread for ever.
         drop(writer);
 
-        handle(reader, &frames);
+        handle(reader, &frames, None);
         drop(frames);
 
         let seen: Vec<String> = inbox

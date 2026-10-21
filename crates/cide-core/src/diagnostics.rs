@@ -118,6 +118,14 @@ impl DiagnosticStore {
         Self::default()
     }
 
+    /// Runtime status only: independent of presentation filters, without sorting findings.
+    pub fn source_statuses(&self) -> BTreeMap<DiagnosticSourceId, SourceStatus> {
+        self.sources
+            .iter()
+            .map(|(id, source)| (id.clone(), source.status.clone()))
+            .collect()
+    }
+
     /// Record what an analyser is doing. Creates the source if this is the first word from it.
     pub fn set_status(&mut self, source: DiagnosticSourceId, status: SourceStatus) {
         self.sources

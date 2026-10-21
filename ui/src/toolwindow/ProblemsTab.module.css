@@ -1,0 +1,27 @@
+.panel { display: flex; flex-direction: column; height: 100%; min-height: 0; color: var(--text); font-size: var(--fs-ui-12); }
+.toolbar { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.scopes { display: flex; gap: var(--sp-2); margin-right: var(--sp-4); }
+.button { composes: button quiet sm from '../kit/components/Button.module.css'; }
+.scope { background: transparent; color: var(--dim); border: 0; border-bottom: 2px solid transparent; padding: var(--sp-3); font: inherit; cursor: pointer; }
+.scope[aria-selected='true'] { color: var(--text-hi); border-bottom-color: var(--accent); }
+.select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font: inherit; padding: var(--sp-1); max-width: 180px; }
+.tree { flex: 1; min-height: 0; overflow: auto; outline: none; }
+.virtualRows { position: relative; width: 100%; }
+.group, .row { position: absolute; top: 0; left: 0; width: 100%; box-sizing: border-box; display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-1) var(--sp-4); cursor: default; white-space: nowrap; }
+.group { color: var(--text-hi); font-weight: 500; }
+.row { padding-left: calc(var(--sp-4) * 2); }
+.row:hover, .group:hover { background: var(--panel-2); }
+.row[aria-selected='true'], .group[aria-selected='true'] { background: color-mix(in srgb, var(--accent) 15%, var(--panel)); }
+.tree:focus .row[aria-selected='true'], .tree:focus .group[aria-selected='true'] { outline: 1px solid var(--accent); outline-offset: -1px; }
+.message { overflow: hidden; text-overflow: ellipsis; min-width: 60px; }
+.meta { color: var(--dim); font-size: var(--fs-ui-11); flex: none; }
+.where { margin-left: auto; font-family: var(--font-mono); color: var(--dim); padding-left: var(--sp-5); }
+.error { color: var(--red); }
+.warning { color: var(--yellow); }
+.info, .hint { color: var(--dim); }
+.note { padding: var(--sp-2) var(--sp-4); color: var(--dim); border-bottom: 1px solid var(--border); }
+.empty { padding: var(--sp-6); color: var(--dim); }
+.logs { margin: 0; padding: var(--sp-4); overflow: auto; flex: 1; min-height: 0; white-space: pre-wrap; font-family: var(--font-mono); font-size: var(--fs-ui-12); user-select: text; -webkit-user-select: text; }
+
+.button[aria-pressed='false'] { opacity: .45; background: transparent; }
+.button[aria-pressed='true'] { background: var(--panel-2); }

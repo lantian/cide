@@ -219,3 +219,23 @@
   line-height: 1;
   color: var(--dim);
 }
+
+.information {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+  white-space: pre-line;
+}
+.statusDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--dim);
+}
+.statusDot[data-status="ready"] { background: var(--green); }
+.statusDot[data-status="scanning"] { background: var(--yellow); }
+.statusDot[data-status="unavailable"] { background: var(--red); }

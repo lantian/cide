@@ -655,6 +655,16 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
         audit: undefined,
       }
 
+    case 'conversation':
+      return {
+        shape: styles.shapeSettings,
+        body: <span>{kind.title}</span>,
+        closable: true,
+        dirty: false,
+        hint: 'Saved conversation · Read only',
+        audit: 'conversationArchiveTab',
+      }
+
     case 'file': {
       const badge = badgeFor(kind.path)
       return {

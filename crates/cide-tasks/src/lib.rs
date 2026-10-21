@@ -651,6 +651,51 @@ pub fn clean_touches(touches: &[String]) -> Vec<String> {
     out
 }
 
+/// A task worktree isolates only this repository. Refuse declarations that escape it before a
+/// worker can treat an adjacent checkout as though it had been isolated too.
+pub fn invalid_touch(root: &Path, touches: &[String]) -> Option<String> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    for entry in touches {
+        let path = Path::new(entry.trim());
+        if path.is_absolute()
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Some(entry.clone());
+        }
+        let mut existing_prefix = PathBuf::new();
+        for component in path.components() {
+            if component
+                .as_os_str()
+                .to_string_lossy()
+                .contains(['*', '?', '[', '{'])
+            {
+                break;
+            }
+            existing_prefix.push(component.as_os_str());
+            if let Ok(target) = root.join(&existing_prefix).canonicalize()
+                && !target.starts_with(&canonical_root)
+            {
+                return Some(entry.clone());
+            }
+        }
+    }
+    None
+}
+
+fn validate_touches(root: &Path, touches: &[String]) -> Result<()> {
+    if let Some(entry) = invalid_touch(root, touches) {
+        return Err(CoreError::Io(format!(
+            "`touches` entry `{entry}` leaves this project repository; cide has no isolated worktree for a neighboring repository"
+        )));
+    }
+    Ok(())
+}
+
 /// The other half of [`TaskRow::of`]: a task's content, projected out of it. (M68)
 ///
 /// The pair is what lets every mutation go on operating on a whole [`Task`] — the shape each arm of
@@ -2778,6 +2823,9 @@ impl TaskStore {
         // Before the lock and before the write: a refusal must not be able to leave a
         // half-created task behind, and the caller wants the sentence, not a poisoned file.
         let change = validated_change(req.change.as_ref())?;
+        if let Some(touches) = req.touches.as_ref() {
+            validate_touches(&self.root, touches)?;
+        }
         self.update(move |file, cache| {
             // Inside the closure, unlike `change` above, because two of its refusals need the
             // file (existence) — and a refusal from in here rolls the update back whole, so
@@ -3195,7 +3243,10 @@ impl TaskStore {
                 }
                 // (M132) Plain field writes: who may make them is decided upstream of the store,
                 // where the caller's kind is known — this crate sees only an author.
-                TaskEdit::SetTouches { touches } => task.touches = clean_touches(&touches),
+                TaskEdit::SetTouches { touches } => {
+                    validate_touches(&self.root, &touches)?;
+                    task.touches = clean_touches(&touches);
+                }
                 TaskEdit::SetAcceptance { acceptance } => task.acceptance = acceptance,
                 TaskEdit::SetQuestion { question } => {
                     // Legacy blank strings clear a question; a structured question must validate.
@@ -5309,6 +5360,47 @@ mod tests {
                 "tools/spritegen/".to_string(),
                 "game/view/map_view.gd".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn touches_cannot_escape_the_project_checkout() {
+        let dir = TempDir::new("touch-boundary");
+        let root = dir.root();
+        assert_eq!(
+            invalid_touch(root, &["../repo-b/src".into()]),
+            Some("../repo-b/src".into())
+        );
+        assert_eq!(
+            invalid_touch(root, &["/tmp/other-repo".into()]),
+            Some("/tmp/other-repo".into())
+        );
+        assert_eq!(invalid_touch(root, &["src/main.rs".into()]), None);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("..", root.join("neighbor")).expect("symlink");
+            assert_eq!(
+                invalid_touch(root, &["neighbor/repo-b/src".into()]),
+                Some("neighbor/repo-b/src".into())
+            );
+        }
+        let store = TaskStore::open(root);
+        let mut request = new_task("outside");
+        request.touches = Some(vec!["../repo-b/src".into()]);
+        assert!(store.create(&request, TaskAuthor::User).is_err());
+        let task = store
+            .create(&new_task("inside"), TaskAuthor::User)
+            .expect("inside task");
+        assert!(
+            store
+                .edit(
+                    &task.id,
+                    TaskEdit::SetTouches {
+                        touches: vec!["../repo-b/src".into()]
+                    },
+                    TaskAuthor::User
+                )
+                .is_err()
         );
     }
 

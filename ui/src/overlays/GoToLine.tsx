@@ -39,6 +39,7 @@ import { Button } from '@/kit/components/Button'
 import { TextInput } from '@/kit/components/Field'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { requestReveal } from '@/editor/revealRequest'
 import { focusedCaret } from '@/editor/caretTrack'
 import { canGo, resolveGoto, gotoNote, parseGoto } from './gotoLineModel'
 import styles from './GoToLine.module.css'
@@ -84,7 +85,10 @@ export function GoToLine({ onDismiss, onGoTo }: GoToLineProps) {
     // the field has already promised. Passing the raw value handed `jump.ts` its own
     // `UNKNOWN_LINE` sentinel and the jump silently did nothing at all.
     const at = resolveGoto(parsed.at)
-    onGoTo(caret.path, at.line, at.column)
+    if (caret.revealKey) {
+      onDismiss()
+      requestReveal(caret.revealKey, { line: at.line, column: at.column, endColumn: at.column, focus: true, align: 'center' })
+    } else onGoTo(caret.path, at.line, at.column)
   }
 
   return (

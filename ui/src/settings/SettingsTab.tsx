@@ -1,3 +1,4 @@
+import { decisionApi } from '@/ipc/client'
 /**
  * Content mode C: the Settings tab.
  *
@@ -112,7 +113,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   const globalSettings = useSettings()
   const [harnessScope, setHarnessScope] = useState<'global' | 'project'>('global')
   const [tabs, setTabs] = useState<Partial<Record<SettingsSection, string>>>({})
-  const scopedProject = active === 'claudeSessions' && tabs.claudeSessions !== 'proxy' && harnessScope === 'project' ? project : null
+  const scopedProject = active === 'decision' ? project : active === 'claudeSessions' && tabs.claudeSessions !== 'proxy' && harnessScope === 'project' ? project : null
   const projectName = useWorkspace((s) => project === null ? null : s.boot?.workspace.projects[project]?.name ?? null)
   const overridesKey = useWorkspace((s) => JSON.stringify(s.boot?.workspace.projectHarness ?? {}))
   const [projectValues, setProjectValues] = useState<{ project: ProjectId; settings: Settings; overrides: ProjectHarnessSettings } | null>(null)
@@ -134,7 +135,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   const claudeVersion = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)
   const { patch: globalPatch, setTheme, setWindowMode } = useSettingsActions()
   const patch = useCallback((next: SettingsPatch) => {
-    if (scopedProject === null || next.proxy !== undefined) { globalPatch(next); return }
+    if (scopedProject === null || next.proxy !== undefined || next.decision !== undefined) { globalPatch(next); return }
     if (next.claude) editProjectHarness({ field: 'claude', value: next.claude.cli })
     if (next.codex) editProjectHarness({ field: 'codex', value: next.codex.cli })
     if (next.opencode) editProjectHarness({ field: 'opencode', value: next.opencode.cli })
@@ -359,6 +360,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
       ? null
       : {
           settings,
+          testDecision: decisionApi.probe,
           ...(scopedProject !== null && projectValues?.project === scopedProject ? { projectHarness: projectValues.overrides, editProjectHarness } : {}),
           opencodeSupport,
           tab,

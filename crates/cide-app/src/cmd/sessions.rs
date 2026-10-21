@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cide_core::CoreError;
+use cide_ipc::conversations::{ConversationPage, ConversationRequest, ConversationResponse};
 use cide_ipc::sessions::{SessionListing, TranscriptHit, TranscriptSearch, UserInputPage};
 use cide_ipc::{HarnessSession, ProjectId, RunOpen};
 use tauri::{AppHandle, Manager, State};
@@ -36,6 +37,70 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn sessions_list(app: AppHandle, project: ProjectId) -> Result<SessionListing> {
     blocking(move || crate::sessions_state::list(&app, project)).await
+}
+
+/// Page through a saved conversation without providing the desktop UI with Send or Resume.
+/// Refresh run sightings first so a History row predating the session journal is readable.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sessions_conversation_read(
+    app: AppHandle,
+    agents: State<'_, Arc<AgentRegistry>>,
+    project: ProjectId,
+    id: String,
+    generation: Option<String>,
+    before: Option<String>,
+) -> Result<ConversationPage> {
+    let agents = Arc::clone(&agents);
+    blocking(move || {
+        crate::sessions_state::observe_runs(&app, &agents, project);
+        match crate::conversations::handle(
+            &app,
+            ConversationRequest::Read {
+                project,
+                id,
+                follow_session: None,
+                generation,
+                before,
+                after: None,
+            },
+        )
+        .map_err(CoreError::Io)?
+        {
+            ConversationResponse::Read { page } => Ok(*page),
+            _ => unreachable!("read request returns a page"),
+        }
+    })
+    .await
+}
+
+/// Expand one archived message or tool result, still through the read-only command surface.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sessions_conversation_detail(
+    app: AppHandle,
+    project: ProjectId,
+    id: String,
+    generation: String,
+    item: String,
+    offset: u32,
+) -> Result<(String, Option<u32>)> {
+    blocking(move || {
+        match crate::conversations::handle(
+            &app,
+            ConversationRequest::Detail {
+                project,
+                id,
+                generation,
+                item,
+                offset,
+            },
+        )
+        .map_err(CoreError::Io)?
+        {
+            ConversationResponse::Detail { text, next } => Ok((text, next)),
+            _ => unreachable!("detail request returns text"),
+        }
+    })
+    .await
 }
 
 /// Prompt history is addressed by the CLI conversation, never by the displaying pane. Resolve
@@ -127,9 +192,8 @@ pub async fn sessions_search(
 /// 1. **A run the registry still holds** — its own `open_plan`, which knows about restarts,
 ///    opencode servers and a review's vanished checkout.
 /// 2. **A live child** with no pane showing it (closing a pane never ends a child) — mirror it.
-/// 3. **An ended conversation** — continue it in the directory it was started in, unless there
-///    is nothing to continue: no id the harness can resume, a directory that is gone (a review's
-///    checkout is deleted at quit), or a transcript that is.
+/// 3. **An ended conversation** — continue it when its directory exists, or show its saved
+///    conversation read-only when the directory has been removed.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn sessions_open(
     app: AppHandle,
@@ -163,7 +227,7 @@ pub async fn sessions_open(
         cwd: record.cwd.clone(),
     });
     if let Some(session) = record.session
-        && registry.get(session).is_some()
+        && registry.get(session).is_some_and(|pty| !pty.has_exited())
     {
         return Ok(RunOpen::Mirror {
             session,
@@ -177,10 +241,7 @@ pub async fn sessions_open(
         ));
     };
     if !conversation.cwd.is_dir() {
-        return Ok(unavailable(&format!(
-            "It was started in {}, which no longer exists — a harness resumes a conversation only from the directory it began in.",
-            conversation.cwd.display()
-        )));
+        return Ok(RunOpen::ReadOnly { conversation });
     }
     let transcript_kept = matches!(
         conversation.harness,

@@ -52,10 +52,15 @@
 //!
 //! | the header names | served |
 //! | --- | --- |
-//! | a run this process dispatched | the **nine** `cide_task_*` tools, scoped to that run's project, signing every comment as that run's role |
-//! | a pane `cide_session_open` opened (`PaneOrigin::Worker`, any kind) — M104 | the **nine** `cide_task_*` tools, scoped to its project, signing as the agent `task` ([`Scope::Worker`]) |
-//! | a Claude pane of a project — its console (`primary_session`) or any other | those nine **and** the orchestration tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
+//! | a run this process dispatched | task and user-request tools, scoped to that run's project, signing every comment as that run's role |
+//! | a pane `cide_session_open` opened (`PaneOrigin::Worker`, any kind) — M104 | task and user-request tools, scoped to its project, signing as the agent `task` ([`Scope::Worker`]) |
+//! | an automatic planner/reviewer tab ([`Scope::CideTab`]) | task, orchestration and user-request tools |
+//! | a user-opened pane of a project — its console (`primary_session`) or any other | task and orchestration tools, scoped to **that** project, signing as [`TaskAuthor::Orchestrator`] |
 //! | anything else, or nothing | a valid `initialize` and an **empty** tool list |
+//!
+//! Main harnesses use their own question flow: neither request tools nor legacy task-update
+//! question arguments are exposed to them. Automatic tabs retain requests across restores.
+//! With the tracker off, task and milestone tools disappear independently of request access.
 //!
 //! Never a crash, and never another project's tasks. The primary-session question is still asked,
 //! and first: not to decide the tool list any more, but to mark the console as such
@@ -389,6 +394,44 @@ pub(crate) trait ToolAccess: Send + Sync {
     fn reply_written(&self, _reply: &Value, _success: bool) {}
 }
 
+/// Read-only context retrieval is scoped by the launch, never by tool arguments.
+struct DecisionTools {
+    handle: crate::decision::Handle,
+    base: Box<dyn ToolAccess>,
+    names: Vec<&'static str>,
+}
+impl ToolAccess for DecisionTools {
+    fn names(&self) -> &[&'static str] {
+        &self.names
+    }
+    fn agent_sessions_enabled(&self) -> bool {
+        self.base.agent_sessions_enabled()
+    }
+    fn call(&self, name: &str, arguments: &Value) -> ToolResult {
+        self.call_cancellable(name, arguments, &AtomicBool::new(false))
+    }
+    fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &AtomicBool,
+    ) -> ToolResult {
+        if name != "cide_context" {
+            return self.base.call_cancellable(name, arguments, cancelled);
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return ToolResult::error("Context request cancelled");
+        }
+        match tauri::async_runtime::block_on(self.handle.context(arguments.clone())) {
+            Ok(value) => ToolResult::text(value.to_string()),
+            Err(error) => ToolResult::error(error),
+        }
+    }
+    fn reply_written(&self, reply: &Value, success: bool) {
+        self.base.reply_written(reply, success);
+    }
+}
+
 /// Pair messages are available only on a connection bound to a paired pane.
 struct PeerTools {
     app: AppHandle,
@@ -656,12 +699,7 @@ impl ToolAccess for ProjectTools {
             .is_some_and(|session| agent_sessions_enabled(&self.app, session))
     }
     fn names(&self) -> &[&'static str] {
-        match (self.orchestrator, self.tracker) {
-            (true, true) => tools::tool::EVERY,
-            (true, false) => tools::tool::ORCHESTRATION_NO_TRACKER,
-            (false, true) => tools::tool::RUN,
-            (false, false) => tools::tool::REQUESTS,
-        }
+        self.caller.tool_names(self.tracker)
     }
 
     fn call(&self, name: &str, arguments: &Value) -> ToolResult {
@@ -673,7 +711,17 @@ impl ToolAccess for ProjectTools {
         arguments: &Value,
         cancelled: &AtomicBool,
     ) -> ToolResult {
+        if let Some(refusal) = tools::question_arguments_refusal(
+            name,
+            arguments,
+            self.allows(tools::tool::USER_REQUEST),
+        ) {
+            return refusal;
+        }
         if tools::tool::REQUESTS.contains(&name) {
+            if !self.allows(name) {
+                return ToolResult::error("User requests are not available on this connection");
+            }
             return self.user_request(name, arguments, cancelled);
         }
 
@@ -698,6 +746,7 @@ impl ToolAccess for ProjectTools {
                 .unwrap_or_else(|| store.root().to_path_buf()),
             caller: self.caller_now(),
             live: live_runs_by_task(&self.app, self.project),
+            active: active_assignments(&self.app, self.project),
             reports: match &self.author {
                 TaskAuthor::Agent { agent, .. } if self.caller == tools::CallerKind::Run => {
                     turn_reports_of(self.project, agent)
@@ -770,7 +819,7 @@ impl ToolAccess for ProjectTools {
         }
         let asked = arguments
             .get("question")
-            .filter(|q| !q.is_null())
+            .filter(|q| name == tools::tool::TASK_UPDATE && !q.is_null())
             .and_then(|_| {
                 mutations
                     .iter()
@@ -820,6 +869,9 @@ impl ProjectTools {
     }
 
     fn user_request(&self, name: &str, args: &Value, cancelled: &AtomicBool) -> ToolResult {
+        if !self.allows(name) {
+            return ToolResult::error("User requests are not available on this connection");
+        }
         if args.get("wait").is_some_and(|wait| !wait.is_boolean()) {
             return ToolResult::error("wait must be a boolean");
         }
@@ -947,6 +999,8 @@ struct StoreSink {
     /// Which tasks a run is working on right now, and its role's label — read from the registry
     /// when the call arrives, as plain data so this type stays `AppHandle`-free. (M132)
     live: Vec<(TaskId, String)>,
+    /// Run identity for reassignment refusals, read at call entry beside `live`.
+    active: Vec<(TaskId, AgentId, RunId, RunState)>,
     /// This run's report comment per task in its current turn (M132), from [`TURN_REPORTS`].
     reports: Vec<(TaskId, cide_ipc::CommentId)>,
     /// Reports this call left, written back to [`TURN_REPORTS`] by [`ProjectTools::call`].
@@ -1050,6 +1104,19 @@ impl TaskSink for StoreSink {
         // orchestrator's revive), the same reading `cmd::tasks::task_edit` gives the dropdown.
         let assign_gesture = matches!(&edit, TaskEdit::Assign { agent: Some(_) });
         let before = self.store.get(id);
+        if let (TaskEdit::Assign { agent: next }, Some(current)) = (&edit, before.as_ref())
+            && current.agent.as_ref() != next.as_ref()
+            && let Some(old) = current.agent.as_ref()
+            && let Some((_, _, run, state)) = self
+                .active
+                .iter()
+                .find(|(task, agent, _, _)| task == id && agent == old)
+        {
+            return Err(format!(
+                "cannot reassign {id} while `{old}` has run {run} [{}] working on it; stop that run first",
+                cide_agents::tools::run_state_wire(state)
+            ));
+        }
         let task = self
             .store
             .edit(id, edit, self.author.clone())
@@ -1910,9 +1977,14 @@ impl AgentSink for RegistrySink {
             (Work::External(work), _) => {
                 crate::cmd::agents::external_prompt(work, request.instructions.as_deref(), tools)
             }
-            (Work::Task(_), task) => {
-                crate::cmd::agents::opening_prompt(task, request.instructions.as_deref(), tools)
-            }
+            (Work::Task(_), task) => crate::cmd::agents::opening_prompt(
+                task,
+                request.instructions.as_deref(),
+                tools,
+                cide_agents::config::load(&root)
+                    .agents
+                    .task_start_template(),
+            ),
         };
         let unattended = cide_agents::config::load(&root).agents.unattended();
 
@@ -2251,7 +2323,24 @@ fn app_binder(app: AppHandle) -> Arc<Binder> {
             )),
             Scope::Unscoped => Box::new(NoTools),
         };
-        with_ide_tools(&app, ide_target, base)
+        let base = with_ide_tools(&app, ide_target, base);
+        if !base.names().is_empty()
+            && let Some(session) = hello
+                .and_then(|h| h.session.as_deref())
+                .and_then(|s| s.parse().ok())
+            && let Some(handle) =
+                crate::decision::handle(&app, session).filter(crate::decision::Handle::enabled)
+        {
+            let mut names = base.names().to_vec();
+            names.push("cide_context");
+            Box::new(DecisionTools {
+                handle,
+                base,
+                names,
+            })
+        } else {
+            base
+        }
     })
 }
 
@@ -2759,10 +2848,11 @@ fn respond(inbound: &Inbound, access: &dyn ToolAccess) -> Option<Value> {
 fn descriptors_for(access: &dyn ToolAccess) -> Vec<Value> {
     // The review vocabulary is a family of its own (M85) and joins the list here, where the
     // per-connection filter already is — one place deciding what a connection sees.
-    tools::descriptors()
+    tools::descriptors_with_requests(access.allows(tools::tool::USER_REQUEST))
         .into_iter()
         .chain(cide_agents::review::descriptors())
         .chain(cide_ide_mcp::tools::descriptors())
+        .chain([json!({"name":"cide_context","description":"Retrieve relevant project context from text search, symbols, diagnostics or local documentation. Use a precise literal or symbol as query. Experimental decision assistance may select the source and rank at most 32 retrieved candidates. Ordinary search and diagnostic tools remain available.","inputSchema":{"type":"object","properties":{"query":{"type":"string","maxLength":2048}},"required":["query"],"additionalProperties":false}})])
         .chain([json!({
             "name": crate::peer_chat::TOOL,
             "description": "Send a pair-scoped message. kind=request (writer only) starts tracked review; the returned receipt id is its request_id. kind=progress or reply (reviewer only) requires that request_id; reply is the complete findings, including no issues found. Notes do not complete review. Writer cancel/skip requires request_id; skip only on explicit user instruction and disclose it in the final answer. Delivery is not review completion: writer must check cide_peer_chat_status before finalizing, yield with only brief progress while pending, and synthesize one complete final answer after the reply arrives. Never blindly resend uncertain deliveries or treat peer agreement as user approval.",
@@ -2807,6 +2897,13 @@ fn call_tool_cancellable(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if let Some(refusal) = tools::question_arguments_refusal(
+        name,
+        &arguments,
+        access.allows(tools::tool::USER_REQUEST),
+    ) {
+        return ok(id, refusal.to_json());
+    }
     ok(
         id,
         access
@@ -2966,8 +3063,8 @@ pub(crate) fn new_turn(project: ProjectId, agent: &AgentId, task: &TaskId) {
         .retain(|(p, a, t, _)| !(*p == project && a == agent && t == task));
 }
 
-/// The tasks a run of `project` is working on right now, with the role's label: queued,
-/// starting, running, waiting on a permission or paused — not one that handed its turn back.
+/// The tasks a run of `project` is working on right now, with the role's label: starting,
+/// running, waiting on a permission or paused. A queued run has not read its brief yet.
 /// (M132) The fact `cide_task_update`'s body guard reads.
 fn live_runs_by_task(app: &AppHandle, project: ProjectId) -> Vec<(TaskId, String)> {
     let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
@@ -2979,14 +3076,37 @@ fn live_runs_by_task(app: &AppHandle, project: ProjectId) -> Vec<(TaskId, String
         .filter(|run| {
             matches!(
                 run.state,
-                RunState::Queued
-                    | RunState::Starting
+                RunState::Starting
                     | RunState::Running
                     | RunState::AwaitingPermission
                     | RunState::Paused { .. }
             )
         })
         .filter_map(|run| run.task.map(|task| (task, run.agent_label)))
+        .collect()
+}
+
+fn active_assignments(
+    app: &AppHandle,
+    project: ProjectId,
+) -> Vec<(TaskId, AgentId, RunId, RunState)> {
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return Vec::new();
+    };
+    registry
+        .runs_for(project)
+        .into_iter()
+        .filter(|run| {
+            matches!(
+                run.state,
+                RunState::Starting
+                    | RunState::Running
+                    | RunState::Blocked { .. }
+                    | RunState::AwaitingPermission
+                    | RunState::Paused { .. }
+            )
+        })
+        .filter_map(|run| run.task.map(|task| (task, run.agent, run.run, run.state)))
         .collect()
 }
 
@@ -4019,6 +4139,27 @@ fn hand_back_to_run_with_view(
 /// `AgentRegistry::watch_exit`'s production closure, which is where a reaped child's exit picks
 /// its app back up (the observation itself travels app-free so a test can drive it).
 pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
+    // A failed live turn needs human attention. The ordinary completion route can
+    // open reviewers, integrate branches or dispatch follow-ups, so it cannot carry
+    // this alert. Use the existing visible warning bus and leave recovery manual.
+    if let Some(registry) = app.try_state::<Arc<AgentRegistry>>()
+        && let Some(row) = registry
+            .runs_for(project)
+            .into_iter()
+            .find(|row| row.run == run)
+        && let RunState::Blocked { reason } = row.state
+    {
+        crate::emit::pool_notice(
+            app,
+            project,
+            format!(
+                "{} is blocked: {} Open its conversation to retry or change models.",
+                row.agent_label,
+                one_line(&reason),
+            ),
+        );
+        return;
+    }
     // The death comment first, before the nudge machinery gets any chance to return early: the
     // nudge dedupes per *turn* and can be refused (a busy orchestrator, a repeated edge), and
     // the comment must not inherit either refusal — the board is the durable record, the nudge
@@ -4040,6 +4181,10 @@ pub fn note_run_over(app: &AppHandle, project: ProjectId, run: RunId) {
     let Some(turn) = turn_of(app, project, run) else {
         return;
     };
+    if matches!(turn.outcome, TurnOutcome::Cancelled { .. }) {
+        announce(app, turn);
+        return;
+    }
     // A turn whose branch is still being verified waits for the answer (M114) — see [`GATES`].
     let Some(turn) = gate_turn(&mut GATES.lock(), turn) else {
         return;
@@ -4308,8 +4453,24 @@ fn flush_nudges(app: &AppHandle) {
         let Some(due) = NUDGES.take_due() else {
             continue;
         };
-        for ((project, route), turns) in by_route(due) {
-            deliver_nudge(app, project, &route, turns);
+        let mut groups: Vec<Vec<Turn>> = Vec::new();
+        for turn in due {
+            let cancelled = matches!(turn.outcome, TurnOutcome::Cancelled { .. });
+            if groups
+                .last()
+                .and_then(|group| group.last())
+                .is_none_or(|last| {
+                    matches!(last.outcome, TurnOutcome::Cancelled { .. }) != cancelled
+                })
+            {
+                groups.push(Vec::new());
+            }
+            groups.last_mut().expect("just made a group").push(turn);
+        }
+        for group in groups {
+            for ((project, route), turns) in by_route(group) {
+                deliver_nudge(app, project, &route, turns);
+            }
         }
         return;
     }
@@ -4354,7 +4515,11 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
     // It **replaces** the console line rather than joining it. Two announcements of one fact
     // cost two turns and give two readers the same job, and the reader with the empty context is
     // the one this feature exists to reach.
-    if config.finish_in_new_tab {
+    if config.finish_in_new_tab
+        && !turns
+            .iter()
+            .all(|turn| matches!(turn.outcome, TurnOutcome::Cancelled { .. }))
+    {
         // **One reviewer per task**, and the second burst is told rather than duplicated —
         // [`REVIEWERS`] carries the whole argument and the board it was measured on. Asked
         // before the prompt is built, because the two roads say different things: a tab that
@@ -4540,10 +4705,13 @@ fn review_checkout(root: &std::path::Path, turns: &[Turn]) -> Option<std::path::
 /// two lookups would be two chances for them to name it differently — and the second would be
 /// taken a few milliseconds later, which is exactly long enough for a run to have renamed it.
 fn title_of(app: &AppHandle, project: ProjectId, turns: &[Turn]) -> Option<String> {
-    turns
-        .last()
-        .and_then(|turn| turn.task.as_ref())
-        .and_then(|task| task_title(app, project, task))
+    turns.last().and_then(|turn| {
+        turn.task_title.clone().or_else(|| {
+            turn.task
+                .as_ref()
+                .and_then(|task| task_title(app, project, task))
+        })
+    })
 }
 
 /// One ended turn, as the edge recorded it.
@@ -4569,6 +4737,7 @@ struct Turn {
     agent: AgentId,
     agent_label: String,
     task: Option<TaskId>,
+    task_title: Option<String>,
     outcome: TurnOutcome,
     /// What the verify of this run's branch said, when the turn waited for it (M114) — `None`
     /// for a turn nothing verified, which is every turn of a project with no verify command.
@@ -4594,6 +4763,7 @@ fn ended_phrase(turn: Option<&Turn>) -> String {
     let ended = match turn.map(|turn| &turn.outcome) {
         None | Some(TurnOutcome::HandedBack) => "handed its turn back".to_string(),
         Some(TurnOutcome::Finished { code }) => format!("finished (exit {code})"),
+        Some(TurnOutcome::Cancelled { reason }) => format!("was cancelled ({})", one_line(reason)),
         Some(TurnOutcome::Failed) => "failed".to_string(),
     };
     match turn.and_then(|turn| turn.gate) {
@@ -4641,6 +4811,8 @@ enum TurnOutcome {
     HandedBack,
     /// The child exited; the code is the reaper's, never invented.
     Finished { code: i32 },
+    /// An intentional stop or reassignment.
+    Cancelled { reason: String },
     /// The run failed before or instead of finishing — a spawn that never came up, a stop.
     Failed,
 }
@@ -4655,6 +4827,7 @@ enum TurnOutcome {
 /// is otherwise indistinguishable from the nudge being off, and the two have different fixes.
 fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
     let registry = app.try_state::<Arc<AgentRegistry>>()?;
+    let (snapshot_title, stop) = registry.turn_details(run)?;
     registry
         .runs_for(project)
         .into_iter()
@@ -4676,8 +4849,27 @@ fn turn_of(app: &AppHandle, project: ProjectId, run: RunId) -> Option<Turn> {
             agent: live.agent,
             agent_label: live.agent_label,
             task: live.task,
+            task_title: snapshot_title,
             gate: None,
             outcome: match live.state {
+                RunState::Cancelled { reason, .. } => TurnOutcome::Cancelled { reason },
+                RunState::Finished { .. }
+                    if stop.as_ref().is_some_and(|stop| {
+                        matches!(
+                            stop.how,
+                            crate::agents::StopHow::WoundDown
+                                | crate::agents::StopHow::Forced { .. }
+                                | crate::agents::StopHow::Immediate { .. }
+                        )
+                    }) =>
+                {
+                    TurnOutcome::Cancelled {
+                        reason: format!(
+                            "stopped by {}",
+                            stop.as_ref().expect("checked").by.phrase()
+                        ),
+                    }
+                }
                 RunState::Finished { code } => TurnOutcome::Finished { code },
                 RunState::Failed { .. } => TurnOutcome::Failed,
                 // The handed-back edge left the run `Idle`; any other state means it has already
@@ -4797,6 +4989,12 @@ fn nudge_line(turns: &[Turn], title: Option<&str>) -> String {
         (Some(id), None) => format!(" on task {id}"),
         (None, _) => String::new(),
     };
+
+    if last.is_some_and(|turn| matches!(turn.outcome, TurnOutcome::Cancelled { .. })) {
+        return one_line(&format!(
+            "A subagent run {ended}: {who}{on}. This was a requested cancellation; check mcp__cide__cide_agent_runs for its final state."
+        ));
+    }
 
     let line = match (turns.len(), task.is_some()) {
         (0 | 1, true) => format!(
@@ -5281,6 +5479,7 @@ mod tests {
             harness_conversation: None,
             continues: None,
             harness: None,
+            harness_choice: None,
             title: "cide : claude".into(),
             docker: None,
             origin: None,
@@ -5696,7 +5895,7 @@ mod tests {
         /// The product owner's list: the nine task tools and the eleven orchestration ones.
         fn every() -> Self {
             Self {
-                names: tools::tool::EVERY.to_vec(),
+                names: tools::tool::CONSOLE.to_vec(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -5722,6 +5921,87 @@ mod tests {
 
     fn ask(raw: &str, access: &dyn ToolAccess) -> Option<Value> {
         respond(&classify(raw), access)
+    }
+
+    #[test]
+    fn questions_are_scoped_and_legacy_arguments_never_reach_a_main_sink() {
+        use tools::CallerKind;
+        for caller in [
+            CallerKind::Console,
+            CallerKind::CideTab,
+            CallerKind::Worker,
+            CallerKind::Run,
+        ] {
+            for tracker in [false, true] {
+                let access = FakeAccess {
+                    names: caller.tool_names(tracker).to_vec(),
+                    calls: Mutex::new(Vec::new()),
+                };
+                let permitted = caller != CallerKind::Console;
+                let listed = descriptors_for(&access);
+                for name in tools::tool::REQUESTS {
+                    assert_eq!(listed.iter().any(|d| d["name"] == *name), permitted);
+                    let reply = call_tool(&json!(1), &json!({"name":name,"arguments":{}}), &access);
+                    assert_eq!(reply["error"]["code"] == METHOD_NOT_FOUND, !permitted);
+                }
+                access.calls.lock().clear();
+                if tracker {
+                    let update = listed
+                        .iter()
+                        .find(|d| d["name"] == tools::tool::TASK_UPDATE)
+                        .unwrap();
+                    assert_eq!(
+                        update["inputSchema"]["properties"]
+                            .get("question")
+                            .is_some(),
+                        permitted
+                    );
+                    assert_eq!(
+                        update["description"]
+                            .as_str()
+                            .unwrap()
+                            .contains("cide_user_request"),
+                        permitted
+                    );
+                    for args in [
+                        json!({"id":"t-1","title":"must not change","question":"Choose"}),
+                        json!({"id":"t-1","question":null}),
+                        json!({"id":"t-1","questionWait":false}),
+                        json!({"id":"t-1","questionTitle":"Choose"}),
+                        json!({"id":"t-1","attachments":["missing"],"question":{"text":"Pick","options":[]}}),
+                    ] {
+                        let reply = call_tool(
+                            &json!(2),
+                            &json!({"name":tools::tool::TASK_UPDATE,"arguments":args}),
+                            &access,
+                        );
+                        assert_eq!(reply["result"]["isError"], !permitted);
+                    }
+                    assert_eq!(access.calls.lock().len(), if permitted { 5 } else { 0 });
+                    access.calls.lock().clear();
+                    // Unsupported extra arguments on another task tool must not reach the
+                    // legacy question handoff, even when the edited task already has a question.
+                    for name in tools::tool::ALL {
+                        let reply = call_tool(
+                            &json!(4),
+                            &json!({"name":name,"arguments":{"id":"t-1","question":"Choose"}}),
+                            &access,
+                        );
+                        assert_eq!(reply["result"]["isError"], !permitted);
+                    }
+                    assert_eq!(
+                        access.calls.lock().len(),
+                        if permitted { tools::tool::ALL.len() } else { 0 }
+                    );
+                    let reply = call_tool(
+                        &json!(3),
+                        &json!({"name":tools::tool::TASK_UPDATE,"arguments":{"id":"t-1","title":"Ordinary edit"}}),
+                        &access,
+                    );
+                    assert_eq!(reply["result"]["isError"], false);
+                }
+            }
+        }
     }
 
     #[test]
@@ -6330,8 +6610,7 @@ mod tests {
             }));
             owner.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
             let names = tool_names(owner.recv());
-            assert_eq!(names.len(), 31, "{names:?}");
-            assert_eq!(names, tools::tool::EVERY);
+            assert_eq!(names, tools::tool::CONSOLE);
             assert!(names.contains(&"cide_task_list"));
             assert!(names.contains(&"cide_agent_dispatch"));
             // The settings four reach a product owner's pane and nowhere else. (M71)
@@ -6455,6 +6734,7 @@ mod tests {
             cwd: root.clone(),
             caller: tools::CallerKind::Console,
             live: Vec::new(),
+            active: Vec::new(),
             reports: Vec::new(),
             new_reports: Mutex::new(Vec::new()),
         };
@@ -6556,6 +6836,7 @@ mod tests {
             cwd: worktree.clone(),
             caller: tools::CallerKind::Run,
             live: Vec::new(),
+            active: Vec::new(),
             reports: Vec::new(),
             new_reports: Mutex::new(Vec::new()),
         };
@@ -6894,6 +7175,7 @@ mod tests {
             agent: AgentId(id.trim_matches('-').to_string()),
             agent_label: agent.to_string(),
             task: task.map(|id| TaskId(id.to_string())),
+            task_title: None,
             outcome,
             gate: None,
         }

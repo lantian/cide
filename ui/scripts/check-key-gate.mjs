@@ -197,6 +197,7 @@ try {
     // Find in files. `KeyF` is in the sweep below, so this covers the property that matters
     // for a chord the terminal would otherwise receive: both entry points must swallow it
     // identically, or ⌃⇧F opens the panel *and* sends `^F` to whatever pty had focus.
+    { key: 'shift shift', command: 'search.everywhere', when: null },
     { key: 'ctrl+shift+f', command: 'sidebar.search', when: null },
     // M13. *Select opened file*, unconditional — and `KeyE` is in the sweep below, which is
     // what pins the property that matters for a chord a terminal would otherwise get: both
@@ -214,6 +215,7 @@ try {
     // browser; `theme.toggle` had it and now ships unbound. `KeyT` is in the sweep's key list,
     // so this and `ctrl+t` below together pin the property that matters for the pair.
     { key: 'ctrl+shift+t', command: 'tab.reopenClosed', when: null },
+    { key: 'ctrl+shift+m', command: 'sidebar.problems', when: null },
     // Git pull. `KeyT` is already in the sweep below, so this covers the property that
     // matters for a chord the terminal would otherwise get: both entry points must swallow
     // it identically. If they disagree, Ctrl+T pulls *and* sends `^T` to the pty — which is
@@ -238,6 +240,7 @@ try {
     // must swallow it in a shell window and pass it through in a detached one, or `mc` and
     // `htop` see a key press the user did not make.
     { key: 'f4', command: 'sidebar.toggle', when: 'shellWindow' },
+    { key: 'f4', command: 'problems.jumpToSource', when: 'problemsFocused' },
     { key: 'ctrl+alt+h', command: 'pane.navigate.left', when: null },
     { key: 'ctrl+alt+l', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+alt+k', command: 'pane.navigate.up', when: null },
@@ -671,6 +674,21 @@ try {
         clock += ms
       },
     }
+  }
+
+  // Two modifier taps complete on keyup, and the window/xterm paths may see each event.
+  {
+    const g = makeGate({ shellWindow: true })
+    for (let tap = 0; tap < 2; tap++) {
+      const down = event({ key: 'Shift', code: 'ShiftLeft', shift: true })
+      const up = { ...event({ key: 'Shift', code: 'ShiftLeft' }), type: 'keyup' }
+      g.gate.windowHandler(down); g.gate.terminalHandler(down)
+      g.advance(30)
+      g.gate.windowHandler(up); g.gate.terminalHandler(up)
+      g.advance(80)
+    }
+    eq(g.dispatched.map(d => d.command).join(','), 'search.everywhere', 'double Shift resolves once across both gate entry points')
+    g.gate.reset()
   }
 
   /* --------------------------------------------- the claim: both entry points agree */

@@ -38,11 +38,14 @@
 pub mod autodispatch;
 pub mod config;
 pub mod defs;
+pub mod task_dispatch;
 // No `///` here, for `harness`'s reason below: `limits.rs`'s `//!` header is the summary.
 pub mod limits;
 /// `@role` mentions in task prose — the pure scanner; who acts on one is `cide-app`'s question.
 pub mod mentions;
 pub mod milestones;
+pub mod native_plan;
+pub mod native_questions;
 pub mod overrides;
 pub mod paths;
 /// The merge-request review vocabulary. (M85)
@@ -155,24 +158,39 @@ pub fn dispatch_refusal(
     config: &AgentsConfig,
     bridge: Option<&std::path::Path>,
 ) -> Option<String> {
+    dispatch_refusals(agent, config, bridge)
+        .into_iter()
+        .next()
+        .map(|reason| reason.text)
+}
+
+/// All applicable role gates, in the same order as the explicit dispatch refusal.
+pub fn dispatch_refusals(
+    agent: &LoadedAgent,
+    config: &AgentsConfig,
+    bridge: Option<&std::path::Path>,
+) -> Vec<cide_ipc::TaskDispatchReason> {
+    use cide_ipc::TaskDispatchReason;
+    let mut reasons = Vec::new();
     if !config.enabled {
-        return Some(format!(
+        reasons.push(TaskDispatchReason::new("agentsDisabled", format!(
             "Subagents are off for this project. Turn them on in the Agents panel, which writes \
              `{}/config.json`.",
             config::CIDE_DIR
-        ));
+        )));
     }
     if bridge.is_none() {
-        return Some(
+        reasons.push(TaskDispatchReason::new(
+            "bridgeUnavailable",
             "cide cannot find its `cide-hook` binary beside the running executable, so a run \
              would start with no connection to the task tracker: no `cide_task_*` tools, and no \
              way to comment what it did. Rebuild it with `cargo build -p cide-hook`, or launch \
              through `./run.sh`, which builds both."
                 .to_string(),
-        );
+        ));
     }
     if let Some(reason) = &agent.def.unavailable {
-        return Some(reason.clone());
+        reasons.push(TaskDispatchReason::new("roleUnavailable", reason.clone()));
     }
     // A project whose own default is bypass passes this gate too. That is coherence rather than
     // a hole: while the project sends every unattended child out with no brake, a role that
@@ -182,17 +200,20 @@ pub fn dispatch_refusal(
         && !config.allow_dangerous_permissions
         && config.unattended() != config::Unattended::Bypass
     {
-        return Some(format!(
-            "`{}` asks for `permission-mode: {}`, which lets it edit, delete and run anything \
+        reasons.push(TaskDispatchReason::new(
+            "permissions",
+            format!(
+                "`{}` asks for `permission-mode: {}`, which lets it edit, delete and run anything \
              without asking. This project runs unattended children in `agents.permissionMode` \
              `auto` or `manual`, and has not authorised this role either: set \
              `agents.allowDangerousPermissions` to true in `{}/config.json` if you mean it.",
-            agent.def.id,
-            defs::BYPASS_PERMISSIONS,
-            config::CIDE_DIR
+                agent.def.id,
+                defs::BYPASS_PERMISSIONS,
+                config::CIDE_DIR
+            ),
         ));
     }
-    None
+    reasons
 }
 
 /// Whether this role asks to skip every permission prompt.

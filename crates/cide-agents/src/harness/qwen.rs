@@ -383,6 +383,15 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     // could not.
     args.push("-i".into());
     args.push(plan.prompt.clone());
+    // Cide enters through Qwen's native /plan command before submitting the work.
+    // This preserves prePlanMode for the native RestorePrevious approval action.
+    if plan
+        .planning
+        .as_ref()
+        .is_some_and(crate::native_plan::State::pending)
+    {
+        args.truncate(args.len() - 2);
+    }
 
     // ---- 2. identity ----
     if resume {
@@ -408,7 +417,7 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     if tracker.is_some() && plan.tracker_paragraphs {
         cide_core::claude_cli::fold_append_system_prompt(
             &mut args,
-            &tracker_preamble(&QwenHarness),
+            &tracker_preamble(&QwenHarness, plan.worker_instructions.as_deref()),
         );
         if let Some(change) = &plan.change {
             cide_core::claude_cli::fold_append_system_prompt(
@@ -456,9 +465,23 @@ fn assemble(plan: &RunPlan<'_>, resume: bool) -> Result<HarnessSpawn, HarnessErr
     //
     // A yargs array collects every following token up to the next `--flag`, so it goes after
     // everything else. An argument added below this line has to think about that.
-    if !plan.agent.tools.is_empty() {
+    let reads: Vec<String> = if tracker.is_some()
+        && plan
+            .planning
+            .as_ref()
+            .is_some_and(crate::native_plan::State::pending)
+    {
+        ["cide_task_get", "cide_task_list"]
+            .into_iter()
+            .map(|tool| QwenHarness.tool_name(tool))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !plan.agent.tools.is_empty() || !reads.is_empty() {
         args.push("--allowed-tools".into());
         args.extend(plan.agent.tools.iter().cloned());
+        args.extend(reads);
     }
 
     let mut spec = SpawnSpec::new(program, plan.cwd.clone()).geometry(PtyGeometry::new(
@@ -619,6 +642,8 @@ mod tests {
             harness: agent.def.harness,
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            worker_instructions: None,
+            planning: None,
             review: false,
             server: None,
             git_dirs: Vec::new(),
@@ -633,6 +658,37 @@ mod tests {
         args.iter()
             .position(|a| a == token)
             .unwrap_or_else(|| panic!("no {token} in {args:?}"))
+    }
+
+    #[test]
+    fn native_planning_waits_for_the_mode_transition_before_submitting_work() {
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.planning = Some(Default::default());
+        plan.unattended = Unattended::Auto;
+        let spawn = QwenHarness.spawn_spec(&plan).unwrap();
+        assert!(
+            !spawn
+                .spec
+                .args
+                .iter()
+                .any(|arg| arg == "-i" || arg == &plan.prompt)
+        );
+        assert_eq!(
+            spawn.spec.args[at(&spawn.spec.args, "--approval-mode") + 1],
+            "auto"
+        );
+        assert!(spawn.opening.is_none());
+        plan.planning.as_mut().unwrap().phase = crate::native_plan::Phase::Implementing;
+        assert!(
+            QwenHarness
+                .spawn_spec(&plan)
+                .unwrap()
+                .spec
+                .args
+                .iter()
+                .any(|arg| arg == &plan.prompt)
+        );
     }
 
     fn env_value<'a>(spec: &'a SpawnSpec, name: &str) -> Option<&'a str> {

@@ -1,0 +1,16 @@
+.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: calc(8px * var(--ui-scale)); margin-bottom: calc(12px * var(--ui-scale)); }
+.total { font-size: var(--fs-ui-20); color: var(--text-hi); font-weight: 600; }
+.muted { display: block; color: var(--dim); font-size: var(--fs-ui-11); }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: calc(12px * var(--ui-scale)); }
+.history, .details { height: min(42vh, calc(480px * var(--ui-scale))); overflow: auto; min-width: 0; }
+.details { display: flex; flex-direction: column; gap: calc(8px * var(--ui-scale)); overflow-wrap: anywhere; }
+/* Keep the summary and disclosures at their natural height inside the scrollport. */
+.details > * { flex-shrink: 0; min-width: 0; }
+.details > p { margin: 0; }
+.details dd { white-space: normal; overflow-wrap: anywhere; }
+.virtualRow { position: absolute; top: 0; left: 0; width: 100%; padding-bottom: calc(4px * var(--ui-scale)); }
+.virtualRow > button { width: 100%; display: flex; justify-content: space-between; gap: var(--sp-4); height: auto; padding: var(--sp-4) var(--sp-5); white-space: normal; min-height: calc(48px * var(--ui-scale)); text-align: left; }
+.virtualRow > button > :first-child { min-width: 0; overflow-wrap: anywhere; }
+.virtualRow > button > :last-child { flex: none; }
+.virtualRow > button[aria-pressed='true'] { background: var(--sel); border-color: var(--accent-dim); color: var(--text-hi); }
+.table { max-height: 45vh; overflow: auto; }

@@ -109,7 +109,7 @@ pub(crate) fn description(name: &str) -> Option<&'static str> {
              preferences: excluded files and review prompts; accounts are connected from the GitLab \
              panel, never here). `action: get` shows the section; `set` with `field` and `value` \
              changes one field. `section: \"harness\"` reads local project overrides: consoleHarness, \
-             claude, codex or opencode launch configuration; set overrides one field, reset removes \
+             claude, codex or opencode launch configuration, and decision experiment settings; set overrides one field, reset removes \
              that field to inherit global settings. How roles run is cide_agents_config and cide_agent_override."
         }
         tool::COMMAND_RUN => {

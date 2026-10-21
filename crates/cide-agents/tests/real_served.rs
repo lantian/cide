@@ -117,6 +117,8 @@ fn plan<'a>(
         harness: agent.def.harness,
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: false,
+        worker_instructions: None,
+        planning: None,
         review: false,
         server: Some(server),
         git_dirs: Vec::new(),

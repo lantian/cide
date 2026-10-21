@@ -3,5 +3,6 @@ import type { ClaudeCli } from "./ClaudeCli";
 import type { CodexCli } from "./CodexCli";
 import type { ConsoleHarness } from "./ConsoleHarness";
 import type { OpencodeCli } from "./OpencodeCli";
+import type { ProjectDecisionSettings } from "./ProjectDecisionSettings";
 
-export type ProjectHarnessSettings = { consoleHarness?: ConsoleHarness, claude?: ClaudeCli, codex?: CodexCli, opencode?: OpencodeCli, };
+export type ProjectHarnessSettings = { decision?: ProjectDecisionSettings, consoleHarness?: ConsoleHarness, claude?: ClaudeCli, codex?: CodexCli, opencode?: OpencodeCli, };

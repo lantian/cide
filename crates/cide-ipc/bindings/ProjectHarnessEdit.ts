@@ -3,8 +3,9 @@ import type { ClaudeCli } from "./ClaudeCli";
 import type { CodexCli } from "./CodexCli";
 import type { ConsoleHarness } from "./ConsoleHarness";
 import type { OpencodeCli } from "./OpencodeCli";
+import type { ProjectDecisionSettings } from "./ProjectDecisionSettings";
 
 /**
  * A field operation, so concurrent edits to different launch configurations cannot erase one another.
  */
-export type ProjectHarnessEdit = { "field": "consoleHarness", "value": ConsoleHarness | null } | { "field": "claude", "value": ClaudeCli | null } | { "field": "codex", "value": CodexCli | null } | { "field": "opencode", "value": OpencodeCli | null };
+export type ProjectHarnessEdit = { "field": "decision", "value": ProjectDecisionSettings | null } | { "field": "consoleHarness", "value": ConsoleHarness | null } | { "field": "claude", "value": ClaudeCli | null } | { "field": "codex", "value": CodexCli | null } | { "field": "opencode", "value": OpencodeCli | null };

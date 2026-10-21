@@ -277,6 +277,17 @@ impl NucleoMatcher {
         });
     }
 
+    /// Read the indexed candidates without changing the matcher's standing query. Search
+    /// Everywhere ranks this snapshot on the blocking pool: two tabs must never reparse
+    /// each other's pattern. Reading the injector also includes entries the scorer has not
+    /// reached yet. Its safe accessor tolerates holes while parallel walkers are injecting.
+    pub fn candidates(&self) -> Vec<Candidate> {
+        let injector = self.injector.read();
+        (0..injector.injected_items())
+            .filter_map(|index| injector.get(index).map(|item| item.data.clone()))
+            .collect()
+    }
+
     /// [`Matcher::frame`], with the score of every row it returned.
     ///
     /// # Why the scores come back out at all
@@ -467,10 +478,104 @@ pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
     }
 }
 
+/// Files accept masks without changing the fuzzy semantics of symbols and actions. A
+/// slashless mask addresses basenames at any depth; slash-containing masks address the
+/// root-relative display path. Smart case agrees with the fuzzy file picker.
+pub fn rank_files(
+    query: &str,
+    items: &[Candidate],
+    roots: &[std::path::PathBuf],
+    limit: usize,
+) -> Result<PickerFrame, String> {
+    if !query.contains(['*', '?']) {
+        return Ok(rank(query, items, limit));
+    }
+    let glob = globset::GlobBuilder::new(query)
+        .literal_separator(true)
+        .case_insensitive(!query.chars().any(char::is_uppercase))
+        .build()
+        .map_err(|error| format!("Invalid filename pattern: {error}"))?
+        .compile_matcher();
+    let basename = !query.contains('/');
+    let mut matched: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            let text = if basename {
+                item.text.rsplit('/').next().unwrap_or(&item.text)
+            } else {
+                &item.text
+            };
+            glob.is_match(text)
+                || (!basename
+                    && roots.iter().any(|root| {
+                        std::path::Path::new(&item.value)
+                            .strip_prefix(root)
+                            .ok()
+                            .is_some_and(|rel| glob.is_match(rel))
+                    }))
+        })
+        .collect();
+    matched.sort_by(|a, b| a.text.cmp(&b.text).then(a.value.cmp(&b.value)));
+    Ok(PickerFrame {
+        matched: matched.len() as u32,
+        total: items.len() as u32,
+        running: false,
+        query: query.to_owned(),
+        items: matched
+            .into_iter()
+            .take(limit.min(MAX_FRAME))
+            .map(|item| PickerRow {
+                text: item.text.clone(),
+                value: item.value.clone(),
+                source: item.source.clone(),
+                indices: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn filename_masks_match_basename_paths_case_and_keep_limits() {
+        let roots = vec![std::path::PathBuf::from("/project")];
+        let items = vec![
+            Candidate::new("root/ui/menu.gd", "/project/ui/menu.gd"),
+            Candidate::new("root/ui/sub/main.gd", "/project/ui/sub/main.gd"),
+            Candidate::new("Main.GD", "/project/Main.GD"),
+            Candidate::from_source("lib/helpers.gd", "/library/helpers.gd", "library"),
+            Candidate::new("config.json", "/project/config.json"),
+        ];
+        let all = rank_files("*.gd", &items, &roots, 2).unwrap();
+        assert_eq!(all.matched, 4);
+        assert_eq!(all.total, 5);
+        assert_eq!(all.items.len(), 2);
+        assert_eq!(rank_files("*.GD", &items, &roots, 20).unwrap().matched, 1);
+        assert_eq!(
+            rank_files("ui/*.gd", &items, &roots, 20).unwrap().matched,
+            1
+        );
+        assert_eq!(
+            rank_files("ui/**/*.gd", &items, &roots, 20)
+                .unwrap()
+                .matched,
+            2
+        );
+        assert_eq!(
+            rank_files("m?nu.gd", &items, &roots, 20).unwrap().matched,
+            1
+        );
+        let libs = rank_files("helpers.*", &items, &roots, 20).unwrap();
+        assert_eq!(libs.items[0].source.as_deref(), Some("library"));
+        assert!(rank_files("*[", &items, &roots, 20).is_err());
+        assert_eq!(
+            rank_files("cfg", &items, &roots, 20).unwrap(),
+            rank("cfg", &items, 20)
+        );
+    }
 
     /// Poll until the worker settles, so an assertion is about matching and not timing.
     fn settle(matcher: &NucleoMatcher, limit: usize) -> PickerFrame {

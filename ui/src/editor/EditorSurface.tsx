@@ -41,6 +41,7 @@ import {
   lineNumbers,
   rectangularSelection,
 } from '@codemirror/view'
+import { markSource, type SourceMark } from './sourceMark'
 import { cideHighlightStyle } from './highlight'
 import { polarityExtension, polaritySlot, watchPolarity } from './cmPolarity'
 import { useCodeMenu } from './codeMenu'
@@ -178,6 +179,11 @@ export interface EditorSurfaceProps {
    * already has [`reloadKey`], which exists to rebuild the view on purpose.
    */
   identity?: string | undefined
+  /** Embedded readers use local reveals while keeping the real path for code intelligence.
+   * Fixed for the mount, just like identity. They claim caret/status only when interacted with. */
+  embedded?: { revealKey: string } | undefined
+  /** A search occurrence to decorate and scroll to; independent of the user's selection. */
+  markedRange?: SourceMark | undefined
   /**
    * The project root the trail is drawn relative to.
    *
@@ -540,6 +546,8 @@ export function EditorSurface({
   // visible at the one place a reader looks for a prop's default and there is no second binding
   // that could be used by mistake. See the prop's doc comment for the split between the two.
   identity = path,
+  embedded,
+  markedRange,
   root,
   project,
   doc,
@@ -569,6 +577,7 @@ export function EditorSurface({
   onShowHistory,
   recovered,
 }: EditorSurfaceProps): ReactNode {
+  const sourceMarks = useRef(new Compartment())
   const hostRef = useRef<HTMLDivElement | null>(null)
   /** Read once, by the build effect — see the prop. A ref so the effect's keys stay as they are. */
   const recoveredRef = useRef(recovered)
@@ -1085,6 +1094,8 @@ export function EditorSurface({
        * regression a reader cannot see in a diff; `check:blame` pins it.
        */
       blameSlot.of(blameOnRef.current === true ? blameExt : []),
+      sourceMarks.current.of([]),
+      ...(embedded ? [EditorView.contentAttributes.of({ 'data-cide-embedded-editor': 'true', 'aria-label': 'Search result source', 'aria-readonly': 'true' })] : []),
       /*
        * Which polarity CodeMirror thinks it is drawing in — see the `polarity` declaration above
        * and `cmPolarity.ts`. Deliberately *after* the blame slot: this contributes no gutter, but
@@ -1636,7 +1647,7 @@ export function EditorSurface({
       path,
       segments,
       readoutFor(view.state),
-      onScreenRef.current,
+      !embedded && onScreenRef.current,
     )
     slotRef.current = readout
     // The claim carries the path alone, so a file whose outline has *already* been parsed — a tab
@@ -1789,6 +1800,7 @@ export function EditorSurface({
           return true
         },
       },
+      embedded,
     )
     /*
      * Seed the real numbers immediately, because nothing else will until the user types.
@@ -1848,7 +1860,7 @@ export function EditorSurface({
       const plan = planRestore(
         remembered,
         view.state.doc.lines,
-        pendingReveals().includes(identity),
+        pendingReveals().includes(embedded?.revealKey ?? identity),
       )
       if (plan !== null) {
         try {
@@ -1938,7 +1950,7 @@ export function EditorSurface({
      * line 1 with no request left to spend. Nothing else in this repository can see that failure,
      * which is why `check:editor` asserts this argument by name.
      */
-    const stopReveal = registerReveal(identity, (target) => {
+    const stopReveal = registerReveal(embedded?.revealKey ?? identity, (target) => {
       try {
         // Every decision is `planReveal`'s, so this handler holds only the two things a headless
         // check could not run anyway: the dispatch and the focus call.
@@ -2060,8 +2072,13 @@ export function EditorSurface({
    * which a demotion here would quietly change into a blank slot.
    */
   useEffect(() => {
-    if (onScreen) slotRef.current?.focus()
-  }, [onScreen])
+    if (onScreen && !embedded) slotRef.current?.focus()
+  }, [onScreen, embedded])
+
+  useEffect(() => {
+    const view = viewRef.current
+    if (view) markSource(view, sourceMarks.current, markedRange ?? null)
+  }, [path, reloadKey, markedRange?.line, markedRange?.column, markedRange?.endColumn])
 
   /*
    * Push the diagnostics, and configure the gutter.
@@ -2239,7 +2256,7 @@ export function EditorSurface({
    * file, badge and all, with the full path on hover.
    */
   return (
-    <div className={styles.pane}>
+    <div className={styles.pane} data-cide-embedded-reader={embedded ? 'true' : undefined}>
       {/*
         * `data-native-menu="false"` even though the surface would already be suppressed: the
         * host is a `contenteditable`, which is the one shape `wantsNativeMenu` treats as a text

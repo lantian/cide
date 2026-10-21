@@ -11,6 +11,7 @@
 import {
   agentRuns,
   gitlab,
+  tab as tabApi,
   type ProjectId,
   type RunId,
   type SplitIntent,
@@ -171,13 +172,20 @@ async function follow(review: string, entry: AgentReview) {
 async function openTab(review: string, entry: AgentReview): Promise<boolean> {
   const plan = await agentRuns.open(entry.project, entry.run)
   if (plan.kind === 'unavailable') return false
+  const iid = data.get(review)?.mr.iid
+  if (plan.kind === 'readOnly') {
+    const { useWorkspace } = await import('@/store/workspace')
+    await tabApi.openConversation(entry.project, plan.conversation.id, `Review${iid === undefined ? '' : ` !${iid}`} · ${HARNESS_LABEL[entry.harness]}`)
+    await useWorkspace.getState().synced()
+    update(entry, { tabOpened: true })
+    return true
+  }
   const intent: SplitIntent =
     plan.kind === 'continue'
       ? { kind: 'continue', conversation: plan.conversation }
       : plan.continues !== null
         ? { kind: 'mirror', session: plan.session, continues: plan.continues }
         : { kind: 'mirror', session: plan.session }
-  const iid = data.get(review)?.mr.iid
   const { useWorkspace } = await import('@/store/workspace')
   await useWorkspace
     .getState()

@@ -161,7 +161,21 @@ impl DiagnosticsRegistry {
         let projects: Vec<Arc<ProjectDiagnostics>> =
             self.projects.iter().map(|entry| entry.clone()).collect();
         for project in projects {
-            project.restart(app, source.clone());
+            if let Some(server) = cide_lsp::discover::servers()
+                .into_iter()
+                .find(|s| s.source() == source)
+            {
+                respawn(
+                    app,
+                    project.project,
+                    &project.store,
+                    &project.handles,
+                    &project.roots,
+                    server,
+                    &project.controls,
+                    false,
+                );
+            }
         }
     }
 
@@ -346,7 +360,15 @@ impl Kick {
 }
 
 /// One project's servers and store.
+#[derive(Default)]
+struct ServerControls {
+    stopped: std::collections::BTreeSet<cide_ipc::DiagnosticSourceId>,
+    monitors: BTreeMap<cide_ipc::DiagnosticSourceId, Arc<cide_lsp::monitor::Monitor>>,
+}
+type Controls = Arc<Mutex<ServerControls>>;
+
 pub struct ProjectDiagnostics {
+    controls: Controls,
     project: ProjectId,
     roots: Vec<PathBuf>,
     store: Arc<Mutex<DiagnosticStore>>,
@@ -438,6 +460,7 @@ impl ProjectDiagnostics {
         let store = Arc::new(Mutex::new(DiagnosticStore::new()));
         let handles: Arc<Mutex<Vec<LspHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let controls = Controls::default();
 
         // Every server in the registry, not the two builtins by name. (M22)
         //
@@ -451,6 +474,7 @@ impl ProjectDiagnostics {
             &roots,
             &binary_choices(&app),
             server_tuning(&app),
+            &controls,
         );
 
         let kick = Arc::new(Kick::default());
@@ -464,11 +488,17 @@ impl ProjectDiagnostics {
                 let kick = Arc::clone(&kick);
                 let open_docs = Arc::clone(&open_docs);
                 let roots = roots.clone();
-                move || pump(app, project, roots, store, handles, stop, kick, open_docs)
+                let controls = Arc::clone(&controls);
+                move || {
+                    pump(
+                        app, project, roots, store, handles, stop, kick, open_docs, controls,
+                    )
+                }
             })
             .ok();
 
         Self {
+            controls,
             project,
             roots,
             store,
@@ -1810,6 +1840,7 @@ impl ProjectDiagnostics {
             &self.roots,
             &binary_choices(app),
             server_tuning(app),
+            &self.controls,
         );
         if self.handles.lock().len() != before {
             crate::emit::diagnostics(app, self.project);
@@ -1880,7 +1911,116 @@ impl ProjectDiagnostics {
             &self.handles,
             &self.roots,
             server,
+            &self.controls,
+            true,
         );
+    }
+
+    /// Server health is independent of inspection filters and finding counts.
+    pub fn language_servers(&self) -> Vec<cide_ipc::diagnostics::LanguageServerSnapshot> {
+        let controls = self.controls.lock();
+        let reports = self.store.lock().source_statuses();
+        let handles = self.handles.lock();
+        cide_lsp::discover::servers()
+            .into_iter()
+            .filter(|server| cide_lsp::discover::applicable(*server, &self.roots))
+            .map(|server| {
+                let source = server.source();
+                let status = reports
+                    .get(&source)
+                    .cloned()
+                    .unwrap_or(SourceStatus::Unavailable {
+                        reason: "Not started".into(),
+                    });
+                let version = controls
+                    .monitors
+                    .get(&source)
+                    .and_then(|m| m.version.lock().clone());
+                let memory_bytes = handles
+                    .iter()
+                    .find(|h| h.server() == server)
+                    .and_then(LspHandle::pid)
+                    .and_then(resident_memory_bytes);
+                cide_ipc::diagnostics::LanguageServerSnapshot {
+                    stopped: controls.stopped.contains(&source),
+                    source,
+                    label: server.binary(),
+                    status,
+                    attached: server.def().connect.is_some(),
+                    version,
+                    memory_bytes,
+                }
+            })
+            .collect()
+    }
+
+    pub fn server_action(
+        &self,
+        app: &tauri::AppHandle,
+        source: Option<cide_ipc::DiagnosticSourceId>,
+        action: cide_ipc::diagnostics::LanguageServerAction,
+    ) -> Result<(), String> {
+        let servers: Vec<_> = cide_lsp::discover::servers()
+            .into_iter()
+            .filter(|s| cide_lsp::discover::applicable(*s, &self.roots))
+            .filter(|s| source.as_ref().is_none_or(|id| *id == s.source()))
+            .collect();
+        if source.is_some() && servers.is_empty() {
+            return Err("This language server is no longer available in the project.".into());
+        }
+        match action {
+            cide_ipc::diagnostics::LanguageServerAction::Restart => {
+                for server in servers {
+                    self.restart(app, server.source());
+                }
+            }
+            cide_ipc::diagnostics::LanguageServerAction::Stop => {
+                let mut controls = self.controls.lock();
+                for server in &servers {
+                    controls.stopped.insert(server.source());
+                }
+                let old = {
+                    let mut handles = self.handles.lock();
+                    let (old, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *handles)
+                        .into_iter()
+                        .partition(|h| servers.contains(&h.server()));
+                    *handles = keep;
+                    old
+                };
+                drop(old);
+                for server in servers {
+                    let source = server.source();
+                    controls
+                        .monitors
+                        .entry(source.clone())
+                        .or_default()
+                        .record("info", "Stopped by user");
+                    let mut store = self.store.lock();
+                    store.clear_source(source.clone());
+                    store.set_status(
+                        source,
+                        SourceStatus::Unavailable {
+                            reason: "Stopped by user".into(),
+                        },
+                    );
+                }
+            }
+        }
+        crate::emit::diagnostics(app, self.project);
+        Ok(())
+    }
+
+    pub fn server_logs(
+        &self,
+        source: cide_ipc::DiagnosticSourceId,
+        after: u64,
+    ) -> Result<cide_ipc::diagnostics::LanguageServerLogs, String> {
+        self.controls
+            .lock()
+            .monitors
+            .get(&source)
+            .map(|m| m.read(after))
+            .ok_or_else(|| "No logs are available for this language server.".into())
     }
 
     /// Drop every handle and wait each shutdown ladder out — returning is the proof the
@@ -1890,6 +2030,7 @@ impl ProjectDiagnostics {
     /// The handles are taken in one short lock and dropped outside it: a ladder can take
     /// seconds, and the pump's watchdog takes this same lock on its tick.
     pub fn stop_servers(&self) {
+        let _guard = self.controls.lock();
         let dropped: Vec<LspHandle> = std::mem::take(&mut *self.handles.lock());
         for handle in dropped {
             let source = handle.server().source();
@@ -1909,6 +2050,7 @@ impl ProjectDiagnostics {
 ///
 /// The binary choice is read fresh, not captured at project open: a respawn that used
 /// yesterday's choice would make the settings row a lie.
+#[allow(clippy::too_many_arguments)]
 fn respawn(
     app: &tauri::AppHandle,
     project: ProjectId,
@@ -1916,8 +2058,18 @@ fn respawn(
     handles: &Arc<Mutex<Vec<LspHandle>>>,
     roots: &[PathBuf],
     server: Server,
+    controls: &Controls,
+    resume: bool,
 ) {
+    let mut controls = controls.lock();
     let source = server.source();
+    if resume {
+        controls.stopped.remove(&source);
+    }
+    if controls.stopped.contains(&source) {
+        return;
+    }
+    let monitor = controls.monitors.entry(source.clone()).or_default().clone();
     // Taken out in one short lock and dropped after it, `stop_servers`' shape. `retain` used to
     // drop the old handle *inside* the guard, and that drop joins the shutdown ladder — up to
     // `GRACE` + `KILL_AFTER`, three seconds — while `notify_document` waits on this same lock
@@ -1941,7 +2093,7 @@ fn respawn(
         .unwrap_or_default();
     let tuning = server_tuning(app);
     let started = cide_core::child_env::on_spawn_thread(move || {
-        LspHandle::start_with(server, roots, choice, tuning)
+        LspHandle::start_monitored(server, roots, choice, tuning, monitor)
     });
     match started {
         Ok(handle) => {
@@ -2191,7 +2343,9 @@ fn sync_servers(
     roots: &[PathBuf],
     choices: &std::collections::BTreeMap<String, cide_ipc::settings::ServerBinaryChoice>,
     tuning: cide_lsp::config::Tuning,
+    controls: &Controls,
 ) {
+    let mut controls = controls.lock();
     let wanted = cide_lsp::discover::servers();
 
     // Gone first, so a server whose extension was just disabled has released its child before a
@@ -2217,7 +2371,7 @@ fn sync_servers(
 
     let running: Vec<Server> = handles.lock().iter().map(LspHandle::server).collect();
     for server in wanted {
-        if running.contains(&server) {
+        if controls.stopped.contains(&server.source()) || running.contains(&server) {
             continue;
         }
         // Not applicable is not "unavailable": a server whose project marker exists nowhere
@@ -2234,8 +2388,13 @@ fn sync_servers(
         // discovery probe plus a `fork` is single-digit milliseconds.
         let roots_for_server = roots.to_vec();
         let choice = choices.get(&server.binary()).copied().unwrap_or_default();
+        let monitor = controls
+            .monitors
+            .entry(server.source())
+            .or_default()
+            .clone();
         let started = cide_core::child_env::on_spawn_thread(move || {
-            LspHandle::start_with(server, roots_for_server, choice, tuning)
+            LspHandle::start_monitored(server, roots_for_server, choice, tuning, monitor)
         });
         match started {
             Ok(handle) => {
@@ -2360,6 +2519,7 @@ fn pump(
     stop: Arc<AtomicBool>,
     kick: Arc<Kick>,
     open_docs: OpenDocuments,
+    controls: Controls,
 ) {
     // The two halves of the debounce: when the first un-emitted change arrived, and when the last
     // one did. See the module docs for why both are needed.
@@ -2538,7 +2698,9 @@ fn pump(
                         limit_mib = limit_mb,
                         "over the memory limit; restarting",
                     );
-                    respawn(&app, project, &store, &handles, &roots, server);
+                    respawn(
+                        &app, project, &store, &handles, &roots, server, &controls, false,
+                    );
                 }
             }
         }
@@ -2665,6 +2827,43 @@ pub type Projects = BTreeMap<ProjectId, Arc<ProjectDiagnostics>>;
 mod tests {
     use super::*;
     use cide_ipc::{DiagnosticKind, DiagnosticSourceId, Severity};
+
+    #[test]
+    fn manually_stopped_servers_survive_repeated_discovery_sync() {
+        let controls = Controls::default();
+        let servers = cide_lsp::discover::servers();
+        for server in &servers {
+            controls.lock().stopped.insert(server.source());
+        }
+        let monitor = Arc::new(cide_lsp::monitor::Monitor::default());
+        monitor.record("info", "before stop");
+        let source = servers[0].source();
+        controls
+            .lock()
+            .monitors
+            .insert(source.clone(), Arc::clone(&monitor));
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(Mutex::new(DiagnosticStore::new()));
+        for _ in 0..3 {
+            sync_servers(
+                &store,
+                &handles,
+                &[PathBuf::from(env!("CARGO_MANIFEST_DIR"))],
+                &BTreeMap::new(),
+                cide_lsp::config::Tuning::default(),
+                &controls,
+            );
+        }
+        assert!(
+            handles.lock().is_empty(),
+            "sync must not respawn a manually stopped server"
+        );
+        assert_eq!(controls.lock().stopped.len(), servers.len());
+        assert_eq!(
+            controls.lock().monitors[&source].read(0).entries[0].message,
+            "before stop"
+        );
+    }
 
     fn item(line: u32, severity: Severity) -> cide_ipc::Diagnostic {
         cide_ipc::Diagnostic {

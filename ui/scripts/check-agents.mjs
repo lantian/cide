@@ -306,7 +306,7 @@ try {
   const rustHarnesses = variants(agentsRs, 'pub enum Harness {', 'Harness')
 
   ok(rustStatuses.length === 5, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
-  ok(rustPhases.length === 9, `read ${rustPhases.length} RunState variants — the scan still matches`)
+  ok(rustPhases.length === 11, `read ${rustPhases.length} RunState variants — the scan still matches`)
   ok(rustHarnesses.length === 5, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
 
   eq(

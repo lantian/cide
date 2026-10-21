@@ -433,7 +433,7 @@ fn assemble(
     if tracker.is_some() && plan.tracker_paragraphs {
         cide_core::claude_cli::fold_append_system_prompt(
             &mut args,
-            &tracker_preamble(&ClaudeHarness),
+            &tracker_preamble(&ClaudeHarness, plan.worker_instructions.as_deref()),
         );
         // And, for a run working an OpenSpec change, one paragraph more. (M28) Gated on the same
         // `tracker`, because it names `mcp__cide__cide_task_update` — a run with no bridge must
@@ -495,7 +495,14 @@ fn assemble(
     // Already validated against `defs::PERMISSION_MODES` at load, so it is not checked again
     // here; what matters is that the role's own word always wins — an author who wrote a
     // mode meant it, restrictive or not, and the project default below never overrides one.
-    if let Some(mode) = &plan.agent.permission_mode
+    if plan
+        .planning
+        .as_ref()
+        .is_some_and(crate::native_plan::State::pending)
+    {
+        args.push("--permission-mode".into());
+        args.push("plan".into());
+    } else if let Some(mode) = &plan.agent.permission_mode
         && !subagent
     {
         args.push("--permission-mode".into());
@@ -669,12 +676,16 @@ pub(super) fn session_state_of(state: &RunState) -> Option<SessionState> {
     match state {
         RunState::Queued | RunState::Starting => Some(SessionState::Spawning),
         RunState::Running => Some(SessionState::Busy),
+        RunState::Blocked { .. } => Some(SessionState::AwaitingInput),
         RunState::Idle => Some(SessionState::Idle),
         RunState::AwaitingPermission => Some(SessionState::AwaitingPermission),
         // No child at all — restored from the registry's snapshot — so no session state can
         // describe it, exactly as the terminal pair below.
         RunState::Interrupted => None,
-        RunState::Paused { .. } | RunState::Finished { .. } | RunState::Failed { .. } => None,
+        RunState::Paused { .. }
+        | RunState::Finished { .. }
+        | RunState::Cancelled { .. }
+        | RunState::Failed { .. } => None,
     }
 }
 
@@ -829,7 +840,7 @@ mod tests {
     /// written to hold — but through `tracker_preamble`, because the constant is now a template
     /// and the tool names in it are Claude Code's only after this harness has filled them in.
     fn tracker() -> String {
-        tracker_preamble(&ClaudeHarness)
+        tracker_preamble(&ClaudeHarness, None)
     }
 
     use crate::defs::LoadedAgent;
@@ -896,6 +907,8 @@ mod tests {
             // and the plan actually said; the skip default has tests of its own.
             unattended: Unattended::Ask,
             tracker_paragraphs: true,
+            worker_instructions: None,
+            planning: None,
             review: false,
             server: None,
             git_dirs: Vec::new(),
@@ -908,6 +921,31 @@ mod tests {
 
     fn spawn(plan: &RunPlan<'_>) -> HarnessSpawn {
         ClaudeHarness.spawn_spec(plan).expect("a spawnable plan")
+    }
+
+    #[test]
+    fn delegated_native_planning_overrides_the_start_mode_without_changing_instructions() {
+        let agent = role();
+        let session = SessionId::new();
+        let ordinary = plan_for(&agent, session);
+        let baseline = spawn(&ordinary);
+        let mut planned = plan_for(&agent, session);
+        planned.planning = Some(Default::default());
+        let planned = spawn(&planned);
+        assert!(
+            planned
+                .spec
+                .args
+                .windows(2)
+                .any(|args| args == ["--permission-mode", "plan"])
+        );
+        assert_eq!(planned.opening, baseline.opening);
+        let prompt = |args: &[String]| {
+            args.windows(2)
+                .find(|args| args[0] == "--append-system-prompt")
+                .map(|args| args[1].clone())
+        };
+        assert_eq!(prompt(&planned.spec.args), prompt(&baseline.spec.args));
     }
 
     /// The index of a token in an argv, for the ordering assertions.

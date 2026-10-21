@@ -154,6 +154,7 @@ if (!U.fileIcons.icons.some((i) => (i.fileNames ?? []).includes('vite.config.ts'
 // ---------------------------------------------------------------------------------------
 
 const FILE_ICONS = [
+  'godot',
   // languages in this repo
   'rust', 'typescript', 'typescript-def', 'react_ts', 'react', 'javascript', 'test-ts',
   // markup / data / style

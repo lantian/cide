@@ -160,6 +160,7 @@ import {
 import { Icon } from '@/icons/Icon'
 import { Banner, Note } from '@/kit/components/Feedback'
 import { InfoPara, InfoTip } from '@/kit/components/InfoTip'
+import { PromptEditors } from './PromptEditors'
 
 import styles from './AgentsSection.module.css'
 
@@ -216,7 +217,7 @@ function AgentsEditor({
 }: {
   project: ProjectId
   /**
-   * Which of the page's four tabs is drawn (M133): `project`, `spawn`, `roles`, `overrides`.
+   * Which tab is drawn: `project`, `spawn`, `roles`, `overrides`, or `prompts`.
    * The role dialog is not in any of them — it is a portal, and a restored or requested dialog
    * must come up whichever tab the page was left on.
    */
@@ -699,6 +700,13 @@ function AgentsEditor({
     [project],
   )
 
+  const savePrompts = useCallback(async (patch: OrchestrationPatch) => {
+    const next = await agentsApi.setConfig(project, patch)
+    setConfig(next)
+    useAgents.getState().adoptConfig(project, next)
+    return next
+  }, [project])
+
   const rows = useMemo(() => rowsFor(entries ?? []), [entries])
   const taken = useMemo(
     () => new Set((entries ?? []).map((entry) => fileKey(entry.scope, entry.name))),
@@ -1133,6 +1141,10 @@ function AgentsEditor({
       )}
 
       {tab === 'spawn' && configBanner}
+      {tab === 'prompts' && configBanner}
+      {tab === 'prompts' && config !== null && (
+        <PromptEditors key={project} project={project} config={config} save={savePrompts} />
+      )}
       {tab === 'spawn' && config !== null && (
         <>
           <Group

@@ -28,6 +28,9 @@
 
 /** 1-based line and 1-based UTF-16 column, matching `RevealTarget` and `SymbolSpan`. */
 export interface CaretPosition {
+  /** Local navigation destination for an embedded editor; path remains the real LSP URI. */
+  readonly revealKey?: string
+
   readonly path: string
   readonly line: number
   readonly column: number
@@ -59,6 +62,8 @@ export interface CaretSlot {
 }
 
 interface Claim {
+  revealKey?: string | undefined
+
   path: string
   line: number
   column: number
@@ -167,7 +172,7 @@ const claims: Claim[] = []
 export function focusedCaret(): CaretPosition | null {
   const top = claims.at(-1)
   if (top === undefined) return null
-  return { path: top.path, line: top.line, column: top.column, lines: top.lines }
+  return { ...(top.revealKey ? { revealKey: top.revealKey } : {}), path: top.path, line: top.line, column: top.column, lines: top.lines }
 }
 
 /**
@@ -226,6 +231,7 @@ export function claimCaret(
   word?: WordReader,
   folds?: FoldActions,
   format?: FormatActions,
+  embedded?: { revealKey: string },
 ): CaretSlot {
   // `lines: 1` rather than 0, because "an empty document is one empty line" is CodeMirror's own
   // arithmetic and this value is read before the first `set` arrives. A 0 here would let Go to
@@ -235,11 +241,13 @@ export function claimCaret(
     line: 1,
     column: 1,
     lines: 1,
+    revealKey: embedded?.revealKey,
     word: word ?? null,
     folds: folds ?? null,
     format: format ?? null,
   }
-  claims.push(claim)
+  // A search result mounting is not an interaction: it claims the slot only on focus.
+  if (!embedded) claims.push(claim)
 
   let released = false
   return {
@@ -257,8 +265,7 @@ export function claimCaret(
       if (released) return
       if (claims.at(-1) === claim) return
       const at = claims.indexOf(claim)
-      if (at === -1) return
-      claims.splice(at, 1)
+      if (at !== -1) claims.splice(at, 1)
       claims.push(claim)
     },
     release() {

@@ -69,6 +69,8 @@ interface TasksStore {
   board: Board
   /** Which task the panel has open, or `null` for the list. */
   selected: TaskId | null
+  /** A notification can open diagnostics for an @mentioned role other than the assignee. */
+  dispatchAgent: string | null
   decisionBackStack: (TaskId | null)[]
   selectFromDecision: (task: TaskId) => void
   /**
@@ -157,6 +159,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
   project: null,
   board: BOARD_UNKNOWN,
   selected: null,
+  dispatchAgent: null,
   decisionBackStack: [],
   compose: null,
   creating: false,
@@ -182,6 +185,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
       project,
       board: BOARD_UNKNOWN,
       selected: null,
+      dispatchAgent: null,
       decisionBackStack: [],
       compose: null,
       creating: false,
@@ -226,8 +230,9 @@ export const useTasks = create<TasksStore>((set, get) => ({
     set({ board: next })
   },
 
-  selectFromDecision: (task) => set({ selected: task, decisionBackStack: [null] }),
+  selectFromDecision: (task) => set({ selected: task, dispatchAgent: null, decisionBackStack: [null] }),
   select: (task) => {
+    set({ dispatchAgent: null })
     const { selected, decisionBackStack } = get()
     if (decisionBackStack.length === 0) { set({ selected: task }); return }
     if (task === null) {

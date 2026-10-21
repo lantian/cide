@@ -161,10 +161,10 @@ pub(crate) fn run_is_busy(state: &RunState, task_status: Option<TaskStatus>, ask
     let handed_in = matches!(task_status, Some(TaskStatus::Review | TaskStatus::Done));
     match state {
         // Over, under every reading.
-        RunState::Finished { .. } | RunState::Failed { .. } => false,
+        RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. } => false,
         // No child — so never on the header's chip — but a claim waiting on Resume or Discard,
         // which the spinner must not plan over. See `Interrupted is a claim` above.
-        RunState::Interrupted => asking == Busy::Claimed && !handed_in,
+        RunState::Interrupted | RunState::Blocked { .. } => asking == Busy::Claimed && !handed_in,
         // A child exists and the turn is live.
         RunState::Starting | RunState::Running | RunState::AwaitingPermission => true,
         // A claim on a slot or a worktree, with nothing executing behind it.

@@ -35,7 +35,7 @@ import { ResumeSplash } from '@/windows/ResumeSplash'
 import { paneSessionId } from '@/layout/paneHosts'
 import { useShallow } from 'zustand/react/shallow'
 import { useWorkspace } from '@/store/workspace'
-import type { Bootstrap, DiffSpec, Pane, PaneId, PaneRestore, TabKind } from '@/ipc/client'
+import type { Bootstrap, ConsoleHarness, DiffSpec, Pane, PaneId, PaneRestore, TabKind } from '@/ipc/client'
 
 /** The `TabKind::Revision` arm, so the lookup below and the pane agree about its shape. */
 type RevisionTab = Extract<TabKind, { kind: 'revision' }>
@@ -154,7 +154,7 @@ export interface PaneBodyProps {
    * `paneHosts`, and a second route to it would be a second answer.
    */
   onScreen?: boolean | undefined
-  onSessionBound?: ((session: string) => void) | undefined
+  onSessionBound?: ((session: string, choice?: ConsoleHarness) => Promise<void> | void) | undefined
 }
 
 export function PaneBody({

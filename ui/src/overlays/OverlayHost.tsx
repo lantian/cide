@@ -1,3 +1,4 @@
+import { Insights } from '@/decision/Insights'
 /**
  * Mounts whichever overlay is open, and nothing when none is.
  *
@@ -11,12 +12,11 @@ import { useEffect } from 'react'
 import { BranchPopup } from '@/chrome/BranchSelector'
 import { AboutCard } from './AboutCard'
 import { PoolStateCard } from './PoolStateCard'
-import { CommandPalette } from './CommandPalette'
-import { FilePicker } from './FilePicker'
+import { SearchEverywhere } from '@/search/SearchEverywhere'
+import { openSearch } from '@/search/store'
 import { GoToLine } from './GoToLine'
 import { ScratchType } from './ScratchType'
 import { StructurePicker } from './StructurePicker'
-import { SymbolPicker } from './SymbolPicker'
 import { UsagesPopup } from './UsagesPopup'
 import { focusedCaret } from '@/editor/caretTrack'
 import { useOverlays } from './store'
@@ -92,6 +92,9 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
    * has to press the key twice before anything can happen.
    */
   useEffect(() => {
+    if (open === 'files') openSearch('files')
+    if (open === 'symbols') openSearch('symbols')
+    if (open === 'commands') openSearch('actions')
     if (open === 'files' && project === null) close()
     if (open === 'symbols' && project === null) close()
     // The File Structure popup needs a *caret*, not merely a project: it preselects the member
@@ -124,18 +127,8 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
 
   if (open === null) return null
 
-  if (open === 'files') {
-    // Until the effect above runs. One frame, and it draws nothing.
-    if (project === null) return null
-    return (
-      <FilePicker
-        project={project}
-        onDismiss={close}
-        onOpen={actions.openFile}
-        onOpenInSplit={actions.openFileInSplit}
-        onMention={actions.mentionFile}
-      />
-    )
+  if (open === 'search') {
+    return <SearchEverywhere project={project} commands={commands} keymap={keymap} context={context} actions={actions} onDismiss={close} />
   }
 
   /*
@@ -152,11 +145,6 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
     return (
       <StructurePicker project={project} onDismiss={close} onGoTo={actions.goToSymbol} />
     )
-  }
-
-  if (open === 'symbols') {
-    if (project === null) return null
-    return <SymbolPicker project={project} onDismiss={close} onGoTo={actions.goToSymbol} />
   }
 
   if (open === 'scratch') {
@@ -184,20 +172,10 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
   // No arm in the effect above, on `goto`'s reasoning: the card reads `capabilities` off the
   // boot this host was mounted with and asks Rust nothing, so there is no state in which it
   // cannot function once it is on screen.
+  if (open === 'decisionInsights') return <Insights onDismiss={close} />
   if (open === 'about') return <AboutCard onDismiss={close} />
   if (open === 'pools') return <PoolStateCard onDismiss={close} />
 
   // GitLab dialogs have their own host. Only the explicit commands state owns the palette.
-  if (open !== 'commands') return null
-
-  return (
-    <CommandPalette
-      commands={commands}
-      keymap={keymap}
-      context={context}
-      onDismiss={close}
-      onRun={actions.runCommand}
-      onRunInNewSession={actions.runCommandInNewSession}
-    />
-  )
+  return null
 }

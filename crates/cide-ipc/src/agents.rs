@@ -286,6 +286,9 @@ pub enum RunState {
     Starting,
     /// A turn is in flight.
     Running,
+    /// The turn failed, but its conversation and child remain available for manual recovery.
+    /// Holds its task/checkout, spends no working time and holds no concurrency slot.
+    Blocked { reason: String },
     /// The harness handed the turn back and is waiting for input. **The child is alive.**
     ///
     /// # Why this is not `Finished { code: 0 }`, which is what it used to be
@@ -367,6 +370,15 @@ pub enum RunState {
     /// [`crate::SessionExit`]'s doc gives: a bare "exited" with no number is the one thing a
     /// finished row cannot be read from.
     Finished { code: i32 },
+    /// The user or orchestrator deliberately ended this run. This is a terminal outcome, not a
+    /// failed attempt to do its work; `reason` records the stop or reassignment.
+    Cancelled {
+        reason: String,
+        /// The child exit status, when cancellation reached a child.
+        #[ts(optional)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+    },
     /// The run never got to a child, or died in a way that is not an exit code: no git worktree,
     /// a harness binary that disappeared between the roster and the dispatch, a spawn error.
     /// `reason` is shown on the row.
@@ -414,11 +426,13 @@ impl RunState {
         match self {
             Self::Starting | Self::Running => true,
             Self::Queued
+            | Self::Blocked { .. }
             | Self::Idle
             | Self::AwaitingPermission
             | Self::Paused { .. }
             | Self::Interrupted
             | Self::Finished { .. }
+            | Self::Cancelled { .. }
             | Self::Failed { .. } => false,
         }
     }
@@ -572,10 +586,10 @@ pub struct AgentRun {
 
 /// What pressing **Open** on a run should do, as `agents_run_open` answers it. (M42)
 ///
-/// One question to Rust, because the three answers depend on facts only Rust has — whether the
+/// One question to Rust, because the answers depend on facts only Rust has — whether the
 /// registry still holds a live child for the run, and whether the harness can re-open the
-/// conversation from its directory — and the frontend then builds the pane through the split
-/// machinery with the intent this names. **Never a pane built by the command**: the argument
+/// conversation from its directory — and the frontend then builds the pane or archive from
+/// this plan. **Never a pane built by the command**: the argument
 /// beside `agent_open_pane` in `cide_app::cmd::agents` is why, and it is unchanged by this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
@@ -596,6 +610,8 @@ pub enum RunOpen {
     /// The child is gone and the harness can re-open the conversation: spawn it, in the pane,
     /// which owns it. See [`crate::SplitIntent::Continue`].
     Continue { conversation: crate::HarnessSession },
+    /// The checkout is gone. Read the saved conversation without spawning a harness.
+    ReadOnly { conversation: crate::HarnessSession },
     /// Nothing to show, and the sentence saying why: a queued run has no child yet, an
     /// `opencode` run that died before naming its conversation has nothing to continue, a
     /// `claude` transcript can be gone with its worktree, or the `--resume` injection is off.
@@ -722,6 +738,10 @@ pub struct OrchestrationConfig {
     /// What a reviewer tab is told, as a template with `{placeholders}`. Empty means *use the
     /// one cide ships*, decided in `AgentsConfig::review_prompt_template`. (M84)
     pub review_prompt: String,
+    /// Effective task opening template, including the shipped default when no override exists.
+    pub task_start_prompt: String,
+    /// Effective cide tracker instructions; separate from a role's own system prompt.
+    pub worker_instructions: String,
     /// `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
     /// Empty when the project isolates nothing, which is the default. (M92)
     pub isolate_env: Vec<String>,
@@ -783,6 +803,8 @@ impl Default for OrchestrationConfig {
             auto_spin_after_secs: 900,
             auto_spin_prompt: String::new(),
             review_prompt: String::new(),
+            task_start_prompt: String::new(),
+            worker_instructions: String::new(),
             isolate_env: Vec::new(),
             isolate_env_share: Vec::new(),
             verify_exclusive: false,
@@ -835,6 +857,11 @@ pub struct OrchestrationPatch {
     /// Flattened to one line by `AgentsConfig::apply`, `auto_spin_prompt`'s reason.
     #[ts(optional)]
     pub review_prompt: Option<String>,
+    /// Empty resets to the current shipped default. These prompts are edited in Settings.
+    #[ts(optional)]
+    pub task_start_prompt: Option<String>,
+    #[ts(optional)]
+    pub worker_instructions: Option<String>,
     /// `agents.isolateEnv`, whole: the list replaces the file's, and an empty one turns
     /// isolation off. `AgentsConfig::apply` drops a name `cide_core::isolated_env::check_var`
     /// refuses; the `cide_agents_config` tool refuses it first, with the sentence. (M92)

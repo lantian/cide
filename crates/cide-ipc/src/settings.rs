@@ -46,6 +46,8 @@ pub struct Settings {
     /// pixel and an integer would snap it. Clamped where a patch lands: see
     /// [`clamp_ui_font_size`].
     pub ui_font_size: f32,
+    /// Arrangement of results and source in Search Everywhere; pinned tabs keep their layout.
+    pub search_modal_layout: SearchModalLayout,
 
     /// The brand colour every accent token is drawn in — primary buttons, focus rings, the
     /// active tab, the awaiting counter. `None` is the shipped red, and it is `None` rather than
@@ -105,8 +107,8 @@ pub struct Settings {
     /// its Resume: the harness a pane runs is stamped on the pane itself
     /// ([`crate::Pane::harness`]) the moment the spawn binds, because resuming a codex thread
     /// with `claude --resume` (or the other way round) is a conversation the other CLI has never
-    /// heard of. Restart session is a fresh spawn, which is how a user moves an open console onto
-    /// the harness this now names.
+    /// heard of. Restart session is a fresh spawn and follows this default unless that pane has
+    /// a context-menu harness choice of its own.
     ///
     /// **Not a default for agent runs.** A role runs the harness its definition (or the
     /// project's `agents.harness`) names, which stays Claude when nothing names one — codex runs
@@ -123,6 +125,7 @@ pub struct Settings {
     /// OpenCode launch configuration, shared by consoles, runs and one-shots.
     #[serde(default)]
     pub opencode: OpencodeSettings,
+    pub decision: crate::DecisionSettings,
     pub proxy: ProxySettings,
     pub sidebar: SidebarSettings,
     pub explorer: ExplorerSettings,
@@ -150,12 +153,23 @@ pub struct Settings {
     pub update: UpdateSettings,
 }
 
+/// A global modal preference, independent of bottom tool-window layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SearchModalLayout {
+    #[default]
+    SideBySide,
+    Stacked,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             window_mode: WindowMode::default(),
             theme: Theme::default(),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
+            search_modal_layout: SearchModalLayout::default(),
             accent: None,
             awaiting_highlight: AwaitingHighlight::default(),
             each_project_keeps_claude_tab: true,
@@ -171,6 +185,7 @@ impl Default for Settings {
             open_run_in: OpenRunIn::default(),
             task_proposal_run_mode: TaskProposalRunMode::default(),
             codex: CodexSettings::default(),
+            decision: crate::DecisionSettings::default(),
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
             explorer: ExplorerSettings::default(),

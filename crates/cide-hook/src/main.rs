@@ -66,6 +66,10 @@ fn main() {
 
     let mut payload = String::new();
     let _ = std::io::stdin().read_to_string(&mut payload);
+    if event == "native-question" {
+        native_question(&payload);
+        std::process::exit(0);
+    }
 
     if event == "statusline" {
         // The user's own command, if they had one, is everything after the subcommand.
@@ -87,6 +91,79 @@ fn main() {
 
     forward(&event, &payload);
     std::process::exit(0);
+}
+
+/// A separate, deliberately blocking mode; never used by ordinary telemetry hooks.
+fn native_question(payload: &str) {
+    let reply = (|| -> Option<serde_json::Value> {
+        let path = std::env::var_os("CIDE_HOOK_SOCK")?;
+        let spawned_as = std::env::var("CIDE_SESSION").ok()?;
+        native_question_at(Path::new(&path), &spawned_as, payload)
+    })().unwrap_or_else(|| serde_json::json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Cide could not collect the user's answer. Do not choose a default or continue dependent work."}}));
+    println!("{reply}");
+}
+
+fn native_question_at(path: &Path, spawned_as: &str, payload: &str) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader};
+    let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if payload["tool_name"] != "AskUserQuestion" {
+        return None;
+    }
+    let mut stream = UnixStream::connect(path).ok()?;
+    stream.set_write_timeout(Some(SOCKET_TIMEOUT)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(86400)))
+        .ok()?;
+    let frame =
+        serde_json::json!({"event":"CideNativeQuestion","payload":payload,"spawned_as":spawned_as});
+    writeln!(stream, "{frame}").ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    serde_json::from_str(&line).ok()
+}
+
+#[cfg(test)]
+mod native_question_tests {
+    use super::*;
+    #[test]
+    fn question_socket_waits_for_the_human_answer_instead_of_the_telemetry_timeout() {
+        use std::{
+            io::{BufRead, BufReader},
+            os::unix::net::UnixListener,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "cide-question-{}-{:?}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let reply = serde_json::json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"questions":[{"question":"Which?"}],"answers":{"Which?":"Русский"}}}});
+        let expected = reply.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut input = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut input)
+                .unwrap();
+            let input: serde_json::Value = serde_json::from_str(&input).unwrap();
+            assert_eq!(input["event"], "CideNativeQuestion");
+            assert_eq!(input["spawned_as"], "worker-pane");
+            assert_eq!(input["payload"]["tool_use_id"], "native-call");
+            std::thread::sleep(SOCKET_TIMEOUT + Duration::from_millis(60));
+            writeln!(stream, "{reply}").unwrap();
+        });
+        assert_eq!(native_question_at(&path,"worker-pane",&serde_json::json!({"tool_name":"AskUserQuestion","tool_use_id":"native-call","tool_input":{"questions":[{"question":"Which?"}]}}).to_string()),Some(expected));
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn an_unavailable_bridge_or_an_unrelated_tool_never_supplies_a_default_answer() {
+        let missing = Path::new("/no-such-cide-question-socket");
+        assert!(
+            native_question_at(missing, "worker", r#"{"tool_name":"AskUserQuestion"}"#).is_none()
+        );
+        assert!(native_question_at(missing, "worker", r#"{"tool_name":"Bash"}"#).is_none());
+    }
 }
 
 /// Run the user's statusline command and print its stdout verbatim.

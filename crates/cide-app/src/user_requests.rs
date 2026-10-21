@@ -3,7 +3,10 @@ use crate::{
     agents::AgentRegistry, state::SessionRegistry, tasks_state::TasksStores,
     workspace_state::WorkspaceState,
 };
-use cide_core::{CoreError, Result, persist, user_requests::Requests};
+use cide_core::{
+    CoreError, Result, persist,
+    user_requests::{AnswerSubmission, AnswerTarget, Requests},
+};
 use cide_ipc::{
     LinkType, ProjectId, RunId, SessionId, TaskAuthor, TaskId, TaskQuestion, UserRequest,
     UserRequestKind, UserRequestResponse, UserRequestTask, UserRequestsView,
@@ -56,9 +59,13 @@ pub fn create(
 ) -> Result<UserRequest> {
     let root = root(app, project)?;
     let listing = crate::sessions_state::list(app, project)?;
-    let origin = listing.rows.into_iter().find(|row| {
-        run.is_some_and(|run| row.record.run == Some(run)) || (run.is_none() && session.is_some_and(|session| row.record.session == Some(session)))
-    }).map(|row| row.record).ok_or_else(|| CoreError::Io("The asking conversation is not yet in the session journal. Retry this call; do not finish or continue dependent work.".into()))?;
+    let origin = listing.rows.into_iter().filter(|row| {
+        run.is_some_and(|run| row.record.run == Some(run)) || (run.is_none() && session.is_some_and(|session| {
+            row.record.session == Some(session)
+                && crate::conversations::live(app, &row.record) == Some(session)
+        }))
+    }).max_by_key(|row| (row.record.known, row.record.last_seen_unix_ms))
+        .map(|row| row.record).ok_or_else(|| CoreError::Io("The asking conversation is not yet in the session journal. Retry this call; do not finish or continue dependent work.".into()))?;
     let question: TaskQuestion =
         serde_json::from_value(args.get("question").cloned().unwrap_or(Value::Null))
             .map_err(|e| CoreError::Io(format!("Invalid question: {e}")))?;
@@ -383,6 +390,10 @@ pub fn start(app: AppHandle) {
                         return;
                     };
                     for mut request in requests.view(&root).requests {
+                        if matches!(request.request, UserRequestKind::Questions { .. }) {
+                            crate::native_questions::reconcile(&app, project, &request);
+                            continue;
+                        }
                         if !request.origin.known
                             && !request.delivered
                             && let Ok(listing) = crate::sessions_state::list(&app, project)
@@ -390,7 +401,9 @@ pub fn start(app: AppHandle) {
                                 listing.rows.into_iter().map(|r| r.record).find(|r| {
                                     r.known
                                         && (r.session == request.origin.session
-                                            && r.session.is_some()
+                                            && r.session.is_some_and(|session| {
+                                                crate::conversations::live(&app, r) == Some(session)
+                                            })
                                             || r.run == request.origin.run && r.run.is_some())
                                 })
                             && let Ok(updated) = requests.resolve_origin(&root, &request.id, origin)
@@ -421,10 +434,19 @@ pub fn start(app: AppHandle) {
                         }
                         match deliver(&app, project, &request) {
                             Ok(true) => {
-                                let _ = requests.delivered(&root, &request.id);
+                                if requests.get(&root, &request.id).is_ok_and(|r| !r.delivered) {
+                                    let _ = requests.delivered(&root, &request.id);
+                                }
                                 broadcast(&app, project);
                             }
-                            Ok(false) => {}
+                            Ok(false) => {
+                                if requests
+                                    .get(&root, &request.id)
+                                    .is_ok_and(|r| r.delivery_error != request.delivery_error)
+                                {
+                                    broadcast(&app, project);
+                                }
+                            }
                             Err(error)
                                 if request.delivery_error.as_deref()
                                     != Some(&error.to_string()) =>
@@ -443,99 +465,202 @@ pub fn start(app: AppHandle) {
 }
 
 fn deliver(app: &AppHandle, project: ProjectId, request: &UserRequest) -> Result<bool> {
-    let result = result_value(request);
-    let line = format!(
-        "The user resolved request {}: {}. Continue this conversation using this decision. Do not ask the same question again; rejection or cancellation does not authorize the proposed work.",
-        request.id, result
-    );
-    if request.origin.run.is_some() {
-        return app.state::<Arc<AgentRegistry>>().deliver_user_request(
-            app,
-            project,
-            &request.origin,
-            &line,
+    if matches!(request.request, UserRequestKind::Questions { .. }) {
+        return Ok(false);
+    }
+    if request.origin.run.is_none() {
+        return store(app)?.deliver_answer(
+            &root(app, project)?,
+            &request.id,
+            &ConversationDelivery { app, project },
         );
     }
-    let listing = crate::sessions_state::list(app, project)?;
-    let origin = listing
-        .rows
-        .into_iter()
-        .find(|row| {
-            row.record.id == request.origin.id
-                || (!request.origin.known && row.record.session == request.origin.session)
-        })
-        .map(|row| row.record)
-        .unwrap_or_else(|| request.origin.clone());
-    if let Some(session) = origin.session
-        && let Some(pty) = app
-            .try_state::<SessionRegistry>()
-            .and_then(|sessions| sessions.get(session))
-            .filter(|pty| !pty.has_exited())
-    {
-        let state = app
-            .try_state::<crate::hooks::HookServer>()
-            .map(|hooks| hooks.state(session));
-        if !matches!(
-            state,
-            Some(cide_ipc::SessionState::Idle | cide_ipc::SessionState::AwaitingInput)
-        ) {
-            return Ok(false);
-        }
-        let bytes =
-            crate::agent_rpc::submit(&line).ok_or_else(|| CoreError::Io("Empty answer.".into()))?;
-        crate::agents::type_submitted_line(app, session, &pty, bytes);
-        return Ok(true);
-    }
-    if !origin.known || !origin.cwd.is_dir() {
-        return Err(CoreError::Io("The original conversation or its working directory is unavailable. The answer is saved.".into()));
-    }
-    let harness = cide_agents::tools::SESSION_HARNESSES
-        .iter()
-        .find(|h| **h == origin.harness)
-        .ok_or_else(|| CoreError::Io("This harness has no resumable console.".into()))?;
-    let tab_harness = match harness {
-        cide_ipc::Harness::Claude => {
-            crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Claude)
-        }
-        cide_ipc::Harness::Codex => {
-            crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Codex)
-        }
-        _ => crate::claude_tab::TabHarness::Opencode,
-    };
-    let mode = cide_agents::config::load(&root(app, project)?)
-        .agents
-        .unattended();
-    crate::claude_tab::open_continuing(
+    app.state::<Arc<AgentRegistry>>().deliver_user_request(
         app,
         project,
-        crate::claude_tab::Open {
-            title: &origin.title,
-            session_name: None,
-            prompt: &line,
-            mode: crate::claude_tab::TabMode {
-                unattended: mode,
-                behind: true,
+        &request.origin,
+        &answer_line(request),
+    )
+}
+
+fn answer_marker(request: &UserRequest) -> String {
+    format!("The user resolved request {}:", request.id)
+}
+
+fn answer_line(request: &UserRequest) -> String {
+    let result = result_value(request);
+    format!(
+        "{} {}. Continue this conversation using this decision. Do not ask the same question again; rejection or cancellation does not authorize the proposed work.",
+        answer_marker(request),
+        result
+    )
+}
+
+struct ConversationDelivery<'a> {
+    app: &'a AppHandle,
+    project: ProjectId,
+}
+
+impl AnswerTarget for ConversationDelivery<'_> {
+    fn received(&self, request: &UserRequest) -> Result<bool> {
+        Ok(crate::conversations::received_answer(
+            self.app,
+            self.project,
+            &request.origin,
+            &answer_marker(request),
+        ))
+    }
+
+    fn submit(
+        &self,
+        request: &UserRequest,
+        begin: &dyn Fn() -> Result<bool>,
+    ) -> Result<AnswerSubmission> {
+        let (app, project) = (self.app, self.project);
+        let origin = &request.origin;
+        let line = answer_line(request);
+        if !origin.known {
+            return Ok(AnswerSubmission::Waiting);
+        }
+        // The journal's old PTY id is not sufficient after /new, /clear or /resume.
+        if let Some(session) = crate::conversations::live(app, origin)
+            && let Some(pty) = app
+                .try_state::<SessionRegistry>()
+                .and_then(|sessions| sessions.get(session))
+                .filter(|pty| !pty.has_exited())
+        {
+            if origin.harness == cide_ipc::Harness::Opencode
+                && let Some(console) = crate::sessions_state::handle(app).and_then(|sessions| {
+                    sessions
+                        .conversations
+                        .consoles
+                        .get(&session)
+                        .map(|c| c.clone())
+                })
+            {
+                if console.conversation().id != origin.id
+                    || !console.peer_ready().map_err(CoreError::Io)?
+                    || !begin()?
+                {
+                    return Ok(AnswerSubmission::Waiting);
+                }
+                console
+                    .prompt_conversation(&origin.id, &line)
+                    .map_err(CoreError::Io)?;
+                return Ok(AnswerSubmission::Confirmed);
+            }
+            if origin.harness == cide_ipc::Harness::Codex
+                && let Some(console) = app
+                    .try_state::<crate::peer_chat::Runtime>()
+                    .and_then(|runtime| runtime.codex_console(session))
+            {
+                let Some(receiver) = console.receiver().map_err(CoreError::Io)? else {
+                    return Ok(AnswerSubmission::Waiting);
+                };
+                if receiver.thread != origin.id || !begin()? {
+                    return Ok(AnswerSubmission::Waiting);
+                }
+                let delivery_app = app.clone();
+                let pinned = origin.clone();
+                let valid = Box::new(move || {
+                    (crate::conversations::live(&delivery_app, &pinned) == Some(session))
+                        .then_some(())
+                        .ok_or_else(|| {
+                            "The asking conversation changed; the answer is saved.".into()
+                        })
+                });
+                return match console.peer_prompt(receiver, line, valid) {
+                    Ok(true) => Ok(AnswerSubmission::Confirmed),
+                    Ok(false) => Ok(AnswerSubmission::Waiting),
+                    Err((false, error)) => Ok(AnswerSubmission::NotSent(error)),
+                    Err((true, error)) => Err(CoreError::Io(error)),
+                };
+            }
+            let state = crate::emit::last_session_states()
+                .get(&session)
+                .copied()
+                .or_else(|| {
+                    app.try_state::<crate::hooks::HookServer>()
+                        .map(|hooks| hooks.state(session))
+                });
+            if !matches!(
+                state,
+                Some(cide_ipc::SessionState::Idle | cide_ipc::SessionState::AwaitingInput)
+            ) || !cide_core::conversations::composer(origin.harness, &pty.capture_screen())
+                .is_some_and(|body| body.trim().is_empty())
+            {
+                return Ok(AnswerSubmission::Waiting);
+            }
+            if !begin()? {
+                return Ok(AnswerSubmission::Waiting);
+            }
+            crate::peer_chat::submit_mobile(app, session, &pty, origin.harness, &line)
+                .map_err(CoreError::Io)?;
+            // An Enter is not a receipt. The next delivery pass checks the transcript.
+            return Ok(AnswerSubmission::Submitted);
+        }
+        if !origin.known || !origin.cwd.is_dir() {
+            return Err(CoreError::Io("The original conversation or its working directory is unavailable. The answer is saved.".into()));
+        }
+        if !crate::conversations::resume_enabled(app, project, origin.harness) {
+            return Err(CoreError::Io("Restoring the asking conversation is disabled for this harness. The answer is saved.".into()));
+        }
+        let harness = cide_agents::tools::SESSION_HARNESSES
+            .iter()
+            .find(|h| **h == origin.harness)
+            .ok_or_else(|| CoreError::Io("This harness has no resumable console.".into()))?;
+        let tab_harness = match harness {
+            cide_ipc::Harness::Claude => {
+                crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Claude)
+            }
+            cide_ipc::Harness::Codex => {
+                crate::claude_tab::TabHarness::Console(cide_ipc::ConsoleHarness::Codex)
+            }
+            _ => crate::claude_tab::TabHarness::Opencode,
+        };
+        let mode = cide_agents::config::load(&root(app, project)?)
+            .agents
+            .unattended();
+        if !begin()? {
+            return Ok(AnswerSubmission::Waiting);
+        }
+        crate::claude_tab::open_continuing(
+            app,
+            project,
+            crate::claude_tab::Open {
+                title: &origin.title,
+                session_name: None,
+                prompt: &line,
+                mode: crate::claude_tab::TabMode {
+                    unattended: mode,
+                    behind: true,
+                },
+                cwd: Some(origin.cwd.clone()),
+                harness: Some(tab_harness),
+                model: None,
+                voice: match origin.kind {
+                    cide_ipc::sessions::SessionKind::Worker => crate::cmd::session::Voice::Worker,
+                    cide_ipc::sessions::SessionKind::Planner
+                    | cide_ipc::sessions::SessionKind::Reviewer => {
+                        crate::cmd::session::Voice::Acting
+                    }
+                    _ => crate::cmd::session::Voice::Pane,
+                },
+                origin: match origin.kind {
+                    cide_ipc::sessions::SessionKind::Planner => Some(cide_ipc::PaneOrigin::Planner),
+                    cide_ipc::sessions::SessionKind::Worker => Some(cide_ipc::PaneOrigin::Worker),
+                    cide_ipc::sessions::SessionKind::Reviewer => {
+                        Some(cide_ipc::PaneOrigin::Reviewer)
+                    }
+                    _ => None,
+                },
             },
-            cwd: Some(origin.cwd.clone()),
-            harness: Some(tab_harness),
-            model: None,
-            voice: if origin.kind == cide_ipc::sessions::SessionKind::Worker {
-                crate::cmd::session::Voice::Worker
-            } else {
-                crate::cmd::session::Voice::Acting
-            },
-            origin: match origin.kind {
-                cide_ipc::sessions::SessionKind::Planner => Some(cide_ipc::PaneOrigin::Planner),
-                cide_ipc::sessions::SessionKind::Worker => Some(cide_ipc::PaneOrigin::Worker),
-                cide_ipc::sessions::SessionKind::Reviewer => Some(cide_ipc::PaneOrigin::Reviewer),
-                _ => None,
-            },
-        },
-        Some(cide_ipc::HarnessSession {
-            harness: origin.harness,
-            id: origin.id,
-            cwd: origin.cwd,
-        }),
-    )?;
-    Ok(true)
+            Some(cide_ipc::HarnessSession {
+                harness: origin.harness,
+                id: origin.id.clone(),
+                cwd: origin.cwd.clone(),
+            }),
+        )?;
+        Ok(AnswerSubmission::Submitted)
+    }
 }

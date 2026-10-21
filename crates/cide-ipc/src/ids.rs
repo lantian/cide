@@ -76,6 +76,10 @@ uuid_id!(
     ProjectId
 );
 uuid_id!(
+    /// One independent Search Everywhere query, optionally retained in a bottom tab.
+    SearchSessionId
+);
+uuid_id!(
     /// One workspace tab inside a project.
     TabId
 );

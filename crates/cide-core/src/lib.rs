@@ -78,3 +78,5 @@ pub use error::{CoreError, Result};
 pub mod peer_chat;
 
 pub mod peer_composer;
+
+pub mod decision;

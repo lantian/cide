@@ -652,6 +652,7 @@ mod tests {
                 harness_conversation: None,
                 continues: None,
                 harness: None,
+                harness_choice: None,
                 title: "f".into(),
                 docker: None,
                 origin: None,

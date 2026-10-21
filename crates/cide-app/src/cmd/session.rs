@@ -219,8 +219,7 @@ impl ConsoleSpawn {
     ///   thread by claude. This is what keeps an open console, its Resume button and its restore
     ///   after restart on the CLI it was started with.
     /// * **A fresh spawn** — a new pane, Restart session, a restored pane whose conversation is
-    ///   gone — runs Settings → Harness. It is the only road by which the setting reaches a
-    ///   pane, and the one the user was told about.
+    ///   gone — runs an explicit pane choice when given, otherwise Settings → Harness.
     fn decide(
         ws: &cide_ipc::Workspace,
         asked: cide_ipc::ConsoleHarness,
@@ -583,23 +582,11 @@ fn orchestrator_paragraph(
     // sentence*: the product owner is told it is, and any other pane is told it may act as one.
     let (root, inferred) = state.with(|ws| {
         let primary = is_primary_console_spawn(ws, registry, project, resume, forking);
-        // A worker restored after a restart is respawned by the webview, which passes no voice:
-        // the tree still says what it is, and `agent_rpc` scopes it by the same mark, so the
-        // paragraph and the tool list cannot disagree. (M104)
-        let worker = !forking
-            && resume.is_some_and(|resume| {
-                cide_core::workspace::project(ws, project).is_ok_and(|project| {
-                    project
-                        .tabs
-                        .iter()
-                        .flat_map(|tab| tab.tree.panes.values())
-                        .chain(project.detached.values())
-                        .any(|pane| {
-                            pane.session == Some(resume)
-                                && pane.origin == Some(cide_ipc::PaneOrigin::Worker)
-                        })
-                })
-            });
+        // Restores pass no voice. Use the same pane origins as the MCP scope resolver,
+        // including detached automatic tabs, so their question instructions survive restart.
+        let restored = (!forking)
+            .then(|| resume.and_then(|session| restored_voice(ws, project, session)))
+            .flatten();
         let root = cide_core::workspace::project(ws, project)
             .ok()?
             .roots
@@ -607,13 +594,11 @@ fn orchestrator_paragraph(
             .map(|root| root.path.clone())?;
         Some((
             root,
-            if worker {
-                Voice::Worker
-            } else if primary {
+            restored.unwrap_or(if primary {
                 Voice::ProductOwner
             } else {
                 Voice::Pane
-            },
+            }),
         ))
     })?;
 
@@ -625,7 +610,7 @@ fn orchestrator_paragraph(
     // that starts before cide knows what to tell it.
     // A worker is told what it is and nothing about orchestration (M104): see `Voice::Worker`.
     if voice.unwrap_or(inferred) == Voice::Worker {
-        return Some(WORKER_PARAGRAPH.to_string());
+        return Some(worker_paragraph());
     }
     let agents = cide_agents::load_project(&root);
     let tracker = cide_agents::config::load_tracker(&root);
@@ -666,6 +651,44 @@ fn orchestrator_paragraph(
     ))
 }
 
+fn restored_voice(
+    ws: &cide_ipc::Workspace,
+    project: cide_ipc::ProjectId,
+    session: SessionId,
+) -> Option<Voice> {
+    let project = cide_core::workspace::project(ws, project).ok()?;
+    let origin = project
+        .tabs
+        .iter()
+        .flat_map(|tab| tab.tree.panes.values())
+        .chain(project.detached.values())
+        .find(|pane| pane.session == Some(session))?
+        .origin;
+    origin_voice(origin)
+}
+
+fn restored_pane_voice(
+    ws: &cide_ipc::Workspace,
+    project: cide_ipc::ProjectId,
+    pane: PaneId,
+) -> Option<Voice> {
+    let project = cide_core::workspace::project(ws, project).ok()?;
+    let pane = project
+        .tabs
+        .iter()
+        .find_map(|tab| tab.tree.panes.get(&pane))
+        .or_else(|| project.detached.get(&pane))?;
+    origin_voice(pane.origin)
+}
+
+fn origin_voice(origin: Option<cide_ipc::PaneOrigin>) -> Option<Voice> {
+    match origin {
+        Some(cide_ipc::PaneOrigin::Worker) => Some(Voice::Worker),
+        Some(cide_ipc::PaneOrigin::Planner | cide_ipc::PaneOrigin::Reviewer) => Some(Voice::Acting),
+        None => None,
+    }
+}
+
 /// The complete console instructions, testable without a Tauri application. `None` is
 /// subagents off, distinct from an enabled project that simply has no roles yet.
 fn project_paragraph(
@@ -675,6 +698,9 @@ fn project_paragraph(
     tracker: bool,
     agent_sessions_enabled: bool,
 ) -> String {
+    if voice == Voice::Worker {
+        return worker_paragraph();
+    }
     let roster = roles
         .map(|roles| roster_paragraph(roles, voice, limits, tracker))
         .unwrap_or_default();
@@ -683,7 +709,12 @@ fn project_paragraph(
     } else {
         ""
     };
-    [roster.as_str(), sessions, IDE_SENTENCE]
+    let requests = if voice == Voice::Acting {
+        request_paragraph(tracker)
+    } else {
+        String::new()
+    };
+    [roster.as_str(), sessions, IDE_SENTENCE, &requests]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -747,6 +778,26 @@ const WORKER_PARAGRAPH: &str = "cide opened this session to implement one piece 
      `mcp__cide__cide_task_*` tools read and write it — leave one short report on the task when \
      you are done (no progress comments), and set it to `review`. Anything you notice that is not your \
      work goes on the board as a new task with `inbox: true` rather than into this branch.";
+
+const REQUEST_PARAGRAPH: &str = "When you need the user, call `mcp__cide__cide_user_request`; \
+     it waits for the answer in this conversation by default. Set wait=false only for \
+     independent work. Reconnect after interruption with `mcp__cide__cide_user_request_result`. \
+     Timeout, rejection or cancellation is not approval.";
+
+fn request_paragraph(tracker: bool) -> String {
+    if tracker {
+        format!(
+            "{REQUEST_PARAGRAPH} Propose inbox activation with kind=moveTasks, a milestone \
+             and task IDs; cide applies the user's selected moves."
+        )
+    } else {
+        REQUEST_PARAGRAPH.to_string()
+    }
+}
+
+fn worker_paragraph() -> String {
+    format!("{WORKER_PARAGRAPH} {REQUEST_PARAGRAPH}")
+}
 
 /// The sentence a console gets when the project has **nobody to dispatch to**. (M104)
 ///
@@ -928,8 +979,7 @@ fn roster_paragraph(
          let the gate — a command cide runs, not your judgement — say when it is met. Work whose \
          quality is a matter of taste (art, the look of the UI) gets `acceptance: user`: cide \
          merges it once verify is green and the user accepts it by eye; feature work uses \
-         placeholders for it. Ask about taste, scope or design with `mcp__cide__cide_user_request`; \
-         it waits for the answer in this conversation by default. Never \
+         placeholders for it. Never \
          rewrite the body of a task a run is working on — comment the correction or dispatch \
          the role with it. Assigning a todo or doing task to a role — with \
          `mcp__cide__cide_task_assign` or `mcp__cide__cide_task_update`, by creating the task \
@@ -970,10 +1020,7 @@ fn roster_paragraph(
          the tracker: hold the goal in one task \
          and decompose from it, and when cide tells you a run ended, re-read that goal task and \
          the board before deciding what is next — the board, not your context, is the plan of \
-         record. When you need the user, call `mcp__cide__cide_user_request`, which waits by default. \
-         Set wait=false only for independent work; cide returns the answer to this conversation. \
-         After interruption reconnect with `mcp__cide__cide_user_request_result`. Propose inbox \
-         activation with kind=moveTasks, a milestone and task IDs; cide applies the user's selected moves."
+         record."
     )
 }
 
@@ -996,10 +1043,7 @@ fn no_tracker_manual(limits: &str) -> String {
          it into a console pane (`notify` on the dispatch: `here`, `main` or `none`); read what \
          it did in its branch, take work you accept with `mcp__cide__cide_agent_integrate`, or \
          dispatch it again with a one-line instruction saying what is still wrong. Watch runs \
-         with `mcp__cide__cide_agent_runs`; stop one with `mcp__cide__cide_agent_stop`. When \
-         you need the user, call `mcp__cide__cide_user_request`; it waits by default. Set wait=false \
-         only for independent work; the answer returns to this conversation. Reconnect after \
-         interruption with `mcp__cide__cide_user_request_result`."
+         with `mcp__cide__cide_agent_runs`; stop one with `mcp__cide__cide_agent_stop`."
     )
 }
 
@@ -1259,6 +1303,17 @@ pub(crate) async fn spawn_session(
         prompt: opening,
         task_tools,
     } = request;
+    // Native continuations name a harness thread rather than the old routing session.
+    // The frontend supplies the pane id, which retains automatic/worker identity even
+    // when no resumable SessionId can be inferred (notably OpenCode's ses_ ids).
+    let voice = voice.or_else(|| {
+        if wants_fork(fork) {
+            return None;
+        }
+        let (project, pane) = (project?, pane?);
+        app.try_state::<crate::workspace_state::WorkspaceState>()?
+            .with(|ws| restored_pane_voice(ws, project, pane))
+    });
     // Desktop and mobile continuations share one admission gate, held until the new
     // child's identity is registered. Forks deliberately create a separate conversation.
     let _resume_guard = if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork))
@@ -2152,6 +2207,99 @@ pub(crate) async fn spawn_session(
         None
     };
     let agent_sessions_launch = registry.prepare_agent_sessions(id, agent_sessions_enabled);
+    let decision_handle = if (is_codex || is_opencode)
+        && let Some(project) = project
+    {
+        let harness = if is_codex {
+            cide_ipc::ConsoleHarness::Codex
+        } else {
+            cide_ipc::ConsoleHarness::Opencode
+        };
+        let pinned = spec
+            .args
+            .iter()
+            .any(|a| a == "--model" || a.starts_with("--model=") || a.starts_with("-m"));
+        Some(crate::decision::register(
+            &app,
+            id,
+            project,
+            harness,
+            spec.cwd.clone(),
+            pane.map(|p| p.to_string())
+                .unwrap_or_else(|| id.to_string()),
+            pinned,
+        ))
+    } else {
+        None
+    };
+    let worker = voice == Some(Voice::Worker)
+        || project.is_some_and(|project| {
+            app.state::<crate::workspace_state::WorkspaceState>()
+                .with(|ws| {
+                    pane.and_then(|pane| restored_pane_voice(ws, project, pane))
+                        .or_else(|| resume.and_then(|session| restored_voice(ws, project, session)))
+                        == Some(Voice::Worker)
+                })
+        });
+    let native_planning = if worker {
+        let conversation = native.clone().or_else(|| continues.clone()).or_else(|| {
+            resume.map(|session| cide_ipc::HarnessSession {
+                harness: if is_codex {
+                    cide_ipc::Harness::Codex
+                } else if is_opencode {
+                    cide_ipc::Harness::Opencode
+                } else {
+                    cide_ipc::Harness::Claude
+                },
+                id: session.to_string(),
+                cwd: spec.cwd.clone(),
+            })
+        });
+        let restored = conversation
+            .as_ref()
+            .and_then(|conversation| crate::native_plan::restored(&app, conversation));
+        let initial = (voice == Some(Voice::Worker) && resume.is_none() && continues.is_none())
+            .then(|| {
+                (
+                    cide_agents::native_plan::State::default(),
+                    spec.args
+                        .windows(2)
+                        .rfind(|args| args[0] == "--permission-mode")
+                        .map(|args| args[1].clone())
+                        .unwrap_or_else(|| "auto".into()),
+                )
+            });
+        restored.or(initial).map(|(state, execution)| {
+            crate::native_plan::register(
+                &app,
+                project,
+                id,
+                None,
+                if is_codex {
+                    cide_ipc::Harness::Codex
+                } else if is_opencode {
+                    cide_ipc::Harness::Opencode
+                } else {
+                    cide_ipc::Harness::Claude
+                },
+                state,
+                execution,
+            )
+        })
+    } else {
+        None
+    };
+    if is_claude && native_planning.as_ref().is_some_and(|plan| plan.pending()) {
+        if !crate::native_plan::claude_observable(&spec.args) {
+            return Err(SessionError::Pty(
+                "Native plan approval requires Claude's hook integration".into(),
+            ));
+        }
+        spec.args = crate::native_plan::claude_args(
+            &spec.args,
+            native_planning.as_ref().unwrap().execution(),
+        );
+    }
     let opencode = if is_opencode {
         let instructions = pair_paragraph
             .clone()
@@ -2176,6 +2324,8 @@ pub(crate) async fn spawn_session(
             .map(|pair| pair[1].clone());
         let unattended = spec.args.iter().any(|arg| arg == "--auto");
         let start = crate::opencode_console::Start {
+            planning: native_planning.clone(),
+            role_document: None,
             harness: native
                 .as_ref()
                 .map(|c| c.harness)
@@ -2191,6 +2341,9 @@ pub(crate) async fn spawn_session(
             unattended: unattended && !pair.as_ref().is_some_and(|p| p.1),
             reviewer: pair.as_ref().is_some_and(|p| p.1),
             paired: pair.is_some(),
+            decision: decision_handle
+                .clone()
+                .filter(|_| crate::decision::configured(&app, project)),
         };
         let (prepared, observer) = blocking(move || {
             crate::opencode_console::Console::start(start).map_err(SessionError::Pty)
@@ -2202,14 +2355,35 @@ pub(crate) async fn spawn_session(
         None
     };
 
-    let codex = if is_codex && pair.is_some() {
+    let codex = if is_codex
+        && (native_planning.is_some()
+            || pair.is_some()
+            || crate::decision::configured(&app, project))
+    {
         let observer = crate::codex_console::observer(app.clone(), id);
+        let paired = pair.is_some();
+        let native_planning = native_planning.clone();
         let (prepared, console) = blocking(move || {
-            crate::codex_console::Console::start(spec, observer).map_err(SessionError::Pty)
+            let original = spec.clone();
+            match crate::codex_console::Console::start_planning(
+                spec,
+                observer,
+                decision_handle.clone(),
+                native_planning.clone(),
+            ) {
+                Ok((prepared, console)) => Ok((prepared, Some(console))),
+                Err(error) if !paired && native_planning.is_none() => {
+                    if let Some(h) = decision_handle {
+                        h.available(false, &error);
+                    }
+                    Ok((original, None))
+                }
+                Err(error) => Err(SessionError::Pty(error)),
+            }
         })
         .await?;
         spec = prepared;
-        Some(console)
+        console
     } else {
         None
     };
@@ -2277,6 +2451,9 @@ pub(crate) async fn spawn_session(
     crate::lifecycle::watch_jobs(app.clone(), id, &session);
 
     registry.insert_prompted(id, Arc::clone(&session), opening_prompt);
+    if let Some(plan) = &native_planning {
+        plan.watch_terminal(&session);
+    }
     agent_sessions_launch.commit();
     if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork)) {
         registry.note_native_conversation(id, conversation.clone());
@@ -2753,6 +2930,7 @@ pub fn session_write(
         tracing::debug!(%session, ?seq, ?epoch, window = window.label(), "session write: dropped a replayed frame");
         return Ok(());
     }
+    crate::decision::user_input(&app, session, &data);
     // A submitted line typed by a person makes a tab cide opened theirs. (M132)
     if data.contains('\r') {
         crate::agent_rpc::note_typed(session);
@@ -2765,10 +2943,9 @@ pub fn session_write(
             .manual_write(&app, session, &s, data.into_bytes())
             .map_err(SessionError::Pty)?;
     } else {
-        if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
-            hooks.note_codex_input(session, data.as_bytes(), &s);
-        }
-        s.write(data.into_bytes());
+        app.state::<crate::peer_chat::Runtime>()
+            .manual_write(&app, session, &s, data.into_bytes())
+            .map_err(SessionError::Pty)?;
     }
     Ok(())
 }
@@ -3132,6 +3309,70 @@ mod tests {
     }
 
     #[test]
+    fn question_instructions_follow_session_identity_with_or_without_roles_and_tracker() {
+        let developer = role("developer", "Implements work");
+        for roles in [None, Some(Vec::new()), Some(vec![&developer])] {
+            for tracker in [false, true] {
+                for voice in [
+                    Voice::ProductOwner,
+                    Voice::Pane,
+                    Voice::Acting,
+                    Voice::Worker,
+                ] {
+                    let text = project_paragraph(roles.as_deref(), voice, None, tracker, true);
+                    let permitted = matches!(voice, Voice::Acting | Voice::Worker);
+                    assert_eq!(text.contains("cide_user_request"), permitted, "{text}");
+                    assert_eq!(
+                        text.contains("cide_user_request_result"),
+                        permitted,
+                        "{text}"
+                    );
+                    assert_eq!(
+                        text.contains("kind=moveTasks"),
+                        voice == Voice::Acting && tracker,
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restored_and_detached_automatic_tabs_keep_their_question_voice() {
+        let mut ws = cide_ipc::Workspace::default();
+        let project =
+            cide_core::workspace::open_project(&mut ws, vec!["/repo".into()], None).unwrap();
+        let console = ws.projects[&project].primary_session;
+        assert_eq!(restored_voice(&ws, project, console), None);
+        for (origin, expected) in [
+            (cide_ipc::PaneOrigin::Planner, Voice::Acting),
+            (cide_ipc::PaneOrigin::Reviewer, Voice::Acting),
+            (cide_ipc::PaneOrigin::Worker, Voice::Worker),
+        ] {
+            let p = ws.projects.get_mut(&project).unwrap();
+            let pane = p.tabs[0].tree.panes.values_mut().next().unwrap();
+            pane.origin = Some(origin);
+            let pane_id = pane.id;
+            assert_eq!(restored_voice(&ws, project, console), Some(expected));
+            assert_eq!(restored_pane_voice(&ws, project, pane_id), Some(expected));
+            let p = ws.projects.get_mut(&project).unwrap();
+            let pane = p.tabs[0].tree.panes.values().next().unwrap().clone();
+            p.tabs[0].tree.panes.clear();
+            p.detached.insert(pane.id, pane);
+            assert_eq!(restored_voice(&ws, project, console), Some(expected));
+            assert_eq!(restored_pane_voice(&ws, project, pane_id), Some(expected));
+            assert_eq!(
+                restored_voice(&ws, cide_ipc::ProjectId::new(), console),
+                None
+            );
+            let p = ws.projects.get_mut(&project).unwrap();
+            let pane = p.detached.values().next().unwrap().clone();
+            p.detached.clear();
+            p.tabs[0].tree.panes.insert(pane.id, pane);
+        }
+    }
+
+    #[test]
     fn the_roster_paragraph_names_the_roles_and_the_namespaced_tools() {
         let developer = role("developer", "Implements one task\n  end to end.");
         let qa = role("qa", "");
@@ -3233,9 +3474,9 @@ mod tests {
             assert!(paragraph.contains(word), "{word} is not named: {paragraph}");
         }
 
-        // A decision stays in the asking conversation through the blocking request tool.
+        // Main harnesses use their own question flow.
         assert!(
-            paragraph.contains("mcp__cide__cide_user_request"),
+            !paragraph.contains("mcp__cide__cide_user_request"),
             "{paragraph}"
         );
     }

@@ -27,6 +27,8 @@ pub(crate) struct Console {
     events: bool,
     peer_model: Option<String>,
     peer_agent: Option<String>,
+    planning: Option<crate::native_plan::Handle>,
+    plan_baseline: Mutex<Option<String>>,
 }
 
 pub(crate) struct Start {
@@ -44,6 +46,10 @@ pub(crate) struct Start {
     /// Paired agents address their one message tool directly. OpenCode 2 defaults
     /// to Code Mode, whose execute wrapper is denied by the reviewer policy.
     pub paired: bool,
+    pub decision: Option<crate::decision::Handle>,
+    pub planning: Option<crate::native_plan::Handle>,
+    /// A dispatched role's existing provider/role document; never planning instructions.
+    pub role_document: Option<serde_json::Value>,
 }
 
 impl Console {
@@ -61,6 +67,9 @@ impl Console {
             unattended,
             reviewer,
             paired,
+            decision,
+            planning,
+            role_document,
         } = start;
         // SpawnSpec applies sets after removals, so discard explicit port entries too.
         spec.env
@@ -87,11 +96,14 @@ impl Console {
             format!("http://127.0.0.1:{port}"),
             password.clone(),
             flags.generation,
-        )?;
+        )?
+        .with_user(flavor.server_user());
         let mut launch = cide_core::opencode_cli::plan(cli);
         let user_model = take_option(&mut launch.args, &["--model", "-m"]);
         let configured_agent = take_option(&mut launch.args, &["--agent"]);
-        let agent = if reviewer {
+        let agent = if let Some(plan) = &planning {
+            Some(if plan.pending() { "plan" } else { "build" }.to_string())
+        } else if reviewer {
             Some("cide-peer-reviewer".to_string())
         } else {
             configured_agent
@@ -101,14 +113,23 @@ impl Console {
         let unattended = !reviewer && (unattended || launch.args.iter().any(|arg| arg == "--auto"));
         launch.args.retain(|arg| arg != "--auto");
         let hook = crate::agents::cide_hook_binary();
-        let mut document: serde_json::Value = flavor
-            .tab_config(
-                &settings.llm,
-                cli.inject.mcp_config.then_some(hook.as_deref()).flatten(),
-                flags.generation,
-            )
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({}));
+        let role_run = role_document.is_some();
+        let mut document: serde_json::Value = role_document.unwrap_or_else(|| {
+            flavor
+                .tab_config(
+                    &settings.llm,
+                    cli.inject.mcp_config.then_some(hook.as_deref()).flatten(),
+                    flags.generation,
+                )
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({}))
+        });
+        if let Some(h) = &decision
+            && let Err(error) =
+                h.install_opencode(&mut spec, &mut document, flags.generation == Generation::V2)
+        {
+            h.available(false, &error);
+        }
         if paired {
             direct_peer_tools(&mut document, flags.generation);
         }
@@ -116,7 +137,7 @@ impl Console {
             reviewer_config(&mut document, flags.generation);
         }
         let instructions =
-            instructions.filter(|_| cli.inject.instructions && cli.inject.mcp_config);
+            instructions.filter(|_| role_run || (cli.inject.instructions && cli.inject.mcp_config));
         let instruction_file = if flags.generation == Generation::V1 {
             instructions
                 .as_ref()
@@ -157,17 +178,24 @@ impl Console {
         ]);
         // The server executes commands and launches MCP children. Both must inherit
         // the reviewer's scratch directory and read-only analysis environment.
+        if role_run {
+            // The server executes the tools: preserve the role's resolved isolation,
+            // launch variables and proxy on that process, as the original run did.
+            server_spec.env.clone_from(&spec.env);
+            server_spec.env_remove.clone_from(&spec.env_remove);
+        }
         for (name, value) in &spec.env {
-            if name.starts_with("CIDE_")
-                || (reviewer
-                    && matches!(
-                        name.as_str(),
-                        "TMPDIR"
-                            | "TMP"
-                            | "TEMP"
-                            | "PYTHONDONTWRITEBYTECODE"
-                            | "GIT_OPTIONAL_LOCKS"
-                    ))
+            if !role_run
+                && (name.starts_with("CIDE_")
+                    || (reviewer
+                        && matches!(
+                            name.as_str(),
+                            "TMPDIR"
+                                | "TMP"
+                                | "TEMP"
+                                | "PYTHONDONTWRITEBYTECODE"
+                                | "GIT_OPTIONAL_LOCKS"
+                        )))
             {
                 server_spec.env.push((name.clone(), value.clone()));
             }
@@ -175,7 +203,7 @@ impl Console {
         server_spec = server_spec
             .env("CIDE_SESSION", routing.to_string())
             .env(format!("{prefix}_SERVER_PASSWORD"), password.clone())
-            .env(format!("{prefix}_SERVER_USERNAME"), "opencode")
+            .env(format!("{prefix}_SERVER_USERNAME"), flavor.server_user())
             .env(format!("{prefix}_CONFIG_CONTENT"), document.to_string());
         let server = match PtySession::spawn(server_spec) {
             Ok(server) => server,
@@ -200,6 +228,8 @@ impl Console {
             events: cli.inject.events,
             peer_model: model.clone(),
             peer_agent: agent.clone(),
+            planning: planning.clone(),
+            plan_baseline: Mutex::new(None),
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         while !console.api.healthy() {
@@ -207,6 +237,9 @@ impl Console {
                 return Err("OpenCode’s private server did not become ready. Check Settings → Harness → Launch.".into());
             }
             std::thread::sleep(Duration::from_millis(150));
+        }
+        if planning.as_ref().is_some_and(|plan| plan.pending()) {
+            console.api.require_native_plan()?;
         }
         let id = match resume.filter(|_| cli.inject.resume) {
             Some(resume) => {
@@ -246,6 +279,15 @@ impl Console {
             )?,
         };
         console.conversation.get_mut().id = id.clone();
+        if planning.is_some() {
+            console
+                .api
+                .select_agent(&id, agent.as_deref().unwrap_or("plan"))?;
+            *console.plan_baseline.get_mut() = console.api.completed_native_plan(&id)?;
+        }
+        if let Some(plan) = &planning {
+            plan.bind(console.conversation());
+        }
         if let Some(instructions) = &console.instructions {
             console.api.instructions(&id, instructions)?;
         }
@@ -268,7 +310,7 @@ impl Console {
         spec = spec
             .apply(launch.env)
             .env(format!("{prefix}_SERVER_PASSWORD"), password)
-            .env(format!("{prefix}_SERVER_USERNAME"), "opencode");
+            .env(format!("{prefix}_SERVER_USERNAME"), flavor.server_user());
         // Submit after the TUI attaches. Passing --prompt also makes the opening turn visible in the TUI.
         if let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) {
             spec.args.extend(["--prompt".into(), prompt]);
@@ -284,11 +326,22 @@ impl Console {
         Ok(matches!(state, SessionState::Idle))
     }
     pub fn peer_prompt(&self, text: &str) -> Result<(), String> {
+        self.prompt_conversation(&self.conversation().id, text)
+    }
+    /// A saved answer names its original conversation even if the TUI selects another
+    /// conversation between the readiness check and this request.
+    pub(crate) fn prompt_conversation(&self, id: &str, text: &str) -> Result<(), String> {
+        if self.planning.as_ref().is_some_and(|plan| plan.pending()) {
+            *self.plan_baseline.lock() = self.api.completed_native_plan(id)?;
+        }
         self.api.prompt_as(
-            &self.conversation().id,
+            id,
             text,
             self.peer_model.as_deref(),
-            self.peer_agent.as_deref(),
+            self.planning
+                .as_ref()
+                .map(|plan| if plan.pending() { "plan" } else { "build" })
+                .or(self.peer_agent.as_deref()),
         )
     }
     pub fn conversation(&self) -> HarnessSession {
@@ -308,6 +361,9 @@ impl Console {
         };
         if info.get("parentID").is_some() || !same_directory(&info, &self.conversation().cwd) {
             return false;
+        }
+        if let Some(plan) = &self.planning {
+            plan.abandon();
         }
         if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
             let pair = state.with(|ws| {
@@ -430,6 +486,7 @@ impl Console {
             let mut failures = 0;
             let mut last_status = serde_json::Value::Null;
             let mut tracked = String::new();
+            let mut questions = std::collections::HashMap::new();
             while !this.stopped.load(Ordering::SeqCst) {
                 let mut conversation = this.conversation();
                 if this.events {
@@ -447,8 +504,39 @@ impl Console {
                     }
                     if tracked != conversation.id { tracked = conversation.id.clone(); worked = false; }
                     match this.api.state(&conversation.id, worked) {
-                        Ok(state) => {
+                        Ok(mut state) => {
                             worked |= state == SessionState::Busy || state == SessionState::AwaitingPermission;
+                            if let Some(plan) = &this.planning {
+                                let asking = if plan.pending() && plan.valid() {
+                                    match poll_questions(&this.api, plan, &conversation.id, &mut questions) {
+                                        Ok(asking) => asking,
+                                        Err(error) => { tracing::warn!(%routing, %error, "native question synchronization failed"); !questions.is_empty() }
+                                    }
+                                } else { questions.retain(|_, (_, q)| q.active()); !questions.is_empty() };
+                                if asking { state = SessionState::AwaitingInput; }
+                                if !asking && plan.pending() && plan.valid() && matches!(state, SessionState::Idle | SessionState::AwaitingInput) {
+                                    let transition = (|| -> Result<bool, String> {
+                                        if this.api.approve_plan_question(&conversation.id)? {
+                                            plan.transition(cide_agents::native_plan::Phase::Implementing);
+                                            return Ok(true);
+                                        }
+                                        if let Some(id) = this.api.completed_native_plan(&conversation.id)?
+                                            && this.plan_baseline.lock().as_deref() != Some(id.as_str()) {
+                                            plan.transition(cide_agents::native_plan::Phase::Approving);
+                                            this.api.prompt_as(&conversation.id, "Implement the plan.", this.peer_model.as_deref(), Some("build"))?;
+                                            plan.transition(cide_agents::native_plan::Phase::Implementing);
+                                            return Ok(true);
+                                        }
+                                        Ok(false)
+                                    })();
+                                    match transition {
+                                        Ok(true) => state = SessionState::Busy,
+                                        Ok(false) => {},
+                                        Err(error) => { plan.fail(&error); this.stop(); break; }
+                                    }
+                                }
+                                plan.state(state);
+                            }
                             failures = 0;
                             if let Ok(info) = this.api.request(reqwest::Method::GET, &format!("/session/{}", conversation.id), None) {
                                 let payload = status_payload(&info);
@@ -469,6 +557,73 @@ impl Console {
             }
         });
     }
+}
+
+fn poll_questions(
+    api: &Api,
+    plan: &crate::native_plan::Handle,
+    session: &str,
+    pending: &mut std::collections::HashMap<
+        String,
+        (serde_json::Value, crate::native_questions::Question),
+    >,
+) -> Result<bool, String> {
+    use cide_agents::native_questions::{self, Dialect};
+    let requests = api.pending_questions(session)?;
+    pending.retain(|id, (_, q)| {
+        q.active()
+            && q.source.conversation == session
+            && requests.iter().any(|r| r["id"].as_str() == Some(id))
+    });
+    for request in requests {
+        let id = request["id"]
+            .as_str()
+            .ok_or("The native question has no id")?
+            .to_string();
+        if let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(id.clone()) {
+            let (field, dialect) = if api.generation == Generation::V2 {
+                ("fields", Dialect::Forms)
+            } else {
+                ("questions", Dialect::OpenCode)
+            };
+            let questions = native_questions::questions(&request[field], dialect)?;
+            let q = plan.ask(session, &id, questions)?;
+            entry.insert((request, q));
+        }
+        let (request, question) = &pending[&id];
+        let Some(response) = question.response() else {
+            continue;
+        };
+        let answer = if matches!(response, cide_ipc::UserRequestResponse::Answers { .. }) {
+            Some(if api.generation == Generation::V2 {
+                native_questions::form_reply(&request["fields"], &question.questions, &response)?
+            } else {
+                json!({"answers":native_questions::answer_values(&question.questions, &response).ok_or("Incomplete answers")?})
+            })
+        } else {
+            None
+        };
+        if question.claim() {
+            match api.reply_question(session, &id, answer.as_ref()) {
+                Ok(()) => {
+                    question.finish();
+                    if answer.is_none() {
+                        question.cancel_turn();
+                    }
+                }
+                Err(error) => {
+                    question.error(&error);
+                    if !error.contains("HTTP 4") {
+                        // A subsequent authenticated pending snapshot is proof that the
+                        // same operation still needs its saved answer. Until then the
+                        // uncertain submission stays retired and cannot be replayed.
+                        question.retire(&format!("Question delivery disconnected: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(pending.values().any(|(_, q)| q.valid()))
 }
 
 /// Private server policy: all agents inherit the same denial, even if the TUI switches modes.

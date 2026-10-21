@@ -149,6 +149,8 @@ import {
 
 import styles from './TasksPanel.module.css'
 import { Button } from '@/kit/components/Button'
+import { TaskDispatchInfo } from './TaskDispatchInfo'
+import type { TaskDispatchStatus } from '@/ipc/generated'
 
 /**
  * One CSS class per `Tone`.
@@ -648,6 +650,8 @@ export interface TaskDetailProps {
    * honestly (*Unassigned*, or the raw id).
    */
   assigneeHint?: string | null | undefined
+  dispatchStatus?: TaskDispatchStatus | null | undefined
+  dispatchError?: string | null | undefined
   /** The clock, as a prop, so the comment log's ages are deterministic under SSR. */
   nowMs: number
   /**
@@ -1452,6 +1456,9 @@ export function TaskDetail(props: TaskDetailProps) {
         {showsAssignee(spec, task.agent !== null) && (
           <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
         )}
+        {task.change === null && <TaskDispatchInfo status={props.dispatchStatus} error={props.dispatchError}
+          onOpenTask={onOpenTask} onOpenMilestone={props.onOpenMilestone} onOpenRun={onOpenRun}
+          openable={runs.some((candidate) => candidate.run === props.dispatchStatus?.run && candidate.openable && candidate.phase !== 'queued')} />}
         <FieldRow field="body" task={task} roles={roles} editing={editing} run={run} props={props} />
 
         {/*

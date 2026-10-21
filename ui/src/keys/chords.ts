@@ -349,6 +349,7 @@ const KEY_GLYPHS: Readonly<Record<string, string>> = {
   down: '↓',
   enter: '⏎',
   escape: 'Esc',
+  shift: '⇧',
   tab: '⇥',
   space: '␣',
   backspace: '⌫',

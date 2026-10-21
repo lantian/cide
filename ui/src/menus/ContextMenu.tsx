@@ -129,6 +129,15 @@ export function ContextMenu({
   const subBox = useRef<HTMLDivElement>(null)
   const subItems = useRef(new Map<number, HTMLButtonElement>())
   const [submenu, setSubmenu] = useState<OpenSubmenu | null>(null)
+  useEffect(() => {
+    setSubmenu(current => {
+      if (current === null) return null
+      const entry = entries[current.index]
+      if (entry?.kind !== 'item' || !entry.enabled || !entry.submenu) return null
+      return { ...current, entries: resolveMenu(entry.submenu(), { chipFor }) }
+    })
+  }, [entries, chipFor])
+
   /*
    * The submenu's placement, tagged with the row it was computed for.
    *
@@ -547,6 +556,11 @@ export function ContextMenu({
           {entries.map((entry, index) =>
             entry.kind === 'separator' ? (
               <div key={entry.id} className={styles.separator} role="separator" />
+            ) : entry.information ? (
+              <div key={entry.id} className={styles.information} role="presentation">
+                {entry.status && <span className={styles.statusDot} data-status={entry.status} aria-hidden="true" />}
+                {entry.label}
+              </div>
             ) : (
               <button
                 key={entry.id}
@@ -610,6 +624,7 @@ export function ContextMenu({
                     {entry.checked === true ? <Icon name="check" size={0} /> : null}
                   </span>
                 )}
+                {entry.status && <span className={styles.statusDot} data-status={entry.status} aria-hidden="true" />}
                 <span className={styles.label}>{entry.label}</span>
                 {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
                 {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
@@ -648,6 +663,11 @@ export function ContextMenu({
           {submenu.entries.map((entry, index) =>
             entry.kind === 'separator' ? (
               <div key={entry.id} className={styles.separator} role="separator" />
+            ) : entry.information ? (
+              <div key={entry.id} className={styles.information} role="presentation">
+                {entry.status && <span className={styles.statusDot} data-status={entry.status} aria-hidden="true" />}
+                {entry.label}
+              </div>
             ) : (
               <button
                 key={entry.id}
@@ -679,6 +699,7 @@ export function ContextMenu({
                     {entry.checked === true ? <Icon name="check" size={0} /> : null}
                   </span>
                 )}
+                {entry.status && <span className={styles.statusDot} data-status={entry.status} aria-hidden="true" />}
                 <span className={styles.label}>{entry.label}</span>
                 {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
                 {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}

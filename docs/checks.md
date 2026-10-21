@@ -42,6 +42,54 @@ pnpm --dir ui build
 
 ## By surface
 
+### Experimental decision assistance
+
+`cargo test --locked -p cide-core --lib decision`, `cargo test --locked -p cide-app
+--lib -- decision codex_console opencode_console cmd::settings cmd::session agent_rpc`,
+`cargo test --locked -p cide-agents --lib -- settings_doc settings_tools`, and
+`pnpm --dir ui run check:decision`. The HTTP/native fixtures need local sockets but
+do not call real models. Also run TypeScript, codegen/contract checks, `check:settings-copy`,
+`check:harness-settings`, `check:commands`, `check:keys`, `check:theme`, `check:ui-scale`
+and the production UI build.
+
+Keep project enablement default-off and separate from the shared endpoint. Never treat
+model confidence as a probability or a delivered suggestion as a successful outcome.
+Queued decisions must still match the session and settings when applied. Check interruption,
+manual model pinning, absent usage, repeated native events, continuation budgets, verification
+revision changes and per-window history eviction. An ordinary passive session has less event
+coverage than an owned native adapter; comparison must say so. No decision journal may enter
+workspace persistence, localStorage or logs. The OpenCode plugin test exercises real bundled
+plugin code against its host contract; it is not an installed-CLI or real-d1 audit.
+The Codex replay regressions interleave a busy main turn with ephemeral helper starts,
+turns, interrupts, approvals and unsubscribe. Only the selected conversation may change
+decision state. Test multiple pending native questions, server-side resolution and delayed
+UI permission status: none may leave context inference blocked after the last reply.
+The `cide_context` result must explain a skipped decision in `note`; returning search hits
+alone does not prove inference ran.
+Repeated failures must gate on `inspect + change` before choosing the response:
+the 38/32/30 regression passes at 50% and fails at 80%, with one inference and one
+history record. Insights must retain the raw distribution alongside both policy
+steps, and distinguish a passed gate from delivery in Observe mode. Verification
+admission must survive low-probability/error results and new prompts on unchanged
+code, while admitting new revisions/settings and rejecting stale snapshots. Exact
+successful native checks count without a prior Cide suggestion and are invalidated
+by edits or a failed rerun.
+The P4 completion regression must reach an outstanding required check after an edit,
+a below-threshold Verification answer and a normal completed turn, without a native
+plan or accepted verification suggestion. Required checks stay independent of that
+scenario's mode; Completion still obeys its own mode, probability threshold, stop/
+waiting guards and continuation budget. Success clears the obligation, later edits
+rearm it, removed settings drop it, and a new read-only turn does not inherit it.
+An explicit required command and the same discovered command form one check.
+
+Setup and scope are documented in [decision-assistance.md](decision-assistance.md).
+The connection-test regressions cover a cold load longer than the runtime budget,
+a warm request exceeding that budget, invalid typed answers and body-read timeouts.
+For an installed local model, explicitly set `CIDE_DECISION_PROBE_URL` and
+`CIDE_DECISION_PROBE_MODEL`, then run `cargo test --locked -p cide-app --lib
+connection_test_against_explicit_local_ollama -- --ignored --nocapture`. This calls the
+real connection-test handler and may load the selected model; it does not download one.
+
 ### `keys/`, a default binding, `cide-core::commands`
 
 **Touches:** `keys/`, a default binding, `cide-core::commands`
@@ -512,7 +560,23 @@ array-splice control still exceeds the limit under these measurement conditions.
 
 **Touches:** overlays, pickers, search
 
-`check:picker`, `check:search`, `check:problems`
+`check:picker`, `check:search`, `check:search-everywhere`, `check:problems`, plus
+`cargo test --locked -p cide-app --lib cmd::search` for runtime session ownership,
+independent provider queries, refresh generations, cancellation and completed-result pagination.
+Run `pnpm --dir ui run audit:search` for mounted Chromium checks with mocked IPC: modal preview,
+keyboard opening and modifiers, independent and duplicate pins, stale responses, hide/reopen,
+refresh, tab close, focus, validation errors and narrow-window themes. It also exercises
+folder completion (including stale replies), page navigation, modal-only layout switching,
+loaded file icons, and the pinned read-only editor: selection, copy/context menu, find,
+Go to Line, definition navigation, and reveal/caret isolation. Group navigation checks cover
+idempotent Left/Right collapse/expand and Shift+Left/Right mode cycling from the query, list,
+filters and preview. Sticky file headings must stay mounted once, hand over at file boundaries,
+preserve bounded virtualization and scrolling at different UI sizes, and leave keyboard-selected
+occurrences visible below the heading in both modal layouts and pinned tabs. The model check
+also covers collapsed groups and the All-mode “show more” boundary. Run `check:editor`,
+`check:outline`, `check:key-gate`, `check:icons`, and the app test
+`search_modal_layout_defaults_and_round_trips_through_patch` when changing these paths.
+This does not exercise the native Tauri webview. `audit:project-picker` also covers Actions-to-project-picker handoff.
 
 ### Terminal file links, `cmd/file.rs`'s refusals
 
@@ -542,7 +606,16 @@ array-splice control still exceeds the limit under these measurement conditions.
 
 **Touches:** `cide-lang`, `cide-lsp`, symbol navigation, diagnostics
 
-`check:outline`, `check:problems`, `check:commands`, `check:keys`
+`check:outline`, `check:problems`, `check:diagnostics-status`, `check:commands`, `check:keys`.
+For the status controls and bottom Problems tab also run `audit:diagnostics` (local Chromium),
+`check:toolwindow`, `check:toolwindow-render`, `check:menus`, `check:sidebar`, and `check:theme`.
+`cargo test --locked -p cide-lsp` exercises bounded logs, initialization metadata and attached
+server shutdown; `cargo test --locked -p cide-app --lib lsp` covers manual-stop preservation.
+Stop is session-local and must survive discovery, settings synchronization and the watchdog;
+attached servers are disconnected, never killed. Menu polling runs only while the menu is open.
+The browser audit delays layout acknowledgements to ensure opening Problems never mounts the
+Git log on the way or steals a later tab selection. It also checks a 1,000-finding snapshot
+with bounded mounted rows, offscreen keyboard navigation, and the breadcrumb-only right divider.
 
 ### Code completion
 
@@ -679,6 +752,19 @@ rotation, and Android Back, from both question options and task attachments.
 - **A `Note` between rows is about nobody.** The user could not tell which row a blue or amber block referred to, and that was the report. A problem with one setting is that row's `status`, and a problem with the page is `sectionBanner`. The `controls.tsx` wrapper is gone, and the check fails on a kit `Note` outside its allowlist.
 - **A row missing from `settingsIndex.ts` cannot be found.** Search scrolls to `[data-setting="<label>"]`. A new literal `Row`/`ToggleRow` label with no index entry fails the check, but a label built at runtime is not seen: give that row an `anchor` and index the anchor.
 
+### Task dispatch prompts
+
+**Touches:** Settings → Agents → Prompts, `AgentsConfig::{task_start_template,worker_instructions_template}`,
+the shared task opening builder and each harness's tracker preamble.
+
+Run `check:settings-prompts`, `check:settings-agents`, `check:settings-copy`, TypeScript and
+the UI build; Rust config, harness and dispatch tests; codegen/contract checks and Clippy.
+The mounted editor check covers explicit save/reset, retained drafts, write failures,
+double submission and late replies after a section switch. Rust regressions cover
+single-pass interpolation, harness-specific tool names, preserved OpenSpec/extra context,
+project isolation and reset removing the override keys. Cide's custom tracker rules replace
+the built-in paragraph without replacing the role prompt or bypassing tool-availability gates.
+
 ### The inbox, milestones and their gates
 
 **Touches:** the inbox, milestones and their gates — `TaskStatus::Inbox`, `TaskFile::schema_on_disk`, `cide_ipc::milestones`, `cide_agents::milestones` (`placement`, `duplicate_of`, `outside_active`, `facts_line`), `config::{load,write}_milestones`, `cide_core::check`, `cide_app::milestones` (`Checks`, `run_gate_now`, `before_integrate`, `prewarm`), the `cide_milestones` and `cide_milestone_proposals` tools, `cide_app::proposals`, `spinner::wake`, the Tasks panel's Milestones tab (`TasksPanel/MilestonesPanel`, `ProposalModal`, `CheckLogModal`)
@@ -766,6 +852,24 @@ concurrent answers may resume the role only once. The displayed question is chec
 accepting selections, and failed writes must retain the draft. Source images are copied into
 task attachments before the question is published; paths resolve against the caller's worktree.
 Schema 5 is written only while a structured question is present; text questions keep schema 4.
+
+### Which sessions can ask cide questions
+
+Run `cargo test --locked -p cide-core --lib user_requests`,
+`cargo test --locked -p cide-agents --lib tools`,
+`cargo test --locked -p cide-app --lib -- agent_rpc cmd::session conversations`, and
+`pnpm --dir ui run check:task-questions`. The socket tests need local socket access.
+Main consoles, user-opened panes and paired writers receive no request tools or question
+instructions. Guessed request calls and legacy task-update question arguments must be refused
+before any task edit or attachment copy. Automatic planner/reviewer tabs, workers and dispatched
+runs keep questions with the tracker either on or off; restored and detached automatic panes
+must keep the same identity and instructions.
+
+The durable delivery tests cover busy receivers, failed socket writes, definite non-submission,
+uncertain submission across restart, exact original-conversation receipts and duplicate attempts.
+A user message confirms terminal delivery; a tool result containing the request ID does not.
+For native transport changes also run the Codex/OpenCode console tests. A saved answer must not
+be marked delivered just because bytes were queued or a continuation tab was opened.
 
 ### What a local override actually changes, or when the workspace reaches the disk
 
@@ -984,3 +1088,61 @@ shared tool handlers and a local fake model. Both Code Mode and direct tools mus
 all five tools, preserve unsaved editor context without submitting on paste, and run for
 30 seconds per mode with an authenticated native connection and no authorization rejection.
 The desktop event consumer is a stand-in; this audit does not exercise a live Tauri window.
+
+### Native planning for delegated workers
+
+Task assignment, role dispatch and worker sessions start in the harness's native Plan mode.
+Cide approves the completed native plan and resumes implementation automatically, without
+adding planning instructions to the role or task prompt. Ordinary consoles and reviewers
+keep their existing launch policy. Execution permissions, model and role instructions still
+come from the resolved launch configuration.
+
+Run `cargo test --locked -p cide-agents -p cide-app --lib` and
+`cargo clippy --locked -p cide-app -p cide-agents --all-targets -- -D warnings`.
+The `native_plan` tests cover native Codex collaboration presets and proposal correlation,
+Claude/Qwen dialog choices and acknowledgements, slot retention during planning, and saved
+phase compatibility. OpenCode's authenticated HTTP fixtures cover native agent selection,
+plan-exit question correlation, completed plans and unsupported installations.
+
+Check a real delegated run for each installed harness: native Plan must precede edits,
+one native plan approval must start implementation, and a planning hand-back must not
+release the worker's slot or open its reviewer. Stop or switch conversations at the approval
+boundary; stale callbacks must not approve another session's prompt. User questions and
+ordinary tool permissions remain separate. Restore an implementing run without planning
+again; snapshots from before this feature retain their old behavior.
+
+Claude requires Cide's native tool hooks, Qwen requires its interactive `/plan` command and
+JSON event tap, Codex requires app-server Plan collaboration support, and OpenCode/MiMo
+requires an exposed native `plan` agent. Missing native capabilities report a launch or
+approval failure; there is no prompt-based substitute. The unit/HTTP checks do not replace
+a live model and desktop check of each installed harness version.
+
+### Native planning questions
+
+Run `cargo test --locked -p cide-core --lib user_requests`,
+`cargo test --locked -p cide-agents --lib native_`,
+`cargo test --locked -p cide-hook native_question_tests`, and
+`cargo test --locked -p cide-app --lib -- native_plan codex_console opencode_console`.
+The socket/HTTP tests need local socket access; use a temporary `XDG_STATE_HOME` for
+the full workspace suite so scratch/note tests do not touch the running IDE's state.
+Also run `check:task-questions`, `check:agents-render`, `check:remote`, `check:kit`,
+TypeScript, codegen, and the shared validation suite.
+
+Only delegated planning workers route their native question calls into Waiting.
+One native call produces one grouped decision, with no selected defaults and all
+questions answered before submission. Saving must be durable before claiming the
+native response. Test exact labels, custom text, multiple selections, duplicate
+submissions, different workers asking identical questions, pause/resume, and stale
+request retirement. A native pending event may reopen the same retired call and reuse
+its saved answer; a different generation, turn/item, or conversation must never receive it.
+Native batches must not enter ordinary conversation-message delivery or restart a worker.
+
+Claude's invocation-local blocking hook returns `updatedInput` and completes on the
+native tool result; after planning it returns no decision. Codex replies use the original
+RPC id and native question ids, consume cide's interrupt acknowledgements, and suppress
+late duplicate terminal replies. OpenCode/MiMo correlate v1 question tools and v2
+`metadata.kind=question` forms, leaving provider forms and plan exits separate. Qwen
+uses the event tap and guarded Ink dialog navigation under the manual input lane;
+changed, clipped, or unsupported dialog layouts retain the saved answer and direct the
+user to the original conversation. Protocol fixtures do not replace a live-model check
+of each installed harness and its terminal renderer.

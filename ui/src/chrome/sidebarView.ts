@@ -155,7 +155,7 @@ export function isPanelOpen(state: SidebarState): boolean {
  * orthogonal to the sidebar, and a rule is worth a line here where a check can run it.
  */
 export function selectView(state: SidebarState, next: ActivityView): SidebarState {
-  if (next === 'settings') return state
+  if (next === 'settings' || next === 'search') return state
   if (state.view === next) return { view: null, last: next }
   return { view: next, last: next }
 }

@@ -15,6 +15,7 @@ import { TaskMarkdown } from '@/sidebar/TasksPanel/TaskMarkdown'
 import panelStyles from '../TasksPanel/TasksPanel.module.css'
 import styles from './WaitingPanel.module.css'
 import { waitingDecisionCount } from './waitingModel'
+import { GroupedQuestions } from './GroupedQuestions'
 
 export interface WaitingPanelProps {
   project: string | null
@@ -60,7 +61,7 @@ export function WaitingPanel(props: WaitingPanelProps) {
           <List label="Decisions waiting for you">
             {items.map((i) => <ListItem key={i.id} top={<Code>{i.label}</Code>}
               topAside={i.request?.response != null ? <span data-audit="waitingAnswered" title="Decision saved; waiting for the agent.">
-                <Badge tone="blue" soft>{i.request.response.kind === 'answer' ? 'Answered' : 'Decision saved'}</Badge>
+                <Badge tone="blue" soft>{i.request.response.kind === 'answer' || i.request.response.kind === 'answers' ? 'Answered' : 'Decision saved'}</Badge>
               </span> : undefined}
               title={<Button variant="link" size="sm" data-audit="waitingOpen" onClick={() => open(i.id)}>{i.title}</Button>}
               meta={i.request ? `${i.request.origin.title} · ${new Date(Number(i.request.createdUnixMs)).toLocaleString()}` : i.task?.id}
@@ -87,6 +88,7 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
   const returnFocus = useRef<HTMLButtonElement | null>(null)
   const inFlight = useRef(false)
   const question = request?.request.kind === 'question' ? request.request.question : item.task?.question ?? null
+  const questions = request?.request.kind === 'questions' ? request.request.questions : null
   const task = request?.task ?? item.task?.id ?? ''
   const images = question !== null ? questionImages(question) : (props.reportAttachments?.[task] ?? [])
     .filter((attachment) => attachment.kind === 'image')
@@ -112,7 +114,7 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
         <Button disabled={busy} onClick={() => void run(() => respond({ kind: 'reject', note }))}>Reject</Button>
         <Button variant="primary" busy={busy} disabled={busy || checked.length === 0} data-audit="waitingApproveMoves"
           onClick={() => void run(() => respond({ kind: 'approve', selectedIds: checked, note }))}>Accept selected ({checked.length})</Button>
-      </> : question !== null ? <Button type="submit" form={formId} variant="primary" busy={busy} disabled={!validAnswer || busy} data-audit="waitingAnswer">Answer</Button> : sendBack ? <>
+      </> : question !== null || questions !== null ? <Button type="submit" form={formId} variant="primary" busy={busy} disabled={!validAnswer || busy} data-audit="waitingAnswer">Answer</Button> : sendBack ? <>
         <Button disabled={busy} onClick={() => setSendBack(false)}>Cancel</Button>
         <Button variant="primary" disabled={busy || note.trim() === ''} busy={busy} data-audit="waitingSendBackSubmit"
           onClick={() => void run(() => props.onSendBack(task, note.trim()))}>Send back</Button>
@@ -140,7 +142,8 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
                     <Button variant="link" size="sm" onClick={(e) => openTask(t.id, e.currentTarget)}>View task</Button></div>} />)}
               </List>
               <Textarea rows={2} value={note} disabled={busy} aria-label="Feedback on the proposed moves" placeholder="Optional feedback" onChange={(e) => setNote(e.target.value)} />
-            </> : question !== null ? (
+            </> : questions !== null ? <GroupedQuestions questions={questions} formId={formId} busy={busy} onValidityChange={setValidAnswer}
+              onAnswer={(answers) => run(() => respond({ kind: 'answers', answers }))} /> : question !== null ? (
               <QuestionAnswer key={JSON.stringify(question)} task={task || item.id} title={item.title} question={question} embedded formId={formId} onValidityChange={setValidAnswer}
                 busy={busy} onOpenTask={openTask} onViewImage={setViewing} previews={props.previews} onRequestPreview={props.onRequestPreview}
                 onAnswer={async (id, answer) => {
@@ -185,6 +188,11 @@ function SavedDecision({ request }: { request: UserRequest }) {
       ? response.selectedIds.map((id) => `${id} · ${proposal.tasks.find((task) => task.id === id)?.title ?? ''}`)
       : []
   const text = response.kind === 'answer' ? response.text : response.kind === 'approve' || response.kind === 'reject' ? response.note : ''
+  const batch = response.kind === 'answers' && proposal.kind === 'questions' ? response.answers.map((answer) => {
+    const q = proposal.questions.find((q) => q.id === answer.id)
+    const options = typeof q?.question === 'string' ? [] : q?.question.options ?? []
+    return `${q?.header ?? answer.id}: ${[...answer.selectedIds.map((id) => options.find((o) => o.id === id)?.title ?? id), answer.text].filter(Boolean).join(', ')}`
+  }) : []
   return (
     <div className={styles.details}>
       <p className={styles.message} role="status">{request.applying
@@ -192,7 +200,8 @@ function SavedDecision({ request }: { request: UserRequest }) {
         : request.wait ? 'Your decision is saved. Sending it to the original conversation…'
           : 'Your decision is saved. The agent continued working without pausing; cide will deliver it when the current turn ends.'}</p>
       <div data-audit="waitingSavedDecision">
-        <p className={styles.savedLabel}>{response.kind === 'answer' ? 'Your answer' : response.kind === 'approve' ? 'Approved tasks' : response.kind === 'reject' ? 'Proposal rejected' : 'Request cancelled'}</p>
+        <p className={styles.savedLabel}>{response.kind === 'answer' || response.kind === 'answers' ? 'Your answer' : response.kind === 'approve' ? 'Approved tasks' : response.kind === 'reject' ? 'Proposal rejected' : 'Request cancelled'}</p>
+        {batch.length > 0 && <ul className={styles.savedChoices}>{batch.map((text, i) => <li key={i}>{text}</li>)}</ul>}
         {selected.length > 0 && <ul className={styles.savedChoices}>{selected.map((label, index) => <li key={index}>{label}</li>)}</ul>}
         {text !== '' && <p className={styles.message}>{text}</p>}
       </div>

@@ -1026,6 +1026,7 @@ version = "0.15.2-dev"
 dependencies = [
  "cide-fs",
  "cide-ipc",
+ "globset",
  "ignore",
  "nucleo",
  "parking_lot",

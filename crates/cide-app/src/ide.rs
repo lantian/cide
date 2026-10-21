@@ -797,6 +797,7 @@ fn open_diff_tab(app: &AppHandle, project: ProjectId, broker: &DiffBroker, reque
         harness_conversation: None,
         continues: None,
         harness: None,
+        harness_choice: None,
         title,
         docker: None,
         origin: None,

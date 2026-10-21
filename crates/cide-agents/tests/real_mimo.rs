@@ -86,6 +86,8 @@ fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
         harness: agent.def.harness,
         unattended: cide_agents::config::Unattended::Bypass,
         tracker_paragraphs: true,
+        worker_instructions: None,
+        planning: None,
         review: false,
         server: None,
         git_dirs: Vec::new(),

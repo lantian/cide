@@ -2,7 +2,7 @@
 //! touch nothing. (M18) The count said twenty-three for a while after it had become twenty-four;
 //! [`tool::EVERY`] is the number, and `the_twenty_three_are_the_only_twenty_three` the check.
 //!
-//! Two families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
+//! Three families, and which of them a caller gets is decided by `cide_app::agent_rpc` from the
 //! connection's header line, never from anything the caller says:
 //!
 //! * the nine `cide_task_*` tools ([`tool::ALL`]) — the shared tracker, served to the project's
@@ -13,6 +13,9 @@
 //!   milestones, and the five that read and change cide's own settings, keymap and commands
 //!   (M134, `crate::settings_tools`) — served **only** to a project's Claude panes, never to a
 //!   run.
+//! * the user-request tools ([`tool::REQUESTS`]) — for dispatched runs, delegated workers and
+//!   automatic planner/reviewer tabs. User-driven main harnesses ask in their own conversation;
+//!   their task-update descriptor also omits the legacy question road.
 //!
 //! That split is the whole of the answer to *may an agent dispatch another agent*: a run's
 //! connection is never handed the vocabulary, so the question never reaches a model at all. See
@@ -427,6 +430,11 @@ pub mod tool {
         PROJECT_SETTINGS,
         COMMAND_RUN,
     ];
+
+    /// User-driven harnesses ask in their own conversation. Keep request tools in the
+    /// descriptor catalog, but expose them only to delegated and automatic sessions.
+    pub const CONSOLE: &[&str] = EVERY.split_at(REQUESTS.len()).1;
+    pub const CONSOLE_NO_TRACKER: &[&str] = ORCHESTRATION_NO_TRACKER.split_at(REQUESTS.len()).1;
 }
 
 /// How many tasks `cide_task_list` answers with when the caller does not say.
@@ -718,6 +726,19 @@ pub enum CallerKind {
 }
 
 impl CallerKind {
+    /// Fixed at connection binding, including for an automatic tab a user later types into.
+    /// MCP clients cache this list for the connection's lifetime.
+    pub fn tool_names(self, tracker: bool) -> &'static [&'static str] {
+        match (self, tracker) {
+            (Self::Console, true) => tool::CONSOLE,
+            (Self::Console, false) => tool::CONSOLE_NO_TRACKER,
+            (Self::CideTab, true) => tool::EVERY,
+            (Self::CideTab, false) => tool::ORCHESTRATION_NO_TRACKER,
+            (Self::Run | Self::Worker, true) => tool::RUN,
+            (Self::Run | Self::Worker, false) => tool::REQUESTS,
+        }
+    }
+
     /// Whether the user can be behind this call — the only caller the user's own gestures
     /// (taking a task out of the inbox, accepting work the user accepts) are open to.
     #[must_use]
@@ -1434,6 +1455,46 @@ pub fn descriptors() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Hide the legacy question road as well as the separate request tools. Otherwise the
+/// main harness is still instructed to open the same dialog through a task update.
+pub fn descriptors_with_requests(requests: bool) -> Vec<Value> {
+    let mut descriptors = descriptors();
+    if !requests {
+        let update = descriptors
+            .iter_mut()
+            .find(|d| d["name"] == tool::TASK_UPDATE)
+            .expect("task update is in the catalog");
+        let properties = update["inputSchema"]["properties"]
+            .as_object_mut()
+            .expect("task update has properties");
+        for field in ["question", "questionWait", "questionTitle"] {
+            properties.remove(field);
+        }
+        update["description"] = Value::String(
+            "Change a task's title, body, status or assigned role, or add files to it. Only the \
+             fields you send are changed. Record why in a comment. When subagents are enabled, \
+             assignment by the user or product owner starts that role on the task. `change` \
+             links an OpenSpec change (null unlinks); `touches` and `acceptance` set those \
+             fields (null clears). `attachments` adds files without removing existing ones. \
+             Only the user moves inbox tasks or accepts work marked `acceptance: user`. \
+             Returns the task's summary and new comments; use cide_task_get for the whole task."
+                .into(),
+        );
+    }
+    descriptors
+}
+
+/// Checked before dispatch: even a guessed legacy argument must cause no task edits or
+/// attachment copies. A null question is also unavailable on the main harness's interface.
+pub fn question_arguments_refusal(name: &str, args: &Value, requests: bool) -> Option<ToolResult> {
+    (!requests
+        && tool::ALL.contains(&name)
+        && ["question", "questionWait", "questionTitle"]
+            .iter()
+            .any(|field| args.get(field).is_some()))
+    .then(|| ToolResult::error("This session asks questions through its harness conversation."))
 }
 
 /// One line the model reads when it is deciding what to call.
@@ -3478,8 +3539,7 @@ fn task_update(arguments: &Value, sink: &dyn TaskSink) -> ToolResult {
 
     if edits.is_empty() && attachments.is_empty() {
         return ToolResult::error(format!(
-            "{}: nothing to change. Send at least one of `title`, `body`, `status`, `assignee`, \
-             `change`, `touches`, `acceptance`, `question` or `attachments`.",
+            "{}: nothing to change. Send at least one supported task field or `attachments`.",
             tool::TASK_UPDATE
         ));
     }
@@ -5074,6 +5134,14 @@ fn render_definition(draft: &AgentDraft) -> String {
 
 /// Patch `.cide/config.json`'s two settable keys. (M71)
 fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    if ["taskStartPrompt", "workerInstructions"]
+        .iter()
+        .any(|key| arguments.get(*key).is_some())
+    {
+        return ToolResult::error(
+            "Dispatch prompts are edited in Settings → Agents → Prompts. Nothing was written.",
+        );
+    }
     // UI-only, and refused by name as well as absent from the schema. Do not turn a guessed
     // field into a tutorial about a capability this harness was intentionally never given.
     if arguments.get("agentSessionsEnabled").is_some() {
@@ -6627,7 +6695,7 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     match sink.integrate(&agent, task.as_ref()) {
         Ok(Integrated::UpToDate { verified }) => ToolResult::text(format!(
             "`cide/{branch}` has nothing this branch does not already have, so nothing was \
-             merged.{}",
+             merged. Integration does not change task status.{}",
             verified_suffix(verified.as_deref())
         )),
         Ok(Integrated::Merged {
@@ -6636,7 +6704,7 @@ fn agent_integrate(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
             verified,
         }) => ToolResult::text(format!(
             "Merged `cide/{branch}` into this project's branch: commit {}, {files} file(s) \
-             changed.{}",
+             changed. Integration does not change task status.{}",
             short(&commit),
             verified_suffix(verified.as_deref())
         )),
@@ -6685,7 +6753,10 @@ fn required_role(arguments: &Value, key: &str, tool: &str) -> Result<AgentId, To
 /// checkout (or its place in the project root), so a caller told it was not live would dispatch
 /// into a directory somebody else's process is sitting in.
 fn is_live(state: &RunState) -> bool {
-    !matches!(state, RunState::Finished { .. } | RunState::Failed { .. })
+    !matches!(
+        state,
+        RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. }
+    )
 }
 
 /// One run, as the list shows it.
@@ -6735,7 +6806,10 @@ fn render_run(run: &AgentRun, now: u64) -> String {
     // the one place the orchestrator hears that its work is in the root.
     if matches!(
         run.state,
-        RunState::Finished { .. } | RunState::Failed { .. } | RunState::Idle
+        RunState::Finished { .. }
+            | RunState::Cancelled { .. }
+            | RunState::Failed { .. }
+            | RunState::Idle
     ) {
         line.push_str(&match &run.task {
             Some(task) => format!(" | read {task}'s comments"),
@@ -6760,11 +6834,13 @@ pub fn run_state_wire(state: &RunState) -> &'static str {
         RunState::Queued => "queued",
         RunState::Starting => "starting",
         RunState::Running => "running",
+        RunState::Blocked { .. } => "blocked",
         RunState::AwaitingPermission => "awaitingPermission",
         RunState::Paused { .. } => "paused",
         RunState::Idle => "idle",
         RunState::Interrupted => "interrupted",
         RunState::Finished { .. } => "finished",
+        RunState::Cancelled { .. } => "cancelled",
         RunState::Failed { .. } => "failed",
     }
 }
@@ -6806,7 +6882,12 @@ pub fn run_state_detail(state: &RunState) -> Option<String> {
                 .to_string(),
         ),
         RunState::Finished { code } => Some(format!("exit {code}")),
+        RunState::Cancelled { reason, .. } => Some(one_line(reason)),
         RunState::Failed { reason } => Some(one_line(reason)),
+        RunState::Blocked { reason } => Some(format!(
+            "{}; open the conversation or send a manual follow-up to retry",
+            one_line(reason)
+        )),
         RunState::Queued | RunState::Starting | RunState::Running => None,
     }
 }
@@ -7115,7 +7196,10 @@ fn agent_integrate_batch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult 
         }
     }
     match sink.integrate_batch(&pairs) {
-        Ok(done) => ToolResult::text(render_batch(&done)),
+        Ok(done) => ToolResult::text(format!(
+            "{}\nIntegration does not change task status.",
+            render_batch(&done)
+        )),
         Err(why) => bad(&why),
     }
 }
@@ -8847,6 +8931,19 @@ mod tests {
             2,
             "the other field was written anyway"
         );
+    }
+
+    #[test]
+    fn dispatch_prompt_edits_are_ui_only_and_cannot_partially_patch_the_config() {
+        let sink = roster();
+        for field in ["taskStartPrompt", "workerInstructions"] {
+            let mut arguments = json!({ "maxConcurrent": 9 });
+            arguments[field] = json!("New workflow");
+            let answer = ask(tool::AGENTS_CONFIG, arguments, &sink);
+            assert!(answer.is_error);
+            assert!(text_of(&answer).contains("Settings → Agents → Prompts"));
+            assert_eq!(sink.config.lock().max_concurrent, 2);
+        }
     }
 
     #[test]
@@ -12687,6 +12784,10 @@ mod tests {
             "{text}"
         );
         assert!(
+            text.contains("Integration does not change task status."),
+            "{text}"
+        );
+        assert!(
             text.contains("\nVerify ran 23:03:12–23:05:40 (fresh), after waiting 12s"),
             "the verify line rides the success answer: {text}"
         );
@@ -12698,6 +12799,10 @@ mod tests {
         ));
         assert!(
             text.contains("nothing this branch does not already have"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Integration does not change task status."),
             "{text}"
         );
     }

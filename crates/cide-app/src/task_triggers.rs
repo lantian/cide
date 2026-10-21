@@ -18,14 +18,8 @@
 //! it. Filtering at the collection sites instead would be two copies of the security boundary
 //! that keeps a subagent from spawning a subagent.
 //!
-//! # Everything declines by doing nothing
-//!
-//! `deliver_nudge`'s argument, inherited: a project with agents off, a role the catalog does not
-//! know, a task deleted mid-flight, a dispatch refusal — each is a log line, never an error the
-//! panel shows. The gesture that got us here (a comment, a `<select>` change) already succeeded
-//! and already answered; a durable "could not auto-start" would need a comment from a system
-//! author `TaskAuthor` has no variant for, and is a named possible follow-up rather than a thing
-//! this module fakes with the user's own identity.
+//! User gestures report dispatch feedback separately from the successful task write. Background
+//! mutations stay quiet, and no refusal impersonates the user by adding a task comment.
 //!
 //! # The duplicate guard is the funnel's; the check here is only a shortcut (M66)
 //!
@@ -96,6 +90,25 @@ pub struct TaskMutation {
     pub fresh_text: Vec<String>,
 }
 
+/// One MCP update writes fields one at a time, but dispatch must see only the resulting task.
+/// Otherwise moving inbox → todo can queue the old assignee before the same call assigns a new
+/// one. Keep the first before-image, last after-image, and all new prose for mention scanning.
+fn coalesce_mutations(mutations: Vec<TaskMutation>) -> Vec<TaskMutation> {
+    let mut result: Vec<TaskMutation> = Vec::new();
+    for mutation in mutations {
+        if let Some(previous) = result.iter_mut().find(|previous| {
+            previous.after.id == mutation.after.id && previous.author == mutation.author
+        }) {
+            previous.after = mutation.after;
+            previous.assign_gesture |= mutation.assign_gesture;
+            previous.fresh_text.extend(mutation.fresh_text);
+        } else {
+            result.push(mutation);
+        }
+    }
+    result
+}
+
 /// Ask the policy about a burst of mutations and act on what it answers. Returns immediately;
 /// the work happens on the blocking pool.
 ///
@@ -124,8 +137,23 @@ pub fn consider(
     mutations: Vec<TaskMutation>,
     notify: RunNotify,
 ) {
+    let mutations = coalesce_mutations(mutations);
     if mutations.is_empty() {
         return;
+    }
+    // Reassignment invalidates a queued brief before another admission pass can start it.
+    // A run already admitted is protected by the active-run refusal at the edit boundary.
+    if let Some(registry) = app.try_state::<Arc<AgentRegistry>>() {
+        for mutation in &mutations {
+            if let Some(old) = mutation
+                .before
+                .as_ref()
+                .and_then(|task| task.agent.as_ref())
+                && mutation.after.agent.as_ref() != Some(old)
+            {
+                registry.cancel_queued_assignment(app, project, old, &mutation.after.id);
+            }
+        }
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -230,6 +258,59 @@ fn consider_blocking(
     // Fresh, per burst — see the module header. The catalog doubles as the mention filter: a
     // typo'd `@develoepr` must act on nothing, above all not on the assignee field.
     let loaded = cide_agents::load_project(&root);
+    let roles: Vec<AgentId> = loaded
+        .catalog
+        .agents
+        .iter()
+        .map(|agent| agent.def.id.clone())
+        .collect();
+    // Diagnose user intent *before* the early returns, including disabled auto-dispatch.
+    // `intent` retains the author gate and the catalog's mention filter.
+    if let (Some(registry), Some(workspace), Some(stores)) = (
+        app.try_state::<Arc<AgentRegistry>>(),
+        app.try_state::<WorkspaceState>(),
+        app.try_state::<Arc<TasksStores>>(),
+    ) {
+        let llm = workspace.with(|ws| ws.settings.llm.clone());
+        let board = stores
+            .get(project)
+            .map(|store| store.list())
+            .unwrap_or_default();
+        let mut reported = HashSet::new();
+        for mutation in &mutations {
+            if mutation.author != TaskAuthor::User {
+                continue;
+            }
+            let fresh: Vec<&str> = mutation.fresh_text.iter().map(String::as_str).collect();
+            if let Some(intent) = autodispatch::intent(
+                mutation.before.as_ref(),
+                &mutation.after,
+                &mutation.author,
+                mutation.assign_gesture,
+                &fresh,
+                &roles,
+            ) {
+                for agent in intent.dispatch {
+                    if reported.insert((mutation.after.id.clone(), agent.clone())) {
+                        let status = crate::task_dispatch::status(
+                            &root,
+                            &registry,
+                            project,
+                            &mutation.after,
+                            &board,
+                            Some(&agent),
+                            &llm,
+                        );
+                        if crate::task_dispatch::needs_notice(&status)
+                            && status.state != cide_ipc::TaskDispatchState::Failed
+                        {
+                            crate::emit::task_dispatch_feedback(app, status);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Nor with the tracker switched off (`config::load_tracker`): the switch is the user saying
     // tasks are not how this project hands out work, and an edit that still reached the file —
     // the panel is hidden, not the file — must not start a run.
@@ -239,12 +320,6 @@ fn consider_blocking(
     {
         return;
     }
-    let roles: Vec<AgentId> = loaded
-        .catalog
-        .agents
-        .iter()
-        .map(|agent| agent.def.id.clone())
-        .collect();
 
     let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
         return;
@@ -283,6 +358,7 @@ fn consider_blocking(
                     task,
                     notify.clone(),
                     Some(mutation.after.id.clone()),
+                    false,
                 );
             }
         }
@@ -329,7 +405,15 @@ fn consider_blocking(
                 );
                 continue;
             }
-            dispatch(app, project, agent, task.clone(), notify.clone(), None);
+            dispatch(
+                app,
+                project,
+                agent,
+                task.clone(),
+                notify.clone(),
+                None,
+                mutation.author == TaskAuthor::User,
+            );
         }
     }
 }
@@ -364,6 +448,7 @@ fn dispatch(
     task: TaskId,
     notify: RunNotify,
     completed: Option<TaskId>,
+    feedback: bool,
 ) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -409,15 +494,26 @@ fn dispatch(
             model: None,
             fresh: false,
         };
-        match crate::cmd::agents::dispatch_or_duplicate(
+        let outcome = crate::cmd::agents::dispatch_or_duplicate(
             app.clone(),
             workspace,
             agents,
             tasks,
             request,
         )
-        .await
-        {
+        .await;
+        if feedback {
+            let report_app = app.clone();
+            let report_agent = agent.clone();
+            let report_task = task.clone();
+            let error = outcome.as_ref().err().map(ToString::to_string);
+            // Diagnostics read configuration from disk, just like the preflight on the blocking pool.
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                report_dispatch(report_app, project, &report_agent, &report_task, error)
+            })
+            .await;
+        }
+        match outcome {
             Ok(DispatchOutcome::Started { run, .. }) => {
                 tracing::info!(%run, agent = %agent, %task, "an assignment started a subagent run");
             }
@@ -439,14 +535,59 @@ fn dispatch(
                     "the funnel refused a second run beside the one already holding the task"
                 );
             }
-            // `plan_dispatch` owns every refusal (role gone, project disabled mid-flight,
-            // `bypassPermissions` never authorised); here each one declines by doing nothing
-            // louder than a line.
+            // `plan_dispatch` owns the refusal; user feedback was sent separately above.
             Err(error) => {
                 tracing::warn!(agent = %agent, %task, %error, "an assignment could not start the role");
             }
         }
     });
+}
+
+/// Report the real queue/refusal after dispatch, rather than guessing from a successful edit.
+fn report_dispatch(
+    app: AppHandle,
+    project: ProjectId,
+    agent: &AgentId,
+    task: &TaskId,
+    error: Option<String>,
+) {
+    let (Some(workspace), Some(registry), Some(stores)) = (
+        app.try_state::<WorkspaceState>(),
+        app.try_state::<Arc<AgentRegistry>>(),
+        app.try_state::<Arc<TasksStores>>(),
+    ) else {
+        return;
+    };
+    let Ok(root) = crate::tasks_state::project_root(&workspace, project) else {
+        return;
+    };
+    let Some(store) = stores.get(project) else {
+        return;
+    };
+    let Some(task) = store.get(task) else {
+        return;
+    };
+    let llm = workspace.with(|ws| ws.settings.llm.clone());
+    let mut status = crate::task_dispatch::status(
+        &root,
+        &registry,
+        project,
+        &task,
+        &store.list(),
+        Some(agent),
+        &llm,
+    );
+    if let Some(error) = error
+        && status.reasons.is_empty()
+    {
+        status
+            .reasons
+            .push(cide_ipc::TaskDispatchReason::new("dispatchFailed", error));
+        status.state = cide_ipc::TaskDispatchState::Failed;
+    }
+    if crate::task_dispatch::needs_notice(&status) {
+        crate::emit::task_dispatch_feedback(&app, status);
+    }
 }
 
 /// A run admitted onto a task moves that task `Todo → Doing` — and only that hop.
@@ -483,6 +624,37 @@ pub fn note_run_started(app: &AppHandle, project: ProjectId, task: &TaskId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_update_dispatches_from_its_final_assignee() {
+        let mut before = linked(TaskStatus::Inbox);
+        before.agent = Some(AgentId("architect".into()));
+        let mut todo = before.clone();
+        todo.status = TaskStatus::Todo;
+        let mut assigned = todo.clone();
+        assigned.agent = Some(AgentId("backend-dev".into()));
+        let mutations = coalesce_mutations(vec![
+            TaskMutation {
+                before: Some(before.clone()),
+                after: todo.clone(),
+                author: TaskAuthor::User,
+                assign_gesture: false,
+                fresh_text: vec!["body".into()],
+            },
+            TaskMutation {
+                before: Some(todo),
+                after: assigned.clone(),
+                author: TaskAuthor::User,
+                assign_gesture: true,
+                fresh_text: Vec::new(),
+            },
+        ]);
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].before.as_ref().unwrap().agent, before.agent);
+        assert_eq!(mutations[0].after.agent, assigned.agent);
+        assert!(mutations[0].assign_gesture);
+        assert_eq!(mutations[0].fresh_text, vec!["body"]);
+    }
 
     fn linked(status: TaskStatus) -> Task {
         Task {

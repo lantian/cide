@@ -1821,6 +1821,7 @@ mod tests {
             harness_conversation: None,
             continues: None,
             harness: None,
+            harness_choice: None,
             title: title.into(),
             docker: None,
             origin: None,

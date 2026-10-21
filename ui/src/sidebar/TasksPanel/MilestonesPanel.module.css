@@ -509,10 +509,33 @@
 
 
 
-.taskTab {
+.taskPane {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+  min-height: 0;
+}
+
+.taskPane > .quiet {
+  margin-bottom: 0;
+}
+
+.taskFilters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.taskFilter {
+  composes: button sm secondary from '../../kit/components/Button.module.css';
+}
+
+.taskFilter[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.taskTab {
   max-height: 58vh;
   overflow-y: auto;
 }

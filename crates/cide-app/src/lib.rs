@@ -25,6 +25,7 @@ pub mod closed_tabs;
 pub mod cmd;
 mod codex_console;
 mod conversations;
+mod decision;
 /// The macOS dock icon's own menu: every open project, one click from the front.
 ///
 /// Platform-neutral model, `cfg`-gated AppKit glue, and a no-op on Linux — its header says why
@@ -81,6 +82,8 @@ pub mod lsp;
 pub mod milestones;
 /// Reviewing a GitLab merge request with an agent, and the tools that review is served. (M85)
 pub mod mr_review;
+mod native_plan;
+mod native_questions;
 pub mod notes;
 pub mod positions_state;
 pub mod proposals;
@@ -94,6 +97,7 @@ pub mod sessions_state;
 pub mod srcgrep;
 pub mod state;
 pub mod symbols;
+pub mod task_dispatch;
 pub mod task_triggers;
 // M18: one `.cide/tasks.json` store per open project, and the thread that ticks them.
 pub mod tasks_state;
@@ -380,6 +384,10 @@ pub fn run() {
 
     builder = builder.manage(SessionRegistry::default());
     builder = builder.manage(peer_chat::Runtime::default());
+    builder = builder.manage(decision::Runtime::default());
+    builder = builder
+        .manage(native_plan::Runtime::default())
+        .manage(native_questions::Runtime::default());
     builder = builder.manage(updater::UpdaterState::default());
     builder = builder.manage(cmd::gitlab::GitLabState::default());
     // The raw text behind rendered log lines, one bounded ring per session. See `logring`.
@@ -597,6 +605,7 @@ pub fn run() {
             cmd::pane::pane_split,
             cmd::pane::pane_add_row,
             cmd::pane::tab_new_run,
+            cmd::pane::tab_open_conversation,
             cmd::pane::pane_close,
             cmd::pane::pane_focus,
             cmd::pane::pane_maximize,
@@ -650,6 +659,11 @@ pub fn run() {
             cmd::settings::settings_defaults,
             cmd::settings::project_harness_get,
             cmd::settings::project_harness_set,
+            decision::decision_snapshot,
+            decision::decision_clear,
+            decision::decision_feedback,
+            decision::decision_auto,
+            decision::decision_probe,
             cmd::settings::project_harness_effective,
             cmd::settings::harness_cli_version,
             cmd::settings::opencode_cli_support,
@@ -722,10 +736,21 @@ pub fn run() {
             cmd::picker::picker_index_libraries,
             cmd::search::search_query,
             cmd::search::search_cancel,
+            cmd::search::search_scope_suggest,
+            cmd::search::search_session_start,
+            cmd::search::search_session_page,
+            cmd::search::search_session_pin,
+            cmd::search::search_session_list,
+            cmd::search::search_session_rerun,
+            cmd::search::search_session_cancel,
+            cmd::search::search_session_close,
             cmd::symbols::symbols_outline,
             cmd::symbols::symbols_index,
             cmd::symbols::symbol_query,
             cmd::diagnostics::diagnostics_get,
+            cmd::diagnostics::language_servers_get,
+            cmd::diagnostics::language_servers_control,
+            cmd::diagnostics::language_servers_logs,
             cmd::diagnostics::diagnostics_did_open,
             cmd::diagnostics::diagnostics_did_change,
             cmd::diagnostics::diagnostics_did_save,
@@ -756,6 +781,7 @@ pub fn run() {
             // M68: the board carries rows, so a body and a log are fetched, and searching them
             // happens where they live.
             cmd::tasks::task_get,
+            cmd::tasks::task_dispatch_status,
             cmd::tasks::task_search,
             cmd::tasks::task_new,
             cmd::tasks::task_new_with_proposal,
@@ -831,6 +857,8 @@ pub fn run() {
             cmd::agents::agents_ack_stale_turn,
             cmd::agents::agents_run_open,
             cmd::sessions::sessions_list,
+            cmd::sessions::sessions_conversation_read,
+            cmd::sessions::sessions_conversation_detail,
             cmd::sessions::sessions_user_inputs,
             cmd::sessions::sessions_search,
             cmd::sessions::sessions_open,
@@ -931,6 +959,9 @@ pub fn run() {
                 // would swallow the first real title of a window that reused the label.
                 tauri::WindowEvent::Destroyed => {
                     let label = cide_ipc::WindowLabel(window.label().to_string());
+                    window.app_handle().state::<cmd::search::SearchRegistry>()
+                        .cancel_search_window(window.label());
+                    window.app_handle().state::<decision::Runtime>().forget_window(window.label());
                     crate::windows::forget_focused(&label);
                     crate::windows::forget_announced(&label);
                 }

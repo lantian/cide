@@ -36,6 +36,7 @@ import findStyles from './TerminalFindBar.module.css'
 import buttonStyles from '@/styles/buttons.module.css'
 import { registerRestarter } from './paneRestart'
 import { restartSpec, specFor, type TerminalSpec } from './terminalSpec'
+import { harnessSwitchEntry } from './harnessSwitch'
 import { acknowledge } from './awaiting'
 import { acknowledgesKey } from './awaitingRule'
 import {
@@ -43,6 +44,7 @@ import {
   diag,
   docker as dockerApi,
   session as sessionApi,
+  type ConsoleHarness,
   type Geometry,
   type Pane,
   type PaneRestore,
@@ -102,7 +104,7 @@ export interface TerminalPaneProps {
    */
   onRevealPath?: ((path: string) => void) | undefined
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
-  onSessionBound?: ((session: string) => void) | undefined
+  onSessionBound?: ((session: string, choice?: ConsoleHarness) => Promise<void> | void) | undefined
   className?: string | undefined
   /*
    * `onExit` was here, and it is deliberately gone rather than merely unused.
@@ -260,6 +262,19 @@ export function TerminalPane({
   forceSpawn,
 }: TerminalPaneProps) {
   const paneId = pane.id
+  const paneRef = useRef(pane)
+  paneRef.current = pane
+  const choiceRef = useRef(pane.harnessChoice)
+  if (pane.harnessChoice !== undefined) choiceRef.current = pane.harnessChoice
+  const recordedHarness: ConsoleHarness =
+    pane.harness === 'codex' || pane.harness === 'opencode' ? pane.harness : 'claude'
+  const activeHarnessRef = useRef<ConsoleHarness>(recordedHarness)
+  const lastRecordedHarnessRef = useRef(pane.harness)
+  if (lastRecordedHarnessRef.current !== pane.harness) {
+    activeHarnessRef.current = recordedHarness
+    lastRecordedHarnessRef.current = pane.harness
+  }
+  const restartingRef = useRef(false)
   const boundRef = useRef<string | null>(null)
   // Held in refs so a changed callback identity cannot tear the session down and respawn it.
   const boundCb = useRef(onSessionBound)
@@ -319,9 +334,9 @@ export function TerminalPane({
    * which belong to the effect, and re-rendering because a function identity changed would be
    * churn on a component whose whole design is to re-render as little as possible.
    */
-  const restartRef = useRef<((mode: RestartMode) => Promise<void>) | null>(null)
-  const runRestart = (mode: RestartMode): void => {
-    void restartRef.current?.(mode).catch((error: unknown) => {
+  const restartRef = useRef<((mode: RestartMode, choice?: ConsoleHarness) => Promise<void>) | null>(null)
+  const runRestart = (mode: RestartMode, choice?: ConsoleHarness): void => {
+    void restartRef.current?.(mode, choice).catch((error: unknown) => {
       console.error('[cide] restart failed', error)
       void diag.log(`pane ${paneId}: restart failed — ${spawnFailureText(error)}`).catch(() => {})
       getHost(paneId).terminal?.term.write(spawnFailureBytes(spawnFailureText(error)))
@@ -341,6 +356,14 @@ export function TerminalPane({
     const host = getHost(paneId)
     const term = host.terminal?.term
     const selection = term?.getSelection() ?? ''
+    const switchItem = harnessSwitchEntry(
+      paneRef.current,
+      host.mirrored === true,
+      activeHarnessRef.current,
+      restartRef.current !== null,
+      restartingRef.current,
+      (harness) => runRestart('fresh', harness),
+    )
     return [
       {
         id: 'copy',
@@ -471,6 +494,7 @@ export function TerminalPane({
         disabledReason:
           restartRef.current === null ? 'This pane does not run a process' : undefined,
       },
+      ...(switchItem === null ? [] : [switchItem]),
     ]
   }
 
@@ -663,7 +687,7 @@ export function TerminalPane({
      * resolves without touching the terminal. Only a pane whose host holds no link — fresh,
      * released, evicted, restarted — actually attaches.
      */
-    const start = async (spawnSpec: TerminalSpec): Promise<void> => {
+    const start = async (spawnSpec: TerminalSpec, bindingChoice?: ConsoleHarness): Promise<void> => {
       const geo = measureGeometry(paneId)
       const id = await sessionFor(paneId, spawnSpec, geo)
       if (disposed) return
@@ -672,8 +696,27 @@ export function TerminalPane({
       // restart: the id is the value passed to `claude --session-id`.
       if (boundRef.current !== id) {
         boundRef.current = id
-        boundCb.current?.(id)
+        try {
+          if (bindingChoice !== undefined) {
+            // A switch becomes this pane's durable choice only after Rust accepts the binding.
+            await boundCb.current?.(id, bindingChoice)
+            choiceRef.current = bindingChoice
+            activeHarnessRef.current = bindingChoice
+          } else {
+            // Ordinary starts keep attaching immediately; the workspace broadcast catches up.
+            void Promise.resolve(boundCb.current?.(id)).catch((error: unknown) => {
+              console.error('[cide] pane binding failed', error)
+            })
+          }
+        } catch (error) {
+          boundRef.current = null
+          await sessionApi.kill(id).catch(() => {})
+          forgetSession(paneId)
+          throw error
+        }
       }
+
+      if (disposed) return
 
       await ensureAttached(paneId, id)
       if (disposed) return
@@ -712,9 +755,9 @@ export function TerminalPane({
      * no such program, a conversation already open in another pane — would spin, and those two
      * failures are ones the user *must* read.
      */
-    const startOrRecover = async (spawnSpec: TerminalSpec, retried: boolean): Promise<void> => {
+    const startOrRecover = async (spawnSpec: TerminalSpec, retried: boolean, bindingChoice?: ConsoleHarness): Promise<void> => {
       try {
-        await start(spawnSpec)
+        await start(spawnSpec, bindingChoice)
       } catch (error: unknown) {
         if (disposed) return
         if (!retried && isRecoverableSessionError(error)) {
@@ -723,7 +766,7 @@ export function TerminalPane({
             .catch(() => {})
           forgetSession(paneId)
           clearWriteFailure(paneId)
-          await startOrRecover(spawnSpec, true)
+          await startOrRecover(spawnSpec, true, bindingChoice)
           return
         }
         // Into the pane, not only the console. A pane whose spawn failed is blank, and blank is
@@ -766,28 +809,33 @@ export function TerminalPane({
      * terminal is never torn down: the transcript stays on screen and the new child prints
      * below it, exactly as re-running a command in a shell does.
      */
-    const restart = async (mode: RestartMode): Promise<void> => {
-      const old = getHost(paneId).sessionId
-      if (old !== undefined) {
-        await sessionApi.kill(old).catch((error: unknown) => {
-          // Not fatal. A child that is already dead is the ordinary case here, and the spawn
-          // below is what the user asked for either way.
-          void diag.log(`pane ${paneId}: kill before restart failed — ${String(error)}`).catch(() => {})
-        })
-        if (mode === 'resume') await settled(old)
+    const restart = async (mode: RestartMode, choice?: ConsoleHarness): Promise<void> => {
+      if (restartingRef.current) return
+      restartingRef.current = true
+      try {
+        const host = getHost(paneId)
+        const old = host.sessionId
+        // A mirror does not own its child. Detaching it must not stop the source pane.
+        if (old !== undefined && host.mirrored !== true) {
+          await sessionApi.kill(old).catch((error: unknown) => {
+            void diag.log(`pane ${paneId}: kill before restart failed — ${String(error)}`).catch(() => {})
+          })
+          if (mode === 'resume') await settled(old)
+        }
+        if (disposed) return
+
+        // This closes the old sink while leaving its transcript in the terminal.
+        forgetSession(paneId)
+        clearWriteFailure(paneId)
+
+        await startOrRecover(
+          restartSpec(spec, kindRef.current, mode, old, choice ?? choiceRef.current),
+          false,
+          choice,
+        )
+      } finally {
+        restartingRef.current = false
       }
-      if (disposed) return
-
-      // `forgetSession` also closes the sink (`PaneHost.sinkClose`), whose closure captured
-      // `old` at attach — which is what guarantees the detach names the session the sink was
-      // registered against, however the ids have moved since.
-      forgetSession(paneId)
-      clearWriteFailure(paneId)
-
-      await startOrRecover(
-        restartSpec(spec, kindRef.current, mode, old),
-        false,
-      )
     }
     restartRef.current = restart
     const unregisterRestarter = registerRestarter(paneId, {

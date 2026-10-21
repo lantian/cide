@@ -12,13 +12,12 @@
  * `scopeDirOf` — and this is the wiring that reads the tree and writes the panel.
  */
 import { requestFocus } from '@/chrome/focusRequests'
-import { requestPanel } from '@/chrome/panelRequests'
+import { openSearch, useSearchSessions, EMPTY_DRAFT } from '@/search/store'
 import { useWorkspace } from '@/store/workspace'
 import { activeProjectIdOf, activeProjectOf } from '@/keys/target'
 import { isSyntheticPath } from './groupRows'
 import { rootOf } from './rowPaths'
 import { scopeDirOf, scopeLabel } from './SearchModel'
-import { useSearch } from './SearchStore'
 import { useFileTree } from './treeStore'
 
 /** The active project's roots, in the shape [`scopeLabel`] wants. */
@@ -71,47 +70,20 @@ export function scopeFromTree(): string | null {
   return scopeFor(path, isDir)
 }
 
-/**
- * Put `scope` in the panel's folder box, for the project the tree is showing.
- *
- * # Why this attaches first
- *
- * `SearchStore.attach` clears both narrowing boxes when the project it is handed is not the one
- * it was pointed at — a path means nothing in another project, and a scope silently carried
- * across is a search of a fraction of the new tree that looks exactly like a search of all of
- * it. That is right, and it is also a trap for this function: the panel is usually **not
- * mounted** when the gesture is made, so its `attach` runs one React commit *later* and would
- * throw away the scope that had just been written for it. The gesture would appear to do
- * nothing, and only for a user who had switched project since they last opened the panel —
- * which is the kind of bug that gets reported as "sometimes it works".
- *
- * Attaching here closes it: by the time the panel mounts and attaches again the store is
- * already pointed at this project, so its call is a no-op as far as the boxes are concerned.
- * `attach` is deliberately not early-returning on the same project, so the second call costs a
- * cleared result list and nothing else — and the poll it schedules is cancelled by the
- * `setQuery` below before its timer can fire.
- */
+/** Set the active project's folder filter before opening its modal. Drafts are per project,
+ * so switching projects cannot carry a previous project's folder into this search. */
 export function applyScope(scope: string): void {
   const project = activeProjectIdOf(useWorkspace.getState().boot)
-  if (project !== null) useSearch.getState().attach(project)
-  useSearch.getState().setQuery({ scope })
+  const state = useSearchSessions.getState()
+  const draft = state.drafts[project ?? ''] ?? EMPTY_DRAFT
+  state.patchDraft(project, { descriptor: { ...draft.descriptor, query: { ...draft.descriptor.query, scope } } })
 }
 
-/**
- * Point the search panel at one folder and put the caret in its query box.
- *
- * The caret goes to the **pattern**, not to the folder: the folder has just been filled in for
- * you, and the pattern is what you came to type.
- *
- * `false` when this window has no sidebar to reveal — the caller says so rather than assuming
- * the gesture landed. See `chrome/panelRequests.ts`.
- */
+/** Open Text search with the requested folder and focus its query input. */
 export function searchInFolder(scope: string): boolean {
-  // Written before the reveal, so the panel's first render already has it. The order is
-  // invisible today because `showPanel` goes through a `useState` setter, and it is written
-  // this way for the same reason `requestAmend` parks before revealing.
+  if (activeProjectIdOf(useWorkspace.getState().boot) === null) return false
   applyScope(scope)
-  if (!requestPanel('search')) return false
+  openSearch('text')
   requestFocus('search')
   return true
 }

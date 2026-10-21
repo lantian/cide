@@ -1,17 +1,14 @@
-import type { SearchFrame, SearchQuery, ViewPosition } from '../../ipc/generated'
+import type { SearchDescriptor, SearchSession, SearchSessionFrame, ViewPosition } from '../../ipc/generated'
 import type { Args } from '../fakeTauri'
 import type { Scene } from '../scenes'
-import { fileTab, wire } from '../world'
+import { fileTab, wire, uid } from '../world'
 import { showPanel, sleep, until } from '../drive'
 import { HITS, PATTERN, frame } from '../data/search'
 import { SESSION_CLEAN, SESSION_PATH, sessionFileHandlers } from '../data/editor'
 
 /**
- * The ⌕ panel with `backpressure` typed in, and a populated list of matches across the PTY
- * crate, its neighbours and the docs — beside `session.rs`, open on one of the hits.
- *
- * Search is a poll (`search_query` with an advancing offset), not a Channel, so one handler
- * answers it: every hit on the first page, `running: false`, and the panel stops asking.
+ * The Text mode of Search Everywhere, with code preview beside the matches. The session
+ * handlers also support pinning, refreshing and reopening the modal in the interactive demo.
  */
 export const search: Scene = {
   setup: (world, handlers) => {
@@ -23,8 +20,23 @@ export const search: Scene = {
     const line = HITS.find((h) => h.rel.endsWith('session.rs') && h.text.includes('PtyError'))?.line ?? 1
     const at: ViewPosition = { path: SESSION_PATH, topLine: Math.max(1, line - 20), line, column: 36, folds: [], markdownView: 'text', touchedAt: wire(0) }
     for (const [cmd, h] of sessionFileHandlers(at, SESSION_CLEAN)) handlers.set(cmd, h)
-    handlers.set('search_query', (a: Args): SearchFrame => frame(a['query'] as SearchQuery, Number(a['offset'] ?? 0)))
-    handlers.set('search_cancel', () => true)
+    const sessions = new Map<string, SearchSession>()
+    handlers.set('search_session_start', (a: Args): SearchSession => {
+      const session: SearchSession = { id: uid('search'), project: String(a['project']), descriptor: a['descriptor'] as SearchDescriptor, pinned: false, generation: 0 }
+      for (const old of sessions.values()) if (!old.pinned) sessions.delete(old.id)
+      sessions.set(session.id, session)
+      return session
+    })
+    const get = (a: Args) => { const session = sessions.get(String(a['session'])); if (!session) throw new Error('Search closed'); return session }
+    handlers.set('search_session_page', (a: Args): SearchSessionFrame => {
+      const session = get(a)
+      return { session, files: null, symbols: null, text: frame(session.descriptor.query, Number(a['offset'] ?? 0)), running: false, errors: [] }
+    })
+    handlers.set('search_session_pin', (a: Args) => { const session = get(a); session.pinned = true; return session })
+    handlers.set('search_session_rerun', (a: Args) => { const session = get(a); session.generation++; return session })
+    handlers.set('search_session_list', () => [...sessions.values()].filter(s => s.pinned))
+    handlers.set('search_session_close', (a: Args) => { sessions.delete(String(a['session'])) })
+    handlers.set('search_session_cancel', (a: Args) => { if (!sessions.get(String(a['session']))?.pinned) sessions.delete(String(a['session'])) })
   },
   drive: async () => {
     await showPanel('search')

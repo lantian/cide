@@ -55,7 +55,7 @@ export function Overlays(): ReactElement {
         }
         ground="bg"
         spec={[
-          ['frame', 'width narrow 420 · default 520 · picker 620 · wide 880; --chrome, 1px --border, --r-4, --shadow-3'],
+          ['frame', 'width narrow 420 · default 520 · picker 620 · wide 880 · search 1100; --chrome, 1px --border, --r-4, --shadow-3'],
           ['height', 'at most the window less 128; the body scrolls, head and footer stay'],
           ['flush', 'a body list edge to edge under a --border-soft rule'],
           ['head / body / foot padding', '16 · 28 horizontally (× --ui-scale)'],
@@ -98,6 +98,9 @@ export function Overlays(): ReactElement {
             <PathRow mark={<Icon name="minus" size={1} />} name="Overlay.tsx" where="ui/src/kit/components" />
             <PathRow mark={<Icon name="minus" size={1} />} name="ui-kit.md" where="docs" />
           </PathList>
+        </Dialog>
+        <Dialog title="Search Everywhere" width="search" flush>
+          <PickerStatus>Search dialog: space for results beside a source preview.</PickerStatus>
         </Dialog>
         <Cell label="on the scrim">
           <Button onClick={() => setOpen(true)}>Open a dialog</Button>

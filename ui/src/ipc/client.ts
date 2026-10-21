@@ -1,3 +1,4 @@
+import { clearToolSelection } from '@/toolwindow/selection'
 /**
  * The single seam between the frontend and the Rust core.
  *
@@ -249,6 +250,9 @@ export const tab = {
    */
   newRun: (projectId: ProjectId, title: string, intent: SplitIntent) =>
     invoke<SplitOutcome>('tab_new_run', { project: projectId, title, intent }),
+  /** Open or reveal a read-only saved conversation tab. */
+  openConversation: (projectId: ProjectId, id: string, title: string) =>
+    invoke<TabId>('tab_open_conversation', { project: projectId, id, title }),
 
   activate: (projectId: ProjectId, id: TabId) =>
     invoke<{ rev: number }>('tab_activate', { project: projectId, tab: id }),
@@ -437,12 +441,13 @@ export const pane = {
     invoke<{ rev: number }>('pane_swap', { project: projectId, tab: tabId, a, b }),
 
   /** Record which session a pane is showing, once it has been spawned at the right size. */
-  bindSession: (projectId: ProjectId, tabId: TabId, paneId: PaneId, session: SessionId) =>
+  bindSession: (projectId: ProjectId, tabId: TabId, paneId: PaneId, session: SessionId, harnessChoice?: ConsoleHarness) =>
     invoke<{ rev: number }>('pane_bind_session', {
       project: projectId,
       tab: tabId,
       pane: paneId,
       session,
+      harnessChoice: harnessChoice ?? null,
     }),
 
   /**
@@ -1246,6 +1251,8 @@ export const session = {
     cwd: string
     geometry: Geometry
     project?: string | undefined
+    /** A one-pane choice for a fresh console; absent follows the project default. */
+    harness?: ConsoleHarness | undefined
     /** Continue an existing conversation. With `fork`, the parent to branch from. */
     resume?: SessionId | undefined
     /** Open Codex's session picker when a saved pane lost its thread id. */
@@ -2455,6 +2462,23 @@ export function openLogDir(): Promise<string> {
  * Rejects with `NoIndex` for a project whose file walk has not started; that is the
  * "opening…" state, not an error. See `store/fileIndex.ts`'s `isNoIndex`.
  */
+/** Independent Search Everywhere jobs. Pins live in Rust until their project closes. */
+export const searchSessions = {
+  suggestScopes: (project: ProjectId, input: string, limit = 20) =>
+    invoke<string[]>('search_scope_suggest', { project, input, limit }),
+  start: (project: ProjectId, descriptor: import('./generated').SearchDescriptor) =>
+    invoke<import('./generated').SearchSession>('search_session_start', { project, descriptor }),
+  page: (project: ProjectId, session: string, offset = 0) =>
+    invoke<import('./generated').SearchSessionFrame>('search_session_page', { project, session, offset }),
+  pin: (project: ProjectId, session: string) =>
+    invoke<import('./generated').SearchSession>('search_session_pin', { project, session }),
+  list: (project: ProjectId) => invoke<import('./generated').SearchSession[]>('search_session_list', { project }),
+  rerun: (project: ProjectId, session: string) =>
+    invoke<import('./generated').SearchSession>('search_session_rerun', { project, session }),
+  cancel: (project: ProjectId, session: string) => invoke<void>('search_session_cancel', { project, session }),
+  close: (project: ProjectId, session: string) => invoke<void>('search_session_close', { project, session }),
+}
+
 export const search = {
   query: (projectId: ProjectId, query: SearchQuery, offset = 0, limit?: number) =>
     invoke<SearchFrame>('search_query', {
@@ -3314,8 +3338,10 @@ export const toolWindow = {
    * `project` of `null` is the projectless shell's panel, exactly as in [`setLayout`] — and
    * `null`/`null` is the only pair it can be asked for, since that panel holds no history.
    */
-  activate: (project: ProjectId | null, tab: HistoryTabId | null) =>
-    invoke<void>('tool_window_activate', { project, tab }),
+  activate: (project: ProjectId | null, tab: HistoryTabId | null) => {
+    clearToolSelection(project)
+    return invoke<void>('tool_window_activate', { project, tab })
+  },
 
   /**
    * Show a file's history, keyed on the repository and the **repo-relative** path.
@@ -3326,8 +3352,10 @@ export const toolWindow = {
    * three identical tabs. The id is minted in Rust, so a webview cannot hand in one that collides
    * with a tab it cannot see.
    */
-  openHistory: (project: ProjectId, repo: RepoId, path: string) =>
-    invoke<HistoryTabId>('tool_window_open_history', { project, repo, path }),
+  openHistory: (project: ProjectId, repo: RepoId, path: string) => {
+    clearToolSelection(project)
+    return invoke<HistoryTabId>('tool_window_open_history', { project, repo, path })
+  },
 
   /** Close one history tab. The Log tab has no id and cannot be closed. */
   closeHistory: (project: ProjectId, tab: HistoryTabId) =>
@@ -3431,9 +3459,11 @@ export const history = {
  * happened, and the frame in between shows a list that is visibly wrong. It also means a
  * mutation needs no `hydrate()` follow-up and no wait for the broadcast to come back round.
  * --------------------------------------------------------------------------------------- */
-import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew, TaskResponse, TaskProposalCreated } from './generated'
+import type { TaskBoard, TaskDetail, TaskEdit, TaskId, TaskNew, TaskResponse, TaskProposalCreated, TaskDispatchStatus } from './generated'
 
 export const tasks = {
+  dispatchStatus: (project: ProjectId, task: TaskId, agent: string | null = null) =>
+    pendingCommand('task_dispatch_status', () => invoke<TaskDispatchStatus | null>('task_dispatch_status', { project, task, agent }), null),
   /**
    * The board as it stands, or `null` in a build whose backend has no such handler.
    *
@@ -3529,6 +3559,8 @@ export const tasks = {
  * A standalone object rather than a member of `events`, per the block header.
  */
 export const taskEvents = {
+  onDispatchFeedback: (handler: (status: TaskDispatchStatus) => void) =>
+    listen<TaskDispatchStatus>('cide://task-dispatch-feedback', (e) => handler(e.payload)),
   onApplyStarted: (handler: (project: ProjectId, change: string, run: import('./generated').RunId | null, error: string | null) => void) =>
     listen<{ project: ProjectId; change: string; run: import('./generated').RunId | null; error: string | null }>('cide://task-apply-started', (e) =>
       handler(e.payload.project, e.payload.change, e.payload.run, e.payload.error),
@@ -5646,6 +5678,14 @@ export const update = {
 import type { SessionListing, TranscriptSearch, UserInputPage } from './generated'
 
 export const sessionJournal = {
+  conversationRead: (project: ProjectId, id: string, generation?: string, before?: string) =>
+    invoke<import('./generated').ConversationPage>('sessions_conversation_read', {
+      project, id, generation: generation ?? null, before: before ?? null,
+    }),
+  conversationDetail: (project: ProjectId, id: string, generation: string, item: string, offset: number) =>
+    invoke<[string, number | null]>('sessions_conversation_detail', {
+      project, id, generation, item, offset,
+    }),
   userInputs: (project: ProjectId, id: string, before?: number) =>
     invoke<UserInputPage>('sessions_user_inputs', { project, id, before: before ?? null }),
   onUserInputsChanged: (handler: (project: ProjectId, id: string) => void) =>
@@ -5690,4 +5730,20 @@ export const imageClipboard = {
     const head: import('./generated').ClipboardImageWrite = { width, height }
     return invoke<void>('clipboard_write_image', packFrame(JSON.stringify(head), rgba))
   },
+}
+
+
+export const decisionApi = {
+  snapshot: (offset=0, limit=200, scenario: import('./generated').DecisionScenario | null=null, project: import('./generated').ProjectId | null=null) =>
+    invoke<import('./generated').DecisionSnapshot>('decision_snapshot', { offset, limit, scenario, project }),
+  clear: () => invoke<void>('decision_clear'),
+  feedback: (id: number, helpful: boolean) => invoke<void>('decision_feedback', { id, helpful }),
+  auto: (session: string, enabled: boolean) => invoke<void>('decision_auto', { session, enabled }),
+  probe: (settings: import('./generated').DecisionSettings) => invoke<string>('decision_probe', { settings }),
+}
+
+export const languageServers = {
+  get: (project: ProjectId) => invoke<import('./generated').LanguageServerSnapshot[]>('language_servers_get', { project }),
+  control: (project: ProjectId, source: string | null, action: import('./generated').LanguageServerAction) => invoke<void>('language_servers_control', { project, source, action }),
+  logs: (project: ProjectId, source: string, after: number) => invoke<import('./generated').LanguageServerLogs>('language_servers_logs', { project, source, after }),
 }

@@ -26,12 +26,24 @@ use std::{
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc as channel, watch};
 use tokio_tungstenite::{
-    accept_hdr_async, connect_async,
-    tungstenite::{self, Message, client::IntoClientRequest, http::StatusCode},
+    accept_hdr_async_with_config, connect_async_with_config,
+    tungstenite::{
+        self, Message, client::IntoClientRequest, http::StatusCode, protocol::WebSocketConfig,
+    },
 };
 
 const TOKEN_ENV: &str = "CIDE_CODEX_CONSOLE_TOKEN";
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+// A resumed Codex thread can arrive as one unfragmented JSON frame. The library's
+// 16 MiB frame default disconnected real consoles during resume (16,796,165 bytes
+// in the reported case). Keep a finite bound equal to its default message limit.
+const MAX_CODEX_MESSAGE: usize = 64 << 20;
+
+fn socket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(Some(MAX_CODEX_MESSAGE))
+        .max_message_size(Some(MAX_CODEX_MESSAGE))
+}
 type Valid = Box<dyn Fn() -> Result<(), String> + Send>;
 type Reply = Result<bool, (bool, String)>;
 type Observe = Arc<dyn Fn(Vec<Hook>) + Send + Sync>;
@@ -69,6 +81,8 @@ struct ForwardContext {
     selected: Arc<Mutex<Selection>>,
     observe: Observe,
     policy: Value,
+    decision: Option<crate::decision::Handle>,
+    planning: Option<crate::native_plan::Handle>,
 }
 
 struct Credentials(PathBuf);
@@ -108,7 +122,29 @@ pub(crate) struct Console {
 }
 
 impl Console {
-    pub fn start(mut spec: SpawnSpec, observe: Observe) -> Result<(SpawnSpec, Arc<Self>), String> {
+    #[cfg(test)]
+    pub fn start(spec: SpawnSpec, observe: Observe) -> Result<(SpawnSpec, Arc<Self>), String> {
+        Self::start_with_decision(spec, observe, None)
+    }
+
+    #[cfg(test)]
+    pub fn start_with_decision(
+        spec: SpawnSpec,
+        observe: Observe,
+        decision: Option<crate::decision::Handle>,
+    ) -> Result<(SpawnSpec, Arc<Self>), String> {
+        Self::start_planning(spec, observe, decision, None)
+    }
+
+    pub(crate) fn start_planning(
+        mut spec: SpawnSpec,
+        observe: Observe,
+        decision: Option<crate::decision::Handle>,
+        planning: Option<crate::native_plan::Handle>,
+    ) -> Result<(SpawnSpec, Arc<Self>), String> {
+        if let Some(h) = &decision {
+            h.available(true, "Native Codex app-server adapter");
+        }
         supports_remote(&spec)?;
         spec.args = protocol::remote_args(&spec.args);
         let token = format!("{}{}", SessionId::new(), SessionId::new());
@@ -170,7 +206,7 @@ impl Console {
                     let Ok((mut client, _)) = tungstenite::client(request, stream) else {
                         return false;
                     };
-                    match read_policy(&mut client, &spec.cwd) {
+                    match read_policy(&mut client, &spec.cwd, planning.is_some()) {
                         Ok(config) => {
                             if let Some((_, scratch)) = spec.env.iter().rev().find(|(name, _)| {
                                 name == cide_core::peer_chat::reviewer::SCRATCH_ENV
@@ -193,7 +229,12 @@ impl Console {
                             }
                             true
                         }
-                        Err(_) => false,
+                        Err(error) => {
+                            if error.starts_with("Native Plan mode unavailable") {
+                                policy_error = Some(error);
+                            }
+                            false
+                        }
                     }
                 });
             if let Some(error) = policy_error.take() {
@@ -228,6 +269,8 @@ impl Console {
                                 selected: protocol,
                                 observe,
                                 policy,
+                                decision,
+                                planning,
                             },
                             receive,
                             shutdown_rx,
@@ -353,6 +396,18 @@ fn authenticated(url: &str, token: &str) -> Result<tungstenite::http::Request<()
     Ok(request)
 }
 
+fn append_research(frame: &mut Value, text: &str) -> bool {
+    let Some(input) = frame["params"]["input"].as_array_mut() else {
+        return false;
+    };
+    input.push(json!({
+        "type": "text",
+        "text": format!("Cide decision assistance (advisory context): {text}\nFollow the user's request and normal permission rules; skip this suggestion if irrelevant."),
+        "text_elements": []
+    }));
+    true
+}
+
 fn supports_remote(spec: &SpawnSpec) -> Result<(), String> {
     let mut command = std::process::Command::new(&spec.program);
     command
@@ -466,9 +521,11 @@ async fn forward_connection(
         selected,
         observe,
         policy,
+        decision,
+        planning,
     } = context;
     let credential = format!("Bearer {token}");
-    let handshake = accept_hdr_async(
+    let handshake = accept_hdr_async_with_config(
         stream,
         move |request: &tungstenite::handshake::server::Request, response| {
             if request
@@ -484,6 +541,7 @@ async fn forward_connection(
             }
             Ok(response)
         },
+        Some(socket_config()),
     );
     if *shutdown.borrow() {
         return Ok(());
@@ -496,10 +554,23 @@ async fn forward_connection(
     let request = authenticated(&server_url, &token)?;
     let (mut server, _) = tokio::select! {
         _ = shutdown.changed() => return Ok(()),
-        connected = connect_async(request) => connected.map_err(|e| e.to_string())?,
+        connected = connect_async_with_config(request, Some(socket_config()), false) => connected.map_err(|e| e.to_string())?,
     };
     let protocol = Arc::new(Mutex::new(Protocol::new(connection)));
     let mut pending: HashMap<String, Pending> = HashMap::new();
+    let (decisions, mut actions) = channel::channel::<crate::decision::Action>(8);
+    let mut decision_pending: HashMap<String, (u64, Option<Value>, Option<String>)> =
+        HashMap::new();
+    let mut research_pending: HashMap<String, u64> = HashMap::new();
+    let mut active_thread = String::new();
+    let mut active_turn = String::new();
+    let mut native_plan = cide_agents::native_plan::Codex::default();
+    let mut plan_ack: Option<String> = None;
+    let mut plan_starts = std::collections::HashSet::new();
+    let mut questions: HashMap<String, (Value, crate::native_questions::Question)> = HashMap::new();
+    let question_scope = SessionId::new().to_string();
+    let mut answered_questions = std::collections::HashSet::new();
+    let mut question_interrupts = std::collections::HashSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let outcome: Result<(), String> = async {
         loop {
@@ -511,9 +582,73 @@ async fn forward_connection(
                     let mut frame = frame.map_err(|e| e.to_string())?;
                     if let Message::Text(text) = &frame {
                         let mut parsed: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+                        if planning.is_some() && parsed["method"] == "initialize" {
+                            if !parsed["params"]["capabilities"].is_object() { parsed["params"]["capabilities"] = json!({}); }
+                            parsed["params"]["capabilities"]["experimentalApi"] = json!(true);
+                            frame = Message::Text(parsed.to_string().into());
+                        }
                         let selects = protocol::apply_policy(&mut parsed, &policy);
+                        if parsed.get("method").is_none() && answered_questions.contains(&parsed["id"].to_string()) { continue; }
+                        if parsed.get("method").is_none()
+                            && let Some((_, question)) = questions.remove(&parsed["id"].to_string()) {
+                            answered_questions.insert(parsed["id"].to_string());
+                            question.retire("Answered in the native terminal.");
+                        }
+                        if selects || parsed["method"] == "turn/interrupt" { questions.clear(); }
+                        if selects && parsed["params"]["ephemeral"] != true
+                            && let Some(plan) = &planning
+                            && protocol.lock().current_thread().is_some_and(|thread| Some(thread) != parsed["params"]["threadId"].as_str()) {
+                            plan.abandon();
+                        }
+                        let input_event = {
+                            let current = selected.lock();
+                            decision_input(&protocol.lock(), current.connection == Some(connection), selects, &parsed)
+                        };
+                        if let Some(h) = &decision && let Some(event) = input_event {
+                            let text = event.text.clone();
+                            h.event(event);
+                            if parsed["method"] == "turn/start" {
+                                h.requested_model(parsed["params"]["model"].as_str());
+                                let research=h.research(&text).await;
+                                let model=h.model(&text).await;
+                                if let Some(action)=research {
+                                    if h.can_apply(action.id, action.generation) && append_research(&mut parsed, &action.text) {
+                                        research_pending.insert(parsed["id"].to_string(),action.id);
+                                    } else {
+                                        h.status(action.id,"stale","Session or settings changed before delivery");
+                                    }
+                                }
+                                // A rejected model retries the user's original model selection
+                                // with the same research context, which is acknowledged only then.
+                                let original=parsed.clone();
+                                if let Some(action)=model && h.can_apply(action.id, action.generation) && let Some(profile)=action.profile {
+                                    parsed["params"]["model"]=json!(profile.model);
+                                    if let Some(effort)=profile.effort {parsed["params"]["effort"]=json!(effort);}
+                                    decision_pending.insert(parsed["id"].to_string(), (action.id,Some(original),Some(profile.model.clone())));
+                                }
+                            }
+                            frame = Message::Text(parsed.to_string().into());
+                        }
                         if selects {
                             frame = Message::Text(parsed.to_string().into());
+                        }
+                        if let Some(plan) = &planning && plan.pending() && plan.valid() {
+                            let owned = protocol.lock().owns_thread(&parsed);
+                            if owned && parsed["method"] == "turn/start" {
+                                if cide_agents::native_plan::codex_implementation_request(&parsed) {
+                                    plan.transition(cide_agents::native_plan::Phase::Implementing);
+                                } else {
+                                    let model = protocol.lock().current_model().map(str::to_string)
+                                        .ok_or_else(|| "Codex did not identify the model for native planning".to_string())?;
+                                    if native_plan.prepare(&mut parsed, &model) {
+                                        plan_starts.insert(parsed["id"].to_string());
+                                        frame = Message::Text(parsed.to_string().into());
+                                    }
+                                }
+                            }
+                            if parsed["method"] == "turn/interrupt" || (selects && protocol.lock().receiver().is_some()) {
+                                native_plan = Default::default();
+                            }
                         }
                         // Same lock order as receiver(): selection, then protocol.
                         let mut current = selected.lock();
@@ -529,8 +664,96 @@ async fn forward_connection(
                 frame = server.next() => {
                     let Some(frame) = frame else { return Err("Codex app-server disconnected".into()) };
                     let frame = frame.map_err(|e| e.to_string())?;
+                    let mut acceptance = None;
                     if let Message::Text(text) = &frame {
                         let parsed: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+                        if parsed.get("method").is_none() && parsed["id"].as_str().is_some_and(|id| question_interrupts.remove(id)) { continue; }
+                        if parsed["method"] == "item/tool/requestUserInput"
+                            && selected.lock().connection == Some(connection)
+                            && protocol.lock().owns_thread(&parsed)
+                            && let Some(plan) = &planning
+                            && plan.pending() && plan.valid() {
+                            let batch = cide_agents::native_questions::questions(&parsed["params"]["questions"], cide_agents::native_questions::Dialect::Codex)?;
+                            let key = parsed["id"].to_string();
+                            if let std::collections::hash_map::Entry::Vacant(entry) = questions.entry(key.clone()) {
+                                let question = plan.ask(parsed["params"]["threadId"].as_str().ok_or("Missing question thread")?, &cide_agents::native_questions::codex_key(&parsed, &question_scope), batch)?;
+                                entry.insert((parsed["id"].clone(), question));
+                            }
+                        }
+                        if parsed["method"] == "serverRequest/resolved"
+                            && protocol.lock().owns_thread(&parsed)
+                            && let Some((_, question)) = questions.remove(&parsed["params"]["requestId"].to_string()) {
+                            question.finish();
+                            observe(vec![Hook { kind:"PostToolUse", payload:json!({"session_id":question.source.conversation,"tool_name":"request_user_input"}) }]);
+                        }
+                        if parsed["method"] == "turn/completed" && protocol.lock().owns_thread(&parsed) { questions.clear(); }
+                        if parsed.get("method").is_none() && plan_starts.remove(&parsed["id"].to_string()) && parsed.get("error").is_some() {
+                            if let Some(plan) = &planning { plan.fail("Codex rejected the native Plan-mode turn"); }
+                            return Err("Codex rejected native Plan mode".into());
+                        }
+                        // Some Codex versions announce the implementation turn before
+                        // replying to our turn/start request. Its start is authoritative
+                        // even if that acknowledgement is delayed or omitted.
+                        if plan_ack.is_some()
+                            && parsed["method"] == "turn/started"
+                            && protocol.lock().owns_thread(&parsed)
+                            && let Some(plan) = &planning {
+                            plan.transition(cide_agents::native_plan::Phase::Implementing);
+                        }
+                        if plan_ack.as_deref().is_some_and(|id| parsed["id"].as_str() == Some(id)) && parsed.get("method").is_none() {
+                            plan_ack = None;
+                            protocol.lock().from_server(&parsed);
+                            if let Some(plan) = &planning {
+                                if parsed.get("error").is_some() {
+                                    plan.fail("Codex rejected its native plan acceptance");
+                                    return Err("Codex rejected native plan acceptance".into());
+                                }
+                                plan.transition(cide_agents::native_plan::Phase::Implementing);
+                            }
+                            continue;
+                        }
+                        acceptance = if let Some(plan) = &planning
+                            && plan.pending() && plan.valid()
+                            && selected.lock().connection == Some(connection)
+                            && protocol.lock().owns_thread(&parsed) {
+                            let id = format!("cide-plan-{}", SessionId::new());
+                            native_plan.observe(&parsed, &id).inspect(|_| {
+                                plan_ack = Some(id);
+                                plan.transition(cide_agents::native_plan::Phase::Approving);
+                            })
+                        } else { None };
+                        if let Some(h)=&decision {
+                            if parsed.get("method").is_none() && let Some((record,original,model))=decision_pending.remove(&parsed["id"].to_string()) {
+                                h.status(record,if parsed.get("error").is_some(){"rejected"}else{"applied"},"Native harness acknowledgement");
+                                if parsed.get("error").is_some() && let Some(original)=original {
+                                    write_frame(&mut server,Message::Text(original.to_string().into())).await?;
+                                    continue;
+                                }
+                                if parsed.get("error").is_none() && let Some(model)=model {h.selected_model(&model);}
+                                if parsed["id"].as_str().is_some_and(|id|id.starts_with("cide-decision-")){continue;}
+                            }
+                            if parsed.get("method").is_none() && let Some(record)=research_pending.remove(&parsed["id"].to_string()) {
+                                h.status(record,if parsed.get("error").is_some(){"rejected"}else{"applied"},"Native Codex user-turn acknowledgement");
+                            }
+                            let owns = {
+                                let current = selected.lock();
+                                current.connection == Some(connection) && protocol.lock().owns_thread(&parsed)
+                            };
+                            if owns {
+                                if parsed["method"]=="turn/started" {
+                                    active_thread=parsed["params"]["threadId"].as_str().unwrap_or_default().into();
+                                    active_turn=parsed["params"]["turn"]["id"].as_str().unwrap_or_default().into();
+                                }
+                                let event = decision_output(&protocol.lock(), &parsed);
+                                if let Some(event)=event {
+                                    let tool=event.kind=="tool";let complete=event.kind=="complete";
+                                    if h.event(event) && (tool||complete) {
+                                        let h=h.clone();let send=decisions.clone();
+                                        tokio::spawn(async move {let action=if complete{h.completion().await}else{h.after_tool().await};if let Some(a)=action{let _=send.try_send(a);}});
+                                    }
+                                }
+                            }
+                        }
                         if parsed.get("method").is_none() && let Some(id) = parsed["id"].as_str().filter(|id| id.starts_with("cide-peer-")) {
                             if let Some(request) = pending.remove(id) {
                                 let result = protocol::acknowledgement(&parsed).map(|_| true);
@@ -539,12 +762,34 @@ async fn forward_connection(
                             continue;
                         }
                         let current = selected.lock();
-                        let hooks = protocol.lock().from_server(&parsed);
+                        let hooks = native_plan_hooks(&mut protocol.lock(), &parsed, acceptance.is_some());
                         let owns = current.connection == Some(connection);
                         drop(current);
                         if owns && !hooks.is_empty() { observe(hooks); }
                     }
                     write_frame(&mut terminal, frame).await?;
+                    if let Some(request) = acceptance
+                        && planning.as_ref().is_some_and(|plan| plan.valid()) {
+                            protocol.lock().from_terminal(&request);
+                            write_frame(&mut server, Message::Text(request.to_string().into())).await?;
+                    }
+                }
+                Some(action) = actions.recv() => {
+                    let Some(h)=&decision else{continue};
+                    if !h.can_apply(action.id, action.generation) || selected.lock().connection!=Some(connection) {h.status(action.id,"stale","Session or settings changed before delivery");continue;}
+                    let id=format!("cide-decision-{}",SessionId::new());
+                    let frame=if action.continuation {
+                        let receiver=protocol.lock().receiver();
+                        let Some(receiver)=receiver else {h.status(action.id,"stale","The terminal is busy or awaiting input");continue;};
+                        if !protocol.lock().claim(&receiver){continue;}
+                        protocol::turn_request(&id,&receiver,&action.text)
+                    } else {
+                        if active_thread.is_empty()||active_turn.is_empty(){continue;}
+                        json!({"id":id,"method":"turn/steer","params":{"threadId":active_thread,"expectedTurnId":active_turn,"input":[{"type":"text","text":action.text}]}})
+                    };
+                    decision_pending.insert(json!(id).to_string(),(action.id,None,None));
+                    h.status(action.id,"delivered","Sent through the native Codex connection");
+                    write_frame(&mut server,Message::Text(frame.to_string().into())).await?;
                 }
                 Some(submission) = submissions.recv() => {
                     if submission.expired.load(Ordering::SeqCst) { continue; }
@@ -560,12 +805,32 @@ async fn forward_connection(
                         let _ = submission.reply.send(Ok(false));
                         continue;
                     }
+                    if let Some(h)=&decision {h.event(cide_core::decision::Event{kind:"prompt".into(),text:submission.body.clone(),..Default::default()});}
                     let id = format!("cide-peer-{}", SessionId::new());
                     let frame = protocol::turn_request(&id, &submission.receiver, &submission.body);
                     pending.insert(id, Pending { deadline: Instant::now() + ACK_TIMEOUT, reply: submission.reply });
                     write_frame(&mut server, Message::Text(frame.to_string().into())).await?;
                 }
                 _ = tick.tick() => {
+                    questions.retain(|_, (_, question)| question.active());
+                    for (id, question) in questions.values() {
+                        if selected.lock().connection != Some(connection) { break; }
+                        let Some(response) = question.response() else { continue; };
+                        if !question.claim() { continue; }
+                        if let Some(reply) = cide_agents::native_questions::codex_reply(id, &question.questions, &response) {
+                            if let Some(h) = &decision && let Some(event) = decision_input(&protocol.lock(), true, false, &reply) { h.event(event); }
+                            protocol.lock().from_terminal(&reply);
+                            answered_questions.insert(id.to_string());
+                            write_frame(&mut server, Message::Text(reply.to_string().into())).await?;
+                        } else {
+                            let id = format!("cide-question-cancel-{}", SessionId::new());
+                            question_interrupts.insert(id.clone());
+                            let frame = json!({"id":id,"method":"turn/interrupt","params":{"threadId":question.source.conversation}});
+                            write_frame(&mut server, Message::Text(frame.to_string().into())).await?;
+                            question.retire("The user cancelled the native question.");
+                            question.cancel_turn();
+                        }
+                    }
                     let now = Instant::now();
                     pending.retain(|_, request| {
                         if now < request.deadline { return true; }
@@ -579,12 +844,88 @@ async fn forward_connection(
     for (_, request) in pending {
         let _ = request.reply.send(Err((true, "Codex disconnected after submission; acceptance is uncertain. Inspect the conversation before resending.".into())));
     }
+    if outcome.is_err()
+        && let Some(plan) = &planning
+        && plan.pending()
+        && plan.valid()
+    {
+        plan.fail("the native Codex connection was lost; plan acceptance was not replayed");
+    }
     outcome
+}
+
+fn native_plan_hooks(protocol: &mut Protocol, frame: &Value, accepting: bool) -> Vec<Hook> {
+    let mut hooks = protocol.from_server(frame);
+    // Acceptance is sent before the queued hook applier necessarily catches up. Never
+    // let the planning Stop release the slot after implementation has advanced the phase.
+    if accepting {
+        hooks.retain(|hook| hook.kind != "Stop");
+    }
+    hooks
+}
+
+fn decision_input(
+    protocol: &Protocol,
+    selected: bool,
+    selects: bool,
+    frame: &Value,
+) -> Option<cide_core::decision::Event> {
+    let mut event = cide_core::decision::Event::default();
+    if selects {
+        event.kind = "stop".into();
+    } else if !selected {
+        return None;
+    } else if protocol.resolves_last_question(frame) {
+        event.kind = "resumed".into();
+    } else if protocol.owns_thread(frame) {
+        match frame["method"].as_str()? {
+            "turn/start" | "turn/steer" => {
+                event.kind = "prompt".into();
+                event.text = frame["params"]["input"]
+                    .as_array()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| p["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+            }
+            "turn/interrupt" | "thread/unsubscribe" => event.kind = "stop".into(),
+            _ => return None,
+        }
+    } else {
+        return None;
+    }
+    Some(event)
+}
+
+fn decision_output(protocol: &Protocol, frame: &Value) -> Option<cide_core::decision::Event> {
+    if !protocol.owns_thread(frame) {
+        return None;
+    }
+    if protocol.resolves_last_question(frame) {
+        return Some(cide_core::decision::Event {
+            kind: "resumed".into(),
+            ..Default::default()
+        });
+    }
+    // Native tool execution also uses server requests. It must remain able to call
+    // cide_context while running; only human questions suspend decision inference.
+    if frame.get("id").is_some() && protocol::requests_user_input(frame) {
+        return Some(cide_core::decision::Event {
+            kind: "waiting".into(),
+            ..Default::default()
+        });
+    }
+    crate::decision::codex_event(frame)
 }
 
 fn read_policy(
     client: &mut tungstenite::WebSocket<TcpStream>,
     cwd: &std::path::Path,
+    planning: bool,
 ) -> Result<Value, String> {
     fn request(
         client: &mut tungstenite::WebSocket<TcpStream>,
@@ -620,7 +961,11 @@ fn read_policy(
         client,
         0,
         "initialize",
-        json!({"clientInfo":{"name":"cide_native_console","version":env!("CARGO_PKG_VERSION")}}),
+        if planning {
+            json!({"clientInfo":{"name":"cide_native_console","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})
+        } else {
+            json!({"clientInfo":{"name":"cide_native_console","version":env!("CARGO_PKG_VERSION")}})
+        },
     )?;
     client
         .send(Message::Text(
@@ -636,6 +981,18 @@ fn read_policy(
         .clone();
     if !config.is_object() {
         return Err("Codex did not return its effective configuration".into());
+    }
+    if planning {
+        let modes = request(client, 2, "collaborationMode/list", json!({}))
+            .map_err(|error| format!("Native Plan mode unavailable: {error}"))?;
+        if !modes["data"]
+            .as_array()
+            .is_some_and(|modes| modes.iter().any(|mode| mode["mode"] == "plan"))
+        {
+            return Err(
+                "Native Plan mode unavailable: Codex exposes no Plan collaboration preset".into(),
+            );
+        }
     }
     let _ = client.close(None);
     Ok(config)

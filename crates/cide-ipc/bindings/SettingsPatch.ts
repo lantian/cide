@@ -4,6 +4,7 @@ import type { AwaitingHighlight } from "./AwaitingHighlight";
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { CodexSettings } from "./CodexSettings";
 import type { ConsoleHarness } from "./ConsoleHarness";
+import type { DecisionSettings } from "./DecisionSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { ExplorerSettings } from "./ExplorerSettings";
 import type { GitSettings } from "./GitSettings";
@@ -14,6 +15,7 @@ import type { OpenRunIn } from "./OpenRunIn";
 import type { OpencodeSettings } from "./OpencodeSettings";
 import type { ProxySettings } from "./ProxySettings";
 import type { RemoteSettings } from "./RemoteSettings";
+import type { SearchModalLayout } from "./SearchModalLayout";
 import type { SidebarSettings } from "./SidebarSettings";
 import type { TaskProposalRunMode } from "./TaskProposalRunMode";
 import type { TerminalSettings } from "./TerminalSettings";
@@ -45,7 +47,7 @@ export type SettingsPatch = { theme?: Theme,
  * `workspace.json` cannot hand CSS a `NaN` multiplier — see
  * [`crate::settings::clamp_ui_font_size`] for what that would paint.
  */
-uiFontSize?: number, 
+uiFontSize?: number, searchModalLayout?: SearchModalLayout, 
 /**
  * Pick or reset the accent. Carries only the picked colour: the fitted variants are
  * computed where this lands, so no caller can store an illegible one. See
@@ -72,7 +74,7 @@ codex?: CodexSettings, opencode?: OpencodeSettings,
  * the boundary is in-process; see [`crate::settings::ProxySettings`] for what is done
  * about the value once it is at rest.
  */
-proxy?: ProxySettings, 
+proxy?: ProxySettings, decision?: DecisionSettings, 
 /**
  * Both sidebar widths, sent together.
  *

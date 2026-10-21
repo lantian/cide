@@ -39,6 +39,7 @@ import {
   tab as tabApi,
   type Axis,
   type Bootstrap,
+  type ConsoleHarness,
   type Direction,
   type PaneId,
   type Project,
@@ -774,6 +775,7 @@ interface WorkspaceStore {
     tab: TabId,
     pane: PaneId,
     session: SessionId,
+    harnessChoice?: ConsoleHarness,
   ) => Promise<void>
 
   /**
@@ -1248,8 +1250,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // keyboard to move.
     return target
   },
-  bindSession: async (project, tab, pane, session) => {
-    const { rev } = await paneApi.bindSession(project, tab, pane, session)
+  bindSession: async (project, tab, pane, session, harnessChoice) => {
+    const { rev } = await paneApi.bindSession(project, tab, pane, session, harnessChoice)
     await synced(rev)
   },
 

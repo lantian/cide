@@ -132,6 +132,7 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+shift+0", "claude.addRow"),
         ("ctrl+shift+bracketleft", "terminal.splitRight"),
         ("ctrl+shift+bracketright", "terminal.addRow"),
+        ("shift shift", "search.everywhere"),
         ("ctrl+p", "picker.files"),
         ("ctrl+shift+p", "palette.commands"),
         // Find in files. The search panel was built, wired to its Rust engine, and reachable
@@ -203,6 +204,7 @@ pub fn defaults() -> Vec<Binding> {
         // nothing but the chord. `project.switcher.prev` is the existing precedent and
         // `the_default_layer_binds_every_command_the_palette_shows` names both.
         ("ctrl+shift+t", "tab.reopenClosed"),
+        ("ctrl+shift+m", "sidebar.problems"),
         // Pull, asked for by name: "need hotkey CTRL+T for git pull".
         //
         // # What it costs, precisely
@@ -816,6 +818,7 @@ pub fn defaults() -> Vec<Binding> {
              * so a bare f-key passes through untouched.
              */
             ("f4", "sidebar.toggle", "shellWindow"),
+            ("f4", "problems.jumpToSource", "problemsFocused"),
             /*
              * Code folding — IDEA's chords, spelled the way this table has to spell them. (M19)
              *
@@ -2442,19 +2445,22 @@ mod tests {
     #[test]
     fn f4_toggles_the_panel_and_can_be_given_back_to_the_terminal() {
         let shipped = resolve(&[]);
-        assert_eq!(command_for(&shipped, "f4"), ["sidebar.toggle"]);
+        assert_eq!(
+            command_for(&shipped, "f4"),
+            ["sidebar.toggle", "problems.jumpToSource"]
+        );
         assert!(command_for(&shipped, "f3").is_empty());
 
         let scoped = resolve(&[Binding::new("f4", "-sidebar.toggle").when("shellWindow")]);
         assert!(
-            command_for(&scoped, "f4").is_empty(),
+            command_for(&scoped, "f4") == ["problems.jumpToSource"],
             "the documented one-liner has to actually give ESC O S back to the pty"
         );
 
         let unscoped = resolve(&[Binding::new("f4", "-sidebar.toggle")]);
         assert_eq!(
             command_for(&unscoped, "f4"),
-            ["sidebar.toggle"],
+            ["sidebar.toggle", "problems.jumpToSource"],
             "a removal that forgets the `when` matches nothing — `docs/journal.md` must not print it"
         );
     }
@@ -3143,8 +3149,8 @@ mod tests {
             }
         );
         assert!(
-            command_for(&resolve(&user), "f4").is_empty(),
-            "F4 has to actually reach the pty again"
+            command_for(&resolve(&user), "f4") == ["problems.jumpToSource"],
+            "only the Problems-local binding remains; F4 reaches the pty again"
         );
         let (_, diags) = resolve_with_diagnostics(&user);
         assert!(

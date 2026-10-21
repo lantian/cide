@@ -172,7 +172,7 @@ pub fn trigger(
     if !matches!(author, TaskAuthor::User | TaskAuthor::Orchestrator) {
         return None;
     }
-    if !matches!(after.status, TaskStatus::Todo | TaskStatus::Doing) {
+    if !crate::task_dispatch::automatic_status(after.status) {
         return None;
     }
     // After the status gate, before the mention scan: a blocked task's mention must not adopt
@@ -187,6 +187,22 @@ pub fn trigger(
         return None;
     }
 
+    intent(before, after, author, assign_gesture, fresh_text, roles)
+}
+
+/// Roles a gesture addresses, before eligibility checks. This is also used to explain a
+/// rejected gesture. It never adopts a task or grants a worker permission to dispatch.
+pub fn intent(
+    before: Option<&Task>,
+    after: &Task,
+    author: &TaskAuthor,
+    assign_gesture: bool,
+    fresh_text: &[&str],
+    roles: &[AgentId],
+) -> Option<Trigger> {
+    if !matches!(author, TaskAuthor::User | TaskAuthor::Orchestrator) {
+        return None;
+    }
     let mut dispatch: Vec<AgentId> = Vec::new();
 
     // The assignment edge, widened by the gesture: creation-with-assignee counts
@@ -200,10 +216,11 @@ pub fn trigger(
     // move to `Todo` is the decision that it is work now, and it must start that role exactly as
     // an assignment would. Without this the promotion is a status flip carrying the assignee
     // along, which fires nothing — and the orchestrator would have to learn to re-assign.
-    let promoted = before.is_some_and(|task| task.status == TaskStatus::Inbox);
+    let promoted = before.is_some_and(|task| task.status == TaskStatus::Inbox)
+        && crate::task_dispatch::automatic_status(after.status);
     // An answered question is the same kind of edge (M132): the task sat inert on purpose, and
     // clearing the question is the user saying "go on".
-    let answered = before.is_some_and(|task| task.question.is_some());
+    let answered = before.is_some_and(|task| task.question.is_some()) && after.question.is_none();
     if let Some(agent) = after.agent.as_ref()
         && (assign_gesture || promoted || answered || previously != Some(agent))
     {
@@ -907,6 +924,172 @@ mod tests {
                 assign: None,
                 dispatch: roles(&["developer", "qa"])
             }
+        );
+    }
+    #[test]
+    fn dispatch_diagnostics_show_all_constraints_and_drop_only_the_resolved_one() {
+        use cide_ipc::{LinkType, Milestone, MilestonePlan, TaskId, TaskLink};
+        let mut blocked = task(TaskStatus::Todo, Some("developer"));
+        blocked.links = vec![
+            TaskLink {
+                link: LinkType::BlockedBy,
+                target: TaskId("t-2".into()),
+                deleted: false,
+                at_unix_ms: 1,
+            },
+            TaskLink {
+                link: LinkType::SubtaskOf,
+                target: TaskId("t-3".into()),
+                deleted: false,
+                at_unix_ms: 1,
+            },
+        ];
+        let mut blocker = task(TaskStatus::Todo, None);
+        blocker.id = TaskId("t-2".into());
+        let mut goal = task(TaskStatus::Todo, None);
+        goal.id = TaskId("t-3".into());
+        let mut plan = MilestonePlan {
+            items: vec![
+                Milestone {
+                    id: "playtest".into(),
+                    title: "Current".into(),
+                    task: Some(TaskId("t-4".into())),
+                    gate: String::new(),
+                    timeout_secs: None,
+                },
+                Milestone {
+                    id: "playtest-oct".into(),
+                    title: "Next".into(),
+                    task: Some(goal.id.clone()),
+                    gate: String::new(),
+                    timeout_secs: None,
+                },
+            ],
+            active: Some("playtest".into()),
+            ..Default::default()
+        };
+        let board = |blocker: &Task| {
+            [blocked.clone(), blocker.clone(), goal.clone()]
+                .iter()
+                .map(TaskRow::of)
+                .collect::<Vec<_>>()
+        };
+        let reasons = crate::task_dispatch::task_reasons(&blocked, &board(&blocker), &plan);
+        assert_eq!(
+            reasons.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            ["inactiveMilestone", "dependency"]
+        );
+        assert_eq!(reasons[0].milestone.as_deref(), Some("playtest-oct"));
+        assert_eq!(reasons[1].task.as_ref(), Some(&blocker.id));
+        blocker.status = TaskStatus::Review;
+        assert_eq!(
+            crate::task_dispatch::task_reasons(&blocked, &board(&blocker), &plan).len(),
+            2,
+            "review is not done"
+        );
+        blocker.status = TaskStatus::Done;
+        let reasons = crate::task_dispatch::task_reasons(&blocked, &board(&blocker), &plan);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "inactiveMilestone");
+        plan.active = Some("playtest-oct".into());
+        assert!(crate::task_dispatch::task_reasons(&blocked, &board(&blocker), &plan).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_intent_does_not_turn_ordinary_comments_into_launch_attempts() {
+        for status in [
+            TaskStatus::Inbox,
+            TaskStatus::Todo,
+            TaskStatus::Doing,
+            TaskStatus::Review,
+            TaskStatus::Done,
+        ] {
+            let mut current = task(status, Some("developer"));
+            current.question = Some("Choose a color".into());
+            assert_eq!(
+                intent(
+                    Some(&current),
+                    &current,
+                    &TaskAuthor::User,
+                    false,
+                    &["ordinary comment"],
+                    &roles(&["developer"])
+                ),
+                None
+            );
+            assert!(
+                intent(
+                    Some(&current),
+                    &current,
+                    &TaskAuthor::User,
+                    true,
+                    &[],
+                    &roles(&["developer"])
+                )
+                .is_some()
+            );
+            assert!(
+                intent(
+                    Some(&current),
+                    &current,
+                    &TaskAuthor::User,
+                    false,
+                    &["@developer implement it"],
+                    &roles(&["developer"])
+                )
+                .is_some()
+            );
+            assert_eq!(
+                intent(
+                    Some(&current),
+                    &current,
+                    &TaskAuthor::Agent {
+                        agent: AgentId("developer".into()),
+                        label: "Developer".into()
+                    },
+                    true,
+                    &["@developer"],
+                    &roles(&["developer"])
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_diagnostics_ignore_deleted_and_missing_dependencies_but_keep_questions() {
+        use cide_ipc::{LinkType, MilestonePlan, TaskId, TaskLink};
+        let mut current = task(TaskStatus::Todo, Some("developer"));
+        current.question = Some("Choose a color".into());
+        current.links = vec![
+            TaskLink {
+                link: LinkType::BlockedBy,
+                target: TaskId("missing".into()),
+                deleted: false,
+                at_unix_ms: 1,
+            },
+            TaskLink {
+                link: LinkType::BlockedBy,
+                target: current.id.clone(),
+                deleted: true,
+                at_unix_ms: 1,
+            },
+        ];
+        let reasons = crate::task_dispatch::task_reasons(
+            &current,
+            &[TaskRow::of(&current)],
+            &MilestonePlan::default(),
+        );
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "question");
+        current.question = None;
+        assert!(
+            crate::task_dispatch::task_reasons(
+                &current,
+                &[TaskRow::of(&current)],
+                &MilestonePlan::default()
+            )
+            .is_empty()
         );
     }
 }

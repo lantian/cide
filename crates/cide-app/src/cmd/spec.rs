@@ -600,6 +600,7 @@ pub(crate) fn open_subject_tab(
                 harness_conversation: None,
                 continues: None,
                 harness: None,
+                harness_choice: None,
                 title: "openspec".into(),
                 docker: None,
                 origin: None,
@@ -1067,6 +1068,9 @@ pub async fn spec_dispatch_to_session(
         refreshed.as_ref(),
         None,
         Some(&cide_agents::harness::ClaudeHarness),
+        cide_agents::config::load(&root)
+            .agents
+            .task_start_template(),
     );
     let started = app
         .try_state::<crate::state::SessionRegistry>()

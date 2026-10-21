@@ -29,9 +29,36 @@ export interface SettingsHit {
 }
 
 export const SETTINGS_INDEX: readonly SettingsHit[] = [
+  { section: 'decision', label: 'Enable decision assistance', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Decision Insights', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'API URL', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Decision model', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Timeout (ms)', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Connection test', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Name', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Harness', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Model', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Effort / variant', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'When to use', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Allow in this project', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Discover checks', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Additional checks', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Maximum continuations', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Loop cooldown (seconds)', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Context candidates retained', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Decision input limit (bytes)', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Assign sessions to control or treatment', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Scenario to compare', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Repeated failures', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Context ranking', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Research route', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Verification', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Completion', keywords: 'experimental decision ollama d1 project assistance' },
+  { section: 'decision', label: 'Model and effort', keywords: 'experimental decision ollama d1 project assistance' },
   { section: 'projectsAndWindows', label: 'New-task proposals', keywords: 'openspec propose task background tab run' },
   // --- Pages drawn in sections.tsx ---
   // Appearance
+  { section: 'appearance', label: 'Search modal layout', keywords: 'search everywhere preview horizontal vertical stacked side by side' },
   { section: 'appearance', label: 'Theme', keywords: 'dark light mode colours' },
   { section: 'appearance', label: 'Waiting pane highlight', keywords: 'awaiting attention notification finished ready accent rail tinted header outline harness session' },
   { section: 'appearance', label: 'UI font size', keywords: 'zoom scale text size interface' },
@@ -111,6 +138,8 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'claudeSessions', tab: 'proxy', label: 'Shell panes', keywords: 'proxy scope shell terminal curl npm' },
   { section: 'claudeSessions', tab: 'proxy', label: 'cide’s own Git', keywords: 'proxy scope git push fetch pull' },
   // --- Agents ---
+  { section: 'agents', tab: 'prompts', label: 'Task-start template', keywords: 'task prompt dispatch template plan first message startup' },
+  { section: 'agents', tab: 'prompts', label: 'Cide worker instructions', keywords: 'worker instructions prompt tracker rules system progress comments' },
   // Agents — This project
   { section: 'agents', tab: 'project', label: 'Task tracker & milestones', keywords: 'board tasks milestones openspec config.json tracker' },
   { section: 'agents', tab: 'project', label: 'Allow agents to open harness tabs', keywords: 'session ad hoc new tab harness parallel agentSessions config.json' },

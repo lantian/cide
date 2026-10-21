@@ -18406,3 +18406,426 @@ sizes and takes the median of seven paired measurements, keeping the original 8�
 16× time bound and fast-input allowance. A deliberate quadratic array-splice control still
 fails that bound (59.4× at the 8× step). All 245 Markdown checks pass in isolation and in the final
 serial CI run: `target/ci-checks/run-ccFcmso6` reports 139 passed, 0 failed.
+
+
+## M183 — Project-scoped decision assistance for Codex and OpenCode
+
+An experimental, default-off project setting enables six scenarios: repeated-failure
+intervention, retrieved-context ranking, research routing, verification selection,
+bounded completion follow-ups, and permitted model/effort routing. Each has Off,
+Observe and Automatic modes and a probability threshold. Ollama connection settings
+and named profiles are shared; project enablement and profile permission are local.
+The typed System One client rejects malformed distributions, bounds state and response
+sizes, limits concurrent/queued requests, times out and opens a temporary circuit after
+repeated errors. Unavailable inference leaves the harness running normally.
+
+Codex uses the authenticated owned app-server connection for turn-boundary model
+selection and native steering. An invalid routed model retries the original request.
+OpenCode 2 receives a bundled local plugin using native prompt, tool, context and
+execution events. Manual interruption, input/permission waits, new work and changed
+configuration invalidate pending decisions. Completion needs an outstanding check or
+plan item and has a two-turn ceiling. Suggested commands use ordinary harness tools
+and permissions. The project-scoped `cide_context` tool routes actual retrieval and
+ranks candidates without rewriting native conversation history. An index for another
+checkout is not used for a worktree. Existing live processes are not restarted.
+
+Experimental: Decision Insights opens from the palette or settings. It shows six
+scenario cards, virtualized history, named probabilities, bounded input state, delivery,
+subsequent observed outcomes and helpfulness feedback. A per-window in-memory journal
+retains at most 10,000 records or 64 MiB; aggregate counts survive eviction. Closing
+the window drops the journal, and no analytics are persisted. Comparison keeps projects,
+harnesses, A/B groups and configuration periods separate, displays unknown usage as
+unknown, and identifies passive sessions' partial event coverage. It reports observed
+totals without claiming causal savings. Native usage has one source and deduplicates
+events; active time excludes permission waits.
+
+Validation: core policy/history tests, 157 app regression tests (one unrelated ignored
+test), 478 agent tests, 890 core tests and 721 IPC tests pass; the new policy cases also
+pass after the final changes. The mounted settings/dialog and bundled-plugin checks,
+related UI checks, TypeScript, production UI build, formatting, scoped strict Clippy,
+code generation and command/event contract checks pass. Generated TypeScript retains
+the generator's existing whitespace convention. No real d1 inference or live Tauri
+window was exercised, and the running IDE was not restarted. Setup and operational
+limits are in `docs/decision-assistance.md`. This was a scoped validation run, not a
+new full shared CI run. The Cide debug binary was rebuilt successfully.
+
+Connection-test follow-up (2026-10-20): the user's local Ollama 0.40.5 and installed d1
+answered a cold request in 20.37 seconds and the identical warm request in 13 ms. The
+test had incorrectly shared the two-second runtime deadline. It now allows 120 seconds
+overall for loading and a second request measured against the unchanged runtime budget.
+The result distinguishes initial and warm latency, warns when warm inference is too slow,
+and keeps connection failures and response-body timeouts distinguishable. No settings
+are changed by the test, and no models are downloaded.
+
+Six focused Rust tests pass, including delayed loading, a slow warm response, invalid
+typed answers and a stalled response body. The explicitly enabled real-d1 audit invokes
+the same Rust handler and passes: initial request 1956 ms, warm probe 9 ms, runtime budget
+2000 ms. Mounted UI tests verify progress, stale-error clearing and no settings writes;
+settings-copy, TypeScript, UI build and strict app Clippy pass. A live Tauri dialog was
+not driven, and the running IDE was not restarted.
+
+User-turn routing follow-up (2026-10-20): the `todo1` experiment was enabled and its
+Codex process was connected through the owned app-server, but a one-file HTML task
+had no permitted model profiles, discoverable verification commands or `cide_context`
+calls. Research routing depended on that optional tool, so an ordinary successful
+coding task could make no decision requests at all.
+
+Research now evaluates each new native user turn in Codex and OpenCode, including
+projects with no profiles or checks. A `none` choice records an unchanged decision.
+Other choices add a bounded advisory research step to the Codex input or OpenCode
+system context, with native acknowledgement and the existing mode, threshold,
+generation, permission and A/B checks. Original Codex input items and attachments
+are retained; a rejected model override retries with the same research context and
+acknowledges it only when the retry is accepted. No-op/Observe/error responses add
+no advice. Each inference retains its configured timeout; research and optional
+model selection run sequentially at the turn boundary.
+
+Insights cards now explain scenario triggers instead of implying every scenario
+runs on every task. The setup documentation explains zero counts for missing checks,
+profiles, outstanding obligations or retrieved context.
+
+Validation: nine focused Rust transport/bridge tests pass, including the no-research
+choice and preservation of Codex input/policy. The mounted UI and plugin checks pass,
+including first-request research without profiles, stale advice and no-op responses.
+TypeScript, UI production build, settings-copy, UI kit/scale and strict app Clippy
+pass. The installed Codex 0.162.1 schema confirms the additional text input format.
+The explicitly enabled local Ollama d1 audit answered the one-page todo research
+question with `none` in 10 ms after warming (probe 9 ms). This validates the real
+System One question and transport, not a live Tauri end-to-end turn. The Cide debug
+binary was rebuilt successfully. The running IDE and the user's test session were
+not restarted.
+
+Insights layout follow-up (2026-10-20): the details scrollport allowed its flex children
+to shrink, collapsing the key/value summary into a clipped strip. Its children now
+retain their content height, long summary values wrap, and paragraph spacing follows
+the panel's gap. History buttons grow with wrapped labels and keep the status badge
+from shrinking. Selected records use the kit's selection surface instead of a primary
+action fill, keeping status text readable.
+
+Validation: an isolated Chromium fixture mounted the actual Insights component with
+mocked decision records in dark/light themes, UI sizes 11/13/17 and widths 850/1000.
+All 12 layouts retained the full summary, avoided horizontal overflow and clipped row
+labels, and allowed scrolling to the disclosure and feedback controls. Dark/light
+screenshots were inspected. Existing Decision checks, TypeScript and kit, scale, motion,
+theme, icon and menu checks pass. This is browser layout validation, not a live Tauri
+interaction; no backend behavior changed.
+
+Context integration follow-up (2026-10-20): the `todo1` transcript confirms that
+`cide_context(localStorage)` really returned two file matches while Insights gained
+neither context records nor a tool-level research record. The MCP bridge and native
+console had the same Cide session identity. A confidence threshold cannot explain
+this: completed evaluations are recorded even below threshold.
+
+The Codex decision observer was consuming helper-thread traffic before the native
+protocol's conversation filter. Ephemeral starts/unsubscribes could stop its tracker,
+and helper turns, approvals or completion could overwrite the main turn's state.
+Decision input and output now share the protocol's selected-thread ownership check,
+including while the main turn is busy. Only real conversation switches invalidate
+the session. Permission waiting ends at the last matching human reply or native
+server-side resolution; unrelated replies cannot reopen it. Native tool execution
+requests still block peer delivery but do not themselves block context inference.
+Delayed baseline permission status cannot re-latch an owned adapter after its native
+reply has resumed it. Exit/pause cancellation remains effective.
+
+`cide_context.note` now explains routing/ranking fallbacks and admission failures,
+including stopped/waiting sessions, an unavailable adapter, an occupied slot, disabled
+mode, service cooldown, timeout, Observe and below-threshold results. Empty retrieval
+skips ranking without sending an empty question set. These diagnostics do not create
+fictional model calls or decision records.
+
+Validation covers interleaved main/helper lifecycles, unrelated connections, native
+tool execution, multiple pending questions, server-side resolution, delayed permission
+status and inference admission reasons. The installed-Codex audit uses isolated state
+and a local fake provider without model quota. This reproduces the adapter defects,
+not the exact transient tracker state inside the user's already-running Tauri process;
+the live `todo1` counter still needs a repeat after loading the rebuilt backend.
+
+The final focused run passed 38 Rust tests; the broader app integration run passed
+167. The isolated native audit, strict Clippy, contract/codegen checks, Decision UI
+and plugin checks, terminal state checks, settings/commands/keys/theme/scale checks,
+TypeScript and UI production build passed. The Cide debug binary was rebuilt.
+The running IDE and the user's conversation were not restarted.
+
+#### Repeated-failure gate and verification deduplication
+
+The reported `todo1` distribution was inspect 38%, change approach 32%, keep 30%.
+The old single-choice threshold rejected inspect even at the project's 50% setting.
+Repeated failures now gates the combined inspect/change probability, then picks the
+more likely advice from those two choices. It reuses one validated response and
+one history record. A keep/intervene tie does nothing; a tie between intervention
+types prefers inspecting. Rounding drift is normalised. The example passes at 50%
+and remains below the unchanged default 80%. Observe and native delivery guards
+remain separate from that gate. The policy version changes the comparison period.
+
+Insights stores and displays the gate, threshold, conditional response shares and
+original probabilities separately, including after the native acknowledgement
+replaces the delivery reason. Older records retain their ordinary distribution
+view. The setting's information tooltip explains what its threshold now measures.
+
+Verification previously marked a revision evaluated only after a confident automatic
+choice, so below-threshold results retried on unrelated tools. Admission now claims
+one evaluation per observed revision and settings period, including Observe and
+errors. New prompts on unchanged code retain the marker. Busy/full/off admission
+does not consume it; generation checks reject stale work. Exact successful native
+commands count even without a prior Cide suggestion, with a bounded cache cleared
+on edits and invalidated by failed reruns. Checks completed during inference or
+before a delivery acknowledgement are not reintroduced as outstanding work.
+The old screenshot's isolated Verification transport/response error was not
+identified; deduplication does not claim to fix an unknown endpoint failure.
+
+Validation: 18 focused core tests, 169 app integration tests, 28 settings-tool tests
+and the isolated installed-Codex delivery fixture passed. The new HTTP regression
+uses a fake System One endpoint and proves the 38/32/30 gate needs one request.
+Mounted Decision UI/plugin checks cover both policy steps, raw probabilities,
+Observe, rejection and older records. A Chromium fixture exercised 12 dark/light,
+11/13/17-size, 850/1000-width layouts, scrolling through both probability cards and
+feedback; inspected screenshots show no clipping or horizontal overflow. These are
+mocked fixtures, not evidence of effectiveness on a live model workload.
+Strict Clippy, codegen/contract checks, the scoped settings/UI checks, TypeScript
+and the production UI build passed. The editor check needed an unsandboxed rerun
+because its read-only grep subprocess returned EPERM; that rerun passed.
+The Cide debug binary was rebuilt successfully. The running IDE and agent were
+left running; testing the new backend requires restarting Cide and reopening or
+resuming the agent console.
+
+#### P4: required checks reach Completion without a Verification acknowledgement
+
+The user's P4 transcript saved a valid required `npm run check`, edited the HTML
+title, slept separately and ended with verification explicitly pending. Both
+Verification records were below threshold. Completion stayed at zero because the
+tracker only acquired a check obligation from an applied Verification suggestion;
+neither the configured required check nor the prose progress report populated it.
+
+Required checks are now tracked separately from accepted optional suggestions.
+An observed edit in the current user turn arms them from current project settings,
+independently of Verification's mode, probability threshold or endpoint result. Completion
+receives the unfinished commands and a list identifying the required ones. Its
+own mode, probability threshold, stop/wait guards and continuation budget still
+apply. A successful exact command clears its obligation; another edit rearms it,
+removing the setting drops it, and a new read-only turn does not inherit a check
+solely from the previous turn's edit. Completion also checks the generation of its
+state snapshot before admission. The policy version separates comparison periods.
+
+Explicit and discovered commands are merged before building the Verification
+question, so `! npm run check` plus the same package script no longer creates an
+optional duplicate. Settings help and the Completion card describe the obligation
+sources. These obligations remain in memory and do not alter project files.
+
+The P4 regression replays native Codex edit/sleep/message/completion events against
+a fake System One endpoint: a below-threshold Verification result still leads to
+a Completion request containing the required command, and a successful check
+clears it. Core tests also cover Off/Observe Verification, setting removal, later
+edits, read-only turns, waits/stops and the continuation limit.
+
+During integration, the concurrently developed native-plan acknowledgement guard
+matched two absent string IDs and swallowed ordinary numeric Codex responses.
+Requiring an actual pending acknowledgement ID fixes that case; the existing
+native forwarding regression then passed.
+
+Validation so far: 21 core tests, 173 app integration tests, 28 settings-tool tests,
+Decision UI/plugin checks, the scoped settings/UI checks, TypeScript, production UI
+build and codegen/contract checks passed. The editor check again required a
+read-only unsandboxed rerun because its grep subprocess returned EPERM.
+The full application Clippy run reported six warnings-as-errors in the parallel
+native-plan implementation (unused interfaces, manual inspect and nested ifs);
+none were in the Decision changes. Strict core Clippy and the isolated installed-
+Codex delivery fixture also passed. The Cide debug binary rebuilt successfully
+with the parallel native-plan unused-code warnings. The IDE and user agent were
+not restarted; repeating P4 against this backend requires restarting Cide and
+opening or resuming the agent console.
+
+## M184 — Keep main harness questions in their own conversations
+
+Main consoles, ordinary user-opened panes and paired writers no longer receive cide's
+user-request tools. Their injected instructions and task-update schema no longer advertise
+questions, and guessed request calls or extra question arguments on any task tool are refused
+before dispatch. Only a task-update call may enter the legacy question handoff. Delegated runs,
+workers and automatic planner/reviewer tabs retain request access, fixed for the connection's
+lifetime even when somebody types in an automatic tab. Restored automatic/worker identities
+come from pane origins, including detached panes and native continuations.
+
+Automatic and worker tab answers use the saved conversation identity. Native Codex/OpenCode
+submission acknowledgements confirm receipt; terminal delivery and closed-tab continuation
+remain pending until the original transcript records the answer as a user message. Tool results
+and Codex's internal input mirrors do not count. Delivery attempts are checkpointed privately
+in the profile-local request store, with defaults for older profiles; uncertain submissions
+survive restart without blind retries. Definite non-submissions can retry. Existing saved main
+requests remain deliverable, and disabled native resume never starts a fresh conversation with
+an old answer. Manual terminal writes share the composer gate while an answer is pasted.
+
+Verification: the final focused app/core and tools runs passed 291 tests, including the real
+local MCP socket and fake native-forwarding checks; the mounted task-question UI check passed.
+Core and agent libraries passed strict Clippy. Broader
+checks exposed unrelated concurrent native-planning fixture/lint failures and an OpenCode
+HTTP fixture expecting /prompt after its transport began using /agent; these are not claimed
+green. Live human replies through installed model sessions were not exercised.
+
+Use an updated cide build and restart affected harness sessions to refresh cached MCP tools
+and injected instructions; this change does not restart the running IDE or user sessions.
+
+## M185 — Native planning questions in Waiting
+
+Delegated planning workers now route native questions into cide's durable Waiting
+decisions. A native call containing several questions opens one grouped dialog. Choice
+labels and descriptions, multiple selection, and supported custom answers survive the
+round trip. Every question needs an answer; dismissal and failed saves preserve drafts,
+and an in-flight submission cannot be sent twice. Projects with task tracking disabled
+use the same decision system. Main consoles keep their native question behavior.
+
+Claude uses an invocation-local blocking AskUserQuestion hook with an extended deadline,
+updatedInput answers, and completion on its native tool result. The ordered hook applier
+keeps serving other sessions, and the extra hook stops intercepting after planning.
+Codex resolves the original app-server request using its question ids; native turn/item
+identity survives reconnects without confusing reused RPC ids. OpenCode/MiMo use v1
+question replies or v2 question-form replies, excluding provider setup and plan-exit
+forms. Qwen bridges its event tap to guarded Ink dialog input and verifies navigation
+while holding the same input lane as manual typing. Unsupported or clipped dialogs
+report delivery errors with access to the original conversation.
+
+Native answers bypass ordinary chat-message delivery. Claims are persisted before
+submission, native receipts complete delivery, and interrupted/stale calls are retired.
+Only a matching native pending event can reopen a retired call and reuse its saved
+answer; a new worker assignment or conversation cannot receive an old answer.
+Explicit cancellation interrupts the planning operation without approving its plan.
+
+Verification: the Rust workspace suite passed with local socket access and isolated
+temporary state. Focused checks passed 13 request-store tests, 27 native adapter tests,
+and 19 app/controller/forwarding tests (the installed-Codex audit remains ignored).
+Strict workspace Clippy, format/codegen/type checks, all UI checks, frontend build,
+and fork-pin checks passed. The initial shared runner hit sandbox socket, state-directory,
+subprocess and DNS restrictions; those checks passed when rerun with the needed access.
+Live human answers in installed model sessions and desktop renderer behavior were not
+exercised. Restart cide and launch new workers to load the updated integrations.
+
+## M186 — Editable task dispatch prompts
+
+Settings → Agents → Prompts now shows the effective task-start template and cide's
+tracker instructions, with explicit Save and Reset to defaults. These are per-project
+overrides in `.cide/config.json`; role prompts keep their existing editor. Both fields
+save together, drafts survive Settings navigation, and failed or late saves cannot erase
+newer writing. Reset removes the override keys so future shipped defaults still apply.
+
+Role dispatch, task worker tabs and OpenSpec task starts share the configured opening
+template. Task facts and harness-specific tool names expand in one pass, inserted values
+remain literal, and the terminal message stays on one line. Cide's worker instructions
+replace its tracker preamble in each harness while retaining the role's own prompt,
+tool-availability gates and separate runtime instructions. Worker-tab system instructions
+and external-work opening templates remain as before. The new fields are UI-only, like
+reviewer prompts; guessed tool edits are refused before any sibling setting is written.
+
+Verification: 317 focused configuration/harness/tool tests and 258 affected app tests
+passed. The mounted prompt editor check covers defaults, explicit save/reset, draft
+isolation, failure recovery, repeated submission, late replies and Settings search.
+TypeScript, the production UI build, strict Clippy for both affected backend crates,
+codegen/contract checks, existing Settings checks and UI kit/style checks passed.
+Broader checks encountered separate working-tree agent-state failures: the Codex idle
+completion fixture, `check:agents` expectations for the new blocked state, and formatting
+in those edits. Those changes were preserved. No installed-model or desktop visual audit
+was run.
+
+## M187 — Search Everywhere with code previews and pinned result tabs
+
+Replaced the search sidebar and file/symbol/action picker entry points with one modal.
+The search rail button and double Shift open All; the existing file, symbol, action and
+find-in-files shortcuts select their modes. The sidebar stays where it was. Text search
+retains regex, case, whole-word, folder and file-pattern filters; files retain library scope.
+A click or arrow movement previews source in a separate read-only CodeMirror instance;
+Enter or double-click opens the result. File split/mention and action new-session modifiers
+remain available. Previewing does not register an editor caret or navigation-history entry.
+
+Pin results (Ctrl+Enter) transfers the running search into a new bottom tab, including when
+another tab has the same query. Each tab has its own selection, collapse state, scrolling and
+preview divider. Refresh replaces that tab's run; Edit search opens an independent modal.
+Closing a selected tab selects a neighbor, then Log. Hiding the panel or switching projects
+keeps pins; closing the project or process releases them. Pins and result sets are runtime
+state, outside workspace persistence and broadcasts. Actions are never pinned.
+
+Rust owns sessions, query descriptors, generations and cancellation. File and symbol jobs
+rank independent snapshots of the shared indexes; text jobs retain the existing bounded walk
+and page protocol. Polling drains the remaining pages even when the worker has already
+finished. Session and generation checks reject stale responses; pin/cancel ownership transfer
+is serialized. Concurrent-provider testing also exposed and fixed the symbol index's repeat
+call setting its indexing flag permanently after the first walk had completed.
+
+Validation: production UI build; IPC codegen and contract checks; 18 app search tests,
+33 search-crate tests, core command/keymap tests; relevant UI search, picker, keyboard,
+sidebar, tool-window, menu, boundary, theme, icon, scale, kit, selector and demo checks.
+Mounted Chromium audits cover actual modal and bottom-host components with mocked IPC:
+preview-only selection, shortcuts and modifiers, complete pagination, independent/duplicate
+pins, refresh, hide/reopen, stale responses, delayed cancellation/pinning, validation and
+missing-file states, focus trapping/restoration, tab closure and Log selection. Both themes
+at UI sizes 11 and 17 were rendered and inspected, including the stacked narrow layout.
+The project-picker audit also passes through the new Actions mode. Native Tauri display
+behavior and a full shared CI run were not exercised; the Rust workers and browser UI were
+validated separately. Existing generated DTO whitespace elsewhere in the dirty workspace
+still causes the whole-tree `git diff --check` to report warnings; the feature's source diff
+passes its scoped whitespace check.
+
+After the successful search-worker run, an additional `cide-app --lib symbols` check was
+blocked at compilation by concurrent changes in `crates/cide-app/src/lsp.rs`: `pump` is called
+with `controls` but its signature has no such parameter, and its body references the missing
+binding. A retry reported the same errors. That separate work was left untouched; the final
+shared Rust tree therefore cannot be claimed to build at this point.
+
+
+## M188 — Search readability, filename masks and an interactive pinned reader
+
+Removed the Search activity-rail button while retaining all keyboard and command entry
+points. Search results now use the existing themed file icons (including newly vendored
+Godot icons), separate provider bands from file headings, emphasize basenames, and align
+text occurrences after a fixed line-number gutter. Leading indentation is removed only
+from display snippets; UTF-8 highlight and original editor coordinates remain intact.
+PageUp/PageDown navigate a viewport of virtualized results from the query or result list.
+Unavailable previews show a centered explanation decoded from the backend error.
+
+Filename queries containing wildcards use glob matching in Files and All's Files provider:
+slashless masks address basenames, slash-containing masks address relative paths, and **
+spans directories. Plain queries retain fuzzy ranking, and library provenance and caps are
+preserved. Folder completion queries indexed directories, including collapsed ones, with
+bounded results, project-relative/root-qualified labels, keyboard acceptance, and stale
+response protection. Settings → Appearance → Search modal layout persists side-by-side or
+stacked orientation globally; the bottom panel keeps its existing layout. Modal dividers
+resize on the selected axis and retain separate transient proportions.
+
+Pinned source previews now use the normal read-only EditorSurface: selection, copying,
+find, Go to Line, folding, context menus, documentation and code navigation. Embedded
+readers keep real paths for language services but have separate local reveal keys. They
+claim the caret only on interaction, release it when unmounted, and cannot consume a file
+tab's pending reveal. Go to Line stays in the preview; definition navigation opens the
+usual destination. Search marks are independent of selection, and existing reference-counted
+LSP document synchronization protects already-open buffers. The modal preview remains passive.
+
+Validation: production UI build; IPC codegen and contract checks; all search-crate tests
+(34 unit, 24 content-walk and one latency correctness test, idle-machine timing skipped);
+20 app search/settings tests; editor (5,462 checks), outline, keyboard gate, search model,
+sidebar, settings copy, menus, icon, theme, UI scale, motion and UI-kit checks. Mounted
+Chromium audit with mocked IPC covers completion and stale replies, page navigation,
+modal-only layout changes, loaded icons, bottom selection/copy/find/Go to Line/definition,
+read-only enforcement, and caret/reveal isolation, alongside the previous pin/session
+regressions. Light/dark and narrow-window screenshots were inspected. Native Tauri display
+behavior and the full shared CI suite were not exercised.
+
+## M189 — Search group navigation and sticky file context
+
+Left/Right now collapse/expand the selected file or provider heading in the shared search
+result list, including from the modal query. Repeated presses preserve the requested state.
+Clicking a heading selects it and focuses the list so subsequent keyboard navigation keeps
+working. Shift+Left/Right cycle Search Everywhere modes with wraparound from anywhere in the
+modal, including its filters and code preview; the query is preserved and regains focus.
+
+The current text-result file heading stays at the top while scrolling, with the next file
+pushing it away. The virtualizer retains the original heading instead of cloning it, keeping
+clicks, selection and accessibility IDs consistent. File context stops at provider and “show
+more” boundaries. Keyboard reveals reserve space below the heading. Fixed-height rows use a
+single offset reveal because the virtualizer's asynchronous index retries could pull a later
+scroll back to an earlier selection; browser scroll anchoring is disabled for this list too.
+Both modal layouts and pinned bottom tabs use the same behavior.
+
+Validation: TypeScript and production build passed, along with search model, picker, search,
+Problems, keyboard gate (26,400 chords), theme, motion and UI-kit checks. The mounted Chromium
+audit passed group keys, mode cycling from multiple focus targets, canonical sticky headings,
+boundary handover, rapid scrolling, selection visibility and 11/13/17 UI sizes, plus the
+existing modal/pinning and embedded-editor regressions. Modal and pinned screenshots were
+inspected. The global UI-scale check found an existing unrelated `font-size: 0.75rem` in
+`ConversationArchivePane.module.css`; that file was left untouched. Native Tauri display
+behavior was not exercised.

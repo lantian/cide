@@ -54,6 +54,23 @@
   width: calc(880px * var(--ui-scale));
 }
 
+.dialog[data-width='search'] {
+  width: calc(1100px * var(--ui-scale));
+  max-height: calc(100vh - 32px);
+}
+
+.scrim:has(.dialog[data-width='search']) {
+  padding-top: clamp(16px, 5vh, 48px);
+}
+
+.dialog[data-width='search'] .dialogHead {
+  padding: var(--sp-2) var(--sp-4) 0;
+}
+
+.dialog[data-width='search'] .dialogBodyFlush {
+  margin-top: var(--sp-2);
+}
+
 .dialogHead {
   flex: none;
   display: flex;

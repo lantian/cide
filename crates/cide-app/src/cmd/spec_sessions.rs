@@ -449,6 +449,7 @@ fn plan_session(
         checkout.is_some(),
     );
     Ok(DispatchSpec {
+        planning: None,
         project,
         agent,
         agent_label: label,

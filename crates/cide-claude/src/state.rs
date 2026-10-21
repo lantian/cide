@@ -90,6 +90,7 @@ pub fn next_state(current: SessionState, event: HookEvent) -> Option<SessionStat
         // Codex cancels a turn with Interrupt rather than Stop. Its TUI remains alive at the
         // composer, so clear activity without a finished-work attention marker.
         HookEvent::Interrupt => SessionState::Idle,
+        HookEvent::CideTurnFailed => SessionState::AwaitingInput,
 
         // Handled by the caller, which can see the payload: only a permission request means
         // `AwaitingPermission`, and an ordinary notification means nothing about liveness.

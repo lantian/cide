@@ -549,7 +549,7 @@ impl ProjectFs {
     /// [`FsRegistry::claim`] applies to the file index, and for the same reason: re-walking would
     /// clear the matcher the first caller's overlay is reading from.
     pub fn index_symbols(&self) -> cide_ipc::SymbolIndexStatus {
-        if self.symbols_indexing.swap(true, Ordering::AcqRel) || self.symbols_started() {
+        if self.symbols_started() || self.symbols_indexing.swap(true, Ordering::AcqRel) {
             return self.symbol_status();
         }
         // Cleared by a guard, so a panic in the walk cannot leave the flag set for ever — which
@@ -561,6 +561,11 @@ impl ProjectFs {
             }
         }
         let _guard = Guard(&self.symbols_indexing);
+        // Another walk may have finished after our first started check but before the
+        // swap. The guard must still release the flag on this idempotent return.
+        if self.symbols_started() {
+            return self.symbol_status();
+        }
 
         let roots: Vec<cide_lang::WalkRoot> = self
             .roots

@@ -19,6 +19,23 @@
  * Every colour is a token, so both themes work with no second rule in this file.
  */
 
+.dispatchInfo {
+  margin-block: var(--sp-2);
+  overflow-wrap: anywhere;
+}
+
+.dispatchReasons {
+  margin: 0;
+  padding-left: calc(18px * var(--ui-scale));
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.dispatchReasons li > button {
+  margin-left: var(--sp-2);
+}
+
 .panel {
   width: var(--w-sidebar-agents);
   flex: none;

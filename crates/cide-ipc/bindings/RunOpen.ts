@@ -5,10 +5,10 @@ import type { SessionId } from "./SessionId";
 /**
  * What pressing **Open** on a run should do, as `agents_run_open` answers it. (M42)
  *
- * One question to Rust, because the three answers depend on facts only Rust has — whether the
+ * One question to Rust, because the answers depend on facts only Rust has — whether the
  * registry still holds a live child for the run, and whether the harness can re-open the
- * conversation from its directory — and the frontend then builds the pane through the split
- * machinery with the intent this names. **Never a pane built by the command**: the argument
+ * conversation from its directory — and the frontend then builds the pane or archive from
+ * this plan. **Never a pane built by the command**: the argument
  * beside `agent_open_pane` in `cide_app::cmd::agents` is why, and it is unchanged by this.
  */
-export type RunOpen = { "kind": "mirror", session: SessionId, continues: HarnessSession | null, } | { "kind": "continue", conversation: HarnessSession, } | { "kind": "unavailable", reason: string, };
+export type RunOpen = { "kind": "mirror", session: SessionId, continues: HarnessSession | null, } | { "kind": "continue", conversation: HarnessSession, } | { "kind": "readOnly", conversation: HarnessSession, } | { "kind": "unavailable", reason: string, };

@@ -171,6 +171,7 @@ const ALLOWED = [
   { file: 'kit/page/chapters/Overlays.tsx', chars: '↑↓⏎', why: 'The PickerHint specimen: key hints in a picker footer, as the app pickers draw them.' },
   { file: 'overlays/StructurePicker.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
   { file: 'overlays/UsagesPopup.tsx', chars: '↑↓⏎', why: 'Key hints in the footer.' },
+  { file: 'search/SearchEverywhere.tsx', chars: '↑↓', why: 'Navigation keys spelled in the Search Everywhere footer help text.' },
   {
     file: 'demo/transcripts.ts',
     chars: '↓⏺⎿▐▛█▜▌▝▘─✻⏵',

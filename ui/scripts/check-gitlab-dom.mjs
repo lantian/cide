@@ -857,8 +857,8 @@ try {
   await act(async () => showOverlay('commands'))
   assert.equal(document.querySelectorAll('[role="dialog"]').length, 1)
   assert.ok(
-    document.querySelector('[aria-label="Show all commands"]'),
-    'palette remains available when explicitly requested',
+    document.querySelector('[data-audit="searchEverywhere"]'),
+    'command search remains available when explicitly requested',
   )
   await act(async () => showOverlay('gitlabOpen'))
   assert.equal(
@@ -866,7 +866,7 @@ try {
     1,
     'URL dialog replaces the palette',
   )
-  assert.equal(document.querySelector('[aria-label="Show all commands"]'), null)
+  assert.equal(document.querySelector('[data-audit="searchEverywhere"]'), null)
   const urlInput = document.querySelector('#gitlab-mr-url')
   assert.equal(
     document.activeElement,

@@ -141,11 +141,9 @@ const ITEMS: readonly RailItem[] = [
   { id: 'files', icon: 'file-text', label: 'Files' },
   { id: 'git', icon: 'git-branch', label: 'Git' },
   { id: 'gitlab', path: 'M12 22 2 14l2-11 4 8h8l4-8 2 11-10 8ZM2 14h20M8 11l4 11 4-11', label: 'GitLab merge requests' },
-  { id: 'search', icon: 'search', label: 'Search' },
-  { id: 'problems', icon: 'triangle-alert', label: 'Problems' },
   /*
    * M18's two, and they go *before* the bottom-anchored Settings rather than after it:
-   * `SPACER_AT` is a `findIndex` for the first `bottom` item, so inserting ahead of it moves the
+   * The spacer follows the first `bottom` item, so inserting ahead of it moves the
    * spacer's index along with them and keeps it immediately before Settings, which stays pinned
    * to the foot. Appending after Settings instead would have put two buttons below the flexible
    * gap — the kind of change that looks right in the diff and wrong on screen.
@@ -154,7 +152,7 @@ const ITEMS: readonly RailItem[] = [
   { id: 'tasks', icon: 'square-check-big', label: 'Tasks' },
   /*
    * M28's, and it goes here for the reason the comment above gives — before the bottom-anchored
-   * Settings, so `SPACER_AT` moves with it.
+   * Settings, so the spacer moves with it.
    *
    * **Always drawn, even in a project with no `openspec/`.** This array is a module constant
    * precisely so `chrome/layoutAudit.ts` can drive it with fixed props; a rail whose buttons
@@ -177,10 +175,9 @@ const ITEMS: readonly RailItem[] = [
   { id: 'settings', icon: 'settings', label: 'Settings', bottom: true },
 ]
 
-/* The spacer belongs immediately before the first pinned item, wherever the array puts it. */
-const SPACER_AT = ITEMS.findIndex((item) => item.bottom === true)
-
 export interface ActivityRailProps {
+  gitLabConfigured?: boolean
+
   active: ActivityView | null
   /**
    * Changed files across every repository in the project — `null` while none has been counted
@@ -312,6 +309,7 @@ export interface ActivityRailProps {
 
 export function ActivityRail({
   active,
+  gitLabConfigured = false,
   changed,
   errors,
   busy,
@@ -328,14 +326,12 @@ export function ActivityRail({
   /*
    * The builtins, with the contributed buttons spliced in ahead of the spacer.
    *
-   * `SPACER_AT` is a `findIndex` over `ITEMS`, so the splice has to happen before the index is
-   * used or the gap lands in the middle of the extension buttons. Recomputed rather than
-   * adjusted, which is one line and cannot be off by one.
+   * Filter unavailable integrations before inserting contributed panels and measuring the
+   * overflow. The spacer belongs immediately before the first pinned item in that final list.
    */
-  const items: readonly RailItem[] =
-    extra === undefined || extra.length === 0
-      ? ITEMS
-      : [...ITEMS.slice(0, SPACER_AT), ...extra, ...ITEMS.slice(SPACER_AT)]
+  const builtins = ITEMS.filter(item => item.id !== 'gitlab' || gitLabConfigured)
+  const insertAt = builtins.findIndex(item => item.bottom === true)
+  const items: readonly RailItem[] = [...builtins.slice(0, insertAt), ...(extra ?? []), ...builtins.slice(insertAt)]
   const spacerAt = items.findIndex((item) => item.bottom === true)
 
   /*

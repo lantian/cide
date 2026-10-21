@@ -115,7 +115,10 @@ pub use fs::{
 pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section
 // comment in `search.rs` for why they are not the picker's.
-pub use search::{SearchFrame, SearchHit, SearchMode, SearchProblem, SearchQuery};
+pub use search::{
+    SearchDescriptor, SearchFrame, SearchHit, SearchMode, SearchProblem, SearchQuery,
+    SearchSession, SearchSessionFrame, SearchSource,
+};
 
 // --- M12: language support ---
 //
@@ -146,10 +149,13 @@ pub use symbols::{
 // share is the cross-link, and it is one id each way (`AgentRun::task`, `Task::agent`), carried
 // as an id precisely so `cide-agents` never has to hold a `Task`.
 pub mod agents;
+pub mod task_dispatch;
 pub mod tasks;
+pub use task_dispatch::{TaskDispatchReason, TaskDispatchState, TaskDispatchStatus};
 pub mod user_requests;
 pub use user_requests::{
-    UserRequest, UserRequestKind, UserRequestResponse, UserRequestTask, UserRequestsView,
+    NativeQuestionSource, UserRequest, UserRequestAnswer, UserRequestKind, UserRequestQuestion,
+    UserRequestResponse, UserRequestTask, UserRequestsView,
 };
 
 pub use agents::{
@@ -1165,3 +1171,6 @@ pub use peer_chat::{
     PeerChat, PeerChatReceipt, PeerChatReviewState, PeerChatReviewStatus, PeerChatReviews,
     PeerChatSelection,
 };
+
+pub mod decision;
+pub use decision::*;

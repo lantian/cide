@@ -559,17 +559,12 @@ try {
    */
   const app = read('src/App.tsx')
   ok(
-    /<ProblemsPanel[\s\S]{0,400}snapshot=\{/.test(app),
-    'App.tsx passes a live snapshot to ProblemsPanel rather than letting it default to NO_SOURCE',
+    /<ToolWindowHost[\s\S]{0,400}snapshot: diagnostics.snapshot/.test(app),
+    'App.tsx passes live diagnostics to the bottom Problems tab',
   )
-  // The derivation is a single `useMemo` (`diagCounts`) so the rail's badge gets one identity
-  // per snapshot rather than a fresh object on every render of the shell. Its second consumer,
-  // the status bar, is gone (M28) — hence a pin on the rail's prop rather than on the bar's.
   ok(
-    /const diagCounts = useMemo\(\(\) => statusBarCounts\(diagnostics\.snapshot\)/.test(app) &&
-      /errors=\{diagCounts\?\.errors \?\? null\}/.test(app),
-    'and derives the rail’s badge from that same snapshot, so the panel and the badge cannot '
-      + 'disagree about whether the workspace is clean',
+    /<DiagnosticsStatus[^>]*snapshot=\{diagnostics.snapshot\}/.test(app),
+    'the status control receives the same diagnostics as the bottom panel',
   )
   ok(
     !app.includes('diagnostics={diagCounts}'),
@@ -749,13 +744,13 @@ try {
    * sat fully built and callable with no caller anywhere in the app from M12 to M18.
    */
   ok(
-    /<ProblemsPanel[\s\S]{0,900}onRefresh=\{/.test(app),
+    /<ToolWindowHost[\s\S]{0,500}onRefresh:/.test(app),
     'App.tsx wires the Re-run control, so the button is not merely renderable',
   )
   ok(
     // The window is wider than `onRefresh`'s above because the routing comments sit between
     // the two props since the handlers moved into pinned `useCallback`s.
-    /<ProblemsPanel[\s\S]{0,1600}onRestartSource=\{/.test(app),
+    read('src/chrome/DiagnosticsStatus.tsx').includes('languageServers.control(project, source, action)'),
     'and the per-source Restart, which is the first caller `diagnostics.restart` has ever had',
   )
   {

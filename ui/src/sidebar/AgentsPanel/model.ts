@@ -131,7 +131,7 @@ export function scopeBadge(scope: string): string | null {
  * Where one run is — the tag of `RunState`, flattened.
  *
  * `RunState` is a tagged union whose payloads (`sinceUnixMs`, `code`, `reason`) belong to three
- * of its nine arms. The panel groups, glyphs and tones by the **tag** in every one of those
+ * of its arms. The panel groups, glyphs and tones by the **tag** in every one of those
  * places, so the tag is lifted out into its own type and the payloads are carried beside it on
  * [`RunView`]. A row that had to `switch` on the union to find out which section it belongs in
  * would be several `switch`es that can disagree.
@@ -149,28 +149,32 @@ export type RunPhase =
   | 'queued'
   | 'starting'
   | 'running'
+  | 'blocked'
   | 'idle'
   | 'awaitingPermission'
   | 'paused'
   | 'interrupted'
   | 'finished'
   | 'failed'
+  | 'cancelled'
 
-/** The nine phases, in `RunState`'s declaration order. */
+/** The phases, in `RunState`'s declaration order. */
 export const RUN_PHASES: readonly RunPhase[] = [
   'queued',
   'starting',
   'running',
+  'blocked',
   'idle',
   'awaitingPermission',
   'paused',
   'interrupted',
   'finished',
   'failed',
+  'cancelled',
 ]
 
 /**
- * Is this one of the nine phases?
+ * Is this one of the known phases?
  *
  * Takes `string` rather than `RunPhase` on purpose, for [`isSeverity`'s reason one panel over]:
  * every caller has a value *annotated* `RunPhase` by a wire type, and the whole point of the
@@ -189,7 +193,7 @@ export function isRunPhase(value: string): value is RunPhase {
 /**
  * Colour roles a phase can take. Each maps to one token in `AgentsPanel.module.css`.
  *
- * Six names for nine phases. `starting` and `running` share `busy`, because "the child is
+ * Six names for the phases. `starting` and `running` share `busy`, because "the child is
  * coming up" and "a turn is in flight" are the same thing to look at and differ only in the
  * glyph. `queued` and `idle` share `idle`: both are runs that are quiet, and the row's glyph
  * and label are what separate "has not started" from "has stopped for now, and is still there".
@@ -230,6 +234,7 @@ const PHASE_GLYPH: Record<RunPhase, string> = {
   // has to *actually* turn for that to be true, and for a long time it did not — see
   // [`SPINNING_GLYPH`].
   running: 'loader-circle',
+  blocked: 'circle-alert',
   // A ringed dot rather than a hollow or a filled one: the child is *there* (the centre) but is
   // not turning (the ring). It has to be readable against both `queued`'s empty circle and
   // `running`'s spinner, because those are the two states a glance at an idle row could
@@ -243,24 +248,28 @@ const PHASE_GLYPH: Record<RunPhase, string> = {
   interrupted: 'circle-minus',
   finished: 'circle-check',
   failed: 'circle-x',
+  cancelled: 'circle-minus',
 }
 
 const PHASE_LABEL: Record<RunPhase, string> = {
   queued: 'Queued',
   starting: 'Starting',
   running: 'Running',
+  blocked: 'Blocked',
   idle: 'Idle',
   awaitingPermission: 'Awaiting permission',
   paused: 'Paused',
   interrupted: 'Interrupted',
   finished: 'Finished',
   failed: 'Failed',
+  cancelled: 'Cancelled',
 }
 
 const PHASE_TONE: Record<RunPhase, Tone> = {
   queued: 'idle',
   starting: 'busy',
   running: 'busy',
+  blocked: 'error',
   idle: 'idle',
   awaitingPermission: 'attention',
   paused: 'paused',
@@ -270,6 +279,7 @@ const PHASE_TONE: Record<RunPhase, Tone> = {
   interrupted: 'paused',
   finished: 'done',
   failed: 'error',
+  cancelled: 'paused',
 }
 
 /*
@@ -438,7 +448,7 @@ export function holdsSlot(phase: string): boolean {
 }
 
 /**
- * Has this run stopped for good? The two phases the Recent section collects.
+ * Has this run stopped for good? These are the phases the Recent section collects.
  *
  * `idle` is **not** one of them, and the negation is where it matters: `RunRow` derives its Stop
  * control as `!isDonePhase(phase)`, so an idle run keeps its Stop button — which is the gesture
@@ -446,7 +456,7 @@ export function holdsSlot(phase: string): boolean {
  * no way to wind down the child that was still there.
  */
 export function isDonePhase(phase: string): boolean {
-  return phase === 'finished' || phase === 'failed'
+  return phase === 'finished' || phase === 'failed' || phase === 'cancelled'
 }
 
 /* ------------------------------------------------------------------------------ the views */
@@ -1149,6 +1159,7 @@ export interface RunRow {
  */
 export const ACTIVE_PHASES: readonly RunPhase[] = [
   'awaitingPermission',
+  'blocked',
   'running',
   'starting',
   'paused',
@@ -1657,9 +1668,9 @@ export function timeTitle(nowMs: number, run: RunView, phrase: string): string {
   return parts.join(' · ')
 }
 
-/** Whether this phase is one a run never leaves — the two the tooltip treats differently. */
+/** Whether this phase is one a run never leaves. */
 function isOver(phase: RunPhase): boolean {
-  return phase === 'finished' || phase === 'failed'
+  return phase === 'finished' || phase === 'failed' || phase === 'cancelled'
 }
 
 /**

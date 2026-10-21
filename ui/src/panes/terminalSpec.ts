@@ -1,5 +1,5 @@
 /** Pure launch decisions, shared by terminal mounting and restoration checks. */
-import type { DockerStream, HarnessSession, Pane, PaneRestore } from '@/ipc/client'
+import type { ConsoleHarness, DockerStream, HarnessSession, Pane, PaneRestore } from '@/ipc/client'
 
 export interface TerminalSpec {
   program: string
@@ -7,6 +7,8 @@ export interface TerminalSpec {
   cwd: string
   /** Decides which IDE server this child is told about. See `session.spawn`. */
   project?: string | undefined
+  /** This pane's explicit choice for a fresh console spawn; absent follows the project default. */
+  harness?: ConsoleHarness | undefined
   /**
    * This pane is continuing session X.
    *
@@ -78,7 +80,7 @@ export function specFor(
   recovery?: 'picker' | 'fresh' | undefined,
 ): TerminalSpec | null {
   if (pane.codexCleared && pane.kind === 'claude') {
-    return { program: 'codex', args: [], cwd, project }
+    return { program: 'codex', args: [], cwd, project, harness: pane.harnessChoice }
   }
   /*
    * A pane opened onto an agent run's conversation re-opens **that** conversation, whatever
@@ -93,8 +95,8 @@ export function specFor(
    */
   if (restore?.restore.kind === 'missingConversation') {
     return pane.harness === 'opencode'
-      ? { program: 'claude', args: [], cwd, project }
-      : { program: 'codex', args: [], cwd, project, resumePicker: recovery !== 'fresh' }
+      ? { program: 'claude', args: [], cwd, project, harness: pane.harnessChoice }
+      : { program: 'codex', args: [], cwd, project, harness: pane.harnessChoice, resumePicker: recovery !== 'fresh' }
   }
   const continues = pane.continues == null ? undefined : (
     restore?.restore.kind === 'resumable' && pane.continues.harness === 'codex'
@@ -110,7 +112,7 @@ export function specFor(
   switch (pane.kind) {
     case 'claude': {
       const resume = restore?.restore.kind === 'resumable' ? restore.restore.session : undefined
-      return { program: 'claude', args: [], cwd, project, resume }
+      return { program: 'claude', args: [], cwd, project, resume, harness: pane.harnessChoice }
     }
     case 'shell': {
       const prior = restore !== undefined ? (pane.session ?? undefined) : undefined
@@ -137,13 +139,14 @@ export function specFor(
 }
 
 
-/** Fresh console restarts resolve the current project default; resume resolves its saved owner. */
-export function restartSpec(spec: TerminalSpec, kind: Pane['kind'], mode: 'fresh' | 'resume', session: string | undefined): TerminalSpec {
+/** Fresh console restarts use a pane choice if present, otherwise the project default. */
+export function restartSpec(spec: TerminalSpec, kind: Pane['kind'], mode: 'fresh' | 'resume', session: string | undefined, choice?: ConsoleHarness): TerminalSpec {
   const console = kind === 'claude'
   return {
     ...spec,
     program: console && mode === 'fresh' ? 'claude' : spec.program,
     args: console && mode === 'fresh' ? [] : spec.args,
+    harness: console && mode === 'fresh' ? choice : undefined,
     continues: console ? undefined : spec.continues,
     resume: mode === 'resume' ? session : undefined,
     resumePicker: false,

@@ -19,6 +19,31 @@ pub(crate) const STATUS_TOOL: &str = "cide_peer_chat_status";
 mod reviews;
 pub(crate) use reviews::{quiet_writer, refresh_reviews, review_snapshot, status};
 
+/// Native dialog navigation shares the input lane with desktop and remote typing.
+pub(crate) fn native_input<T>(
+    app: &AppHandle,
+    session: SessionId,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let runtime = app.state::<Runtime>();
+    let lane = runtime.lane(session);
+    {
+        let mut held = lane.lock();
+        if held.writing {
+            return Err("Another operation is using this terminal. Open the original conversation to finish answering.".into());
+        }
+        held.writing = true;
+    }
+    struct Release<'a>(&'a Mutex<Lane>);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.lock().writing = false;
+        }
+    }
+    let _release = Release(&lane);
+    work()
+}
+
 /// A mobile prompt is one transaction with the same gate as desktop keystrokes.
 pub(crate) fn submit_mobile(
     app: &AppHandle,
@@ -127,8 +152,20 @@ impl Runtime {
     pub fn note_console(&self, id: SessionId, console: Arc<crate::opencode_console::Console>) {
         self.consoles.insert(id, console);
     }
+    pub(crate) fn worker_console(
+        &self,
+        id: SessionId,
+    ) -> Option<Arc<crate::opencode_console::Console>> {
+        self.consoles.get(&id).map(|console| console.clone())
+    }
     pub fn note_codex_console(&self, id: SessionId, console: Arc<crate::codex_console::Console>) {
         self.codex_consoles.insert(id, console);
+    }
+    pub(crate) fn codex_console(
+        &self,
+        id: SessionId,
+    ) -> Option<Arc<crate::codex_console::Console>> {
+        self.codex_consoles.get(&id).map(|console| console.clone())
     }
     fn lane(&self, id: SessionId) -> Arc<Mutex<Lane>> {
         self.lanes.entry(id).or_default().clone()
@@ -224,7 +261,7 @@ impl Runtime {
         let lane = self.lane(session);
         let guard = lane.lock();
         if guard.writing {
-            return Err("A peer message is being delivered; input is briefly suspended. Please type again when delivery finishes.".into());
+            return Err("A message is being delivered; input is briefly suspended. Please type again when delivery finishes.".into());
         }
         if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
             hooks.note_codex_input(session, &data, pty);

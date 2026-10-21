@@ -322,7 +322,7 @@ try {
   ok(/'drawingFocused',/.test(context), 'drawingFocused is a derived flag')
   ok(/drawingKindFor\(focusedPath\)/.test(context) && /focusedTabPath\(boot\)/.test(context),
     'derived by name from the same function the handlers use')
-  ok(/editorFocused: kind === 'editor' && !drawing,/.test(context) && /drawingFocused: drawing,/.test(context),
+  ok(/editorFocused: embeddedEditor \|\| \(kind === 'editor' && !drawing\),/.test(context) && /drawingFocused: drawing,/.test(context),
     'and editorFocused excludes it, or Ctrl+G and Ctrl+= are swallowed by editor commands')
   const commands = source('../crates/cide-core/src/commands.rs')
   ok(/"drawingFocused",/.test(commands.slice(commands.indexOf('pub const CONTEXT_FLAGS'))),

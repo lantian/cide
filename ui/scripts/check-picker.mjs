@@ -838,8 +838,8 @@ try {
       'makes unrepresentable',
   )
   ok(
-    /toggleLibraries\(\)/.test(dispatch),
-    'and it flips the flag rather than opening something',
+    /libraries: !draft\.descriptor\.libraries/.test(dispatch),
+    'and it toggles the active project search draft library scope',
   )
 
   /*

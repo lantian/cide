@@ -3,6 +3,195 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 const THREAD: &str = "00000000-0000-4000-8000-000000000001";
 
+#[derive(Default)]
+struct DecisionReplay {
+    protocol: Protocol,
+    tracker: cide_core::decision::Tracker,
+    metrics: cide_ipc::DecisionMetrics,
+}
+impl DecisionReplay {
+    fn terminal(&mut self, mut frame: Value) -> Option<String> {
+        let selects = protocol::apply_policy(&mut frame, &json!({}));
+        let event = decision_input(&self.protocol, true, selects, &frame);
+        let kind = event.as_ref().map(|event| event.kind.clone());
+        if let Some(event) = event {
+            self.tracker.event(event, &mut self.metrics, 1000);
+        }
+        self.protocol.from_terminal(&frame);
+        kind
+    }
+    fn server(&mut self, frame: Value) -> Option<String> {
+        let event = decision_output(&self.protocol, &frame);
+        let kind = event.as_ref().map(|event| event.kind.clone());
+        if let Some(event) = event {
+            self.tracker.event(event, &mut self.metrics, 1000);
+        }
+        self.protocol.from_server(&frame);
+        kind
+    }
+    fn running() -> Self {
+        let mut replay = Self::default();
+        replay.terminal(json!({"method":"initialized"}));
+        replay.terminal(json!({"id":1,"method":"thread/start","params":{}}));
+        replay.server(json!({"id":1,"result":{"thread":{"id":THREAD,"status":{"type":"idle"}}}}));
+        assert_eq!(
+            replay.terminal(json!({"id":2,"method":"turn/start","params":{"threadId":THREAD,"input":[{"type":"text","text":"Find localStorage with cide_context"}]}})),
+            Some("prompt".into())
+        );
+        replay.server(json!({"id":2,"result":{"turn":{"id":"main","status":"inProgress"}}}));
+        replay.server(
+            json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"main"}}}),
+        );
+        replay
+    }
+}
+
+#[test]
+fn native_plan_hands_back_only_after_the_implementation_turn() {
+    let mut protocol = DecisionReplay::running().protocol;
+    let mut plan = cide_agents::native_plan::Codex::default();
+    let mut input = json!({"method":"turn/start","params":{"threadId":THREAD,"input":[{"type":"text","text":"Fix the bug"}]}});
+    assert!(plan.prepare(&mut input, "chosen"));
+    plan.observe(
+        &json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"main"}}}),
+        "accept",
+    );
+    plan.observe(&json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":"main","item":{"type":"plan","text":"Fix and verify"}}}), "accept");
+    let done = json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"main","status":"completed"}}});
+    let acceptance = plan.observe(&done, "accept").unwrap();
+    // These hooks may be consumed after the next turn has already acknowledged.
+    let planning_hooks = native_plan_hooks(&mut protocol, &done, true);
+    protocol.from_terminal(&acceptance);
+    protocol.from_server(
+        &json!({"id":"accept","result":{"turn":{"id":"implementation","status":"inProgress"}}}),
+    );
+    protocol.from_server(&json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"implementation"}}}));
+    assert!(planning_hooks.iter().all(|hook| hook.kind != "Stop"));
+    let hooks = native_plan_hooks(
+        &mut protocol,
+        &json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"implementation","status":"completed"}}}),
+        false,
+    );
+    assert_eq!(hooks.iter().filter(|hook| hook.kind == "Stop").count(), 1);
+}
+
+#[test]
+fn decision_helpers_cannot_disable_context_or_overwrite_the_running_turn() {
+    let mut replay = DecisionReplay::running();
+    let generation = replay.tracker.generation;
+    let helper = "00000000-0000-4000-8000-000000000002";
+    assert!(replay.protocol.receiver().is_none(), "main turn is busy");
+    assert_eq!(
+        replay.terminal(json!({"id":3,"method":"thread/start","params":{"ephemeral":true}})),
+        None
+    );
+    replay.server(json!({"id":3,"result":{"thread":{"id":helper,"status":{"type":"idle"}}}}));
+    for method in [
+        "turn/start",
+        "turn/steer",
+        "turn/interrupt",
+        "thread/unsubscribe",
+    ] {
+        assert_eq!(replay.terminal(json!({"id":4,"method":method,"params":{"threadId":helper,"input":[{"type":"text","text":"Generate a title"}]}})), None);
+    }
+    for frame in [
+        json!({"method":"turn/started","params":{"threadId":helper,"turn":{"id":"helper"}}}),
+        json!({"method":"turn/completed","params":{"threadId":helper,"turn":{"id":"helper","status":"failed"}}}),
+        json!({"id":55,"method":"item/tool/requestUserInput","params":{"threadId":helper}}),
+        json!({"method":"thread/tokenUsage/updated","params":{"threadId":helper,"tokenUsage":{"total":{"inputTokens":999}}}}),
+        json!({"method":"turn/plan/updated","params":{"threadId":helper,"plan":[{"step":"helper","status":"pending"}]}}),
+    ] {
+        assert_eq!(replay.server(frame), None);
+    }
+    assert_eq!(replay.tracker.prompt, "Find localStorage with cide_context");
+    assert_eq!(replay.tracker.generation, generation);
+    assert_eq!(replay.metrics.turns, 1);
+    assert_eq!(replay.metrics.input_tokens, None);
+    assert!(replay.tracker.obligations.is_empty());
+    assert!(replay.tracker.active && !replay.tracker.stopped && !replay.tracker.waiting);
+    assert_eq!(replay.server(json!({"method":"item/completed","params":{"threadId":THREAD,"item":{"id":"context","type":"mcpToolCall","server":"cide","tool":"cide_context","status":"completed"}}})), Some("tool".into()));
+    assert_eq!(replay.metrics.tools, 1);
+    assert_eq!(
+        replay.terminal(json!({"id":6,"method":"turn/interrupt","params":{"threadId":THREAD}})),
+        Some("stop".into())
+    );
+    assert!(replay.tracker.stopped);
+    assert_eq!(
+        replay.terminal(json!({"id":7,"method":"thread/resume","params":{"threadId":helper}})),
+        Some("stop".into())
+    );
+}
+
+#[test]
+fn decision_waits_for_the_last_native_question_and_ignores_other_connections() {
+    let mut replay = DecisionReplay::running();
+    assert_eq!(replay.server(json!({"id":50,"method":"item/tool/call","params":{"threadId":THREAD,"tool":"cide_context"}})), None);
+    assert!(
+        !replay.tracker.waiting,
+        "context must be callable from a running tool"
+    );
+    for id in [51, 52] {
+        assert_eq!(replay.server(json!({"id":id,"method":"item/permissions/requestApproval","params":{"threadId":THREAD}})), Some("waiting".into()));
+    }
+    assert_eq!(replay.terminal(json!({"id":99,"result":{}})), None);
+    assert_eq!(replay.terminal(json!({"id":51,"result":{}})), None);
+    assert!(replay.tracker.waiting);
+    assert_eq!(
+        replay.server(
+            json!({"method":"serverRequest/resolved","params":{"threadId":THREAD,"requestId":52}})
+        ),
+        Some("resumed".into())
+    );
+    assert!(!replay.tracker.waiting);
+    assert!(
+        replay.protocol.receiver().is_none(),
+        "tool execution still blocks peer delivery"
+    );
+    assert_eq!(replay.terminal(json!({"id":50,"result":{}})), None);
+    replay.server(
+        json!({"id":53,"method":"item/tool/requestUserInput","params":{"threadId":THREAD}}),
+    );
+    assert_eq!(
+        replay.terminal(json!({"id":53,"result":{}})),
+        Some("resumed".into())
+    );
+    assert!(!replay.tracker.waiting);
+    let prompt = json!({"id":9,"method":"turn/start","params":{"threadId":THREAD,"input":[{"type":"text","text":"Other connection"}]}});
+    assert!(decision_input(&replay.protocol, false, false, &prompt).is_none());
+    assert!(decision_input(&Protocol::default(), true, false, &prompt).is_none());
+}
+
+#[test]
+fn decision_research_preserves_user_input_attachments_and_native_policy() {
+    let mut frame = json!({
+        "id": 42, "method": "turn/start",
+        "params": {
+            "threadId": THREAD,
+            "input": [
+                {"type": "text", "text": "Fix Привет", "text_elements": []},
+                {"type": "localImage", "path": "/tmp/reference.png"}
+            ],
+            "model": "pinned-model", "effort": "high", "approvalPolicy": "on-request"
+        }
+    });
+    let original = frame.clone();
+    assert!(append_research(&mut frame, "Inspect diagnostics"));
+    assert_eq!(
+        &frame["params"]["input"].as_array().unwrap()[..2],
+        original["params"]["input"].as_array().unwrap()
+    );
+    assert!(
+        frame["params"]["input"][2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Inspect diagnostics")
+    );
+    frame["params"]["input"].as_array_mut().unwrap().pop();
+    assert_eq!(frame, original);
+    let mut missing_input = json!({"method":"turn/start","params":{}});
+    assert!(!append_research(&mut missing_input, "Inspect diagnostics"));
+}
+
 fn read_json(socket: &mut tungstenite::WebSocket<TcpStream>) -> Value {
     loop {
         if let Message::Text(text) = socket.read().unwrap() {
@@ -14,6 +203,67 @@ fn send_json(socket: &mut tungstenite::WebSocket<TcpStream>, frame: Value) {
     socket
         .send(Message::Text(frame.to_string().into()))
         .unwrap();
+}
+
+#[test]
+fn forwarding_keeps_large_resume_frames_in_both_directions() {
+    // Codex sends resumed thread data as a single frame. This is just over
+    // tungstenite's 16 MiB default, which used to close the proxy on every retry.
+    let frame = json!({"method":"fixture/large","params":{"text":"x".repeat((16 << 20) + 1)}});
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let upstream_url = format!("ws://{}", upstream.local_addr().unwrap());
+    let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let (submit, receive) = channel::unbounded_channel();
+    let (stop, shutdown) = watch::channel(false);
+    let worker = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(forward(
+                proxy,
+                ForwardContext {
+                    server_url: upstream_url,
+                    token: "test-secret".into(),
+                    selected: Arc::new(Mutex::new(Selection::default())),
+                    observe: Arc::new(|_| {}),
+                    policy: json!({}),
+                    decision: None,
+                    planning: None,
+                },
+                receive,
+                shutdown,
+            ))
+    });
+    let expected = frame.clone();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = upstream.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut server = tungstenite::accept_with_config(stream, Some(socket_config())).unwrap();
+        assert_eq!(read_json(&mut server), expected);
+        send_json(&mut server, expected);
+    });
+    let stream = TcpStream::connect(proxy_addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let (mut terminal, _) = tungstenite::client::client_with_config(
+        authenticated(&format!("ws://{proxy_addr}"), "test-secret").unwrap(),
+        stream,
+        Some(socket_config()),
+    )
+    .unwrap();
+    send_json(&mut terminal, frame.clone());
+    assert_eq!(read_json(&mut terminal), frame);
+    drop(terminal);
+    server.join().unwrap();
+    stop.send_replace(true);
+    drop(submit);
+    worker.join().unwrap().unwrap();
 }
 
 #[test]
@@ -41,6 +291,8 @@ fn forwarding_preserves_native_approvals_and_consumes_only_peer_acknowledgements
                     selected: protocol,
                     observe: Arc::new(|_| {}),
                     policy: json!({}),
+                    decision: None,
+                    planning: None,
                 },
                 receive,
                 shutdown,
@@ -79,6 +331,19 @@ fn forwarding_preserves_native_approvals_and_consumes_only_peer_acknowledgements
         send_json(
             &mut server,
             json!({"method":"serverRequest/resolved","params":{"threadId":THREAD,"requestId":200}}),
+        );
+        send_json(
+            &mut server,
+            json!({"id":201,"method":"item/tool/requestUserInput","params":{"threadId":THREAD,"turnId":"turn-1","questions":[{"id":"language","header":"Language","question":"Which language?","options":[{"label":"Русский"}]}]}}),
+        );
+        assert_eq!(
+            read_json(&mut server),
+            json!({"id":201,"result":{"answers":{"language":{"answers":["Русский"]}}}}),
+            "an ordinary console keeps native questions in its own conversation"
+        );
+        send_json(
+            &mut server,
+            json!({"method":"serverRequest/resolved","params":{"threadId":THREAD,"requestId":201}}),
         );
         send_json(
             &mut server,
@@ -173,6 +438,15 @@ fn forwarding_preserves_native_approvals_and_consumes_only_peer_acknowledgements
     send_json(
         &mut terminal,
         json!({"id":200,"result":{"decision":"decline"}}),
+    );
+    assert_eq!(read_json(&mut terminal)["method"], "serverRequest/resolved");
+    assert_eq!(
+        read_json(&mut terminal)["method"],
+        "item/tool/requestUserInput"
+    );
+    send_json(
+        &mut terminal,
+        json!({"id":201,"result":{"answers":{"language":{"answers":["Русский"]}}}}),
     );
     assert_eq!(read_json(&mut terminal)["method"], "serverRequest/resolved");
     assert_eq!(read_json(&mut terminal)["method"], "turn/completed");

@@ -120,6 +120,7 @@
 import { renderStroke, strokeFromEvent, type KeyStroke } from './chords'
 import { buildKeymap, type KeyBinding, type KeyContext, type Keymap } from './keymap'
 import { latiniseKeyEvent } from './latin'
+import { createDoubleShift } from './doubleShift'
 
 /**
  * How long a pending prefix survives.
@@ -178,6 +179,7 @@ export type GateEvent = KeyStroke & {
   type?: string | undefined
   /** Read by `keys/latin.ts` only, to leave the input method's keystrokes alone. */
   keyCode?: number | undefined
+  repeat?: boolean | undefined
   isComposing?: boolean | undefined
   preventDefault?: (() => void) | undefined
   stopPropagation?: (() => void) | undefined
@@ -248,6 +250,7 @@ export function currentStroke(): string | null {
 export function createKeyGate(host: KeyGateHost): KeyGate {
   const clock = host.now ?? (() => Date.now())
   const timeout = host.timeoutMs ?? PREFIX_TIMEOUT_MS
+  const shiftTaps = createDoubleShift(clock)
 
   /** Memoised decisions, so an event seen by both entry points dispatches once. */
   const seen = new WeakMap<object, Decision>()
@@ -297,18 +300,22 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
   }
 
   function decide(ev: GateEvent): Decision {
-    // xterm calls its custom handler for keydown, keypress *and* keyup. Only keydown is a
-    // chord; resolving on keyup would fire every command a second time. `type` is optional
-    // so a hand-built stroke in a test is treated as a keydown.
-    if (ev.type !== undefined && ev.type !== 'keydown') return PASS
-
     const cached = seen.get(ev)
     if (cached !== undefined) return cached
 
+    // Modifier taps complete on keyup; ordinary chords still resolve only on keydown.
+    // Cache PASS too: xterm may offer the same modifier event after window capture.
+    if (shiftTaps.feed(ev)) {
+      setPending(null)
+      const decision = resolveStroke('shift shift')
+      seen.set(ev, decision)
+      return decision
+    }
+    if (ev.type !== undefined && ev.type !== 'keydown') { seen.set(ev, PASS); return PASS }
+
     const stroke = strokeFromEvent(ev)
     if (stroke === null) {
-      // A bare modifier. Not memoised: it carries no decision worth remembering and the
-      // WeakMap would grow one entry per shift press.
+      seen.set(ev, PASS)
       return PASS
     }
 
@@ -382,7 +389,7 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
     decide,
     keymap,
     pending: () => pendingSequence,
-    reset: () => setPending(null),
+    reset: () => { setPending(null); shiftTaps.reset() },
 
     windowHandler(ev) {
       // Before anything reads the event: see "Normalisation before resolution" above.
@@ -503,12 +510,24 @@ export function installKeyGate(host: KeyGateHost): () => void {
   installed = created
 
   const listening = typeof window !== 'undefined'
-  if (listening) window.addEventListener('keydown', gate, true)
+  if (listening) {
+    window.addEventListener('keydown', gate, true)
+    window.addEventListener('keyup', gate, true)
+    window.addEventListener('blur', created.reset)
+    window.addEventListener('pointerdown', created.reset, true)
+    window.addEventListener('compositionstart', created.reset, true)
+  }
 
   return () => {
     created.reset()
     if (installed !== created) return
-    if (listening) window.removeEventListener('keydown', gate, true)
+    if (listening) {
+      window.removeEventListener('keydown', gate, true)
+      window.removeEventListener('keyup', gate, true)
+      window.removeEventListener('blur', created.reset)
+      window.removeEventListener('pointerdown', created.reset, true)
+      window.removeEventListener('compositionstart', created.reset, true)
+    }
     installed = null
   }
 }

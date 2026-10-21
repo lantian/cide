@@ -458,3 +458,7 @@ stylesheet.
 
 **When the redesign moves a surface onto the kit**, update that row in
 `page/chapters/Inventory.tsx`. Once a row reaches zero, delete it.
+
+### Search dialog width
+
+`Dialog width="search"` provides a 1100px (scaled), viewport-constrained frame for Search Everywhere’s results and source preview. Its compact header and smaller top inset leave room for code in short windows; it shares the dialog’s surface and focus styling. The Overlays chapter includes its specimen.

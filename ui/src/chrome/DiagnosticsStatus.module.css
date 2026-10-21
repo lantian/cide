@@ -1,0 +1,10 @@
+.controls { display: flex; align-items: center; gap: var(--sp-1); flex: none; }
+.button { display: inline-flex; align-items: center; gap: var(--sp-2); height: 22px; background: transparent; color: var(--dim); border: 0; border-radius: 3px; padding: 0 var(--sp-2); font: inherit; font-size: var(--fs-ui-11); cursor: pointer; }
+.button:hover, .button[aria-expanded='true'] { background: var(--panel-2); color: var(--text-hi); }
+.button:focus-visible { outline: 1px solid var(--accent); }
+.button:disabled { cursor: default; opacity: .6; }
+.count { display: inline-flex; align-items: center; gap: var(--sp-1); font-variant-numeric: tabular-nums; }
+.error { color: var(--red); }
+.warning { color: var(--yellow); }
+.ready { color: var(--green); }
+.busy { color: var(--accent); }

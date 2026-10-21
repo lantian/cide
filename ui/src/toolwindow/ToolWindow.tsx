@@ -34,13 +34,13 @@ export function ToolWindowView({
   children,
 }: ToolWindowViewProps) {
   return (
-    <section className={styles.toolWindow} data-audit="toolWindow" aria-label="Git">
+    <section className={styles.toolWindow} data-audit="toolWindow" aria-label="Tool window">
       {/*
        * A real tablist, unlike the activity rail's new button: these *are* tabs — one selection,
        * each swapping the body below. The rail's tool-window button is a toggle and carries
        * `aria-pressed` instead, because it opens a panel rather than selecting within one.
        */}
-      <div className={styles.tabs} role="tablist" aria-label="Git tool window tabs">
+      <div className={styles.tabs} role="tablist" aria-label="Tool window tabs">
         {rows.map((row) => (
           <div
             key={row.id ?? 'log'}
@@ -80,8 +80,8 @@ export function ToolWindowView({
         <button
           type="button"
           className={styles.hide}
-          aria-label="Hide the git tool window"
-          title="Hide the git tool window"
+          aria-label="Hide the tool window"
+          title="Hide the tool window"
           data-audit="toolWindowHide"
           onClick={onHide}
         >

@@ -47,6 +47,7 @@ fn pane(title: &str, harness: ConsoleHarness) -> Pane {
         harness_conversation: None,
         continues: None,
         harness: Some(harness.harness()),
+        harness_choice: None,
         title: title.into(),
         docker: None,
         origin: None,

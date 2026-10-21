@@ -134,6 +134,7 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
         // Stamped when a spawn binds, from what it actually ran — see `Pane::harness`. A mirror
         // is bound to its source's session and learns nothing new by being a mirror.
         harness: None,
+        harness_choice: None,
         docker: match intent {
             SplitIntent::Docker {
                 container,
@@ -189,6 +190,14 @@ pub fn pane_split(
 ) -> Result<SplitOutcome, CoreError> {
     state.update(|ws| {
         let name = workspace::project(ws, project)?.name.clone();
+        if matches!(
+            &workspace::tab(ws, project, tab)?.kind,
+            TabKind::Conversation { .. }
+        ) {
+            return Err(CoreError::Io(
+                "A saved conversation is read only and cannot be split.".into(),
+            ));
+        }
         cide_core::peer_chat::require_unpaired(ws, project, tab)?;
         let intent = intent.unwrap_or_else(|| {
             default_intent(&workspace::tab(ws, project, tab).unwrap().kind, axis)
@@ -266,6 +275,36 @@ pub fn tab_new_run(
     })
 }
 
+/// Open a saved conversation as a document. The placeholder pane has no session and the
+/// frontend renders the tab's conversation page instead of its pane tree.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_open_conversation(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    id: String,
+    title: String,
+) -> Result<TabId, CoreError> {
+    if id.trim().is_empty() {
+        return Err(CoreError::Io("a conversation id is required".into()));
+    }
+    state.update(|ws| {
+        let project_view = workspace::project(ws, project)?;
+        let existing = project_view.tabs.iter().find_map(|tab| match &tab.kind {
+            TabKind::Conversation { id: open, .. } if open == &id => Some(tab.id),
+            _ => None,
+        });
+        if let Some(tab) = existing {
+            workspace::activate_tab(ws, project, tab)?;
+            return Ok(tab);
+        }
+        let name = project_view.name.clone();
+        let mut pane = pane_for(&SplitIntent::NewClaude, &name);
+        pane.kind = PaneKind::Diff;
+        pane.title = title.clone();
+        workspace::open_tab(ws, project, TabKind::Conversation { id, title }, pane)
+    })
+}
+
 /// A new full-width row holding one pane.
 ///
 /// `after: None` appends at the bottom. `intent: None` asks for the tab's default, which is
@@ -284,6 +323,14 @@ pub fn pane_add_row(
 ) -> Result<SplitOutcome, CoreError> {
     state.update(|ws| {
         let name = workspace::project(ws, project)?.name.clone();
+        if matches!(
+            &workspace::tab(ws, project, tab)?.kind,
+            TabKind::Conversation { .. }
+        ) {
+            return Err(CoreError::Io(
+                "A saved conversation is read only and cannot be split.".into(),
+            ));
+        }
         cide_core::peer_chat::require_unpaired(ws, project, tab)?;
         let intent = intent.unwrap_or_else(|| {
             default_intent(&workspace::tab(ws, project, tab).unwrap().kind, Axis::Col)
@@ -475,6 +522,7 @@ pub fn pane_swap(
 /// Resume splash, and nothing had ever written it after project creation — see the function's
 /// own note.
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)] // Tauri-injected state plus the pane binding wire fields.
 pub fn pane_bind_session(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
@@ -483,11 +531,22 @@ pub fn pane_bind_session(
     tab: TabId,
     pane: PaneId,
     session: SessionId,
+    harness_choice: Option<cide_ipc::ConsoleHarness>,
 ) -> Result<Mutated, CoreError> {
     // Which CLI the spawn ran, when it was a console's (M93): the registry heard it from
     // `spawn_session`, and this is the first moment the pane is known to stamp it on.
     let out = state
-        .update(|ws| bind_recorded_session(ws, &registry, project, tab, pane, session))
+        .update(|ws| {
+            bind_recorded_session_with_choice(
+                ws,
+                &registry,
+                project,
+                tab,
+                pane,
+                session,
+                harness_choice,
+            )
+        })
         .map(|()| Mutated { rev: state.rev() })?;
 
     // This is the only point at which a pid and a pane are both known, which is what the IDE
@@ -515,13 +574,26 @@ pub(crate) fn bind_recorded_session(
     pane: PaneId,
     session: SessionId,
 ) -> Result<(), CoreError> {
-    workspace::bind_session(
+    bind_recorded_session_with_choice(ws, registry, project, tab, pane, session, None)
+}
+
+fn bind_recorded_session_with_choice(
+    ws: &mut cide_ipc::Workspace,
+    registry: &crate::state::SessionRegistry,
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    session: SessionId,
+    choice: Option<cide_ipc::ConsoleHarness>,
+) -> Result<(), CoreError> {
+    workspace::bind_session_with_choice(
         ws,
         project,
         tab,
         pane,
         session,
         registry.harness_of(session),
+        choice,
     )?;
     if let Some(conversation) = registry.native_conversation(session) {
         workspace::note_native_conversation(ws, session, &conversation);
@@ -540,6 +612,34 @@ mod tests {
     use super::*;
     use cide_core::layout::{MIN_TILE, add_row, add_tile, leaves, new_tree, validate};
     use cide_ipc::{LayoutNode, PaneTree};
+
+    #[test]
+    fn a_switch_binds_the_recorded_harness_as_this_panes_choice() {
+        let mut ws = cide_ipc::Workspace::default();
+        let project = workspace::open_project(&mut ws, vec!["/tmp/choice".into()], None).unwrap();
+        let tab = ws.projects[&project].tabs[0].id;
+        let pane = ws.projects[&project].tabs[0].tree.focused;
+        let session = SessionId::new();
+        let registry = crate::state::SessionRegistry::default();
+        registry.note_harness(session, cide_ipc::Harness::Opencode);
+
+        bind_recorded_session_with_choice(
+            &mut ws,
+            &registry,
+            project,
+            tab,
+            pane,
+            session,
+            Some(cide_ipc::ConsoleHarness::Opencode),
+        )
+        .unwrap();
+        let pane = &ws.projects[&project].tabs[0].tree.panes[&pane];
+        assert_eq!(pane.harness, Some(cide_ipc::Harness::Opencode));
+        assert_eq!(
+            pane.harness_choice,
+            Some(cide_ipc::ConsoleHarness::Opencode)
+        );
+    }
 
     #[test]
     fn a_clear_before_binding_invalidates_a_resume_seed() {
@@ -715,6 +815,7 @@ mod tests {
             harness_conversation: None,
             continues: None,
             harness: None,
+            harness_choice: None,
             title: "cide : claude".into(),
             docker: None,
             origin: None,

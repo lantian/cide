@@ -1,0 +1,11 @@
+.editors {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}

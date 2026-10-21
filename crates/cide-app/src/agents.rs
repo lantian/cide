@@ -182,6 +182,7 @@ type AgentKey = (ProjectId, AgentId);
 /// [`SessionRegistry`], and so does this. See the module header.
 #[derive(Debug, Clone)]
 struct LiveRun {
+    planning: Option<cide_agents::native_plan::State>,
     run: RunId,
     agent: AgentId,
     /// Copied at dispatch, for [`cide_ipc::AgentRun::agent_label`]'s reason: a history row must
@@ -669,6 +670,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
     inner.runs.insert(
         run,
         LiveRun {
+            planning: spec.planning,
             run,
             agent: spec.agent,
             agent_label: spec.agent_label,
@@ -784,6 +786,9 @@ fn holder_in(
         .map(|run| HeldPair {
             run: run.run,
             state: run.state.clone(),
+            agent: run.agent.clone(),
+            task: run.task.clone(),
+            change: run.change.clone(),
         })
 }
 
@@ -810,6 +815,33 @@ fn change_holder_in(inner: &Inner, project: ProjectId, change: &str) -> Option<H
         .map(|run| HeldPair {
             run: run.run,
             state: run.state.clone(),
+            agent: run.agent.clone(),
+            task: run.task.clone(),
+            change: run.change.clone(),
+        })
+}
+
+/// Apply owns a change exclusively. Separate work tasks on that change instead use the
+/// path gate, which can admit disjoint checkouts in parallel.
+fn change_holder_for_dispatch(inner: &Inner, spec: &DispatchSpec) -> Option<HeldPair> {
+    let change = implementation_change(&spec.purpose, spec.change.as_deref())?;
+    inner
+        .runs
+        .values()
+        .find(|run| {
+            run.project == spec.project
+                && holds_a_pair(&run.state)
+                && implementation_change(&run.purpose, run.change.as_deref()).as_deref()
+                    == Some(change.as_str())
+                && !(matches!(spec.purpose, RunPurpose::Work(_))
+                    && matches!(run.purpose, RunPurpose::Work(_)))
+        })
+        .map(|run| HeldPair {
+            run: run.run,
+            state: run.state.clone(),
+            agent: run.agent.clone(),
+            task: run.task.clone(),
+            change: run.change.clone(),
         })
 }
 
@@ -848,17 +880,18 @@ fn last_conversation_in(
 /// a state added later must be classified by whoever adds it, and the compiler is the only
 /// reviewer that never forgets to ask. Getting it wrong in the permissive direction spawns a
 /// second process; in the strict direction it wedges a task nobody can dispatch.
-fn holds_a_pair(state: &RunState) -> bool {
+pub(crate) fn holds_a_pair(state: &RunState) -> bool {
     match state {
         RunState::Queued
         | RunState::Starting
         | RunState::Running
+        | RunState::Blocked { .. }
         | RunState::AwaitingPermission
         | RunState::Idle
         | RunState::Paused { .. } => true,
         // Its child died with a previous cide — nothing is running, so nothing is doubled.
         RunState::Interrupted => false,
-        RunState::Finished { .. } | RunState::Failed { .. } => false,
+        RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. } => false,
     }
 }
 
@@ -1015,6 +1048,91 @@ impl LiveRun {
             // Filled by the roster builder, which has the root; see `AgentRun::worktree`.
             worktree: false,
             reviewer: None,
+        }
+    }
+}
+
+impl AgentRegistry {
+    pub(crate) fn planning(&self, run: RunId) -> Option<cide_agents::native_plan::State> {
+        self.inner
+            .lock()
+            .runs
+            .get(&run)
+            .and_then(|live| live.planning.clone())
+    }
+
+    pub(crate) fn planning_active(
+        &self,
+        run: RunId,
+        session: SessionId,
+        generation: SessionId,
+    ) -> bool {
+        self.inner.lock().runs.get(&run).is_some_and(|live| {
+            live.session == Some(session)
+                && !live.stopping
+                && live.stop.is_none()
+                && live.frozen.is_none()
+                && live
+                    .planning
+                    .as_ref()
+                    .is_some_and(|state| state.generation == generation)
+                && matches!(
+                    live.state,
+                    RunState::Starting
+                        | RunState::Running
+                        | RunState::Blocked { .. }
+                        | RunState::Idle
+                        | RunState::AwaitingPermission
+                )
+        })
+    }
+
+    pub(crate) fn note_planning(
+        &self,
+        run: RunId,
+        session: SessionId,
+        state: &cide_agents::native_plan::State,
+    ) {
+        let changed = {
+            let mut inner = self.inner.lock();
+            let Some(live) = inner.runs.get_mut(&run).filter(|live| {
+                live.session == Some(session) && !live.stopping && live.stop.is_none()
+            }) else {
+                return;
+            };
+            if live
+                .planning
+                .as_ref()
+                .is_none_or(|old| old.generation != state.generation)
+            {
+                return;
+            }
+            live.planning = Some(state.clone());
+            true
+        };
+        if changed {
+            self.save_snapshot();
+        }
+    }
+
+    pub(crate) fn native_state(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        run: RunId,
+        session: SessionId,
+        state: RunState,
+    ) {
+        let current = self
+            .inner
+            .lock()
+            .runs
+            .get(&run)
+            .filter(|live| live.session == Some(session) && live.frozen.is_none() && !live.stopping)
+            .map(|live| live.state.clone());
+        if let Some(current) = current
+            && self.set_state_from(Some(app), run, Some(&current), state) == Some(true)
+        {
+            after_transition(app, self, run);
         }
     }
 }
@@ -1183,6 +1301,7 @@ impl WorkOptions {
 /// the refusal short-circuits.
 #[derive(Debug, Clone)]
 pub struct DispatchSpec {
+    pub planning: Option<cide_agents::native_plan::State>,
     pub project: ProjectId,
     pub agent: AgentId,
     pub agent_label: String,
@@ -1226,6 +1345,9 @@ pub struct DispatchSpec {
 pub struct HeldPair {
     pub run: RunId,
     pub state: RunState,
+    pub agent: AgentId,
+    pub task: Option<TaskId>,
+    pub change: Option<String>,
 }
 
 /// One run the queue has decided to start. Produced under the lock, acted on outside it.
@@ -1386,6 +1508,8 @@ struct Inner {
     /// because the files a branch changed are a `git` question; absent for a project nobody has
     /// refreshed yet, which gates nothing.
     paths: HashMap<ProjectId, PathTable>,
+    /// Reject an older asynchronous path scan after a newer state change requested one.
+    path_epochs: HashMap<ProjectId, u64>,
 }
 
 /// What one project's path gate knows. (M132) See [`refresh_paths`].
@@ -1464,9 +1588,7 @@ impl AgentRegistry {
     /// and Explore can coexist in the project root. Apply also claims its change across roles.
     pub fn enqueue_unique(&self, spec: DispatchSpec) -> std::result::Result<RunId, HeldPair> {
         let mut inner = self.inner.lock();
-        if let Some(change) = implementation_change(&spec.purpose, spec.change.as_deref())
-            && let Some(held) = change_holder_in(&inner, spec.project, &change)
-        {
+        if let Some(held) = change_holder_for_dispatch(&inner, &spec) {
             return Err(held);
         }
         if let Some(task) = spec.task.as_ref()
@@ -2485,6 +2607,7 @@ fn holds_its_checkout(live: &LiveRun) -> bool {
         live.state,
         RunState::Starting
             | RunState::Running
+            | RunState::Blocked { .. }
             | RunState::AwaitingPermission
             | RunState::Paused { .. }
     )
@@ -2708,7 +2831,9 @@ pub(crate) fn stop_route(
 ) -> StopRoute {
     match state {
         RunState::Queued => StopRoute::Cancel,
-        RunState::Finished { .. } | RunState::Failed { .. } => StopRoute::Nothing,
+        RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. } => {
+            StopRoute::Nothing
+        }
         RunState::Interrupted => StopRoute::Discard,
         _ => {
             let Some(_session) = session else {
@@ -2873,6 +2998,8 @@ fn idle_tasks(rows: &[cide_ipc::TaskRow]) -> HashMap<TaskId, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum ParkedAtQuit {
+    /// The turn failed and needs an explicit retry, including after restart.
+    Blocked,
     /// `Idle`: the turn was handed back and the child sat at its prompt.
     Idle,
     /// `AwaitingPermission`: an approval prompt was up. It died with the child, so a Resume
@@ -2885,6 +3012,7 @@ impl ParkedAtQuit {
     /// launch, as before.
     fn of(state: &RunState) -> Option<Self> {
         match state {
+            RunState::Blocked { .. } => Some(Self::Blocked),
             RunState::Idle => Some(Self::Idle),
             RunState::AwaitingPermission => Some(Self::Permission),
             _ => None,
@@ -2894,6 +3022,9 @@ impl ParkedAtQuit {
     /// The restored row's note: why it did not start by itself, and what does start it.
     fn note(self) -> &'static str {
         match self {
+            Self::Blocked => {
+                "its turn failed before cide closed; open the conversation or resume it manually to retry"
+            }
             Self::Idle => {
                 "its turn had ended when cide closed, so it was not resumed; it continues when \
                  the task is answered or dispatched again, or on Resume"
@@ -3024,6 +3155,7 @@ impl AgentRegistry {
                 && matches!(
                     live.state,
                     RunState::Queued
+                        | RunState::Blocked { .. }
                         | RunState::Starting
                         | RunState::Running
                         | RunState::AwaitingPermission
@@ -3152,9 +3284,23 @@ impl AgentRegistry {
         run: RunId,
         line: &str,
     ) -> Result<()> {
+        let recovering = self
+            .inner
+            .lock()
+            .runs
+            .get(&run)
+            .is_some_and(|live| matches!(live.state, RunState::Blocked { .. }));
         let Some((session, kind, line)) = self.plan_follow_up(project, run, line)? else {
             return Ok(());
         };
+        if !recovering && let Some(handle) = crate::native_plan::get(app, session) {
+            let state = cide_agents::native_plan::State::default();
+            if let Some(live) = self.inner.lock().runs.get_mut(&run) {
+                live.planning = Some(state.clone());
+            }
+            handle.restart(state);
+            self.save_snapshot();
+        }
         self.send_prompt(app, project, run, session, &line, kind)?;
         self.mark_changed(app, project);
         Ok(())
@@ -3182,7 +3328,7 @@ impl AgentRegistry {
         match (&live.state, live.session) {
             // Idle and not paused: its turn is over, so type now — and anything held for it too,
             // which would otherwise wait for a hand-back an idle run is not going to make.
-            (RunState::Idle, Some(session)) if live.frozen.is_none() => {
+            (RunState::Idle | RunState::Blocked { .. }, Some(session)) if live.frozen.is_none() => {
                 let mut lines = std::mem::take(&mut live.follow_ups);
                 lines.push(line.to_string());
                 Ok(Some((session, live.harness, lines.join(" — then: "))))
@@ -3217,9 +3363,7 @@ impl AgentRegistry {
     ) -> std::result::Result<RunId, HeldPair> {
         let prompt = spec.prompt.clone();
         let mut inner = self.inner.lock();
-        if let Some(change) = implementation_change(&spec.purpose, spec.change.as_deref())
-            && let Some(held) = change_holder_in(&inner, spec.project, &change)
-        {
+        if let Some(held) = change_holder_for_dispatch(&inner, &spec) {
             return Err(held);
         }
         if let Some(task) = spec.task.as_ref()
@@ -3249,7 +3393,9 @@ impl AgentRegistry {
                 matches!(&run.purpose, RunPurpose::MrReview { review: r, .. } if r == review)
                     && !matches!(
                         run.state,
-                        RunState::Finished { .. } | RunState::Failed { .. }
+                        RunState::Finished { .. }
+                            | RunState::Cancelled { .. }
+                            | RunState::Failed { .. }
                     )
             })
             .map(|run| (run.project, run.run))
@@ -3379,9 +3525,38 @@ impl AgentRegistry {
         let Some(live) = inner.runs.get_mut(&run) else {
             return Some(false);
         };
+        // A native plan's hand-back is internal to this assignment. Keep its slot and
+        // checkout until the approved implementation actually hands back.
+        if matches!(next, RunState::Idle)
+            && live
+                .planning
+                .as_ref()
+                .is_some_and(cide_agents::native_plan::State::pending)
+            && live.stop.is_none()
+        {
+            return Some(false);
+        }
         if from.is_some_and(|from| live.state != *from) {
             return None;
         }
+        let observed_next = next.clone();
+        let next = match (&next, live.stop.as_ref()) {
+            (RunState::Finished { code }, Some(stop))
+                if matches!(
+                    stop.how,
+                    StopHow::WindingDown { .. }
+                        | StopHow::WoundDown
+                        | StopHow::Forced { .. }
+                        | StopHow::Immediate { .. }
+                ) =>
+            {
+                RunState::Cancelled {
+                    reason: format!("stopped by {}", stop.by.phrase()),
+                    code: Some(*code),
+                }
+            }
+            _ => next,
+        };
         if live.state == next {
             return Some(false);
         }
@@ -3392,12 +3567,16 @@ impl AgentRegistry {
                 RunState::Idle
             )
         );
+        let blocked = matches!(next, RunState::Blocked { .. });
         // `Interrupted` ends the child as surely as the terminal states do — it is what an
         // [`Self::external_stop`] records — so it gives back the slot and the freeze the same way.
         // It is *not* terminal: the row keeps its session and a Resume continues it.
         let over = matches!(
             next,
-            RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+            RunState::Finished { .. }
+                | RunState::Cancelled { .. }
+                | RunState::Failed { .. }
+                | RunState::Interrupted
         );
         // A task run that has just stopped at an approval prompt. Armed here, where the edge is
         // seen once, and watched after the lock is dropped. (M118)
@@ -3406,8 +3585,13 @@ impl AgentRegistry {
         let now = now_unix_ms();
         // The shutdown reaper can see a hung-up TUI before restore does. Keep the same waiting
         // fact the snapshot keeps, so losing an idle child does not lose its completed turn.
-        if next == RunState::Interrupted && self.going_down() {
+        if next == RunState::Interrupted
+            && (self.going_down() || matches!(live.state, RunState::Blocked { .. }))
+        {
             live.parked_at_quit = ParkedAtQuit::of(&live.state);
+            if let RunState::Blocked { reason } = &live.state {
+                live.note = Some(reason.clone());
+            }
         }
         live.parked_since_unix_ms = match (parked_now, &next) {
             (true, _) => Some(now),
@@ -3415,6 +3599,13 @@ impl AgentRegistry {
             (false, _) => None,
         };
         let park = (parked_now && live.task.is_some()).then_some(now);
+        let reclaim = (matches!(live.state, RunState::Blocked { .. })
+            && matches!(next, RunState::Running)
+            && !live.slot)
+            .then(|| (live.key(), live.project));
+        if reclaim.is_some() {
+            live.slot = true;
+        }
         move_to(live, next, now);
         if over {
             // A frozen child that died under the freeze is not frozen any more, and leaving the
@@ -3426,6 +3617,10 @@ impl AgentRegistry {
             inner
                 .frozen_sessions
                 .retain(|_, frozen| frozen.run != Some(run));
+        }
+        if let Some((key, project)) = reclaim {
+            *inner.agent_slots.entry(key).or_default() += 1;
+            *inner.project_slots.entry(project).or_default() += 1;
         }
         let Some(live) = inner.runs.get_mut(&run) else {
             return Some(true);
@@ -3447,7 +3642,7 @@ impl AgentRegistry {
         // ever lost to it.
         let mut wind_down_kill = None;
         if let Some(stop) = live.stop.as_mut() {
-            match wind_down_step(&stop.how, handed_back, &live.state) {
+            match wind_down_step(&stop.how, handed_back, &observed_next) {
                 WindDownStep::Wait => {}
                 WindDownStep::Arm => {
                     if let StopHow::WindingDown { saw_a_turn, .. } = &mut stop.how {
@@ -3470,7 +3665,7 @@ impl AgentRegistry {
             false => Vec::new(),
         };
         let follow_project = live.project;
-        if handed_back || over {
+        if handed_back || over || blocked {
             let key = live.key();
             let project = live.project;
             let held = live.slot;
@@ -3675,6 +3870,66 @@ impl AgentRegistry {
         !self.inner.lock().paused_projects.contains(&project)
     }
 
+    /// Read the actual admission gates under the registry lock. Never enqueue as a probe.
+    pub fn queue_reasons(&self, run: RunId) -> Vec<cide_ipc::TaskDispatchReason> {
+        use cide_ipc::TaskDispatchReason as Reason;
+        let inner = self.inner.lock();
+        let Some(live) = inner.runs.get(&run) else {
+            return Vec::new();
+        };
+        if !matches!(live.state, RunState::Queued) {
+            return Vec::new();
+        }
+        let mut reasons = Vec::new();
+        if inner.paused_projects.contains(&live.project) {
+            reasons.push(Reason::new("paused", PAUSED_QUEUE_NOTE));
+        }
+        let key = (live.project, live.agent.clone());
+        let agent_held = inner.agent_slots.get(&key).copied().unwrap_or(0);
+        let project_held = inner.project_slots.get(&live.project).copied().unwrap_or(0);
+        if agent_held >= live.agent_limit {
+            reasons.push(Reason::new("roleLimit", format!("Waiting for this role's running limit ({agent_held}/{}). Starts when a slot frees.", live.agent_limit)));
+        }
+        if project_held >= live.project_limit {
+            reasons.push(Reason::new("projectLimit", format!("Waiting for the project's running limit ({project_held}/{}). Starts when a slot frees.", live.project_limit)));
+        }
+        if !live.pool.is_empty()
+            && choose_entry(
+                &inner,
+                &live.pool,
+                live.pool_index.min(live.pool.len() - 1),
+                None,
+                now_unix_ms(),
+            )
+            .is_none()
+        {
+            reasons.push(Reason::new(
+                "poolLimit",
+                pool_full_note(&inner, &live.pool, live.pool_index.min(live.pool.len() - 1)),
+            ));
+        }
+        if let Some(checkout) = &live.checkout
+            && inner.runs.values().any(|other| {
+                other.run != run
+                    && other.project == live.project
+                    && other.checkout.as_ref() == Some(checkout)
+                    && holds_its_checkout(other)
+            })
+        {
+            reasons.push(Reason::new(
+                "checkoutBusy",
+                "Waiting for another run to release this checkout.",
+            ));
+        }
+        if let Some(why) = path_wait(&inner, &run) {
+            reasons.push(Reason::new("pathsBusy", why));
+        }
+        if reasons.is_empty() {
+            reasons.push(Reason::new("queue", live.wire().note.unwrap_or_else(|| "Queued; waiting for admission. Starts automatically when resources are available.".into())));
+        }
+        reasons
+    }
+
     /// The run of `agent` on `task` that would be doubled by a new dispatch, if there is one.
     ///
     /// **The duplicate rule, and it is narrower than "has not ended".** (M66) A pair is held by
@@ -3701,6 +3956,87 @@ impl AgentRegistry {
         task: &TaskId,
     ) -> Option<HeldPair> {
         holder_in(&self.inner.lock(), project, agent, task)
+    }
+
+    pub fn active_assignment(
+        &self,
+        project: ProjectId,
+        agent: &AgentId,
+        task: &TaskId,
+    ) -> Option<HeldPair> {
+        self.run_holding(project, agent, task).filter(|held| {
+            matches!(
+                held.state,
+                RunState::Starting
+                    | RunState::Running
+                    | RunState::Blocked { .. }
+                    | RunState::AwaitingPermission
+                    | RunState::Paused { .. }
+            )
+        })
+    }
+
+    pub fn turn_details(&self, run: RunId) -> Option<(Option<String>, Option<StopRecord>)> {
+        self.inner
+            .lock()
+            .runs
+            .get(&run)
+            .map(|live| (live.task_title.clone(), live.stop.clone()))
+    }
+
+    /// Remove the old assignee's queued brief when a task is handed to another role. Admission
+    /// and cancellation share this lock, so a queued run cannot slip between the check and the
+    /// removal. A run already admitted is left for the caller's active-run guard.
+    pub fn cancel_queued_assignment(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        agent: &AgentId,
+        task: &TaskId,
+    ) {
+        let cancelled = {
+            let mut inner = self.inner.lock();
+            let runs: Vec<RunId> = inner
+                .runs
+                .values()
+                .filter(|run| {
+                    run.project == project
+                        && &run.agent == agent
+                        && run.task.as_ref() == Some(task)
+                        && run.state == RunState::Queued
+                })
+                .map(|run| run.run)
+                .collect();
+            for run in &runs {
+                let key = inner.runs.get(run).expect("collected above").key();
+                if let Some(queue) = inner.queues.get_mut(&key) {
+                    queue.retain(|queued| queued != run);
+                }
+                if let Some(live) = inner.runs.get_mut(run) {
+                    live.stop = Some(StopRecord {
+                        by: StopBy::Orchestrator,
+                        reason: Some("task reassigned before this run started".into()),
+                        how: StopHow::BeforeStart,
+                        grace_secs: 0,
+                    });
+                    move_to(
+                        live,
+                        RunState::Cancelled {
+                            reason: "cancelled after task reassignment".into(),
+                            code: None,
+                        },
+                        now_unix_ms(),
+                    );
+                }
+            }
+            runs
+        };
+        if !cancelled.is_empty() {
+            self.mark_changed(app, project);
+            for run in cancelled {
+                crate::agent_rpc::note_run_over(app, project, run);
+            }
+        }
     }
 
     pub fn change_holding(&self, project: ProjectId, change: &str) -> Option<HeldPair> {
@@ -3775,7 +4111,10 @@ impl AgentRegistry {
             run.session == Some(session)
                 && !matches!(
                     run.state,
-                    RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+                    RunState::Finished { .. }
+                        | RunState::Cancelled { .. }
+                        | RunState::Failed { .. }
+                        | RunState::Interrupted
                 )
         })
     }
@@ -3830,6 +4169,10 @@ impl AgentRegistry {
         }
         let code = match live.state {
             RunState::Failed { .. } => None,
+            RunState::Cancelled {
+                code: Some(code), ..
+            } if stopped.is_some() => Some(code),
+            RunState::Cancelled { .. } => return None,
             RunState::Finished { code } if code != 0 => Some(code),
             RunState::Finished { code } if stopped.is_some() => Some(code),
             _ => return None,
@@ -3845,7 +4188,9 @@ impl AgentRegistry {
                 && other.task.as_ref() == Some(&task)
                 && !matches!(
                     other.state,
-                    RunState::Finished { .. } | RunState::Failed { .. }
+                    RunState::Finished { .. }
+                        | RunState::Cancelled { .. }
+                        | RunState::Failed { .. }
                 )
         });
         inner
@@ -3962,6 +4307,7 @@ impl AgentRegistry {
         // lives), and closing that pane ends only the attached client, never the run.
         if let Some(conversation) = conversation.as_ref()
             && matches!(live.harness, Harness::Opencode | Harness::Mimo)
+            && cwd.is_dir()
             && inner
                 .servers
                 .get(&run)
@@ -4014,6 +4360,12 @@ impl AgentRegistry {
                 session,
                 continues: conversation,
             });
+        }
+
+        if let Some(conversation) = conversation.clone()
+            && !cwd.is_dir()
+        {
+            return Ok(RunOpen::ReadOnly { conversation });
         }
 
         if let Some(conversation) = conversation.clone() {
@@ -4182,7 +4534,10 @@ impl AgentRegistry {
                 );
             };
             match live.state {
-                RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted => {
+                RunState::Finished { .. }
+                | RunState::Cancelled { .. }
+                | RunState::Failed { .. }
+                | RunState::Interrupted => {
                     inner.runs.remove(&run);
                 }
                 // Mid-turn: the user may want what it is doing. Stop is a separate, explicit act.
@@ -4196,6 +4551,7 @@ impl AgentRegistry {
                 // Alive but not working — above all a Claude session waiting at its prompt, which
                 // never ends by itself. Hidden now; the caller stops it.
                 RunState::Queued
+                | RunState::Blocked { .. }
                 | RunState::Idle
                 | RunState::AwaitingPermission
                 | RunState::Paused { .. } => {
@@ -4219,7 +4575,7 @@ impl AgentRegistry {
         for run in inner.runs.values() {
             if matches!(
                 run.state,
-                RunState::Finished { .. } | RunState::Failed { .. }
+                RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. }
             ) {
                 done.entry(run.project)
                     .or_default()
@@ -4362,7 +4718,7 @@ fn freeze_run(live: &mut LiveRun, now_ms: u64) -> Option<SessionId> {
     if live.frozen.is_some()
         || matches!(
             live.state,
-            RunState::Finished { .. } | RunState::Failed { .. }
+            RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. }
         )
     {
         return None;
@@ -4498,7 +4854,9 @@ impl AgentRegistry {
                 }
                 if matches!(
                     live.state,
-                    RunState::Finished { .. } | RunState::Failed { .. }
+                    RunState::Finished { .. }
+                        | RunState::Cancelled { .. }
+                        | RunState::Failed { .. }
                 ) {
                     return Err(CoreError::Io("this run has already ended".into()));
                 }
@@ -5357,7 +5715,10 @@ impl AgentRegistry {
             || live.frozen.is_some()
             || matches!(
                 live.state,
-                RunState::Idle | RunState::Finished { .. } | RunState::Failed { .. }
+                RunState::Idle
+                    | RunState::Blocked { .. }
+                    | RunState::Finished { .. }
+                    | RunState::Failed { .. }
             )
         {
             return false;
@@ -5435,6 +5796,60 @@ impl AgentRegistry {
         prompt: &str,
         kind: Harness,
     ) -> Result<()> {
+        let reserved = reserve_blocked_retry(&mut self.inner.lock(), run)?;
+        let result = self.send_prompt_inner(app, project, run, session, prompt, kind);
+        if result.is_err() && reserved {
+            let mut inner = self.inner.lock();
+            if let Some(live) = inner.runs.get_mut(&run)
+                && live.session == Some(session)
+                && matches!(live.state, RunState::Blocked { .. })
+                && live.slot
+            {
+                live.slot = false;
+                let key = live.key();
+                let project = live.project;
+                release(&mut inner, &key, project);
+            }
+        }
+        result
+    }
+
+    fn send_prompt_inner(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        project: ProjectId,
+        run: RunId,
+        session: SessionId,
+        prompt: &str,
+        kind: Harness,
+    ) -> Result<()> {
+        if let Some(plan) = crate::native_plan::get(app, session) {
+            if kind.reads_provider_document()
+                && let Some(console) = app
+                    .state::<crate::peer_chat::Runtime>()
+                    .worker_console(session)
+            {
+                return console.peer_prompt(prompt).map_err(CoreError::Io);
+            }
+            if plan.pending() && matches!(kind, Harness::Claude | Harness::Qwen) {
+                let pty = app
+                    .state::<SessionRegistry>()
+                    .get(session)
+                    .ok_or_else(|| CoreError::Io("the native worker has ended".into()))?;
+                plan.watch_terminal(&pty);
+                if kind == Harness::Qwen {
+                    plan.start_qwen(&pty, prompt.into());
+                } else {
+                    type_submitted_line(
+                        app,
+                        session,
+                        &pty,
+                        format!("/plan {prompt}\r").into_bytes(),
+                    );
+                }
+                return Ok(());
+            }
+        }
         let harness = cide_agents::for_kind(kind).ok_or_else(|| {
             CoreError::Io(format!(
                 "this build has no implementation for the `{kind:?}` harness"
@@ -6370,6 +6785,32 @@ fn release(inner: &mut Inner, key: &AgentKey, project: ProjectId) {
     }
 }
 
+/// A manual retry of a live blocked child uses the same concurrency ceilings as a dispatch.
+fn reserve_blocked_retry(inner: &mut Inner, run: RunId) -> Result<bool> {
+    let Some(live) = inner.runs.get(&run) else {
+        return Ok(false);
+    };
+    if !matches!(live.state, RunState::Blocked { .. }) || live.slot {
+        return Ok(false);
+    }
+    let key = live.key();
+    let project = live.project;
+    let agent_held = inner.agent_slots.get(&key).copied().unwrap_or(0);
+    let project_held = inner.project_slots.get(&project).copied().unwrap_or(0);
+    if inner.paused_projects.contains(&project)
+        || live.frozen.is_some()
+        || live.stop.is_some()
+        || agent_held >= live.agent_limit
+        || project_held >= live.project_limit
+    {
+        return Err(CoreError::Io("This run is blocked; retry when the project is resumed and a concurrency slot is available.".into()));
+    }
+    inner.agent_slots.insert(key, agent_held + 1);
+    inner.project_slots.insert(project, project_held + 1);
+    inner.runs.get_mut(&run).expect("checked above").slot = true;
+    Ok(true)
+}
+
 // ==========================================================================================
 // The snapshot: runs that outlive the process.
 // ==========================================================================================
@@ -6393,6 +6834,11 @@ struct RunsFile {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SavedRun {
+    /// Preserve a failed turn's reason when shutdown has already marked its child Interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planning: Option<cide_agents::native_plan::State>,
     run: RunId,
     project: ProjectId,
     agent: AgentId,
@@ -6949,9 +7395,11 @@ impl AgentRegistry {
         self.set_state(None, run, RunState::Interrupted);
         let mut inner = self.inner.lock();
         let live = inner.runs.get_mut(&run)?;
-        live.note = Some(
-            "its child was stopped from outside cide; Resume continues the conversation".into(),
-        );
+        if live.parked_at_quit != Some(ParkedAtQuit::Blocked) {
+            live.note = Some(
+                "its child was stopped from outside cide; Resume continues the conversation".into(),
+            );
+        }
         Some(live.project)
     }
 
@@ -6997,6 +7445,16 @@ impl AgentRegistry {
                 runs: runs
                     .into_iter()
                     .map(|live| SavedRun {
+                        blocked_reason: match &live.state {
+                            RunState::Blocked { reason } => Some(reason.clone()),
+                            RunState::Interrupted
+                                if live.parked_at_quit == Some(ParkedAtQuit::Blocked) =>
+                            {
+                                live.note.clone()
+                            }
+                            _ => None,
+                        },
+                        planning: live.planning.clone(),
                         run: live.run,
                         project: live.project,
                         agent: live.agent.clone(),
@@ -7158,22 +7616,29 @@ impl AgentRegistry {
                 .parked_at_quit
                 .or_else(|| saved.state.as_ref().and_then(ParkedAtQuit::of));
             let (state, session, note) = match saved.state {
-                Some(state @ (RunState::Finished { .. } | RunState::Failed { .. })) => {
-                    (state, saved.session.filter(|_| reopenable), None)
+                Some(RunState::Blocked { reason }) => {
+                    (RunState::Interrupted, saved.session, Some(reason))
                 }
+                Some(
+                    state @ (RunState::Finished { .. }
+                    | RunState::Cancelled { .. }
+                    | RunState::Failed { .. }),
+                ) => (state, saved.session.filter(|_| reopenable), None),
                 _ => (
                     RunState::Interrupted,
                     saved.session,
-                    Some(
-                        match parked_at_quit {
-                            Some(parked) => parked.note(),
-                            None => {
-                                "its child ended with a cide restart; Resume continues the \
+                    saved.blocked_reason.or_else(|| {
+                        Some(
+                            match parked_at_quit {
+                                Some(parked) => parked.note(),
+                                None => {
+                                    "its child ended with a cide restart; Resume continues the \
                                      conversation"
+                                }
                             }
-                        }
-                        .to_string(),
-                    ),
+                            .to_string(),
+                        )
+                    }),
                 ),
             };
             // History never comes back parked: the flag steers a resume, and a terminal row
@@ -7182,6 +7647,7 @@ impl AgentRegistry {
             inner.runs.insert(
                 saved.run,
                 LiveRun {
+                    planning: saved.planning,
                     run: saved.run,
                     agent: saved.agent,
                     agent_label: saved.agent_label,
@@ -7311,7 +7777,10 @@ impl AgentRegistry {
                 .filter(|live| {
                     !matches!(
                         live.state,
-                        RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+                        RunState::Finished { .. }
+                            | RunState::Cancelled { .. }
+                            | RunState::Failed { .. }
+                            | RunState::Interrupted
                     )
                 })
                 .filter_map(|live| live.session.map(|session| (live.run, session)))
@@ -7347,7 +7816,7 @@ impl AgentRegistry {
 /// Which of the panel's groups a state belongs to. See `AgentRoster::Ready::runs`.
 fn group_rank(state: &RunState) -> u8 {
     match state {
-        RunState::Running | RunState::AwaitingPermission => 0,
+        RunState::Running | RunState::AwaitingPermission | RunState::Blocked { .. } => 0,
         RunState::Starting => 1,
         RunState::Paused { .. } => 2,
         RunState::Idle => 3,
@@ -7355,7 +7824,7 @@ fn group_rank(state: &RunState) -> u8 {
         // actionable, and sorting it into the finished tail would bury the one row that still
         // has a Resume on it.
         RunState::Queued | RunState::Interrupted => 4,
-        RunState::Finished { .. } | RunState::Failed { .. } => 5,
+        RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. } => 5,
     }
 }
 
@@ -7618,8 +8087,25 @@ struct Started {
 impl AgentRegistry {
     /// Start every run the queue will admit. Returns at once; each start runs on its own task.
     /// Replace one project's path table. (M132) See [`refresh_paths`].
+    #[cfg(test)]
     fn set_paths(&self, project: ProjectId, table: PathTable) {
         self.inner.lock().paths.insert(project, table);
+    }
+
+    fn begin_path_refresh(&self, project: ProjectId) -> u64 {
+        let mut inner = self.inner.lock();
+        let epoch = inner.path_epochs.entry(project).or_default();
+        *epoch += 1;
+        *epoch
+    }
+
+    fn set_paths_if_current(&self, project: ProjectId, epoch: u64, table: PathTable) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.path_epochs.get(&project).copied() != Some(epoch) {
+            return false;
+        }
+        inner.paths.insert(project, table);
+        true
     }
 
     pub fn pump(self: &Arc<Self>, app: &AppHandle) {
@@ -7794,6 +8280,7 @@ impl AgentRegistry {
         run: RunId,
         flavor: &cide_agents::harness::opencode::Flavor,
         plan: &cide_agents::RunPlan<'_>,
+        decision: Option<&crate::decision::Handle>,
     ) -> Option<cide_agents::RunServer> {
         let stale = {
             let mut inner = self.inner.lock();
@@ -7826,6 +8313,25 @@ impl AgentRegistry {
                 return None;
             }
         };
+        let mut spec = spec;
+        if let Some(h) = decision {
+            let key = "OPENCODE_CONFIG_CONTENT";
+            let mut document = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| serde_json::from_str(v).ok())
+                .unwrap_or(serde_json::json!({}));
+            let v2 = plan
+                .opencode_flags
+                .as_ref()
+                .is_some_and(|f| f.generation == cide_agents::harness::opencode::Generation::V2);
+            match h.install_opencode(&mut spec, &mut document, v2) {
+                Ok(()) => spec.env.push((key.into(), document.to_string())),
+                Err(_) => h.available(false, "Decision plugin could not be prepared"),
+            }
+        }
         let pty = match PtySession::spawn(spec) {
             Ok(pty) => pty,
             Err(error) => {
@@ -8327,9 +8833,22 @@ impl AgentRegistry {
                 && run.checkout.as_deref() == Some(name)
                 && !matches!(
                     run.state,
-                    RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+                    RunState::Finished { .. }
+                        | RunState::Cancelled { .. }
+                        | RunState::Failed { .. }
+                        | RunState::Interrupted
                 )
         })
+    }
+
+    /// The board task whose checkout this is, even after its last run has ended.
+    fn checkout_task(&self, project: ProjectId, name: &str) -> Option<TaskId> {
+        self.inner
+            .lock()
+            .runs
+            .values()
+            .find(|run| run.project == project && run.checkout.as_deref() == Some(name))
+            .and_then(|run| run.task.clone())
     }
 
     /// This run's checkout, if the run is over and had one. What [`after_transition`] offers
@@ -8339,7 +8858,7 @@ impl AgentRegistry {
         let live = inner.runs.get(&run)?;
         if !matches!(
             live.state,
-            RunState::Finished { .. } | RunState::Failed { .. }
+            RunState::Finished { .. } | RunState::Cancelled { .. } | RunState::Failed { .. }
         ) {
             return None;
         }
@@ -8545,7 +9064,10 @@ impl AgentRegistry {
         }
         if matches!(
             live.state,
-            RunState::Finished { .. } | RunState::Failed { .. } | RunState::Interrupted
+            RunState::Finished { .. }
+                | RunState::Cancelled { .. }
+                | RunState::Failed { .. }
+                | RunState::Interrupted
         ) {
             return None;
         }
@@ -8746,7 +9268,14 @@ impl AgentRegistry {
                         }
                     }
                 }
-                self.fail(Some(app), run, "stopped before it started");
+                self.set_state(
+                    Some(app),
+                    run,
+                    RunState::Cancelled {
+                        reason: "stopped before it started".into(),
+                        code: None,
+                    },
+                );
                 Stopped::BeforeStart
             }
             StopRoute::Nothing => Stopped::AlreadyOver,
@@ -8755,7 +9284,14 @@ impl AgentRegistry {
             // means "do not resume this": the row closes into Recent, the conversation stays on
             // disk, and a fresh dispatch remains available.
             StopRoute::Discard => {
-                self.fail(Some(app), run, "discarded without resuming");
+                self.set_state(
+                    Some(app),
+                    run,
+                    RunState::Cancelled {
+                        reason: "discarded without resuming".into(),
+                        code: None,
+                    },
+                );
                 Stopped::Discarded
             }
             StopRoute::Kill { why } => {
@@ -9187,6 +9723,7 @@ fn start_child(
     let events_path = event_tap::path_for(facts.agent_sock.as_deref(), admission.run);
 
     let plan = RunPlan {
+        planning: registry.planning(admission.run),
         run: admission.run,
         session,
         agent,
@@ -9256,6 +9793,13 @@ fn start_child(
         // name tools it cannot call — the same failure by a third road.
         tracker_paragraphs: matches!(admission.purpose, RunPurpose::Work(_))
             && cide_agents::config::load_tracker(&facts.root),
+        worker_instructions: Some(
+            project
+                .config
+                .agents
+                .worker_instructions_template()
+                .to_string(),
+        ),
         review: matches!(admission.purpose, RunPurpose::MrReview { .. }),
         server: None,
         git_dirs,
@@ -9438,6 +9982,35 @@ fn start_child(
         }
         brief.push_str(note);
     }
+    let decision_handle = if matches!(resolved.harness, Harness::Codex | Harness::Opencode) {
+        let source_session = registry
+            .inner
+            .lock()
+            .runs
+            .get(&admission.run)
+            .and_then(|r| match r.notify {
+                RunNotify::Session { session } => Some(session),
+                _ => None,
+            });
+        let lineage = source_session
+            .and_then(|session| crate::decision::lineage(app, session))
+            .unwrap_or_else(|| admission.run.to_string());
+        Some(crate::decision::register(
+            app,
+            session,
+            admission.project,
+            if resolved.harness == Harness::Codex {
+                cide_ipc::ConsoleHarness::Codex
+            } else {
+                cide_ipc::ConsoleHarness::Opencode
+            },
+            plan.cwd.clone(),
+            lineage,
+            true,
+        ))
+    } else {
+        None
+    };
     if let Some(flavor) = cide_agents::harness::opencode::Flavor::of(resolved.harness) {
         // Asked of the installed binary before the first spec is built (M108): which of cide's
         // flags it has. Forks once per binary version, here on the blocking pool, so the spec
@@ -9454,8 +10027,17 @@ fn start_child(
         // Keyed on the flag alone, every 2.x machine would silently lose the live TUI a pane
         // attaches to, and would log a sentence that is true about `--password` and wrong about
         // the CLI. (M110)
-        plan.server = if flags.can_attach() {
-            registry.ensure_server(admission.run, flavor, &plan)
+        plan.server = if plan.planning.is_some() {
+            None
+        } else if flags.can_attach() {
+            registry.ensure_server(
+                admission.run,
+                flavor,
+                &plan,
+                decision_handle
+                    .as_ref()
+                    .filter(|_| crate::decision::configured(app, Some(admission.project))),
+            )
         } else {
             // A CLI whose `run` can send no password at all could only use an unguarded server.
             // It runs standalone, as before M105 — the full TUI on a live run is what it gives up.
@@ -9480,11 +10062,112 @@ fn start_child(
     // The one difference between a fresh child and a continuing one, and it is the harness's to
     // express: `respawn_spec` names the conversation the CLI already minted. See
     // `AgentRegistry::respawn`.
-    let spawn = match resume {
+    let mut spawn = match resume {
         Some(previous) => harness.respawn_spec(&plan, previous),
         None => harness.spawn_spec(&plan),
     }
     .map_err(|error| CoreError::Io(error.to_string()))?;
+
+    let native_planning = plan.planning.clone().map(|state| {
+        let execution = plan
+            .agent
+            .permission_mode
+            .as_deref()
+            .filter(|mode| *mode != "plan")
+            .unwrap_or(match plan.unattended {
+                cide_agents::Unattended::Auto => "auto",
+                cide_agents::Unattended::Bypass => "bypassPermissions",
+                cide_agents::Unattended::Ask => "manual",
+            });
+        crate::native_plan::register(
+            app,
+            Some(admission.project),
+            session,
+            Some(admission.run),
+            resolved.harness,
+            state,
+            execution.into(),
+        )
+    });
+    if resolved.harness == Harness::Claude
+        && native_planning.as_ref().is_some_and(|plan| plan.pending())
+    {
+        if !crate::native_plan::claude_observable(&spawn.spec.args) {
+            return Err(CoreError::Io(
+                "Native plan approval requires Claude's hook integration".into(),
+            ));
+        }
+        spawn.spec.args = crate::native_plan::claude_args(
+            &spawn.spec.args,
+            native_planning.as_ref().unwrap().execution(),
+        );
+    }
+    let mut native_opencode = None;
+    if native_planning.is_some() && resolved.harness.reads_provider_document() {
+        let prefix = if resolved.harness == Harness::Mimo {
+            "MIMOCODE_CONFIG_CONTENT"
+        } else {
+            "OPENCODE_CONFIG_CONTENT"
+        };
+        let document: serde_json::Value = spawn
+            .spec
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == prefix)
+            .and_then(|(_, value)| serde_json::from_str(value).ok())
+            .ok_or_else(|| CoreError::Io("the worker has no native role configuration".into()))?;
+        let role = document
+            .get("agents")
+            .or_else(|| document.get("agent"))
+            .and_then(|agents| agents.get(plan.agent.def.id.as_str()));
+        let instructions = role
+            .and_then(|role| role["system"].as_str().or_else(|| role["prompt"].as_str()))
+            .map(str::to_string);
+        let mut settings = app
+            .state::<crate::workspace_state::WorkspaceState>()
+            .with(|ws| ws.settings.clone());
+        settings.claude = plan.claude.clone();
+        settings.opencode.cli = plan.opencode_cli.clone();
+        settings.llm = plan.llm.clone();
+        let model = spawn
+            .spec
+            .args
+            .windows(2)
+            .find(|args| args[0] == "--model")
+            .map(|args| args[1].clone());
+        let start = crate::opencode_console::Start {
+            harness: resolved.harness,
+            settings,
+            spec: spawn.spec.clone(),
+            routing: session,
+            resume: resume.map(|id| cide_ipc::HarnessSession {
+                harness: resolved.harness,
+                id: id.into(),
+                cwd: cwd.clone(),
+            }),
+            fork: false,
+            prompt: Some(plan.prompt.clone()),
+            instructions,
+            model,
+            unattended: plan.unattended != cide_agents::Unattended::Ask,
+            reviewer: false,
+            paired: false,
+            decision: decision_handle.clone(),
+            planning: native_planning.clone(),
+            role_document: Some(document),
+        };
+        let (mut prepared, console) =
+            crate::opencode_console::Console::start(start).map_err(CoreError::Io)?;
+        prepared.render = None;
+        prepared.fixed_size = false;
+        registry.note_harness_session(admission.run, console.conversation().id.clone());
+        spawn.spec = prepared;
+        spawn.opening = None;
+        spawn.events = None;
+        spawn.binding = SessionBinding::Caller;
+        native_opencode = Some(console);
+    }
 
     let cide_agents::HarnessSpawn {
         spec,
@@ -9608,7 +10291,57 @@ fn start_child(
     {
         spec.output_observer = Some(hooks.codex_approval_observer(session));
     }
+    let codex_decision = if resolved.harness == Harness::Codex
+        && (native_planning.is_some() || crate::decision::configured(app, Some(admission.project)))
+    {
+        let observer = crate::codex_console::observer(app.clone(), session);
+        match crate::codex_console::Console::start_planning(
+            spec.clone(),
+            observer,
+            decision_handle.clone(),
+            native_planning.clone(),
+        ) {
+            Ok((prepared, console)) => {
+                spec = prepared;
+                Some(console)
+            }
+            Err(error) => {
+                if native_planning.is_some() {
+                    return Err(CoreError::Io(error));
+                }
+                if let Some(h) = decision_handle {
+                    h.available(false, &error);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if codex_decision.is_some()
+        && let Some(hooks) = app.try_state::<crate::hooks::HookServer>()
+    {
+        // Native lifecycle is authoritative; delayed CLI hooks must not resurrect a
+        // failed or completed turn, or adopt a helper conversation.
+        hooks.codex_native(session, None);
+    }
     let pty = PtySession::spawn(spec).map_err(|error| CoreError::Io(error.to_string()))?;
+    if let Some(plan) = &native_planning {
+        plan.watch_terminal(&pty);
+        if resolved.harness == Harness::Qwen && plan.pending() {
+            plan.start_qwen(&pty, admission.prompt.clone());
+        }
+    }
+    if let Some(console) = native_opencode {
+        app.state::<crate::peer_chat::Runtime>()
+            .note_console(session, console.clone());
+        console.observe(app.clone(), session, &pty);
+    }
+    if let Some(console) = codex_decision {
+        app.state::<crate::peer_chat::Runtime>()
+            .note_codex_console(session, console.clone());
+        console.observe(&pty);
+    }
 
     Ok(Started {
         session: pty,
@@ -9823,7 +10556,6 @@ pub(crate) fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, r
         registry.mark_changed(app, project);
     }
     registry.retire_server(run);
-    registry.pump(app);
     // What this run holds may have changed with it, and a run waiting on its paths may be free
     // now. (M132)
     if let Some(project) = project {
@@ -9844,40 +10576,40 @@ pub(crate) fn after_transition(app: &AppHandle, registry: &Arc<AgentRegistry>, r
 /// Called whenever what is in flight can have moved — a board change (`tasks_state::broadcast`),
 /// a run's transition, a dispatch — so admission reads facts no older than the last of those.
 pub(crate) fn refresh_paths_and_pump(app: &AppHandle, project: ProjectId) {
+    let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
+        return;
+    };
+    let epoch = registry.begin_path_refresh(project);
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(registry) = app.try_state::<Arc<AgentRegistry>>() else {
             return;
         };
         let registry = Arc::clone(&registry);
-        if let Some(table) = path_table(&app, &registry, project) {
-            registry.set_paths(project, table);
+        if let Some(table) = path_table(&app, &registry, project)
+            && !registry.set_paths_if_current(project, epoch, table)
+        {
+            return;
         }
         registry.pump(&app);
     });
 }
 
-/// Which tasks the runs hold, and whether each hold is live. (M132)
+/// Which tasks still have active turns. (M132)
 ///
-/// A run holds the task it is on while that task is open on the board. A task the board
-/// calls done holds nothing even under a live run: the reviewer merged it and closed it,
-/// and the run's tab outliving that — `retire_done` leaves a shown run idle on purpose —
-/// is not a reason to hold the repository from the next task. The idle child of a task
-/// still in review does hold: it is the send-back target until the reviewer closes it.
-fn path_holders(
-    runs: &[cide_ipc::AgentRun],
-    rows: &[cide_ipc::TaskRow],
-) -> Vec<(TaskId, AgentId, bool)> {
+/// Only a turn still working holds paths. A handed-back child can receive another turn, but
+/// it has released the scheduler's claim; an unmerged review branch is likewise not a worker.
+fn path_holders(runs: &[cide_ipc::AgentRun], rows: &[cide_ipc::TaskRow]) -> Vec<(TaskId, AgentId)> {
     let mut seen: Vec<TaskId> = Vec::new();
-    let mut out: Vec<(TaskId, AgentId, bool)> = Vec::new();
+    let mut out: Vec<(TaskId, AgentId)> = Vec::new();
     for run in runs {
         let live = matches!(
             run.state,
             RunState::Starting
+                | RunState::Blocked { .. }
                 | RunState::Running
                 | RunState::AwaitingPermission
                 | RunState::Paused { .. }
-                | RunState::Idle
         );
         if let (true, Some(task)) = (live, run.task.as_ref())
             && !seen.contains(task)
@@ -9889,7 +10621,7 @@ fn path_holders(
                 continue;
             }
             seen.push(task.clone());
-            out.push((task.clone(), run.agent.clone(), true));
+            out.push((task.clone(), run.agent.clone()));
         }
     }
     out
@@ -9897,10 +10629,8 @@ fn path_holders(
 
 /// The path table as the board and the checkouts say it is now. (M132)
 ///
-/// **Held** is every task a run is on (starting, running, waiting on a permission, paused, or
-/// idle having handed a turn back), and every task in doing or review whose branch or checkout
-/// holds changes — the declaration plus the files actually changed, so a run that strayed
-/// outside its `touches` still holds what it touched.
+/// **Held** is every task with an active turn, including a paused child. Its declaration and
+/// changed files guard parallel work until that turn hands back.
 fn path_table(
     app: &AppHandle,
     registry: &Arc<AgentRegistry>,
@@ -9920,22 +10650,8 @@ fn path_table(
         table.touches.insert(row.id.clone(), row.touches.clone());
     }
     let runs = registry.runs_for(project);
-    let mut candidates = path_holders(&runs, &rows);
-    let mut seen: Vec<TaskId> = candidates.iter().map(|(task, _, _)| task.clone()).collect();
-    for row in rows.iter().filter(|r| {
-        matches!(
-            r.status,
-            cide_ipc::TaskStatus::Doing | cide_ipc::TaskStatus::Review
-        )
-    }) {
-        if let Some(agent) = row.agent.as_ref()
-            && !seen.contains(&row.id)
-        {
-            seen.push(row.id.clone());
-            candidates.push((row.id.clone(), agent.clone(), false));
-        }
-    }
-    for (task, agent, live) in candidates {
+    let candidates = path_holders(&runs, &rows);
+    for (task, agent) in candidates {
         let name = cide_agents::checkout_name(&agent, Some(&task));
         let mut files =
             crate::milestones::changed_paths(&root, &format!("cide/{name}")).unwrap_or_default();
@@ -9946,10 +10662,6 @@ fn path_table(
                     files.push(file);
                 }
             }
-        }
-        // A task in doing or review with nothing on its branch holds nothing yet.
-        if !live && files.is_empty() {
-            continue;
         }
         let touches = rows
             .iter()
@@ -9978,6 +10690,9 @@ fn path_table(
 ///   directory that no longer exists. `Interrupted` does not hold it: there is no child, and a
 ///   Resume's `bring_up` calls `worktree::ensure`, which re-makes the checkout from the kept
 ///   branch. A queued run does hold it — it is about to stand there;
+/// * **the task is no longer doing** — an interrupted or failed run can leave a task in
+///   `doing` on a branch merged during an earlier review. That checkout still belongs to
+///   unfinished work, even if it is clean at this instant;
 /// * **no pane's child stands in it** — asked of the session registry by [`a_pane_stands_in`].
 ///   The registry of runs is not enough, and the case that proved it is **the reviewer**: the
 ///   tab cide opens for a finished run (M79) is started *in the worktree it reviews*, is not a
@@ -10003,6 +10718,16 @@ pub(crate) fn retire_worktree(
 ) {
     if registry.checkout_in_use(project, &name) {
         tracing::debug!(checkout = %name, "a run still holds this worktree; keeping it for now");
+        return;
+    }
+    if let Some(task) = registry.checkout_task(project, &name)
+        && let Some(stores) = app.try_state::<Arc<crate::tasks_state::TasksStores>>()
+        && let Some(store) = stores.get(project)
+        && store
+            .get(&task)
+            .is_some_and(|task| task.status == cide_ipc::TaskStatus::Doing)
+    {
+        tracing::info!(checkout = %name, %task, "task is still doing; keeping its worktree");
         return;
     }
     let Some(root) = app
@@ -10538,6 +11263,57 @@ impl Coalescer {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_old_path_scan_cannot_restore_a_released_hold() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let older = registry.begin_path_refresh(project);
+        let newer = registry.begin_path_refresh(project);
+        let mut held = PathTable::default();
+        held.holds.push((
+            TaskId("t-1".into()),
+            cide_agents::paths::Held {
+                touches: Vec::new(),
+                files: Vec::new(),
+            },
+        ));
+        assert!(registry.set_paths_if_current(project, newer, PathTable::default()));
+        assert!(!registry.set_paths_if_current(project, older, held));
+        assert!(
+            registry
+                .inner
+                .lock()
+                .paths
+                .get(&project)
+                .unwrap()
+                .holds
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_requested_stop_records_cancellation_and_the_real_exit_code() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        registry.take_admissions();
+        registry.set_state(None, run, RunState::Running);
+        registry.inner.lock().runs.get_mut(&run).unwrap().stop = Some(StopRecord {
+            by: StopBy::Orchestrator,
+            reason: None,
+            how: StopHow::Immediate { why: None },
+            grace_secs: 0,
+        });
+        registry.set_state(None, run, RunState::Finished { code: 129 });
+        assert_eq!(
+            registry.inner.lock().runs.get(&run).unwrap().state,
+            RunState::Cancelled {
+                reason: "stopped by the orchestrator".into(),
+                code: Some(129)
+            }
+        );
+    }
+
     /// A park is ended only while it is the same park, with no stop under way and nobody
     /// looking — a person with the run open answers the prompt themselves. (M118)
     #[test]
@@ -10638,6 +11414,7 @@ mod tests {
     /// names explicitly.
     fn spec(project: ProjectId, agent: &str, agent_limit: u16, project_limit: u16) -> DispatchSpec {
         DispatchSpec {
+            planning: None,
             project,
             agent: AgentId(agent.into()),
             agent_label: agent.to_string(),
@@ -10653,6 +11430,299 @@ mod tests {
             purpose: RunPurpose::default(),
             pool: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dispatch_queue_diagnostics_use_current_capacity_and_pause() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let first = registry
+            .enqueue_unique(spec(project, "developer", 1, 1))
+            .unwrap();
+        registry.take_admissions();
+        let mut next = spec(project, "developer", 1, 1);
+        next.task = Some(TaskId("t-2".into()));
+        let waiting = registry.enqueue_unique(next).unwrap();
+        let reasons = registry.queue_reasons(waiting);
+        assert!(reasons.iter().any(|r| r.code == "roleLimit"));
+        assert!(reasons.iter().any(|r| r.code == "projectLimit"));
+        registry.inner.lock().paused_projects.insert(project);
+        assert!(
+            registry
+                .queue_reasons(waiting)
+                .iter()
+                .any(|r| r.code == "paused")
+        );
+        registry.inner.lock().paused_projects.remove(&project);
+        registry.set_state(None, first, RunState::Finished { code: 0 });
+        let reasons = registry.queue_reasons(waiting);
+        assert!(
+            reasons
+                .iter()
+                .all(|r| r.code != "roleLimit" && r.code != "projectLimit")
+        );
+        assert!(registry.queue_reasons(RunId::new()).is_empty());
+    }
+
+    #[test]
+    fn dispatch_queue_diagnostics_explain_pool_checkout_and_file_holds() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut work = spec(project, "developer", 5, 5);
+        work.task = Some(TaskId("t-1".into()));
+        work.checkout = Some("same-checkout".into());
+        work.pool = vec![cide_ipc::PoolEntry {
+            max_running: Some(1),
+            ..pool_entry("local", "model")
+        }];
+        let first = registry.enqueue(work.clone());
+        assert_eq!(registry.take_admissions().len(), 1);
+        work.task = Some(TaskId("t-2".into()));
+        let waiting = registry.enqueue(work);
+        let mut table = PathTable::default();
+        table
+            .touches
+            .insert(TaskId("t-2".into()), vec!["ui/menus/match_setup.gd".into()]);
+        table.holds.push((
+            TaskId("t-1".into()),
+            cide_agents::paths::Held {
+                touches: vec!["ui/menus/".into()],
+                files: Vec::new(),
+            },
+        ));
+        registry.set_paths(project, table);
+        let reasons = registry.queue_reasons(waiting);
+        for code in ["poolLimit", "checkoutBusy", "pathsBusy"] {
+            assert!(
+                reasons.iter().any(|r| r.code == code),
+                "missing {code}: {reasons:?}"
+            );
+        }
+        assert!(
+            reasons
+                .iter()
+                .find(|r| r.code == "pathsBusy")
+                .unwrap()
+                .text
+                .contains("t-1")
+        );
+        registry.set_state(None, first, RunState::Finished { code: 0 });
+        registry.set_paths(project, PathTable::default());
+        assert!(
+            registry
+                .queue_reasons(waiting)
+                .iter()
+                .all(|r| r.code == "queue")
+        );
+    }
+
+    #[test]
+    fn codex_capacity_failure_releases_the_slot_without_completing_native_planning() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut work = spec(project, "developer", 1, 1);
+        work.harness = Harness::Codex;
+        work.task = Some(TaskId("t-capacity".into()));
+        work.planning = Some(Default::default());
+        let run = registry.enqueue(work);
+        registry.take_admissions();
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry.set_state(None, run, RunState::Running);
+        let failed = HookFrame::new(
+            "CideTurnFailed",
+            serde_json::json!({
+                "session_id":session.to_string(), "turn_id":"planning",
+                "error":{"message":"Selected model is at capacity. Please try a different model.", "codexErrorInfo":"serverOverloaded"}
+            }),
+        );
+        let next = registry
+            .observe(None, session, Observation::Hook(&failed))
+            .unwrap()
+            .1;
+        assert!(matches!(next, RunState::Blocked { ref reason } if reason.contains("at capacity")));
+        {
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert!(!live.slot);
+            assert!(live.working_since_unix_ms.is_none());
+            assert!(live.planning.as_ref().unwrap().pending());
+            assert!(!spec_turn_complete(live));
+            assert!(holds_its_checkout(live));
+            assert_eq!(
+                holder_in(&inner, project, &live.agent, live.task.as_ref().unwrap())
+                    .unwrap()
+                    .run,
+                run
+            );
+        }
+        assert!(registry.follow_up_reachable(project, run));
+        assert!(
+            registry
+                .observe(None, session, Observation::Hook(&failed))
+                .is_none()
+        );
+        let late = HookFrame::new(
+            "Stop",
+            serde_json::json!({"session_id":session.to_string()}),
+        );
+        assert!(
+            registry
+                .observe(None, session, Observation::Hook(&late))
+                .is_none()
+        );
+        let queued = registry.enqueue(spec(project, "other", 1, 1));
+        assert_eq!(registry.take_admissions()[0].run, queued);
+        assert!(reserve_blocked_retry(&mut registry.inner.lock(), run).is_err());
+        registry.set_state(None, queued, RunState::Finished { code: 0 });
+        assert!(
+            registry
+                .plan_follow_up(project, run, "Try again")
+                .unwrap()
+                .is_some()
+        );
+        assert!(reserve_blocked_retry(&mut registry.inner.lock(), run).unwrap());
+        let prompt = HookFrame::new(
+            "UserPromptSubmit",
+            serde_json::json!({"session_id":session.to_string()}),
+        );
+        assert_eq!(
+            registry
+                .observe(None, session, Observation::Hook(&prompt))
+                .unwrap()
+                .1,
+            RunState::Running
+        );
+        assert_eq!(registry.inner.lock().project_slots[&project], 1);
+        assert!(
+            registry.planning(run).unwrap().pending(),
+            "manual retry preserves the native planning phase"
+        );
+    }
+
+    #[test]
+    fn blocked_codex_turn_restores_as_waiting_with_its_failure_reason() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        registry.take_admissions();
+        registry.set_state(None, run, RunState::Running);
+        registry.set_state(
+            None,
+            run,
+            RunState::Blocked {
+                reason: "Selected model is at capacity".into(),
+            },
+        );
+        let path = std::env::temp_dir().join(format!("cide-blocked-{}.json", RunId::new()));
+        registry.write_snapshot_now(&path);
+        let restored = AgentRegistry::default();
+        restored.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        std::fs::remove_file(&path).unwrap();
+        let rows = restored.runs_for(project);
+        assert_eq!(rows[0].state, RunState::Interrupted);
+        assert!(rows[0].note.as_deref().unwrap().contains("at capacity"));
+        let inner = restored.inner.lock();
+        assert_eq!(inner.runs[&run].parked_at_quit, Some(ParkedAtQuit::Blocked));
+        assert!(!spec_turn_complete(&inner.runs[&run]));
+        drop(inner);
+        // A second restart must not forget that this Interrupted row was blocked.
+        restored.write_snapshot_now(&path);
+        let again = AgentRegistry::default();
+        again.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            again.runs_for(project)[0]
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("at capacity")
+        );
+        // Shutdown can observe the child exit before writing the final snapshot.
+        registry.begin_going_down();
+        registry.set_state(None, run, RunState::Interrupted);
+        registry.write_snapshot_now(&path);
+        let shutdown = AgentRegistry::default();
+        shutdown.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            shutdown.runs_for(project)[0]
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("at capacity")
+        );
+    }
+
+    #[test]
+    fn native_planning_keeps_the_slot_until_implementation_hands_back() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut work = spec(project, "developer", 1, 1);
+        work.planning = Some(Default::default());
+        let run = registry.enqueue(work);
+        let waiting = registry.enqueue(spec(project, "other", 1, 1));
+        assert_eq!(registry.take_admissions().len(), 1);
+        registry.set_state(None, run, RunState::Running);
+        for phase in [
+            cide_agents::native_plan::Phase::Planning,
+            cide_agents::native_plan::Phase::Approving,
+        ] {
+            registry
+                .inner
+                .lock()
+                .runs
+                .get_mut(&run)
+                .unwrap()
+                .planning
+                .as_mut()
+                .unwrap()
+                .phase = phase;
+            assert!(!registry.set_state(None, run, RunState::Idle));
+            assert!(registry.take_admissions().is_empty());
+            assert!(registry.inner.lock().runs[&run].slot);
+        }
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&run)
+            .unwrap()
+            .planning
+            .as_mut()
+            .unwrap()
+            .phase = cide_agents::native_plan::Phase::Implementing;
+        assert!(registry.set_state(None, run, RunState::Idle));
+        assert_eq!(registry.take_admissions()[0].run, waiting);
+    }
+
+    #[test]
+    fn native_planning_snapshots_preserve_progress_and_missing_state_is_legacy() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut work = spec(project, "developer", 1, 1);
+        let state = cide_agents::native_plan::State {
+            phase: cide_agents::native_plan::Phase::Implementing,
+            ..Default::default()
+        };
+        work.planning = Some(state.clone());
+        let run = registry.enqueue(work);
+        let path = std::env::temp_dir().join(format!("cide-native-planning-{}.json", RunId::new()));
+        registry.write_snapshot_now(&path);
+        let restored = AgentRegistry::default();
+        restored.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        assert_eq!(restored.planning(run), Some(state));
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("planning");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = AgentRegistry::default();
+        restored.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| false);
+        assert!(restored.planning(run).is_none());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -10695,13 +11765,9 @@ mod tests {
         let mut second_task = spec(project, "qa", 2, 4);
         second_task.task = Some(TaskId("t-2".into()));
         second_task.change = Some("add-dark-mode".into());
-        assert_eq!(
-            registry
-                .enqueue_unique(second_task)
-                .expect_err("same change, another task")
-                .run,
-            original
-        );
+        let second = registry
+            .enqueue_unique(second_task)
+            .expect("different work tasks on one change use the path gate");
         apply.project = ProjectId::new();
         assert!(
             registry.enqueue_unique(apply.clone()).is_ok(),
@@ -10714,6 +11780,13 @@ mod tests {
             .get_mut(&original)
             .expect("run")
             .state = RunState::Finished { code: 0 };
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&second)
+            .expect("second run")
+            .state = RunState::Finished { code: 0 };
         apply.project = project;
         assert!(
             registry.enqueue_unique(apply).is_ok(),
@@ -10722,7 +11795,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_apply_admission_creates_one_run_for_a_change() {
+    fn concurrent_work_tasks_on_one_change_are_distinct_runs() {
         let registry = Arc::new(AgentRegistry::default());
         let barrier = Arc::new(std::sync::Barrier::new(4));
         let project = ProjectId::new();
@@ -10743,18 +11816,8 @@ mod tests {
             .into_iter()
             .map(|thread| thread.join().expect("worker"))
             .collect();
-        assert_eq!(answers.iter().filter(|answer| answer.is_ok()).count(), 1);
-        let winner = answers
-            .iter()
-            .find_map(|answer| answer.as_ref().ok())
-            .expect("winner");
-        assert!(
-            answers
-                .iter()
-                .filter_map(|answer| answer.as_ref().err())
-                .all(|held| held.run == *winner)
-        );
-        assert_eq!(registry.spec_runs(project).len(), 1);
+        assert_eq!(answers.iter().filter(|answer| answer.is_ok()).count(), 4);
+        assert_eq!(registry.spec_runs(project).len(), 4);
     }
 
     #[test]
@@ -13098,23 +14161,16 @@ mod tests {
             "a done task holds nothing even under a live run"
         );
 
-        // Still in review: the idle child is the send-back target, so it holds.
+        // Still in review: the idle child can receive a follow-up, but holds no paths.
         let review = [row("t-20", "review")];
         let holders = path_holders(&runs, &review);
-        assert_eq!(
-            holders.len(),
-            1,
-            "the idle child of a review task still holds"
+        assert!(
+            holders.is_empty(),
+            "review cannot hold the queue after hand-back"
         );
-        assert_eq!(holders[0].0, TaskId("t-20".into()));
-        assert!(holders[0].2, "and the hold is live");
 
         // A task the board has no row for keeps the old conservative hold.
-        assert_eq!(
-            path_holders(&runs, &[]).len(),
-            1,
-            "no row: the run still holds"
-        );
+        assert!(path_holders(&runs, &[]).is_empty());
     }
 
     #[test]
@@ -16272,6 +17328,7 @@ mod tests {
         }
 
         // Ended, with the transcript under the worktree: the real harness, from there.
+        std::fs::create_dir_all(&cwd).expect("test checkout");
         pty.kill();
         wait_exited(&pty);
         registry.set_state(None, run, RunState::Finished { code: 0 });
@@ -16325,6 +17382,22 @@ mod tests {
             }
             other => panic!("nothing to show, got {other:?}"),
         }
+
+        std::fs::remove_dir_all(&root).expect("remove test checkout");
+        match registry
+            .open_plan_with(project, run, &none, &root, true, |_, _, _| true)
+            .expect("the run exists")
+        {
+            RunOpen::ReadOnly { conversation } => {
+                assert_eq!(conversation.id, session.to_string());
+                assert_eq!(conversation.cwd, cwd);
+            }
+            other => panic!("a missing checkout must open a read-only archive, got {other:?}"),
+        }
+        assert!(
+            !cwd.exists(),
+            "opening the archive must not recreate its checkout"
+        );
     }
 
     /// An opencode run's conversation is the `ses_…` it printed, re-opened in the TUI from the
@@ -16335,7 +17408,10 @@ mod tests {
         let registry = Arc::new(AgentRegistry::default());
         let sessions = SessionRegistry::default();
         let project = ProjectId::new();
-        let root = PathBuf::from("/p");
+        let root =
+            std::env::temp_dir().join(format!("cide-opencode-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(cide_git::worktree::path_of(&root, "qa-t-2"))
+            .expect("test checkout");
 
         let run = registry.enqueue(opencode_spec(project, "qa"));
         registry.take_admissions();
@@ -16401,6 +17477,7 @@ mod tests {
             live.reopenable = false;
         }
         assert!(!registry.runs_for(project)[0].openable);
+        std::fs::remove_dir_all(root).expect("remove test checkout");
     }
 
     /// The registry never starts a second harness process on a conversation a pane is driving

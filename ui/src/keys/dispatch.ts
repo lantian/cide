@@ -1,3 +1,4 @@
+import { showProblems } from '@/toolwindow/selection'
 /**
  * Command dispatch — what actually happens when the gate resolves a chord, or the palette
  * runs a row.
@@ -48,6 +49,7 @@
  * a dispatcher closed over render output would act on whatever the last render saw.
  */
 import { useOverlays } from '@/overlays/store'
+import { openSearch, useSearchSessions, EMPTY_DRAFT } from '@/search/store'
 import { useFileTree } from '@/sidebar/treeStore'
 import { treeFocused } from '@/sidebar/treeFocus'
 import { applyScope, scopeFromTree } from '@/sidebar/searchScope'
@@ -697,6 +699,8 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       /* ------------------------------------------------------------------ Window: tabs */
 
+      case 'experimental.decisionInsights':
+        return useOverlays.getState().show('decisionInsights')
       case 'experimental.peerChat': {
         const project = activeProjectOf(boot())
         if (project === null) return unmet(command, 'no open project')
@@ -2001,7 +2005,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * reachable through Back, because whatever brought the caret into this file recorded an
          * entry. `editor/navHistory.ts` carries the full list of what is and is not recorded.
          */
-        requestReveal(caret.path, {
+        requestReveal(caret.revealKey ?? caret.path, {
           line: to.startLine,
           column: to.startColumn,
           endColumn: to.endColumn,
@@ -2105,41 +2109,32 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       /* -------------------------------------------------------------------------- View */
 
+      case 'search.everywhere':
+        openSearch('all')
+        return
+
       case 'picker.symbols':
-        // Toggling, like `picker.files`: Escape is the only other way out of an overlay.
-        //
         // The index is built lazily and idempotently, so asking here — rather than at project
         // open — means a user who never presses this never pays for a symbol walk.
         if (activeProjectOf(boot()) === null) return unmet(command, 'no open project')
-        useOverlays.getState().toggle('symbols')
+        openSearch('symbols')
         return
 
       case 'picker.files':
-        // `toggle`, not `show`: Ctrl+P with the picker already up closes it. The gate
-        // swallows the chord either way, so a `show` here would leave the user with no
-        // keystroke that dismisses what their keystroke opened except Escape.
-        useOverlays.getState().toggle('files')
+        if (activeProjectOf(boot()) === null) return unmet(command, 'no open project')
+        openSearch('files')
         return
 
-      case 'picker.libraries':
-        /*
-         * Widen — or narrow — the file picker's scope.
-         *
-         * It flips a flag and nothing else. Starting the walk is `FilePicker`'s, on an effect
-         * keyed to the flag, and deliberately: the walk needs a project id and the overlay has
-         * one, this does not, and a second place that could start a `cargo metadata` is a second
-         * place to get "at most once per project" wrong.
-         *
-         * Reachable two ways, which is the point of it being a command at all. From the keyboard
-         * it is ⌥L while the picker has focus (`filePickerOpen`), and from the palette it sets
-         * the scope for the *next* Ctrl+P — the two overlays cannot be open at once, so from
-         * there it can only ever be a preparation, and that is a useful thing to be able to do.
-         */
-        useOverlays.getState().toggleLibraries()
+      case 'picker.libraries': {
+        const project = activeProjectOf(boot())?.id ?? null
+        const state = useSearchSessions.getState()
+        const draft = state.drafts[project ?? ''] ?? EMPTY_DRAFT
+        state.patchDraft(project, { descriptor: { ...draft.descriptor, libraries: !draft.descriptor.libraries } })
         return
+      }
 
       case 'palette.commands':
-        useOverlays.getState().toggle('commands')
+        openSearch('actions')
         return
 
       case 'help.about': {
@@ -2276,51 +2271,27 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
-      case 'sidebar.problems':
-        // Reveal, never toggle — the same call `sidebar.files` and `sidebar.git` make, and for
-        // the reason spelled out under `sidebar.search`: a panel is not an overlay, the ⚑ button
-        // is right there, and a second press that closed it would take away the thing the
-        // binding is for.
-        if (!requestPanel('problems')) return unmet(command, 'this window has no sidebar')
+      case 'sidebar.problems': {
+        const project = activeProjectOf(boot())
+        if (!project) return unmet(command, 'no open project')
+        if (!panelHostPresent()) return unmet(command, 'this window has no tool window')
+        void showProblems(project.id).catch(notifyFailure)
+        return
+      }
+      case 'languageServers.open':
+        window.dispatchEvent(new Event('cide:language-servers'))
+        return
+      case 'problems.jumpToSource':
+        window.dispatchEvent(new Event('cide:problem-open'))
         return
 
       case 'sidebar.search':
-        /*
-         * Reveal *and* focus, and never toggle shut.
-         *
-         * `picker.files` two screens up toggles because Escape is the only other way out of an
-         * overlay. A sidebar panel is not an overlay: the ⌕ button in the activity rail is
-         * right there, and a second Ctrl+Shift+F that closed the panel would take away the one
-         * thing this binding is for, which is landing in the search box with a chord. VS Code
-         * behaves the same way and for the same reason.
-         *
-         * Focusing is not a flourish. The panel had no keyboard path of any kind — no command,
-         * no binding, and no `ref`, `autoFocus` or focus effect on its input, so even the
-         * existing mouse path revealed a panel and left the caret in the terminal. Revealing
-         * without focusing would have been a new command with the old defect.
-         */
-        /*
-         * Pressed with the file tree focused, the chord also points the panel at the selected
-         * folder — a file row meaning its parent. That is the *only* thing focus changes here;
-         * from anywhere else this arm does exactly what it always did.
-         *
-         * The focus test is at runtime rather than in a `when` clause, and `treeFocus.ts`'s
-         * header is the argument: a `Command::when` does not gate the keyboard at all, and
-         * gating is not wanted anyway — the command must keep working everywhere. The tree's
-         * other focus-scoped chords live on its scroller instead, which this one cannot,
-         * because the gate is a window *capture* listener and `ctrl+shift+f` is bound, so the
-         * scroller's `onKeyDown` never runs for it.
-         *
-         * An existing scope is deliberately **left alone** when the press comes from anywhere
-         * else. A chord that silently widened a search back to the whole project would be
-         * worse than one that does not narrow it — the box is on screen with an ✕ beside it,
-         * and the panel opens with the boxes shown whenever either holds something.
-         */
+        // Keep the query and filters; tree focus changes only the folder scope.
         if (treeFocused()) {
           const scope = scopeFromTree()
           if (scope !== null) applyScope(scope)
         }
-        if (!requestPanel('search')) return unmet(command, 'this window has no sidebar')
+        openSearch('text')
         requestFocus('search')
         return
 

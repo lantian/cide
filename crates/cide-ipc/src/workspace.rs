@@ -586,6 +586,11 @@ pub struct Tab {
 pub enum TabKind {
     /// The pinned project console. Always `tabs[0]`; `tab.close` on it is an error.
     ClaudeHome,
+    /// A saved conversation shown without a process or working directory.
+    Conversation {
+        id: String,
+        title: String,
+    },
     /// A closable full-screen Claude tab. Splitting it creates *new* sessions.
     ClaudeFull {
         title: String,
@@ -894,6 +899,7 @@ impl TabKind {
     pub fn title(&self) -> String {
         match self {
             Self::ClaudeHome => "Claude".into(),
+            Self::Conversation { title, .. } => title.clone(),
             Self::ClaudeFull { title, .. } => title.clone(),
             Self::File { path, .. } => path
                 .file_name()
@@ -1065,6 +1071,7 @@ pub enum SettingsSection {
     ProjectsAndWindows,
     Keymap,
     ClaudeSessions,
+    Decision,
     Editor,
     /// What the file tree shows: dotfiles, ignored files. (M18)
     ///
@@ -1322,7 +1329,8 @@ pub struct Pane {
     /// ran — never from Settings → Harness directly — because the setting describes the *next*
     /// fresh console and this field describes the one that exists. A resume, a fork, a restore
     /// after restart and the Resume button all read it so the conversation goes back to the CLI
-    /// that owns it; only a fresh spawn (a new pane, Restart session) consults the setting.
+    /// that owns it; a fresh spawn consults the setting unless this pane has a
+    /// [`Self::harness_choice`] of its own.
     ///
     /// Meaningful only on a [`PaneKind::Claude`] pane. [`Self::conversation`] holds the codex
     /// thread id for a codex console: a codex conversation cannot be handed cide's id the way
@@ -1333,6 +1341,12 @@ pub struct Pane {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub harness: Option<crate::Harness>,
+    /// A harness chosen for this pane from its context menu. Unlike `harness`, which records
+    /// the child that actually ran, this is the pane's choice for later fresh starts. `None`
+    /// keeps the normal project default behavior for panes that have never been switched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness_choice: Option<crate::ConsoleHarness>,
     /// e.g. `cide : claude`, `cide : bash`, `cide : claude — diff`.
     pub title: String,
     /// The container this pane's bytes come from, when they come from one. (M42)

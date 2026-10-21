@@ -1,24 +1,11 @@
-/**
- * The git tool window's wiring: the workspace mirror in, commands out.
- *
- * Split from `ToolWindow.tsx` for the reason `GitPanelHost.tsx` is split from `GitPanel.tsx` —
- * the view stays server-renderable by a check script, and everything that needs a store, an
- * `invoke` or a live DOM is here.
- *
- * # Why there is no store
- *
- * The panel's state is **Rust-owned** — on `Project::tool_window`, or on
- * `Workspace::tool_window` for the shell with no project open, which is the same field in the
- * one place a project cannot be named — so the workspace mirror already *is* the store: a toggle bumps `rev`, `emit::workspace_changed` reaches every window, and
- * `store/workspace.ts` mirrors it. A zustand store beside that would be a second copy of one
- * fact, and `chrome/sidebarView.ts` records what happens when a boolean has two sources. The
- * commands are therefore called straight from here and from `keys/dispatch.ts`, and neither holds
- * any state of its own.
- *
- * The one thing the webview does own is the *painted* height, which has to be on the first frame
- * — see `ToolWindowSplitter.tsx`'s boot cache for why an IPC round trip is too late.
- */
-import { useCallback } from 'react'
+/** Bottom-panel wiring. Rust owns the layout and history tabs; the search registry owns
+ * runtime search sessions. This host mirrors those summaries and keeps only the selected
+ * transient tab (search, Docker or an extension) in webview state. Result sets stay out of
+ * workspace persistence and workspace broadcasts. */
+import { useCallback, useEffect, useRef } from 'react'
+import { ProblemsTab, type ProblemsTabProps } from './ProblemsTab'
+import { LanguageServerLogs } from './LanguageServerLogs'
+import { PROBLEMS_TAB, serverLogTabId, closeServerLogs } from './selection'
 import { logWalk, toolWindow as toolWindowApi } from '@/ipc/client'
 import type { HistoryTabId, ProjectId, RepoId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
@@ -40,9 +27,18 @@ import {
 import { ExtPanelHost } from '@/ext/ExtPanelHost'
 import { DockerPanel } from '@/sidebar/DockerPanel'
 import { useExtPanels } from '@/ext/extStore'
-import { useState } from 'react'
+import { useToolSelection, selectTransientToolTab, isSearchTab, searchTabId } from './selection'
+import { useSearchSessions, syncSessions, closeSession } from '@/search/store'
+import { tabLabel } from '@/search/model'
+import { PinnedSearch } from '@/search/PinnedSearch'
+import { notifyFailure } from '@/chrome/notices'
+import type { OpenHit } from '@/sidebar/SearchPanel'
+const NO_LOGS: { source: string; label: string }[] = []
+const NO_SEARCHES: import('@/ipc/client').SearchSession[] = []
 
 export interface ToolWindowHostProps {
+  problems?: Omit<ProblemsTabProps, 'project'> | undefined
+
   /**
    * Whose panel this is, or `null` for the shell that has **no project open**. (M74)
    *
@@ -55,9 +51,10 @@ export interface ToolWindowHostProps {
    * list, and Docker draws what it always draws — the daemon is a property of the machine.
    */
   project: ProjectId | null
+  onOpenHit?: OpenHit | undefined
 }
 
-export function ToolWindowHost({ project }: ToolWindowHostProps) {
+export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostProps) {
   const state = useWorkspace((s) =>
     project === null
       ? (s.boot?.workspace.toolWindow ?? null)
@@ -75,7 +72,26 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
    * Cleared whenever the extension that owned it goes away, so disabling an extension in another
    * window does not leave this one showing a tab that no longer exists.
    */
-  const [extActive, setExtActive] = useState<string | null>(null)
+  const transient = useToolSelection(s => s.byProject[project ?? ''] ?? null)
+  const logs = useToolSelection(s => s.logs[project ?? ''] ?? NO_LOGS)
+  const logActive = logs.find(row => serverLogTabId(row.source) === transient)
+  const problemsActive = transient === PROBLEMS_TAB
+  const extActive = isExtTab(transient) ? transient : null
+  const searches = useSearchSessions(s => project === null ? NO_SEARCHES : s.tabs[project] ?? NO_SEARCHES)
+  const searchActive = searches.find(tab => searchTabId(tab.id) === transient) ?? null
+  useEffect(() => {
+    if (project === null) return
+    void syncSessions(project).catch(notifyFailure)
+    const timer = setInterval(() => { void syncSessions(project).catch(() => {}) }, 1000)
+    return () => clearInterval(timer)
+  }, [project])
+  const lastRustActive = useRef({ project, active: state?.active })
+  useEffect(() => {
+    if (project === lastRustActive.current.project && state?.active !== lastRustActive.current.active) {
+      selectTransientToolTab(project, null)
+    }
+    lastRustActive.current = { project, active: state?.active }
+  }, [state?.active, project])
   /*
    * Whether the Docker tab is in front. (M46)
    *
@@ -84,27 +100,27 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
    * returns to the history tab the user had open, which is the behaviour a contributed tab
    * already has.
    */
-  const [dockerActive, setDockerActive] = useState(false)
+  const dockerActive = isDockerTab(transient)
   const shownExt =
     extActive !== null && panels.some((panel) => panel.view === extActive) ? extActive : null
 
   const onActivate = useCallback(
     (id: string | null) => {
+      if (id === PROBLEMS_TAB || id?.startsWith('lsp-log:')) { selectTransientToolTab(project, id); return }
+      if (isSearchTab(id)) { selectTransientToolTab(project, id); return }
       if (isDockerTab(id)) {
         // Never reaches Rust: `tool_window_activate` takes a uuid and `docker` is not one.
-        setExtActive(null)
-        setDockerActive(true)
+        selectTransientToolTab(project, DOCKER_TAB)
         return
       }
-      setDockerActive(false)
       if (isExtTab(id)) {
         // Never reaches Rust: `tool_window_activate` takes a `HistoryTabId`, which is a uuid, and
         // an `ext:` id is not one. Rust's own `active` is left exactly where it was, so switching
         // back to a contributed tab and away again returns to the history tab the user had open.
-        setExtActive(id)
+        selectTransientToolTab(project, id)
         return
       }
-      setExtActive(null)
+      selectTransientToolTab(project, null)
       void toolWindowApi.activate(project, id as HistoryTabId | null).catch(() => {})
     },
     [project],
@@ -115,6 +131,22 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
       // rather than asserted, because both commands below take a `ProjectId` and neither has
       // anything to answer without one.
       if (project === null) return
+      if (id.startsWith('lsp-log:')) {
+        closeServerLogs(project, id.slice('lsp-log:'.length))
+        return
+      }
+      if (isSearchTab(id)) {
+        const at = searches.findIndex(tab => searchTabId(tab.id) === id)
+        const session = searches[at]
+        if (session) void closeSession(session).then(() => {
+          if (useToolSelection.getState().byProject[project] !== id) return
+          const remaining = useSearchSessions.getState().tabs[project] ?? []
+          const neighbor = remaining[Math.max(0, at - 1)]
+          selectTransientToolTab(project, neighbor ? searchTabId(neighbor.id) : null)
+          if (!neighbor) void toolWindowApi.activate(project, null).catch(notifyFailure)
+        }).catch(notifyFailure)
+        return
+      }
       // Cancel first, then close. A walk over a deep repository outlives the tab that asked for
       // it by seconds, and nothing else would ever stop it: the registry's other cancellation is
       // *supersession* — the next `page` for the same key — and a closed tab issues no next page.
@@ -127,7 +159,7 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
       void logWalk.cancel(project, id).catch(() => {})
       void toolWindowApi.closeHistory(project, id as HistoryTabId).catch(() => {})
     },
-    [project],
+    [project, searches],
   )
   const onHide = useCallback(() => {
     void toolWindowApi.setLayout(project, { open: false }).catch(() => {})
@@ -145,13 +177,15 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
   })
   const tabs = {
     ...repaired,
+    logs,
+    search: searches.map(tab => ({ id: searchTabId(tab.id), title: tabLabel(tab.descriptor) })),
     ext: panels.map((panel) => ({ view: panel.view, label: panel.def.label })),
     // A contributed tab in front wins over Rust's `active`, which stays where it was — see
     // `onActivate`. `restoreTabs` has already repaired the stored half, and this cannot make it
     // invalid again because `shownExt` is only ever an id in `panels`.
     // Docker outranks a contributed tab, which outranks Rust's — the order the three are
     // *selected* in, so the last thing clicked is the thing in front.
-    active: dockerActive ? DOCKER_TAB : (shownExt ?? repaired.active),
+    active: problemsActive ? PROBLEMS_TAB : logActive ? serverLogTabId(logActive.source) : searchActive ? searchTabId(searchActive.id) : dockerActive ? DOCKER_TAB : (shownExt ?? repaired.active),
   }
   const rows = tabRow(tabs)
   const active = tabs.history.find((t) => t.id === tabs.active) ?? null
@@ -172,7 +206,13 @@ export function ToolWindowHost({ project }: ToolWindowHostProps) {
          * generation counter and the selection are all per question, and re-pointing would leave
          * one tab's rows on screen under another tab's heading for a frame.
          */}
-        {dockerActive ? (
+        {problemsActive ? (
+          <ProblemsTab key={project ?? 'none'} project={project} {...problems} />
+        ) : logActive && project ? (
+          <LanguageServerLogs key={`${project}:${logActive.source}`} project={project} source={logActive.source} label={logActive.label} />
+        ) : searchActive ? (
+          <PinnedSearch key={searchActive.id} session={searchActive} onOpenHit={onOpenHit} />
+        ) : dockerActive ? (
           /*
            * The machine's containers. (M46)
            *

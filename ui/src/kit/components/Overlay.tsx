@@ -44,7 +44,7 @@ export function Scrim({
 }
 
 /** `narrow` 420 for a one-question confirm, `default` 520, `picker` 620, `wide` 880. */
-export type DialogWidth = 'narrow' | 'default' | 'picker' | 'wide'
+export type DialogWidth = 'narrow' | 'default' | 'picker' | 'wide' | 'search'
 
 export type DialogProps = DivAttrs & {
   title: string

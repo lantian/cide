@@ -47,6 +47,8 @@ export interface MenuInvocation {
 }
 
 export interface UseContextMenuOptions {
+  readonly live?: boolean
+
   /** Accessible name for the menu, e.g. `File tree`. Not shown. */
   readonly label: string
   /** Built at open time. Return `[]` (or only separators) to decline to open at all. */
@@ -133,7 +135,7 @@ interface OpenMenu {
 }
 
 export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandle {
-  const { label, items, keymap, restoreFocus, search } = options
+  const { label, items, keymap, restoreFocus, search, live } = options
   const windowKeymap = useWindowKeymap()
   const chipFor = (keymap ?? windowKeymap).chipFor
 
@@ -142,8 +144,8 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
   const overlay = useOverlays((s) => s.open)
   const entries = useMemo(() => {
     if (open === null) return []
-    return search === undefined ? open.entries : resolveMenu(items(open.invocation, query), { chipFor })
-  }, [open, search, items, query, chipFor])
+    return search === undefined && !live ? open.entries : resolveMenu(items(open.invocation, query), { chipFor })
+  }, [open, search, items, query, chipFor, live])
   /** Where focus was when the menu opened, so it can be handed back. */
   const returnTo = useRef<HTMLElement | null>(null)
   // In a ref so `close`'s identity does not change when a caller rebuilds the callback every

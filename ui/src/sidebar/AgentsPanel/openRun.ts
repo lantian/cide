@@ -1,9 +1,8 @@
 /**
- * *Open* — put the **real harness** on a run's conversation, in a tab of its own or a row of this
- * window's project console, as Settings says. (M18, rewritten in M42; the choice is M108's)
+ * *Open* — show a run's conversation, live or saved, in a tab or pane. (M18, M42, M108)
  *
  * The Agents panel's third run gesture. It asks Rust one question — `agentRuns.open` — and builds
- * the pane itself through the split machinery with the intent the answer names. Three answers:
+ * the pane itself through the split machinery with the intent the answer names. Four answers:
  *
  * * **`mirror`** — the run's child is alive. A second sink on its session, no new process: for a
  *   `claude` run that is the real TUI mid-turn, for `opencode` the rendered stream of a turn in
@@ -16,6 +15,8 @@
  *   replay of a dead mirror — an Ink TUI's scrollback rendered at the headless 80×24, "a hardly
  *   concatenated log" in the words of the report — and it is what makes a finished run readable
  *   *and* continuable, from the harness's own rendering, after a cide restart included.
+ * * **`readOnly`** — the worktree is gone. Open a saved-conversation document that never starts
+ *   a harness or recreates a checkout. Both History and Sessions use this route.
  * * **`unavailable`** — nothing to show, and the sentence says why. Thrown, so `guarded` puts it
  *   on screen: a press that resolves to nothing is the dead control this panel exists to make
  *   unrepresentable.
@@ -73,6 +74,7 @@
 import { revealPane } from '@/editor/revealPane'
 import {
   agentRuns,
+  tab as tabApi,
   type HarnessSession,
   type RunOpen,
   type Pane,
@@ -211,6 +213,17 @@ export async function showOpenPlan(
   const target = consolePaneOf(boot)
   const project = activeProjectOf(boot)
   if (target === null || project === null) throw new Error(NO_CONSOLE)
+  if (plan.kind === 'readOnly') {
+    const tab = await tabApi.openConversation(target.project, plan.conversation.id, title)
+    await ws.synced()
+    const archivePane = useWorkspace.getState().boot?.workspace.projects[target.project]?.tabs
+      .find((entry) => entry.id === tab)?.tree.focused
+    if (archivePane !== undefined) {
+      const why = await revealPane(target.project, archivePane)
+      if (why !== null) throw new Error(`The saved ${noun} was opened, but ${why}.`)
+    }
+    return
+  }
   const session = plan.kind === 'mirror' ? plan.session : null
   const conversation = plan.kind === 'mirror' ? plan.continues : plan.conversation
 
