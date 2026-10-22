@@ -1037,6 +1037,56 @@ pub fn forget_announced(label: &WindowLabel) {
         .remove(label.as_str());
 }
 
+/// Apply the application-wide Dock count through one live window. Tauri exposes the setter
+/// on windows, but macOS stores the badge on NSApplication's Dock tile.
+#[cfg(target_os = "macos")]
+pub fn set_dock_badge(app: &AppHandle, count: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REQUESTED: AtomicUsize = AtomicUsize::new(0);
+    REQUESTED.store(count, Ordering::Relaxed);
+    let handle = app.clone();
+    // Resolve the window and update the cache on the main thread, where Tauri applies the
+    // setter immediately. Otherwise a queued setter could lose its window before delivery
+    // while the cache incorrectly remembered a successful update.
+    if let Err(error) = app.run_on_main_thread(move || {
+        let Some(window) = handle.webview_windows().into_values().next() else {
+            return;
+        };
+        // A newer call on the main thread can run before this queued callback. Read the
+        // latest request so an older callback cannot restore a count that was just cleared.
+        let count = REQUESTED.load(Ordering::Relaxed);
+        static APPLIED: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+        let mut applied = APPLIED
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("the Dock badge cache is never poisoned");
+        if let Err(error) =
+            update_dock_badge(&mut applied, count, |badge| window.set_badge_count(badge))
+        {
+            tracing::debug!(%error, count, "could not set the Dock badge");
+        }
+    }) {
+        tracing::debug!(%error, count, "could not schedule the Dock badge update");
+    }
+}
+
+/// Remember only successful writes, including the initial clear. `None` removes the badge;
+/// the pinned macOS runtime renders `Some(0)` as the literal label "0".
+#[cfg(any(target_os = "macos", test))]
+fn update_dock_badge<E>(
+    applied: &mut Option<usize>,
+    count: usize,
+    set: impl FnOnce(Option<i64>) -> Result<(), E>,
+) -> Result<(), E> {
+    if *applied != Some(count) {
+        let badge = (count > 0).then(|| i64::try_from(count).unwrap_or(i64::MAX));
+        set(badge)?;
+        *applied = Some(count);
+    }
+    Ok(())
+}
+
 /// Set one window's title, if it still exists.
 pub fn set_title(app: &AppHandle, label: &WindowLabel, title: &str) {
     let Some(window) = app.get_webview_window(label.as_str()) else {
@@ -1125,6 +1175,40 @@ mod tests {
     use super::{BG_DARK, BG_LIGHT};
     use cide_ipc::SessionId;
     use tauri::window::Color;
+
+    #[test]
+    fn dock_badge_clears_at_zero_skips_repeats_and_retries_failed_updates() {
+        let mut applied = None;
+        let mut writes = Vec::new();
+        for count in [0, 0, 1, 1, 3, 0, 0] {
+            super::update_dock_badge(&mut applied, count, |badge| {
+                writes.push(badge);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+        assert_eq!(writes, [None, Some(1), Some(3), None]);
+
+        assert_eq!(
+            super::update_dock_badge(&mut applied, 2, |_| Err("unavailable")),
+            Err("unavailable")
+        );
+        assert_eq!(applied, Some(0));
+        super::update_dock_badge(&mut applied, 2, |badge| {
+            assert_eq!(badge, Some(2));
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(applied, Some(2));
+        assert!(super::update_dock_badge(&mut applied, 0, |_| Err("unavailable")).is_err());
+        assert_eq!(applied, Some(2), "a failed clear must also be retried");
+        super::update_dock_badge(&mut applied, 0, |badge| {
+            assert_eq!(badge, None);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(applied, Some(0));
+    }
 
     /// The one place a token value is copied out of CSS into Rust, so it is the one place
     /// that can silently drift. It costs a frame of the wrong colour at launch — the exact

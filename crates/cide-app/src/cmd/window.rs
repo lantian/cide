@@ -439,8 +439,8 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
     windows::awaiting_sessions()
 }
 
-/// Recompute every window's title **and its urgency hint** from the workspace, the waiting
-/// set and the focus.
+/// Recompute every window's title and urgency hint, and the macOS Dock badge, from the
+/// workspace, the waiting set and the focus.
 ///
 /// Called after a report, after any mutation that moves a pane between windows, and on every
 /// `WindowEvent::Focused` — all three change the answer. A detach has to take the
@@ -474,8 +474,8 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
 ///   tabs — a background tab is still in that window, and one of the two situations the user
 ///   described is precisely a session finishing in a tab they are not looking at;
 /// * a pane that has been torn out is counted by *its* window and **not** by the shell it came
-///   from, so one waiting session is announced by exactly one window and the count over all
-///   windows is the truth rather than a multiple of it.
+///   from. Mirrored sessions can still appear in several windows, so the application-wide
+///   Dock count unions their session ids rather than adding the window counts.
 pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
     for (label, role) in &ws.windows {
         let sessions = sessions_of(ws, role);
@@ -509,6 +509,37 @@ pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
         let say = windows::announce(&title_for(ws, role), count, windows::is_focused(label));
         windows::apply_announcement(app, label, say);
     }
+
+    #[cfg(target_os = "macos")]
+    windows::set_dock_badge(
+        app,
+        dock_badge_count(
+            ws,
+            &windows::awaiting_sessions().into_iter().collect(),
+            |project| crate::running::waiting_for(app, project),
+        ),
+    );
+}
+
+/// The Dock represents the whole application. Count each waiting session and each shell's
+/// project once, even when mirrors or detached tabs put the same session in several windows.
+/// Use the title's membership rules; stale awaiting entries with no pane do not contribute.
+/// Focus is deliberately absent: arriving at a window does not acknowledge all its panes.
+#[cfg(any(target_os = "macos", test))]
+fn dock_badge_count(
+    ws: &Workspace,
+    awaiting: &BTreeSet<SessionId>,
+    waiting_for: impl FnMut(ProjectId) -> usize,
+) -> usize {
+    let mut sessions = BTreeSet::new();
+    let mut projects = BTreeSet::new();
+    for role in ws.windows.values() {
+        sessions.extend(sessions_of(ws, role));
+        if let WindowRole::Shell { projects: held, .. } = role {
+            projects.extend(held.iter().copied());
+        }
+    }
+    sessions.intersection(awaiting).count() + projects.into_iter().map(waiting_for).sum::<usize>()
 }
 
 /// The desktop moved the focus into or out of one of our windows.
@@ -1044,6 +1075,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dock_badge_tracks_sessions_and_waiting_tasks_across_projects_and_window_modes() {
+        let mut ws = Workspace::default();
+        let a = workspace::open_project(&mut ws, vec!["/home/dev/a".into()], None).unwrap();
+        let b = workspace::open_project(&mut ws, vec!["/home/dev/b".into()], None).unwrap();
+        let first = SessionId::new();
+        let second = SessionId::new();
+        for (project, session) in [(a, first), (b, second)] {
+            let tab = &mut workspace::project_mut(&mut ws, project).unwrap().tabs[0];
+            tab.tree.panes.get_mut(&tab.tree.focused).unwrap().session = Some(session);
+        }
+        assert_eq!(dock_badge_count(&ws, &BTreeSet::new(), |_| 0), 0);
+        // The unrelated entry has no pane and must not leave a badge that cannot be cleared.
+        let mut awaiting = BTreeSet::from([first, second, SessionId::new()]);
+        let mut tasks = std::collections::BTreeMap::from([(a, 2), (b, 1)]);
+        for mode in [WindowMode::Stacked, WindowMode::PerProject] {
+            workspace::set_window_mode(&mut ws, mode).unwrap();
+            let mut reads = Vec::new();
+            assert_eq!(
+                dock_badge_count(&ws, &awaiting, |project| {
+                    reads.push(project);
+                    tasks[&project]
+                }),
+                5
+            );
+            reads.sort();
+            assert_eq!(
+                reads,
+                BTreeSet::from([a, b]).into_iter().collect::<Vec<_>>()
+            );
+        }
+
+        awaiting.remove(&first); // Acknowledged, resumed work, or exited.
+        assert_eq!(
+            dock_badge_count(&ws, &awaiting, |project| tasks[&project]),
+            4
+        );
+        tasks.insert(a, 0); // The project's decisions have been answered.
+        assert_eq!(
+            dock_badge_count(&ws, &awaiting, |project| tasks[&project]),
+            2
+        );
+        workspace::close_project(&mut ws, b, true).unwrap();
+        assert_eq!(
+            dock_badge_count(&ws, &awaiting, |project| tasks[&project]),
+            0,
+            "closing a project removes its tasks and sessions even before stale reports clear"
+        );
+        workspace::close_project(&mut ws, a, true).unwrap();
+        assert_eq!(
+            dock_badge_count(&ws, &awaiting, |_| panic!("no projects left")),
+            0
+        );
+    }
+
+    #[test]
+    fn dock_badge_counts_each_projects_waiting_tasks_once() {
+        let mut ws = Workspace::default();
+        let project = workspace::open_project(&mut ws, vec!["/home/dev/a".into()], None).unwrap();
+        // More than one shell may name a project; the Dock must not add its task count twice.
+        let role = ws.windows.values().next().unwrap().clone();
+        ws.windows.insert(WindowLabel::shell(), role);
+        let mut reads = 0;
+        assert_eq!(
+            dock_badge_count(&ws, &BTreeSet::new(), |id| {
+                assert_eq!(id, project);
+                reads += 1;
+                2
+            }),
+            2
+        );
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
     fn only_labels_this_app_mints_are_reconciled() {
         assert!(minted_here(&WindowLabel::shell()));
         assert!(minted_here(&WindowLabel::detached_pane()));
@@ -1164,6 +1269,7 @@ mod tests {
             one,
             "two panes mirroring one child are one waiting session, not two"
         );
+        assert_eq!(dock_badge_count(&ws, &one, |_| 0), 1);
 
         let detached = workspace::detach_pane(&mut ws, project, tab, mirror_id).unwrap();
         assert_eq!(
@@ -1172,10 +1278,17 @@ mod tests {
             "the detached window counts the pane it is showing"
         );
         assert_eq!(
+            dock_badge_count(&ws, &one, |_| 0),
+            1,
+            "the Dock counts a mirrored session once across both windows"
+        );
+        assert_eq!(
             title_for(&ws, &ws.windows[&detached].clone()),
             "atlas : claude — mirror",
             "a detached window is named after its pane, read live rather than remembered"
         );
+        workspace::redock_pane(&mut ws, &detached).unwrap();
+        assert_eq!(dock_badge_count(&ws, &one, |_| 0), 1);
     }
 
     /// The other half of the same claim, with nothing shared between the two panes.
@@ -1319,6 +1432,16 @@ mod tests {
             workspace::open_project(&mut ws, vec!["/home/dev/work/atlas".into()], None).unwrap();
         let tab = workspace::project(&ws, project).unwrap().tabs[0].id;
         let console = workspace::tab(&ws, project, tab).unwrap().tree.focused;
+        let session = SessionId::new();
+        workspace::tab_mut(&mut ws, project, tab)
+            .unwrap()
+            .tree
+            .panes
+            .get_mut(&console)
+            .unwrap()
+            .session = Some(session);
+        let awaiting = BTreeSet::from([session]);
+        assert_eq!(dock_badge_count(&ws, &awaiting, |_| 2), 3);
 
         let torn = cide_ipc::WindowLabel::detached_tab();
         ws.windows
@@ -1328,6 +1451,11 @@ mod tests {
             window_showing(&ws, project, console),
             Some(torn),
             "the tab's own window shows its panes, however early the map names the shell"
+        );
+        assert_eq!(
+            dock_badge_count(&ws, &awaiting, |_| 2),
+            3,
+            "a detached tab adds neither a second session nor another project's task count"
         );
     }
 
