@@ -212,8 +212,8 @@ export function AppHeader({
        */}
       <ProjectMenu />
 
-      {/* `data-tauri-drag-region` does not inherit, so the drag surface is this filler rather
-          than the header itself. Also a sibling now: it is what takes the slack `.tabs` gave
+      {/* `data-tauri-drag-region` does not inherit, so spare header space gets its own drag
+          surface. Also a sibling now: it is what takes the slack `.tabs` gave
           up when it stopped being `flex: 1`, so the two controls above stay hard against the
           project strip instead of being pushed to the far right. `data-window-drag` is the hook
           the window-frame agent binds double-click-to-maximize to. */}
@@ -303,7 +303,13 @@ const LIGHTS = {
  */
 export function WindowLights() {
   return (
-    <div className={`${styles.lights} ${CONTROLS.side === 'right' ? styles.lightsRight : ''}`}>
+    <div
+      className={`${styles.lights} ${CONTROLS.side === 'right' ? styles.lightsRight : ''}`}
+      // Keep the macOS controls' padding and gaps draggable even when projects fill the header.
+      // The native drag attribute does not inherit: the three buttons still handle clicks.
+      data-tauri-drag-region={CONTROLS.side === 'left' ? '' : undefined}
+      data-window-drag={CONTROLS.side === 'left' ? 'true' : undefined}
+    >
       {CONTROLS.order.map((id) => (
         <button
           key={id}

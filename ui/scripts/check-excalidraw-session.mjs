@@ -352,7 +352,16 @@ try {
 } finally {
   if (outer) await act(async () => outer.unmount())
   if (testModule) await act(async () => {
-    testModule.useWorkspace.setState({ boot: { role: { kind: 'shell', projects: [] }, workspace: { projects: {} } } })
+    const { useWorkspace } = testModule
+    const boot = useWorkspace.getState().boot
+    if (boot === null) return
+    // Parked roots can read settings before the queued workspace reconciliation disposes them.
+    // Close their projects while retaining the rest of the last valid bootstrap snapshot.
+    useWorkspace.setState({ boot: {
+      ...boot,
+      role: { kind: 'shell', active: null, projects: [] },
+      workspace: { ...boot.workspace, projects: {} },
+    } })
   })
   dom?.window.close()
   rmSync(out, { recursive: true, force: true })

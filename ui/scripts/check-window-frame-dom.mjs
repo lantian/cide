@@ -55,7 +55,9 @@ export async function checkWindowFrameEvents(agents) {
       <header>
         <div id="filler" data-tauri-drag-region data-window-drag="true"></div>
         <button id="action">Header action</button>
-        <button id="zoom" data-window-button="zoom">Zoom</button>
+        <div id="lights" data-tauri-drag-region data-window-drag="true">
+          <button id="zoom" data-window-button="zoom">Zoom</button>
+        </div>
       </header>
       <header>
         <div id="detached" data-tauri-drag-region data-window-drag="true"></div>
@@ -129,7 +131,7 @@ export async function checkWindowFrameEvents(agents) {
       document.addEventListener('mouseup', nativeUp)
       await mount()
 
-      for (const id of ['filler', 'detached']) {
+      for (const id of ['filler', 'detached', 'lights']) {
         const before = maximized
         await doubleClick(id)
         assert.equal(maximized, !before, `${platform}: ${id} maximizes/restores`)
@@ -190,6 +192,11 @@ export async function checkWindowFrameEvents(agents) {
       calls.length = 0
       await act(async () => mouse('zoom', 'click', { detail: 1 }))
       assert.equal(count('toggle_maximize'), 1, `${platform}: zoom control still works`)
+      await doubleClick('zoom')
+      assert.equal(count('start_dragging'), 0, `${platform}: window button never starts dragging`)
+      assert.equal(count('toggle_maximize'), 2, `${platform}: window button only handles its clicks`)
+      assert.equal(count('internal_toggle_maximize'), 0,
+        `${platform}: window button does not inherit the native drag region`)
       calls.length = 0
       await act(async () => { await toggleMaximize() })
       assert.equal(count('toggle_maximize'), 1, `${platform}: project-tab maximize API still works`)
