@@ -278,8 +278,15 @@ try {
   eq(act2('F2'), null, 'F2 is the rename key in Explorer and IDEA and is deliberately NOT '
     + 'claimed: the brief asked for Ctrl+R, and a second undocumented binding for one action '
     + 'is a decision rather than a freebie')
-  eq(act2('Backspace'), null, 'Backspace is not Delete — on a Mac keyboard it is the key most '
-    + 'people call Delete, which is exactly why answering it would be a surprise')
+  eq(act2('Backspace'), null, 'Backspace remains unclaimed outside macOS')
+  for (let bits = 0; bits < 16; bits++) {
+    const held = { ctrl: !!(bits & 1), meta: !!(bits & 2), alt: !!(bits & 4), shift: !!(bits & 8) }
+    const expected = !held.ctrl && !held.alt && !held.shift ? 'delete' : null
+    eq(c.treeKeyAction('Backspace', mods(held), true), expected,
+      `macOS Backspace opens trash confirmation only bare or with Command: ${JSON.stringify(held)}`)
+    eq(c.treeKeyAction('Backspace', mods(held), false), null,
+      'other platforms keep every Backspace chord unclaimed')
+  }
   eq(act2('ArrowDown'), null, 'navigation keys are not this function\'s business')
 
   // --- which root a row belongs to, and what "relative" means ----------------------------

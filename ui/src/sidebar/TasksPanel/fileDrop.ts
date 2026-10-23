@@ -5,12 +5,9 @@
  *
  * The native drag-drop handler on every cide window is **on** — `crates/cide-app/src/windows.rs`
  * never disables it — and it eats `dragenter`/`dragover`/`drop` before the page sees them, which
- * is why every in-app drag in this codebase is pointer-based and why `sidebar/useTreeDrag.ts`
- * records "no drag *into* cide from Dolphin or Nautilus" as an accepted cost. What the handler
- * takes from the page it hands back as events of its own, with the dropped **paths** — which is
- * exactly the currency an attachment needs, since Rust copies by path and no bytes may cross the
- * seam. So this is the one surface in cide that accepts a desktop drag, and it can because it
- * wants paths, not a `File`.
+ * is why in-app drags start as pointer gestures. Tauri hands native events back with paths,
+ * which both attachments and the file tree can copy without sending bytes through IPC.
+ * This subscription also feeds `files/desktopDrop.ts`, which routes tree and tab-strip drops.
  *
  * # One subscription per window, one hit test
  *
@@ -30,6 +27,7 @@
  */
 import { useSyncExternalStore } from 'react'
 import { dragDrop, diag } from '@/ipc/client'
+import { routeDesktopDrop } from '@/files/desktopDrop'
 import { cssPoint, dropZoneAt, parseDropTarget, type DropTarget, type DropZoneRect } from './model'
 
 export type FileDropHandler = (target: DropTarget, paths: readonly string[]) => void
@@ -99,10 +97,11 @@ function zones(): DropZoneRect[] {
 export async function startFileDrop(): Promise<() => void> {
   try {
     return await dragDrop.onEvent((event) => {
+      routeDesktopDrop(event)
       switch (event.type) {
         case 'enter':
         case 'over': {
-          const point = cssPoint(event.position, window.devicePixelRatio)
+          const point = cssPoint(event.position, dragDrop.coordinateScale())
           setHot(dropZoneAt(point, zones()))
           break
         }
@@ -110,7 +109,7 @@ export async function startFileDrop(): Promise<() => void> {
           setHot(null)
           break
         case 'drop': {
-          const point = cssPoint(event.position, window.devicePixelRatio)
+          const point = cssPoint(event.position, dragDrop.coordinateScale())
           const key = dropZoneAt(point, zones())
           setHot(null)
           if (key === null) return

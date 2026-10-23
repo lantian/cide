@@ -140,6 +140,7 @@ function labelFor(row: DragRow): string {
 
 /** What dropping a load on a row would do. `hint` is the sentence the ghost draws. */
 export type TreeDropOutcome =
+  | { readonly kind: 'open'; readonly paths: readonly string[]; readonly mark: null; readonly hint: string }
   | {
       readonly kind: 'move'
       /** Absolute destination directory — what `fs_paste` takes as `destDir`. */
@@ -201,6 +202,7 @@ export function dropOutcome(
   target: DragRow | null,
   roots: readonly string[],
   writable: readonly string[],
+  mode: 'cut' | 'copy' = 'cut',
 ): TreeDropOutcome {
   if (drag.refusal !== null) return refuse(drag.refusal, target?.path ?? null)
 
@@ -267,7 +269,7 @@ export function dropOutcome(
    */
   const itself = drag.paths.find((path) => isInside(dest.parent, path))
   if (itself !== undefined) {
-    return refuse(`“${basenameOf(itself)}” cannot be moved into itself`, dest.parent)
+    return refuse(`“${basenameOf(itself)}” cannot be ${mode === 'copy' ? 'copied' : 'moved'} into itself`, dest.parent)
   }
 
   /*
@@ -278,7 +280,7 @@ export function dropOutcome(
    * and changes nothing on screen reads as a broken drag, and a drop of five files where two are
    * already there should say it moved three. Same discipline as `dragDrop.ts::dropOutcome`.
    */
-  const moving = drag.paths.filter((path) => dirnameOf(path) !== dest.parent)
+  const moving = mode === 'copy' ? drag.paths : drag.paths.filter((path) => dirnameOf(path) !== dest.parent)
   if (moving.length === 0) {
     return {
       kind: 'noop',
@@ -293,7 +295,7 @@ export function dropOutcome(
     destDir: dest.parent,
     paths: moving,
     mark: dest.parent,
-    hint: `Move ${what} to “${dest.label}”`,
+    hint: `${mode === 'copy' ? 'Copy' : 'Move'} ${what} to “${dest.label}”`,
   }
 }
 
@@ -360,4 +362,14 @@ export function springTarget(row: DragRow | null, outcome: TreeDropOutcome): str
   if (row === null || outcome.kind === 'refuse') return null
   if (row.kind !== 'dir' || row.expanded || !row.hasChildren) return null
   return row.path
+}
+
+/** Desktop drops copy; their sources need not belong to the receiving project. */
+export function externalDropOutcome(
+  paths: readonly string[], target: DragRow | null,
+  roots: readonly string[], writable: readonly string[],
+): TreeDropOutcome {
+  const outcome = dropOutcome({ paths, origin: paths[0] ?? '', label: plural(paths.length),
+    widened: paths.length > 1, refusal: null }, target, roots, writable, 'copy')
+  return outcome
 }
