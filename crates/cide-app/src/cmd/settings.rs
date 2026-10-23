@@ -2270,7 +2270,7 @@ pub async fn scheme_import(
     app: AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<Vec<cide_ipc::ColorScheme>, CoreError> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    let (tx, rx) = std::sync::mpsc::channel::<crate::cmd::project::PickerReply>();
     crate::cmd::project::show_picker(
         &app,
         window,
@@ -2293,9 +2293,7 @@ pub async fn scheme_import(
     // `spawn_blocking` rather than blocking this task: the answer arrives only when the user
     // has finished browsing, which is unbounded, and the async runtime's worker pool is shared
     // with every other command in flight. Exactly `project_pick`'s reasoning.
-    let picked = tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
-        .await
-        .map_err(|e| CoreError::Io(format!("colour theme picker: {e}")))?;
+    let picked = crate::cmd::project::receive_picker(rx).await?;
     let Some(path) = picked.into_iter().next() else {
         return Ok(Vec::new());
     };

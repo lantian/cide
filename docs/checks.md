@@ -98,6 +98,13 @@ real connection-test handler and may load the selected model; it does not downlo
 
 ### Opening and searching projects
 
+For the native picker, run `cargo test --locked -p cide-app cmd::project` on macOS and
+`cargo clippy --locked -p cide-app --all-targets -- -D warnings`. The nullable NSOpenPanel
+return and result channel are regression-tested there; Linux cannot compile that AppKit arm.
+Check a real sheet for cancel and success as well. `docs/platforms.md` records the nil-return
+crash and the isolated fault-injection check; the Chromium audit below mocks IPC and cannot
+detect a native picker abort.
+
 **Touches:** the header project menu, project picker, or remembered-project retention.
 
 Run `check:menu-model`, `check:menus`, `check:picker`, `check:keys`, `check:commands`, and

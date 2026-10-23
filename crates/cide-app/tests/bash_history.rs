@@ -275,18 +275,21 @@ fn a_readonly_global_histfile_is_reported_without_overwriting_it() {
     let history = fixture.history(PaneId::new());
     let shell = PtySession::spawn(fixture.spec(&history)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while shell.exit_status().is_none() && Instant::now() < deadline {
+    let diagnostic = "cide: cannot select this panel history file";
+    let mut output = String::from_utf8_lossy(&shell.screen_state()).into_owned();
+    // The reaper can publish exit before the PTY coalescer processes the final output.
+    // Wait for both observations instead of treating exit as a screen-flush barrier.
+    while (shell.exit_status().is_none() || !output.contains(diagnostic))
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
+        output = String::from_utf8_lossy(&shell.screen_state()).into_owned();
     }
     assert!(
         shell.exit_status().is_some(),
         "initializer should refuse readonly HISTFILE"
     );
-    let output = String::from_utf8_lossy(&shell.screen_state()).into_owned();
-    assert!(
-        output.contains("cide: cannot select this panel history file"),
-        "{output}"
-    );
+    assert!(output.contains(diagnostic), "{output}");
     assert_eq!(
         read(fixture.0.join(".bash_history")),
         "echo GLOBAL_HISTORY_SENTINEL\n"
