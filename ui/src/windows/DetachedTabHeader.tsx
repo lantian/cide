@@ -86,9 +86,8 @@ export function DetachedTabHeader({ tab, onRedock }: DetachedTabHeaderProps): Re
         {title}
       </span>
 
-      {/* The only drag surface — `data-tauri-drag-region` does not inherit, so it sits on
-          an empty box rather than on the header, where it would turn the buttons into drag
-          handles. `data-window-drag` is `WindowFrame`'s double-click-to-maximize hook. */}
+      {/* Spare space is draggable alongside the macOS traffic-light background.
+          `data-window-drag` is `WindowFrame`'s double-click-to-maximize hook. */}
       <div className={styles.filler} data-tauri-drag-region data-window-drag="true" />
 
       <button

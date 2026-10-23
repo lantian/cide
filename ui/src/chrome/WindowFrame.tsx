@@ -215,6 +215,12 @@ function onDocumentDoubleClick(event: MouseEvent): void {
   const handle = target.closest('[data-window-drag="true"]')
   if (handle === null) return
 
+  // A control inside a drag surface owns its clicks, including the final dblclick event.
+  for (const el of event.composedPath()) {
+    if (el === handle) break
+    if (el instanceof HTMLElement && isTauriClickable(el)) return
+  }
+
   if (tauriOwnsDoubleClick(event.composedPath())) return
 
   void toggleMaximize()

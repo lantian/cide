@@ -15,16 +15,16 @@
    accordingly. Only the padding differs between the two, below — the 12px edge always faces
    the window corner, so the cluster keeps the same distance from the frame either way. */
 .lights {
+  /* Reserve the drag surface around the macOS buttons when the project strip overflows. */
+  flex: none;
   display: flex;
   align-items: center;
   gap: var(--sp-4);
   padding: 0 14px 0 12px;
 }
 
-/* Trailing-edge placement: the padding mirrors, nothing else. `flex: none` because this box
-   now follows `.filler`, which would otherwise be free to squash it. */
+/* Trailing-edge placement mirrors the padding. */
 .lightsRight {
-  flex: none;
   padding: 0 12px 0 14px;
 }
 
@@ -561,9 +561,8 @@
 }
 
 /*
- * The one element that starts a window drag. `data-tauri-drag-region` does not inherit, so
- * it sits here rather than on the header, where it would turn every tab and button into a
- * drag handle instead of a control.
+ * Spare space starts a window drag; macOS also keeps a drag surface around the traffic lights
+ * when this filler shrinks to zero. Drag attributes belong on these surfaces, not the header.
  */
 .filler {
   flex: 1;
