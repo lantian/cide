@@ -86,7 +86,7 @@ zbus = { workspace = true }
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 gtk = { workspace = true }
 
-# The dock menu's AppKit glue — `crate::dock`'s `macos` module and nothing else. AppKit offers
+# AppKit glue for the dock menu and the fallible native file picker. AppKit offers
 # exactly one hook for it (`applicationDockMenu:` on the app delegate) and neither tauri, tao nor
 # muda exposes a dock menu, so the method is added to tao's delegate class at runtime and the
 # `NSMenu` is built by hand. See `dock.rs`, which is also honest about what has and has not been
@@ -96,6 +96,7 @@ gtk = { workspace = true }
 # bearing rather than decorative.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
+block2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-app-kit = { workspace = true }
 

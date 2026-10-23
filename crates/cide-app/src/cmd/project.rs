@@ -503,7 +503,7 @@ pub async fn project_pick(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<Vec<String>, CoreError> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    let (tx, rx) = std::sync::mpsc::channel::<PickerReply>();
     show_picker(
         &app,
         window,
@@ -526,9 +526,7 @@ pub async fn project_pick(
     // with the window, say. Cancelled and never-answered both mean "no project", which is why
     // the empty vector covers them rather than an error the caller would have to invent a
     // message for.
-    let picked = tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
-        .await
-        .map_err(|e| CoreError::Io(format!("folder picker: {e}")))?;
+    let picked = receive_picker(rx).await?;
 
     Ok(picked
         .into_iter()
@@ -536,22 +534,38 @@ pub async fn project_pick(
         .collect())
 }
 
-/// What a picker asks for. One type across both `cfg` arms, so a second caller cannot pick up
+/// A cancelled picker is `Ok([])`; a native failure must reach the command's caller.
+/// In particular, macOS can fail to create NSOpenPanel before a sheet exists at all.
+pub(crate) type PickerReply = Result<Vec<PathBuf>, CoreError>;
+
+pub(crate) async fn receive_picker(rx: std::sync::mpsc::Receiver<PickerReply>) -> PickerReply {
+    tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_else(|_| Ok(Vec::new())))
+        .await
+        .map_err(|e| CoreError::Io(format!("file picker: {e}")))?
+}
+
+#[cfg(target_os = "macos")]
+#[path = "project_picker_macos.rs"]
+mod macos_picker;
+#[cfg(target_os = "macos")]
+pub(crate) use macos_picker::show_picker;
+
+/// What a picker asks for. One type across the platform arms, so a second caller cannot pick up
 /// the Linux behaviour and quietly lose the other.
 ///
 /// `filter` is `(label, globs)` — glob form, because that is what GTK's `FileFilter` takes and
 /// because the plugin's bare-extension form can be derived from it and not the other way round.
 pub(crate) struct PickerSpec {
     pub title: &'static str,
-    /// The confirm button's label. GTK only; the plugin has no equivalent.
+    /// The confirm button's label. GTK and AppKit; the plugin has no equivalent.
     ///
-    /// `allow(dead_code)` off the GTK arm rather than a `cfg` on the field: the struct is
-    /// deliberately one type across both arms (see above), and the shared constructor sets
+    /// `allow(dead_code)` off GTK/AppKit rather than a `cfg` on the field: the struct is
+    /// deliberately one type across the platform arms, and the shared constructor sets
     /// this on every platform — a `cfg`-ed field would have to be `cfg`-ed at construction
-    /// too, which is exactly the fork this type exists to prevent. The lint is right that
-    /// nothing reads it on macOS, and it is `-D warnings` there.
+    /// too, which is exactly the fork this type exists to prevent.
     #[cfg_attr(
         not(any(
+            target_os = "macos",
             target_os = "linux",
             target_os = "dragonfly",
             target_os = "freebsd",
@@ -562,10 +576,12 @@ pub(crate) struct PickerSpec {
     )]
     pub accept: &'static str,
     pub folders: bool,
-    /// Read by the GTK arm's `set_select_multiple`; the plugin's multi-select is chosen by
+    /// Read by GTK's `set_select_multiple` and AppKit's `setAllowsMultipleSelection`;
+    /// the plugin's multi-select is chosen by
     /// which plugin call is made, so it has no field to receive this. Same rule as `accept`.
     #[cfg_attr(
         not(any(
+            target_os = "macos",
             target_os = "linux",
             target_os = "dragonfly",
             target_os = "freebsd",
@@ -595,7 +611,7 @@ pub(crate) fn show_picker(
     app: &tauri::AppHandle,
     window: tauri::WebviewWindow,
     spec: PickerSpec,
-    tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    tx: std::sync::mpsc::Sender<PickerReply>,
 ) -> Result<(), CoreError> {
     app.run_on_main_thread(move || {
         use gtk::prelude::*;
@@ -695,7 +711,7 @@ pub(crate) fn show_picker(
             dialog.hide();
             // The receiver is gone if the command's task was cancelled. Nothing to do about
             // it, and nothing lost: the user's answer had nowhere to go anyway.
-            let _ = tx.send(picked);
+            let _ = tx.send(Ok(picked));
             held.borrow_mut().take();
         });
         dialog.show();
@@ -824,10 +840,10 @@ fn create_folder(chooser: &gtk::FileChooserNative, entry: &gtk::Entry) {
     }
 }
 
-/// Windows and macOS, where the plugin parents the dialog itself and `rfd`'s backend honours
-/// it. cide is a Linux app; this arm exists so the crate still compiles elsewhere, and it is
-/// the shape the whole command would have if the Linux gap above were ever closed upstream.
+/// Other targets use the plugin. macOS has its own fallible AppKit path because rfd's
+/// non-null NSOpenPanel return type turns a native service failure into a process abort.
 #[cfg(not(any(
+    target_os = "macos",
     target_os = "linux",
     target_os = "dragonfly",
     target_os = "freebsd",
@@ -838,7 +854,7 @@ pub(crate) fn show_picker(
     _app: &tauri::AppHandle,
     window: tauri::WebviewWindow,
     spec: PickerSpec,
-    tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    tx: std::sync::mpsc::Sender<PickerReply>,
 ) -> Result<(), CoreError> {
     use tauri_plugin_dialog::DialogExt;
 
@@ -848,7 +864,7 @@ pub(crate) fn show_picker(
             .into_iter()
             .filter_map(|p| p.into_path().ok())
             .collect();
-        let _ = tx.send(picked);
+        let _ = tx.send(Ok(picked));
     };
     let mut builder = window
         .dialog()

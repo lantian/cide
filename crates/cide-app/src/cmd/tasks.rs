@@ -843,7 +843,7 @@ pub async fn task_pick_attachments(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<Vec<PathBuf>> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    let (tx, rx) = std::sync::mpsc::channel::<crate::cmd::project::PickerReply>();
     crate::cmd::project::show_picker(
         &app,
         window,
@@ -860,9 +860,7 @@ pub async fn task_pick_attachments(
     )?;
     // Unbounded — the user is browsing — so off the runtime's worker pool: `project_pick`'s
     // reasoning.
-    tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
-        .await
-        .map_err(|e| CoreError::Io(format!("attachment picker: {e}")))
+    crate::cmd::project::receive_picker(rx).await
 }
 
 /// Where one attachment's bytes are, from the record — never from anything the caller typed.

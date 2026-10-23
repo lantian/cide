@@ -89,7 +89,7 @@ tauri-plugin-updater = { version = "=2.12.0", default-features = false, features
 # no new compilation — wry already builds it — and it is the reason `docs/adr/0001`'s
 # argument about `wry`/`tao` does not apply: this pin matches rather than competes.
 gtk = { version = "0.18", features = ["v3_24"] }
-# The macOS dock menu, and nothing else. (`crates/cide-app/src/dock.rs`)
+# macOS AppKit glue: the dock menu and the fallible native file picker.
 #
 # The same argument the `gtk` pin above makes, one platform over: these are versions tauri's
 # own graph already resolves — tao and muda pull `objc2 0.6` and `objc2-app-kit 0.3` on macOS —
@@ -98,13 +98,14 @@ gtk = { version = "0.18", features = ["v3_24"] }
 # the whole reason a direct dependency exists at all, and `dock.rs`'s header says why the hook
 # cannot be reached any other way.
 #
-# `default-features = false` with the four headers spelled out: the default set is every header
-# in AppKit, and this needs a menu, a menu item, the application and the responder it inherits
-# from. The union with whatever tao and muda enable is what actually gets built, so this list is
-# a statement about *our* requirements rather than a saving.
+# `default-features = false` with our headers spelled out: the default set is every header
+# in AppKit. The picker also needs NSOpenPanel/NSSavePanel, their superclasses and block2
+# for its asynchronous completion. The union with whatever tao and muda enable is what
+# actually gets built, so this list states our requirements rather than a saving.
 objc2 = "0.6.4"
+block2 = "0.6.2"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSObject", "NSArray", "NSDictionary", "NSValue", "NSURL"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSPasteboard"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSPasteboard", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "block2"] }
 
 # --- terminal ---
 portable-pty = "0.9.0"

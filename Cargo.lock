@@ -709,6 +709,7 @@ dependencies = [
 name = "cide-app"
 version = "0.16.1-dev"
 dependencies = [
+ "block2",
  "cide-agents",
  "cide-claude",
  "cide-core",
