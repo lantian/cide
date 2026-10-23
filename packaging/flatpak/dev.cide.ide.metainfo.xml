@@ -20,6 +20,6 @@
     </p>
   </description>
   <releases>
-    <release version="0.16.1-dev"/>
+    <release version="0.16.1"/>
   </releases>
 </component>
