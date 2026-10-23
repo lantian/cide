@@ -44,8 +44,8 @@ the crates with a platform problem that compiles anyway are `cide-core` (`child_
 `cide-fs` (`trash`), and both are in the table below. Every Linux-only API in the workspace is
 already behind a `cfg` with a counterpart that compiles: `gtk` is target-gated to Linux and four
 BSDs in `crates/cide-app/Cargo.toml`, the GTK mouse-button handler has a non-GTK arm, the folder
-picker falls back to `tauri_plugin_dialog` (which parents the dialog itself off Linux, which is
-the only reason the GTK arm exists), the signal handlers are `cfg(unix)` and macOS is a unix,
+picker uses a fallible AppKit sheet on macOS and `tauri_plugin_dialog` on other non-GTK targets
+(the GTK arm exists to supply a real transient parent), the signal handlers are `cfg(unix)` and macOS is a unix,
 and `git2`/tree-sitter build with `cc` everywhere. Reading every arm suggested `cargo build`
 would succeed on a Mac with few or no changes.
 
@@ -53,6 +53,44 @@ would succeed on a Mac with few or no changes.
 `.github/workflows/ci.yml` exists to convert reading into knowing; it is `continue-on-error:
 true` until it has been green once, because a job that has never passed cannot tell a regression
 from a first attempt. The comment on that job says what to delete when it does.
+
+### macOS file picker: nil is a recoverable service failure (2026-10-23)
+
+The header's `+` could abort cide **before the folder picker appeared**. Three local crash
+reports (October 16, 19 and 23) had the same main-thread call sequence. The October 19 report's
+UUID matched the published 0.15.1 binary; disassembling its frame at image offset `19401372`
+identified objc2's non-null return check for `+[NSOpenPanel openPanel]`. The caller at
+`20337540` was rfd's folder-panel construction. This was not the separate nested-tokio-runtime
+bug in the project-open path.
+
+`rfd 0.16.0` uses objc2-app-kit's generated `Retained<NSOpenPanel>` return type. AppKit can
+actually return nil when its separate Open/Save panel service fails; the generated binding
+panics, and cide's release `panic = "abort"` terminates the process. Apple documents that
+[Open panels run in a separate process](https://developer.apple.com/documentation/appkit/nsopenpanel?language=objc).
+[Tauri issue 13047](https://github.com/tauri-apps/tauri/issues/13047) records the same failure;
+replacing a running app's bundle and the resulting code-signature mismatch is one reported
+trigger. The reports here establish the nil-return failure, not which service failure caused
+it on those three occasions.
+
+`cmd/project_picker_macos.rs` reads this selector as `Option<Retained<NSOpenPanel>>` and
+returns a `CoreError` through the picker reply channel on nil. All four shared picker commands
+propagate it: open project, new-project location, attachments, and theme import. The panel is
+still an asynchronous, parented sheet. Cancel means an empty successful selection; a failed
+panel or an abort response means an error. Single/multiple selection, file/folder mode and
+theme-extension filters are preserved. No signing entitlements are relaxed by the fix.
+
+Verified on a Mac: native build, `cargo test --locked -p cide-app cmd::project`, and
+`cargo clippy --locked -p cide-app --all-targets -- -D warnings`. The regression tests cover
+a native Objective-C nil crossing the command reply channel, cancellation, abort, and success.
+For an additional runtime check, a temporary Objective-C library replaced `+[NSOpenPanel
+openPanel]` with a function returning nil, **only in isolated test app copies and profiles**.
+Clicking the old release's actual `+` reproduced `unexpected NULL returned from +[NSOpenPanel
+openPanel]` and process termination. The new debug build's real `project_pick` and
+`project_pick_location` commands, invoked from a minimal local webview fixture, returned an
+error and remained usable under the same injection. Without injection, opening the sheet,
+cancelling, and selecting a folder whose path contains Cyrillic and spaces succeeded. These
+checks do not establish that the external service will always be available; its failure is
+now survivable, with a restart suggestion.
 
 ## What the first Mac build actually reported
 
@@ -1069,4 +1107,3 @@ piece of documentation here names one path, and `app_config_dir()` would fork th
 answers for one question. Hook sockets already fall back from `$XDG_RUNTIME_DIR` to
 `std::env::temp_dir()`, which is unset-and-therefore-`$TMPDIR` on every Mac — a per-user 0700
 directory, with an explicit 0600 chmod on the socket besides.
-

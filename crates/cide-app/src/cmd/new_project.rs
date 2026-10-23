@@ -204,7 +204,7 @@ pub async fn project_pick_location(
     app: AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<Option<String>> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    let (tx, rx) = std::sync::mpsc::channel::<crate::cmd::project::PickerReply>();
     crate::cmd::project::show_picker(
         &app,
         window,
@@ -217,9 +217,7 @@ pub async fn project_pick_location(
         },
         tx,
     )?;
-    let picked = tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
-        .await
-        .map_err(|error| CoreError::Io(format!("folder picker: {error}")))?;
+    let picked = crate::cmd::project::receive_picker(rx).await?;
     Ok(picked
         .into_iter()
         .next()
