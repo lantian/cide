@@ -515,7 +515,8 @@ try {
   // Both trees end the search on the two gestures that are not keystrokes.
   for (const [name, body] of [['FileTree', fileTree], ['ChangesTree', changes]]) {
     ok(
-      /onPointerDownCapture=\{speedSearch\.exit\}/.test(body),
+      /onPointerDownCapture=\{speedSearch\.exit\}/.test(body)
+        || /onPointerDownCapture=\{\(e\) => \{[^}]*speedSearch\.exit\(\)/.test(body),
       `${name} ends the search on a press — the pointer is answering the same question the `
       + 'query was asking, and a box left up over a selection it did not make is a lie',
     )

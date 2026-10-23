@@ -1,6 +1,6 @@
 /**
  * The pointer half of dragging rows between changelists. Every *rule* it applies lives in
- * `dragDrop.ts`; this file is the mechanism, and it is the part no check in this repo can run.
+ * `dragDrop.ts`; this file is the mechanism, exercised by `check-git-tree-dom.mjs`.
  *
  * # Pointer events, not HTML5 drag and drop
  *
@@ -89,6 +89,8 @@ export interface UseChangesDragOptions {
 
 export interface ChangesDrag {
   state: ChangesDragState | null
+  /** Put on the tree so even a control that stops propagation begins a fresh gesture. */
+  onPointerDownCapture: (e: React.PointerEvent) => void
   /** Put on every row; it decides for itself whether that row can start a drag. */
   onPointerDown: (e: React.PointerEvent, row: Row) => void
   /**
@@ -134,6 +136,13 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
   /** Whether the *last* gesture became a drag. Cleared by the next press, not by the drop. */
   const wasDrag = useRef(false)
 
+  const onPointerDownCapture = useCallback((e: React.PointerEvent) => {
+    // The arrow and checkbox stop the bubbling press before it can start a drag. Reset
+    // here so their next click cannot inherit the previous drag's release suppression.
+    // Keep that verdict through pointerup/mouseup, and while another pointer is active.
+    if (e.button === 0 && gesture.current === null) wasDrag.current = false
+  }, [])
+
   const finish = useCallback((commit: boolean) => {
     const active = gesture.current
     gesture.current = null
@@ -164,8 +173,6 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
        */
       if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
       if (gesture.current !== null) return
-      // A new press: whatever the previous gesture was, this one is a click until it moves.
-      wasDrag.current = false
       /*
        * Nothing to land on, so nothing is picked up.
        *
@@ -269,7 +276,7 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
   // leave four window listeners behind firing at a dead component.
   useEffect(() => () => finish(false), [finish])
 
-  return { state, onPointerDown, dragged: () => wasDrag.current }
+  return { state, onPointerDownCapture, onPointerDown, dragged: () => wasDrag.current }
 }
 
 /**

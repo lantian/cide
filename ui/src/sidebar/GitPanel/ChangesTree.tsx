@@ -25,7 +25,7 @@
  *
  * The rules for all three live where a check script can run them: ticks in `model.ts`, row
  * selection in `rowSelection.ts`, click meanings in `clickSemantics.ts`. This file wires them
- * to a DOM and nothing more, because nothing in this repo can execute a DOM.
+ * to a DOM; `check-git-tree-dom.mjs` exercises the pointer and mouse event sequence.
  *
  * `current` is a row **id**, not an index, and so is every id in `selection`. Row ids are
  * stable across refreshes (`fileRowId` is repo plus path) and this panel refreshes constantly
@@ -448,7 +448,10 @@ export function ChangesTree({
          press is the user choosing a row with the pointer, and a blur would otherwise leave a
          query armed to swallow the first letters typed on the way back. Capture phase, so a
          press that moves focus is caught either way. */
-      onPointerDownCapture={speedSearch.exit}
+      onPointerDownCapture={(e) => {
+        drag.onPointerDownCapture(e)
+        speedSearch.exit()
+      }}
       onBlur={(e) => {
         // Only when focus really left the tree — `onBlur` is the bubbling
         // `focusout`, so landing on a match fires it too. See `blurLeftTheTree`.
