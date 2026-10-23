@@ -1,4 +1,5 @@
 import { clearToolSelection } from '@/toolwindow/selection'
+import { dropCoordinateScale } from '@/files/dropPosition'
 /**
  * The single seam between the frontend and the Rust core.
  *
@@ -5096,8 +5097,22 @@ export const attachments = {
  * `sidebar/TasksPanel/fileDrop.ts`, which says why paths are exactly the right currency.
  * --------------------------------------------------------------------------------------- */
 import { getCurrentWebview, type DragDropEvent } from '@tauri-apps/api/webview'
+export type { DragDropEvent } from '@tauri-apps/api/webview'
 
 export const dragDrop = {
+  // Wry's WKWebView implementation sends Cocoa points despite the PhysicalPosition type.
+  coordinateScale: () => dropCoordinateScale(
+    typeof navigator === 'undefined' ? '' : navigator.userAgent, window.devicePixelRatio),
+  available: () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window,
+  start: (project: ProjectId, paths: readonly string[]) =>
+    invoke<void>('fs_drag_start', { project, paths }),
+  claim: (paths: readonly string[]) => invoke<string>('fs_drop_claim', { paths }),
+  plan: (project: ProjectId, receipt: string, destDir: string) =>
+    invoke<PasteCollision[]>('fs_drop_plan', { project, receipt, destDir }),
+  paste: (project: ProjectId, receipt: string, destDir: string, decisions: readonly PasteDecision[]) =>
+    invoke<PastedEntry[]>('fs_drop_paste', { project, receipt, destDir, decisions }),
+  open: (project: ProjectId, receipt: string, path: string) =>
+    invoke<TabId>('fs_drop_open', { project, receipt, path }),
   /** Every drag event this webview receives, until the answer is called. */
   onEvent: (handler: (event: DragDropEvent) => void) =>
     /*

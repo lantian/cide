@@ -41,6 +41,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { openFileProperties } from '@/chrome/filePropertiesOpen'
+import { currentUserAgent, isMacUserAgent } from '@/chrome/windowControls'
 import { letterFor, statusAt } from './treeStatus'
 import {
   enterOn,
@@ -57,10 +58,13 @@ import {
   pressMenu,
   type SelectMods,
 } from './treeSelection'
-import { inDrag, inDropBand, type DragRow } from './treeDrag'
+import { inDrag, inDropBand, type DragRow, type TreeDragSet } from './treeDrag'
 import { useSpeedSearch } from './useSpeedSearch'
 import { SpeedName, SpeedSearchBar } from './SpeedSearchBar'
 import { useTreeDrag, type TreeDragState } from './useTreeDrag'
+import { useTreeDesktopDrop } from './useTreeDesktopDrop'
+import { exportTreeDrag } from '@/files/desktopDrop'
+import { dragDrop } from '@/ipc/client'
 import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import { copyText } from './copyText'
 import { creationRefusal, isRootPath, mutationRefusal, relativeTo, rootOf } from './rowPaths'
@@ -84,6 +88,7 @@ import {
   pasteRefusal,
   pasteTargetFor,
   pendingNote,
+  pastedSummary,
   type ClipMode,
   type FileClip,
 } from './clipboardModel'
@@ -215,6 +220,8 @@ type Transfer = {
   readonly sources: readonly string[]
   readonly destDir: string
   readonly mode: ClipMode
+  /** Native receipt for a desktop copy; the backend resolves its captured sources. */
+  readonly receipt?: string
   /**
    * The project the clipboard was filled in, when it is not this one — a paste between
    * projects, which Rust checks against that project's roots. Absent for a drag, which never
@@ -613,6 +620,9 @@ export function FileTree({
     (project_: ProjectId, transfer: Transfer, decisions: ReturnType<typeof askDecisions>) => {
       const sent = transfer.fromClip
         ? useFileClipboard.getState().paste(project_, transfer.destDir, decisions, transfer.clip)
+        : transfer.receipt !== undefined
+        ? dragDrop.paste(project_, transfer.receipt, transfer.destDir, decisions)
+          .then((entries) => ({ paths: entries.map((entry) => entry.dest), note: pastedSummary(entries, 'copy') }))
         : pasteEntries(project_, transfer.sources, transfer.destDir, transfer.mode, decisions)
       void sent
         .finally(() => {
@@ -628,7 +638,7 @@ export function FileTree({
           if (first !== undefined) void useFileTree.getState().reveal(first)
           else void useFileTree.getState().refresh()
         })
-        .catch(fail(transfer.fromClip ? 'Paste' : 'Move'))
+        .catch(fail(transfer.fromClip ? 'Paste' : transfer.mode === 'copy' ? 'Copy' : 'Move'))
     },
     [fail],
   )
@@ -661,7 +671,10 @@ export function FileTree({
       pasting.current = true
       setProblem(null)
       setNote(null)
-      void planEntries(project, transfer.sources, transfer.destDir, transfer.mode, transfer.from, transfer.clip?.id)
+      const planned = transfer.receipt !== undefined
+        ? dragDrop.plan(project, transfer.receipt, transfer.destDir)
+        : planEntries(project, transfer.sources, transfer.destDir, transfer.mode, transfer.from, transfer.clip?.id)
+      void planned
         .then((collisions) => {
           if (collisions.length === 0) {
             commitTransfer(project, transfer, [])
@@ -671,7 +684,7 @@ export function FileTree({
         })
         .catch((error: unknown) => {
           pasting.current = false
-          fail(transfer.fromClip ? 'Paste' : 'Move')(error)
+          fail(transfer.fromClip ? 'Paste' : transfer.mode === 'copy' ? 'Copy' : 'Move')(error)
         })
     },
     [commitTransfer, fail, project],
@@ -797,9 +810,10 @@ export function FileTree({
    */
   const cancelPaste = useCallback(() => {
     const fromClip = pendingPaste?.transfer.fromClip ?? true
+    const copying = pendingPaste?.transfer.mode === 'copy'
     setPendingPaste(null)
     pasting.current = false
-    setNote(fromClip ? cancelledNote() : moveCancelledNote())
+    setNote(fromClip ? cancelledNote() : copying ? 'Copy cancelled. Nothing was changed.' : moveCancelledNote())
   }, [pendingPaste])
 
   /** One answer from the dialog. The last one sends the transfer. */
@@ -1042,7 +1056,18 @@ export function FileTree({
     rowFor,
     onSpring: springOpen,
     onMove: runMove,
+    ...(onOpen === undefined ? {} : { onOpen: (paths: readonly string[]) => paths.forEach(onOpen) }),
+    ...(project !== null && dragDrop.available()
+      ? { onExport: (load: TreeDragSet) => void exportTreeDrag(project, load) }
+      : {}),
   })
+
+  const desktopDrag = useTreeDesktopDrop({
+    container: scrollRef, roots, writable, rowFor, onSpring: springOpen, onMove: runMove,
+    onCopy: (sources, destDir, receipt) => startTransfer({ sources, destDir, receipt, mode: 'copy', fromClip: false }),
+    onError: fail('Copy'),
+  })
+  const flightState = desktopDrag ?? drag.state
 
   /**
    * The release of a press whose collapse was deferred.
@@ -1058,8 +1083,8 @@ export function FileTree({
    * many rows were picked up — Ctrl+A can select 10 000 of them.
    */
   const inFlight = useMemo(
-    () => (drag.state === null ? null : new Set(drag.state.drag.paths)),
-    [drag.state],
+    () => (flightState === null || flightState.drag.origin === '' ? null : new Set(flightState.drag.paths)),
+    [flightState],
   )
 
   const releasePress = useCallback(
@@ -1379,7 +1404,7 @@ export function FileTree({
         meta: e.metaKey,
         alt: e.altKey,
         shift: e.shiftKey,
-      })
+      }, isMacUserAgent(currentUserAgent()))
       if (action !== null) {
         if (action === 'delete') {
           // Every highlighted row, which is what the confirmation then names one per line.
@@ -2348,7 +2373,7 @@ export function FileTree({
         /* One flag for the whole box while a drag is in flight: it turns off the hover wash,
            which would otherwise follow the pointer *and* the drop outline — two bands making two
            different claims about where the files are going. */
-        {...(drag.state === null ? {} : { 'data-dragging': '' })}
+        {...(flightState === null ? {} : { 'data-dragging': '' })}
         onKeyDown={onKeyDown}
         /*
          * The tree has the caret. `onFocus` is the bubbling `focusin`, so this also fires for
@@ -2411,7 +2436,7 @@ export function FileTree({
                 />
               )
             }
-            const flight = drag.state
+            const flight = flightState
             /*
              * The drop's three answers for *this* row, computed here rather than in `Row` so the
              * row stays a renderer. All three are `null`/`undefined` unless a drag is in flight,
@@ -2610,7 +2635,7 @@ export function FileTree({
         * scroller is `role="tree"` and its children have to be tree items, and its viewport is as
         * tall as the whole flattened repository.
         */}
-      {drag.state !== null && <TreeDragGhost state={drag.state} />}
+      {flightState !== null && <TreeDragGhost state={flightState} />}
     </>
   )
 }

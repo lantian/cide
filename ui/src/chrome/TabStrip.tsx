@@ -68,6 +68,7 @@ import { clippedTabs, overflowHint } from './tabOverflow'
 import { useTabDrag } from './useTabDrag'
 import { Icon } from '@/icons/Icon'
 import { consoleName, type ConsoleName } from './consoleName'
+import { useTabFileDrop } from './useTabFileDrop'
 
 import styles from './TabStrip.module.css'
 
@@ -169,6 +170,8 @@ export function TabStrip({
   onProperties,
 }: TabStripProps) {
   const tablist = useRef<HTMLDivElement | null>(null)
+  const strip = useRef<HTMLDivElement | null>(null)
+  const fileDropHot = useTabFileDrop(strip, project)
   const drag = useTabDrag({
     tabs,
     container: tablist,
@@ -362,6 +365,9 @@ export function TabStrip({
     <div
       className={styles.strip}
       data-audit="tabStrip"
+      ref={strip}
+      data-file-drop-project={project}
+      {...(fileDropHot ? { 'data-file-drop': '' } : {})}
       // A right-click mid-drag would open a menu about a tab that is in flight, over a caret the
       // user is still aiming — and the menu's own pointer handling would fight the capture.
       onContextMenu={(e) => {
