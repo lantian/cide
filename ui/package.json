@@ -1,7 +1,7 @@
 {
   "name": "cide-ui",
   "private": true,
-  "version": "0.16.1-dev",
+  "version": "0.16.2-dev",
   "type": "module",
   "scripts": {
     "check:diagnostics-status": "node scripts/check-diagnostics-status.mjs",
