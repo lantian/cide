@@ -1069,6 +1069,11 @@ Saved decisions remain in the list with an `Answered` or `Decision saved` badge 
 is pending, but no longer count as waiting for the user in the panel, tab or project indicators.
 The mounted check covers save failures, restored answers, delivery delays and reset decisions;
 the core request tests also verify durable counts and deduplication of linked tasks.
+Saved decisions offer **Remove from Waiting**, including cancelled requests whose task or
+original run no longer exists. Cover failed removal with retry, duplicate clicks, close versus
+remove, and disabled removal while applying. Backend tests reject unanswered/applying requests
+and wrong-project IDs, retain the saved response, and verify that retirement survives restart
+without retrying delivery or reopening a repeated native call.
 
 The shared modal image viewer is covered by `pnpm --dir ui run check:image-viewer`:
 gallery order and boundaries, shared preview URLs, loading and refused images, fit and zoom

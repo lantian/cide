@@ -224,6 +224,31 @@ impl Requests {
         })
     }
 
+    /// Retire a saved decision from Waiting without losing its answer. Like native
+    /// retirement, this ends delivery retries; it does not recall input already sent.
+    pub fn dismiss(&self, root: &Path, id: &str) -> Result<UserRequest> {
+        self.update(|file| {
+            let request = request_mut(file, root, id)?;
+            if request.response.is_none() {
+                return Err(CoreError::Io(
+                    "Answer or cancel this request before removing it from Waiting.".into(),
+                ));
+            }
+            if request.applying {
+                return Err(CoreError::Io(
+                    "Wait for the saved decision to finish applying before removing it.".into(),
+                ));
+            }
+            request.delivered = true;
+            request.delivery_error = None;
+            let request = request.clone();
+            file.delivery_attempts.remove(id);
+            // A repeated native event must not reopen an explicitly dismissed call.
+            file.retired_native.remove(id);
+            Ok(request)
+        })
+    }
+
     /// Complete only a confirmed delivery. An uncertain submission survives restart and
     /// is reconciled against the saved conversation before another send is considered.
     pub fn deliver_answer(&self, root: &Path, id: &str, target: &dyn AnswerTarget) -> Result<bool> {
@@ -721,6 +746,83 @@ mod tests {
                 AnswerSubmission::Submitted
             })
         }
+    }
+
+    #[test]
+    fn dismissing_a_saved_decision_survives_restart_without_retrying_delivery() {
+        let (root, store, mut request) = fixture();
+        request.wait = false;
+        request.task = Some(TaskId("t-20".into()));
+        store.create(&root, request.clone()).unwrap();
+        let mut other = request;
+        other.id = "other".into();
+        other.task = None;
+        store.create(&root, other.clone()).unwrap();
+        store
+            .decide(&root, "request", UserRequestResponse::Cancel)
+            .unwrap();
+        store.complete_application(&root, "request").unwrap();
+        store
+            .delivery_error(&root, "request", "The original run is unavailable".into())
+            .unwrap();
+        let before = store.view(&root).rev;
+        let dismissed = store.dismiss(&root, "request").unwrap();
+        assert!(dismissed.delivered);
+        assert_eq!(dismissed.response, Some(UserRequestResponse::Cancel));
+        assert!(dismissed.delivery_error.is_none());
+        assert!(store.view(&root).rev > before);
+        assert_eq!(store.get(&root, "other").unwrap(), other);
+        let restored = Requests::load(root.join("requests.json"));
+        assert!(restored.get(&root, "request").unwrap().delivered);
+        let target = FakeHarness::new(&root);
+        target.ready.store(true, Ordering::Release);
+        assert!(restored.deliver_answer(&root, "request", &target).unwrap());
+        assert_eq!(target.sends.load(Ordering::Acquire), 0);
+        assert_eq!(waiting_count(&restored.view(&root).requests, &[]), 1);
+        // A second window may still have the removed row open.
+        restored.dismiss(&root, "request").unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dismissal_refuses_unanswered_applying_and_wrong_project_requests() {
+        let (root, store, mut request) = fixture();
+        request.task = Some(TaskId("t-20".into()));
+        store.create(&root, request).unwrap();
+        let before = store.view(&root);
+        assert!(store.dismiss(&root, "request").is_err());
+        assert_eq!(store.view(&root), before);
+        store
+            .decide(&root, "request", UserRequestResponse::Cancel)
+            .unwrap();
+        let before = store.view(&root);
+        assert!(store.dismiss(&root, "request").is_err());
+        assert!(
+            store
+                .dismiss(&root.join("other-project"), "request")
+                .is_err()
+        );
+        assert_eq!(store.view(&root), before);
+        store.complete_application(&root, "request").unwrap();
+        store.dismiss(&root, "request").unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dismissed_native_decisions_do_not_reopen_on_repeated_events() {
+        let (root, store, mut request) = fixture();
+        native(&mut request);
+        store.create(&root, request.clone()).unwrap();
+        store
+            .decide(&root, "request", UserRequestResponse::Cancel)
+            .unwrap();
+        assert!(store.claim_native(&root, "request").unwrap());
+        store.dismiss(&root, "request").unwrap();
+        assert!(store.file.lock().delivery_attempts.is_empty());
+        let restored = Requests::load(root.join("requests.json"));
+        assert!(restored.create(&root, request).unwrap().delivered);
+        assert!(!restored.claim_native(&root, "request").unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

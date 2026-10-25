@@ -75,6 +75,47 @@ try {
     request: { kind: 'question', question: referenceQuestion } }
   const referenceProps = { ...waitingProps, questions: [], review: [], requests: [referenceRequest], onOpenSession() {}, onRespondRequest: async () => {} }
   const savedRequest = { ...referenceRequest, response: { kind: 'answer', text: 'Production only', selectedIds: ['wait_production'] } }
+  let failDismiss = true
+  const dismissCalls = []
+  let finishDismiss
+  function DismissTransition() {
+    const [requests, setRequests] = React.useState([{ ...savedRequest, task: 't-20', response: { kind: 'cancel' },
+      deliveryError: 'The original run is unavailable; the decision is saved.' }])
+    return React.createElement(WaitingPanel, { ...referenceProps, requests,
+      onDismissRequest: async (id) => {
+        dismissCalls.push(id)
+        if (failDismiss) throw new Error('Could not remove the request')
+        await new Promise((resolve) => { finishDismiss = resolve })
+        setRequests((now) => now.map((request) => request.id === id ? { ...request, delivered: true } : request))
+      },
+    })
+  }
+  await mount(DismissTransition, {}, 'dismiss-transition')
+  await click(button('Choose model sources'))
+  assert.ok(document.querySelector('[data-audit="waitingSavedDecision"]').textContent.includes('Request cancelled'))
+  assert.ok(document.querySelector('[role="status"]').textContent.includes('delivery has not completed'))
+  assert.ok(!document.querySelector('[role="status"]').textContent.includes('current turn ends'), 'an unavailable run must not promise delivery')
+  await click(button('Close'))
+  assert.ok(button('Choose model sources'), 'closing a saved decision does not remove it')
+  await click(button('Choose model sources'))
+  await click(button('Remove from Waiting'))
+  assert.ok([...document.querySelectorAll('[role="alert"]')].some((alert) => alert.textContent === 'Could not remove the request'))
+  assert.ok(button('Remove from Waiting'), 'a failed removal stays open for retry')
+  failDismiss = false
+  await click(button('Remove from Waiting'))
+  assert.ok(button('Remove from Waiting').disabled)
+  await click(button('Remove from Waiting'))
+  assert.deepEqual(dismissCalls, ['reference-1', 'reference-1'], 'double clicking cannot remove a request twice')
+  await act(async () => finishDismiss())
+  assert.ok(document.querySelector('[data-audit="waitingEmpty"]'), 'removing an orphaned request does not need its deleted task or original run')
+  assert.equal(document.querySelector('[data-audit="waitingDecisionDialog"]'), null)
+  await mount(WaitingPanel, { ...referenceProps, onDismissRequest: async () => {} }, 'dismiss-open')
+  await click(button('Choose model sources'))
+  assert.equal(button('Remove from Waiting'), undefined, 'an unanswered request still requires an answer or cancellation')
+  assert.ok(button('Cancel request'))
+  await mount(WaitingPanel, { ...referenceProps, requests: [{ ...savedRequest, applying: true }], onDismissRequest: async () => {} }, 'dismiss-applying')
+  await click(button('Choose model sources'))
+  assert.ok(button('Remove from Waiting').disabled, 'removal cannot interrupt applying task changes')
   const countBadge = () => document.querySelector('[data-audit="waitingCount"]')
   const answeredBadge = () => document.querySelector('[data-audit="waitingAnswered"]')
   const headerCount = () => document.querySelector('[data-audit="waitingHeaderCount"]').textContent

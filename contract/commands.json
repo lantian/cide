@@ -386,6 +386,7 @@
   "update_install",
   "update_restart",
   "update_status",
+  "user_request_dismiss",
   "user_request_respond",
   "user_requests_list",
   "window_awaiting_sessions",

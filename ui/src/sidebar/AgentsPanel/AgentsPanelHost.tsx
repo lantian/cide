@@ -200,6 +200,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
   const requestView = useUserRequests((s) => s.view)
   const requestError = useUserRequests((s) => s.error)
   const respondRequest = useUserRequests((s) => s.respond)
+  const dismissRequest = useUserRequests((s) => s.dismiss)
   const selectedTask = useTasks((s) => s.selected)
   const decisionBackStack = useTasks((s) => s.decisionBackStack)
   const selectFromDecision = useTasks((s) => s.selectFromDecision)
@@ -489,6 +490,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
         requestError={requestError}
         taskOpen={selectedTask !== null && decisionBackStack.length > 0}
         onRespondRequest={respondRequest}
+        onDismissRequest={dismissRequest}
         onOpenSession={(id) => { void sessionJournal.open(project, id).then((plan) => { if (plan.kind === 'unavailable') throw new Error(plan.reason); return showOpenPlan(plan, 'Request conversation', 'session') }).catch(notifyFailure) }}
         // The run row's task link, exactly — see `onRevealTask` below for the road and its refusals.
         onOpenTask={(task) => selectFromDecision(task)}

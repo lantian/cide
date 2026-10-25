@@ -5724,6 +5724,8 @@ export const peerChat = {
 /** User decisions are independent of the task board and retain their originating conversation. */
 export const userRequests = {
   list: (project: ProjectId) => invoke<import('./generated').UserRequestsView>('user_requests_list', { project }),
+  dismiss: (project: ProjectId, id: string) =>
+    invoke<import('./generated').UserRequestsView>('user_request_dismiss', { project, id }),
   respond: (project: ProjectId, id: string, response: import('./generated').UserRequestResponse) =>
     invoke<import('./generated').UserRequestsView>('user_request_respond', { project, id, response }),
 }
