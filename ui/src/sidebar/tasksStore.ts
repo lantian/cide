@@ -72,7 +72,11 @@ interface TasksStore {
   /** A notification can open diagnostics for an @mentioned role other than the assignee. */
   dispatchAgent: string | null
   decisionBackStack: (TaskId | null)[]
+  /** Invalidates the originating Waiting dialog when navigation leaves task details. */
+  decisionEpoch: number
   selectFromDecision: (task: TaskId) => void
+  /** Leave all task/decision cards for another surface, rather than following Back. */
+  closeDetails: () => void
   /**
    * The task being composed, or `null` when the compose dialog is not up. (M21)
    *
@@ -161,6 +165,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
   selected: null,
   dispatchAgent: null,
   decisionBackStack: [],
+  decisionEpoch: 0,
   compose: null,
   creating: false,
 
@@ -231,6 +236,7 @@ export const useTasks = create<TasksStore>((set, get) => ({
   },
 
   selectFromDecision: (task) => set({ selected: task, dispatchAgent: null, decisionBackStack: [null] }),
+  closeDetails: () => set((state) => ({ selected: null, dispatchAgent: null, decisionBackStack: [], decisionEpoch: state.decisionEpoch + 1 })),
   select: (task) => {
     set({ dispatchAgent: null })
     const { selected, decisionBackStack } = get()

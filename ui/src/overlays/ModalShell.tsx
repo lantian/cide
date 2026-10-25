@@ -193,11 +193,15 @@ export function ModalShell({
 export function OverlayCard({
   label,
   onDismiss,
+  onEscapeFromOutside,
   children,
   className,
 }: {
   label: string
   onDismiss: () => void
+  /** Optional fallback for a modal whose focus was taken by a background pane.
+   * Inner controls still own Escape; only the top visible dialog may claim an outside key. */
+  onEscapeFromOutside?: (() => void) | undefined
   children: ReactNode
   /**
    * Added to the card's own class, for a dialog that needs a different width than the 620px every
@@ -206,6 +210,24 @@ export function OverlayCard({
    */
   className?: string | undefined
 }) {
+  const card = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    if (onEscapeFromOutside === undefined) return
+    const keydown = (event: KeyboardEvent) => {
+      const el = card.current
+      if (event.key !== 'Escape' || event.defaultPrevented || !el || el.contains(event.target as Node)) return
+      const dialogs = [...document.querySelectorAll('[aria-modal="true"]')]
+        .filter((dialog) => !dialog.closest('[inert], [hidden]'))
+      if (dialogs.at(-1) !== el) return
+      event.preventDefault()
+      event.stopPropagation()
+      onEscapeFromOutside()
+      // If Escape cancelled an editor instead of closing, restore the card's keyboard scope.
+      el.querySelector<HTMLElement>('[tabindex="-1"]')?.focus()
+    }
+    document.addEventListener('keydown', keydown, true)
+    return () => document.removeEventListener('keydown', keydown, true)
+  }, [onEscapeFromOutside])
   return createPortal(
     // The kit's `Scrim` (the same layer `Modal` below draws), so a card and a kit `Dialog` sit
     // on one scrim. Click-through to dismiss is on the scrim only; `stopPropagation` on the card
@@ -215,6 +237,7 @@ export function OverlayCard({
     // one of them (`settings/AgentsSection.tsx`) has a reason it must not be the first control.
     <Scrim data-audit="overlayScrim" onDismiss={onDismiss}>
       <div
+        ref={card}
         className={className === undefined ? styles.card : `${styles.card} ${className}`}
         data-audit="overlayCard"
         role="dialog"

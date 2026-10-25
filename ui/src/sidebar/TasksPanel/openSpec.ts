@@ -2,10 +2,11 @@ import { settings, spec, type ProjectId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { useTasks } from '../tasksStore'
 import { startSession } from '../OpenSpecPanel/specRuns'
+import { leaveTaskDetails } from './taskNavigation'
 
 /** Leave the task modal, reuse/open its change tab, and wait until that tab is focused. */
 export async function openTaskSpec(project: ProjectId, change: string): Promise<void> {
-  useTasks.getState().select(null)
+  leaveTaskDetails(project)
   const tab = await spec.openTab(project, { kind: 'change', change: change as never })
   await useWorkspace.getState().activateTab(project, tab)
 }
@@ -24,7 +25,6 @@ export async function approveTaskSpec(project: ProjectId, task: string, change: 
   await startSession(project, {
     op: 'apply', change: change as never, launcher: { kind: 'harness', harness },
   }, () => {
-    const current = useTasks.getState()
-    if (current.project === project && current.selected === task) current.select(null)
+    leaveTaskDetails(project, task)
   })
 }
