@@ -184,7 +184,7 @@ export function consolePaneOfProject(boot: Bootstrap | null, project: ProjectId)
  */
 export function focusedFilePath(boot: Bootstrap | null): string | null {
   const tab = activeTabOf(boot)
-  if (tab === null || tab.kind.kind !== 'file') return null
+  if (tab === null || (tab.kind.kind !== 'file' && tab.kind.kind !== 'clipboardDiff')) return null
   return tab.kind.path
 }
 
@@ -236,7 +236,7 @@ export function focusedFilePath(boot: Bootstrap | null): string | null {
 export function focusedTabPath(boot: Bootstrap | null): string | null {
   const tab = activeTabOf(boot)
   if (tab === null) return null
-  if (tab.kind.kind === 'file') return tab.kind.path
+  if (tab.kind.kind === 'file' || tab.kind.kind === 'clipboardDiff') return tab.kind.path
   // Absolute only — see above. A leading `/` is the whole test: cide is Linux-first and every
   // path on the wire is POSIX, which is the same shape `groupRows.isSyntheticPath` keys on.
   if (tab.kind.kind === 'diff' && tab.kind.spec.newPath.startsWith('/')) {

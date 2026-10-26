@@ -272,6 +272,11 @@ pub struct Accent {
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct ExplorerSettings {
+    /// Conservative indexing allocation limits in MiB. Shared across all providers.
+    #[serde(rename = "indexMemoryMiB")]
+    pub index_memory_mib: u32,
+    #[serde(rename = "totalIndexMemoryMiB")]
+    pub total_index_memory_mib: u32,
     /// Draw dot-prefixed entries — `.claude`, `.github`, `.env`.
     pub show_hidden_files: bool,
     /// Draw entries the ignore rules cover, tinted the way IDEA tints them.
@@ -283,6 +288,14 @@ pub struct ExplorerSettings {
     /// *directory* travels as one entry and its contents inherit it, which is what keeps this
     /// affordable on the wire.
     pub show_ignored_files: bool,
+}
+
+impl ExplorerSettings {
+    pub fn clamped(mut self) -> Self {
+        self.index_memory_mib = self.index_memory_mib.clamp(64, 4096);
+        self.total_index_memory_mib = self.total_index_memory_mib.clamp(256, 16384);
+        self
+    }
 }
 
 impl Default for ExplorerSettings {
@@ -301,6 +314,8 @@ impl Default for ExplorerSettings {
     /// cheap one is available to anyone who finds it too slow.
     fn default() -> Self {
         Self {
+            index_memory_mib: 512,
+            total_index_memory_mib: 2048,
             show_hidden_files: true,
             show_ignored_files: true,
         }
@@ -2868,3 +2883,23 @@ pub struct GitSettings {
 // Both fields' defaults are the derive's — `PullDefault::Ask` and `false` — which is why there
 // is no hand-written `impl` here. `#[serde(default)]` above is what fills them into a
 // `workspace.json` written before this group existed.
+
+#[cfg(test)]
+mod index_budget_tests {
+    use super::*;
+    #[test]
+    fn old_settings_get_defaults_and_new_wire_names_round_trip() {
+        let old: ExplorerSettings =
+            serde_json::from_str(r#"{"showHiddenFiles":true,"showIgnoredFiles":true}"#).unwrap();
+        assert_eq!(old.index_memory_mib, 512);
+        assert_eq!(old.total_index_memory_mib, 2048);
+        let next: ExplorerSettings =
+            serde_json::from_str(r#"{"indexMemoryMiB":1,"totalIndexMemoryMiB":99999}"#).unwrap();
+        let next = next.clamped();
+        assert_eq!(next.index_memory_mib, 64);
+        assert_eq!(next.total_index_memory_mib, 16384);
+        let wire = serde_json::to_value(next).unwrap();
+        assert_eq!(wire["indexMemoryMiB"], 64);
+        assert_eq!(wire["totalIndexMemoryMiB"], 16384);
+    }
+}

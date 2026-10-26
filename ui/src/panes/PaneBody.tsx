@@ -21,6 +21,7 @@ import { documentFromKey } from '@/gitlab/store'
 import { useState, type ReactNode } from 'react'
 import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
+import { ClipboardDiffPane } from './ClipboardDiffPane'
 import { ImagePane } from './ImagePane'
 import { imageKindFor } from './imageKinds'
 import { ExcalidrawHost } from './ExcalidrawHost'
@@ -237,6 +238,8 @@ export function PaneBody({
   )
 
   const pairTab = useWorkspace((s) => s.boot?.workspace.projects[project ?? '']?.tabs.find((t) => t.peerChat !== undefined && pane.id in t.tree.panes))
+  const clipboardTab = useWorkspace(s => s.boot?.workspace.projects[project ?? '']?.tabs.find(t =>
+    t.kind.kind === 'clipboardDiff' && pane.id in t.tree.panes))
   if (pairTab) return <PeerChatPane tab={pairTab} pane={pane} cwd={cwd} project={project} primarySession={primarySession} restore={restore} roots={roots} onOpenPath={onOpenPath} onRevealPath={onRevealPath} onSessionBound={onSessionBound} onScreen={onScreen} />
 
   // A file is a document too: no session, no spawn, nothing to resume. (M9)
@@ -251,6 +254,12 @@ export function PaneBody({
   if (diff?.origin.kind === 'gitLab' && pane.kind === 'diff') {
     return <ReviewEditor document={documentFromKey(diff.origin.document)} project={project ?? null} visible={onScreen ?? true} />
   }
+  if (clipboardTab?.kind.kind === 'clipboardDiff' && pane.kind === 'editor') {
+    return <ClipboardDiffPane snapshotId={clipboardTab.kind.snapshotId}
+      path={clipboardTab.kind.path} tab={clipboardTab.id} project={project}
+      pane={pane.id} root={cwd} onScreen={onScreen} onShowHistory={onShowHistory} />
+  }
+
   if (editor && pane.kind === 'editor') {
     /*
      * An image is a file tab too, and the fork is here rather than in Rust. (M18)

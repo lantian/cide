@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -41,6 +42,10 @@ struct File {
     /// same identity, may reopen it; ordinary chat delivery must never do so.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     retired_native: BTreeMap<String, bool>,
+    /// A tool reply can finish after its model turn has ended (Codex exec cells).
+    /// These are provisional receipts, never permission to replay a submitted turn.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    tool_replies: BTreeMap<String, BTreeSet<Option<String>>>,
 }
 
 pub enum AnswerSubmission {
@@ -71,7 +76,34 @@ pub struct Requests {
     file: Mutex<File>,
     changed: Condvar,
     /// Leases last through the socket write, rather than just through the wait.
-    waiters: Mutex<HashMap<String, usize>>,
+    waiters: Mutex<HashMap<String, BTreeSet<uuid::Uuid>>>,
+}
+
+/// One call owns one lease through the socket write. Dropping an error, cancelled
+/// call, or unwritten reply cannot release a different call's wait on the same id.
+pub struct WaitedRequest {
+    pub request: UserRequest,
+    store: Arc<Requests>,
+    token: uuid::Uuid,
+}
+
+impl std::ops::Deref for WaitedRequest {
+    type Target = UserRequest;
+    fn deref(&self) -> &UserRequest {
+        &self.request
+    }
+}
+
+impl Drop for WaitedRequest {
+    fn drop(&mut self) {
+        let mut waiters = self.store.waiters.lock();
+        if let Some(tokens) = waiters.get_mut(&self.request.id) {
+            tokens.remove(&self.token);
+            if tokens.is_empty() {
+                waiters.remove(&self.request.id);
+            }
+        }
+    }
 }
 
 impl Requests {
@@ -220,6 +252,7 @@ impl Requests {
             let request = r.clone();
             file.delivery_attempts.remove(id);
             file.retired_native.remove(id);
+            file.tool_replies.remove(id);
             Ok(request)
         })
     }
@@ -245,8 +278,30 @@ impl Requests {
             file.delivery_attempts.remove(id);
             // A repeated native event must not reopen an explicitly dismissed call.
             file.retired_native.remove(id);
+            file.tool_replies.remove(id);
             Ok(request)
         })
+    }
+
+    /// Save before returning the tool result. A successful socket write alone does
+    /// not prove the model consumed it; reconcile a model-visible output instead.
+    pub fn tool_reply(&self, root: &Path, id: &str, turn: Option<String>) -> Result<()> {
+        self.update(|file| {
+            let request = request_mut(file, root, id)?;
+            if !request.delivered && request.response.is_some() && !request.applying {
+                file.tool_replies.entry(id.into()).or_default().insert(turn);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn tool_reply_turns(&self, id: &str) -> BTreeSet<Option<String>> {
+        self.file
+            .lock()
+            .tool_replies
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Complete only a confirmed delivery. An uncertain submission survives restart and
@@ -370,24 +425,31 @@ impl Requests {
         })
     }
     pub fn has_waiter(&self, id: &str) -> bool {
-        self.waiters.lock().get(id).copied().unwrap_or(0) > 0
+        self.waiters
+            .lock()
+            .get(id)
+            .is_some_and(|tokens| !tokens.is_empty())
     }
-    pub fn release(&self, id: &str) {
-        let mut waiters = self.waiters.lock();
-        if let Some(count) = waiters.get_mut(id) {
-            *count -= 1;
-            if *count == 0 {
-                waiters.remove(id);
-            }
-        }
-    }
-    /// The caller releases the lease after writing its reply, including on write failure.
-    pub fn wait(&self, root: &Path, id: &str, cancelled: impl Fn() -> bool) -> Result<UserRequest> {
-        *self.waiters.lock().entry(id.to_owned()).or_default() += 1;
+    /// Keep the returned guard until the reply is written, including on write failure.
+    pub fn wait(
+        self: &Arc<Self>,
+        root: &Path,
+        id: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<WaitedRequest> {
+        let mut waited = WaitedRequest {
+            request: self.get(root, id)?,
+            store: Arc::clone(self),
+            token: uuid::Uuid::new_v4(),
+        };
+        self.waiters
+            .lock()
+            .entry(id.to_owned())
+            .or_default()
+            .insert(waited.token);
         let mut file = self.file.lock();
         loop {
             if cancelled() {
-                self.release(id);
                 return Err(CoreError::Io(format!(
                     "Waiting interrupted. Request {id} is saved; reconnect with cide_user_request_result and wait=true before continuing dependent work."
                 )));
@@ -397,12 +459,14 @@ impl Requests {
                 .get(&root.to_string_lossy().into_owned())
                 .and_then(|rows| rows.iter().find(|r| r.id == id));
             match request {
-                Some(r) if r.response.is_some() && !r.applying => return Ok(r.clone()),
+                Some(r) if r.response.is_some() && !r.applying => {
+                    waited.request = r.clone();
+                    return Ok(waited);
+                }
                 Some(_) => {
                     self.changed.wait_for(&mut file, Duration::from_millis(200));
                 }
                 None => {
-                    self.release(id);
                     return Err(CoreError::Io("No such request.".into()));
                 }
             }
@@ -517,6 +581,115 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn each_waiting_call_holds_only_its_own_reply_lease() {
+        let (root, store, request) = fixture();
+        store.create(&root, request).unwrap();
+        store
+            .decide(&root, "request", UserRequestResponse::Cancel)
+            .unwrap();
+        let first = store.wait(&root, "request", || false).unwrap();
+        let second = store.wait(&root, "request", || false).unwrap();
+        drop(first);
+        assert!(store.has_waiter("request"));
+        assert!(store.wait(&root, "request", || true).is_err());
+        assert!(
+            store.has_waiter("request"),
+            "cancellation must not release another reply"
+        );
+        drop(second);
+        assert!(!store.has_waiter("request"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_late_codex_tool_display_resumes_once_but_a_consumed_result_does_not() {
+        use crate::conversations::Transcript;
+        use serde_json::json;
+        struct Receiver<'a> {
+            store: &'a Requests,
+            transcript: Transcript,
+            harness: FakeHarness,
+        }
+        impl AnswerTarget for Receiver<'_> {
+            fn received(&self, request: &UserRequest) -> Result<bool> {
+                Ok(self
+                    .transcript
+                    .received_tool_answer(request, &self.store.tool_reply_turns(&request.id))
+                    || self.harness.received(request)?)
+            }
+            fn submit(
+                &self,
+                request: &UserRequest,
+                begin: &dyn Fn() -> Result<bool>,
+            ) -> Result<AnswerSubmission> {
+                self.harness.submit(request, begin)
+            }
+        }
+        for consumed in [false, true] {
+            let (root, store, request) = fixture();
+            store.create(&root, request).unwrap();
+            let response = UserRequestResponse::Answer {
+                text: "На этой же странице, но следующим рядом".into(),
+                selected_ids: vec![],
+            };
+            store.decide(&root, "request", response.clone()).unwrap();
+            let waiter = store.wait(&root, "request", || false).unwrap();
+            store
+                .tool_reply(&root, "request", Some("asking-turn".into()))
+                .unwrap();
+            drop(waiter); // socket accepted the reply, including after the turn ended
+            assert!(!store.get(&root, "request").unwrap().delivered);
+            // Provisional receipts survive an IDE restart; already delivered rows do not reopen.
+            let restored = Requests::load(root.join("requests.json"));
+            let mut receiver = Receiver {
+                store: &restored,
+                transcript: Transcript::default(),
+                harness: FakeHarness::new(&root),
+            };
+            receiver.harness.native.store(true, Ordering::Release);
+            receiver.harness.acknowledge.store(false, Ordering::Release);
+            let result = json!({"id":"request", "pending":false, "response":response});
+            receiver.transcript.feed(&json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"asking-turn"}}), "start");
+            if consumed {
+                receiver.transcript.feed(&json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"exec","output":format!("Script completed\nOutput:\n{}", json!({"content":[{"type":"text","text":result.to_string()}]}))}}), "consumed");
+            }
+            receiver.transcript.feed(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"asking-turn"}}), "end");
+            receiver.transcript.feed(&json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"McpToolCall","result":result}}}), "display-only");
+            if !consumed {
+                assert!(
+                    !restored
+                        .deliver_answer(&root, "request", &receiver)
+                        .unwrap()
+                );
+                assert_eq!(receiver.harness.sends.load(Ordering::Acquire), 0);
+            }
+            receiver.harness.ready.store(true, Ordering::Release);
+            assert!(
+                restored
+                    .deliver_answer(&root, "request", &receiver)
+                    .unwrap()
+            );
+            assert!(
+                restored
+                    .deliver_answer(&root, "request", &receiver)
+                    .unwrap()
+            );
+            assert_eq!(
+                receiver.harness.sends.load(Ordering::Acquire),
+                usize::from(!consumed)
+            );
+            assert!(restored.tool_reply_turns("request").is_empty());
+            let again = Requests::load(root.join("requests.json"));
+            assert!(again.deliver_answer(&root, "request", &receiver).unwrap());
+            assert_eq!(
+                receiver.harness.sends.load(Ordering::Acquire),
+                usize::from(!consumed)
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn native(request: &mut UserRequest) {
         request.request = UserRequestKind::Questions {
             source: cide_ipc::NativeQuestionSource {
@@ -579,7 +752,7 @@ mod tests {
             .unwrap();
         assert!(store.claim_native(&root, "request").unwrap());
         assert!(!store.claim_native(&root, "request").unwrap());
-        let restored = Requests::load(root.join("requests.json"));
+        let restored = Arc::new(Requests::load(root.join("requests.json")));
         assert!(
             !restored.claim_native(&root, "request").unwrap(),
             "uncertain writes must not be replayed after restart"
@@ -656,7 +829,7 @@ mod tests {
             store
                 .retire_native(&root, "request", "Disconnected")
                 .unwrap();
-            let restored = Requests::load(root.join("requests.json"));
+            let restored = Arc::new(Requests::load(root.join("requests.json")));
             assert!(restored.get(&root, "request").unwrap().delivered);
             let reopened = restored.create(&root, request.clone()).unwrap();
             assert!(!reopened.delivered);
@@ -909,7 +1082,7 @@ mod tests {
         target.acknowledge.store(false, Ordering::Release);
         target.fail.store(true, Ordering::Release);
         assert!(store.deliver_answer(&root, "request", &target).is_err());
-        let restored = Requests::load(root.join("requests.json"));
+        let restored = Arc::new(Requests::load(root.join("requests.json")));
         assert!(!restored.deliver_answer(&root, "request", &target).unwrap());
         assert_eq!(target.sends.load(Ordering::Acquire), 1);
         let mut wrong = restored.get(&root, "request").unwrap();
@@ -932,11 +1105,11 @@ mod tests {
             .unwrap();
         let target = FakeHarness::new(&root);
         target.ready.store(true, Ordering::Release);
-        store.wait(&root, "request", || false).unwrap();
+        let waited = store.wait(&root, "request", || false).unwrap();
         assert!(!store.deliver_answer(&root, "request", &target).unwrap());
         assert_eq!(target.sends.load(Ordering::Acquire), 0);
         // A failed socket write releases the waiter without marking delivery complete.
-        store.release("request");
+        drop(waited);
         target.reject.store(true, Ordering::Release);
         assert!(!store.deliver_answer(&root, "request", &target).unwrap());
         assert!(store.file.lock().delivery_attempts.is_empty());
@@ -969,7 +1142,7 @@ mod tests {
         store.decide(&root, "request", answer.clone()).unwrap();
         assert!(store.get(&root, "request").unwrap().applying);
         assert_eq!(waiting_count(&store.view(&root).requests, &tasks), 0);
-        let restored = Requests::load(root.join("requests.json"));
+        let restored = Arc::new(Requests::load(root.join("requests.json")));
         assert_eq!(
             waiting_count(&restored.view(&root).requests, &tasks),
             0,
@@ -1038,13 +1211,8 @@ mod tests {
             selected_ids: vec![],
         };
         store.decide(&root, "request", answer.clone()).unwrap();
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .unwrap()
-                .response,
-            Some(answer.clone())
-        );
+        let waited = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(waited.response, Some(answer.clone()));
         assert!(store.decide(&root, "request", answer.clone()).is_err());
         assert_eq!(
             Requests::load(root.join("requests.json"))
@@ -1058,7 +1226,7 @@ mod tests {
             "delivery owns the lease until the socket write"
         );
         store.delivered(&root, "request").unwrap();
-        store.release("request");
+        drop(waited);
         thread.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1073,7 +1241,7 @@ mod tests {
                 .is_err()
         );
         assert!(!store.has_waiter("request"));
-        let restored = Requests::load(root.join("requests.json"));
+        let restored = Arc::new(Requests::load(root.join("requests.json")));
         assert!(restored.get(&root, "request").unwrap().response.is_none());
         restored
             .decide(&root, "request", UserRequestResponse::Cancel)
@@ -1082,7 +1250,7 @@ mod tests {
             restored.wait(&root, "request", || false).unwrap().response,
             Some(UserRequestResponse::Cancel)
         );
-        restored.release("request");
+
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1114,7 +1282,7 @@ mod tests {
                 .unwrap()
                 .applying
         );
-        store.release("request");
+
         waiter.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1156,11 +1324,11 @@ mod tests {
             )
             .unwrap();
         assert!(approved.applying);
-        let restored = Requests::load(root.join("requests.json"));
+        let restored = Arc::new(Requests::load(root.join("requests.json")));
         assert!(restored.get(&root, "request").unwrap().applying);
         restored.complete_application(&root, "request").unwrap();
         assert!(!restored.wait(&root, "request", || false).unwrap().applying);
-        restored.release("request");
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

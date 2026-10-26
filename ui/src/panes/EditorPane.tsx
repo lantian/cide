@@ -6,17 +6,9 @@
  * one, writes one back, keeps the tab's dirty dot honest, and decides what to do when
  * something else changes the file underneath it.
  *
- * # Splitting
- *
- * There is nothing here about splits, and that is the point. A file tab carries a
- * `PaneTree` like every other tab, so "split editor right" is `pane.split` on the focused
- * pane — the same command, the same domain code and the same `SplitTree` that splits a
- * terminal. Each pane in the tree renders its own `EditorPane` over the same path, which is
- * two views of one file, which is what a split editor is. They are two *buffers*, not one
- * shared document, and that is a real limitation rather than a design: an edit in the left
- * half does not appear in the right until one of them saves and the other reloads. Sharing
- * would mean lifting the `EditorState` out of the component and into a per-path store, and
- * the milestone asks for the split path to exist, not for collaborative buffers.
+ * A clipboard comparison and the ordinary file tab attach to one shared document. The
+ * session owns text and undo history, while this host retains file loading, conflict checks,
+ * autosave and recovery. Closing either view leaves that document in the remaining view.
  */
 import {
   useCallback,
@@ -53,6 +45,8 @@ import {
   revisionFile,
 } from '@/ipc/client'
 import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
+import { documentFor, prepareDocument, saveSharedDocument } from '@/editor/sharedDocuments'
+import type { ClipboardComparison } from '@/editor/clipboardDiffView'
 import { registerPaneFocus } from './paneFocus'
 import {
   fetchOutline,
@@ -99,6 +93,7 @@ import type { ProjectId } from '@/ipc/client'
 import styles from './EditorPane.module.css'
 
 export interface EditorPaneProps {
+  comparison?: ClipboardComparison | undefined
   /** Absolute path of the file this tab shows. */
   path: string
   /** The project root, so the status bar's trail is repo-relative. */
@@ -188,6 +183,7 @@ const POSITION_DEBOUNCE_MS = 500
 const mountedPanes = new Map<string, number>()
 
 export function EditorPane({
+  comparison,
   path,
   root,
   project,
@@ -434,7 +430,7 @@ export function EditorPane({
       const kept = backedUpRef.current
       if (kept === null || project === undefined || tab === undefined) return
       const open = (useWorkspace.getState().boot?.workspace.projects[project]?.tabs ?? []).some(
-        (t) => t.id === tab,
+        (t) => t.id === tab || ((t.kind.kind === 'file' || t.kind.kind === 'clipboardDiff') && t.kind.path === kept),
       )
       if (!open) {
         backedUpRef.current = null
@@ -908,6 +904,15 @@ export function EditorPane({
    * `text` for every file that is not markdown, where it is never read. See Rust's `MarkdownView`
    * for why one field on one record beats a second store keyed on "only the markdown ones".
    */
+  const comparisonKey = comparison ? `${comparison.id}:${comparison.layout}` : null
+  const previousComparison = useRef(comparisonKey)
+  useEffect(() => {
+    if (previousComparison.current !== comparisonKey) {
+      previousComparison.current = comparisonKey
+      setReloadKey(n => n + 1)
+    }
+  }, [comparisonKey])
+
   const [mdView, setMdView] = useState<MdView>('text')
   /*
    * Read on every note, so an ordinary scroll does not overwrite the layout with a default.
@@ -1020,9 +1025,13 @@ export function EditorPane({
       const keptRead =
         bump || carried ? Promise.resolve(null) : fileApi.backupRead(path).catch(() => null)
       void Promise.all([fileApi.read(path), fileApi.position(path).catch(() => null), keptRead])
-        .then(([doc, at, kept]) => {
+        .then(async ([doc, at, kept]) => {
           if (cancelled) return
           const recovery = restoreDecision(kept?.text ?? null, doc.text)
+          const shared = await prepareDocument(path, doc.text,
+            recovery === 'restore' && kept !== null ? kept.baseStamp : doc.stamp, tab)
+          if (cancelled) return
+          if (bump) shared.reload(doc.text, doc.stamp)
           if (recovery === 'drop') void fileApi.backupClear(path).catch(() => {})
           /*
            * A carried buffer takes the refs and nothing else.
@@ -1060,7 +1069,7 @@ export function EditorPane({
              */
             setMdView(at?.markdownView ?? 'text')
           }
-          diskTextRef.current = doc.text
+          diskTextRef.current = shared.savedText
           backupSize.current = doc.text.length
           /*
            * A recovered buffer autosaves against the stamp it was *typed* against, not the one
@@ -1068,11 +1077,11 @@ export function EditorPane({
            * conflict bar asks, rather than the kept text silently replacing whatever landed.
            */
           stampRef.current =
-            recovery === 'restore' && kept !== null ? kept.baseStamp : doc.stamp
+            recovery === 'restore' && kept !== null ? kept.baseStamp : shared.stamp
           if (recovery === 'restore') backedUpRef.current = path
           writableRef.current = doc.writable
           setConflict(false)
-          if (!carried) reportDirty(false)
+          if (!carried) reportDirty(shared.dirty)
           else {
             /*
              * Still dirty, and the *new* path has to be the one offering the bytes.
@@ -1099,6 +1108,14 @@ export function EditorPane({
   )
 
   useEffect(() => read(false), [read])
+  useEffect(() => {
+    const shared = documentFor(path)
+    if (!shared) return
+    return shared.subscribe(() => {
+      diskTextRef.current = shared.savedText
+      stampRef.current = shared.stamp
+    })
+  }, [path, load.kind])
 
   /**
    * Write the buffer back.
@@ -1125,7 +1142,7 @@ export function EditorPane({
        * because that is the user deciding — the same asymmetry `write_if_unchanged` documents
        * from the other end.
        */
-      fileApi.write(path, text, cause === 'autosave' ? stampRef.current : null).then(
+      saveSharedDocument(path, text, cause === 'autosave' ? stampRef.current : null).then(
         (stamp) => {
           // The token moves with the write. Without this the *next* autosave would compare
           // against the file as it stood when the tab opened and refuse for ever after the
@@ -1297,7 +1314,9 @@ export function EditorPane({
         // or split away. The inline version this replaced closed over its effect's own
         // `dropped` flag, and losing that guard would mean rebuilding an `EditorView` for a
         // pane that no longer exists.
-        if (!aliveRef.current || doc.stamp === stampRef.current) return
+        if (!aliveRef.current || doc.stamp === stampRef.current
+          || (doc.stamp !== null && stampRef.current !== null
+            && doc.stamp.mtimeNanos === stampRef.current.mtimeNanos && doc.stamp.len === stampRef.current.len)) return
         if (dirtyRef.current) setConflict(true)
         else read(true)
       })
@@ -1458,6 +1477,7 @@ export function EditorPane({
              */
             onClick={() => {
               stampRef.current = null
+              documentFor(path)?.acceptStamp(null)
               setConflict(false)
             }}
           >
@@ -1471,7 +1491,8 @@ export function EditorPane({
         <MaybeMarkdown
           path={path}
           project={project}
-          view={mdView}
+          forceText={comparison !== undefined}
+          view={comparison ? 'text' : mdView}
           onView={chooseView}
           readText={readText}
           subscribeText={subscribeText}
@@ -1480,6 +1501,8 @@ export function EditorPane({
           onSyncHandle={onSyncHandle}
         >
         <EditorSurface
+          sharedFile
+          comparison={comparison}
           path={path}
           onShowHistory={onShowHistory}
           root={root}
@@ -1578,6 +1601,7 @@ export function EditorPane({
  * that component's header for why preview mode hides the buffer rather than unmounting it.
  */
 function MaybeMarkdown({
+  forceText = false,
   path,
   project,
   view,
@@ -1589,6 +1613,7 @@ function MaybeMarkdown({
   onSyncHandle,
   children,
 }: {
+  forceText?: boolean
   path: string
   project: ProjectId | undefined
   view: MdView
@@ -1613,7 +1638,7 @@ function MaybeMarkdown({
     [project],
   )
 
-  if (!isMarkdownPath(path)) return children
+  if (forceText || !isMarkdownPath(path)) return children
   return (
     <MarkdownFrame
       path={path}

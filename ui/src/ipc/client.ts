@@ -2704,6 +2704,9 @@ export const clipboard = {
 export const fsReveal = {
   showInManager: (projectId: ProjectId, path: string) =>
     invoke<string>('fs_show_in_manager', { project: projectId, path }),
+  /** Open the saved file using the desktop's default application for its type. */
+  openExternal: (projectId: ProjectId, path: string) =>
+    invoke<void>('fs_open_external', { project: projectId, path }),
 }
 
 // -------------------------------------------------------------------------------------------
@@ -5752,4 +5755,19 @@ export const languageServers = {
   get: (project: ProjectId) => invoke<import('./generated').LanguageServerSnapshot[]>('language_servers_get', { project }),
   control: (project: ProjectId, source: string | null, action: import('./generated').LanguageServerAction) => invoke<void>('language_servers_control', { project, source, action }),
   logs: (project: ProjectId, source: string, after: number) => invoke<import('./generated').LanguageServerLogs>('language_servers_logs', { project, source, after }),
+}
+
+/** Clipboard snapshots and shared file buffers live in the native process, never the layout. */
+export const clipboardComparison = {
+  open: (project: ProjectId, path: string, text: string) =>
+    invoke<TabId>('tab_open_clipboard_diff', { project, path, text }),
+  content: (snapshotId: string) => invoke<string>('clipboard_diff_content', { snapshotId }),
+}
+export const sharedDocument = {
+  onRedockRequested: (handler: () => void) =>
+    listen<string>('cide://editor-redock-requested', event => { if (event.payload === windowLabel()) handler() }),
+  sync: (path: string, expected: number | null, next: import('./generated').SharedDocumentSnapshot | null) =>
+    invoke<import('./generated').SharedDocumentSnapshot | null>('shared_document_sync', { path, expected, next }),
+  onChanged: (handler: (event: { path: string; version: number }) => void) =>
+    listen<{ path: string; version: number }>('cide://shared-document-changed', event => handler(event.payload)),
 }

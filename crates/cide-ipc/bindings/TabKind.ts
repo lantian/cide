@@ -43,7 +43,7 @@ export type TabKind = { "kind": "claudeHome" } | { "kind": "conversation", id: s
  * learnt the same way. `false` is also the right answer for such a tab: the user opened
  * it.
  */
-ephemeral: boolean, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "diff", spec: DiffSpec, 
+ephemeral: boolean, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "clipboardDiff", path: string, snapshotId: string, dirty: boolean, } | { "kind": "diff", spec: DiffSpec, 
 /**
  * A **preview** tab: the one slot a single click in the git panel is allowed to
  * re-point at another file. VS Code's preview tab, and taken deliberately.

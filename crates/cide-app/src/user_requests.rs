@@ -484,18 +484,10 @@ fn deliver(app: &AppHandle, project: ProjectId, request: &UserRequest) -> Result
     if matches!(request.request, UserRequestKind::Questions { .. }) {
         return Ok(false);
     }
-    if request.origin.run.is_none() {
-        return store(app)?.deliver_answer(
-            &root(app, project)?,
-            &request.id,
-            &ConversationDelivery { app, project },
-        );
-    }
-    app.state::<Arc<AgentRegistry>>().deliver_user_request(
-        app,
-        project,
-        &request.origin,
-        &answer_line(request),
+    store(app)?.deliver_answer(
+        &root(app, project)?,
+        &request.id,
+        &ConversationDelivery { app, project },
     )
 }
 
@@ -519,12 +511,14 @@ struct ConversationDelivery<'a> {
 
 impl AnswerTarget for ConversationDelivery<'_> {
     fn received(&self, request: &UserRequest) -> Result<bool> {
-        Ok(crate::conversations::received_answer(
+        crate::conversations::received_answer(
             self.app,
             self.project,
             &request.origin,
             &answer_marker(request),
-        ))
+            request,
+            &store(self.app)?.tool_reply_turns(&request.id),
+        )
     }
 
     fn submit(
@@ -537,6 +531,11 @@ impl AnswerTarget for ConversationDelivery<'_> {
         let line = answer_line(request);
         if !origin.known {
             return Ok(AnswerSubmission::Waiting);
+        }
+        if origin.run.is_some() {
+            return app
+                .state::<Arc<AgentRegistry>>()
+                .deliver_user_request(app, project, origin, &line, begin);
         }
         // The journal's old PTY id is not sufficient after /new, /clear or /resume.
         if let Some(session) = crate::conversations::live(app, origin)

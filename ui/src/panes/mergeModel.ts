@@ -147,6 +147,16 @@ function same(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((line, i) => line === b[i])
 }
 
+/** Append a line range without spreading a large file into function arguments. */
+function appendLines(
+  out: string[],
+  source: readonly string[],
+  from = 0,
+  to = source.length,
+): void {
+  for (let i = from; i < to; i += 1) out.push(source[i] as string)
+}
+
 /** One side's version of a base window, with that side's edits applied into it. */
 function window(
   base: readonly string[],
@@ -158,11 +168,11 @@ function window(
   const out: string[] = []
   let at = from
   for (const edit of edits) {
-    if (edit.aFrom > at) out.push(...base.slice(at, edit.aFrom))
-    out.push(...side.slice(edit.bFrom, edit.bTo))
+    if (edit.aFrom > at) appendLines(out, base, at, edit.aFrom)
+    appendLines(out, side, edit.bFrom, edit.bTo)
     at = edit.aTo
   }
-  if (at < to) out.push(...base.slice(at, to))
+  if (at < to) appendLines(out, base, at, to)
   return out
 }
 
@@ -229,7 +239,7 @@ function group(ours: readonly Edit[], theirs: readonly Edit[]): Group[] {
  * Patience diff over lines: the changed blocks of `a` against `b`.
  *
  * Patience rather than the textbook LCS, and the reason is size as much as quality. A dynamic
- * table is `O(n·m)` cells, which for two 12,000-line files — the resolver's own limit — is 144
+ * table is `O(n·m)` cells, which for even two 12,000-line files is 144
  * million, in a webview, on a keystroke. Patience anchors on lines that appear **exactly once on
  * each side**, takes the longest increasing run of those, and recurses between them; the common
  * prefix and suffix trim first, which on a real conflicted file collapses almost all of it.
@@ -453,7 +463,7 @@ export function regionText(doc: MergeDoc, region: Region, decision: Decision): s
   if (decision.taken.length === 0) return doc.base.slice(region.baseFrom, region.baseTo)
   const out: string[] = []
   for (const side of decision.taken) {
-    out.push(...(side === 'ours' ? region.ours : region.theirs))
+    appendLines(out, side === 'ours' ? region.ours : region.theirs)
   }
   return out
 }
@@ -463,11 +473,11 @@ export function renderResult(doc: MergeDoc, decisions: Decisions): string {
   const out: string[] = []
   let at = 0
   for (const region of doc.regions) {
-    out.push(...doc.base.slice(at, region.baseFrom))
-    out.push(...regionText(doc, region, decisionOf(decisions, region.id)))
+    appendLines(out, doc.base, at, region.baseFrom)
+    appendLines(out, regionText(doc, region, decisionOf(decisions, region.id)))
     at = region.baseTo
   }
-  out.push(...doc.base.slice(at))
+  appendLines(out, doc.base, at)
   return out.join('\n')
 }
 

@@ -1,4 +1,4 @@
-//! The multi-root file index: a parallel gitignore-aware walk and the flattened row model
+//! The multi-root file index: a bounded gitignore-aware walk and the flattened row model
 //! the file tree renders from.
 //!
 //! # The row model
@@ -21,10 +21,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::Arc;
+
+use crate::budget::{Budget, Worker};
 
 use cide_ipc::{FsChange, TreeMatch, TreeRow, TreeRowKind};
-use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::filter::{Filter, Visibility};
 
@@ -63,7 +64,7 @@ pub struct WalkItem {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BuildOptions {
-    /// 0 lets `ignore` pick one thread per core.
+    /// Retained for compatibility. Walks use one of four app-wide worker permits.
     pub threads: usize,
     /// How many entries accumulate before a worker hands them to the sink. Small enough
     /// that the picker fills visibly during a long walk, large enough that the channel is
@@ -113,6 +114,7 @@ struct Node {
 /// A project's file tree.
 #[derive(Debug)]
 pub struct Index {
+    budget: Arc<Budget>,
     nodes: Vec<Node>,
     /// Slots freed by deletions, reused before the arena grows.
     free: Vec<NodeId>,
@@ -142,6 +144,7 @@ impl Index {
     /// the first millisecond has something to answer from.
     pub fn empty(roots: Vec<Root>, visibility: Visibility) -> Self {
         let mut index = Self {
+            budget: Budget::standalone(),
             nodes: Vec::new(),
             free: Vec::new(),
             by_path: HashMap::new(),
@@ -212,6 +215,14 @@ impl Index {
     /// stopped being one: a shown `target/` is thousands of directories the watcher must not
     /// take a descriptor on. It is still what [`crate::Filter::build`] wants — every visited
     /// directory, so every `.gitignore` is found — and [`Index::watch_dirs`] is the watch list.
+    pub fn file_paths(&self) -> Vec<PathBuf> {
+        self.by_path
+            .iter()
+            .filter(|(_, id)| matches!(self.nodes[**id as usize].kind, TreeRowKind::File))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
     pub fn dir_paths(&self) -> Vec<PathBuf> {
         self.by_path
             .iter()
@@ -230,6 +241,7 @@ impl Index {
     pub fn watch_dirs(&self, filter: &Filter) -> Vec<PathBuf> {
         self.by_path
             .iter()
+            .take_while(|_| !self.budget.cancelled())
             .filter(|&(_, &id)| matches!(self.nodes[id as usize].kind, TreeRowKind::Dir))
             .filter(|(path, id)| {
                 filter.watchable(path, true)
@@ -246,6 +258,7 @@ impl Index {
     pub fn watch_links(&self, filter: &Filter) -> Vec<PathBuf> {
         self.by_path
             .iter()
+            .take_while(|_| !self.budget.cancelled())
             .filter(|(path, id)| {
                 let node = &self.nodes[**id as usize];
                 node.symlink
@@ -421,34 +434,62 @@ impl Index {
     /// Walk the roots and build the tree, streaming batches of entries to `sink` as they
     /// are found.
     ///
-    /// The sink runs on *this* thread, once per batch, draining the channel the walker
-    /// threads fill — not on the walker threads themselves, so it is never called
-    /// concurrently with itself. It still has to be cheap: every millisecond it spends is a
-    /// millisecond the channel backs up behind it. Injecting into a lock-free `nucleo` queue
-    /// is exactly the shape it is meant for.
+    /// The sink runs synchronously on this thread. Returning from it is the backpressure:
+    /// no producer can queue paths while the tree or matcher is admitting this batch.
     pub fn build(
         roots: Vec<Root>,
         opts: BuildOptions,
         sink: &(dyn Fn(&[WalkItem]) + Sync),
     ) -> Self {
+        Self::build_controlled(roots, opts, Budget::standalone(), sink)
+    }
+
+    pub fn build_controlled(
+        roots: Vec<Root>,
+        opts: BuildOptions,
+        budget: Arc<Budget>,
+        sink: &(dyn Fn(&[WalkItem]) + Sync),
+    ) -> Self {
         let mut index = Self::empty(roots, opts.visibility);
+        index.budget = Arc::clone(&budget);
         let multi = index.roots.len() > 1;
-        let mut entries: Vec<WalkItem> = Vec::new();
-
-        for (i, root) in index.roots.clone().iter().enumerate() {
-            let start = entries.len();
-            walk_root(root, &root.path, i as u16, multi, opts, true, |batch| {
-                sink(batch);
-                entries.extend_from_slice(batch);
-            });
-            tracing::debug!(
-                root = %root.path.display(),
-                entries = entries.len() - start,
-                "walked a project root"
-            );
+        // Finish ordinary sources in every root before spending capacity on ignored trees
+        // or linked targets. The second pass skips known paths without charging them twice.
+        for extras in [false, true] {
+            let mut pass = opts;
+            if !extras {
+                pass.visibility.ignored = false;
+            }
+            for (i, root) in index.roots.clone().iter().enumerate() {
+                walk_root(
+                    root,
+                    &root.path,
+                    i as u16,
+                    multi,
+                    pass,
+                    extras,
+                    &budget,
+                    |batch| {
+                        let inserted = index.graft_batch(
+                            batch
+                                .iter()
+                                .filter(|i| extras || !i.symlink)
+                                .cloned()
+                                .collect(),
+                            false,
+                        );
+                        sink(&inserted);
+                    },
+                );
+            }
         }
-
-        index.graft_entries(entries);
+        for id in 0..index.nodes.len() {
+            if budget.cancelled() {
+                return index;
+            }
+            index.sort_children(id as NodeId);
+        }
+        index.recompute_all();
         index
     }
 
@@ -467,27 +508,22 @@ impl Index {
     /// Uses the same ignore rules and `rel` construction as the project walk. Library
     /// directory links remain leaves, matching the synthetic library tree's existing policy.
     ///
-    /// # Threads, and the 20× trap
-    ///
-    /// `BuildOptions::default()` is `threads: 0`, which lets `ignore` spin one walker per core.
-    /// That is right for a handful of project roots and catastrophic for hundreds of tiny ones:
-    /// measured on this repository's own dependency set — 593 package directories, 36,643
-    /// entries of which 31,865 are files, warm cache, 32 cores — a loop of `threads: 0` walks
-    /// costs **1.24 s**, against **130 ms** for the same loop at `threads: 1`. The cost is not
-    /// the walking, it is spawning and joining 32 threads 593 times over directories that hold
-    /// 60 entries each.
-    ///
-    /// So the caller passes `threads: 1` and this function does not decide for it — but the
-    /// number is written down here because the *default* is the trap, and a caller reaching for
-    /// `BuildOptions::default()` gets it.
-    ///
-    /// `multi` is `true` for these callers, which is what makes `rel` come back as
-    /// `serde-1.0.229/src/de/mod.rs` — the package name prefixed for free by `Visitor::item`,
-    /// and exactly the string the picker should match and draw.
+    /// Uses one of the four shared worker permits, with no thread pool per package. `multi`
+    /// prefixes the root label onto each candidate's relative path.
     pub fn walk_roots(
         roots: &[Root],
         opts: BuildOptions,
         multi: bool,
+        sink: &(dyn Fn(&[WalkItem]) + Sync),
+    ) {
+        Self::walk_roots_controlled(roots, opts, multi, &Budget::standalone(), sink);
+    }
+
+    pub fn walk_roots_controlled(
+        roots: &[Root],
+        opts: BuildOptions,
+        multi: bool,
+        budget: &Budget,
         sink: &(dyn Fn(&[WalkItem]) + Sync),
     ) {
         for (i, root) in roots.iter().enumerate() {
@@ -495,9 +531,23 @@ impl Index {
             // indices. Truncating is the right failure: the index is only used to attribute a
             // `WalkItem` to a root, no caller of this function reads it, and refusing to walk
             // would be a worse answer than an unread field being wrong.
-            walk_root(root, &root.path, i as u16, multi, opts, false, |batch| {
-                sink(batch)
-            });
+            walk_root(
+                root,
+                &root.path,
+                i as u16,
+                multi,
+                opts,
+                false,
+                budget,
+                |batch| {
+                    let admitted: Vec<_> = batch
+                        .iter()
+                        .take_while(|item| budget.reserve_path(&item.path, &item.rel))
+                        .cloned()
+                        .collect();
+                    sink(&admitted)
+                },
+            );
         }
     }
 
@@ -506,7 +556,11 @@ impl Index {
     /// Sorting by path is what makes a second pass unnecessary: a parent path is a
     /// component-wise prefix of its children, so it always sorts before them and its node
     /// id is in `by_path` by the time they are reached.
-    fn graft_entries(&mut self, mut entries: Vec<WalkItem>) -> Vec<WalkItem> {
+    fn graft_entries(&mut self, entries: Vec<WalkItem>) -> Vec<WalkItem> {
+        self.graft_batch(entries, true)
+    }
+
+    fn graft_batch(&mut self, mut entries: Vec<WalkItem>, finish: bool) -> Vec<WalkItem> {
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         entries.dedup_by(|a, b| a.path == b.path);
 
@@ -530,16 +584,21 @@ impl Index {
                 Some(name) => name.to_string(),
                 None => continue,
             };
+            if !self.budget.reserve_path(&item.path, &item.rel) {
+                break;
+            }
             let node = self.new_child(parent, name, &item);
             self.by_path.insert(item.path.clone(), node);
             touched.insert(parent);
             inserted.push(item);
         }
 
-        for parent in touched {
-            self.sort_children(parent);
+        if finish {
+            for parent in touched {
+                self.sort_children(parent);
+            }
+            self.recompute_all();
         }
-        self.recompute_all();
         inserted
     }
 
@@ -728,6 +787,9 @@ impl Index {
             .collect();
         let mut added = Vec::new();
         for dir in &dirs {
+            if self.budget.cancelled() {
+                break;
+            }
             added.extend(self.rescan_dir(dir, filter));
         }
         added
@@ -767,7 +829,12 @@ impl Index {
         };
 
         let mut on_disk: HashMap<String, (PathBuf, bool, bool)> = HashMap::new();
+        let mut complete = true;
         for entry in read.flatten() {
+            if self.budget.cancelled() {
+                complete = false;
+                break;
+            }
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -779,6 +846,14 @@ impl Index {
             let is_dir = meta.is_dir() || (meta.is_symlink() && path.is_dir());
             if !filter.admits(&path, is_dir) {
                 continue;
+            }
+            if self.by_path.get(&path).is_none_or(|id| {
+                let old = &self.nodes[*id as usize];
+                matches!(old.kind, TreeRowKind::Dir) != is_dir || old.symlink != meta.is_symlink()
+            }) && !self.budget.reserve_path(&path, &self.rel_of(&path, root))
+            {
+                complete = false;
+                break;
             }
             on_disk.insert(name.to_string(), (path, is_dir, meta.is_symlink()));
         }
@@ -794,6 +869,9 @@ impl Index {
         let mut reopen = HashSet::new();
         let mut retargeted = Vec::new();
         for (child, name) in &existing {
+            if !complete && !on_disk.contains_key(name) {
+                continue;
+            }
             let same = on_disk.get(name).is_some_and(|(_, is_dir, symlink)| {
                 let old = &self.nodes[*child as usize];
                 matches!(old.kind, TreeRowKind::Dir) == *is_dir && old.symlink == *symlink
@@ -892,35 +970,38 @@ impl Index {
     fn graft_subtree(&mut self, path: &Path, root_index: u16, filter: &Filter) -> Vec<WalkItem> {
         filter.refresh_rules(path);
         let root = Root::new(path);
-        let mut entries = Vec::new();
-        // The *index's* visibility, not the default: a project showing dotfiles that has just
-        // had `.github/` created in it must graft what the original walk would have grafted.
+        let budget = Arc::clone(&self.budget);
+        let boundary = self.roots[root_index as usize].path.clone();
         let opts = BuildOptions {
             visibility: self.visibility,
             ..BuildOptions::default()
         };
+        let mut added = Vec::new();
         walk_root(
             &root,
-            &self.roots[root_index as usize].path,
+            &boundary,
             root_index,
             false,
             opts,
             true,
+            &budget,
             |batch| {
-                entries.extend_from_slice(batch);
+                for item in batch.iter().filter(|i| i.is_dir) {
+                    filter.refresh_rules(&item.path);
+                }
+                let entries = batch
+                    .iter()
+                    .filter(|item| filter.admits(&item.path, item.is_dir))
+                    .map(|item| {
+                        let mut item = item.clone();
+                        item.rel = self.rel_of(&item.path, root_index);
+                        item
+                    })
+                    .collect();
+                added.extend(self.graft_entries(entries));
             },
         );
-        for item in entries.iter().filter(|item| item.is_dir) {
-            filter.refresh_rules(&item.path);
-        }
-        entries.retain(|item| filter.admits(&item.path, item.is_dir));
-        // The walk made `rel` relative to the new directory; the picker wants it relative to
-        // the project root.
-        for item in &mut entries {
-            item.rel = self.rel_of(&item.path, root_index);
-        }
-        // The directory node itself already exists; `graft_entries` skips known paths.
-        self.graft_entries(entries)
+        added
     }
 
     /// Drop a node and everything under it.
@@ -1135,7 +1216,9 @@ fn name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// The `ignore` walk of one root, batching entries to `on_batch` as they are found.
+/// One bounded streaming walk. A serial iterator avoids `ignore`'s unbounded parallel
+/// work queue; four such iterators across projects still overlap filesystem latency.
+#[allow(clippy::too_many_arguments)]
 fn walk_root(
     root: &Root,
     boundary: &Path,
@@ -1143,200 +1226,91 @@ fn walk_root(
     multi: bool,
     opts: BuildOptions,
     follow_links: bool,
+    budget: &Budget,
     mut on_batch: impl FnMut(&[WalkItem]),
 ) {
-    let mut builder = WalkBuilder::new(&root.path);
-    let visibility = opts.visibility;
-    builder
-        // `hidden` and the git rules are `WalkBuilder`'s defaults; they are spelled out
-        // because `Filter` reimplements exactly this set for the watcher and the two have to
-        // be read together. Both are now *settings* — see `crate::filter::Visibility`, and
-        // note the inversion: `hidden(true)` means "hide them".
-        .hidden(!visibility.hidden)
-        // All four together, never separately: `.gitignore`, the global ignore file,
-        // `.git/info/exclude` and `.ignore` are four sources for one question, and a tree that
-        // showed the paths one of them covers while hiding another's would be inexplicable
-        // from the outside. `Filter::is_ignored` consults the same four.
-        .git_ignore(!visibility.ignored)
-        .git_global(!visibility.ignored)
-        .git_exclude(!visibility.ignored)
-        .ignore(!visibility.ignored)
-        // See `Filter`: ignore files above the project root are not consulted, so that the
-        // watcher can make the same decision without an unbounded ancestor walk.
-        .parents(false)
-        // Honour `.gitignore` even when the root is not a git repository. The default is to
-        // ignore it outside a repo, which surprises anyone who keeps a project in a plain
-        // directory.
-        .require_git(false)
-        // Keep the logical path while walking the target. `ignore` detects loops within
-        // this walk; the visitor also checks ancestors above an incremental walk's root.
-        .follow_links(follow_links)
-        .threads(opts.threads);
-
-    // `.git` is pruned here rather than left to `hidden(true)`, because with dotfiles shown
-    // `hidden(false)` would descend into it: 60,000 loose objects in this repository, every one
-    // of them an arena node and a `Ctrl+P` candidate. `Filter::admits` refuses the same paths,
-    // so the walk and the watcher agree; this is the half that stops the *descent*, which is
-    // the expensive part. Depth 0 is exempt so that a root a user has literally opened at a
-    // `.git` directory still walks — refusing to walk a path the user named is a worse answer
-    // than showing it.
-    builder.filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git");
-
-    let (tx, rx) = mpsc::channel::<Vec<WalkItem>>();
-    let root_path = root.path.clone();
-    let boundary = boundary.to_path_buf();
-    let label = root.label.clone();
-    let batch = opts.batch;
-
-    std::thread::scope(|scope| {
-        let walker = builder.build_parallel();
-        scope.spawn(move || {
-            let mut visitors = Collector {
-                tx,
-                root: root_path,
-                boundary,
-                visibility,
-                label,
-                root_index,
-                multi,
-                batch,
-            };
-            walker.visit(&mut visitors);
-        });
-        for batch in rx {
-            on_batch(&batch);
+    let Some(_worker) = Worker::acquire(budget) else {
+        return;
+    };
+    let ancestors: Vec<_> = root
+        .path
+        .ancestors()
+        .take_while(|p| p.starts_with(boundary))
+        .collect();
+    let filter = Filter::build(&[boundary.to_path_buf()], ancestors, opts.visibility);
+    // Each iterator reads one directory only. walkdir's default max_open otherwise buffers
+    // entire ancestor directories at depth ten, before admission can enforce our budget.
+    let shallow = |path: &Path| {
+        let mut builder = ignore::WalkBuilder::new(path);
+        builder
+            .hidden(!opts.visibility.hidden)
+            .git_ignore(!opts.visibility.ignored)
+            .git_global(!opts.visibility.ignored)
+            .git_exclude(!opts.visibility.ignored)
+            .ignore(!opts.visibility.ignored)
+            .parents(false)
+            .require_git(false)
+            .follow_links(false)
+            .max_depth(Some(1));
+        builder.build()
+    };
+    let mut stack = vec![shallow(&root.path)];
+    let batch_size = opts.batch.clamp(1, 512);
+    let mut batch = Vec::with_capacity(batch_size);
+    while let Some(walk) = stack.last_mut() {
+        if budget.stopped() {
+            break;
         }
-    });
-}
-
-struct Collector {
-    tx: mpsc::Sender<Vec<WalkItem>>,
-    root: PathBuf,
-    boundary: PathBuf,
-    visibility: Visibility,
-    label: String,
-    root_index: u16,
-    multi: bool,
-    batch: usize,
-}
-
-impl<'s> ignore::ParallelVisitorBuilder<'s> for Collector {
-    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
-        Box::new(Visitor {
-            tx: self.tx.clone(),
-            root: self.root.clone(),
-            boundary: self.boundary.clone(),
-            visibility: self.visibility,
-            label: self.label.clone(),
-            root_index: self.root_index,
-            multi: self.multi,
-            batch: self.batch,
-            buf: Vec::with_capacity(self.batch),
-        })
-    }
-}
-
-struct Visitor {
-    tx: mpsc::Sender<Vec<WalkItem>>,
-    root: PathBuf,
-    boundary: PathBuf,
-    visibility: Visibility,
-    label: String,
-    root_index: u16,
-    multi: bool,
-    batch: usize,
-    buf: Vec<WalkItem>,
-}
-
-impl Visitor {
-    fn flush(&mut self) {
-        if self.buf.is_empty() {
-            return;
+        let Some(entry) = walk.next() else {
+            stack.pop();
+            continue;
+        };
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.depth() == 0 || entry.file_name() == ".git" {
+            continue;
         }
-        let batch = std::mem::replace(&mut self.buf, Vec::with_capacity(self.batch));
-        // A closed receiver means the walk is being abandoned; there is nothing useful to
-        // do about it here and the walker will wind down on its own.
-        let _ = self.tx.send(batch);
-    }
-
-    fn item(&self, entry: &DirEntry) -> Option<WalkItem> {
-        let file_type = entry.file_type()?;
-        self.path_item(entry.path(), file_type.is_dir(), entry.path_is_symlink())
-    }
-
-    fn path_item(&self, path: &Path, is_dir: bool, symlink: bool) -> Option<WalkItem> {
-        // Non-UTF-8 names are dropped rather than lossily converted. A row's path is the
-        // identifier the frontend hands back to `fs.expand`, and `to_string_lossy` produces
-        // a path that no longer names the file.
-        let rel = path.strip_prefix(&self.root).ok()?.to_str()?;
-        path.to_str()?;
-        if rel.is_empty() {
-            // The root entry itself; its node exists before the walk starts.
-            return None;
+        let Some(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let symlink = entry.path_is_symlink();
+        let is_dir = kind.is_dir() || (follow_links && symlink && path.is_dir());
+        if !filter.admits(path, is_dir) {
+            continue;
         }
-        let rel = if self.multi {
-            format!("{}/{rel}", self.label)
+        let Some(rel) = path.strip_prefix(&root.path).ok().and_then(|p| p.to_str()) else {
+            continue;
+        };
+        if path.to_str().is_none() {
+            continue;
+        }
+        let rel = if multi {
+            format!("{}/{rel}", root.label)
         } else {
             rel.to_string()
         };
-        Some(WalkItem {
+        batch.push(WalkItem {
             path: path.to_path_buf(),
             rel,
-            root: self.root_index,
+            root: root_index,
             is_dir,
             symlink,
-        })
-    }
-}
-
-impl ignore::ParallelVisitor for Visitor {
-    fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
-        match entry {
-            Ok(entry) => {
-                let cycle = entry.file_type().is_some_and(|t| t.is_dir())
-                    && directory_cycle(entry.path(), &self.boundary);
-                if let Some(item) = self.item(&entry) {
-                    self.buf.push(item);
-                    if self.buf.len() >= self.batch {
-                        self.flush();
-                    }
-                }
-                if cycle {
-                    WalkState::Skip
-                } else {
-                    WalkState::Continue
-                }
-            }
-            Err(err) => {
-                // Following a dangling link or an ancestor loop produces an error before
-                // the walker yields its entry. Keep the link itself, subject to the same
-                // ignore rules (the walk checks those only after resolving a link).
-                if let Some(path) = error_path(&err)
-                    && path.is_symlink()
-                {
-                    let is_dir = path.is_dir();
-                    let dirs: Vec<_> = path
-                        .ancestors()
-                        .skip(1)
-                        .take_while(|p| p.starts_with(&self.boundary))
-                        .collect();
-                    let filter =
-                        Filter::build(std::slice::from_ref(&self.boundary), dirs, self.visibility);
-                    if filter.admits(path, is_dir)
-                        && let Some(item) = self.path_item(path, is_dir, true)
-                    {
-                        self.buf.push(item);
-                        if self.buf.len() >= self.batch {
-                            self.flush();
-                        }
-                    }
-                }
-                // A permission error on one directory is not a reason to abandon the walk;
-                // an unreadable `node_modules` should cost that subtree and nothing else.
-                tracing::debug!(%err, "skipping an unreadable entry");
-                WalkState::Continue
-            }
+        });
+        // Admit a directory before opening it or loading its rules. File batches are fixed
+        // size and there is no producer channel or whole-walk staging vector.
+        if is_dir || batch.len() >= batch_size {
+            on_batch(&batch);
+            batch.clear();
         }
+        if is_dir && !budget.stopped() && !directory_cycle(path, boundary) {
+            filter.refresh_rules(path);
+            stack.push(shallow(path));
+        }
+    }
+    if !budget.cancelled() && !batch.is_empty() {
+        on_batch(&batch);
     }
 }
 
@@ -1359,23 +1333,6 @@ pub(crate) fn directory_cycle(path: &Path, boundary: &Path) -> bool {
         .skip(1)
         .take_while(|p| p.starts_with(boundary))
         .any(|parent| std::fs::canonicalize(parent).is_ok_and(|real| real == target))
-}
-
-fn error_path(error: &ignore::Error) -> Option<&Path> {
-    match error {
-        ignore::Error::WithPath { path, .. } => Some(path),
-        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
-            error_path(err)
-        }
-        ignore::Error::Loop { child, .. } => Some(child),
-        _ => None,
-    }
-}
-
-impl Drop for Visitor {
-    fn drop(&mut self) {
-        self.flush();
-    }
 }
 
 #[cfg(test)]

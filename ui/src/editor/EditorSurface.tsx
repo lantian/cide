@@ -45,6 +45,8 @@ import { markSource, type SourceMark } from './sourceMark'
 import { cideHighlightStyle } from './highlight'
 import { polarityExtension, polaritySlot, watchPolarity } from './cmPolarity'
 import { useCodeMenu } from './codeMenu'
+import { attachDocument, documentFor, flushDocument } from './sharedDocuments'
+import { createClipboardDiff, type ClipboardComparison } from './clipboardDiffView'
 import { lineEditKeymap } from './editorKeys'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
@@ -122,6 +124,8 @@ import styles from './EditorSurface.module.css'
 export const HIGHLIGHT_LIMIT_BYTES = 1024 * 1024
 
 export interface EditorSurfaceProps {
+  sharedFile?: boolean | undefined
+  comparison?: ClipboardComparison | undefined
   /** Absolute path, used for the status bar's trail and to pick the language. */
   path: string
   /**
@@ -541,6 +545,8 @@ function indentExtensions(source: string, indent: EditorSurfaceProps['indent']):
 }
 
 export function EditorSurface({
+  sharedFile = false,
+  comparison,
   path,
   // Defaulted from `path` in the pattern itself rather than in a `??` below, so the fallback is
   // visible at the one place a reader looks for a prop's default and there is no second binding
@@ -578,6 +584,9 @@ export function EditorSurface({
   recovered,
 }: EditorSurfaceProps): ReactNode {
   const sourceMarks = useRef(new Compartment())
+  const comparisonRef = useRef(comparison)
+  comparisonRef.current = comparison
+  const clipboardViewRef = useRef<EditorView | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   /** Read once, by the build effect — see the prop. A ref so the effect's keys stay as they are. */
   const recoveredRef = useRef(recovered)
@@ -735,6 +744,7 @@ export function EditorSurface({
    * `items` runs at open time and the view alive then is the one to act on — a captured
    * `viewRef.current` from render time is a destroyed editor after a reload.
    */
+  const clipboardMenu = useCodeMenu({ view: () => clipboardViewRef.current, path: 'Clipboard', readOnly: true })
   const { onContextMenu, menu } = useCodeMenu({
     view: () => viewRef.current,
     path,
@@ -932,7 +942,8 @@ export function EditorSurface({
      * failed, because closing after a failed write is exactly the loss the confirmation
      * exists to prevent.
      */
-    const saveNow = (view: EditorView, cause: SaveCause = 'manual'): Promise<void> => {
+    const saveNow = async (view: EditorView, cause: SaveCause = 'manual'): Promise<void> => {
+      if (sharedFile) await flushDocument(path)
       if (readOnly) return Promise.resolve()
       const saving = view.state.doc
       const text = restoreLineEndings(saving.toString(), endingRef.current)
@@ -944,29 +955,9 @@ export function EditorSurface({
 
     const save = (view: EditorView): boolean => {
       if (readOnly) return false
-      const saving = view.state.doc
-      const text = restoreLineEndings(saving.toString(), endingRef.current)
-
-      // The baseline moves only once the write has landed, and this ordering is the whole
-      // of it. Clearing the dirty flag optimistically reads better and is wrong: a write
-      // that fails — read-only mount, disk full, the file replaced by a directory — would
-      // leave a tab that looks saved over a buffer that is not. Rust *refuses* to close a
-      // tab carrying this flag without an explicit `force`, so staying dirty through a
-      // failed save is not a belt-and-braces measure — it is what puts the close
-      // confirmation in front of the user, and clearing it early is what would let the next
-      // `×` discard the write that never landed.
-      void Promise.resolve(saveCb.current?.(text, 'manual')).then(
-        () => {
-          baseline = saving
-          // Compared against the buffer as it is *now*, not as it was when the write
-          // started: the user may have typed during the round trip, and those keystrokes
-          // are unsaved.
-          setDirty(!view.state.doc.eq(saving))
-        },
-        () => {
-          // The caller reports the failure; the tab simply stays dirty.
-        },
-      )
+      void saveNow(view).catch(() => {
+        // The pane reports a write failure and keeps the document dirty.
+      })
       return true
     }
 
@@ -1525,8 +1516,18 @@ export function EditorSurface({
     }
 
     let view: EditorView
+    let destroyView: (() => void) | undefined
     try {
-      view = new EditorView({ doc: source, extensions: shared, parent: host })
+      const comparison = comparisonRef.current
+      if (comparison) {
+        const current = sharedFile ? documentFor(path)?.state.doc.toString() ?? source : source
+        const built = createClipboardDiff(host, path, current, shared, comparison, readOnly)
+        view = built.view
+        clipboardViewRef.current = built.clipboard
+        destroyView = built.destroy
+      } else {
+        view = new EditorView({ doc: source, extensions: shared, parent: host })
+      }
     } catch (error) {
       // A third-party constructor over arbitrary file contents in an app with no error
       // boundary: an exception escaping here unmounts the React root and blanks the window,
@@ -1579,6 +1580,11 @@ export function EditorSurface({
     if (!oversize && baselineRef.current !== null) {
       view.dispatch({ effects: setChangeBaseline.of(baselineRef.current) })
     }
+    const stopShared = sharedFile ? attachDocument(path, view, text => {
+      baseline = EditorState.create({ doc: text }).doc
+      setDirty(!view.state.doc.eq(baseline))
+    }) : () => {}
+
     // Hand the awaitable save outward, so a close confirmation can offer *Save and close*.
     // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
     // that is no longer on screen.
@@ -2010,7 +2016,10 @@ export function EditorSurface({
       // Before `destroy`, so a request racing the unmount cannot dispatch into a dead view.
       stopReveal()
       stopPolarity()
-      view.destroy()
+      stopShared()
+      clipboardViewRef.current = null
+      if (destroyView) destroyView()
+      else view.destroy()
     }
     // Rebuilt only on a different file or an explicit reload. `doc` is intentionally absent:
     // see `reloadKey`. `readOnly` is absent because it only ever arrives with a new file. And
@@ -2269,10 +2278,14 @@ export function EditorSurface({
       <div
         className={styles.body}
         ref={hostRef}
-        onContextMenu={onContextMenu}
+        onContextMenu={event => {
+          if (clipboardViewRef.current?.dom.contains(event.target as Node)) clipboardMenu.onContextMenu(event)
+          else onContextMenu(event)
+        }}
         data-native-menu="false"
       />
       {menu}
+      {clipboardMenu.menu}
     </div>
   )
 }

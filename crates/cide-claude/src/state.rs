@@ -112,15 +112,21 @@ pub fn next_state(current: SessionState, event: HookEvent) -> Option<SessionStat
 /// Whether a `Notification` payload is a permission request.
 ///
 /// The CLI sends `Notification` for several things — idle nudges, permission prompts — and
-/// only one of them blocks the turn on a human. There is no typed field for this, so the
-/// message text is what there is to go on; a false negative costs a confirmation prompt that
-/// does not fire, which is better than a false positive that fires on every notification.
+/// `notification_type` identifies permission prompts independently of their wording. Only
+/// older payloads without that field fall back to message text; an explicit unrelated or
+/// malformed type must not become a permission request because of words in its message.
 pub fn is_permission_request(payload: &serde_json::Value) -> bool {
+    if let Some(kind) = payload.get("notification_type") {
+        return kind.as_str() == Some("permission_prompt");
+    }
     let Some(message) = payload.get("message").and_then(|m| m.as_str()) else {
         return false;
     };
     let lowered = message.to_ascii_lowercase();
-    lowered.contains("permission") || lowered.contains("approve") || lowered.contains("allow")
+    lowered.contains("permission")
+        || lowered.contains("approve")
+        || lowered.contains("approval")
+        || lowered.contains("allow")
 }
 
 #[cfg(test)]
@@ -226,16 +232,60 @@ mod tests {
 
     #[test]
     fn only_a_permission_notification_counts_as_one() {
-        assert!(is_permission_request(
-            &json!({"message": "Claude needs your permission to use Bash"})
-        ));
-        assert!(is_permission_request(
-            &json!({"message": "Allow this edit?"})
-        ));
+        for message in [
+            "Claude needs your permission to use Bash",
+            "Allow this edit?",
+            "Approve this edit?",
+            "Claude Code needs your approval for the plan",
+            "APPROVAL needed",
+        ] {
+            assert!(
+                is_permission_request(&json!({"message": message})),
+                "{message}"
+            );
+        }
         assert!(!is_permission_request(
             &json!({"message": "Claude is waiting for your input"})
         ));
-        assert!(!is_permission_request(&json!({})));
+        for payload in [json!({}), json!({"message": 42}), json!(null), json!([])] {
+            assert!(!is_permission_request(&payload), "{payload}");
+        }
+    }
+
+    #[test]
+    fn typed_permission_notifications_do_not_depend_on_message_wording() {
+        for payload in [
+            json!({
+                "notification_type": "permission_prompt",
+                "message": "Claude Code needs your approval for the plan",
+            }),
+            json!({"notification_type": "permission_prompt", "message": "Ready to code?"}),
+            json!({"notification_type": "permission_prompt"}),
+        ] {
+            assert!(is_permission_request(&payload), "{payload}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_notification_type_takes_precedence_over_permission_words() {
+        for kind in [
+            json!("idle_prompt"),
+            json!("auth_success"),
+            json!("elicitation_dialog"),
+            json!("unknown"),
+            json!(""),
+            json!(null),
+            json!(42),
+            json!({}),
+        ] {
+            assert!(
+                !is_permission_request(&json!({
+                    "notification_type": kind,
+                    "message": "Claude Code needs your approval for the plan",
+                })),
+                "{kind}"
+            );
+        }
     }
 
     #[test]

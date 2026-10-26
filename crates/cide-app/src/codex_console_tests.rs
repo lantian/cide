@@ -349,6 +349,27 @@ fn forwarding_preserves_native_approvals_and_consumes_only_peer_acknowledgements
             &mut server,
             json!({"method":"turn/completed","params":{"threadId":THREAD}}),
         );
+        // A background MCP cell can finish after the model handed back. The
+        // terminal still displays it, but resuming requires another user turn.
+        send_json(
+            &mut server,
+            json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":"turn-1","item":{"type":"mcpToolCall","server":"cide","tool":"cide_user_request","status":"completed"}}}),
+        );
+        let answer = read_json(&mut server);
+        assert_eq!(answer["method"], "turn/start");
+        assert_eq!(answer["params"]["threadId"], THREAD);
+        assert_eq!(
+            answer["params"]["input"][0]["text"],
+            "The user resolved request saved: На этой же странице, но следующим рядом"
+        );
+        send_json(
+            &mut server,
+            json!({"id":answer["id"],"result":{"turn":{"id":"answer-turn","status":"inProgress"}}}),
+        );
+        send_json(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"answer-turn","status":"completed"}}}),
+        );
         let rejected = read_json(&mut server);
         assert_eq!(rejected["params"]["input"][0]["text"], "rejected");
         send_json(
@@ -450,7 +471,20 @@ fn forwarding_preserves_native_approvals_and_consumes_only_peer_acknowledgements
     );
     assert_eq!(read_json(&mut terminal)["method"], "serverRequest/resolved");
     assert_eq!(read_json(&mut terminal)["method"], "turn/completed");
+    assert_eq!(read_json(&mut terminal)["method"], "item/completed");
     assert!(state.lock().receiver().is_some());
+    let (reply, ack) = mpsc::channel();
+    submit
+        .send(Submission {
+            receiver: state.lock().receiver().unwrap(),
+            body: "The user resolved request saved: На этой же странице, но следующим рядом".into(),
+            valid: Box::new(|| Ok(())),
+            expired: Arc::new(AtomicBool::new(false)),
+            reply,
+        })
+        .unwrap();
+    assert_eq!(ack.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(true));
+    assert_eq!(read_json(&mut terminal)["method"], "turn/completed");
     for (body, uncertain, event) in [
         ("rejected", false, Some("thread/status/changed")),
         ("timeout", true, Some("turn/completed")),

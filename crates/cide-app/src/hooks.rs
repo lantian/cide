@@ -73,11 +73,66 @@ struct CodexConsole {
     clear: cide_pty::codex_clear::ClearObserver,
     active: Option<SessionId>,
     invalidated: std::collections::HashSet<SessionId>,
+    turn: Option<String>,
+    turn_closed: bool,
+    completed_turns: std::collections::VecDeque<String>,
 }
 
 type CodexConsoles = Arc<DashMap<SessionId, Arc<parking_lot::Mutex<CodexConsole>>>>;
 
 impl CodexConsole {
+    /// Hook-only consoles can finish an exec cell after Stop. Keep its file
+    /// notifications, but do not let that traffic restart the completed turn.
+    fn late_turn(&mut self, frame: &HookFrame) -> bool {
+        if frame.payload["cide_late_turn"] == true {
+            return true;
+        }
+        let turn = frame.payload["turn_id"].as_str();
+        if frame.kind() == Some(HookEvent::SessionStart) {
+            self.turn = None;
+            self.turn_closed = false;
+            self.completed_turns.clear();
+            return false;
+        }
+        if turn.is_some_and(|id| self.completed_turns.iter().any(|old| old == id)) {
+            return true;
+        }
+        if frame.kind() == Some(HookEvent::UserPromptSubmit) {
+            self.turn = turn.map(str::to_owned);
+            self.turn_closed = false;
+            return false;
+        }
+        if turn.is_some() && self.turn.is_some() && turn != self.turn.as_deref() {
+            return true;
+        }
+        if matches!(
+            frame.kind(),
+            Some(HookEvent::Stop | HookEvent::Interrupt | HookEvent::CideTurnFailed)
+        ) {
+            if self.turn_closed {
+                return true;
+            }
+            self.turn_closed = true;
+            if let Some(turn) = turn.or(self.turn.as_deref()) {
+                self.completed_turns.push_back(turn.to_owned());
+                if self.completed_turns.len() > 64 {
+                    self.completed_turns.pop_front();
+                }
+            }
+            return false;
+        }
+        self.turn_closed
+            && matches!(
+                frame.kind(),
+                Some(
+                    HookEvent::PreToolUse
+                        | HookEvent::PostToolUse
+                        | HookEvent::PostToolBatch
+                        | HookEvent::PreCompact
+                )
+            )
+    }
+
     fn invalidate(&mut self, fallback: Option<SessionId>) {
         self.invalidated.extend(self.active.take());
         self.invalidated.extend(fallback);
@@ -207,14 +262,18 @@ impl HookServer {
                 // ended and no connection thread is left holding a clone.
                 for inbound in inbox {
                     match inbound {
-                        Inbound::Frame(frame) => {
+                        Inbound::Frame(mut frame) => {
                             if let Some(session) =
                                 frame.owner().and_then(|raw| raw.parse::<SessionId>().ok())
                             {
-                                if let Some(console) = apply_codex.get(&session)
-                                    && !console.lock().accepts(&frame)
-                                {
-                                    continue;
+                                if let Some(console) = apply_codex.get(&session) {
+                                    let mut console = console.lock();
+                                    if !console.accepts(&frame) {
+                                        continue;
+                                    }
+                                    if console.late_turn(&frame) {
+                                        frame.payload["cide_late_turn"] = serde_json::Value::Bool(true);
+                                    }
                                 }
                                 apply_last.insert(session, Instant::now());
                             }
@@ -701,12 +760,16 @@ fn apply(
     states: &DashMap<SessionId, SessionState>,
     conversations: &DashMap<SessionId, SessionId>,
 ) {
-    crate::decision::baseline_hook(app, frame);
-    crate::native_plan::observe_hook(app, frame);
-    crate::native_questions::observe_hook(app, frame);
+    let late = frame.payload["cide_late_turn"] == true;
+    if !late {
+        crate::decision::baseline_hook(app, frame);
+        crate::native_plan::observe_hook(app, frame);
+        crate::native_questions::observe_hook(app, frame);
+    }
     // A failure can arrive while the session is already AwaitingInput. Its run must
     // still learn the terminal verdict even when no session-state edge is emitted.
-    if frame.kind() == Some(HookEvent::CideTurnFailed)
+    if !late
+        && frame.kind() == Some(HookEvent::CideTurnFailed)
         && let Some(session) = frame.owner()
     {
         crate::agents::note_hook(app, session, frame);
@@ -864,12 +927,16 @@ fn decide(
         });
     }
 
+    if frame.payload["cide_late_turn"] == true {
+        return effects;
+    }
+
     let current = states
         .get(&session)
         .map(|s| *s)
         .unwrap_or(SessionState::Spawning);
 
-    // The state machine cannot see payloads: permissions need the notification text, and
+    // The state machine cannot see payloads: permissions need the notification type or text, and
     // Codex's interactive question is a tool call that waits for the user mid-turn.
     let next = if event == HookEvent::Notification {
         cide_claude::is_permission_request(&frame.payload)
@@ -924,6 +991,53 @@ fn decide(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn late_codex_tool_hooks_keep_file_notifications_without_reopening_a_turn() {
+        let session = cide_ipc::SessionId::new();
+        let mut console = super::CodexConsole::default();
+        let states = States::new();
+        let mut send = |event: &str, turn: &str| {
+            let mut frame = super::HookFrame::new(
+                event,
+                serde_json::json!({
+                    "session_id":session.to_string(), "turn_id":turn,
+                    "tool_name":"Write", "tool_input":{"file_path":"/repo/file"}
+                }),
+            );
+            if console.late_turn(&frame) {
+                frame.payload["cide_late_turn"] = serde_json::json!(true);
+            }
+            decide(&frame, &states)
+        };
+        send("UserPromptSubmit", "old");
+        send("Stop", "old");
+        let late = send("PostToolUse", "old");
+        assert!(
+            late.iter()
+                .any(|effect| matches!(effect, super::Effect::Tool { .. }))
+        );
+        assert!(
+            !late
+                .iter()
+                .any(|effect| matches!(effect, super::Effect::State { .. }))
+        );
+        assert_eq!(
+            state_of(&states, session),
+            Some(cide_ipc::SessionState::AwaitingInput)
+        );
+        send("UserPromptSubmit", "new");
+        assert!(send("Stop", "old").is_empty());
+        assert_eq!(
+            state_of(&states, session),
+            Some(cide_ipc::SessionState::Busy)
+        );
+        send("Stop", "new");
+        assert_eq!(
+            state_of(&states, session),
+            Some(cide_ipc::SessionState::AwaitingInput)
+        );
+    }
+
     #[test]
     fn a_native_codex_console_ignores_duplicate_cli_hook_frames() {
         let mut console = super::CodexConsole {
@@ -1490,7 +1604,7 @@ mod tests {
 
     #[test]
     fn only_a_notification_that_asks_for_permission_changes_the_state() {
-        // The one branch the state machine cannot decide, because it needs the payload text.
+        // The state machine cannot decide this without the notification payload.
         let states = States::new();
         let session = SessionId::new();
         states.insert(session, SessionState::Busy);
@@ -1527,6 +1641,65 @@ mod tests {
             state_of(&states, session),
             Some(SessionState::AwaitingPermission)
         );
+    }
+
+    #[test]
+    fn a_claude_plan_approval_notifies_the_pane_once_and_execution_resumes_it() {
+        let pane = SessionId::new();
+        let conversation = SessionId::new();
+        let states = States::new();
+        let conversations = DashMap::new();
+        states.insert(pane, SessionState::Busy);
+        let mut asking = HookFrame::new(
+            "Notification",
+            json!({
+                "session_id": conversation.to_string(),
+                "notification_type": "permission_prompt",
+                "message": "Claude Code needs your approval for the plan",
+            }),
+        );
+        asking.spawned_as = Some(pane.to_string());
+
+        // ExitPlanMode waits inside the turn, so no Stop hook precedes this prompt.
+        assert_eq!(
+            super::decide(&asking, &states, &conversations),
+            vec![
+                Effect::Conversation {
+                    session: pane,
+                    conversation,
+                },
+                Effect::State {
+                    session: pane.to_string(),
+                    state: SessionState::AwaitingPermission,
+                },
+            ]
+        );
+        assert_eq!(
+            state_of(&states, pane),
+            Some(SessionState::AwaitingPermission)
+        );
+        assert_eq!(state_of(&states, conversation), None);
+        assert!(super::decide(&asking, &states, &conversations).is_empty());
+
+        let mut approved = HookFrame::new(
+            "PostToolUse",
+            json!({ "session_id": conversation.to_string(), "tool_name": "ExitPlanMode" }),
+        );
+        approved.spawned_as = Some(pane.to_string());
+        assert_eq!(
+            super::decide(&approved, &states, &conversations),
+            vec![
+                Effect::Tool {
+                    session: pane.to_string(),
+                    paths: Vec::new(),
+                },
+                Effect::State {
+                    session: pane.to_string(),
+                    state: SessionState::Busy,
+                },
+            ]
+        );
+        assert_eq!(state_of(&states, pane), Some(SessionState::Busy));
     }
 
     #[test]

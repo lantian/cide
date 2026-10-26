@@ -11,6 +11,10 @@ import type { PickerRow } from "./PickerRow";
  */
 export type PickerFrame = { 
 /**
+ * Coverage is partial while indexing or after an indexing limit.
+ */
+incomplete: boolean, 
+/**
  * At most the `limit` the caller asked for, capped in Rust at 200. A keystroke must
  * never ship 100k rows over IPC — the overlay draws about twelve.
  */
