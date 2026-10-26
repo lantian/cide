@@ -719,6 +719,7 @@ pub fn run() {
             cmd::fs::fs_expand_all,
             cmd::fs::fs_reveal,
             cmd::fs::fs_show_in_manager,
+            cmd::fs::fs_open_external,
             cmd::fs::fs_paths_exist,
             cmd::fs::fs_stat_paths,
             cmd::fs::fs_read_file,

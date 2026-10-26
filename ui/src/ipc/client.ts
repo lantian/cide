@@ -2704,6 +2704,9 @@ export const clipboard = {
 export const fsReveal = {
   showInManager: (projectId: ProjectId, path: string) =>
     invoke<string>('fs_show_in_manager', { project: projectId, path }),
+  /** Open the saved file using the desktop's default application for its type. */
+  openExternal: (projectId: ProjectId, path: string) =>
+    invoke<void>('fs_open_external', { project: projectId, path }),
 }
 
 // -------------------------------------------------------------------------------------------

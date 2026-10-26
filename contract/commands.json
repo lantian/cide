@@ -121,6 +121,7 @@
   "fs_expand_all",
   "fs_index",
   "fs_notes_ensure",
+  "fs_open_external",
   "fs_paste",
   "fs_paste_image",
   "fs_paste_plan",
