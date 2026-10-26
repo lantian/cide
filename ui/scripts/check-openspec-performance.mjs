@@ -143,16 +143,7 @@ try {
   await render(tab(true))
   const approve = () => document.querySelector('[data-audit="specTabApprove"]')
   assert.equal(approve().textContent, 'Approve')
-  await act(async () => {
-    approve().click(); approve().click()
-    // The first approval loads a module through filesystem I/O. Event-loop turns
-    // do not establish that the import completed; wait for the observable launch.
-    const deadline = Date.now() + 3000
-    while (!calls.some((c) => c.command === 'spec_session_start')) {
-      assert.ok(Date.now() < deadline, 'approval did not start Apply within three seconds')
-      await new Promise((resolve) => setTimeout(resolve, 5))
-    }
-  })
+  await act(async () => { approve().click(); approve().click(); for (let i = 0; i < 8; i++) await flush() })
   assert.equal(calls.filter((c) => c.command === 'spec_session_start').length, 1)
   assert.equal(approve().disabled, true)
   await act(async () => { launch.reject(new Error('Apply could not start')); await flush() })
