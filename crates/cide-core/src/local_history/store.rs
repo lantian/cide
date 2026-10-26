@@ -11,13 +11,18 @@ use std::{
 
 const SCHEMA: u32 = 1;
 const PAGE_SIZE: usize = 100;
+fn initial_generation() -> u32 {
+    1
+}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Metadata {
     schema: u32,
     canonical_root: Vec<u8>,
     generation: u32,
+    #[serde(default = "initial_generation")]
+    min_generation: u32,
     next_sequence: u32,
     policy: HistoryPolicy,
 }
@@ -42,6 +47,7 @@ pub struct HistoryStore {
     lineage: BTreeMap<String, Vec<u32>>,
     pub coverage: HistoryCoverage,
     revision: u32,
+    pins: HashSet<String>,
 }
 
 pub fn now_ms() -> u64 {
@@ -113,6 +119,7 @@ impl HistoryStore {
                 schema: SCHEMA,
                 canonical_root: root.path.as_os_str().as_encoded_bytes().to_vec(),
                 generation: 1,
+                min_generation: 1,
                 next_sequence: 1,
                 policy: HistoryPolicy::default(),
             };
@@ -139,6 +146,7 @@ impl HistoryStore {
             lineage: BTreeMap::new(),
             coverage: HistoryCoverage::default(),
             revision: 0,
+            pins: HashSet::new(),
         };
         store.load_index()?;
         Ok(store)
@@ -178,7 +186,9 @@ impl HistoryStore {
                 if record.schema != SCHEMA {
                     return Err("Unsupported revision schema".into());
                 }
-                if record.generation != self.meta.generation {
+                if record.generation < self.meta.min_generation
+                    || record.generation > self.meta.generation
+                {
                     // A crash after the generation commit must not resurrect cleared records.
                     fs::remove_file(&path).map_err(|e| e.to_string())?;
                     return Ok(None);
@@ -289,24 +299,156 @@ impl HistoryStore {
         }
     }
     pub fn used_bytes(&self) -> u64 {
-        let mut digests = HashSet::new();
-        let mut bytes = 0;
-        for r in self.records.values() {
-            bytes += fs::metadata(self.record_path(r))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if let HistoryContent::Content { digest, .. } = &r.content {
-                if digests.insert(digest) {
-                    bytes += fs::metadata(self.dir.join("blobs").join(digest))
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                }
+        let mut total = fs::metadata(self.dir.join("root.json"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        for folder in ["records", "blobs"] {
+            if let Ok(entries) = fs::read_dir(self.dir.join(folder)) {
+                total += entries
+                    .filter_map(Result::ok)
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum::<u64>();
             }
         }
-        bytes
-            + fs::metadata(self.dir.join("root.json"))
-                .map(|m| m.len())
-                .unwrap_or(0)
+        total
+    }
+    pub fn pin(&mut self, id: &LocalRevisionId) -> Result<(), String> {
+        self.get(id)?;
+        self.pins.insert(id.0.clone());
+        Ok(())
+    }
+    pub fn unpin(&mut self, id: &LocalRevisionId) {
+        self.pins.remove(&id.0);
+    }
+
+    fn evict(&mut self, sequence: u32) -> Result<(), String> {
+        let r = self.records.get(&sequence).ok_or("Missing revision")?;
+        fs::remove_file(self.record_path(r)).map_err(|e| e.to_string())?;
+        crate::persist::sync_dir(&self.dir.join("records")).map_err(|e| e.to_string())?;
+        self.ids.remove(&r.id.0);
+        self.records.remove(&sequence);
+        self.rebuild_paths();
+        self.gc_blobs()?;
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn cleanup(&mut self, at_ms: u64) -> Result<(), String> {
+        let cutoff = at_ms.saturating_sub(self.meta.policy.retention_days as u64 * 86_400_000);
+        let expired: Vec<u32> = self
+            .records
+            .values()
+            .filter(|r| r.observed_ms < cutoff && !self.pins.contains(&r.id.0))
+            .map(|r| r.sequence)
+            .collect();
+        for n in expired {
+            self.evict(n)?;
+        }
+        while self.used_bytes() > self.meta.policy.budget_bytes as u64 {
+            let Some(n) = self
+                .records
+                .values()
+                .find(|r| !self.pins.contains(&r.id.0))
+                .map(|r| r.sequence)
+            else {
+                return Err("History budget cannot fit pinned revisions and metadata".into());
+            };
+            self.evict(n)?;
+        }
+        Ok(())
+    }
+
+    fn admit(&mut self, r: &LocalRevision) -> Result<(), String> {
+        self.cleanup(now_ms())?;
+        let record_bytes = serde_json::to_vec(&Record {
+            schema: SCHEMA,
+            generation: self.generation(),
+            revision: r.clone(),
+        })
+        .map_err(|e| e.to_string())?
+        .len() as u64;
+        loop {
+            let blob_bytes = match &r.content {
+                HistoryContent::Content { digest, bytes }
+                    if !self.dir.join("blobs").join(digest).exists() =>
+                {
+                    *bytes as u64
+                }
+                _ => 0,
+            };
+            // Leave space for the next sequence's metadata growth.
+            if self.used_bytes() + record_bytes + blob_bytes + 16
+                <= self.meta.policy.budget_bytes as u64
+            {
+                return Ok(());
+            }
+            let Some(n) = self
+                .records
+                .values()
+                .find(|r| !self.pins.contains(&r.id.0))
+                .map(|r| r.sequence)
+            else {
+                return Err(
+                    "History budget cannot admit this revision; increase the budget".into(),
+                );
+            };
+            self.evict(n)?;
+        }
+    }
+
+    pub fn set_policy(&mut self, policy: HistoryPolicy) -> Result<HistoryStatus, String> {
+        let eligibility = HistoryEligibility::new(self.eligibility.root.clone(), policy.clone())?;
+        if self.meta.policy == policy {
+            return Ok(self.status());
+        }
+        let mut next = self.meta.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or("History generation exhausted")?;
+        next.policy = policy;
+        json(&self.dir.join("root.json"), &next)?;
+        self.meta = next;
+        self.eligibility = eligibility;
+        self.revision = self.revision.wrapping_add(1);
+        if self.meta.policy.enabled
+            && let Err(reason) = self.cleanup(now_ms())
+        {
+            self.coverage.degraded = Some(reason);
+        }
+        Ok(self.status())
+    }
+
+    pub fn clear(&mut self, confirmed: bool) -> Result<HistoryStatus, String> {
+        if !confirmed {
+            return Err("Confirm clearing this root's Local History".into());
+        }
+        if !self.pins.is_empty() {
+            return Err("A restore is using history; retry after it finishes".into());
+        }
+        let mut next = self.meta.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or("History generation exhausted")?;
+        next.min_generation = next.generation;
+        json(&self.dir.join("root.json"), &next)?;
+        // The durable generation changes before any deletion; recovery ignores obsolete records.
+        self.meta = next;
+        self.records.clear();
+        self.ids.clear();
+        self.paths.clear();
+        self.lineage.clear();
+        self.coverage = HistoryCoverage::default();
+        self.revision = self.revision.wrapping_add(1);
+        for entry in fs::read_dir(self.dir.join("records")).map_err(|e| e.to_string())? {
+            fs::remove_file(entry.map_err(|e| e.to_string())?.path()).map_err(|e| e.to_string())?;
+        }
+        crate::persist::sync_dir(&self.dir.join("records")).map_err(|e| e.to_string())?;
+        self.gc_blobs()?;
+        Ok(self.status())
     }
     pub fn check_generation(&self, generation: u32) -> Result<(), String> {
         if generation != self.generation() {
@@ -452,6 +594,7 @@ impl HistoryStore {
         if let Some(bytes) = bytes {
             HistoryEligibility::validate_bytes(bytes)?;
         }
+        self.cleanup(now_ms())?;
         let content = Self::content(bytes);
         if rename.is_none()
             && let Some(last) = self.latest(&path)
@@ -459,13 +602,6 @@ impl HistoryStore {
             && last.unavailable.is_none()
         {
             return Ok(last.id.clone());
-        }
-        if let HistoryContent::Content { digest, .. } = &content {
-            let dest = self.dir.join("blobs").join(digest);
-            if !dest.exists() {
-                crate::persist::write_atomic(&dest, bytes.unwrap()).map_err(|e| e.to_string())?;
-            }
-            self.bytes(&content)?;
         }
         let lifecycle = rename
             .as_ref()
@@ -489,6 +625,14 @@ impl HistoryStore {
             content,
             unavailable: None,
         };
+        self.admit(&r)?;
+        if let HistoryContent::Content { digest, .. } = &r.content {
+            let dest = self.dir.join("blobs").join(digest);
+            if !dest.exists() {
+                crate::persist::write_atomic(&dest, bytes.unwrap()).map_err(|e| e.to_string())?;
+            }
+            self.bytes(&r.content)?;
+        }
         self.meta.next_sequence = r
             .sequence
             .checked_add(1)
@@ -538,6 +682,154 @@ impl HistoryStore {
 mod tests {
     use super::*;
     use cide_fs::testing::scratch;
+    #[test]
+    fn shared_blobs_survive_pins_and_age_cleanup_reclaims_them() {
+        let project = scratch("history-retention-root");
+        let state = scratch("history-retention-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let first = s
+            .capture(1, "a", Some(b"shared"), HistorySource::Baseline)
+            .unwrap();
+        let second = s
+            .capture(1, "b", Some(b"shared"), HistorySource::Baseline)
+            .unwrap();
+        assert_eq!(fs::read_dir(state.join("blobs")).unwrap().count(), 1);
+        s.pin(&first).unwrap();
+        s.cleanup(now_ms() + 8 * 86_400_000).unwrap();
+        assert!(s.get(&first).is_ok());
+        assert!(s.get(&second).is_err());
+        assert_eq!(fs::read_dir(state.join("blobs")).unwrap().count(), 1);
+        assert!(s.clear(true).is_err());
+        s.unpin(&first);
+        s.cleanup(now_ms() + 8 * 86_400_000).unwrap();
+        assert_eq!(fs::read_dir(state.join("blobs")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn policy_disable_and_clear_persist_without_reviving_old_jobs() {
+        let project = scratch("history-clear-root");
+        let state = scratch("history-clear-state");
+        let root = RootIdentity::new(&project).unwrap();
+        let mut s = HistoryStore::open(root.clone(), state.to_path_buf()).unwrap();
+        let first = s
+            .capture(1, "a", Some(b"before"), HistorySource::Baseline)
+            .unwrap();
+        let policy = HistoryPolicy {
+            enabled: false,
+            exclusions: vec!["*.secret".into()],
+            ..HistoryPolicy::default()
+        };
+        s.set_policy(policy.clone()).unwrap();
+        assert!(
+            s.capture(1, "a", Some(b"queued"), HistorySource::External)
+                .is_err()
+        );
+        assert!(
+            s.capture(
+                s.generation(),
+                "a",
+                Some(b"disabled"),
+                HistorySource::External
+            )
+            .is_err()
+        );
+        drop(s);
+        let mut s = HistoryStore::open(root, state.to_path_buf()).unwrap();
+        assert_eq!(s.status().policy, policy);
+        assert!(s.get(&first).is_ok());
+        assert!(s.clear(false).is_err());
+        let generation = s.generation();
+        s.clear(true).unwrap();
+        assert_eq!(s.status().policy, policy);
+        assert!(s.get(&first).is_err());
+        assert!(
+            s.capture(generation, "a", Some(b"old job"), HistorySource::External)
+                .is_err()
+        );
+        s.set_policy(HistoryPolicy {
+            enabled: true,
+            ..policy
+        })
+        .unwrap();
+        s.capture(
+            s.generation(),
+            "a",
+            Some(b"new baseline"),
+            HistorySource::Baseline,
+        )
+        .unwrap();
+        assert_eq!(s.list("a", None).unwrap().revisions.len(), 1);
+    }
+
+    #[test]
+    fn small_budget_evicts_oldest_unpinned_and_refuses_unadmittable_content() {
+        let project = scratch("history-budget-root");
+        let state = scratch("history-budget-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let first = s
+            .capture(1, "a", Some(&vec![b'a'; 2000]), HistorySource::Baseline)
+            .unwrap();
+        s.pin(&first).unwrap();
+        let budget = s.used_bytes() as u32 + 700;
+        s.set_policy(HistoryPolicy {
+            budget_bytes: budget,
+            ..HistoryPolicy::default()
+        })
+        .unwrap();
+        assert!(
+            s.capture(
+                s.generation(),
+                "b",
+                Some(&vec![b'b'; 2000]),
+                HistorySource::External
+            )
+            .is_err()
+        );
+        assert!(s.get(&first).is_ok());
+        s.unpin(&first);
+        let newest = s
+            .capture(
+                s.generation(),
+                "b",
+                Some(&vec![b'b'; 2000]),
+                HistorySource::External,
+            )
+            .unwrap();
+        assert!(s.get(&first).is_err());
+        assert!(s.get(&newest).is_ok());
+        assert!(s.used_bytes() <= budget as u64);
+        s.set_policy(HistoryPolicy {
+            budget_bytes: 1,
+            ..HistoryPolicy::default()
+        })
+        .unwrap();
+        assert!(
+            s.capture(s.generation(), "c", Some(b"x"), HistorySource::External)
+                .is_err()
+        );
+        assert!(s.status().coverage.degraded.is_some());
+    }
+
+    #[test]
+    fn clear_generation_commit_survives_interrupted_removal() {
+        let project = scratch("history-clear-crash-root");
+        let state = scratch("history-clear-crash-state");
+        let root = RootIdentity::new(&project).unwrap();
+        let mut s = HistoryStore::open(root.clone(), state.to_path_buf()).unwrap();
+        let id = s
+            .capture(1, "a", Some(b"old"), HistorySource::Baseline)
+            .unwrap();
+        let record = s.record_path(s.get(&id).unwrap());
+        let saved = fs::read(&record).unwrap();
+        s.clear(true).unwrap();
+        fs::write(record, saved).unwrap();
+        drop(s);
+        let s = HistoryStore::open(root, state.to_path_buf()).unwrap();
+        assert!(s.paths(None, "", false).paths.is_empty());
+        assert!(s.get(&id).is_err());
+    }
     #[test]
     fn consecutive_dedup_preserves_source_and_recreation_starts_a_lifecycle() {
         let project = scratch("history-dedup-root");

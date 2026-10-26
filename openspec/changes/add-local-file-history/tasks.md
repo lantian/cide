@@ -7,7 +7,7 @@
 
 - [x] 2.1 Implement profile-local store paths, schema metadata, root ownership locking, immutable BLAKE3 blobs/revision records and background index loading with cursor pagination; verify restart persistence and byte-exact CRLF recovery.
 - [x] 2.2 Implement consecutive-content deduplication, absence markers, lifecycle/rename records and independent-record recovery; cover interrupted blob/record commits, missing blobs, corrupt records and unsupported schema handling.
-- [ ] 2.3 Implement age/budget accounting, oldest-unpinned eviction and blob GC, restore pins, policy persistence, disable and generation-safe clear; test shared blobs, small budgets, queued work after clear and capture resumption.
+- [x] 2.3 Implement age/budget accounting, oldest-unpinned eviction and blob GC, restore pins, policy persistence, disable and generation-safe clear; test shared blobs, small budgets, queued work after clear and capture resumption.
 
 ## 3. Observation and capture integration
 
