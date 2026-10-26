@@ -65,6 +65,33 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 
 use crate::filter::Filter;
 
+/// Independent from tree visibility. Directory discovery may continue after watcher startup.
+pub struct HistorySubscription {
+    pub directories: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>,
+    pub admits: Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>,
+    pub changed: Arc<dyn Fn(FsChange) + Send + Sync>,
+    pub degraded: Arc<dyn Fn(String) + Send + Sync>,
+    pub ready: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
+}
+impl std::fmt::Debug for HistorySubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HistorySubscription")
+    }
+}
+impl HistorySubscription {
+    pub fn accepts(&self, path: &Path, is_dir: bool) -> bool {
+        (self.admits)(path, is_dir)
+    }
+    pub fn deliver(&self, mut change: FsChange) {
+        change
+            .paths
+            .retain(|p| self.accepts(Path::new(p), Path::new(p).is_dir()));
+        if change.truncated || !change.paths.is_empty() {
+            (self.changed)(change);
+        }
+    }
+}
+
 /// What the watcher tells the app about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchEvent {
@@ -76,6 +103,7 @@ pub enum WatchEvent {
 
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
+    pub history: Option<Arc<HistorySubscription>>,
     pub roots: Vec<PathBuf>,
     /// Every non-ignored directory, from the walk.
     pub dirs: Vec<PathBuf>,
@@ -105,6 +133,7 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
+            history: None,
             roots: Vec::new(),
             dirs: Vec::new(),
             links: Vec::new(),
@@ -172,10 +201,60 @@ fn run(
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
     let (mut backend, mut status) = Backend::start(&config, &filter, tx.clone());
     sink(WatchEvent::Status(status.clone()));
+    if let Some(history) = &config.history {
+        if let Some(reason) = &status.reason {
+            (history.degraded)(reason.clone());
+        }
+    }
 
     let mut coalescer = Coalescer::new(config.quiet, config.max_wait, config.max_paths);
+    let mut history_changes = Coalescer::new(config.quiet, config.max_wait, config.max_paths);
+    let mut history_dirs = HashSet::<PathBuf>::new();
 
     while !stop.load(Ordering::Acquire) {
+        if let Some(history) = &config.history {
+            let desired: HashSet<_> = (history.directories)()
+                .into_iter()
+                .filter(|p| history.accepts(p, true))
+                .collect();
+            for path in desired.difference(&history_dirs) {
+                // Non-recursive descriptors preserve ignore/dependency pruning at every depth.
+                if let Err(error) = backend.watch(path, RecursiveMode::NonRecursive) {
+                    (history.degraded)(format!("History directory could not be watched: {error}"));
+                    if matches!(error.kind, ErrorKind::MaxFilesWatch) && !backend.is_polling() {
+                        let mut fallback = config.clone();
+                        fallback.dirs = backend
+                            .aliases
+                            .directories
+                            .iter()
+                            .chain(desired.iter())
+                            .cloned()
+                            .collect();
+                        (backend, status) = Backend::start_polling(
+                            &fallback,
+                            tx.clone(),
+                            enospc_reason(backend.watched.len()),
+                        );
+                        sink(WatchEvent::Status(status.clone()));
+                    }
+                }
+            }
+            for path in history_dirs.difference(&desired) {
+                if !config.dirs.contains(path) && !filter.watchable(path, true) {
+                    if let Some(real) = std::fs::canonicalize(path).ok() {
+                        backend.unwatch_real(&real);
+                    }
+                }
+            }
+            history_dirs = desired
+                .into_iter()
+                .filter(|p| {
+                    backend.watched.contains(p)
+                        || backend.recursive.iter().any(|r| p.starts_with(r))
+                })
+                .collect();
+            (history.ready)(history_dirs.iter().cloned().collect());
+        }
         match rx.recv_timeout(TICK) {
             Ok(Ok(events)) => {
                 for event in events {
@@ -203,7 +282,12 @@ fn run(
                         // directory map first, then filter each logical alias independently.
                         for path in backend.aliases.paths(physical) {
                             let is_dir = path.is_dir();
-                            if !filter.watchable(&path, is_dir) {
+                            let tree = filter.watchable(&path, is_dir);
+                            let history = config
+                                .history
+                                .as_ref()
+                                .is_some_and(|h| h.accepts(&path, is_dir));
+                            if !tree && !history {
                                 continue;
                             }
                             let known = backend.aliases.directories.contains(&path);
@@ -228,7 +312,12 @@ fn run(
                                     backend.watch_tree(&path, &filter);
                                 }
                             }
-                            coalescer.push(path.clone(), filter.is_git_path(&path));
+                            if tree {
+                                coalescer.push(path.clone(), filter.is_git_path(&path));
+                            }
+                            if history {
+                                history_changes.push(path.clone(), false);
+                            }
                         }
                     }
                 }
@@ -239,6 +328,9 @@ fn run(
                     .any(|e| matches!(e.kind, ErrorKind::MaxFilesWatch));
                 for error in &errors {
                     tracing::warn!(kind = ?error.kind, paths = ?error.paths, "watcher error");
+                    if let Some(history) = &config.history {
+                        (history.degraded)(format!("Filesystem observer reported a gap: {error}"));
+                    }
                 }
                 if exhausted && !backend.is_polling() {
                     let reason = enospc_reason(backend.watched.len());
@@ -261,12 +353,22 @@ fn run(
         if let Some(change) = coalescer.take_due(Instant::now()) {
             sink(WatchEvent::Changed(change));
         }
+        if let Some(change) = history_changes.take_due(Instant::now()) {
+            if let Some(history) = &config.history {
+                history.deliver(change);
+            }
+        }
     }
 
     // Anything still pending is worth one last delivery: the common way to reach here is a
     // project closing, but a stop during a build would otherwise drop a real change.
     if let Some(change) = coalescer.take_pending() {
         sink(WatchEvent::Changed(change));
+    }
+    if let Some(change) = history_changes.take_pending() {
+        if let Some(history) = &config.history {
+            history.deliver(change);
+        }
     }
 }
 
@@ -338,6 +440,7 @@ impl<W: notify::Watcher> notify::Watcher for LiveCreates<W> {
 }
 
 struct Backend {
+    history: Option<Arc<HistorySubscription>>,
     inner: Inner,
     /// Everything currently under a watch, so a directory created twice is not watched
     /// twice and the ENOSPC message can say how far it got.
@@ -478,7 +581,7 @@ impl Backend {
             return Self::start_polling(config, tx, reason);
         }
 
-        let per_directory = config.dirs.len() <= config.max_dir_watches;
+        let per_directory = config.history.is_some() || config.dirs.len() <= config.max_dir_watches;
         let debouncer =
             match new_debouncer_opt::<_, LiveCreates<RecommendedWatcher>, RecommendedCache>(
                 config.debounce,
@@ -495,6 +598,7 @@ impl Backend {
             };
 
         let mut backend = Self {
+            history: config.history.clone(),
             inner: Inner::Native(debouncer),
             watched: HashSet::new(),
             per_directory,
@@ -601,9 +705,10 @@ impl Backend {
         .expect("PollWatcher has no resources to run out of");
 
         let mut backend = Self {
+            history: config.history.clone(),
             inner: Inner::Polling(debouncer),
             watched: HashSet::new(),
-            per_directory: false,
+            per_directory: config.history.is_some(),
             aliases: DirectoryAliases::default(),
             recursive: HashSet::new(),
             guards: HashSet::new(),
@@ -611,8 +716,18 @@ impl Backend {
         // Polling must cover external targets as well as the project's physical roots.
         // The same alias map translates events in both backends.
         backend.seed_aliases(config);
-        for root in &config.roots {
-            if let Err(err) = backend.watch(root, RecursiveMode::Recursive) {
+        let poll_dirs = if config.history.is_some() {
+            &config.dirs
+        } else {
+            &config.roots
+        };
+        let mode = if config.history.is_some() {
+            RecursiveMode::NonRecursive
+        } else {
+            RecursiveMode::Recursive
+        };
+        for root in poll_dirs {
+            if let Err(err) = backend.watch(root, mode) {
                 tracing::warn!(path = %root.display(), kind = ?err.kind, "could not poll-watch a root");
             }
         }
@@ -790,7 +905,13 @@ impl Backend {
                 // `Filter::classify` refuses `crate::filter::GIT_NEVER` before it consults the
                 // watched list, so no entry on that list, present or future, can turn this
                 // descent loose on a 256-way object fanout.
-                if child.is_dir() && filter.watchable(&child, true) {
+                if child.is_dir()
+                    && (filter.watchable(&child, true)
+                        || self
+                            .history
+                            .as_ref()
+                            .is_some_and(|h| h.accepts(&child, true)))
+                {
                     stack.push(child);
                 }
             }

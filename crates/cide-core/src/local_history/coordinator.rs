@@ -39,6 +39,9 @@ struct Shared {
     reconcile: AtomicBool,
     queued_bytes: AtomicUsize,
     nested: RwLock<Vec<PathBuf>>,
+    watch_dirs: RwLock<HashSet<PathBuf>>,
+    watched_dirs: RwLock<HashSet<PathBuf>>,
+    observer_attached: AtomicBool,
     membership_changed: AtomicBool,
     changed: Box<Changed>,
 }
@@ -52,6 +55,9 @@ pub struct HistoryCoordinator {
 fn publish(shared: &Shared, store: &HistoryStore, paths: Vec<String>) {
     let mut status = store.status();
     let previous = shared.status.read().clone();
+    if previous.generation != status.generation {
+        shared.watched_dirs.write().clear();
+    }
     if previous.generation == status.generation {
         for notice in previous.coverage.notices {
             if !status.coverage.notices.contains(&notice) {
@@ -92,19 +98,14 @@ fn observe(store: &mut HistoryStore, path: &Path, source: HistorySource, allow_n
 
 struct Scan {
     generation: u32,
-    readers: Vec<fs::ReadDir>,
+    readers: Vec<(PathBuf, fs::ReadDir)>,
     dirs: HashSet<PathBuf>,
     retained: std::vec::IntoIter<String>,
     source: HistorySource,
 }
 impl Scan {
-    fn start(store: &mut HistoryStore) -> Result<Self, String> {
+    fn start(store: &mut HistoryStore, source: HistorySource) -> Result<Self, String> {
         let retained = store.known_paths();
-        let source = if retained.is_empty() {
-            HistorySource::Baseline
-        } else {
-            HistorySource::Reopen
-        };
         store.coverage.baseline_running = true;
         store.coverage.scanned_files = 0;
         store.coverage.captured_files = 0;
@@ -122,7 +123,7 @@ impl Scan {
         let reader = fs::read_dir(&root).map_err(|e| e.to_string())?;
         Ok(Self {
             generation: store.generation(),
-            readers: vec![reader],
+            readers: vec![(root.clone(), reader)],
             dirs: HashSet::from([root]),
             retained: retained.into_iter(),
             source,
@@ -130,12 +131,23 @@ impl Scan {
     }
 
     /// One bounded batch; interactive calls can acquire the authority between files.
-    fn step(&mut self, store: &mut HistoryStore, nested: &[PathBuf]) -> bool {
+    fn step(&mut self, store: &mut HistoryStore, nested: &[PathBuf], shared: &Shared) -> bool {
         if self.generation != store.generation() || !store.eligibility.policy.enabled {
             return false;
         }
         for _ in 0..16 {
-            let next = self.readers.last_mut().and_then(Iterator::next);
+            if shared.observer_attached.load(Ordering::Acquire)
+                && self
+                    .readers
+                    .last()
+                    .is_some_and(|(dir, _)| !shared.watched_dirs.read().contains(dir))
+            {
+                return true;
+            }
+            let next = self
+                .readers
+                .last_mut()
+                .and_then(|(_, reader)| reader.next());
             match next {
                 Some(Ok(entry)) => {
                     let path = entry.path();
@@ -151,8 +163,9 @@ impl Scan {
                     }
                     if is_dir {
                         if self.dirs.insert(physical.clone()) {
-                            match fs::read_dir(physical) {
-                                Ok(reader) => self.readers.push(reader),
+                            shared.watch_dirs.write().insert(physical.clone());
+                            match fs::read_dir(&physical) {
+                                Ok(reader) => self.readers.push((physical, reader)),
                                 Err(e) => store.coverage.degraded = Some(e.to_string()),
                             }
                         }
@@ -188,6 +201,23 @@ impl HistoryCoordinator {
         nested: Vec<PathBuf>,
         changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::start_inner(root, dir, nested, false, changed)
+    }
+    pub fn start_observed(
+        root: RootIdentity,
+        dir: PathBuf,
+        nested: Vec<PathBuf>,
+        changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::start_inner(root, dir, nested, true, changed)
+    }
+    fn start_inner(
+        root: RootIdentity,
+        dir: PathBuf,
+        nested: Vec<PathBuf>,
+        observed: bool,
+        changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
+    ) -> Arc<Self> {
         let status = HistoryStatus {
             root: root.id.clone(),
             canonical_root: root.path.to_string_lossy().into_owned(),
@@ -212,6 +242,9 @@ impl HistoryCoordinator {
             reconcile: AtomicBool::new(true),
             queued_bytes: AtomicUsize::new(0),
             nested: RwLock::new(nested),
+            watch_dirs: RwLock::new(HashSet::from([root.path.clone()])),
+            watched_dirs: RwLock::new(HashSet::new()),
+            observer_attached: AtomicBool::new(observed),
             membership_changed: AtomicBool::new(false),
             changed: Box::new(changed),
         });
@@ -243,6 +276,7 @@ impl HistoryCoordinator {
                 let startup_generation = shared.generation.load(Ordering::Acquire);
                 let mut scan: Option<Scan> = None;
                 let mut ticks = 0u32;
+                let mut first_scan = true;
                 while !shared.stop.load(Ordering::Acquire) {
                     if shared.membership_changed.swap(false, Ordering::AcqRel) {
                         if let Some(store) = &mut shared.state.lock().store {
@@ -298,7 +332,18 @@ impl HistoryCoordinator {
                             .is_some_and(|s| s.generation != store.generation())
                     {
                         scan = if store.eligibility.policy.enabled {
-                            match Scan::start(store) {
+                            match Scan::start(
+                                store,
+                                if first_scan {
+                                    if store.known_path_count() == 0 {
+                                        HistorySource::Baseline
+                                    } else {
+                                        HistorySource::Reopen
+                                    }
+                                } else {
+                                    HistorySource::External
+                                },
+                            ) {
                                 Ok(scan) => Some(scan),
                                 Err(reason) => {
                                     store.coverage.degraded = Some(reason);
@@ -310,8 +355,9 @@ impl HistoryCoordinator {
                             None
                         };
                     }
+                    first_scan = false;
                     if let Some(active) = &mut scan {
-                        if !active.step(store, &shared.nested.read()) {
+                        if !active.step(store, &shared.nested.read(), &shared) {
                             scan = None;
                             publish(&shared, store, Vec::new());
                         }
@@ -325,6 +371,10 @@ impl HistoryCoordinator {
                     {
                         store.coverage.degraded = Some(reason);
                     }
+                    drop(state);
+                    if scan.is_some() {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
                 // In-flight direct calls hold this lock; wait for them before releasing ownership.
                 shared.state.lock().store.take();
@@ -337,6 +387,26 @@ impl HistoryCoordinator {
         })
     }
 
+    pub fn attach_observer(&self) {
+        self.shared.observer_attached.store(true, Ordering::Release);
+        self.shared.reconcile.store(true, Ordering::Release);
+    }
+    pub fn confirm_watches(&self, dirs: &[PathBuf]) {
+        self.shared
+            .watched_dirs
+            .write()
+            .extend(dirs.iter().cloned());
+    }
+    pub fn is_nested(&self, path: &Path) -> bool {
+        self.shared
+            .nested
+            .read()
+            .iter()
+            .any(|r| path.starts_with(r))
+    }
+    pub fn watch_directories(&self) -> Vec<PathBuf> {
+        self.shared.watch_dirs.read().iter().cloned().collect()
+    }
     pub fn status(&self) -> HistoryStatus {
         self.shared.status.read().clone()
     }
@@ -370,6 +440,12 @@ impl HistoryCoordinator {
     pub fn observe(&self, paths: Vec<PathBuf>, truncated: bool) {
         if self.shared.stop.load(Ordering::Acquire) {
             return;
+        }
+        if paths
+            .iter()
+            .any(|p| p.is_dir() || self.shared.watch_dirs.read().contains(p))
+        {
+            self.shared.reconcile.store(true, Ordering::Release);
         }
         let bytes = paths.iter().map(|p| p.as_os_str().len()).sum::<usize>();
         if truncated || paths.len() > MAX_BATCH_PATHS || bytes > MAX_QUEUED_BYTES {
@@ -466,6 +542,85 @@ mod tests {
     use super::*;
     use cide_fs::testing::scratch;
     use std::time::Instant;
+    #[test]
+    fn observer_barrier_captures_unopened_hidden_edits_and_external_deletion() {
+        let project = scratch("history-hidden-feed");
+        let state = scratch("history-hidden-feed-state");
+        fs::create_dir(project.join(".hidden")).unwrap();
+        let file = project.join(".hidden/source");
+        fs::write(&file, "A").unwrap();
+        let c = HistoryCoordinator::start_observed(
+            RootIdentity::new(&project).unwrap(),
+            state.to_path_buf(),
+            vec![],
+            |_, _| {},
+        );
+        c.confirm_watches(&[project.to_path_buf()]);
+        let start = Instant::now();
+        while !c.watch_directories().contains(&project.join(".hidden")) {
+            c.confirm_watches(&[project.to_path_buf()]);
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        c.with_store(|s| {
+            assert!(s.list(".hidden/source", None)?.revisions.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        c.confirm_watches(&[project.to_path_buf(), project.join(".hidden")]);
+        wait_done(&c);
+        let tree = cide_fs::Filter::build(
+            &[project.to_path_buf()],
+            vec![project.path()],
+            cide_fs::Visibility::CONSERVATIVE,
+        );
+        assert!(!tree.watchable(&file, false));
+        let consumer = c.clone();
+        let feed = cide_fs::watch::HistorySubscription {
+            directories: Arc::new(Vec::new),
+            admits: Arc::new(|_, _| true),
+            ready: Arc::new(|_| {}),
+            degraded: Arc::new(|_| {}),
+            changed: Arc::new(move |change| consumer.observe(change.paths, change.truncated)),
+        };
+        fs::write(&file, "B").unwrap();
+        feed.deliver(cide_ipc::FsChange {
+            paths: vec![file.clone()],
+            truncated: false,
+            git: false,
+        });
+        let start = Instant::now();
+        while c
+            .with_store(|s| Ok(s.list(".hidden/source", None)?.revisions.len()))
+            .unwrap()
+            < 2
+        {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::remove_file(&file).unwrap();
+        feed.deliver(cide_ipc::FsChange {
+            paths: vec![file],
+            truncated: false,
+            git: false,
+        });
+        let start = Instant::now();
+        while !c
+            .with_store(|s| {
+                Ok(s.latest(".hidden/source")
+                    .is_some_and(|r| r.content == HistoryContent::Absent))
+            })
+            .unwrap()
+        {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        c.with_store(|s| {
+            assert_eq!(s.list(".hidden/source", None)?.revisions.len(), 3);
+            Ok(())
+        })
+        .unwrap();
+    }
     #[test]
     fn watcher_admission_stays_bounded_while_a_direct_write_holds_authority() {
         let project = scratch("history-queue-root");

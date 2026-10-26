@@ -12,7 +12,7 @@
 ## 3. Observation and capture integration
 
 - [x] 3.1 Add the per-root capture coordinator, bounded queue, baseline/reopen scans, close cancellation, generation checks and degraded-status reporting; test baseline races, overflow/truncation reconciliation and closed-period coverage.
-- [ ] 3.2 Extend the existing filesystem observer with a history-policy subscription and watched-directory union independent of tree visibility; preserve existing tree filtering and avoid ignored/dependency watch expansion. Test external edits to unopened hidden files and external deletion.
+- [x] 3.2 Extend the existing filesystem observer with a history-policy subscription and watched-directory union independent of tree visibility; preserve existing tree filtering and avoid ignored/dependency watch expansion. Test external edits to unopened hidden files and external deletion.
 - [ ] 3.3 Wire editor text saves, autosave, tree text writes/create/overwrite and applicable text writes through the bytes/IDE-diff routes to pre/post capture. Verify refused/failed writes, watcher echo deduplication and successful ordinary saves when history storage fails.
 - [ ] 3.4 Integrate tree rename/move/delete, including eligible descendants of directories and overwrite destinations; preserve within-root lineage, represent cross-root moves separately and distinguish deletion/recreation lifecycles.
 

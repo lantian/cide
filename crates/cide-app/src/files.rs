@@ -126,7 +126,11 @@ impl FsRegistry {
     /// `fs_close` hands it to a blocking worker rather than doing it on the async runtime.
     #[must_use = "dropping the entry here does the watcher teardown on this thread"]
     pub fn remove(&self, project: ProjectId) -> Option<Arc<ProjectFs>> {
-        self.projects.remove(&project).map(|(_, fs)| fs)
+        let removed = self.projects.remove(&project).map(|(_, fs)| fs);
+        if removed.is_some() {
+            crate::local_history::tree_unsubscribed(project);
+        }
+        removed
     }
 
     pub fn close_all(&self) {
@@ -304,6 +308,7 @@ impl Indexing {
         drop(guard);
 
         let config = WatchConfig {
+            history: crate::local_history::history_subscription(project),
             roots: root_paths,
             dirs: watched,
             links,
