@@ -16,6 +16,8 @@ import { listen as tauriListen, type Event as TauriEvent } from '@tauri-apps/api
 import { guardUnlisten } from './unlisten'
 import type {
   Axis,
+  HistoryStatus, HistoryRootId, HistoryPathPage, HistoryRevisionPage, HistoryComparison,
+  HistoryPolicy, HistoryInvalidation, LocalRevisionId,
   Bootstrap,
   Capabilities,
   ColorScheme,
@@ -1429,6 +1431,7 @@ export const remote = {
 }
 
 export const events = {
+  onLocalHistoryChanged: (handler: (change: HistoryInvalidation) => void) => listen<HistoryInvalidation>('cide://local-history-changed', (e) => handler(e.payload)),
   onUserRequestsChanged: (handler: (payload: { project: ProjectId; view: import("./generated").UserRequestsView }) => void) =>
     listen<{ project: ProjectId; view: import("./generated").UserRequestsView }>("cide://user-requests-changed", (event) => handler(event.payload)),
   /**
@@ -5750,4 +5753,13 @@ export const languageServers = {
   get: (project: ProjectId) => invoke<import('./generated').LanguageServerSnapshot[]>('language_servers_get', { project }),
   control: (project: ProjectId, source: string | null, action: import('./generated').LanguageServerAction) => invoke<void>('language_servers_control', { project, source, action }),
   logs: (project: ProjectId, source: string, after: number) => invoke<import('./generated').LanguageServerLogs>('language_servers_logs', { project, source, after }),
+}
+
+export const localHistory = {
+  status: (project: ProjectId) => invoke<HistoryStatus[]>('local_history_status', { project }),
+  paths: (project: ProjectId, root: HistoryRootId, generation: number, after: string | null, filter: string, deletedOnly: boolean) => invoke<HistoryPathPage>('local_history_paths', { project, root, generation, after, filter, deletedOnly }),
+  list: (project: ProjectId, root: HistoryRootId, generation: number, path: string, before: number | null) => invoke<HistoryRevisionPage>('local_history_list', { project, root, generation, path, before }),
+  compare: (project: ProjectId, root: HistoryRootId, generation: number, path: string, target: LocalRevisionId, other: LocalRevisionId | null) => invoke<HistoryComparison>('local_history_compare', { project, root, generation, path, target, other }),
+  setPolicy: (project: ProjectId, root: HistoryRootId, generation: number, policy: HistoryPolicy) => invoke<HistoryStatus>('local_history_set_policy', { project, root, generation, policy }),
+  clear: (project: ProjectId, root: HistoryRootId, generation: number, confirmed: boolean) => invoke<HistoryStatus>('local_history_clear', { project, root, generation, confirmed }),
 }

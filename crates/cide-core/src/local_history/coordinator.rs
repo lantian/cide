@@ -89,6 +89,7 @@ fn publish(shared: &Shared, store: &HistoryStore, paths: Vec<String>) {
     if previous.generation != status.generation {
         shared.watched_dirs.write().clear();
     }
+    let previous_status = previous.clone();
     if previous.generation == status.generation {
         for notice in previous.coverage.notices {
             if !status.coverage.notices.contains(&notice) {
@@ -101,7 +102,9 @@ fn publish(shared: &Shared, store: &HistoryStore, paths: Vec<String>) {
         .generation
         .store(status.generation, Ordering::Release);
     *shared.status.write() = status.clone();
-    (shared.changed)(status, paths);
+    if status != previous_status || !paths.is_empty() {
+        (shared.changed)(status, paths);
+    }
 }
 
 fn observe(store: &mut HistoryStore, path: &Path, source: HistorySource, allow_new_absence: bool) {

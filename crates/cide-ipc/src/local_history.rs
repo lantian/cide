@@ -128,6 +128,8 @@ pub struct HistoryRevisionPage {
 #[ts(export)]
 pub struct HistorySide {
     pub revision: Option<LocalRevisionId>,
+    #[ts(type = "number | null")]
+    pub observed_ms: Option<u64>,
     pub content: HistoryContent,
     pub text: Option<String>,
     pub unavailable: Option<String>,

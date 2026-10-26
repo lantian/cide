@@ -20,7 +20,7 @@ struct Entry {
 static ROOTS: LazyLock<Mutex<BTreeMap<String, Entry>>> = LazyLock::new(Mutex::default);
 
 /// Called only when project/root membership changes, never for editor dirty-state updates.
-pub fn sync(_app: &tauri::AppHandle, workspace: &Workspace) {
+pub fn sync(app: &tauri::AppHandle, workspace: &Workspace) {
     let mut wanted: BTreeMap<String, (RootIdentity, HashSet<ProjectId>)> = BTreeMap::new();
     for project in workspace.projects.values() {
         for root in &project.roots {
@@ -67,11 +67,22 @@ pub fn sync(_app: &tauri::AppHandle, workspace: &Workspace) {
             }
             entry.coordinator.set_nested(nested);
         } else {
+            let events = app.clone();
             let coordinator = HistoryCoordinator::start_observed(
                 identity.clone(),
                 HistoryStore::profile_path(&identity),
                 nested,
-                |_, _| {},
+                move |status, paths| {
+                    crate::emit::local_history_changed(
+                        &events,
+                        &cide_ipc::local_history::HistoryInvalidation {
+                            root: status.root,
+                            paths,
+                            generation: status.generation,
+                            revision: status.revision,
+                        },
+                    )
+                },
             );
             let fallback = Some(fallback(&identity, &coordinator));
             roots.insert(

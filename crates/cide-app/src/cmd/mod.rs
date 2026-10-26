@@ -11,6 +11,7 @@ pub mod diag;
 pub mod file;
 pub mod git;
 pub mod lifecycle;
+pub mod local_history;
 /// The New project wizard. (M97)
 pub mod new_project;
 pub mod pane;

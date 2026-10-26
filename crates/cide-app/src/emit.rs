@@ -20,6 +20,15 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const COMMIT_MESSAGE_PROGRESS: &str = "cide://commit-message-progress";
+pub const LOCAL_HISTORY_CHANGED: &str = "cide://local-history-changed";
+pub fn local_history_changed(
+    app: &AppHandle,
+    change: &cide_ipc::local_history::HistoryInvalidation,
+) {
+    if let Err(error) = app.emit(LOCAL_HISTORY_CHANGED, change) {
+        tracing::debug!(%error, "history invalidation reached no window");
+    }
+}
 
 pub fn commit_message_progress(
     window: &tauri::WebviewWindow,

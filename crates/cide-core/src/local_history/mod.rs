@@ -1,4 +1,5 @@
 //! Root-scoped local recovery storage and eligibility, without a webview dependency.
+mod comparison;
 mod coordinator;
 mod policy;
 pub use coordinator::{HistoryCoordinator, HistoryTreeChange};

@@ -493,6 +493,18 @@ impl HistoryStore {
             .and_then(|v| v.last())
             .and_then(|n| self.records.get(n))
     }
+    pub fn revision_belongs(&self, path: &str, id: &LocalRevisionId) -> Result<(), String> {
+        let revision = self.get(id)?;
+        if self
+            .lineage
+            .get(path)
+            .is_some_and(|sequences| sequences.contains(&revision.sequence))
+        {
+            Ok(())
+        } else {
+            Err("This revision does not belong to the selected path".into())
+        }
+    }
     pub fn paths(&self, after: Option<&str>, filter: &str, deleted_only: bool) -> HistoryPathPage {
         let mut paths = self
             .paths

@@ -485,6 +485,12 @@ pub fn run() {
         .manage(caps::ClaudeVersion::default())
         .manage(caps::HarnessVersions::default())
         .invoke_handler(tauri::generate_handler![
+            cmd::local_history::local_history_status,
+            cmd::local_history::local_history_paths,
+            cmd::local_history::local_history_list,
+            cmd::local_history::local_history_compare,
+            cmd::local_history::local_history_set_policy,
+            cmd::local_history::local_history_clear,
             cmd::gitlab::gitlab_request,
             cmd::gitlab::gitlab_open_document,
             cmd::gitlab::gitlab_review_launch,
