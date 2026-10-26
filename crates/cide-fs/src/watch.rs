@@ -1229,7 +1229,7 @@ mod tests {
             debounce: Duration::from_millis(10),
             ..WatchConfig::default()
         };
-        let (tx, rx) = mpsc::sync_channel(8);
+        let (tx, _rx) = mpsc::sync_channel(8);
         let (mut backend, _) = Backend::start_polling(&config, &filter, tx, "test".into());
         assert!(!backend.aliases.logical.contains_key(&captured));
         backend.watch_history_directory(&hidden).unwrap();
