@@ -62,10 +62,12 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debounc
 
 use crate::filter::Filter;
 
+pub type HistoryAdmission = dyn Fn(&Path, bool) -> bool + Send + Sync;
+
 /// Independent from tree visibility. Directory discovery may continue after watcher startup.
 pub struct HistorySubscription {
     pub directories: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>,
-    pub admits: Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>,
+    pub admits: Arc<HistoryAdmission>,
     pub changed: Arc<dyn Fn(FsChange) + Send + Sync>,
     pub degraded: Arc<dyn Fn(String) + Send + Sync>,
     pub ready: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
@@ -220,10 +222,10 @@ fn run(
     let (tx, rx) = mpsc::sync_channel::<DebounceEventResult>(8);
     let (mut backend, mut status) = Backend::start(&config, &filter, tx.clone());
     sink(WatchEvent::Status(status.clone()));
-    if let Some(history) = &config.history {
-        if let Some(reason) = &status.reason {
-            (history.degraded)(reason.clone());
-        }
+    if let Some(history) = &config.history
+        && let Some(reason) = &status.reason
+    {
+        (history.degraded)(reason.clone());
     }
 
     let mut coalescer = Coalescer::new(config.quiet, config.max_wait, config.max_paths);
@@ -262,10 +264,9 @@ fn run(
             for path in history_dirs.difference(&desired) {
                 if !config.dirs.contains(path)
                     && (config.history_only || !filter.watchable(path, true))
+                    && let Ok(real) = std::fs::canonicalize(path)
                 {
-                    if let Some(real) = std::fs::canonicalize(path).ok() {
-                        backend.unwatch_real(&real);
-                    }
+                    backend.unwatch_real(&real);
                 }
             }
             history_dirs = desired
@@ -408,10 +409,10 @@ fn run(
         if let Some(change) = coalescer.take_due(Instant::now()) {
             sink(WatchEvent::Changed(change));
         }
-        if let Some(change) = history_changes.take_due(Instant::now()) {
-            if let Some(history) = &config.history {
-                history.deliver(change);
-            }
+        if let Some(change) = history_changes.take_due(Instant::now())
+            && let Some(history) = &config.history
+        {
+            history.deliver(change);
         }
     }
 
@@ -420,10 +421,10 @@ fn run(
     if let Some(change) = coalescer.take_pending() {
         sink(WatchEvent::Changed(change));
     }
-    if let Some(change) = history_changes.take_pending() {
-        if let Some(history) = &config.history {
-            history.deliver(change);
-        }
+    if let Some(change) = history_changes.take_pending()
+        && let Some(history) = &config.history
+    {
+        history.deliver(change);
     }
 }
 

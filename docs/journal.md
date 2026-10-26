@@ -18948,9 +18948,12 @@ view and editor expectation tests passed. Local History behavior/SSR and 33 affe
 checks passed, including drawing jsdom restore gating, reload/undo isolation and teardown.
 The broader app filesystem tests passed 18/19 with a private temporary trash location. Its
 native linked-target notification test failed identically on pre-change commit `b0e0452`
-in this environment; native delivery remains for reviewer confirmation. No full CI, live
-agent, native multi-window acceptance or visual review was performed. This sandbox has no
-display/audio and refuses Unix sockets, so captures/renders belong to the reviewer.
+in the initial restricted environment. That initial run did not perform full CI, live
+agent, native multi-window acceptance or visual review. PR preparation subsequently
+integrated current master, ran the complete host suite, corrected Clippy and asynchronous
+UI-test warnings/failures, and repeated the affected checks. The verification record
+distinguishes the original aggregate failures from successful individual reruns. Native
+multi-window acceptance and visual review remain pending.
 
 See [Local History](local-history.md) for storage, defaults, coverage/recovery limits and
 reviewer acceptance steps, and [verification](local-history-verification.md) for commands

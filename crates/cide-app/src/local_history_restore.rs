@@ -46,10 +46,10 @@ fn editors_with(
                     tab: home,
                     pane,
                 } = role
+                    && *owner == project.id
+                    && *home == tab.id
                 {
-                    if *owner == project.id && *home == tab.id {
-                        expected.insert(pane.to_string());
-                    }
+                    expected.insert(pane.to_string());
                 }
             }
         }

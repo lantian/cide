@@ -163,10 +163,10 @@ impl RestoreGates {
         dirty: bool,
     ) -> Result<(), String> {
         let mut state = self.inner.state.lock();
-        if !state
+        if state
             .mounted
             .get(&(identity.window.clone(), identity.editor.clone()))
-            .is_some_and(|m| m.identity == *identity)
+            .is_none_or(|m| m.identity != *identity)
         {
             return Err("This editor mount is no longer current".into());
         }

@@ -318,8 +318,10 @@ mod tests {
     #[test]
     fn user_exclusions_and_limits_are_validated() {
         let dir = scratch("history-exclusions");
-        let mut policy = HistoryPolicy::default();
-        policy.exclusions = vec!["secret/**".into(), "*.key".into()];
+        let mut policy = HistoryPolicy {
+            exclusions: vec!["secret/**".into(), "*.key".into()],
+            ..Default::default()
+        };
         fs::create_dir(dir.join("secret")).unwrap();
         let p = HistoryEligibility::new(RootIdentity::new(&dir).unwrap(), policy.clone()).unwrap();
         assert!(p.path(Path::new("secret/a"), false).is_err());

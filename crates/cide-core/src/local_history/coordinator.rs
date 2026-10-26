@@ -292,15 +292,14 @@ impl HistoryCoordinator {
                     }
                     if !self.is_nested(path)
                         && let Ok((_, relative)) = store.eligibility.root.resolve(path)
-                    {
-                        if let Err(reason) = store.capture(
+                        && let Err(reason) = store.capture(
                             store.generation(),
                             &relative,
                             None,
                             HistorySource::FileOperation,
-                        ) {
-                            store.coverage.degraded = Some(reason);
-                        }
+                        )
+                    {
+                        store.coverage.degraded = Some(reason);
                     }
                 }
             }
@@ -321,17 +320,11 @@ impl HistoryCoordinator {
                     if let (Ok((_, old_relative)), Ok((new_relative, Some(bytes)))) = (
                         store.eligibility.root.resolve(old),
                         store.eligibility.read(&new),
-                    ) {
-                        if !self.is_nested(&new)
-                            && let Err(reason) = store.renamed(
-                                store.generation(),
-                                &old_relative,
-                                &new_relative,
-                                &bytes,
-                            )
-                        {
-                            store.coverage.degraded = Some(reason);
-                        }
+                    ) && !self.is_nested(&new)
+                        && let Err(reason) =
+                            store.renamed(store.generation(), &old_relative, &new_relative, &bytes)
+                    {
+                        store.coverage.degraded = Some(reason);
                     }
                 }
             }
@@ -445,13 +438,13 @@ impl HistoryCoordinator {
                 let mut first_scan = true;
                 let mut baseline_generation = startup_generation;
                 while !shared.stop.load(Ordering::Acquire) {
-                    if shared.membership_changed.swap(false, Ordering::AcqRel) {
-                        if let Some(store) = &mut shared.state.lock().store {
-                            if let Err(reason) = store.restart_observation() {
-                                store.coverage.degraded = Some(reason);
-                            }
-                            publish(&shared, store, Vec::new());
+                    if shared.membership_changed.swap(false, Ordering::AcqRel)
+                        && let Some(store) = &mut shared.state.lock().store
+                    {
+                        if let Err(reason) = store.restart_observation() {
+                            store.coverage.degraded = Some(reason);
                         }
+                        publish(&shared, store, Vec::new());
                     }
                     let observation = if scan.is_some() {
                         rx.try_recv().ok()
@@ -526,17 +519,17 @@ impl HistoryCoordinator {
                     }
                     first_scan = false;
                     baseline_generation = store.generation();
-                    if let Some(active) = &mut scan {
-                        if !active.step(store, &shared.nested.read(), &shared) {
-                            scan = None;
-                            publish(&shared, store, Vec::new());
-                        }
-                    }
-                    ticks = ticks.wrapping_add(1);
-                    if ticks % 32 == 0 {
+                    if let Some(active) = &mut scan
+                        && !active.step(store, &shared.nested.read(), &shared)
+                    {
+                        scan = None;
                         publish(&shared, store, Vec::new());
                     }
-                    if ticks % 2000 == 0
+                    ticks = ticks.wrapping_add(1);
+                    if ticks.is_multiple_of(32) {
+                        publish(&shared, store, Vec::new());
+                    }
+                    if ticks.is_multiple_of(2000)
                         && let Err(reason) = store.cleanup(super::store::now_ms())
                     {
                         store.coverage.degraded = Some(reason);

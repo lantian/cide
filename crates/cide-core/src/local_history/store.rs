@@ -629,12 +629,11 @@ impl HistoryStore {
         source: HistorySource,
     ) -> Result<LocalRevisionId, String> {
         let result = self.capture_record(generation, path, bytes, source, None);
-        if result.is_ok() {
-            if let Ok((_, relative)) = self.eligibility.root.resolve(Path::new(path)) {
-                if let Some(safety) = self.pending_safety.remove(&relative) {
-                    self.unpin(&safety);
-                }
-            }
+        if result.is_ok()
+            && let Ok((_, relative)) = self.eligibility.root.resolve(Path::new(path))
+            && let Some(safety) = self.pending_safety.remove(&relative)
+        {
+            self.unpin(&safety);
         }
         result
     }
@@ -865,10 +864,10 @@ impl HistoryStore {
             })
         })();
         self.unpin(&token.target);
-        if let Some(id) = safety {
-            if !mutated || result.as_ref().is_ok_and(|r| r.degraded.is_none()) {
-                self.unpin(&id);
-            }
+        if let Some(id) = safety
+            && (!mutated || result.as_ref().is_ok_and(|r| r.degraded.is_none()))
+        {
+            self.unpin(&id);
         }
         result
     }

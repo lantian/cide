@@ -176,10 +176,10 @@ impl WatchPolicy {
             return false;
         }
         let mut policy = self.policy.lock();
-        if policy.policy != current {
-            if let Ok(next) = HistoryEligibility::new(policy.root.clone(), current) {
-                *policy = next;
-            }
+        if policy.policy != current
+            && let Ok(next) = HistoryEligibility::new(policy.root.clone(), current)
+        {
+            *policy = next;
         }
         if path == policy.root.path && directory {
             return true;
@@ -223,16 +223,16 @@ fn subscription(
             for policy in ready.iter() {
                 policy.coordinator.confirm_watches(&paths);
             }
-            if let Some(project) = project {
-                if ready.iter().all(|p| {
+            if let Some(project) = project
+                && ready.iter().all(|p| {
                     p.coordinator
                         .watch_directories()
                         .iter()
                         .all(|d| !p.accepts(d, true) || paths.contains(d))
-                }) && !notified.swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
-                    tree_subscribed(project);
-                }
+                })
+                && !notified.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                tree_subscribed(project);
             }
         }),
         directories: Arc::new(move || {

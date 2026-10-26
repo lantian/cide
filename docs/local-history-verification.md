@@ -75,3 +75,38 @@ Real-window acceptance, dark/light visual review, captures and renders remain fo
 sandbox has no display/audio and refuses Unix sockets; no GUI application, virtual display
 or socket-dependent capture tool was launched. No full-repository CI or live agent session
 was run.
+
+## PR preparation after integrating master
+
+Integrated `origin/master` at `49fd982`, resolving shared-editor/clipboard and bounded
+filesystem-indexing changes. Restore preparation now also checks clipboard comparison
+tabs. Catalog polling admits eligible hidden files independently of the visible tree's
+file catalog, including after native-to-polling fallback. Regression fixtures cover both.
+
+The development application was built and opened successfully with `./run.sh` in the `dev`
+profile. This is a launch smoke check, not native multi-window or visual acceptance.
+
+The complete `./test.sh` host run finished all 146 checks: 143 passed initially and three
+check groups failed. Shell portability, the dependency boundary, formatting, workspace
+build, codegen/contracts (417 commands, 48 events), frozen UI install, TypeScript, production
+UI build and fork pins passed. Of 133 UI checks, 132 passed on that run.
+
+- Workspace Rust tests: 4,848 passed, four failed, 104 ignored. The process-shutdown,
+  check-timeout and Codex-RPC tests passed when rerun individually with one test thread.
+  LSP discovery failed because `rust-analyzer` was unavailable to that shell; its individual
+  rerun passed with `CIDE_RA_PATH=/Applications/cide.app/Contents/MacOS/cide-rust-analyzer`.
+  These reruns do not turn the original aggregate run into a green workspace run.
+- Clippy initially found style warnings in the new history modules. After correcting them,
+  `cargo clippy --locked --workspace --all-targets -- -D warnings` passed without warnings.
+- `check:openspec-performance` initially assumed eight event-loop turns were enough for a
+  lazy module import. A bounded wait confirmed the application launched correctly; the test
+  now waits for the launch command, still asserts exactly one launch after two clicks, and
+  passes along with its remaining approval, retry and large-list checks.
+- After the final Rust edits, `cargo test --locked -p cide-core -p cide-ipc -p cide-fs
+  -p cide-app --lib history` passed all 129 matching tests. The final
+  `cargo test --locked -p cide-fs --lib watch::tests` passed all 10 tests.
+
+The full runner used private temporary XDG state/data/config/cache directories. Complete
+local logs are under `target/ci-checks/run-xRJKtaDf/`, with final Clippy/history/watcher logs
+and individual rerun logs alongside it. Native-window acceptance and dark/light visual
+review remain pending; see the acceptance sequence in `local-history.md`.

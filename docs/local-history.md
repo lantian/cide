@@ -201,8 +201,9 @@ are recorded in [local-history-verification.md](local-history-verification.md).
 
 Implementation and automated verification are complete; native-window acceptance and visual
 sign-off are pending reviewer execution. Do these on a normal desktop with a disposable
-project/profile. This sandbox has no display/audio and refuses Unix sockets. No GUI app,
-virtual display, screenshot tool or renderer was launched here.
+project/profile. The initial restricted-checkout run had no display/audio or Unix sockets.
+Subsequent PR preparation built and opened the development application; this launch smoke
+check does not establish visual or native multi-window acceptance.
 
 - Repeat the native linked-folder watcher test listed in the verification record outside
   the sandbox, then confirm actual external edits to unopened hidden files reach Local
