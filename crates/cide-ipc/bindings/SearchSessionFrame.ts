@@ -8,4 +8,4 @@ import type { SymbolFrame } from "./SymbolFrame";
  * File and symbol results are bounded ranked sets; text results are append-only pages.
  * The generation prevents a page from the old run being appended after Refresh.
  */
-export type SearchSessionFrame = { session: SearchSession, files: PickerFrame | null, symbols: SymbolFrame | null, text: SearchFrame | null, running: boolean, errors: Array<string>, };
+export type SearchSessionFrame = { incomplete: boolean, session: SearchSession, files: PickerFrame | null, symbols: SymbolFrame | null, text: SearchFrame | null, running: boolean, errors: Array<string>, };

@@ -97,6 +97,77 @@ pub fn walk_symbols(
     outcome
 }
 
+/// Parse a bounded catalog, preserving the logical paths and aliases admitted by the index.
+/// Returning false from the sink stops before opening another file.
+pub fn catalog_symbols<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    limits: Limits,
+    stopped: &dyn Fn() -> bool,
+    sink: &mut dyn FnMut(WalkedFile) -> bool,
+) -> WalkOutcome {
+    use std::io::Read;
+    let mut outcome = WalkOutcome::default();
+    let mut parser = Parser::new();
+    let mut text = String::new();
+    for (absolute, rel) in files {
+        if stopped() {
+            outcome.truncated = true;
+            break;
+        }
+        let path = Path::new(absolute);
+        let Some(lang) = Lang::of_path(path) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        if file
+            .metadata()
+            .is_ok_and(|m| !m.is_file() || m.len() > limits.max_file_bytes)
+        {
+            continue;
+        }
+        text.clear();
+        if file
+            .take(limits.max_file_bytes + 1)
+            .read_to_string(&mut text)
+            .is_err()
+            || text.len() as u64 > limits.max_file_bytes
+        {
+            continue;
+        }
+        let Some(tree) = parse_with(&mut parser, lang, &text, limits) else {
+            continue;
+        };
+        let (symbols, truncated) = symbols_of(&tree, &text, lang, limits);
+        fn count(symbols: &[Symbol]) -> usize {
+            symbols.iter().map(|s| 1 + count(&s.children)).sum()
+        }
+        let count = count(&symbols);
+        if count + outcome.symbols as usize > limits.max_symbols {
+            outcome.truncated = true;
+            break;
+        }
+        outcome.truncated |= truncated;
+        if stopped() {
+            outcome.truncated = true;
+            break;
+        }
+        if !sink(WalkedFile {
+            path: absolute.to_string(),
+            rel: rel.to_string(),
+            lang,
+            symbols,
+        }) {
+            outcome.truncated = true;
+            break;
+        }
+        outcome.files += 1;
+        outcome.symbols += count as u32;
+    }
+    outcome
+}
+
 fn walk_root(
     root: &WalkRoot,
     multi: bool,

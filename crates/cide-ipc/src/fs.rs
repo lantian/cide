@@ -168,6 +168,16 @@ impl TreeRowKind {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct FsStatus {
+    /// Monotonic generation; late results from a replaced index must not win.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Conservative charged allocations, not the application's resident memory.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub index_bytes: u64,
+    #[serde(default)]
+    pub index_limit: Option<IndexLimit>,
     /// True between `fs.index` starting and the walk finishing. The picker is usable the
     /// whole time — this only tells the UI whether its counts are still climbing.
     pub indexing: bool,
@@ -177,6 +187,14 @@ pub struct FsStatus {
     /// scrollbar does not need a second round trip.
     pub rows: u32,
     pub watch: WatchStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum IndexLimit {
+    ProjectBudget,
+    TotalBudget,
 }
 
 /// How the watcher is watching, and why.

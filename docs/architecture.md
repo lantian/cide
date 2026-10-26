@@ -191,6 +191,30 @@ Shutdown is a ladder — SIGHUP, SIGTERM, SIGKILL — so a `claude` finishes wri
 that resume depends on; signals arrive through a self-pipe because taking the workspace lock in
 a handler deadlocks whenever the interrupted thread already held it.
 
+## Filesystem indexing and memory
+
+`cide-fs::budget` accounts each project's index generation against a project limit and a
+shared application limit. The Files settings default to 512 MiB/project and 2048 MiB combined.
+These are conservative allocation budgets for indexing, including fixed working buffers,
+path/tree/matcher capacity, symbol and library candidates and watcher metadata. They are not
+RSS limits for the application, language servers or agent processes. Charges survive deletion
+and stay reserved until the generation's last reader releases them; candidate snapshots share
+strings and retain that reservation. An explicit root Refresh rebuilds an incomplete index.
+
+Indexing streams admitted batches, visits ordinary sources across roots before ignored trees
+and directory links, and shares four filesystem worker permits with catalog searches. Shallow
+directory iterators avoid walkdir buffering whole ancestors on deep trees. Text and symbol
+search consume the admitted catalog, including available entries during construction, and
+report incomplete coverage. Settings changes cancel affected generations; close and shutdown
+cancel scans and suppress stale results. Increases retry incomplete indexes, while exhaustion
+alone never schedules another scan.
+
+Watchers use no recursive file-ID cache. Native event delivery and queues are bounded;
+overflow requests reconciliation. The polling fallback stats admitted files and directory
+timestamps, with bounded discovery for new directories and link targets. Ignored trees still
+require manual Refresh. `fs-status` carries the generation, charged bytes and limit reason;
+the explorer's memory-limit banner links to Files settings.
+
 ## On disk
 
 Under a profile every path below has `cide-<profile>` where it says `cide` — one leaf, decided

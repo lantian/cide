@@ -30,6 +30,8 @@
 
 pub mod content;
 
+use std::borrow::Borrow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cide_ipc::{PickerFrame, PickerRow};
@@ -41,8 +43,9 @@ use parking_lot::{Mutex, RwLock};
 pub const MAX_FRAME: usize = 200;
 
 /// One candidate the user can pick.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Candidate {
+    lease: Option<Arc<dyn Send + Sync>>,
     /// What is matched and drawn — for files, the path relative to its root.
     pub text: String,
     /// What picking it means: an absolute path, a command id. Never shown.
@@ -63,9 +66,26 @@ pub struct Candidate {
     pub source: Option<String>,
 }
 
+impl std::fmt::Debug for Candidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Candidate")
+            .field("text", &self.text)
+            .field("value", &self.value)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.value == other.value && self.source == other.source
+    }
+}
+impl Eq for Candidate {}
+
 impl Candidate {
     pub fn new(text: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            lease: None,
             text: text.into(),
             value: value.into(),
             source: None,
@@ -79,6 +99,7 @@ impl Candidate {
         source: impl Into<String>,
     ) -> Self {
         Self {
+            lease: None,
             text: text.into(),
             value: value.into(),
             source: Some(source.into()),
@@ -153,6 +174,7 @@ pub fn merge(project: Scored, libraries: Scored, limit: usize) -> PickerFrame {
     }
 
     PickerFrame {
+        incomplete: project.frame.incomplete || libraries.frame.incomplete,
         items,
         // Saturating rather than wrapping: the counter is a readout and a wrapped `total` is a
         // number that reads as a bug. Neither side can realistically reach `u32::MAX` — the
@@ -207,10 +229,11 @@ pub trait Matcher: Send + Sync {
 /// both threads — `parking_lot` guards have no timeout, so the picker never came back. Any
 /// new method must take these in the order they are declared here.
 pub struct NucleoMatcher {
-    inner: Mutex<Nucleo<Candidate>>,
+    lease: Option<Arc<dyn Send + Sync>>,
+    inner: Mutex<Nucleo<Arc<Candidate>>>,
     /// Held separately from the worker so that injection never waits on a query. Behind an
     /// `RwLock` only because `clear` has to replace it: pushes take the read side.
-    injector: RwLock<nucleo::Injector<Candidate>>,
+    injector: RwLock<nucleo::Injector<Arc<Candidate>>>,
     /// The query as last parsed, for the append fast path and to echo in the frame.
     query: Mutex<String>,
     /// Reused across frames for the highlight offsets. `nucleo::Matcher::new` allocates the
@@ -261,6 +284,7 @@ impl NucleoMatcher {
         let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, Some(workers), 1);
         let injector = RwLock::new(nucleo.injector());
         Self {
+            lease: None,
             inner: Mutex::new(nucleo),
             injector,
             query: Mutex::new(String::new()),
@@ -270,9 +294,16 @@ impl NucleoMatcher {
     }
 
     /// Push one candidate. The hot path during a walk.
-    pub fn push(&self, item: Candidate) {
+    pub fn with_owner(owner: Arc<dyn Send + Sync>) -> Self {
+        let mut matcher = Self::new();
+        matcher.lease = Some(owner);
+        matcher
+    }
+
+    pub fn push(&self, mut item: Candidate) {
+        item.lease = self.lease.clone();
         let injector = self.injector.read();
-        injector.push(item, |item, columns| {
+        injector.push(Arc::new(item), |item, columns| {
             columns[0] = item.text.as_str().into();
         });
     }
@@ -281,7 +312,17 @@ impl NucleoMatcher {
     /// Everywhere ranks this snapshot on the blocking pool: two tabs must never reparse
     /// each other's pattern. Reading the injector also includes entries the scorer has not
     /// reached yet. Its safe accessor tolerates holes while parallel walkers are injecting.
-    pub fn candidates(&self) -> Vec<Candidate> {
+    pub fn push_shared(&self, item: Arc<Candidate>) {
+        self.injector.read().push(item, |item, columns| {
+            columns[0] = item.text.as_str().into();
+        });
+    }
+
+    pub fn candidate_count(&self) -> usize {
+        self.injector.read().injected_items() as usize
+    }
+
+    pub fn candidates(&self) -> Vec<Arc<Candidate>> {
         let injector = self.injector.read();
         (0..injector.injected_items())
             .filter_map(|index| injector.get(index).map(|item| item.data.clone()))
@@ -359,6 +400,7 @@ impl NucleoMatcher {
 
         Scored {
             frame: PickerFrame {
+                incomplete: false,
                 items,
                 matched,
                 total,
@@ -373,8 +415,9 @@ impl NucleoMatcher {
 impl Matcher for NucleoMatcher {
     fn extend(&self, items: &mut dyn Iterator<Item = Candidate>) {
         let injector = self.injector.read();
-        for item in items {
-            injector.push(item, |item, columns| {
+        for mut item in items {
+            item.lease = self.lease.clone();
+            injector.push(Arc::new(item), |item, columns| {
                 columns[0] = item.text.as_str().into();
             });
         }
@@ -426,7 +469,7 @@ impl Matcher for NucleoMatcher {
 /// For the command palette, which has fifty entries and no streaming to do. It goes through
 /// the same scoring as the file picker on purpose: two overlays that rank the same query
 /// differently is the sort of thing that reads as a bug even when both answers are defensible.
-pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
+pub fn rank<T: Borrow<Candidate>>(query: &str, items: &[T], limit: usize) -> PickerFrame {
     let limit = limit.min(MAX_FRAME);
     let mut matcher = nucleo::Matcher::new(Config::DEFAULT.match_paths());
     let pattern = nucleo::pattern::Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
@@ -434,6 +477,7 @@ pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
     let mut scored: Vec<(u32, usize)> = Vec::new();
     let mut buf = Vec::new();
     for (i, item) in items.iter().enumerate() {
+        let item = item.borrow();
         let haystack = nucleo::Utf32Str::new(&item.text, &mut buf);
         if let Some(score) = pattern.score(haystack, &mut matcher) {
             scored.push((score, i));
@@ -449,7 +493,7 @@ pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
         .into_iter()
         .take(limit)
         .map(|(_, i)| {
-            let item = &items[i];
+            let item = items[i].borrow();
             indices.clear();
             let haystack = nucleo::Utf32Str::new(&item.text, &mut buf);
             pattern.indices(haystack, &mut matcher, &mut indices);
@@ -470,6 +514,7 @@ pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
         .collect();
 
     PickerFrame {
+        incomplete: false,
         items: rows,
         matched,
         total: items.len() as u32,
@@ -481,9 +526,9 @@ pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
 /// Files accept masks without changing the fuzzy semantics of symbols and actions. A
 /// slashless mask addresses basenames at any depth; slash-containing masks address the
 /// root-relative display path. Smart case agrees with the fuzzy file picker.
-pub fn rank_files(
+pub fn rank_files<T: Borrow<Candidate>>(
     query: &str,
-    items: &[Candidate],
+    items: &[T],
     roots: &[std::path::PathBuf],
     limit: usize,
 ) -> Result<PickerFrame, String> {
@@ -497,8 +542,9 @@ pub fn rank_files(
         .map_err(|error| format!("Invalid filename pattern: {error}"))?
         .compile_matcher();
     let basename = !query.contains('/');
-    let mut matched: Vec<_> = items
+    let mut matched: Vec<&Candidate> = items
         .iter()
+        .map(Borrow::borrow)
         .filter(|item| {
             let text = if basename {
                 item.text.rsplit('/').next().unwrap_or(&item.text)
@@ -517,6 +563,7 @@ pub fn rank_files(
         .collect();
     matched.sort_by(|a, b| a.text.cmp(&b.text).then(a.value.cmp(&b.value)));
     Ok(PickerFrame {
+        incomplete: false,
         matched: matched.len() as u32,
         total: items.len() as u32,
         running: false,
@@ -947,5 +994,25 @@ mod tests {
             "same rows, same order, whichever way round the feature is switched"
         );
         assert_eq!(merged.total, alone.frame.total);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    #[test]
+    fn snapshots_share_strings_and_retain_the_generation_owner() {
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let matcher = NucleoMatcher::with_owner(owner);
+        matcher.push(Candidate::new("hello", "/project/hello"));
+        let first = matcher.candidates();
+        let second = matcher.candidates();
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        drop(matcher);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
     }
 }

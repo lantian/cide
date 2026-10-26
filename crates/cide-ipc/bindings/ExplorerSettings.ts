@@ -32,6 +32,10 @@
  */
 export type ExplorerSettings = { 
 /**
+ * Conservative indexing allocation limits in MiB. Shared across all providers.
+ */
+indexMemoryMiB: number, totalIndexMemoryMiB: number, 
+/**
  * Draw dot-prefixed entries — `.claude`, `.github`, `.env`.
  */
 showHiddenFiles: boolean, 
