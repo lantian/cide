@@ -113,6 +113,7 @@ import {
 } from '@/ipc/client'
 import { Icon, FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+import { canCompareClipboard, compareToClipboard } from '@/editor/compareClipboard'
 import { COMPOSE_LABEL, COMPOSE_VERBS, isComposePath } from '@/chrome/composeModel'
 import { runCompose } from '@/chrome/composeRun'
 // The sentence, not a second copy of it. `NO_HOST` is user-visible prose that now appears on
@@ -2195,6 +2196,10 @@ export function FileTree({
          * the system clipboard — so the text a Copy leaves behind and the text these two write
          * are the same shape, and pasting either into a terminal works.
          */
+        ...(!row.isDir && canCompareClipboard(row.path) ? [{
+          id: 'compareClipboard', label: 'Compare to Clipboard',
+          run: () => { void compareToClipboard(project, row.path) },
+        }] : []),
         {
           id: 'copyPath',
           label: many ? `Copy ${scope.length} Paths` : 'Copy Path',

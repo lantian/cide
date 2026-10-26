@@ -59,7 +59,7 @@ const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 try {
   // --- the pure half: which file is "the opened file" ------------------------------------
   //
-  // `keys/target.ts` imports only types, so `tsc` compiles it standalone the same way
+  // Both pure modules import only types, so `tsc` compiles them standalone the same way
   // `check-key-gate.mjs` compiles the four key modules.
   //
   // Through a generated `tsconfig.json` rather than bare flags, because this module names its
@@ -82,13 +82,14 @@ try {
         baseUrl: resolve('.'),
         paths: { '@/*': ['src/*'] },
       },
-      files: [resolve('src/keys/target.ts')],
+      files: [resolve('src/keys/target.ts'), resolve('src/chrome/menuModel.ts')],
     }),
   )
   execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', config], {
     stdio: 'inherit',
   })
   const target = await import(`file://${join(out, 'keys', 'target.js')}`)
+  const menuModel = await import(`file://${join(out, 'chrome', 'menuModel.js')}`)
 
   /** A shell-window bootstrap showing one project whose active tab is `kind`. */
   const boot = (kind) => ({
@@ -115,6 +116,19 @@ try {
     target.focusedTabPath(boot({ kind: 'file', path: '/p/src/main.rs', dirty: false })),
     '/p/src/main.rs',
     'a file tab names its file',
+  )
+  const comparison = boot({
+    kind: 'clipboardDiff', path: '/p/src/main.rs', snapshotId: 'clip', dirty: true,
+  })
+  eq(
+    target.focusedTabPath(comparison),
+    '/p/src/main.rs',
+    'a clipboard comparison reveals its editable file',
+  )
+  eq(
+    target.focusedFilePath(comparison),
+    '/p/src/main.rs',
+    'file commands target the editable file in a clipboard comparison',
   )
   /*
    * A **diff** tab names the file it is diffing, which is what IDEA reveals — but only when
@@ -146,16 +160,24 @@ try {
   )
 
   /*
-   * And it must agree with `chrome/menuModel.ts::pathOf`, which answers the same question for
-   * the tab strip's menu. The two cannot import each other — that module is compiled standalone
-   * and its header forbids a value import — so the agreement is asserted here instead.
+   * And it must agree with `chrome/menuModel.ts::absolutePathOf`, which answers the same
+   * question for the tab strip's menu. Exercise both implementations so this checks behavior
+   * without depending on the spelling of their branches.
    */
-  const menuModel = read('../src/chrome/menuModel.ts')
-  ok(
-    /if \(tab\.kind\.kind === 'file'\) return tab\.kind\.path/.test(menuModel) &&
-      /if \(tab\.kind\.kind === 'diff'\) return tab\.kind\.spec\.newPath/.test(menuModel),
-    '`menuModel.pathOf` still answers file-then-diff, which is what `focusedTabPath` mirrors',
-  )
+  for (const kind of [
+    { kind: 'claudeHome' },
+    { kind: 'file', path: '/p/src/main.rs', dirty: false },
+    { kind: 'clipboardDiff', path: '/p/src/main.rs', snapshotId: 'clip', dirty: true },
+    { kind: 'diff', spec: { oldPath: '/p/a.rs', newPath: '/p/b.rs' } },
+    { kind: 'diff', spec: { oldPath: 'src/a.rs', newPath: 'src/b.rs' } },
+  ]) {
+    const bootstrap = boot(kind)
+    eq(
+      target.focusedTabPath(bootstrap),
+      menuModel.absolutePathOf(bootstrap.workspace.projects.p.tabs[0]),
+      `keyboard and tab menu agree on the file path for ${kind.kind}`,
+    )
+  }
 
   // --- 1. the chord ------------------------------------------------------------------------
 

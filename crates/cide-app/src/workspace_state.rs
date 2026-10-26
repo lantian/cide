@@ -326,6 +326,13 @@ impl WorkspaceState {
         // their snapshots in the opposite order to the one they were applied in. The clone
         // is the price of that; the alternative is a frontend that can be told about rev 8
         // and then rev 7 and has to sort it out from the number alone.
+        // Runtime file views follow the same mutation while its lock is held. Doing this
+        // during the later broadcast lets an older event prune a newer clipboard snapshot.
+        if let Some(app) = self.app.get()
+            && let Some(comparisons) = app.try_state::<crate::cmd::compare_clipboard::Comparisons>()
+        {
+            comparisons.reconcile(&guard);
+        }
         let snapshot = guard.clone();
         drop(guard);
         if let Some(app) = self.app.get() {

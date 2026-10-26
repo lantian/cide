@@ -18829,3 +18829,40 @@ existing modal/pinning and embedded-editor regressions. Modal and pinned screens
 inspected. The global UI-scale check found an existing unrelated `font-size: 0.75rem` in
 `ConversationArchivePane.module.css`; that file was left untouched. Native Tauri display
 behavior was not exercised.
+
+## M190 — Compare to Clipboard with editable file hunks
+
+Text files offer **Compare to Clipboard** in the editor, tab (including a detached tab),
+and file-tree context menus. The action captures the clipboard and opens a separate,
+file-backed comparison tab. Repeating it refreshes that tab's snapshot. Split and unified
+layouts both offer per-hunk **Copy from Clipboard** controls; the clipboard stays read-only.
+The file side shares unsaved text, Undo/Redo and Save with the ordinary editor. Read-only
+files omit copy controls, and comparisons beyond 1 MiB or 12,000 combined lines retain an
+ordinary file editor with an explanatory notice.
+
+Shared documents keep local views synchronous and arbitrate updates between windows through
+native compare-and-swap snapshots, including CodeMirror history. A rejected revision rebases
+pending edits. Tab close/detach/redock flush pending changes; compositor close of a detached
+file requests the same acknowledgement before destroying its webview. Dirty flags and close
+checks describe the shared file, so closing one view preserves edits in the other. Renames
+move the session, recovery backups survive while either view remains, and normal typing
+retains its Undo grouping across acknowledgements. Clipboard snapshots and history are never
+written into workspace persistence. Restart converts comparison tabs to ordinary file views,
+deduplicating plain editors while preserving auxiliary sessions.
+
+Validation: production UI build and typecheck; IPC codegen and contract checks; Rust workspace,
+persistence, file/window and shared-document tests; editor (5,462 checks), clipboard model and
+real CodeMirror merge controls, menu model/menus, close, detached, sidebar, diff render, merge,
+scheme, markdown, keyboard, tab overflow, selectors, theme, UI scale, motion and kit checks.
+The mounted Chromium audit exercises the editor context menu, unsaved text, hunk copying,
+shared Undo/Save, clipboard refresh and layout switching. Light/dark split screenshots were
+inspected. Native Tauri clipboard access and compositor detach/redock were not manually
+exercised.
+
+The subsequent shared CI run reported 141 passing checks and four failures. Follow-up fixes
+apply Rust formatting, move production helpers before test modules, collapse nested conditions,
+and use plain `vs Clipboard` labels. The Select opened file check now drives both keyboard and
+menu path resolution, including clipboard comparisons, instead of matching a branch's source
+text. All four failing checks (`rust/fmt`, `rust/clippy`, `check:select-opened`, `check:ui-icons`)
+pass on rerun; UI typecheck and `check:menu-model` also pass. The entire suite was not rerun
+after these fixes.

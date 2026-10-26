@@ -12,6 +12,7 @@ pub mod conversations;
 pub mod git;
 pub mod gitlab;
 pub mod headless;
+pub mod shared_document;
 // The Git tool window: the commit log and its graph, one commit's contents, revisions, blame and
 // the commit-level actions. (M18)
 //
