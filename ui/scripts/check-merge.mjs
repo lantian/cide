@@ -208,6 +208,34 @@ try {
     )
   }
 
+  // --- large text files ------------------------------------------------------------------------
+
+  {
+    // A few MiB of short lines exceed JS's function-argument limit when passed to push(...).
+    // Exercise both unchanged ranges and a whole-file conflict, including taking both sides.
+    const large = 'journal entry\n'.repeat(200_000)
+    const unchanged = m.build(large, large, large)
+    ok(m.renderResult(unchanged, {}) === large, 'a large unchanged file round-trips')
+
+    const sparseBase = `${large}base\n${large}`
+    const sparseOurs = `${large}ours\n${large}`
+    const sparseTheirs = `${large}theirs\n${large}`
+    const sparse = m.build(sparseBase, sparseOurs, sparseTheirs)
+    eq(sparse.conflicts.length, 1, 'a small conflict within a large file stays one block')
+    const ours = { r0: { taken: ['ours'], ignored: ['theirs'] } }
+    ok(m.renderResult(sparse, ours) === sparseOurs, 'large unchanged prefix and suffix survive')
+
+    const theirs = large.replaceAll('entry', 'other')
+    const replaced = m.build('base', large, theirs)
+    eq(replaced.conflicts.length, 1, 'a large replacement is one conflict')
+    ok(m.renderResult(replaced, {}) === 'base', 'an undecided large conflict preserves the base')
+    ok(m.renderResult(replaced, ours) === large, 'a large accepted block round-trips')
+    const both = { r0: { taken: ['ours', 'theirs'], ignored: [] } }
+    const result = m.renderResult(replaced, both)
+    ok(result === `${large}\n${theirs}`, 'both large sides retain their text and click order')
+    ok(m.canApply(result, replaced, both), 'the large resolved result can be applied')
+  }
+
   // --- decisions ---------------------------------------------------------------------------------
 
   {
