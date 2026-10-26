@@ -65,6 +65,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { clipboard, imageClipboard, diag, events, file as fileApi, fileChanged, type ProjectId } from '@/ipc/client'
 import type { FileStamp } from '@/ipc/generated'
 import { useWorkspace } from '@/store/workspace'
+import { useHistoryRestoreGate } from '@/editor/useHistoryRestoreGate'
 import { autosaveDelay, shouldAutosave } from '@/editor/autosave'
 import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
 import { claimStatusReadout, pathTrail, type ReadoutSlot } from '@/editor/statusReadout'
@@ -115,6 +116,7 @@ const GIT_RECHECK_MS = 120
 type SurfaceModule = typeof import('./ExcalidrawSurface')
 
 export interface ExcalidrawPaneProps {
+  pane?: string | undefined
   /** Absolute path of the file this tab shows — the path as the user asked for it. */
   path: string
   /** The project root, so the status bar's trail is repo-relative. */
@@ -141,7 +143,7 @@ function basename(path: string): string {
   return cut >= 0 ? path.slice(cut + 1) : path
 }
 
-export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment }: ExcalidrawPaneProps): ReactNode {
+export function ExcalidrawPane({ path, root, project, tab, pane, onScreen, attachment }: ExcalidrawPaneProps): ReactNode {
   const theme = useWorkspace((s) => s.theme)
   /** `settings.editor.autosave`, from the mirror — the editor's own default before bootstrap. */
   const autosaveOn = useWorkspace((s) => s.boot?.workspace.settings.editor.autosave ?? true)
@@ -179,6 +181,7 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment 
   const surfaceRef = useRef<SurfaceModule | null>(null)
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
   const dirtyRef = useRef(false)
+  const historyGatedRef = useRef(pane !== undefined)
   /** What the file was when the drawing last agreed with the disk — `EditorPane.stampRef`. */
   const stampRef = useRef<FileStamp | null>(null)
   const writableRef = useRef(true)
@@ -336,6 +339,8 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment 
     setReloads((n) => n + 1)
   }, [])
 
+  const historyGateHandle = useHistoryRestoreGate(pane, path, () => dirtyRef.current, reload)
+
   /* -------------------------------------------------------------------------- saving */
 
   const save = useCallback(
@@ -343,11 +348,12 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment 
       const surface = surfaceRef.current
       const api = apiRef.current
       // Nothing loaded — a Ctrl+S on the failure notice — is nothing to write, not a failure.
-      if (surface === null || api === null) return
+      if (surface === null || api === null || historyGatedRef.current) return
       const at = pathRef.current
       const format = drawingKindFor(at) ?? 'json'
       const snapshot = surface.fingerprintOf(api)
       const bytes = await surface.serializeScene(api, format)
+      if (historyGatedRef.current) return
       try {
         const stamp = await fileApi.writeBytes(at, bytes, cause === 'autosave' ? stampRef.current : null)
         // The token moves with the write, or the next autosave compares against the file as it
@@ -452,7 +458,8 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment 
 
   const onApi = useCallback((api: ExcalidrawImperativeAPI) => {
     apiRef.current = api
-  }, [])
+    historyGateHandle((active) => { historyGatedRef.current = active; api.updateScene({ appState: { viewModeEnabled: active || !writableRef.current } }) })
+  }, [historyGateHandle])
 
   /**
    * Every change the engine reports, most of which are not edits.
@@ -628,7 +635,7 @@ export function ExcalidrawPane({ path, root, project, tab, onScreen, attachment 
             key={load.key}
             initial={load.scene}
             theme={theme}
-            viewMode={!writableRef.current}
+            viewMode={!writableRef.current || historyGatedRef.current}
             name={name}
             onChange={onChange}
             onApi={onApi}

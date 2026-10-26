@@ -21,6 +21,15 @@ use tauri::{AppHandle, Emitter, Manager};
 
 pub const COMMIT_MESSAGE_PROGRESS: &str = "cide://commit-message-progress";
 pub const LOCAL_HISTORY_CHANGED: &str = "cide://local-history-changed";
+pub const LOCAL_HISTORY_EDITOR_GATE: &str = "cide://local-history-editor-gate";
+pub fn local_history_editor_gate(
+    app: &AppHandle,
+    gate: &cide_ipc::local_history::HistoryEditorGate,
+) {
+    if let Err(error) = app.emit(LOCAL_HISTORY_EDITOR_GATE, gate) {
+        tracing::debug!(%error, "history editor gate reached no window");
+    }
+}
 pub fn local_history_changed(
     app: &AppHandle,
     change: &cide_ipc::local_history::HistoryInvalidation,

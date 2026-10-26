@@ -19,7 +19,7 @@
 ## 4. IPC and restore safety
 
 - [x] 4.1 Add backend history status/path/list/compare/policy/clear commands and the shared frontend IPC seam, scoped validation, stale-generation errors and versioned history invalidation events through `emit.rs`.
-- [ ] 4.2 Implement digest/absence comparison tokens and restore preparation with canonical-path editor prepare/acknowledge gates across windows; abort for dirty editors, missing acknowledgements, lifecycle changes, stale disk state and invalid target permissions/containment.
+- [x] 4.2 Implement digest/absence comparison tokens and restore preparation with canonical-path editor prepare/acknowledge gates across windows; abort for dirty editors, missing acknowledgements, lifecycle changes, stale disk state and invalid target permissions/containment.
 - [ ] 4.3 Implement durable pre-restore safety capture, pinned revisions, atomic restore/recreation/absence restore, clean-editor refresh and all-exit gate cleanup. Cover changed symlink targets, absent parents, failed safety capture and successful mutation followed by post-record failure.
 - [ ] 4.4 Regenerate TypeScript DTOs and command/event manifests using `cargo xtask codegen` and `cargo xtask contract-check --write`; verify generated outputs rather than editing them manually.
 

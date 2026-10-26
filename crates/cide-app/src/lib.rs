@@ -46,6 +46,7 @@ pub mod ext_assets;
 pub mod ext_state;
 mod image_snapshots;
 mod local_history;
+mod local_history_restore;
 mod opencode_console;
 mod peer_chat;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
@@ -485,6 +486,9 @@ pub fn run() {
         .manage(caps::ClaudeVersion::default())
         .manage(caps::HarnessVersions::default())
         .invoke_handler(tauri::generate_handler![
+            local_history_restore::local_history_editor_register,
+            local_history_restore::local_history_editor_unregister,
+            local_history_restore::local_history_editor_acknowledge,
             cmd::local_history::local_history_status,
             cmd::local_history::local_history_paths,
             cmd::local_history::local_history_list,

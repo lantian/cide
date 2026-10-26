@@ -179,6 +179,35 @@ pub struct HistoryInvalidation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
+pub struct HistoryEditorRegistration {
+    pub window: String,
+    pub editor: String,
+    pub mount: String,
+    pub canonical_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum HistoryGatePhase {
+    Prepare,
+    Release,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HistoryEditorGate {
+    pub request: String,
+    pub canonical_path: String,
+    pub editors: Vec<HistoryEditorRegistration>,
+    pub phase: HistoryGatePhase,
+    pub restored: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct LocalHistoryView {
     pub root: HistoryRootId,
     /// None opens the project browser, including deleted paths.

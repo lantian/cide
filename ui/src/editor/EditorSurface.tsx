@@ -122,6 +122,7 @@ import styles from './EditorSurface.module.css'
 export const HIGHLIGHT_LIMIT_BYTES = 1024 * 1024
 
 export interface EditorSurfaceProps {
+  onHistoryGateHandle?: ((handle: ((active: boolean) => void) | null) => void) | undefined
   /** Absolute path, used for the status bar's trail and to pick the language. */
   path: string
   /**
@@ -541,6 +542,7 @@ function indentExtensions(source: string, indent: EditorSurfaceProps['indent']):
 }
 
 export function EditorSurface({
+  onHistoryGateHandle,
   path,
   // Defaulted from `path` in the pattern itself rather than in a `??` below, so the fallback is
   // visible at the one place a reader looks for a prop's default and there is no second binding
@@ -623,6 +625,9 @@ export function EditorSurface({
   const focusCb = useRef(onFocus)
   focusCb.current = onFocus
   const saveHandleCb = useRef(onSaveHandle)
+  const historyGateCb = useRef(onHistoryGateHandle)
+  historyGateCb.current = onHistoryGateHandle
+  const historyGatedRef = useRef(false)
   saveHandleCb.current = onSaveHandle
   const scrollHandleCb = useRef(onScrollHandle)
   scrollHandleCb.current = onScrollHandle
@@ -900,6 +905,7 @@ export function EditorSurface({
      * is built with, because the first Tab can land before any effect has run.
      */
     const indentSlot = new Compartment()
+    const historyGateSlot = new Compartment()
     /*
      * Which polarity CodeMirror thinks it is drawing in. (M24)
      *
@@ -933,7 +939,7 @@ export function EditorSurface({
      * exists to prevent.
      */
     const saveNow = (view: EditorView, cause: SaveCause = 'manual'): Promise<void> => {
-      if (readOnly) return Promise.resolve()
+      if (readOnly || historyGatedRef.current) return Promise.resolve()
       const saving = view.state.doc
       const text = restoreLineEndings(saving.toString(), endingRef.current)
       return Promise.resolve(saveCb.current?.(text, cause)).then(() => {
@@ -943,7 +949,7 @@ export function EditorSurface({
     }
 
     const save = (view: EditorView): boolean => {
-      if (readOnly) return false
+      if (readOnly || historyGatedRef.current) return false
       const saving = view.state.doc
       const text = restoreLineEndings(saving.toString(), endingRef.current)
 
@@ -1234,6 +1240,7 @@ export function EditorSurface({
        */
       navRecorder(project, identity),
       indentSlot.of(indentExtensions(source, indentRef.current)),
+      historyGateSlot.of([]),
       languageSlot.of([]),
       lintSlot.of([]),
       completionSlot.of(completionFor(completionRef.current, project, path, readOnly, oversize)),
@@ -1583,6 +1590,10 @@ export function EditorSurface({
     // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
     // that is no longer on screen.
     saveHandleCb.current?.(() => saveNow(view))
+    historyGateCb.current?.((active) => {
+      historyGatedRef.current = active
+      view.dispatch({ effects: historyGateSlot.reconfigure(active ? [EditorState.readOnly.of(true), EditorView.editable.of(false), EditorState.transactionFilter.of((tr) => tr.docChanged ? [] : tr)] : []) })
+    })
 
     /*
      * And the way to scroll it, for the markdown preview. (M20)
@@ -1990,6 +2001,7 @@ export function EditorSurface({
       lintFingerprintRef.current = null
       blameSlotRef.current = null
       saveHandleCb.current?.(null)
+      historyGateCb.current?.(null)
       scrollHandleCb.current?.(null)
       focusHandleCb.current?.(null)
       /*

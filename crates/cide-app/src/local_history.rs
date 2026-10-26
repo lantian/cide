@@ -123,11 +123,12 @@ pub fn for_path(path: &Path) -> Option<Arc<HistoryCoordinator>> {
         .map(|(e, _)| e.coordinator.clone())
 }
 
-pub fn mutate<T, E>(
+pub fn mutate<T, E: HistoryMutationError>(
     path: &Path,
     source: cide_ipc::local_history::HistorySource,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    let _lease = write_lease(std::slice::from_ref(&path.to_path_buf())).map_err(E::history_busy)?;
     match for_path(path) {
         Some(coordinator) => coordinator.mutate(path, source, operation),
         None => operation(),
@@ -290,11 +291,18 @@ pub fn tree_unsubscribed(project: ProjectId) {
 }
 
 /// Hold every affected root in stable key order, including roots nested in a moved directory.
-pub fn mutate_tree<T, E>(
+pub fn mutate_tree<T, E: HistoryMutationError>(
     paths: &[PathBuf],
     operation: impl FnOnce() -> Result<T, E>,
     summarize: &impl Fn(&Result<T, E>) -> Vec<cide_core::local_history::HistoryTreeChange>,
 ) -> Result<T, E> {
+    let mut regions = paths.to_vec();
+    regions.extend(
+        paths
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf)),
+    );
+    let _lease = write_lease(&regions).map_err(E::history_busy)?;
     let coordinators: Vec<_> = ROOTS
         .lock()
         .values()
@@ -321,4 +329,55 @@ pub fn mutate_tree<T, E>(
         }
     }
     run(&coordinators, paths, operation, summarize)
+}
+
+pub static EDITOR_GATES: LazyLock<cide_core::local_history::RestoreGates> =
+    LazyLock::new(Default::default);
+pub trait HistoryMutationError {
+    fn history_busy(reason: String) -> Self;
+}
+impl HistoryMutationError for cide_core::CoreError {
+    fn history_busy(reason: String) -> Self {
+        Self::Io(reason)
+    }
+}
+impl HistoryMutationError for cide_fs::FsError {
+    fn history_busy(reason: String) -> Self {
+        Self::InvalidPath(reason)
+    }
+}
+impl HistoryMutationError for std::io::Error {
+    fn history_busy(reason: String) -> Self {
+        Self::other(reason)
+    }
+}
+impl HistoryMutationError for String {
+    fn history_busy(reason: String) -> Self {
+        reason
+    }
+}
+pub fn canonical_path(path: &Path) -> Option<PathBuf> {
+    ROOTS
+        .lock()
+        .values()
+        .filter_map(|e| {
+            e.identity
+                .resolve(path)
+                .ok()
+                .map(|(physical, _)| (e.identity.path.components().count(), physical))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, physical)| physical)
+}
+fn write_lease(paths: &[PathBuf]) -> Result<cide_core::local_history::WriteLease, String> {
+    EDITOR_GATES.write(
+        paths
+            .iter()
+            .map(|p| {
+                canonical_path(p)
+                    .or_else(|| std::fs::canonicalize(p).ok())
+                    .unwrap_or_else(|| p.clone())
+            })
+            .collect(),
+    )
 }

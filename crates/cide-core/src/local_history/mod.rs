@@ -1,5 +1,7 @@
 //! Root-scoped local recovery storage and eligibility, without a webview dependency.
 mod comparison;
+mod gates;
+pub use gates::{EditorIdentity, RestoreGates, RestorePermit, WriteLease};
 mod coordinator;
 mod policy;
 pub use coordinator::{HistoryCoordinator, HistoryTreeChange};
