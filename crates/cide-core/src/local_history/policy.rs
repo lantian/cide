@@ -160,6 +160,11 @@ impl HistoryEligibility {
     }
 
     fn check_components(&self, path: &Path, is_dir: bool) -> Result<(), String> {
+        let storage = crate::persist::state_dir().join("local-history");
+        let storage = fs::canonicalize(&storage).unwrap_or(storage);
+        if path.starts_with(storage) {
+            return Err("Local History storage is excluded".into());
+        }
         let relative = path
             .strip_prefix(&self.root.path)
             .map_err(|_| "Outside history root")?;

@@ -45,6 +45,7 @@ pub mod ext_assets;
 /// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
 pub mod ext_state;
 mod image_snapshots;
+mod local_history;
 mod opencode_console;
 mod peer_chat;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
@@ -975,6 +976,7 @@ pub fn run() {
             // Before any window exists, so the first mutation can already broadcast.
             app.state::<WorkspaceState>()
                 .attach_app(app.handle().clone());
+            local_history::sync(app.handle(), &app.state::<WorkspaceState>().snapshot());
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());

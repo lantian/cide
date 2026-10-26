@@ -111,7 +111,8 @@ impl HistoryStore {
             .try_lock()
             .map_err(|_| "Local History is owned by another process".to_owned())?;
         let metadata = dir.join("root.json");
-        let meta: Metadata = if metadata.exists() {
+        let reopened = metadata.exists();
+        let mut meta: Metadata = if reopened {
             serde_json::from_slice(&fs::read(&metadata).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("Unavailable history metadata: {e}"))?
         } else {
@@ -133,6 +134,13 @@ impl HistoryStore {
             return Err("History root identity does not match this store".into());
         }
         let eligibility = HistoryEligibility::new(root, meta.policy.clone())?;
+        if reopened {
+            meta.generation = meta
+                .generation
+                .checked_add(1)
+                .ok_or("History generation exhausted")?;
+            json(&metadata, &meta)?;
+        }
         private_dir(&dir.join("blobs"))?;
         private_dir(&dir.join("records"))?;
         let mut store = Self {
@@ -284,8 +292,24 @@ impl HistoryStore {
                 .insert(path.clone(), sequences.into_iter().collect());
         }
     }
+    pub fn known_paths(&self) -> Vec<String> {
+        self.paths.keys().cloned().collect()
+    }
+    pub fn known_path_count(&self) -> u32 {
+        self.paths.len().min(u32::MAX as usize) as u32
+    }
     pub fn generation(&self) -> u32 {
         self.meta.generation
+    }
+    pub fn restart_observation(&mut self) -> Result<(), String> {
+        let mut next = self.meta.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or("History generation exhausted")?;
+        json(&self.dir.join("root.json"), &next)?;
+        self.meta = next;
+        Ok(())
     }
     pub fn status(&self) -> HistoryStatus {
         HistoryStatus {

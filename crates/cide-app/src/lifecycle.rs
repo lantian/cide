@@ -338,6 +338,7 @@ fn run_teardown(app: &AppHandle) {
     // Ahead of the child ladder because a device watching a session should learn that cide is
     // going rather than watch a terminal stop for no stated reason. (M72)
     crate::remote::stop(app);
+    crate::local_history::close_all();
 
     notice::say("Disconnecting Claude Code…");
     if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
