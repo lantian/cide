@@ -381,3 +381,29 @@ fn write_lease(paths: &[PathBuf]) -> Result<cide_core::local_history::WriteLease
             .collect(),
     )
 }
+
+pub fn view_for(
+    project: ProjectId,
+    path: Option<&Path>,
+    root: Option<&HistoryRootId>,
+) -> Result<cide_ipc::local_history::LocalHistoryView, String> {
+    let roots = ROOTS.lock();
+    let entry = roots
+        .values()
+        .filter(|e| e.owners.contains(&project) && root.is_none_or(|r| r == &e.identity.id))
+        .filter(|e| path.is_none_or(|p| e.identity.resolve(p).is_ok()))
+        .max_by_key(|e| {
+            if path.is_some() {
+                e.identity.path.components().count()
+            } else {
+                0
+            }
+        })
+        .ok_or("This path is outside the project's open history roots")?;
+    Ok(cide_ipc::local_history::LocalHistoryView {
+        root: entry.identity.id.clone(),
+        path: path
+            .map(|p| entry.identity.resolve(p).map(|(_, p)| p))
+            .transpose()?,
+    })
+}

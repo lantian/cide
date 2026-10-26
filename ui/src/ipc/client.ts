@@ -16,7 +16,7 @@ import { listen as tauriListen, type Event as TauriEvent } from '@tauri-apps/api
 import { guardUnlisten } from './unlisten'
 import type {
   Axis,
-  HistoryCompareToken, HistoryRestoreResult, HistoryEditorRegistration, HistoryEditorGate, HistoryStatus, HistoryRootId, HistoryPathPage, HistoryRevisionPage, HistoryComparison,
+  LocalHistoryView, HistoryCompareToken, HistoryRestoreResult, HistoryEditorRegistration, HistoryEditorGate, HistoryStatus, HistoryRootId, HistoryPathPage, HistoryRevisionPage, HistoryComparison,
   HistoryPolicy, HistoryInvalidation, LocalRevisionId,
   Bootstrap,
   Capabilities,
@@ -5757,6 +5757,8 @@ export const languageServers = {
 }
 
 export const localHistory = {
+  openView: (project: ProjectId, path: string | null, root: HistoryRootId | null = null) => invoke<LocalHistoryView>('local_history_open_view', { project, path, root }),
+  closeView: (project: ProjectId, view: LocalHistoryView) => invoke<void>('local_history_close_view', { project, view }),
   restore: (project: ProjectId, root: HistoryRootId, token: HistoryCompareToken, confirmed: boolean) => invoke<HistoryRestoreResult>('local_history_restore', { project, root, token, confirmed }),
   registerEditor: (editor: string, path: string) => invoke<HistoryEditorRegistration>('local_history_editor_register', { editor, path }),
   unregisterEditor: (editor: string, mount: string) => invoke<void>('local_history_editor_unregister', { editor, mount }),

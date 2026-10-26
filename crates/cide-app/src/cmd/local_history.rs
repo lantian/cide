@@ -194,3 +194,39 @@ pub async fn local_history_restore(
     })
     .await
 }
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn local_history_open_view(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    root: Option<HistoryRootId>,
+    path: Option<String>,
+) -> Result<LocalHistoryView, String> {
+    let view =
+        crate::local_history::view_for(project, path.as_deref().map(Path::new), root.as_ref())?;
+    state
+        .update(|ws| cide_core::toolwindow::open_local_history(ws, project, view.clone()))
+        .map_err(|e| e.to_string())?;
+    if let Some(label) = state.with(|ws| {
+        ws.windows.iter().find_map(|(label, role)| match role {
+            cide_ipc::WindowRole::Shell { projects, .. } if projects.contains(&project) => {
+                Some(label.clone())
+            }
+            _ => None,
+        })
+    }) {
+        crate::windows::raise(&app, &label);
+    }
+    Ok(view)
+}
+#[tauri::command(rename_all = "camelCase")]
+pub fn local_history_close_view(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    view: LocalHistoryView,
+) -> Result<(), String> {
+    state
+        .update(|ws| cide_core::toolwindow::close_local_history(ws, project, &view))
+        .map_err(|e| e.to_string())
+}

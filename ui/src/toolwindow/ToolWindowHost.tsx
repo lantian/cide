@@ -6,7 +6,9 @@ import { useCallback, useEffect, useRef } from 'react'
 import { ProblemsTab, type ProblemsTabProps } from './ProblemsTab'
 import { LanguageServerLogs } from './LanguageServerLogs'
 import { PROBLEMS_TAB, serverLogTabId, closeServerLogs } from './selection'
-import { logWalk, toolWindow as toolWindowApi } from '@/ipc/client'
+import { LocalHistoryPanel } from '@/localHistory/LocalHistoryPanel'
+import { localHistoryKey } from './toolWindowModel'
+import { localHistory, logWalk, toolWindow as toolWindowApi } from '@/ipc/client'
 import type { HistoryTabId, ProjectId, RepoId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { LogTab } from '@/gitlog/LogTab'
@@ -85,13 +87,14 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
     const timer = setInterval(() => { void syncSessions(project).catch(() => {}) }, 1000)
     return () => clearInterval(timer)
   }, [project])
-  const lastRustActive = useRef({ project, active: state?.active })
+  const localKey = state?.activeLocalHistory ? localHistoryKey(state.activeLocalHistory) : null
+  const lastRustActive = useRef({ project, active: state?.active, localKey })
   useEffect(() => {
-    if (project === lastRustActive.current.project && state?.active !== lastRustActive.current.active) {
+    if (project === lastRustActive.current.project && (state?.active !== lastRustActive.current.active || localKey !== lastRustActive.current.localKey)) {
       selectTransientToolTab(project, null)
     }
-    lastRustActive.current = { project, active: state?.active }
-  }, [state?.active, project])
+    lastRustActive.current = { project, active: state?.active, localKey }
+  }, [state?.active, localKey, project])
   /*
    * Whether the Docker tab is in front. (M46)
    *
@@ -106,6 +109,8 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
 
   const onActivate = useCallback(
     (id: string | null) => {
+      const local = state?.localHistory?.find((view) => localHistoryKey(view) === id)
+      if (local && project) { selectTransientToolTab(project, null); void localHistory.openView(project, local.path, local.root).catch(notifyFailure); return }
       if (id === PROBLEMS_TAB || id?.startsWith('lsp-log:')) { selectTransientToolTab(project, id); return }
       if (isSearchTab(id)) { selectTransientToolTab(project, id); return }
       if (isDockerTab(id)) {
@@ -123,7 +128,7 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
       selectTransientToolTab(project, null)
       void toolWindowApi.activate(project, id as HistoryTabId | null).catch(() => {})
     },
-    [project],
+    [project, state?.localHistory],
   )
   const onClose = useCallback(
     (id: string) => {
@@ -131,6 +136,8 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
       // rather than asserted, because both commands below take a `ProjectId` and neither has
       // anything to answer without one.
       if (project === null) return
+      const local = state?.localHistory?.find((view) => localHistoryKey(view) === id)
+      if (local) { void localHistory.closeView(project, local).catch(notifyFailure); return }
       if (id.startsWith('lsp-log:')) {
         closeServerLogs(project, id.slice('lsp-log:'.length))
         return
@@ -159,7 +166,7 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
       void logWalk.cancel(project, id).catch(() => {})
       void toolWindowApi.closeHistory(project, id as HistoryTabId).catch(() => {})
     },
-    [project, searches],
+    [project, searches, state?.localHistory],
   )
   const onHide = useCallback(() => {
     void toolWindowApi.setLayout(project, { open: false }).catch(() => {})
@@ -185,9 +192,10 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
     // invalid again because `shownExt` is only ever an id in `panels`.
     // Docker outranks a contributed tab, which outranks Rust's — the order the three are
     // *selected* in, so the last thing clicked is the thing in front.
-    active: problemsActive ? PROBLEMS_TAB : logActive ? serverLogTabId(logActive.source) : searchActive ? searchTabId(searchActive.id) : dockerActive ? DOCKER_TAB : (shownExt ?? repaired.active),
+    active: problemsActive ? PROBLEMS_TAB : logActive ? serverLogTabId(logActive.source) : searchActive ? searchTabId(searchActive.id) : dockerActive ? DOCKER_TAB : (shownExt ?? localKey ?? repaired.active),
   }
-  const rows = tabRow(tabs)
+  const rows = [...tabRow(tabs), ...(state.localHistory ?? []).map((view) => ({ id: localHistoryKey(view), label: view.path ? `Local: ${view.path.split('/').pop()}` : 'Local History', title: `Local History · ${view.path ?? 'Project'}`, active: tabs.active === localHistoryKey(view), closable: true }))]
+  const localActive = state.localHistory?.find((view) => localHistoryKey(view) === tabs.active)
   const active = tabs.history.find((t) => t.id === tabs.active) ?? null
   const extPanel = panels.find((panel) => panel.view === shownExt) ?? null
 
@@ -206,7 +214,9 @@ export function ToolWindowHost({ project, onOpenHit, problems }: ToolWindowHostP
          * generation counter and the selection are all per question, and re-pointing would leave
          * one tab's rows on screen under another tab's heading for a frame.
          */}
-        {problemsActive ? (
+        {localActive && project ? (
+          <LocalHistoryPanel key={localHistoryKey(localActive)} project={project} view={localActive} />
+        ) : problemsActive ? (
           <ProblemsTab key={project ?? 'none'} project={project} {...problems} />
         ) : logActive && project ? (
           <LanguageServerLogs key={`${project}:${logActive.source}`} project={project} source={logActive.source} label={logActive.label} />

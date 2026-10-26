@@ -102,6 +102,7 @@ import {
 } from '@/chrome/pasteConfirmModel'
 import {
   diag,
+  localHistory,
   fs as fsApi,
   fsClipboard,
   fsReveal,
@@ -2150,6 +2151,12 @@ export function FileTree({
                 },
               }),
         },
+        ...(!row.isDir ? [{
+          id: 'local-history', label: 'Local History', submenu: () => [{
+            id: 'show-local-history', label: 'Show History', command: 'local-history.file',
+            ...(rowRefusal === null ? { run: () => { if (project !== null) void localHistory.openView(project, row.path).catch(fail('Local History')) } } : { disabledReason: 'Local History captures project files only' }),
+          }],
+        }] : []),
         {
           /*
            * File history opens a per-file tab; folder history filters the main Log tab.

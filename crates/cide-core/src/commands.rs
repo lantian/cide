@@ -1208,6 +1208,20 @@ fn build() -> Vec<Command> {
         // file tab, and this command is about the tab rather than about the focused pane. That
         // is the distinction `file.reveal`'s comment spells out, derived from the same
         // `focusedTabPath`.
+        Command::new(
+            "local-history.file",
+            "Local History: Show history for this file",
+            FILE,
+        )
+        .when("projectOpen && fileTabActive")
+        .keywords(&["recover", "restore", "versions", "local history"]),
+        Command::new(
+            "local-history.project",
+            "Local History: Browse project history",
+            FILE,
+        )
+        .when("projectOpen")
+        .keywords(&["recover", "deleted", "versions", "local history"]),
         Command::new("git.history.file", "Show history for this file", GIT)
             .when("shellWindow && projectOpen && fileTabActive")
             .keywords(&["log", "commits", "revisions", "versions", "annotate"]),

@@ -149,11 +149,12 @@ pub fn activate(
             "history tab {id} is not open in this project"
         )));
     }
-    if state.active == tab && state.open {
+    if state.active == tab && state.open && state.active_local_history.is_none() {
         return Ok(());
     }
     let state = state_mut(ws, project_id)?;
     state.active = tab;
+    state.active_local_history = None;
     // Activating reveals. Every caller got here by asking to *see* something, and a version that
     // left a closed panel closed would be a command that sometimes did nothing visible — the
     // argument `sidebarView::showPanel` makes for the sidebar's own commands.
@@ -204,6 +205,7 @@ pub fn open_history(
     let state = &mut project_mut(ws, project_id)?.tool_window;
     state.history.push(tab);
     state.active = Some(id);
+    state.active_local_history = None;
     state.open = true;
     bump(ws);
     Ok(id)
@@ -245,10 +247,82 @@ fn basename(path: &str) -> String {
     }
 }
 
+/// Local views are keyed by canonical root and physical path, independently of Git tabs.
+pub fn open_local_history(
+    ws: &mut Workspace,
+    project_id: ProjectId,
+    view: cide_ipc::local_history::LocalHistoryView,
+) -> Result<()> {
+    if let Some(path) = &view.path {
+        crate::local_history::validate_relative(std::path::Path::new(path))
+            .map_err(CoreError::Invariant)?;
+    }
+    let state = &mut project_mut(ws, project_id)?.tool_window;
+    if state.active_local_history.as_ref() == Some(&view) && state.open {
+        return Ok(());
+    }
+    if !state.local_history.contains(&view) {
+        state.local_history.push(view.clone());
+    }
+    state.active_local_history = Some(view);
+    state.open = true;
+    bump(ws);
+    Ok(())
+}
+pub fn close_local_history(
+    ws: &mut Workspace,
+    project_id: ProjectId,
+    view: &cide_ipc::local_history::LocalHistoryView,
+) -> Result<()> {
+    let state = &mut project_mut(ws, project_id)?.tool_window;
+    if !state.local_history.contains(view) {
+        return Ok(());
+    }
+    state.local_history.retain(|v| v != view);
+    if state.active_local_history.as_ref() == Some(view) {
+        state.active_local_history = state.local_history.last().cloned();
+    }
+    bump(ws);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cide_ipc::{ProjectId, Workspace};
+    #[test]
+    fn local_views_deduplicate_persist_identity_and_keep_git_activation_separate() {
+        let mut ws = crate::workspace::demo_workspace();
+        let project = *ws.projects.keys().next().unwrap();
+        let view = cide_ipc::local_history::LocalHistoryView {
+            root: cide_ipc::local_history::HistoryRootId("canonical-root".into()),
+            path: Some("src/file".into()),
+        };
+        open_local_history(&mut ws, project, view.clone()).unwrap();
+        let rev = ws.rev;
+        open_local_history(&mut ws, project, view.clone()).unwrap();
+        assert_eq!(ws.rev, rev);
+        assert_eq!(
+            ws.projects[&project].tool_window.local_history,
+            vec![view.clone()]
+        );
+        let restored: Workspace =
+            serde_json::from_slice(&serde_json::to_vec(&ws).unwrap()).unwrap();
+        assert_eq!(
+            restored.projects[&project].tool_window.active_local_history,
+            Some(view.clone())
+        );
+        activate(&mut ws, Some(project), None).unwrap();
+        assert!(
+            ws.projects[&project]
+                .tool_window
+                .active_local_history
+                .is_none()
+        );
+        assert_eq!(ws.projects[&project].tool_window.local_history.len(), 1);
+        close_local_history(&mut ws, project, &view).unwrap();
+        assert!(ws.projects[&project].tool_window.local_history.is_empty());
+    }
 
     /// The projectless shell's panel: [`Workspace::tool_window`], reached with `None`.
     ///

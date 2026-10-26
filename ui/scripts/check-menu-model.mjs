@@ -263,10 +263,11 @@ try {
         'detach',
         '--',
         'copy-path',
+        'local-history',
         'history',
         'properties',
       ],
-      'the workspace tab menu is the nine items, in three groups, with left before right',
+      'the workspace tab menu includes Local History beside Git history, with left before right',
     )
     item(entries, 'close-right').run()
     eq(bulk.calls, [['t2']], 'Close to the right closes only what follows this tab, in one call')

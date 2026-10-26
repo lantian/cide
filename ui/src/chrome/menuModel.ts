@@ -227,6 +227,7 @@ export interface TabActions {
    * Absent in a window with no tool window, which is every detached-pane window.
    */
   history?: ((path: string) => void) | undefined
+  localHistory?: ((path: string) => void) | undefined
   /**
    * *Properties* — raises the file properties card. (M70)
    *
@@ -304,7 +305,7 @@ export function tabMenuEntries(
   activeTab: TabId,
   actions: TabActions,
 ): MenuEntry[] {
-  const { close, closeMany, split, detach, copy, history, properties } = actions
+  const { close, closeMany, split, detach, copy, history, localHistory, properties } = actions
   const index = tabs.indexOf(tab)
   const others = tabs.filter((t) => t !== tab && closable(t))
   /*
@@ -387,6 +388,12 @@ export function tabMenuEntries(
         ? { run: () => copy(path) }
         : { disabledReason: path === null ? NOT_A_FILE : NO_CLIPBOARD }),
     },
+    ...(absolute === null ? [] : [{
+      id: 'local-history', label: 'Local History', submenu: () => [{
+        id: 'show-local-history', label: 'Show History', command: 'local-history.file',
+        ...(localHistory ? { run: () => localHistory(absolute) } : { disabledReason: NO_HOST }),
+      }],
+    }]),
     {
       // Carries the command id, so the row draws whatever chord the live keymap has for it —
       // nothing today, which is correct: this is the same *act* as the palette row, unlike

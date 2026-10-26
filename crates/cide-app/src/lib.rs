@@ -496,6 +496,8 @@ pub fn run() {
             cmd::local_history::local_history_set_policy,
             cmd::local_history::local_history_clear,
             cmd::local_history::local_history_restore,
+            cmd::local_history::local_history_open_view,
+            cmd::local_history::local_history_close_view,
             cmd::gitlab::gitlab_request,
             cmd::gitlab::gitlab_open_document,
             cmd::gitlab::gitlab_review_launch,
