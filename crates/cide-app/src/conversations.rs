@@ -93,21 +93,63 @@ pub(crate) fn live(app: &AppHandle, record: &SessionRecord) -> Option<SessionId>
         .or_else(|| registry.ids().into_iter().find(|s| matches(*s)))
 }
 
-/// Only a user message in the saved conversation proves a later answer reached it.
-/// The same id appearing in a tool call/result is not a submission receipt.
+/// Reconcile an answer against its original conversation. A resumed user message
+/// or matching model-context tool output is a receipt; a UI-only tool event is not.
 pub(crate) fn received_answer(
     app: &AppHandle,
     project: ProjectId,
     record: &SessionRecord,
     marker: &str,
-) -> bool {
+    request: &cide_ipc::UserRequest,
+    turns: &std::collections::BTreeSet<Option<String>>,
+) -> cide_core::Result<bool> {
     let Some(sessions) = crate::sessions_state::handle(app) else {
-        return false;
+        return Err(cide_core::CoreError::Io(
+            "The conversation journal is unavailable.".into(),
+        ));
     };
     let cache = cache(&sessions.conversations, project, &record.id);
     let mut cache = cache.lock();
     refresh(app, project, record, &mut cache, None);
-    transcript_has_answer(transcript(&cache, record.harness), marker)
+    if !cache.available && !turns.is_empty() {
+        return Err(cide_core::CoreError::Io("The answer is saved; its tool receipt cannot yet be checked in the original transcript.".into()));
+    }
+    let transcript = transcript(&cache, record.harness);
+    let received = transcript_has_answer(transcript, marker)
+        || (record.harness == Harness::Codex && transcript.received_tool_answer(request, turns));
+    // Native readiness may arrive before the rollout writer flushes. Absence of
+    // a result is evidence only once that same transcript records the turn end.
+    if !received && !turns.is_empty() && !transcript.tool_reply_turns_finished(turns) {
+        return Err(cide_core::CoreError::Io(
+            "The answer is saved. Waiting for the original turn's transcript to confirm delivery."
+                .into(),
+        ));
+    }
+    Ok(received)
+}
+
+/// Capture the asking turn before blocking. A later result read can belong to a
+/// new turn in the same conversation; both must be correlated independently.
+pub(crate) fn request_turn(
+    app: &AppHandle,
+    project: ProjectId,
+    record: &SessionRecord,
+) -> Option<String> {
+    if record.harness != Harness::Codex {
+        return None;
+    }
+    if let Some(turn) = record.session.and_then(|session| {
+        app.try_state::<crate::peer_chat::Runtime>()?
+            .codex_console(session)?
+            .turn(&record.id)
+    }) {
+        return Some(turn);
+    }
+    let sessions = crate::sessions_state::handle(app)?;
+    let cache = cache(&sessions.conversations, project, &record.id);
+    let mut cache = cache.lock();
+    refresh(app, project, record, &mut cache, None);
+    cache.jsonl.transcript.codex_turn.clone()
 }
 
 fn transcript_has_answer(transcript: &Transcript, marker: &str) -> bool {

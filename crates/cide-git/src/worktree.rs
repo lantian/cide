@@ -1163,6 +1163,10 @@ mod tests {
     fn project(tag: &str) -> PathBuf {
         let root = scratch(tag);
         git(&root, &["init", "-q", "-b", "main"]);
+        // Keep fixture creation under the test's control: detached maintenance can prune
+        // a worktree's admin directory before libgit2 finishes writing its registration.
+        git(&root, &["config", "gc.auto", "0"]);
+        git(&root, &["config", "maintenance.auto", "false"]);
         git(&root, &["config", "user.name", "cide tests"]);
         git(&root, &["config", "user.email", "tests@cide.invalid"]);
         git(&root, &["config", "core.autocrlf", "false"]);

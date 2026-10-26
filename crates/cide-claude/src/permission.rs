@@ -1,7 +1,7 @@
 //! What a permission prompt is offering, read off the screen. (M72)
 //!
-//! cide has modelled a permission prompt as **one boolean** since M5: [`is_permission_request`]
-//! matches three substrings in a `Notification` hook's message, the session moves to
+//! cide models a permission prompt as **one boolean**: [`is_permission_request`] classifies
+//! a `Notification` hook by its type, or legacy message text, and the session moves to
 //! `AwaitingPermission`, and that is the whole of what anybody knows. A person at the keyboard
 //! needs no more, because the options are on the screen in front of them. A person on a phone
 //! needs the options as *data*, or the feature is a picture of a question with a keyboard under

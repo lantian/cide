@@ -116,7 +116,8 @@ pub(crate) async fn query_project(
         if !libraries {
             let mut frame = matcher.frame(limit);
             frame.running |= indexing;
-            return frame;
+            frame.incomplete = fs.incomplete();
+            return current_frame(&fs, frame);
         }
 
         // Read before both frames, for the reason spelled out above: a flag read afterwards can
@@ -135,9 +136,21 @@ pub(crate) async fn query_project(
             limit,
         );
         frame.running |= indexing || walking;
-        frame
+        frame.incomplete = fs.incomplete();
+        current_frame(&fs, frame)
     })
     .await
+}
+
+fn current_frame(fs: &crate::files::ProjectFs, mut frame: PickerFrame) -> PickerFrame {
+    if fs.budget.cancelled() {
+        frame.items.clear();
+        frame.matched = 0;
+        frame.total = 0;
+        frame.running = false;
+        frame.incomplete = true;
+    }
+    frame
 }
 
 /// Rank a list the caller supplies — the command palette, and anything else with a fixed,

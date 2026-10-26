@@ -131,7 +131,7 @@ pub async fn symbol_query(
 ) -> Result<SymbolFrame> {
     let fs = registry.get(project).ok_or(SymbolError::NotIndexed)?;
     blocking(move || {
-        if !fs.symbols_started() {
+        if fs.budget.cancelled() || !fs.symbols_started() {
             return Err(SymbolError::NotIndexed);
         }
         let limit = limit
@@ -162,13 +162,16 @@ pub async fn symbol_query(
             .take(limit as usize)
             .collect();
 
+        if fs.budget.cancelled() {
+            return Err(SymbolError::NotIndexed);
+        }
         Ok(SymbolFrame {
             items,
             matched: raw.matched,
             total: raw.total,
             running: raw.running || indexing,
             query: raw.query,
-            truncated: store.truncated,
+            truncated: store.truncated || fs.incomplete(),
         })
     })
     .await

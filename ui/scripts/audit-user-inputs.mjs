@@ -29,32 +29,42 @@ import { followUserInputs } from '@/terminal/userInputNavigation';
 import { useTerminalFind } from '@/terminal/findStore';
 import { Recap } from '@/kit/components/Recap';
 import { UserInputRecap, useUserInputs } from '@/panes/UserInputRecap';
+import { expandInput, recapKey } from '@/panes/recapStore';
 import { sessionJournal } from '@/ipc/client';
 import { useWorkspace } from '@/store/workspace';
 import { getHost, openTerminal, destroyHost } from '@/layout/paneHosts';
 import '@/styles/tokens.css'; import '@/styles/fonts.css';
 document.body.style.background='var(--panel)';
 let handle, painter;
-function Fixture() { const [expanded, setExpanded]=React.useState(false); const [text,setText]=React.useState('Привет мир\\nПроверь перенос панели, поиск и тему.\\n\\nИстория относится к разговору.');window.recapText=setText;return <div id="fixture" style={{height:480,width:800,display:'flex',flexDirection:'column'}}>
-<Recap text={text} ordinal={2} total={2} expanded={expanded} onFirst={()=>{}} onPrevious={()=>{}} onNext={()=>{}} onLatest={()=>{}} onExpand={()=>setExpanded(!expanded)}/>
+function Fixture() { const [expanded, setExpanded]=React.useState(false); const [status,setStatus]=React.useState();const [text,setText]=React.useState('Привет мир\\nПроверь перенос панели, поиск и тему.\\n\\nИстория относится к разговору.');window.recapText=setText;window.recapStatus=setStatus;return <div id="fixture" style={{height:480,width:800,display:'flex',flexDirection:'column'}}>
+<Recap text={text} ordinal={2} total={2} expanded={expanded} status={status} onFirst={()=>{}} onPrevious={()=>{}} onNext={()=>{}} onLatest={()=>{}} onExpand={()=>setExpanded(!expanded)}/>
 <div id="terminal" style={{flex:1,minHeight:0}}/></div>; }
 const root = createRoot(document.getElementById('root'));
 root.render(<Fixture/>);
 const inputPage = ${JSON.stringify(inputPage)};
 const resumedPage = {inputs:[{id:'resumed-1',ordinal:1,text:'Prompt from the resumed conversation'}],total:1,hasPrevious:false,available:true,generation:0};
+const boundaryPage = {inputs:[
+ {id:'boundary-1',ordinal:1,text:'macos CI failed:\\nDiagnostic message\\nThird line'},
+ {id:'boundary-2',ordinal:2,text:'Implement the plan.'},
+ {id:'boundary-3',ordinal:3,text:'Why only change the test?'},
+],total:3,hasPrevious:false,available:true,generation:0};
 const transcriptPane = {id:'transcript-pane',kind:'claude',harness:'codex',session:'routing-id',conversation:'actual-thread'};
-sessionJournal.userInputs=async(project,id)=>{if(project!=='transcript-project'||!['actual-thread','resumed-thread'].includes(id))throw new Error('wrong conversation identity');return id==='actual-thread'?inputPage:resumedPage;};
+sessionJournal.userInputs=async(project,id)=>{if(project!=='transcript-project')throw new Error('wrong project identity');if(id.startsWith('boundary-'))return boundaryPage;if(!['actual-thread','resumed-thread'].includes(id))throw new Error('wrong conversation identity');return id==='actual-thread'?inputPage:resumedPage;};
 sessionJournal.onUserInputsChanged=async()=>()=>{};
 const transcriptText=page=>page.inputs.map(input=>'› '+input.text.replaceAll('\\n','\\r\\n  ')+'\\r\\n\\r\\n• Response\\r\\n\\r\\n').join('')+'› draft';
-function TranscriptFixture({renderer}) {
+function TranscriptFixture({renderer,conversationId='actual-thread'}) {
  const slot=React.useRef(null);
- const [conversation,setConversation]=React.useState('actual-thread');window.resumeConversation=setConversation;
+ const [conversation,setConversation]=React.useState(conversationId);window.resumeConversation=setConversation;
  React.useEffect(()=>{
   const host=getHost(transcriptPane.id);slot.current.appendChild(host.el);
   handle=openTerminal(transcriptPane.id,'claude');handle.fit.fit();
   if(renderer==='webgl')promoteWebgl(handle);else releaseWebgl(handle);
-  handle.term.write(transcriptText(inputPage));
-  return()=>destroyHost(transcriptPane.id);
+  handle.term.write(transcriptText(conversationId.startsWith('boundary-')?boundaryPage:inputPage));
+  // Production PaneSlot refits on every layout change. A one-time fit hides recap/viewport
+  // feedback: changing the prompt used to change its height and cross the boundary again.
+  const terminal=handle;
+  const observer=new ResizeObserver(()=>terminal.fit.fit());observer.observe(slot.current);
+  return()=>{observer.disconnect();destroyHost(transcriptPane.id);};
  },[]);
  const feature=useUserInputs({...transcriptPane,conversation},'transcript-project');
  return <div data-kind="claude" style={{height:480,width:800,display:'flex',flexDirection:'column'}}>
@@ -120,12 +130,86 @@ window.altNavigationProbe=async()=>{
  const movedForward=await nav.reveal(3),atThird=offset;
  const rect=terminal.element.querySelector('.xterm-screen').getBoundingClientRect();
  const wheel=delta=>terminal.element.querySelector('.xterm-screen').dispatchEvent(new WheelEvent('wheel',{deltaY:delta,clientX:rect.left+rect.width/2,clientY:rect.top+rect.height/2,bubbles:true,cancelable:true,view:window}));
- wheel(-60);await new Promise(r=>setTimeout(r,90));const context=followed.at(-1);
+ // Keep the third prompt and its answer inside the resized grid after the wheel step;
+ // an anchor-free screen intentionally cannot report a reliable context.
+ offset=48;await draw();
+ wheel(-1);await new Promise(r=>setTimeout(r,90));const context=followed.at(-1);
  const pending=nav.reveal(1);terminal.element.dispatchEvent(new KeyboardEvent('keydown',{key:'Shift',bubbles:true}));const cancelled=await pending;
  stopped=true;await new Promise(r=>terminal.write('\\x1b[?1000l\\x1b[2J\\x1b[Hno retained prompt\\x1b['+terminal.rows+';1H› draft',r));
  const count=outbound.length,unsupported=await nav.reveal(2),noTypedKeys=outbound.length===count;
  nav.dispose();writer.dispose();terminal.reset();await new Promise(r=>terminal.write(transcriptText(inputPage),r));await new Promise(r=>setTimeout(r,90));
  return {moved,atFirst,movedForward,atThird,encoded,reports:count,context,cancelled,unsupported,noTypedKeys};
+};
+window.boundaryProbe=async(renderer,alt)=>{
+ const id='boundary-'+renderer+'-'+alt;
+ root.render(<TranscriptFixture key={id} renderer={renderer} conversationId={id}/>);
+ await new Promise(r=>setTimeout(r,650));
+ await document.fonts.ready;
+ const terminal=handle.term,frame=terminal.element.closest('[data-kind]'),key=recapKey('transcript-project',id);
+ // Refresh metrics after font loading before placing a prompt exactly on a row boundary.
+ terminal.resize(terminal.cols-1,terminal.rows);handle.fit.fit();
+ const history=boundaryPage.inputs.flatMap(input=>[
+  ...('› '+input.text.replaceAll('\\n','\\n  ')).split('\\n'),'• Response',
+  ...Array.from({length:14},(_,i)=>'output '+input.ordinal+' '+i),
+ ]);
+ history.push(...Array.from({length:40},(_,i)=>'last response '+i));
+ const boundary=history.indexOf('› Implement the plan.');
+ const tick=()=>new Promise(r=>requestAnimationFrame(r));
+ const settle=async()=>{for(let i=0;i<8;i++)await tick();};
+ let offset=boundary,oldRows=terminal.rows,resizeCount=0;
+ const draw=()=>new Promise(r=>terminal.write('\\x1b[?1049h\\x1b[2J\\x1b[H'+
+  history.slice(offset,offset+terminal.rows-1).join('\\r\\n')+'\\x1b['+terminal.rows+';1H› draft',r));
+ terminal.reset();
+ if(alt)await draw();else await new Promise(r=>terminal.write(history.join('\\r\\n')+'\\r\\n› draft',r));
+ const resizer=terminal.onResize(()=>{
+  resizeCount++;
+  if(alt){
+   // Model a fullscreen CLI preserving its bottom row when SIGWINCH changes the grid.
+   offset=Math.max(0,Math.min(history.length-1,offset+oldRows-terminal.rows));
+   void draw();
+  }
+  oldRows=terminal.rows;
+ });
+ const snapshot=()=>({
+  selected:document.querySelector('[aria-label="User input recap"] [aria-live="polite"]').textContent,
+  height:document.querySelector('[aria-label="User input recap"]').getBoundingClientRect().height,
+  rows:terminal.rows,top:terminal.buffer.active.viewportY,offset:alt?offset:null,
+ });
+ const locate=async(delta)=>{
+  if(alt){
+   offset=boundary+delta;await draw();
+   terminal.element.dispatchEvent(new WheelEvent('wheel',{deltaY:delta?40:-40,bubbles:true}));
+   return 0;
+  }else{
+   let row=0;while(row<terminal.buffer.active.length&&!terminal.buffer.active.getLine(row)?.translateToString(true).startsWith('› Implement the plan.'))row++;
+   terminal.scrollToLine(row+delta);
+   return row+delta;
+  }
+ };
+ const cases=[];
+ try{
+  for(const [expanded,width,height,scale] of [
+   [false,1000,650,1],[true,1000,650,1],[true,320,480,1],[false,320,480,1],
+   [false,1000,900,1],[false,1000,650,1],[false,1000,650,1.25],[false,1000,200,1],
+  ]){
+   frame.style.width=width+'px';frame.style.height=height+'px';
+   document.documentElement.style.setProperty('--ui-scale',String(scale));
+   expandInput(key,expanded);await settle();
+   // Let xterm reconcile its DOM scrollbar after the external resize before positioning
+   // the exact boundary. Start from the latest (short) recap, as in the reported loop.
+   if(!alt){terminal.scrollToBottom();await settle();}
+   const before=snapshot(),resizes=resizeCount;
+   const target=await locate(0);await tick();await tick();
+   const samples=[];
+   for(let i=0;i<24;i++){await tick();samples.push(snapshot());}
+   await locate(1);await settle();
+   cases.push({expanded,width,height,scale,before,target,samples,after:snapshot(),resizes:resizeCount-resizes,
+    collapse:!!document.querySelector('[aria-label="Collapse input"]'),stableTerminal:terminal===handle.term});
+  }
+ }finally{
+  resizer.dispose();document.documentElement.style.removeProperty('--ui-scale');
+ }
+ return cases;
 };
 window.probe = async (theme, renderer, harness, alt) => {
  painter?.dispose(); handle?.dispose(); document.getElementById('terminal').replaceChildren();
@@ -293,13 +377,35 @@ try {
  }
  // Native layout decides whether disclosure has anything to show. Test both explicit lines
  // and width-dependent wrapping, plus the collapse control while full text is open.
+ const recapHeight=()=>evaluate('document.querySelector("[aria-label=\'User input recap\']").getBoundingClientRect().height');
+ const collapsedHeight=await recapHeight();
  assert(await evaluate("!!document.querySelector('[aria-label=\\\"Expand input\\\"]')"));
  await evaluate("document.querySelector('[aria-label=\\\"Expand input\\\"]').click()");
  await new Promise(r=>setTimeout(r,100));
  assert(await evaluate("!!document.querySelector('[aria-label=\\\"Collapse input\\\"]')"));
- await evaluate("document.querySelector('[aria-label=\\\"Collapse input\\\"]').click();window.recapText('short prompt')");
+ const expandedHeight=await recapHeight();
+ assert(Math.abs(expandedHeight-160)<1,'expanded recap occupies one third of its 480px pane');
+ await evaluate("window.recapText(Array(40).fill('Long input line').join(String.fromCharCode(10)))");
+ await new Promise(r=>setTimeout(r,100));
+ assert.equal(await recapHeight(),expandedHeight,'long content scrolls within the fixed expanded area');
+ assert(await evaluate("(()=>{const content=document.querySelector('[aria-label=\\\"User input recap\\\"]').lastElementChild;content.scrollTop=100;return content.scrollTop>0})()"),'expanded text remains scrollable');
+ await evaluate("window.recapText('short prompt')");
+ await new Promise(r=>setTimeout(r,100));
+ assert.equal(await recapHeight(),expandedHeight,'short content must retain expanded geometry');
+ assert(await evaluate("!!document.querySelector('[aria-label=\\\"Collapse input\\\"]')"));
+ await evaluate("window.recapStatus('Loading inputs…')");
+ await new Promise(r=>setTimeout(r,100));
+ assert.equal(await recapHeight(),expandedHeight,'status text must retain expanded geometry');
+ await evaluate("document.querySelector('[aria-label=\\\"Collapse input\\\"]').click()");
+ await new Promise(r=>setTimeout(r,100));
+ assert.equal(await recapHeight(),collapsedHeight,'collapsed status reserves two lines');
+ await evaluate("window.recapStatus(undefined)");
  await new Promise(r=>setTimeout(r,100));
  assert(await evaluate("!document.querySelector('[aria-expanded]')"),'short text has no disclosure icon');
+ assert.equal(await recapHeight(),collapsedHeight,'short content reserves two lines');
+ await evaluate("window.recapText('')");
+ await new Promise(r=>setTimeout(r,100));
+ assert.equal(await recapHeight(),collapsedHeight,'empty content reserves two lines');
  await evaluate("window.recapText('wrap '.repeat(20));document.getElementById('fixture').style.width='260px'");
  await new Promise(r=>setTimeout(r,100));
  assert(await evaluate("!!document.querySelector('[aria-label=\\\"Expand input\\\"]')"),'wrapping shows disclosure');
@@ -332,5 +438,23 @@ try {
   assert(altNavigation.encoded);assert(altNavigation.reports>0);assert.equal(altNavigation.context,2);
   assert.equal(altNavigation.cancelled,'cancelled');assert.equal(altNavigation.unsupported,'unsupported');assert(altNavigation.noTypedKeys);
  }
- assert.equal(errors.length,0,JSON.stringify(errors));console.log('browser: 16 theme/renderer/harness/buffer cases, 4 Rust-transcript feature/resume cases, and 8 normal/alternate navigation cases passed')
+ for(const renderer of ['dom','webgl'])for(const alt of [false,true]){
+  const cases=await evaluate('window.boundaryProbe('+JSON.stringify(renderer)+','+alt+')');
+  writeFileSync(join(dir,'boundary-'+renderer+'-'+alt+'.json'),JSON.stringify(cases,null,2));
+  for(const result of cases){
+   const context=JSON.stringify({renderer,alt,expanded:result.expanded,width:result.width,height:result.height,scale:result.scale});
+   assert.equal(result.samples[0].selected,'1 / 3',context);
+   assert.equal(result.samples[0].top,result.target,'the input must sit exactly at the viewport boundary: '+context);
+   for(const sample of result.samples)assert.deepEqual(sample,result.samples[0],'idle selection and viewport must stay still: '+context);
+   assert.equal(result.after.selected,'2 / 3','following must still react to a subsequent scroll: '+context);
+   assert.equal(result.before.height,result.after.height,'prompt changes must not resize the recap: '+context);
+   assert.equal(result.before.rows,result.after.rows,context);
+   assert.equal(result.resizes,0,'following a prompt must not resize the terminal: '+context);
+   assert.equal(result.collapse,result.expanded,'short content must keep Collapse available: '+context);
+   assert(result.stableTerminal,context);
+   assert(result.after.height<=result.height/3+1,'small panes retain the height cap: '+context);
+  }
+  console.log('recap stability',renderer,alt?'alternate':'normal',cases.length,'layouts passed');
+ }
+ assert.equal(errors.length,0,JSON.stringify(errors));console.log('browser: 16 theme/renderer/harness/buffer cases, 4 Rust-transcript feature/resume cases, 8 normal/alternate navigation cases and 32 recap stability cases passed')
 }finally{ws?.close();child.kill();await new Promise(r=>server.httpServer.close(r))}

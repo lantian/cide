@@ -17,6 +17,8 @@ pub(super) struct Session {
 }
 
 struct Run {
+    budget: Mutex<Option<std::sync::Weak<cide_fs::budget::Budget>>>,
+    incomplete: AtomicBool,
     stop: AtomicBool,
     file_running: AtomicBool,
     symbol_running: AtomicBool,
@@ -29,6 +31,8 @@ struct Run {
 impl Run {
     fn new(descriptor: &SearchDescriptor) -> Self {
         Self {
+            budget: Mutex::new(None),
+            incomplete: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             file_running: AtomicBool::new(matches!(
                 descriptor.source,
@@ -70,6 +74,22 @@ impl Session {
         let (generation, run) = self.run.lock().clone();
         let mut summary = self.summary();
         summary.generation = generation;
+        if run
+            .budget
+            .lock()
+            .as_ref()
+            .is_some_and(|weak| weak.upgrade().is_none_or(|budget| budget.cancelled()))
+        {
+            return SearchSessionFrame {
+                session: summary,
+                incomplete: true,
+                files: None,
+                symbols: None,
+                text: None,
+                running: false,
+                errors: vec!["Index changed. Refresh this search.".into()],
+            };
+        }
         let text = matches!(
             self.descriptor.source,
             SearchSource::All | SearchSource::Text
@@ -79,6 +99,7 @@ impl Session {
             || run.symbol_running.load(Ordering::Acquire)
             || text.as_ref().is_some_and(|frame| frame.running);
         SearchSessionFrame {
+            incomplete: run.incomplete.load(Ordering::Acquire),
             session: summary,
             files: run.files.lock().clone(),
             symbols: run.symbols.lock().clone(),
@@ -206,7 +227,9 @@ impl SearchRegistry {
 }
 
 fn launch(descriptor: &SearchDescriptor, run: Arc<Run>, fs: Arc<ProjectFs>) {
-    if run.stop.load(Ordering::Acquire) {
+    *run.budget.lock() = Some(Arc::downgrade(&fs.budget));
+    run.incomplete.fetch_or(fs.incomplete(), Ordering::AcqRel);
+    if run.stop.load(Ordering::Acquire) || fs.budget.cancelled() {
         return;
     }
     if run.file_running.load(Ordering::Acquire) {
@@ -219,7 +242,7 @@ fn launch(descriptor: &SearchDescriptor, run: Arc<Run>, fs: Arc<ProjectFs>) {
                 fs.index_libraries();
             }
             loop {
-                if run.stop.load(Ordering::Acquire) {
+                if run.stop.load(Ordering::Acquire) || fs.budget.cancelled() {
                     break;
                 }
                 // Read progress first: a walk finishing between progress and snapshot is
@@ -245,7 +268,9 @@ fn launch(descriptor: &SearchDescriptor, run: Arc<Run>, fs: Arc<ProjectFs>) {
                     }
                 };
                 frame.running = indexing;
-                if run.stop.load(Ordering::Acquire) {
+                frame.incomplete = fs.incomplete();
+                run.incomplete.fetch_or(fs.incomplete(), Ordering::AcqRel);
+                if run.stop.load(Ordering::Acquire) || fs.budget.cancelled() {
                     break;
                 }
                 *run.files.lock() = Some(frame);
@@ -263,12 +288,13 @@ fn launch(descriptor: &SearchDescriptor, run: Arc<Run>, fs: Arc<ProjectFs>) {
         let query = descriptor.query.pattern.clone();
         tauri::async_runtime::spawn_blocking(move || {
             fs.index_symbols();
+            run.incomplete.fetch_or(fs.incomplete(), Ordering::AcqRel);
             loop {
-                if run.stop.load(Ordering::Acquire) {
+                if run.stop.load(Ordering::Acquire) || fs.budget.cancelled() {
                     break;
                 }
                 let indexing = fs.is_symbol_indexing();
-                let candidates = fs.symbol_store().read().candidates();
+                let candidates = fs.symbol_matcher().candidates();
                 let raw = cide_search::rank(&query, &candidates, cide_search::MAX_FRAME);
                 let store = fs.symbol_store().read();
                 let items = raw
@@ -282,10 +308,10 @@ fn launch(descriptor: &SearchDescriptor, run: Arc<Run>, fs: Arc<ProjectFs>) {
                     total: raw.total,
                     running: indexing,
                     query: raw.query,
-                    truncated: store.truncated,
+                    truncated: store.truncated || fs.incomplete(),
                 };
                 drop(store);
-                if run.stop.load(Ordering::Acquire) {
+                if run.stop.load(Ordering::Acquire) || fs.budget.cancelled() {
                     break;
                 }
                 *run.symbols.lock() = Some(frame);
@@ -314,7 +340,14 @@ fn launch(descriptor: &SearchDescriptor, run: Arc<Run>, fs: Arc<ProjectFs>) {
                 })
                 .collect::<Vec<_>>();
             match plan(&job.query, &roots) {
-                Ok(plan) => job.walk(roots, fs.filter(), plan.regex, plan.scope, plan.include),
+                Ok(plan) => job.walk(
+                    roots,
+                    fs.filter(),
+                    plan.regex,
+                    plan.scope,
+                    plan.include,
+                    Some(&fs),
+                ),
                 Err(problem) => {
                     job.found.lock().error = Some(problem);
                     job.running.store(false, Ordering::Release);
@@ -608,5 +641,45 @@ mod tests {
                 }
             });
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ignored_and_external_sources_share_all_three_search_providers() {
+        let dir = cide_fs::testing::scratch("catalog-ignored");
+        let external = cide_fs::testing::scratch("catalog-external");
+        std::fs::write(dir.join(".gitignore"), ".cache/\n").unwrap();
+        std::fs::create_dir(dir.join(".cache")).unwrap();
+        std::fs::write(dir.join(".cache/needle.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(external.join("needle.rs"), "fn needle() {}\n").unwrap();
+        std::os::unix::fs::symlink(external.path(), dir.join(".cache/drive")).unwrap();
+        let project = ProjectId::new();
+        let files = FsRegistry::default();
+        files
+            .claim(
+                project,
+                vec![dir.to_path_buf()],
+                cide_fs::Visibility {
+                    hidden: true,
+                    ignored: true,
+                },
+            )
+            .unwrap()
+            .run(Arc::new(QuietEvents), project);
+        let registry = SearchRegistry::default();
+        let mut query = descriptor("needle");
+        query.source = SearchSource::All;
+        let session = registry.create_session(project, "main".into(), query);
+        launch(
+            &session.descriptor,
+            session.run.lock().1.clone(),
+            files.get(project).unwrap(),
+        );
+        let frame = settled(&session).await;
+        assert_eq!(frame.files.unwrap().items.len(), 2);
+        assert_eq!(frame.symbols.unwrap().items.len(), 2);
+        assert_eq!(frame.text.unwrap().hits.len(), 2);
+        assert!(!frame.incomplete);
+        registry.cancel(project);
+        files.close_all();
     }
 }

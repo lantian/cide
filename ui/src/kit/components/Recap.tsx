@@ -46,21 +46,21 @@ export function Recap({ text, ordinal, total, expanded, status, busy,
     document.fonts?.addEventListener('loadingdone', measure)
     return () => { observer.disconnect(); document.fonts?.removeEventListener('loadingdone', measure) }
   }, [text, status])
-  const showExpanded = expanded && overflows
+  // Expansion is explicit: following shorter text must not change terminal geometry.
   const revealable = !!onReveal && !busy && status === undefined && total > 0
   return (
-    <section className={styles.recap} aria-label="User input recap">
+    <section className={[styles.recap, expanded ? styles.expanded : ''].filter(Boolean).join(' ')} aria-label="User input recap">
       <div className={styles.tools}>
         <IconButton icon="chevron-first" label="First input" disabled={busy || ordinal <= 1} onClick={onFirst} />
         <IconButton icon="chevron-left" label="Previous input" disabled={busy || ordinal <= 1} onClick={onPrevious} />
         <IconButton icon="chevron-right" label="Next input" disabled={busy || ordinal >= total} onClick={onNext} />
         <IconButton icon="chevron-last" label="Latest input" disabled={busy || ordinal >= total} onClick={onLatest} />
         <span className={styles.counter} aria-live="polite">{ordinal} / {total}</span>
-        {overflows && total > 0 && <IconButton icon={showExpanded ? 'chevron-up' : 'chevron-down'} label={showExpanded ? 'Collapse input' : 'Expand input'}
-          aria-expanded={showExpanded} onClick={onExpand} />}
+        {(expanded || (overflows && total > 0)) && <IconButton icon={expanded ? 'chevron-up' : 'chevron-down'} label={expanded ? 'Collapse input' : 'Expand input'}
+          aria-expanded={expanded} onClick={onExpand} />}
       </div>
-      <div ref={content} className={[showExpanded ? styles.full : styles.preview, revealable ? styles.reveal : ''].filter(Boolean).join(' ')}
-        role={revealable ? 'button' : undefined} tabIndex={revealable || showExpanded ? 0 : undefined}
+      <div ref={content} className={[expanded ? styles.full : styles.preview, revealable ? styles.reveal : ''].filter(Boolean).join(' ')}
+        role={revealable ? 'button' : undefined} tabIndex={revealable || expanded ? 0 : undefined}
         aria-label={revealable ? 'Show input in console' : undefined} title={revealable ? 'Show input in console' : undefined}
         onClick={() => {
           if (!revealable) return

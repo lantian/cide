@@ -655,6 +655,14 @@ pub enum TabKind {
         path: PathBuf,
         dirty: bool,
     },
+    /// An editable view of a live file against a process-local clipboard snapshot.
+    /// Only the identifier is durable; startup turns these into ordinary file tabs.
+    ClipboardDiff {
+        #[ts(type = "string")]
+        path: PathBuf,
+        snapshot_id: String,
+        dirty: bool,
+    },
     Diff {
         spec: DiffSpec,
         /// A **preview** tab: the one slot a single click in the git panel is allowed to
@@ -905,6 +913,12 @@ impl TabKind {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            Self::ClipboardDiff { path, .. } => format!(
+                "{} vs Clipboard",
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+            ),
             Self::Diff { spec, .. } => spec.title.clone(),
             Self::Revision { title, .. } => title.clone(),
             Self::Merge { path, .. } => format!(

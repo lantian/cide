@@ -197,7 +197,7 @@ export function SearchEverywhere({ project, commands, context, keymap, actions, 
         </div>}
         <ResultsView project={project} layout={layout} id={id} items={items} mode={mode} running={starting || currentFrame?.running === true} error={status} onOpen={open} onMode={setMode} selectedRef={selected} />
         <div className={styles.footer} aria-live="polite">
-          <span>{starting || currentFrame?.running ? 'Searching…' : `${total.toLocaleString()} results`}{truncated ? ' · Result limit reached' : ''}</span>
+          <span>{starting || currentFrame?.running ? 'Searching…' : `${total.toLocaleString()} results`}{truncated ? ' · Result limit reached' : ''}{currentFrame?.incomplete ? ' · Index incomplete — Refresh for latest coverage' : ''}</span>
           <span>↑/↓ / PgUp / PgDn Preview · ←/→ Groups · Shift+←/→ Mode · Enter Open · {mode === 'actions' ? 'Ctrl+Enter New session' : 'Ctrl+Enter Pin'} · Esc Close</span>
         </div>
       </div>

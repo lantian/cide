@@ -286,6 +286,7 @@ pub fn load_report(path: &Path) -> Loaded {
             // path is stored. A restored tab is showing the file as it is on disk, so the
             // flag has to start false or `close_tab` refuses it over edits that no longer
             // exist. See `workspace::clear_dirty_flags`.
+            crate::workspace::restore_clipboard_comparisons(workspace);
             crate::workspace::clear_dirty_flags(workspace);
             // `tab_mru` arrived after `Project` did and is `#[serde(default)]`, so every file
             // written before it reads back with an empty order — which `workspace::validate`

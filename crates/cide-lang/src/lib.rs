@@ -59,7 +59,7 @@ use std::path::Path;
 
 pub use error::SymbolError;
 pub use extract::{Limits, outline, outline_symbols};
-pub use walk::{Admits, WalkOutcome, WalkRoot, WalkedFile, walk_symbols};
+pub use walk::{Admits, WalkOutcome, WalkRoot, WalkedFile, catalog_symbols, walk_symbols};
 
 /// A language this crate can parse.
 ///

@@ -15,8 +15,13 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new(prompt_command: &str) -> Self {
+        Self::with_system_profile(prompt_command, "")
+    }
+
+    fn with_system_profile(prompt_command: &str, system_profile: &str) -> Self {
         let root = std::env::temp_dir().join(format!("cide bash history '{}", PaneId::new()));
         fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("system-profile"), system_profile).unwrap();
         fs::write(root.join(".bash_history"), "echo GLOBAL_HISTORY_SENTINEL\n").unwrap();
         fs::write(
             root.join(".bash_profile"),
@@ -46,7 +51,20 @@ impl Fixture {
     }
 
     fn history(&self, pane: PaneId) -> HistoryFiles {
-        shell_history::prepare_in(&self.0.join("state"), pane).unwrap()
+        let mut history = shell_history::prepare_in(&self.0.join("state"), pane).unwrap();
+        // Exercise the real initializer with a controlled system profile. A managed Mac's
+        // /etc/profile can enable timestamps and replace PROMPT_COMMAND, so a temporary HOME
+        // alone does not isolate the fixture. Replace only the profile path, keeping startup
+        // ordering and all history handling intact; production still loads /etc/profile.
+        let init = read(&history.init);
+        assert_eq!(init.matches("/etc/profile").count(), 2);
+        history.init = self.0.join("fixture-bash-init.sh");
+        fs::write(
+            &history.init,
+            init.replace("/etc/profile", "\"$HOME/system-profile\""),
+        )
+        .unwrap();
+        history
     }
 
     fn spec(&self, history: &HistoryFiles) -> SpawnSpec {
@@ -54,7 +72,8 @@ impl Fixture {
         let bash = std::env::var("CIDE_TEST_BASH").unwrap_or_else(|_| "/bin/bash".into());
         let mut spec = SpawnSpec::new(bash, &self.0)
             .env("HOME", self.0.to_string_lossy())
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            .env_remove("HISTTIMEFORMAT");
         for arg in shell_history::BASH_ARGS {
             spec = spec.arg(arg);
         }
@@ -266,6 +285,52 @@ fn bash_history_preserves_an_inherited_prompt_hook_from_the_first_prompt() {
     shell.command("false");
     assert_eq!(read(fixture.0.join("status")), "inherited=0\ninherited=1\n");
     assert_eq!(read(&history.history), "false\n");
+    shell.terminate();
+}
+
+#[test]
+fn bash_history_respects_a_system_profiles_prompt_override() {
+    let fixture = Fixture::with_system_profile(
+        "",
+        "export PROMPT_COMMAND='printf \"system=%s\\n\" \"$?\" >> \"$HOME/status\"'\n",
+    );
+    let history = fixture.history(PaneId::new());
+    let mut shell = fixture.spawn(&history);
+    assert_eq!(read(fixture.0.join("status")), "system=0\n");
+    shell.command("false");
+    assert_eq!(read(fixture.0.join("status")), "system=0\nsystem=1\n");
+    assert_eq!(read(&history.history), "false\n");
+    shell.terminate();
+}
+
+#[test]
+fn timestamped_history_with_an_append_hook_survives_a_prompt_and_restart() {
+    let fixture = Fixture::with_system_profile(
+        "",
+        "export HISTTIMEFORMAT='%F %T '\nexport PROMPT_COMMAND='history -a'\n",
+    );
+    let pane = PaneId::new();
+    let history = fixture.history(pane);
+    let mut shell = fixture.spawn(&history);
+    shell.command("echo FIRST");
+    shell.command("echo SECOND");
+    shell.command("echo THIRD");
+    let saved = read(&history.history);
+    let lines: Vec<_> = saved.lines().collect();
+    assert_eq!(lines.len(), 6, "{saved}");
+    for (entry, command) in lines
+        .chunks_exact(2)
+        .zip(["echo FIRST", "echo SECOND", "echo THIRD"])
+    {
+        assert!(entry[0].strip_prefix('#').unwrap().parse::<u64>().is_ok());
+        assert_eq!(entry[1], command);
+    }
+    shell.terminate();
+    assert_eq!(read(&history.history), saved);
+    let mut shell = fixture.spawn(&fixture.history(pane));
+    assert_eq!(read(&history.history), saved);
+    let recalled = shell.recall();
+    assert!(recalled.contains("\r\nTHIRD\r\n"), "{recalled}");
     shell.terminate();
 }
 

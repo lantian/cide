@@ -89,6 +89,8 @@ import {
   unfoldRecursive,
 } from './folding'
 import { sendLabel } from './sendToClaude'
+import { canCompareClipboard, compareToClipboard } from './compareClipboard'
+import { sharedHistory, sharedHistoryDepth } from './sharedDocuments'
 import { useSendToClaude } from './useSendToClaude'
 
 export interface CodeMenuOptions {
@@ -254,6 +256,10 @@ export function useCodeMenu({
       const needsSelection = hasSelection ? undefined : 'Select some text first'
 
       return [
+        ...(project && path.startsWith('/') && canCompareClipboard(path) ? [{
+          id: 'compareClipboard', label: 'Compare to Clipboard',
+          run: () => { void compareToClipboard(project, path) },
+        }, { kind: 'separator' as const }] : []),
         {
           id: 'undo',
           label: 'Undo',
@@ -272,11 +278,11 @@ export function useCodeMenu({
            */
           disabledReason: readOnly
             ? 'This buffer is read-only'
-            : undoDepth(live.state) === 0
+            : (sharedHistoryDepth(live, 'undo') ?? undoDepth(live.state)) === 0
               ? 'Nothing to undo yet'
               : undefined,
           run: () => {
-            undo(live)
+            if (sharedHistory(live, 'undo') === null) undo(live)
             // Focus, for the reason Cut and Copy do: the menu took it, and the next Ctrl+Z has
             // to reach the buffer rather than whatever the menu left behind.
             live.focus()
@@ -287,11 +293,11 @@ export function useCodeMenu({
           label: 'Redo',
           disabledReason: readOnly
             ? 'This buffer is read-only'
-            : redoDepth(live.state) === 0
+            : (sharedHistoryDepth(live, 'redo') ?? redoDepth(live.state)) === 0
               ? 'Nothing to redo'
               : undefined,
           run: () => {
-            redo(live)
+            if (sharedHistory(live, 'redo') === null) redo(live)
             live.focus()
           },
         },

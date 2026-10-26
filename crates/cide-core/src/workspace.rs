@@ -503,7 +503,7 @@ pub fn reinsert_tab(
 pub fn tab_outlives_close(kind: &TabKind) -> bool {
     match kind {
         TabKind::Diff { spec, .. } => !matches!(spec.origin, DiffOrigin::ClaudeMcp { .. }),
-        TabKind::Merge { .. } => false,
+        TabKind::Merge { .. } | TabKind::ClipboardDiff { .. } => false,
         // **False**, and it is the same argument `toolWindowModel.ts` makes about contributed
         // bottom tabs. An inspect tab is a view of a container that exists *now*; nothing
         // durable is in it, the document is re-read on every open, and a container is removed
@@ -675,7 +675,7 @@ fn adopt_layout(ws: &Workspace, mut project: Project) -> Option<Project> {
     }
 
     for tab in &mut project.tabs {
-        if let TabKind::File { dirty, .. } = &mut tab.kind {
+        if let TabKind::File { dirty, .. } | TabKind::ClipboardDiff { dirty, .. } = &mut tab.kind {
             *dirty = false;
         }
     }
@@ -739,7 +739,11 @@ pub fn unsaved_tabs(ws: &Workspace, only: Option<ProjectId>) -> Vec<UnsavedTab> 
             continue;
         }
         for t in &p.tabs {
-            if let Some(unsaved) = describe_unsaved(*id, p, t) {
+            if let Some(unsaved) = describe_unsaved(*id, p, t)
+                && !out
+                    .iter()
+                    .any(|u: &UnsavedTab| u.project == unsaved.project && u.path == unsaved.path)
+            {
                 out.push(unsaved);
             }
         }
@@ -763,7 +767,14 @@ pub fn unsaved_in_tab(
         .iter()
         .find(|t| t.id == tab)
         .ok_or(CoreError::NoSuchTab(tab))?;
-    Ok(describe_unsaved(project, p, t))
+    let unsaved = describe_unsaved(project, p, t);
+    Ok(unsaved.filter(|u| {
+        !p.tabs.iter().any(|other| {
+            other.id != tab
+                && matches!(&other.kind,
+            TabKind::File { path, .. } | TabKind::ClipboardDiff { path, .. } if path == &u.path)
+        })
+    }))
 }
 
 /// Close a tab, activating the tab to its left if it was the active one, and dropping any
@@ -1243,7 +1254,8 @@ pub fn retarget_paths(ws: &mut Workspace, moves: &[(PathBuf, PathBuf)]) {
         .iter()
         .flat_map(|(id, p)| {
             p.tabs.iter().filter_map(move |t| {
-                let TabKind::File { path, .. } = &t.kind else {
+                let (TabKind::File { path, .. } | TabKind::ClipboardDiff { path, .. }) = &t.kind
+                else {
                     return None;
                 };
                 let next = moves
@@ -1266,7 +1278,7 @@ pub fn retarget_paths(ws: &mut Workspace, moves: &[(PathBuf, PathBuf)]) {
         let Ok(t) = tab_mut(ws, project, tab) else {
             continue;
         };
-        if let TabKind::File { path, .. } = &mut t.kind {
+        if let TabKind::File { path, .. } | TabKind::ClipboardDiff { path, .. } = &mut t.kind {
             *path = next;
         }
         for pane in t.tree.panes.values_mut() {
@@ -2711,7 +2723,11 @@ fn validate_windows(ws: &Workspace) -> Result<()> {
 /// [`unsaved_in_tab`] cannot answer differently about the same tab — which they would
 /// eventually, as one of them grew a case the other did not.
 fn describe_unsaved(id: ProjectId, p: &Project, t: &Tab) -> Option<UnsavedTab> {
-    let TabKind::File { path, dirty: true } = &t.kind else {
+    let (TabKind::File { path, dirty: true }
+    | TabKind::ClipboardDiff {
+        path, dirty: true, ..
+    }) = &t.kind
+    else {
         return None;
     };
     Some(UnsavedTab {
@@ -2933,6 +2949,85 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         docker: None,
         origin: None,
     }
+}
+
+/// Clipboard snapshots are process-local. Restore their file views so recovery can restore
+/// unsaved text, deduplicating plain editors while keeping tabs with auxiliary sessions.
+pub fn restore_clipboard_comparisons(ws: &mut Workspace) {
+    let detached: std::collections::HashSet<_> = ws
+        .windows
+        .values()
+        .filter_map(|w| match w {
+            WindowRole::DetachedPane { tab, .. } => Some(*tab),
+            _ => None,
+        })
+        .collect();
+    for p in ws.projects.values_mut() {
+        if !p
+            .tabs
+            .iter()
+            .any(|t| matches!(t.kind, TabKind::ClipboardDiff { .. }))
+        {
+            continue;
+        }
+        let mut files: std::collections::HashMap<PathBuf, TabId> = p
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::File { path, .. } => Some((path.clone(), t.id)),
+                _ => None,
+            })
+            .collect();
+        let mut replacements = std::collections::HashMap::new();
+        p.tabs.retain_mut(|t| {
+            if let TabKind::ClipboardDiff { path, .. } = &t.kind {
+                // A comparison may also contain terminals. Keep those views and their
+                // detached panes; only a redundant, plain editor can be dropped.
+                if files.contains_key(path)
+                    && !detached.contains(&t.id)
+                    && t.tree.panes.values().all(|p| p.kind == PaneKind::Editor)
+                {
+                    replacements.insert(t.id, files[path]);
+                    return false;
+                }
+                files.entry(path.clone()).or_insert(t.id);
+                t.kind = TabKind::File {
+                    path: path.clone(),
+                    dirty: false,
+                };
+                for pane in t
+                    .tree
+                    .panes
+                    .values_mut()
+                    .filter(|p| p.kind == PaneKind::Editor)
+                {
+                    pane.title = t.kind.title();
+                }
+            }
+            true
+        });
+        let surviving: std::collections::HashSet<_> = p.tabs.iter().map(|t| t.id).collect();
+        p.tab_mru.retain(|id| surviving.contains(id));
+        if !surviving.contains(&p.active_tab) {
+            p.active_tab = replacements
+                .get(&p.active_tab)
+                .copied()
+                .unwrap_or(p.tabs[0].id);
+        }
+        p.tab_mru.retain(|id| *id != p.active_tab);
+        p.tab_mru.insert(0, p.active_tab);
+    }
+    let tabs: std::collections::HashSet<_> = ws
+        .projects
+        .values()
+        .flat_map(|p| p.tabs.iter().map(|t| t.id))
+        .collect();
+    ws.windows.retain(|_, w| match &*w {
+        WindowRole::DetachedTab { tab, .. } | WindowRole::DetachedPane { tab, .. } => {
+            tabs.contains(tab)
+        }
+        _ => true,
+    });
 }
 
 #[cfg(test)]
@@ -3652,6 +3747,88 @@ mod tests {
         close_project(&mut ws, id, true).expect("force discards them");
         assert!(!ws.projects.contains_key(&id));
         validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn clipboard_views_share_close_guards_and_follow_renames() {
+        let mut ws = Workspace::default();
+        let p = open(&mut ws, "/tmp/clipboard");
+        let file = open_file(&mut ws, p, "/tmp/clipboard/file.txt", true);
+        let clip = open_tab(
+            &mut ws,
+            p,
+            TabKind::ClipboardDiff {
+                path: "/tmp/clipboard/file.txt".into(),
+                snapshot_id: "clip".into(),
+                dirty: true,
+            },
+            demo_pane(PaneKind::Editor, "Clipboard", false),
+        )
+        .unwrap();
+        assert_eq!(unsaved_tabs(&ws, Some(p)).len(), 1);
+        assert!(unsaved_in_tab(&ws, p, file).unwrap().is_none());
+        assert!(unsaved_in_tab(&ws, p, clip).unwrap().is_none());
+        retarget_paths(&mut ws, &[("/tmp/clipboard".into(), "/tmp/renamed".into())]);
+        assert!(
+            matches!(&tab(&ws, p, clip).unwrap().kind, TabKind::ClipboardDiff { path, .. }
+            if path == &PathBuf::from("/tmp/renamed/file.txt"))
+        );
+        close_tab(&mut ws, p, file, false).unwrap();
+        assert!(matches!(
+            close_tab(&mut ws, p, clip, false),
+            Err(CoreError::UnsavedChanges { .. })
+        ));
+        close_tab(&mut ws, p, clip, true).unwrap();
+        validate(&ws).unwrap();
+    }
+
+    #[test]
+    fn clipboard_restore_keeps_files_without_retaining_clipboards() {
+        let mut ws = Workspace::default();
+        let p = open(&mut ws, "/tmp/clipboard");
+        let file = open_file(&mut ws, p, "/tmp/clipboard/a.txt", false);
+        let clip = open_tab(
+            &mut ws,
+            p,
+            TabKind::ClipboardDiff {
+                path: "/tmp/clipboard/a.txt".into(),
+                snapshot_id: "clip".into(),
+                dirty: true,
+            },
+            demo_pane(PaneKind::Editor, "Clipboard", false),
+        )
+        .unwrap();
+        let only = open_tab(
+            &mut ws,
+            p,
+            TabKind::ClipboardDiff {
+                path: "/tmp/clipboard/b.txt".into(),
+                snapshot_id: "only".into(),
+                dirty: true,
+            },
+            demo_pane(PaneKind::Editor, "Clipboard", false),
+        )
+        .unwrap();
+        let kind = tab(&ws, p, clip).unwrap().kind.clone();
+        let torn = open_tab(
+            &mut ws,
+            p,
+            kind,
+            demo_pane(PaneKind::Editor, "Clipboard", false),
+        )
+        .unwrap();
+        detach_tab(&mut ws, p, torn).unwrap();
+        activate_tab(&mut ws, p, clip).unwrap();
+        restore_clipboard_comparisons(&mut ws);
+        assert_eq!(project(&ws, p).unwrap().active_tab, file);
+        assert!(tab(&ws, p, clip).is_err());
+        assert!(tab(&ws, p, file).is_ok());
+        assert!(matches!(
+            tab(&ws, p, only).unwrap().kind,
+            TabKind::File { dirty: false, .. }
+        ));
+        assert!(detached_tab_window(&ws, torn).is_none());
+        validate(&ws).unwrap();
     }
 
     #[test]
