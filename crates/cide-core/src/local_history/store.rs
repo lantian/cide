@@ -573,7 +573,7 @@ impl HistoryStore {
             revisions,
             next,
             generation: self.generation(),
-            excluded: self.eligibility.path(Path::new(path), false).err(),
+            excluded: self.eligibility.read(Path::new(path)).err(),
         })
     }
     pub fn bytes(&self, content: &HistoryContent) -> Result<Option<Vec<u8>>, String> {
