@@ -298,6 +298,10 @@ impl Filter {
     /// syscalls on a large tree, done once, off the walk's critical path — cheap next to
     /// re-deriving the rules per event, which is the alternative.
     pub fn build_with(input: FilterInput<'_>) -> Self {
+        Self::build_controlled(input, &|| false)
+    }
+
+    pub fn build_controlled(input: FilterInput<'_>, cancelled: &dyn Fn() -> bool) -> Self {
         let FilterInput {
             roots,
             dirs,
@@ -312,14 +316,20 @@ impl Filter {
 
         let mut per_dir = HashMap::new();
         for dir in dirs {
+            if cancelled() {
+                break;
+            }
             let file = dir.join(".gitignore");
-            if !file.is_file() {
+            if !file.is_file() && !dir.join(".ignore").is_file() {
                 continue;
             }
             let mut builder = GitignoreBuilder::new(dir);
-            if let Some(err) = builder.add(&file) {
+            if let Some(err) = file.is_file().then(|| builder.add(&file)).flatten() {
                 tracing::debug!(%err, path = %file.display(), "skipping an unreadable .gitignore");
                 continue;
+            }
+            if dir.join(".ignore").is_file() {
+                builder.add(dir.join(".ignore"));
             }
             match builder.build() {
                 Ok(gi) => {
@@ -601,13 +611,15 @@ impl Filter {
     /// existing logical path. Refresh on directory reads, without changing the shared roots.
     pub(crate) fn refresh_rules(&self, dir: &Path) {
         let file = dir.join(".gitignore");
-        let rules = file
-            .is_file()
+        let rules = (file.is_file() || dir.join(".ignore").is_file())
             .then(|| {
                 let mut builder = GitignoreBuilder::new(dir);
-                if let Some(err) = builder.add(&file) {
+                if let Some(err) = file.is_file().then(|| builder.add(&file)).flatten() {
                     tracing::debug!(%err, path = %file.display(), "could not refresh .gitignore");
                     return None;
+                }
+                if dir.join(".ignore").is_file() {
+                    builder.add(dir.join(".ignore"));
                 }
                 builder.build().ok()
             })

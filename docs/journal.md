@@ -18866,3 +18866,61 @@ menu path resolution, including clipboard comparisons, instead of matching a bra
 text. All four failing checks (`rust/fmt`, `rust/clippy`, `check:select-opened`, `check:ui-icons`)
 pass on rerun; UI typecheck and `check:menu-model` also pass. The entire suite was not rerun
 after these fixes.
+
+## M191 — Bound filesystem indexing across projects and external links
+
+An ignored packaging directory can contain a Wine `dosdevices/z:` link to a much larger
+filesystem. With hidden and ignored files shown, eager indexing previously retained the
+whole traversal, and macOS's debouncer cache could traverse the link independently. The file
+index now admits paths against configurable 512 MiB/project and 2048 MiB combined allocation
+budgets. Ordinary source files precede ignored and linked contents. Four shared workers,
+synchronous batches, cancellation on replacement/close/shutdown, and generation-owned
+reservations bound ongoing work without changing the visibility defaults.
+
+Filename snapshots share candidates. Text and symbol searches use that catalog, preserve
+file/parsing/hit limits, and include ignored/external sources that were admitted. Searches
+report partial coverage, old generations cannot supply current session results, and Refresh
+gets newer coverage. Watcher caches, native event bursts, polling and incremental additions
+are bounded; aliases, retargeted links, Git metadata and manual ignored-folder refresh retain
+regression coverage. The explorer shows “Index incomplete: memory limit reached” with a
+Settings action. These budgets describe indexing allocations, not total app or child-process
+RSS.
+
+Validation: the filesystem/search/language/IPC suites and app indexing/search/settings tests
+passed, including synthetic external links, shared accounting, snapshot ownership, cancellation,
+visibility changes and native/polling watcher behavior. All 134 UI checks passed, including
+production build, settings search/copy, picker, tree, search, kit and theme checks. The full
+shared runner passed 142 checks; its lint failure was corrected and the workspace Clippy rerun
+passed. Four failures remain in the unchanged Bash-history integration tests (timestamped
+history and a missing fixture output); all other workspace test targets passed. Native
+watcher tests require unsandboxed macOS event delivery and use temporary fixtures. The live
+IDE was not restarted or replaced.
+
+The isolated `cide-fs/examples/index_budget.rs` benchmark uses a synthetic external drive,
+never `/`. At an 8 MiB budget, both 10,000- and 100,000-file fixtures admitted 2,709 files and
+charged 8,387,152 bytes. Peak RSS was 11,599,872 and 11,583,488 bytes respectively (about
+11.1 MiB), demonstrating a plateau as the external tree grows. Cancellation is also covered
+by the local fixture's under-one-second assertion.
+
+
+## M192 — Isolate Bash history tests from host login profiles
+
+The four Bash-history failures recorded in M191 came from the host's managed `/etc/profile`:
+it enabled timestamped history and replaced the inherited `PROMPT_COMMAND`. A temporary
+`HOME` did not isolate either setting, so exact file comparisons and the inherited-hook
+fixture depended on the machine running the suite. PTY fixtures now copy the real initializer
+with only its system-profile path redirected to a controlled fixture and remove inherited
+`HISTTIMEFORMAT`. Production startup and system-profile loading are unchanged.
+
+Two additional PTY regressions explicitly cover a system profile replacing the inherited
+prompt hook and enabling timestamps with an append hook, including persistence before exit
+and Up-arrow recall after forced restart. All seven history tests pass on Apple's Bash 3.2,
+including a run with timestamp and prompt-hook settings exported by the parent process.
+The full workspace test rerun passed 4,771 tests with zero failures and 104 ignored tests;
+state and data roots were isolated under `/private/tmp` and native watcher tests had macOS
+event access.
+
+Investigation also reproduced duplicate entries with timestamped files and `history -a;
+history -n` in plain Bash 3.2 without Cide. This upstream behavior is not changed here; the
+timestamp fixture covers the managed profile's `history -a` hook, while the existing
+append/read-hook fixture retains its explicit untimestamped history format.

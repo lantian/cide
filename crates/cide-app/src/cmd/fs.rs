@@ -83,12 +83,17 @@ pub async fn fs_index(
     // Both out of one `with`: the roots and the visibility have to describe the same instant,
     // and two reads with a settings write between them would walk one answer and filter by the
     // other.
-    let (roots, visibility) = state.with(|ws| {
+    let (roots, visibility, explorer) = state.with(|ws| {
         let roots = cide_core::workspace::project(ws, project)
             .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
-        (roots, crate::files::visibility_of(&ws.settings))
+        (
+            roots,
+            crate::files::visibility_of(&ws.settings),
+            ws.settings.explorer,
+        )
     });
+    registry.configure(&explorer);
     index_project(Arc::new(app), &registry, project, roots, visibility).await
 }
 
@@ -564,6 +569,17 @@ pub async fn fs_refresh(
     path: PathBuf,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    // An explicit root refresh retries an incomplete generation, reclaiming its stale
+    // arena/matcher capacity. Exhaustion itself never schedules a retry loop.
+    if fs.budget.reason().is_some() && fs.root_paths().contains(&path) {
+        let roots = fs.root_paths();
+        let visibility = fs.with_index(|index| index.visibility());
+        drop(fs);
+        drop(registry.remove(project));
+        return index_project(Arc::new(app), &registry, project, roots, visibility)
+            .await
+            .map(|status| status.rows);
+    }
     let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_refresh", move || {
         ops::check_within(&fs.root_paths(), &path)?;
@@ -575,6 +591,8 @@ pub async fn fs_refresh(
                 item.path.to_string_lossy().into_owned(),
             ));
         }
+        fs.compact_files();
+        events.status(project, &fs.status());
         let change = cide_ipc::FsChange {
             paths: vec![path],
             truncated: false,

@@ -43,6 +43,8 @@ pub struct SearchSession {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct SearchSessionFrame {
+    #[serde(default)]
+    pub incomplete: bool,
     pub session: SearchSession,
     pub files: Option<PickerFrame>,
     pub symbols: Option<crate::SymbolFrame>,
@@ -61,6 +63,9 @@ pub struct SearchSessionFrame {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct PickerFrame {
+    /// Coverage is partial while indexing or after an indexing limit.
+    #[serde(default)]
+    pub incomplete: bool,
     /// At most the `limit` the caller asked for, capped in Rust at 200. A keystroke must
     /// never ship 100k rows over IPC — the overlay draws about twelve.
     pub items: Vec<PickerRow>,

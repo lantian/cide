@@ -30,7 +30,7 @@ export const search: Scene = {
     const get = (a: Args) => { const session = sessions.get(String(a['session'])); if (!session) throw new Error('Search closed'); return session }
     handlers.set('search_session_page', (a: Args): SearchSessionFrame => {
       const session = get(a)
-      return { session, files: null, symbols: null, text: frame(session.descriptor.query, Number(a['offset'] ?? 0)), running: false, errors: [] }
+      return { incomplete: false, session, files: null, symbols: null, text: frame(session.descriptor.query, Number(a['offset'] ?? 0)), running: false, errors: [] }
     })
     handlers.set('search_session_pin', (a: Args) => { const session = get(a); session.pinned = true; return session })
     handlers.set('search_session_rerun', (a: Args) => { const session = get(a); session.generation++; return session })
