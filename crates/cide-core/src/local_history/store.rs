@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +39,7 @@ pub struct HistoryStore {
     records: BTreeMap<u32, LocalRevision>,
     ids: BTreeMap<String, u32>,
     paths: BTreeMap<String, Vec<u32>>,
+    lineage: BTreeMap<String, Vec<u32>>,
     pub coverage: HistoryCoverage,
     revision: u32,
 }
@@ -134,6 +136,7 @@ impl HistoryStore {
             records: BTreeMap::new(),
             ids: BTreeMap::new(),
             paths: BTreeMap::new(),
+            lineage: BTreeMap::new(),
             coverage: HistoryCoverage::default(),
             revision: 0,
         };
@@ -146,32 +149,103 @@ impl HistoryStore {
             .join(format!("{:010}-{}.json", r.sequence, r.id.0))
     }
     fn load_index(&mut self) -> Result<(), String> {
+        for entry in fs::read_dir(&self.dir).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().is_some_and(|e| e == "tmp") {
+                fs::remove_file(path).map_err(|e| e.to_string())?;
+            }
+        }
         for entry in fs::read_dir(self.dir.join("records")).map_err(|e| e.to_string())? {
             let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().is_some_and(|e| e == "tmp") {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+                continue;
+            }
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            let record: Record =
-                serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
-                    .map_err(|e| format!("Unreadable history record: {e}"))?;
-            if record.schema != SCHEMA || record.generation != self.meta.generation {
-                continue;
+            let loaded = (|| -> Result<Option<LocalRevision>, String> {
+                let mut data = Vec::new();
+                File::open(&path)
+                    .map_err(|e| e.to_string())?
+                    .take(65537)
+                    .read_to_end(&mut data)
+                    .map_err(|e| e.to_string())?;
+                if data.len() > 65536 {
+                    return Err("History record is too large".into());
+                }
+                let record: Record = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
+                if record.schema != SCHEMA {
+                    return Err("Unsupported revision schema".into());
+                }
+                if record.generation != self.meta.generation {
+                    // A crash after the generation commit must not resurrect cleared records.
+                    fs::remove_file(&path).map_err(|e| e.to_string())?;
+                    return Ok(None);
+                }
+                let mut r = record.revision;
+                validate_relative(Path::new(&r.path))?;
+                if let Some(prior) = &r.prior_path {
+                    validate_relative(Path::new(prior))?;
+                }
+                uuid::Uuid::parse_str(&r.id.0).map_err(|_| "Invalid revision ID")?;
+                uuid::Uuid::parse_str(&r.lifecycle).map_err(|_| "Invalid lifecycle ID")?;
+                if self.record_path(&r) != path
+                    || self.records.contains_key(&r.sequence)
+                    || self.ids.contains_key(&r.id.0)
+                {
+                    return Err("Invalid or duplicate record identity".into());
+                }
+                if let Err(reason) = self.bytes(&r.content) {
+                    r.unavailable = Some(reason);
+                }
+                Ok(Some(r))
+            })();
+            match loaded {
+                Ok(Some(r)) => {
+                    self.meta.next_sequence = self.meta.next_sequence.max(
+                        r.sequence
+                            .checked_add(1)
+                            .ok_or("History sequence exhausted")?,
+                    );
+                    if let Some(reason) = &r.unavailable {
+                        self.coverage.degraded = Some(reason.clone());
+                    }
+                    self.insert(r);
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    self.coverage.degraded = Some(format!(
+                        "Some history records could not be recovered: {reason}"
+                    ));
+                    // Keep the offending file for recovery; unrelated records remain readable.
+                }
             }
-            let r = record.revision;
-            validate_relative(Path::new(&r.path))?;
-            uuid::Uuid::parse_str(&r.id.0).map_err(|_| "Invalid history revision ID")?;
-            if self.record_path(&r) != path {
-                return Err("History record identity does not match its filename".into());
-            }
-            self.meta.next_sequence = self.meta.next_sequence.max(
-                r.sequence
-                    .checked_add(1)
-                    .ok_or("History sequence exhausted")?,
-            );
-            self.insert(r);
         }
         self.rebuild_paths();
+        self.gc_blobs()?;
         Ok(())
+    }
+    fn gc_blobs(&self) -> Result<(), String> {
+        let referenced: HashSet<&str> = self
+            .records
+            .values()
+            .filter_map(|r| match &r.content {
+                HistoryContent::Content { digest, .. } => Some(digest.as_str()),
+                _ => None,
+            })
+            .collect();
+        for entry in fs::read_dir(self.dir.join("blobs")).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_none_or(|name| !referenced.contains(name))
+            {
+                fs::remove_file(path).map_err(|e| e.to_string())?;
+            }
+        }
+        crate::persist::sync_dir(&self.dir.join("blobs")).map_err(|e| e.to_string())
     }
     fn insert(&mut self, r: LocalRevision) {
         self.ids.insert(r.id.0.clone(), r.sequence);
@@ -179,11 +253,25 @@ impl HistoryStore {
     }
     fn rebuild_paths(&mut self) {
         self.paths.clear();
+        self.lineage.clear();
+        let mut lifecycles: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for r in self.records.values() {
             self.paths
                 .entry(r.path.clone())
                 .or_default()
                 .push(r.sequence);
+            lifecycles
+                .entry(r.lifecycle.clone())
+                .or_default()
+                .push(r.sequence);
+        }
+        for (path, own) in &self.paths {
+            let mut sequences = std::collections::BTreeSet::new();
+            for n in own {
+                sequences.extend(lifecycles[&self.records[n].lifecycle].iter().copied());
+            }
+            self.lineage
+                .insert(path.clone(), sequences.into_iter().collect());
         }
     }
     pub fn generation(&self) -> u32 {
@@ -274,7 +362,7 @@ impl HistoryStore {
     pub fn list(&self, path: &str, before: Option<u32>) -> Result<HistoryRevisionPage, String> {
         validate_relative(Path::new(path))?;
         let mut revisions = self
-            .paths
+            .lineage
             .get(path)
             .into_iter()
             .flatten()
@@ -307,8 +395,20 @@ impl HistoryStore {
                 {
                     return Err("Invalid history blob reference".into());
                 }
-                let data = fs::read(self.dir.join("blobs").join(digest))
-                    .map_err(|_| "Revision content is unavailable".to_owned())?;
+                let blob = self.dir.join("blobs").join(digest);
+                if fs::metadata(&blob)
+                    .map_err(|_| "Revision content is unavailable")?
+                    .len()
+                    != *bytes as u64
+                {
+                    return Err("Revision content is corrupt".into());
+                }
+                let mut data = Vec::new();
+                File::open(blob)
+                    .map_err(|_| "Revision content is unavailable")?
+                    .take(HISTORY_MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut data)
+                    .map_err(|e| e.to_string())?;
                 if data.len() != *bytes as usize || blake3::hash(&data).to_hex().as_str() != digest
                 {
                     return Err("Revision content is corrupt".into());
@@ -334,6 +434,16 @@ impl HistoryStore {
         bytes: Option<&[u8]>,
         source: HistorySource,
     ) -> Result<LocalRevisionId, String> {
+        self.capture_record(generation, path, bytes, source, None)
+    }
+    fn capture_record(
+        &mut self,
+        generation: u32,
+        path: &str,
+        bytes: Option<&[u8]>,
+        source: HistorySource,
+        rename: Option<(String, String)>,
+    ) -> Result<LocalRevisionId, String> {
         self.check_generation(generation)?;
         if !self.meta.policy.enabled {
             return Err("Local History capture is disabled".into());
@@ -343,20 +453,39 @@ impl HistoryStore {
             HistoryEligibility::validate_bytes(bytes)?;
         }
         let content = Self::content(bytes);
+        if rename.is_none()
+            && let Some(last) = self.latest(&path)
+            && last.content == content
+            && last.unavailable.is_none()
+        {
+            return Ok(last.id.clone());
+        }
         if let HistoryContent::Content { digest, .. } = &content {
             let dest = self.dir.join("blobs").join(digest);
             if !dest.exists() {
                 crate::persist::write_atomic(&dest, bytes.unwrap()).map_err(|e| e.to_string())?;
             }
+            self.bytes(&content)?;
         }
+        let lifecycle = rename
+            .as_ref()
+            .map(|(_, lifecycle)| lifecycle.clone())
+            .or_else(|| {
+                self.latest(&path)
+                    .filter(|r| {
+                        content == HistoryContent::Absent || r.content != HistoryContent::Absent
+                    })
+                    .map(|r| r.lifecycle.clone())
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let r = LocalRevision {
             id: LocalRevisionId(uuid::Uuid::new_v4().to_string()),
             sequence: self.meta.next_sequence,
             observed_ms: now_ms(),
             path,
-            lifecycle: uuid::Uuid::new_v4().to_string(),
+            lifecycle,
             source,
-            prior_path: None,
+            prior_path: rename.map(|(prior, _)| prior),
             content,
             unavailable: None,
         };
@@ -379,12 +508,145 @@ impl HistoryStore {
         self.revision = self.revision.wrapping_add(1);
         Ok(id)
     }
+    /// Called only after a successful within-root move. The old path remains discoverable.
+    pub fn renamed(
+        &mut self,
+        generation: u32,
+        from: &str,
+        to: &str,
+        bytes: &[u8],
+    ) -> Result<LocalRevisionId, String> {
+        self.check_generation(generation)?;
+        validate_relative(Path::new(from))?;
+        validate_relative(Path::new(to))?;
+        let lifecycle = self
+            .latest(from)
+            .map(|r| r.lifecycle.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.capture(generation, from, None, HistorySource::FileOperation)?;
+        self.capture_record(
+            generation,
+            to,
+            Some(bytes),
+            HistorySource::FileOperation,
+            Some((from.into(), lifecycle)),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cide_fs::testing::scratch;
+    #[test]
+    fn consecutive_dedup_preserves_source_and_recreation_starts_a_lifecycle() {
+        let project = scratch("history-dedup-root");
+        let state = scratch("history-dedup-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let first = s
+            .capture(1, "a", Some(b"A"), HistorySource::CideSave)
+            .unwrap();
+        assert_eq!(
+            s.capture(1, "a", Some(b"A"), HistorySource::External)
+                .unwrap(),
+            first
+        );
+        assert_eq!(s.get(&first).unwrap().source, HistorySource::CideSave);
+        s.capture(1, "a", Some(b"B"), HistorySource::External)
+            .unwrap();
+        let again = s
+            .capture(1, "a", Some(b"A"), HistorySource::External)
+            .unwrap();
+        assert_ne!(first, again);
+        assert_eq!(
+            s.get(&first).unwrap().lifecycle,
+            s.get(&again).unwrap().lifecycle
+        );
+        s.capture(1, "a", None, HistorySource::External).unwrap();
+        let recreated = s
+            .capture(1, "a", Some(b"A"), HistorySource::CideSave)
+            .unwrap();
+        assert_ne!(
+            s.get(&first).unwrap().lifecycle,
+            s.get(&recreated).unwrap().lifecycle
+        );
+        assert_eq!(s.list("a", None).unwrap().revisions.len(), 5);
+    }
+
+    #[test]
+    fn explicit_rename_keeps_old_revisions_accessible_at_new_path() {
+        let project = scratch("history-rename-root");
+        let state = scratch("history-rename-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let old = s
+            .capture(1, "old", Some(b"old content"), HistorySource::Baseline)
+            .unwrap();
+        let new = s.renamed(1, "old", "new", b"old content").unwrap();
+        assert_eq!(
+            s.get(&old).unwrap().lifecycle,
+            s.get(&new).unwrap().lifecycle
+        );
+        assert_eq!(s.get(&new).unwrap().prior_path.as_deref(), Some("old"));
+        assert!(
+            s.list("new", None)
+                .unwrap()
+                .revisions
+                .iter()
+                .any(|r| r.id == old)
+        );
+        assert_eq!(s.paths(None, "", true).paths[0].path, "old");
+    }
+
+    #[test]
+    fn independent_records_recover_around_corruption_and_interrupted_commits() {
+        let project = scratch("history-recovery-root");
+        let state = scratch("history-recovery-state");
+        let root = RootIdentity::new(&project).unwrap();
+        let mut s = HistoryStore::open(root.clone(), state.to_path_buf()).unwrap();
+        let good = s
+            .capture(1, "good", Some(b"good"), HistorySource::Baseline)
+            .unwrap();
+        let missing = s
+            .capture(1, "missing", Some(b"missing"), HistorySource::Baseline)
+            .unwrap();
+        let HistoryContent::Content { digest, .. } = &s.get(&missing).unwrap().content else {
+            panic!()
+        };
+        fs::remove_file(state.join("blobs").join(digest)).unwrap();
+        fs::write(state.join("records/corrupt.json"), "{truncated").unwrap();
+        fs::write(state.join("records/.interrupted.tmp"), "partial").unwrap();
+        fs::write(state.join("blobs/orphan"), "blob committed before record").unwrap();
+        drop(s);
+        let s = HistoryStore::open(root, state.to_path_buf()).unwrap();
+        assert_eq!(
+            s.bytes(&s.get(&good).unwrap().content).unwrap().unwrap(),
+            b"good"
+        );
+        assert!(s.get(&missing).unwrap().unavailable.is_some());
+        assert!(s.bytes(&s.get(&missing).unwrap().content).is_err());
+        assert!(s.coverage.degraded.is_some());
+        assert!(!state.join("blobs/orphan").exists());
+        assert!(!state.join("records/.interrupted.tmp").exists());
+    }
+
+    #[test]
+    fn unsupported_schema_and_root_mismatch_are_unavailable() {
+        let project = scratch("history-schema-root");
+        let other = scratch("history-schema-other");
+        let state = scratch("history-schema-state");
+        let root = RootIdentity::new(&project).unwrap();
+        drop(HistoryStore::open(root.clone(), state.to_path_buf()).unwrap());
+        assert!(
+            HistoryStore::open(RootIdentity::new(&other).unwrap(), state.to_path_buf()).is_err()
+        );
+        let mut meta: Metadata =
+            serde_json::from_slice(&fs::read(state.join("root.json")).unwrap()).unwrap();
+        meta.schema = 99;
+        json(&state.join("root.json"), &meta).unwrap();
+        assert!(HistoryStore::open(root, state.to_path_buf()).is_err());
+    }
     #[test]
     fn restart_preserves_bytes_root_and_revision() {
         let project = scratch("history-store-root");
