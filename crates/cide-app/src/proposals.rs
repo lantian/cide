@@ -262,7 +262,12 @@ fn apply_files(root: &Path, files: &[ProposedFile], proposal: &Proposal) -> Resu
             }
             None => {
                 if path.exists() {
-                    std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", f.path))?;
+                    crate::local_history::mutate(
+                        &path,
+                        cide_ipc::local_history::HistorySource::FileOperation,
+                        || std::fs::remove_file(&path),
+                    )
+                    .map_err(|e| format!("{}: {e}", f.path))?;
                     if let Some(dir) = path.parent() {
                         let _ = cide_core::persist::sync_dir(dir);
                     }

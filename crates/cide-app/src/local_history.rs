@@ -277,3 +277,37 @@ pub fn tree_unsubscribed(project: ProjectId) {
         }
     }
 }
+
+/// Hold every affected root in stable key order, including roots nested in a moved directory.
+pub fn mutate_tree<T, E>(
+    paths: &[PathBuf],
+    operation: impl FnOnce() -> Result<T, E>,
+    summarize: &impl Fn(&Result<T, E>) -> Vec<cide_core::local_history::HistoryTreeChange>,
+) -> Result<T, E> {
+    let coordinators: Vec<_> = ROOTS
+        .lock()
+        .values()
+        .filter(|e| {
+            paths.iter().any(|p| {
+                p.starts_with(&e.identity.path)
+                    || e.identity.path.starts_with(p)
+                    || e.identity.resolve(p).is_ok()
+            })
+        })
+        .map(|e| e.coordinator.clone())
+        .collect();
+    fn run<T, E>(
+        roots: &[Arc<HistoryCoordinator>],
+        paths: &[PathBuf],
+        operation: impl FnOnce() -> Result<T, E>,
+        summarize: &impl Fn(&Result<T, E>) -> Vec<cide_core::local_history::HistoryTreeChange>,
+    ) -> Result<T, E> {
+        match roots.split_first() {
+            Some((first, rest)) => {
+                first.mutate_tree(paths, || run(rest, paths, operation, summarize), summarize)
+            }
+            None => operation(),
+        }
+    }
+    run(&coordinators, paths, operation, summarize)
+}

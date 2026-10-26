@@ -52,6 +52,37 @@ pub struct HistoryCoordinator {
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+pub struct HistoryTreeChange {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub moved: bool,
+    pub created: bool,
+}
+
+fn tree_files(store: &mut HistoryStore, selections: &[PathBuf]) -> Vec<PathBuf> {
+    let mut stack = selections.to_vec();
+    let mut directories = HashSet::new();
+    let mut files = HashSet::new();
+    while let Some(path) = stack.pop() {
+        let directory = path.is_dir();
+        let Ok((physical, _)) = store.eligibility.path(&path, directory) else {
+            continue;
+        };
+        if directory {
+            if !directories.insert(physical.clone()) {
+                continue;
+            }
+            match fs::read_dir(&physical) {
+                Ok(entries) => stack.extend(entries.filter_map(Result::ok).map(|e| e.path())),
+                Err(reason) => store.coverage.degraded = Some(reason.to_string()),
+            }
+        } else if physical.is_file() {
+            files.insert(physical);
+        }
+    }
+    files.into_iter().collect()
+}
+
 fn publish(shared: &Shared, store: &HistoryStore, paths: Vec<String>) {
     let mut status = store.status();
     let previous = shared.status.read().clone();
@@ -195,6 +226,126 @@ impl Scan {
 }
 
 impl HistoryCoordinator {
+    /// Coordinators are acquired in stable root order by the app for cross-root operations.
+    pub fn mutate_tree<T, E>(
+        &self,
+        paths: &[PathBuf],
+        operation: impl FnOnce() -> Result<T, E>,
+        summarize: &impl Fn(&Result<T, E>) -> Vec<HistoryTreeChange>,
+    ) -> Result<T, E> {
+        let mut state = self.shared.state.lock();
+        while state.loading {
+            self.shared.ready.wait(&mut state);
+        }
+        if self.shared.stop.load(Ordering::Acquire) || state.store.is_none() {
+            return operation();
+        }
+        let store = state.store.as_mut().unwrap();
+        let before = tree_files(store, paths);
+        let regions: std::collections::HashMap<_, _> = paths
+            .iter()
+            .filter_map(|p| {
+                if p.is_symlink() {
+                    return None;
+                }
+                store
+                    .eligibility
+                    .root
+                    .resolve(p)
+                    .ok()
+                    .map(|(physical, _)| (p.clone(), physical))
+            })
+            .collect();
+        for path in &before {
+            if !self.is_nested(path) {
+                observe(store, path, HistorySource::External, false);
+            }
+        }
+        let result = operation();
+        let changes = summarize(&result);
+        let mut after_selections = paths.to_vec();
+        after_selections.extend(changes.iter().map(|c| c.to.clone()));
+        let after = tree_files(store, &after_selections);
+        for change in &changes {
+            let expected_dest = change
+                .to
+                .parent()
+                .and_then(|p| fs::canonicalize(p).ok())
+                .and_then(|p| change.to.file_name().map(|n| p.join(n)));
+            if change.created
+                && let Some(expected) = &expected_dest
+            {
+                for path in after
+                    .iter()
+                    .filter(|p| p.starts_with(expected) && !before.contains(p))
+                {
+                    if store
+                        .eligibility
+                        .read(path)
+                        .ok()
+                        .is_none_or(|(_, bytes)| bytes.is_none())
+                    {
+                        continue;
+                    }
+                    if !self.is_nested(path)
+                        && let Ok((_, relative)) = store.eligibility.root.resolve(path)
+                    {
+                        if let Err(reason) = store.capture(
+                            store.generation(),
+                            &relative,
+                            None,
+                            HistorySource::FileOperation,
+                        ) {
+                            store.coverage.degraded = Some(reason);
+                        }
+                    }
+                }
+            }
+            if change.moved
+                && !change.to.is_symlink()
+                && let Some(source) = regions.get(&change.from)
+            {
+                for old in before.iter().filter(|p| p.starts_with(source)) {
+                    let suffix = old.strip_prefix(source).unwrap();
+                    let new = if suffix.as_os_str().is_empty() {
+                        change.to.clone()
+                    } else {
+                        change.to.join(suffix)
+                    };
+                    if self.is_nested(old) {
+                        continue;
+                    }
+                    if let (Ok((_, old_relative)), Ok((new_relative, Some(bytes)))) = (
+                        store.eligibility.root.resolve(old),
+                        store.eligibility.read(&new),
+                    ) {
+                        if !self.is_nested(&new)
+                            && let Err(reason) = store.renamed(
+                                store.generation(),
+                                &old_relative,
+                                &new_relative,
+                                &bytes,
+                            )
+                        {
+                            store.coverage.degraded = Some(reason);
+                        }
+                    }
+                }
+            }
+        }
+        let post_source = if result.is_ok() {
+            HistorySource::FileOperation
+        } else {
+            HistorySource::External
+        };
+        for path in before.iter().chain(after.iter()) {
+            if !self.is_nested(path) {
+                observe(store, path, post_source, false);
+            }
+        }
+        publish(&self.shared, store, Vec::new());
+        result
+    }
     pub fn start(
         root: RootIdentity,
         dir: PathBuf,
@@ -542,6 +693,136 @@ mod tests {
     use super::*;
     use cide_fs::testing::scratch;
     use std::time::Instant;
+    #[test]
+    fn directory_moves_deletes_and_overwrites_keep_recoverable_descendants() {
+        let project = scratch("history-tree-mutations");
+        let state = scratch("history-tree-mutations-state");
+        fs::create_dir(project.join("old")).unwrap();
+        fs::write(project.join("old/child"), "original").unwrap();
+        fs::write(project.join("destination"), "overwritten").unwrap();
+        let c = HistoryCoordinator::start(
+            RootIdentity::new(&project).unwrap(),
+            state.to_path_buf(),
+            vec![],
+            |_, _| {},
+        );
+        wait_done(&c);
+        let from = project.join("old");
+        let to = project.join("new");
+        c.mutate_tree(
+            &[from.clone(), to.clone()],
+            || fs::rename(&from, &to),
+            &|result| {
+                if result.is_ok() {
+                    vec![HistoryTreeChange {
+                        from: from.clone(),
+                        to: to.clone(),
+                        moved: true,
+                        created: true,
+                    }]
+                } else {
+                    vec![]
+                }
+            },
+        )
+        .unwrap();
+        c.with_store(|s| {
+            assert!(
+                s.list("new/child", None)?
+                    .revisions
+                    .iter()
+                    .any(|r| r.path == "old/child")
+            );
+            assert_eq!(
+                s.latest("old/child").unwrap().content,
+                HistoryContent::Absent
+            );
+            Ok(())
+        })
+        .unwrap();
+        let dest = project.join("destination");
+        c.mutate_tree(
+            &[to.clone(), dest.clone()],
+            || fs::copy(to.join("child"), &dest),
+            &|_| vec![],
+        )
+        .unwrap();
+        c.with_store(|s| {
+            assert_eq!(s.list("destination", None)?.revisions.len(), 2);
+            Ok(())
+        })
+        .unwrap();
+        c.mutate_tree(
+            std::slice::from_ref(&to),
+            || fs::remove_dir_all(&to),
+            &|_| vec![],
+        )
+        .unwrap();
+        c.with_store(|s| {
+            assert_eq!(
+                s.latest("new/child").unwrap().content,
+                HistoryContent::Absent
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cross_root_move_has_independent_deletion_and_creation() {
+        let a = scratch("history-cross-a");
+        let b = scratch("history-cross-b");
+        let sa = scratch("history-cross-sa");
+        let sb = scratch("history-cross-sb");
+        let from = a.join("a");
+        let to = b.join("b");
+        fs::write(&from, "text").unwrap();
+        let ca = HistoryCoordinator::start(
+            RootIdentity::new(&a).unwrap(),
+            sa.to_path_buf(),
+            vec![],
+            |_, _| {},
+        );
+        let cb = HistoryCoordinator::start(
+            RootIdentity::new(&b).unwrap(),
+            sb.to_path_buf(),
+            vec![],
+            |_, _| {},
+        );
+        wait_done(&ca);
+        wait_done(&cb);
+        let paths = [from.clone(), to.clone()];
+        let summary = |result: &std::io::Result<()>| {
+            if result.is_ok() {
+                vec![HistoryTreeChange {
+                    from: from.clone(),
+                    to: to.clone(),
+                    moved: true,
+                    created: true,
+                }]
+            } else {
+                vec![]
+            }
+        };
+        ca.mutate_tree(
+            &paths,
+            || cb.mutate_tree(&paths, || fs::rename(&from, &to), &summary),
+            &summary,
+        )
+        .unwrap();
+        let old = ca
+            .with_store(|s| {
+                assert_eq!(s.latest("a").unwrap().content, HistoryContent::Absent);
+                Ok(s.latest("a").unwrap().lifecycle.clone())
+            })
+            .unwrap();
+        cb.with_store(|s| {
+            assert_ne!(s.latest("b").unwrap().lifecycle, old);
+            assert_eq!(s.latest("b").unwrap().prior_path, None);
+            Ok(())
+        })
+        .unwrap();
+    }
     #[test]
     fn refused_save_never_records_requested_content_and_creation_keeps_absence() {
         let project = scratch("history-refused-save");
