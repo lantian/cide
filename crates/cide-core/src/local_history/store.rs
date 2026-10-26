@@ -443,6 +443,9 @@ impl HistoryStore {
         json(&self.dir.join("root.json"), &next)?;
         self.meta = next;
         self.eligibility = eligibility;
+        if !self.meta.policy.enabled {
+            self.coverage.baseline_running = false;
+        }
         self.revision = self.revision.wrapping_add(1);
         if self.meta.policy.enabled
             && let Err(reason) = self.cleanup(now_ms())
@@ -875,6 +878,63 @@ impl HistoryStore {
 mod tests {
     use super::*;
     use cide_fs::testing::scratch;
+    #[test]
+    fn linked_worktree_stores_survive_restart_without_sharing_revisions() {
+        let trees = scratch("history-worktree-isolation");
+        let state = scratch("history-worktree-isolation-state");
+        let a = trees.join("main");
+        let b = trees.join("linked");
+        fs::create_dir_all(a.join(".git/worktrees/linked")).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(
+            b.join(".git"),
+            format!("gitdir: {}\n", a.join(".git/worktrees/linked").display()),
+        )
+        .unwrap();
+        fs::write(a.join(".git/worktrees/linked/commondir"), "../..\n").unwrap();
+        let ra = RootIdentity::new(&a).unwrap();
+        let rb = RootIdentity::new(&b).unwrap();
+        assert_ne!(
+            HistoryStore::profile_path(&ra),
+            HistoryStore::profile_path(&rb)
+        );
+        let da = state.join(&ra.id.0);
+        let db = state.join(&rb.id.0);
+        let mut sa = HistoryStore::open(ra.clone(), da.clone()).unwrap();
+        let mut sb = HistoryStore::open(rb.clone(), db.clone()).unwrap();
+        let first = sa
+            .capture(
+                sa.generation(),
+                "same.rs",
+                Some(b"main"),
+                HistorySource::Baseline,
+            )
+            .unwrap();
+        let second = sb
+            .capture(
+                sb.generation(),
+                "same.rs",
+                Some(b"linked"),
+                HistorySource::Baseline,
+            )
+            .unwrap();
+        assert!(sa.get(&second).is_err());
+        assert!(sb.get(&first).is_err());
+        drop(sa);
+        drop(sb);
+        let sa = HistoryStore::open(ra, da).unwrap();
+        let sb = HistoryStore::open(rb, db).unwrap();
+        assert_eq!(
+            sa.bytes(&sa.get(&first).unwrap().content).unwrap().unwrap(),
+            b"main"
+        );
+        assert_eq!(
+            sb.bytes(&sb.get(&second).unwrap().content)
+                .unwrap()
+                .unwrap(),
+            b"linked"
+        );
+    }
     #[test]
     fn restore_preserves_safety_bytes_and_can_reverse_recreation_with_absence() {
         let project = scratch("history-restore-bytes");

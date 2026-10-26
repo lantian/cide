@@ -355,7 +355,7 @@ impl HistoryCoordinator {
         nested: Vec<PathBuf>,
         changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
     ) -> Arc<Self> {
-        Self::start_inner(root, dir, nested, false, changed)
+        Self::start_inner(root, dir, nested, false, || {}, changed)
     }
     pub fn start_observed(
         root: RootIdentity,
@@ -363,13 +363,24 @@ impl HistoryCoordinator {
         nested: Vec<PathBuf>,
         changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
     ) -> Arc<Self> {
-        Self::start_inner(root, dir, nested, true, changed)
+        Self::start_observed_after(root, dir, nested, || {}, changed)
+    }
+    /// Wait off the UI thread for this process's retiring authority to release ownership.
+    pub fn start_observed_after(
+        root: RootIdentity,
+        dir: PathBuf,
+        nested: Vec<PathBuf>,
+        before_load: impl FnOnce() + Send + 'static,
+        changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::start_inner(root, dir, nested, true, before_load, changed)
     }
     fn start_inner(
         root: RootIdentity,
         dir: PathBuf,
         nested: Vec<PathBuf>,
         observed: bool,
+        before_load: impl FnOnce() + Send + 'static,
         changed: impl Fn(HistoryStatus, Vec<String>) + Send + Sync + 'static,
     ) -> Arc<Self> {
         let status = HistoryStatus {
@@ -408,6 +419,7 @@ impl HistoryCoordinator {
             .name("cide-local-history".into())
             .spawn(move || {
                 let shared = worker_shared;
+                before_load();
                 {
                     let opened = HistoryStore::open(root, dir);
                     let mut state = shared.state.lock();
@@ -431,6 +443,7 @@ impl HistoryCoordinator {
                 let mut scan: Option<Scan> = None;
                 let mut ticks = 0u32;
                 let mut first_scan = true;
+                let mut baseline_generation = startup_generation;
                 while !shared.stop.load(Ordering::Acquire) {
                     if shared.membership_changed.swap(false, Ordering::AcqRel) {
                         if let Some(store) = &mut shared.state.lock().store {
@@ -494,6 +507,8 @@ impl HistoryCoordinator {
                                     } else {
                                         HistorySource::Reopen
                                     }
+                                } else if baseline_generation != store.generation() {
+                                    HistorySource::Baseline
                                 } else {
                                     HistorySource::External
                                 },
@@ -510,6 +525,7 @@ impl HistoryCoordinator {
                         };
                     }
                     first_scan = false;
+                    baseline_generation = store.generation();
                     if let Some(active) = &mut scan {
                         if !active.step(store, &shared.nested.read(), &shared) {
                             scan = None;
@@ -696,6 +712,123 @@ mod tests {
     use super::*;
     use cide_fs::testing::scratch;
     use std::time::Instant;
+    #[test]
+    fn rapid_reopen_waits_for_retiring_owner_and_admitted_write() {
+        let project = scratch("history-retirement-root");
+        let state = scratch("history-retirement-state");
+        let path = project.join("a");
+        fs::write(&path, "A").unwrap();
+        let root = RootIdentity::new(&project).unwrap();
+        let old = HistoryCoordinator::start(root.clone(), state.to_path_buf(), vec![], |_, _| {});
+        wait_done(&old);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = old.clone();
+        let job = thread::spawn(move || {
+            writer.mutate(&path, HistorySource::CideSave, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fs::write(&path, "B")
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let retirement = thread::spawn(move || old.close());
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let reopened = HistoryCoordinator::start_inner(
+            root,
+            state.to_path_buf(),
+            vec![],
+            false,
+            move || {
+                waiting_tx.send(()).unwrap();
+                retirement.join().unwrap();
+            },
+            |_, _| {},
+        );
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(reopened.status().generation, 0);
+        assert!(reopened.status().coverage.baseline_running);
+        release_tx.send(()).unwrap();
+        job.join().unwrap().unwrap();
+        wait_done(&reopened);
+        assert!(reopened.status().coverage.degraded.is_none());
+        reopened
+            .with_store(|store| {
+                let revisions = store.list("a", None)?.revisions;
+                assert_eq!(revisions.len(), 2);
+                assert_eq!(revisions[0].source, HistorySource::CideSave);
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn unavailable_storage_preserves_ordinary_save_outcomes() {
+        let project = scratch("history-unavailable-root");
+        let state = scratch("history-unavailable-state");
+        let blocked = state.join("blocked");
+        fs::write(&blocked, "not a directory").unwrap();
+        let c = HistoryCoordinator::start(
+            RootIdentity::new(&project).unwrap(),
+            blocked,
+            vec![],
+            |_, _| {},
+        );
+        c.mutate(&project.join("a"), HistorySource::CideSave, || {
+            fs::write(project.join("a"), "saved")
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(project.join("a")).unwrap(), "saved");
+        assert!(c.status().coverage.degraded.is_some());
+        assert!(c.with_store(|_| Ok(())).is_err());
+    }
+    #[test]
+    fn nested_roots_are_not_baselined_or_observed_twice() {
+        let project = scratch("history-nested-baseline");
+        let state = scratch("history-nested-state");
+        fs::create_dir(project.join("nested")).unwrap();
+        fs::write(project.join("a"), "outer").unwrap();
+        fs::write(project.join("nested/a"), "inner").unwrap();
+        let c = HistoryCoordinator::start(
+            RootIdentity::new(&project).unwrap(),
+            state.to_path_buf(),
+            vec![project.join("nested")],
+            |_, _| {},
+        );
+        wait_done(&c);
+        c.observe(vec![project.join("nested/a")], false);
+        thread::sleep(Duration::from_millis(50));
+        c.with_store(|s| {
+            assert_eq!(s.known_paths(), vec!["a"]);
+            Ok(())
+        })
+        .unwrap();
+    }
+    #[test]
+    fn clear_and_reenable_resume_with_baseline_provenance() {
+        let project = scratch("history-baseline-resume");
+        let state = scratch("history-baseline-resume-state");
+        fs::write(project.join("a"), "current").unwrap();
+        let c = HistoryCoordinator::start(
+            RootIdentity::new(&project).unwrap(),
+            state.to_path_buf(),
+            vec![],
+            |_, _| {},
+        );
+        wait_done(&c);
+        c.with_store(|s| s.clear(true)).unwrap();
+        let start = Instant::now();
+        loop {
+            let source = c
+                .with_store(|s| Ok(s.latest("a").map(|r| r.source)))
+                .unwrap();
+            if let Some(source) = source {
+                assert_eq!(source, HistorySource::Baseline);
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
     #[test]
     fn directory_moves_deletes_and_overwrites_keep_recoverable_descendants() {
         let project = scratch("history-tree-mutations");

@@ -19,7 +19,12 @@ fn scope(
 
 fn path_in(store: &HistoryStore, path: &str) -> Result<String, String> {
     validate_relative(Path::new(path))?;
-    let (physical, relative) = store.eligibility.root.resolve(Path::new(path))?;
+    let (_, relative) = store.eligibility.root.resolve(Path::new(path))?;
+    Ok(relative)
+}
+fn restore_path_in(store: &HistoryStore, path: &str) -> Result<String, String> {
+    let relative = path_in(store, path)?;
+    let physical = store.eligibility.root.path.join(&relative);
     if let Some(owner) = crate::local_history::for_path(&physical) {
         if owner.status().root != store.eligibility.root.id {
             return Err("This file belongs to a deeper open history root".into());
@@ -167,14 +172,14 @@ pub async fn local_history_restore(
     let coordinator = scope(&state, project, &root)?;
     blocking(move || {
         let physical = coordinator.with_store(|s| {
-            path_in(s, &token.path)?;
+            restore_path_in(s, &token.path)?;
             s.validate_restore(&token)
         })?;
         let state = app.state::<WorkspaceState>();
         let mut prepared =
             crate::local_history_restore::PreparedEditors::prepare(&app, &state, physical.clone())?;
         let result = coordinator.with_store(|s| {
-            path_in(s, &token.path)?;
+            restore_path_in(s, &token.path)?;
             s.restore_with(&token, |write| prepared.commit(&state, write))
         })?;
         if result.restored {

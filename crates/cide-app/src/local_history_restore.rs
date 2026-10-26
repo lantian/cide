@@ -9,13 +9,20 @@ use std::{
 };
 
 fn editors(ws: &Workspace, target: &Path) -> Result<(BTreeSet<String>, String), String> {
+    editors_with(ws, target, crate::local_history::canonical_path)
+}
+fn editors_with(
+    ws: &Workspace,
+    target: &Path,
+    resolve: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(BTreeSet<String>, String), String> {
     let mut expected = BTreeSet::new();
     for project in ws.projects.values() {
         for tab in &project.tabs {
             let TabKind::File { path, dirty } = &tab.kind else {
                 continue;
             };
-            if crate::local_history::canonical_path(path).as_deref() != Some(target) {
+            if resolve(path).as_deref() != Some(target) {
                 continue;
             }
             if *dirty {
@@ -165,4 +172,72 @@ pub fn local_history_editor_acknowledge(
         &request,
         dirty,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn history_editor_expectations_include_detached_editors_and_dirty_tabs() {
+        let mut ws = cide_core::workspace::demo_workspace();
+        let project = *ws.projects.keys().next().unwrap();
+        let tab = ws.projects[&project]
+            .tabs
+            .iter()
+            .find(|t| matches!(t.kind, TabKind::File { .. }))
+            .unwrap()
+            .id;
+        let path = match &ws.projects[&project]
+            .tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .unwrap()
+            .kind
+        {
+            TabKind::File { path, .. } => path.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            editors_with(&ws, &path, |p| Some(p.into()))
+                .unwrap_err()
+                .contains("unsaved")
+        );
+        let file = ws
+            .projects
+            .get_mut(&project)
+            .unwrap()
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .unwrap();
+        if let TabKind::File { dirty, .. } = &mut file.kind {
+            *dirty = false;
+        }
+        let original = file.tree.panes.values().next().unwrap().clone();
+        let mut detached = original.clone();
+        detached.id = cide_ipc::PaneId::new();
+        let id = detached.id;
+        ws.projects
+            .get_mut(&project)
+            .unwrap()
+            .detached
+            .insert(id, detached);
+        ws.windows.insert(
+            cide_ipc::WindowLabel("detached".into()),
+            WindowRole::DetachedPane {
+                project,
+                tab,
+                pane: id,
+            },
+        );
+        let before = editors_with(&ws, &path, |p| Some(p.into())).unwrap();
+        assert!(before.0.contains(&original.id.to_string()));
+        assert!(before.0.contains(&id.to_string()));
+        ws.windows
+            .shift_remove(&cide_ipc::WindowLabel("detached".into()));
+        assert_ne!(
+            editors_with(&ws, &path, |p| Some(p.into())).unwrap(),
+            before
+        );
+    }
 }

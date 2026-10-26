@@ -18,6 +18,8 @@ struct Entry {
     subscribed: HashSet<ProjectId>,
 }
 static ROOTS: LazyLock<Mutex<BTreeMap<String, Entry>>> = LazyLock::new(Mutex::default);
+static RETIRING: LazyLock<Mutex<BTreeMap<String, std::thread::JoinHandle<()>>>> =
+    LazyLock::new(Mutex::default);
 
 /// Called only when project/root membership changes, never for editor dirty-state updates.
 pub fn sync(app: &tauri::AppHandle, workspace: &Workspace) {
@@ -40,6 +42,7 @@ pub fn sync(app: &tauri::AppHandle, workspace: &Workspace) {
     }
     let identities: Vec<_> = wanted.values().map(|(r, _)| r.clone()).collect();
     let mut roots = ROOTS.lock();
+    RETIRING.lock().retain(|_, worker| !worker.is_finished());
     let removed: Vec<_> = roots
         .keys()
         .filter(|key| !wanted.contains_key(*key))
@@ -47,10 +50,11 @@ pub fn sync(app: &tauri::AppHandle, workspace: &Workspace) {
         .collect();
     for key in removed {
         if let Some(entry) = roots.remove(&key) {
-            std::thread::spawn(move || {
+            let retirement = std::thread::spawn(move || {
                 drop(entry.fallback);
                 entry.coordinator.close();
             });
+            RETIRING.lock().insert(key, retirement);
         }
     }
     for (key, (identity, owners)) in wanted {
@@ -68,10 +72,16 @@ pub fn sync(app: &tauri::AppHandle, workspace: &Workspace) {
             entry.coordinator.set_nested(nested);
         } else {
             let events = app.clone();
-            let coordinator = HistoryCoordinator::start_observed(
+            let retirement = RETIRING.lock().remove(&key);
+            let coordinator = HistoryCoordinator::start_observed_after(
                 identity.clone(),
                 HistoryStore::profile_path(&identity),
                 nested,
+                move || {
+                    if let Some(retiring) = retirement {
+                        let _ = retiring.join();
+                    }
+                },
                 move |status, paths| {
                     crate::emit::local_history_changed(
                         &events,
@@ -149,6 +159,9 @@ pub fn close_all() {
     for entry in entries.into_values() {
         drop(entry.fallback);
         entry.coordinator.close();
+    }
+    for retirement in std::mem::take(&mut *RETIRING.lock()).into_values() {
+        let _ = retirement.join();
     }
 }
 
@@ -248,6 +261,7 @@ fn subscription(
 }
 fn fallback(identity: &RootIdentity, coordinator: &Arc<HistoryCoordinator>) -> cide_fs::Watcher {
     let config = cide_fs::WatchConfig {
+        history_only: true,
         roots: vec![identity.path.clone()],
         dirs: vec![identity.path.clone()],
         history: subscription(vec![(identity.clone(), coordinator.clone())], None),

@@ -974,6 +974,7 @@ pub fn run() {
                 // The announcement cache goes with it for the same reason: a stale entry
                 // would swallow the first real title of a window that reused the label.
                 tauri::WindowEvent::Destroyed => {
+                    local_history::EDITOR_GATES.unregister_window(window.label());
                     let label = cide_ipc::WindowLabel(window.label().to_string());
                     window.app_handle().state::<cmd::search::SearchRegistry>()
                         .cancel_search_window(window.label());

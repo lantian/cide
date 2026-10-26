@@ -82,6 +82,15 @@ impl RestoreGates {
             self.inner.wake.notify_all();
         }
     }
+    pub fn unregister_window(&self, window: &str) {
+        let mut state = self.inner.state.lock();
+        let before = state.mounted.len();
+        state.mounted.retain(|(owner, _), _| owner != window);
+        if state.mounted.len() != before {
+            state.epoch = state.epoch.wrapping_add(1);
+            self.inner.wake.notify_all();
+        }
+    }
     pub fn write(&self, paths: Vec<PathBuf>) -> Result<WriteLease, String> {
         let mut state = self.inner.state.lock();
         if paths.iter().any(|p| {
@@ -247,6 +256,22 @@ impl Drop for WriteLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn destroyed_windows_abort_preparation_and_do_not_leave_ghost_participants() {
+        let gates = RestoreGates::default();
+        let path = PathBuf::from("/project/file");
+        let editor = gates.register("detached".into(), "pane".into(), path.clone());
+        let permit = gates
+            .prepare(path.clone(), &BTreeSet::from(["pane".into()]))
+            .unwrap();
+        gates.acknowledge(&editor, &permit.request, false).unwrap();
+        gates.unregister_window("detached");
+        assert!(permit.commit(|| Ok(())).is_err());
+        drop(permit);
+        let permit = gates.prepare(path, &BTreeSet::new()).unwrap();
+        assert!(permit.editors.is_empty());
+        permit.wait(Duration::from_millis(1)).unwrap();
+    }
     #[test]
     fn dirty_detached_missing_and_replaced_editors_abort_and_drop_releases_gates() {
         let gates = RestoreGates::default();

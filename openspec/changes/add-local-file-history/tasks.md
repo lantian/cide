@@ -32,7 +32,7 @@
 
 ## 6. Verification and handoff
 
-- [ ] 6.1 Run focused socket-free history/store/observer/restore tests in affected Rust crates and frontend checks, including restart, unreadable storage, symlink escapes, worktree isolation, dirty detached-editor handshake and clear-generation races.
+- [x] 6.1 Run focused socket-free history/store/observer/restore tests in affected Rust crates and frontend checks, including restart, unreadable storage, symlink escapes, worktree isolation, dirty detached-editor handshake and clear-generation races.
 - [ ] 6.2 Run `cargo xtask codegen --check`, `cargo xtask contract-check`, `pnpm --dir ui run typecheck`, `pnpm --dir ui run build`, and affected command/menu/editor/diff/restore/theme checks; record which checks passed and any environmental blockers.
 - [ ] 6.3 Document storage/defaults/exclusions, capture gaps, restore behavior and recovery limits in project docs; provide reviewer acceptance steps for non-Git edits, external agent edits, rename/delete/recreate, restart and multi-window restore.
 - [ ] 6.4 Hand off real-window acceptance, dark/light visual review, captures and renders to the reviewer. This sandbox has no display/audio and refuses Unix sockets; do not launch GUI apps, virtual displays or socket-dependent capture tools here.
