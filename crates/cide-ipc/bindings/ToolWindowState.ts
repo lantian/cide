@@ -4,8 +4,8 @@ import type { HistoryTabId } from "./HistoryTabId";
 import type { LocalHistoryView } from "./LocalHistoryView";
 
 /**
- * The Git tool window's own state, per project — and once more on [`Workspace`] itself, for
- * the shell that has no project open. (M18, M74)
+ * The history tool window's own state, per project — and once more on [`Workspace`] itself,
+ * for the shell that has no project open. Git and Local History share its layout. (M18, M74)
  *
  * One type for both because the panel is one panel: the tab strip, the splitter, the repair
  * pass and every command that moves any of it are written against this shape, and a second,
@@ -13,7 +13,7 @@ import type { LocalHistoryView } from "./LocalHistoryView";
  * What differs is only which of them can be *reached* — see [`Workspace::tool_window`].
  *
  * Per project and not per window, deliberately. The panel is a view of *this project's*
- * repositories, and the same project shown in two windows (which `Stacked` mode makes ordinary)
+ * repositories and roots, and the same project shown in two windows (which `Stacked` mode makes ordinary)
  * is one set of open histories; keying it by window would mean a user who detaches a tab finds
  * the panel they were reading empty, and a user who reads a history in two windows has to open
  * it twice.
@@ -23,7 +23,7 @@ import type { LocalHistoryView } from "./LocalHistoryView";
  * would be shared across every project, so opening a second project would inherit the first's
  * history tabs.
  */
-export type ToolWindowState = { localHistory: Array<LocalHistoryView>, activeLocalHistory: LocalHistoryView | null, 
+export type ToolWindowState = { 
 /**
  * Closed by default. A tool window that opens itself on first launch is a strip of chrome
  * the user has to dismiss before they have asked anything of it.
@@ -87,4 +87,4 @@ logSplit: number,
  * halves are in different subtrees, which is exactly why the choice is offered rather than
  * decided.
  */
-filesAsTree: boolean, };
+filesAsTree: boolean, localHistory: Array<LocalHistoryView>, activeLocalHistory: LocalHistoryView | null, };

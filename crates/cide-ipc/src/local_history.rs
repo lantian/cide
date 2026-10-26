@@ -210,7 +210,7 @@ pub struct HistoryEditorGate {
 #[ts(export)]
 pub struct LocalHistoryView {
     pub root: HistoryRootId,
-    /// None opens the project browser, including deleted paths.
+    // None opens the project browser, including deleted paths.
     pub path: Option<String>,
 }
 
