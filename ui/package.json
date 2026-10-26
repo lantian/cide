@@ -137,6 +137,7 @@
     "check:toolwindow": "node scripts/check-toolwindow.mjs",
     "check:toolwindow-render": "node scripts/check-toolwindow-render.mjs",
     "check:tree-drag": "node scripts/check-tree-drag.mjs",
+    "check:desktop-drop": "node scripts/check-desktop-drop.mjs",
     "check:tree-flicker": "node scripts/check-tree-flicker.mjs",
     "check:tree-select": "node scripts/check-tree-select.mjs",
     "check:tree-status": "node scripts/check-tree-status.mjs",

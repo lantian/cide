@@ -18924,3 +18924,38 @@ Investigation also reproduced duplicate entries with timestamped files and `hist
 history -n` in plain Bash 3.2 without Cide. This upstream behavior is not changed here; the
 timestamp fixture covers the managed profile's `history -a` hook, while the existing
 append/read-hook fixture retains its explicit untimestamped history format.
+
+## M193 — Desktop files can cross the Explorer boundary
+
+Files and folders dropped from the desktop into Explorer now highlight the receiving folder,
+including when the pointer is over one of its files. Resting on a collapsed folder expands it;
+empty space inside the tree targets the project root. Imports copy the originals and use the
+existing collision planner and Keep both / Replace / Skip dialog. Cancellation writes nothing
+and neither drag direction changes the system clipboard. A drop onto the editor tab strip opens
+the original file, including an external file, without copying it into the project. Tree files
+can also be dragged onto the strip directly; in-tree moves keep their existing rules.
+
+Leaving the tree hands a drag to the desktop using native file URLs (`drag` 2.1.1). Native
+drop receipts are bound to the receiving window and the exact paths delivered by the OS;
+the webview cannot authorize an arbitrary external source or destination. Opening a dropped
+file retains the regular-file, size and canonical-target checks. A late macOS start after
+mouse release is cancelled to avoid leaving a phantom native drag. WKWebView coordinates are
+Cocoa points on Retina, and Tauri's single-webview drops arrive as window events.
+
+Validation: the mounted desktop-drop check covers tree targeting/copying, retained enter paths,
+leave/drop cleanup, read-only and recursive refusals, tab opens, direct tree-to-tab opening,
+native export handoff, failure cleanup and StrictMode unmounts. Two Rust tests cover receipt
+scope/expiry and external folder imports, collision planning, preserved originals and immediate
+index updates. UI build/typecheck, affected tree/clipboard/tab/attachment checks and contract
+checks pass. The existing linked-folder watcher test failed once in the wider filesystem run
+and passed when repeated alone. In an isolated macOS test application, Finder received an
+exported text file and a tree-to-strip drag opened its original editor tab. Desktop-to-tree
+and desktop-to-strip routing are covered by fixtures; a complete live inbound drag, Telegram,
+Linux and Windows were not verified on a display.
+
+macOS follow-up: bare Backspace and Command+Backspace in Explorer now use the existing
+selection-scoped Move to Trash confirmation. Inline name inputs keep their editing keys;
+bare Backspace still edits an active speed-search query. The rule tests cover all modifier
+combinations on macOS and other platforms. Both shortcuts opened the confirmation in the
+running macOS test copy; cancelling preserved the file. Tree/status/selection, speed-search,
+key-gate checks and TypeScript pass.

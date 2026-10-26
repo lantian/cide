@@ -346,6 +346,15 @@ both the OpenSpec panel and the change tab.
 
 ### The file tree, fs ops
 
+Desktop drag-and-drop also needs `check:desktop-drop`, `check:tree-drag`, `check:tab-drag`,
+and `cargo test --locked -p cide-app file_drag`. The mounted check drives native enter/over/drop/
+leave events through the real tree and tab hooks with IPC substituted. Native receipts restrict
+imports to the paths actually dropped into that window; planning never writes, and collisions
+keep the existing file unless explicitly answered otherwise. macOS WKWebView supplies logical
+points even though Tauri calls them physical positions. Single-webview windows deliver native
+drops as `WindowEvent::DragDrop`. Confirm actual OS transfers on a display; JS fixtures cannot
+validate the pasteboard formats received by Finder or another application.
+
 **Touches:** the file tree, fs ops
 
 Directory links: `cargo test --locked -p cide-fs -p cide-search`,
