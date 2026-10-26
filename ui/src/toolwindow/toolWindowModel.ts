@@ -289,3 +289,8 @@ export function restoreTabs(tabs: ToolWindowTabs): ToolWindowTabs {
   const active = tabs.active !== null && seen.has(tabs.active) ? tabs.active : null
   return { open: tabs.open === true, history, active }
 }
+
+/** Root and nullable path are the persisted identity; this string is only a tab-row key. */
+export function localHistoryKey(view: { root: string; path: string | null }): string {
+  return `local-history:${JSON.stringify([view.root, view.path])}`
+}

@@ -1571,7 +1571,11 @@ pub(crate) fn write_document_bytes(
     // Checked **after** the read-only rule and before anything is written. Order matters only
     // for the message: a buffer over a registry source that also happens to have moved should
     // report the rule the user can act on.
-    document::write_bytes_if_unchanged(path, bytes, if_unchanged)
+    crate::local_history::mutate(
+        path,
+        cide_ipc::local_history::HistorySource::CideSave,
+        || document::write_bytes_if_unchanged(path, bytes, if_unchanged),
+    )
 }
 
 /// The file's stamp right now, for a pane that follows the disk without re-reading it. (M63)

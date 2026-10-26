@@ -29,6 +29,7 @@ pub mod ids;
 pub mod image;
 pub mod keymap;
 pub mod llm;
+pub mod local_history;
 pub mod milestones;
 /// The New project wizard: a probe of a path, a request, a checklist. (M97)
 pub mod new_project;

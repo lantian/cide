@@ -266,8 +266,10 @@ try {
   for (const hidden of ['loadScene: false', 'saveToActiveFile: false', 'export: false', 'saveAsImage: false', 'toggleTheme: false']) {
     ok(surface.includes(hidden), `${hidden} — a canvas action that ends in a Download a wry webview drops`)
   }
-  ok(!/\.updateScene\(/.test(source('src/panes/ExcalidrawPane.tsx')) && !/\.updateScene\(/.test(surface),
-    'a reload is a remount, never updateScene — the undo stack would resurrect the pre-reload scene')
+  const gateOnlyUpdate = /api\.updateScene\(\{ appState: \{ viewModeEnabled: active \|\| !writableRef\.current \} \}\)/g
+  const withoutGate = source('src/panes/ExcalidrawPane.tsx').replace(gateOnlyUpdate, '')
+  ok(!/\.updateScene\(/.test(withoutGate) && !/\.updateScene\(/.test(surface),
+    'reload replaces the engine; only the history gate may update viewMode without touching scene or undo')
 
   // --- the pane reaches the engine lazily, after the asset path is set --------------------------
   const pane = source('src/panes/ExcalidrawPane.tsx')

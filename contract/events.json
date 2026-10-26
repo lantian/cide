@@ -18,6 +18,8 @@
   "cide://gitlab-drafts-changed",
   "cide://ipc-degraded",
   "cide://keymap-changed",
+  "cide://local-history-changed",
+  "cide://local-history-editor-gate",
   "cide://milestones-changed",
   "cide://mouse-nav",
   "cide://peer-chat-reviews",

@@ -45,6 +45,8 @@ pub mod ext_assets;
 /// repository. `ext_state.rs`'s header argues it, and `cide_ext::config`'s argues the file layout.
 pub mod ext_state;
 mod image_snapshots;
+mod local_history;
+mod local_history_restore;
 mod opencode_console;
 mod peer_chat;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
@@ -485,6 +487,18 @@ pub fn run() {
         .manage(caps::ClaudeVersion::default())
         .manage(caps::HarnessVersions::default())
         .invoke_handler(tauri::generate_handler![
+            local_history_restore::local_history_editor_register,
+            local_history_restore::local_history_editor_unregister,
+            local_history_restore::local_history_editor_acknowledge,
+            cmd::local_history::local_history_status,
+            cmd::local_history::local_history_paths,
+            cmd::local_history::local_history_list,
+            cmd::local_history::local_history_compare,
+            cmd::local_history::local_history_set_policy,
+            cmd::local_history::local_history_clear,
+            cmd::local_history::local_history_restore,
+            cmd::local_history::local_history_open_view,
+            cmd::local_history::local_history_close_view,
             cmd::gitlab::gitlab_request,
             cmd::gitlab::gitlab_open_document,
             cmd::gitlab::gitlab_review_launch,
@@ -965,6 +979,7 @@ pub fn run() {
                 // The announcement cache goes with it for the same reason: a stale entry
                 // would swallow the first real title of a window that reused the label.
                 tauri::WindowEvent::Destroyed => {
+                    local_history::EDITOR_GATES.unregister_window(window.label());
                     let label = cide_ipc::WindowLabel(window.label().to_string());
                     window.app_handle().state::<cmd::search::SearchRegistry>()
                         .cancel_search_window(window.label());
@@ -980,6 +995,7 @@ pub fn run() {
             // Before any window exists, so the first mutation can already broadcast.
             app.state::<WorkspaceState>()
                 .attach_app(app.handle().clone());
+            local_history::sync(app.handle(), &app.state::<WorkspaceState>().snapshot());
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());

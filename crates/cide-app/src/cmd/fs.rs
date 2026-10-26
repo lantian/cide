@@ -909,7 +909,11 @@ pub async fn fs_write_file(
     let fs = project_fs(&registry, project)?;
     blocking("fs_write_file", move || {
         ops::check_within(&fs.writable_paths(), &path)?;
-        ops::write(&path, &contents)?;
+        crate::local_history::mutate(
+            &path,
+            cide_ipc::local_history::HistorySource::FileOperation,
+            || ops::write(&path, &contents),
+        )?;
         // Nothing watches the drawer, so a write that created a file there has to say so or
         // the row appears the next time somebody folds the group. Guarded, so the ordinary
         // write — a project file — costs one lock and a prefix test.
@@ -929,7 +933,15 @@ pub async fn fs_create(
     let fs = project_fs(&registry, project)?;
     blocking("fs_create", move || {
         ops::check_within(&fs.writable_paths(), &path)?;
-        ops::create(&path, directory)?;
+        if directory {
+            ops::create(&path, directory)?;
+        } else {
+            crate::local_history::mutate(
+                &path,
+                cide_ipc::local_history::HistorySource::FileOperation,
+                || ops::create(&path, false),
+            )?;
+        }
         let _ = relist_if_scratch(&fs, std::slice::from_ref(&path));
         Ok(())
     })
@@ -983,7 +995,15 @@ pub(crate) fn create_entry(
     name: &str,
     directory: bool,
 ) -> Result<PathBuf, FsError> {
-    let created = ops::create_in(&fs.writable_paths(), parent, name, directory)?;
+    let created = if directory {
+        ops::create_in(&fs.writable_paths(), parent, name, true)?
+    } else {
+        crate::local_history::mutate(
+            &parent.join(name),
+            cide_ipc::local_history::HistorySource::FileOperation,
+            || ops::create_in(&fs.writable_paths(), parent, name, false),
+        )?
+    };
     Ok(show_now(fs, created))
 }
 
@@ -1355,7 +1375,22 @@ pub(crate) fn rename_entry(
     ops::check_within(&writable, from)?;
     ops::check_within(&writable, to)?;
     ops::check_not_root(&writable, from)?;
-    ops::rename(from, to)?;
+    crate::local_history::mutate_tree(
+        &[from.to_path_buf(), to.to_path_buf()],
+        || ops::rename(from, to),
+        &|result| {
+            if result.is_ok() {
+                vec![cide_core::local_history::HistoryTreeChange {
+                    from: from.into(),
+                    to: to.into(),
+                    moved: true,
+                    created: true,
+                }]
+            } else {
+                Vec::new()
+            }
+        },
+    )?;
     // The fold [`delete_entries`] carries, for its reason: inside an ignored directory this
     // is the only mechanism that will ever move the row, and even outside one it is what
     // makes the new name appear before the watcher's debounce. Both ends in one change, the
@@ -1438,7 +1473,11 @@ pub(crate) fn delete_entries(
     let mut trashed = Vec::with_capacity(paths.len());
     let mut failure: Option<FsError> = None;
     for path in paths {
-        match ops::delete(path) {
+        match crate::local_history::mutate_tree(
+            std::slice::from_ref(path),
+            || ops::delete(path),
+            &|_| Vec::new(),
+        ) {
             Ok(dest) => trashed.push(dest),
             Err(err) => {
                 tracing::warn!(
@@ -1867,15 +1906,48 @@ fn paste_with_source_roots(
     // is copied into the project with the gesture the user already knows.
     let writable = fs.writable_paths();
     let source_writable = source.map(crate::files::ProjectFs::writable_paths);
-    let pasted = cide_fs::copy::paste_between(
-        source_roots
-            .or(source_writable.as_deref())
-            .unwrap_or(&writable),
-        &writable,
-        sources,
-        dest_dir,
-        mode,
-        decisions,
+    let mut history_paths = sources.to_vec();
+    history_paths.extend(
+        sources
+            .iter()
+            .filter_map(|p| p.file_name().map(|name| dest_dir.join(name))),
+    );
+    let pasted = crate::local_history::mutate_tree(
+        &history_paths,
+        || {
+            cide_fs::copy::paste_between(
+                source_roots
+                    .or(source_writable.as_deref())
+                    .unwrap_or(&writable),
+                &writable,
+                sources,
+                dest_dir,
+                mode,
+                decisions,
+            )
+        },
+        &|result: &Result<Vec<cide_ipc::PastedEntry>, FsError>| match result {
+            Ok(entries) => entries
+                .iter()
+                .map(|e| cide_core::local_history::HistoryTreeChange {
+                    from: e.source.clone(),
+                    to: e.dest.clone(),
+                    moved: mode == cide_ipc::PasteMode::Cut,
+                    created: e.replaced == 0,
+                })
+                .collect(),
+            Err(FsError::PartialPaste { pasted, .. }) => sources
+                .iter()
+                .zip(pasted.iter())
+                .map(|(from, to)| cide_core::local_history::HistoryTreeChange {
+                    from: from.clone(),
+                    to: PathBuf::from(to),
+                    moved: mode == cide_ipc::PasteMode::Cut,
+                    created: false,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
     )?;
 
     // A cut out of another project: fold the sources into *its* index, the same way the

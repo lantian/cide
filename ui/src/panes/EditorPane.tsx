@@ -20,6 +20,7 @@ import {
   type ReactNode,
 } from 'react'
 import { EditorSurface, type SaveCause } from '@/editor/EditorSurface'
+import { useHistoryRestoreGate } from '@/editor/useHistoryRestoreGate'
 
 /**
  * How long a burst of `cide://git-status` events is held before one on-disk check runs.
@@ -1322,6 +1323,7 @@ export function EditorPane({
       })
       .catch(() => {})
   }, [path, read])
+  const historyGateHandle = useHistoryRestoreGate(pane, path, () => dirtyRef.current, () => { read(true) })
 
   /**
    * Follow the file across a git operation. (M20)
@@ -1501,6 +1503,7 @@ export function EditorPane({
           onSyncHandle={onSyncHandle}
         >
         <EditorSurface
+          onHistoryGateHandle={historyGateHandle}
           sharedFile
           comparison={comparison}
           path={path}

@@ -118,7 +118,7 @@ const dispatchTs = read('../src/keys/dispatch.ts')
  */
 function handlers() {
   const source = stripComments(dispatchTs)
-  const marks = [...source.matchAll(/case '([a-zA-Z][\w.]*)':/g)]
+  const marks = [...source.matchAll(/case '([a-zA-Z][\w.-]*)':/g)]
   const end = source.indexOf('default:', marks.at(-1)?.index ?? 0)
   return marks.map((mark, i) => {
     const from = mark.index + mark[0].length

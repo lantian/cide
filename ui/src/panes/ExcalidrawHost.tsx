@@ -28,6 +28,7 @@ export function drawingSessions(boot: Bootstrap): ReadonlyMap<string, Excalidraw
         // A File tab can contain Claude splits; PaneBody only renders its editor pane.
         if (pane.kind !== 'editor') continue
         live.set(pane.id, {
+          pane: pane.id,
           project: id,
           tab: tab.id,
           path: tab.kind.path,
@@ -67,8 +68,8 @@ function followWorkspace(): void {
 
 export function ExcalidrawHost({ pane, ...props }: ExcalidrawPaneProps & { pane: string }): ReactNode {
   const slot = useRef<HTMLDivElement>(null)
-  const latest = useRef(props)
-  latest.current = props
+  const latest = useRef({ ...props, pane })
+  latest.current = { ...props, pane }
   const { project, tab } = props
 
   useLayoutEffect(() => {
@@ -79,7 +80,7 @@ export function ExcalidrawHost({ pane, ...props }: ExcalidrawPaneProps & { pane:
   }, [pane, project, tab])
 
   useLayoutEffect(() => {
-    if (slot.current !== null) hosts.update(pane, slot.current, props)
+    if (slot.current !== null) hosts.update(pane, slot.current, { ...props, pane })
   })
 
   // Standalone panes have no workspace identity to retain or reconcile.

@@ -784,8 +784,10 @@ version = "0.16.3-dev"
 dependencies = [
  "blake3",
  "chrono",
+ "cide-fs",
  "cide-ipc",
  "flate2",
+ "globset",
  "indexmap 2.14.0",
  "libc",
  "parking_lot",

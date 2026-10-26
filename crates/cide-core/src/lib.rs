@@ -42,6 +42,7 @@ pub mod isolated_env;
 pub mod jsonlog;
 pub mod keymap;
 pub mod layout;
+pub mod local_history;
 pub mod login_path;
 /// Node package managers' global-binary directories: where `npm -g` puts a thing on a machine
 /// whose shell rc, not its desktop launcher, put that directory on `PATH`.

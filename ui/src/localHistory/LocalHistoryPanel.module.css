@@ -1,0 +1,10 @@
+.panel { display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0; background: var(--panel); color: var(--text); }
+.columns { display: flex; flex: 1; min-height: 0; min-width: 0; overflow: auto; }
+.paths, .revisions { display: flex; flex-direction: column; flex: 0 0 27%; min-width: calc(180px * var(--ui-scale)); min-height: 0; border-right: 1px solid var(--border); }
+.preview { display: flex; flex-direction: column; flex: 1; min-width: calc(240px * var(--ui-scale)); min-height: 0; overflow: hidden; }
+.scroll { overflow: auto; min-height: 0; flex: 1; }
+.filters { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2); }
+.caption { padding: var(--sp-2); font-size: var(--fs-ui-12); overflow-wrap: anywhere; border-bottom: 1px solid var(--border); }
+.coverage { flex: none; padding: var(--sp-1) var(--sp-2); color: var(--dim); font-size: var(--fs-ui-11); border-top: 1px solid var(--border); }
+.largeDiff { display: flex; }
+.largeDiff :global(.cm-editor) { flex: 1; min-width: 0; border-right: 1px solid var(--border); }

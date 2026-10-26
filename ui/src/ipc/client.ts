@@ -16,6 +16,8 @@ import { listen as tauriListen, type Event as TauriEvent } from '@tauri-apps/api
 import { guardUnlisten } from './unlisten'
 import type {
   Axis,
+  LocalHistoryView, HistoryCompareToken, HistoryRestoreResult, HistoryEditorRegistration, HistoryEditorGate, HistoryStatus, HistoryRootId, HistoryPathPage, HistoryRevisionPage, HistoryComparison,
+  HistoryPolicy, HistoryInvalidation, LocalRevisionId,
   Bootstrap,
   Capabilities,
   ColorScheme,
@@ -1429,6 +1431,8 @@ export const remote = {
 }
 
 export const events = {
+  onLocalHistoryEditorGate: (handler: (gate: HistoryEditorGate) => void) => listen<HistoryEditorGate>('cide://local-history-editor-gate', (e) => handler(e.payload)),
+  onLocalHistoryChanged: (handler: (change: HistoryInvalidation) => void) => listen<HistoryInvalidation>('cide://local-history-changed', (e) => handler(e.payload)),
   onUserRequestsChanged: (handler: (payload: { project: ProjectId; view: import("./generated").UserRequestsView }) => void) =>
     listen<{ project: ProjectId; view: import("./generated").UserRequestsView }>("cide://user-requests-changed", (event) => handler(event.payload)),
   /**
@@ -5753,6 +5757,21 @@ export const languageServers = {
   get: (project: ProjectId) => invoke<import('./generated').LanguageServerSnapshot[]>('language_servers_get', { project }),
   control: (project: ProjectId, source: string | null, action: import('./generated').LanguageServerAction) => invoke<void>('language_servers_control', { project, source, action }),
   logs: (project: ProjectId, source: string, after: number) => invoke<import('./generated').LanguageServerLogs>('language_servers_logs', { project, source, after }),
+}
+
+export const localHistory = {
+  openView: (project: ProjectId, path: string | null, root: HistoryRootId | null = null) => invoke<LocalHistoryView>('local_history_open_view', { project, path, root }),
+  closeView: (project: ProjectId, view: LocalHistoryView) => invoke<void>('local_history_close_view', { project, view }),
+  restore: (project: ProjectId, root: HistoryRootId, token: HistoryCompareToken, confirmed: boolean) => invoke<HistoryRestoreResult>('local_history_restore', { project, root, token, confirmed }),
+  registerEditor: (editor: string, path: string) => invoke<HistoryEditorRegistration>('local_history_editor_register', { editor, path }),
+  unregisterEditor: (editor: string, mount: string) => invoke<void>('local_history_editor_unregister', { editor, mount }),
+  acknowledge: (editor: string, mount: string, request: string, dirty: boolean) => invoke<void>('local_history_editor_acknowledge', { editor, mount, request, dirty }),
+  status: (project: ProjectId) => invoke<HistoryStatus[]>('local_history_status', { project }),
+  paths: (project: ProjectId, root: HistoryRootId, generation: number, after: string | null, filter: string, deletedOnly: boolean) => invoke<HistoryPathPage>('local_history_paths', { project, root, generation, after, filter, deletedOnly }),
+  list: (project: ProjectId, root: HistoryRootId, generation: number, path: string, before: number | null) => invoke<HistoryRevisionPage>('local_history_list', { project, root, generation, path, before }),
+  compare: (project: ProjectId, root: HistoryRootId, generation: number, path: string, target: LocalRevisionId, other: LocalRevisionId | null) => invoke<HistoryComparison>('local_history_compare', { project, root, generation, path, target, other }),
+  setPolicy: (project: ProjectId, root: HistoryRootId, generation: number, policy: HistoryPolicy) => invoke<HistoryStatus>('local_history_set_policy', { project, root, generation, policy }),
+  clear: (project: ProjectId, root: HistoryRootId, generation: number, confirmed: boolean) => invoke<HistoryStatus>('local_history_clear', { project, root, generation, confirmed }),
 }
 
 /** Clipboard snapshots and shared file buffers live in the native process, never the layout. */

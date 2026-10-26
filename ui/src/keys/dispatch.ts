@@ -1,3 +1,4 @@
+import { localHistory } from '@/ipc/client'
 import { showProblems } from '@/toolwindow/selection'
 /**
  * Command dispatch — what actually happens when the gate resolves a chord, or the palette
@@ -1608,6 +1609,15 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      case 'local-history.file':
+      case 'local-history.project': {
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no project is open')
+        const path = command === 'local-history.file' ? pathArg(args) ?? focusedTabPath(boot()) : null
+        if (command === 'local-history.file' && path === null) return unmet(command, 'no file tab is active')
+        void localHistory.openView(project.id, path).catch((error: unknown) => notify(String(error), { kind: 'error' }))
+        return
+      }
       case 'git.history.file': {
         if (boot()?.role.kind !== 'shell') {
           return unmet(command, 'this window has no tool window')

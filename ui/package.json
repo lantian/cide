@@ -68,6 +68,7 @@
     "check:keymap": "node scripts/check-keymap.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:latin": "node scripts/check-latin.mjs",
+    "check:local-history": "node scripts/check-local-history.mjs",
     "check:log": "node scripts/check-log.mjs",
     "check:log-actions": "node scripts/check-log-actions.mjs",
     "check:log-render": "node scripts/check-log-render.mjs",

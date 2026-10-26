@@ -18924,3 +18924,37 @@ Investigation also reproduced duplicate entries with timestamped files and `hist
 history -n` in plain Bash 3.2 without Cide. This upstream behavior is not changed here; the
 timestamp fixture covers the managed profile's `history -a` hook, while the existing
 append/read-hook fixture retains its explicit untimestamped history format.
+
+## M193 — Root-scoped Local History and guarded recovery
+
+Added automatic local file history for open project roots, independently of Git and editor
+visibility. Canonical roots own profile-local immutable records and deduplicated blobs,
+with bounded baseline/reopen observation, hidden-file subscriptions, direct mutation
+pre/post capture, explicit absence and rename lifecycles, recovery, retention and validated
+root settings. Worktrees stay isolated; capture gaps and unavailable storage are visible
+without changing ordinary save outcomes.
+
+File/tree menus and palette commands open persistent, deduplicated Local History views.
+The project browser includes deleted paths, paginated revisions, source/lineage details,
+read-only comparisons and confirmed clear/restore. Restore revalidates disk digests and
+containment, requires a durable pinned safety revision, and prepares live clean editors
+across windows before mutation. Text and drawing editors gate edits/saves; successful
+restores reload clean surfaces. Post-record failure reports the successful file mutation
+and preserves the safety state.
+
+Validation: codegen/contract checks (413 commands, 46 events), TypeScript and production UI
+build passed. Focused Rust history, IPC, observer/filter, document, persistence, command,
+view and editor expectation tests passed. Local History behavior/SSR and 33 affected UI
+checks passed, including drawing jsdom restore gating, reload/undo isolation and teardown.
+The broader app filesystem tests passed 18/19 with a private temporary trash location. Its
+native linked-target notification test failed identically on pre-change commit `b0e0452`
+in the initial restricted environment. That initial run did not perform full CI, live
+agent, native multi-window acceptance or visual review. PR preparation subsequently
+integrated current master, ran the complete host suite, corrected Clippy and asynchronous
+UI-test warnings/failures, and repeated the affected checks. The verification record
+distinguishes the original aggregate failures from successful individual reruns. Native
+multi-window acceptance and visual review remain pending.
+
+See [Local History](local-history.md) for storage, defaults, coverage/recovery limits and
+reviewer acceptance steps, and [verification](local-history-verification.md) for commands
+and recorded outcomes.

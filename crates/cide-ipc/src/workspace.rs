@@ -317,8 +317,8 @@ pub const TOOL_WINDOW_MIN_HEIGHT: u16 = 120;
 /// is tall enough to honour it.
 pub const TOOL_WINDOW_MAX_HEIGHT: u16 = 900;
 
-/// The Git tool window's own state, per project — and once more on [`Workspace`] itself, for
-/// the shell that has no project open. (M18, M74)
+/// The history tool window's own state, per project — and once more on [`Workspace`] itself,
+/// for the shell that has no project open. Git and Local History share its layout. (M18, M74)
 ///
 /// One type for both because the panel is one panel: the tab strip, the splitter, the repair
 /// pass and every command that moves any of it are written against this shape, and a second,
@@ -326,7 +326,7 @@ pub const TOOL_WINDOW_MAX_HEIGHT: u16 = 900;
 /// What differs is only which of them can be *reached* — see [`Workspace::tool_window`].
 ///
 /// Per project and not per window, deliberately. The panel is a view of *this project's*
-/// repositories, and the same project shown in two windows (which `Stacked` mode makes ordinary)
+/// repositories and roots, and the same project shown in two windows (which `Stacked` mode makes ordinary)
 /// is one set of open histories; keying it by window would mean a user who detaches a tab finds
 /// the panel they were reading empty, and a user who reads a history in two windows has to open
 /// it twice.
@@ -392,6 +392,11 @@ pub struct ToolWindowState {
     /// decided.
     #[serde(default = "files_as_tree_default")]
     pub files_as_tree: bool,
+    // Local and Git histories keep separate identities while sharing this panel's layout.
+    #[serde(default)]
+    pub local_history: Vec<crate::local_history::LocalHistoryView>,
+    #[serde(default)]
+    pub active_local_history: Option<crate::local_history::LocalHistoryView>,
 }
 
 /// Grouped. A free function because `#[serde(default = …)]` names a path, not an expression, and
@@ -403,6 +408,8 @@ fn files_as_tree_default() -> bool {
 impl Default for ToolWindowState {
     fn default() -> Self {
         Self {
+            local_history: Vec::new(),
+            active_local_history: None,
             open: false,
             height: 260,
             history: Vec::new(),

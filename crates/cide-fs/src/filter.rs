@@ -416,16 +416,23 @@ impl Filter {
                 git: false,
             });
 
-            // `info/exclude` is still resolved from the root's *own* git directory, which for
-            // a linked worktree is `<common>/worktrees/<name>` and holds no `info/` — so a
-            // linked worktree's `info/exclude` is not read. Left as it was on purpose: that
-            // is a rule about *ignoring*, the file is per-worktree in git's own model, and
-            // `git_dirs` is a flat list with no root to attribute an entry back to. The
-            // watcher half — the three defects this pass is about — does not depend on it.
+            // Linked worktrees keep shared excludes in their common directory. Reading only
+            // the private worktree directory would admit files Git ignores into local history.
             let Some(git_dir) = git_dir(root) else {
                 continue;
             };
-            let exclude = git_dir.join("info/exclude");
+            let common = std::fs::read_to_string(git_dir.join("commondir"))
+                .ok()
+                .map(|s| {
+                    let path = PathBuf::from(s.trim());
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        git_dir.join(path)
+                    }
+                })
+                .unwrap_or(git_dir);
+            let exclude = common.join("info/exclude");
             if exclude.is_file() {
                 let mut builder = GitignoreBuilder::new(root);
                 if builder.add(&exclude).is_none()
@@ -609,7 +616,7 @@ impl Filter {
 
     /// A retargeted directory link can bring a different set of ignore rules under an
     /// existing logical path. Refresh on directory reads, without changing the shared roots.
-    pub(crate) fn refresh_rules(&self, dir: &Path) {
+    pub fn refresh_rules(&self, dir: &Path) {
         let file = dir.join(".gitignore");
         let rules = (file.is_file() || dir.join(".ignore").is_file())
             .then(|| {
@@ -748,7 +755,7 @@ impl Filter {
     /// Separate from [`Filter::admits`] because with *show ignored files* on, the tree needs
     /// the paths and the watcher needs the verdict about them, and one function cannot answer
     /// both.
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         // Deepest first — a `.gitignore` nearer the file wins, including when it whitelists
         // something a shallower one ignored. `matched_path_or_any_parents` also applies the
         // rule that nothing inside an ignored directory can be brought back.
@@ -882,6 +889,34 @@ pub fn git_dir(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::testing::scratch;
+    #[test]
+    fn linked_worktrees_share_common_info_excludes() {
+        let dir = scratch("history-common-exclude");
+        let root = dir.join("checkout");
+        let common = dir.join("repository.git");
+        let private = common.join("worktrees/checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(common.join("info")).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(common.join("info/exclude"), "secret.local\n").unwrap();
+        let filter = Filter::build(
+            std::slice::from_ref(&root),
+            vec![root.as_path()],
+            Visibility {
+                hidden: true,
+                ignored: false,
+            },
+        );
+        assert!(filter.is_ignored(&root.join("secret.local"), false));
+        assert!(!filter.watchable(&root.join("secret.local"), false));
+        assert!(filter.admits(&root.join("source.rs"), false));
+    }
 
     #[test]
     fn a_gitignored_path_is_rejected_and_a_whitelisted_one_survives() {

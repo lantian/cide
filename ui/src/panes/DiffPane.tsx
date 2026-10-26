@@ -66,7 +66,7 @@ function countLines(text: string): number {
   return n
 }
 
-function tooLargeToDiff(original: string, proposed: string): boolean {
+export function tooLargeToDiff(original: string, proposed: string): boolean {
   if (original.length + proposed.length > MAX_DIFF_CHARS) return true
   return countLines(original) + countLines(proposed) > MAX_DIFF_LINES
 }

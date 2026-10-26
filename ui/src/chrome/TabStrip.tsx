@@ -57,6 +57,8 @@
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
+import { localHistory } from '@/ipc/client'
+import { notifyFailure } from '@/chrome/notices'
 import { canCompareClipboard, compareToClipboard } from '@/editor/compareClipboard'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
@@ -331,6 +333,7 @@ export function TabStrip({
         split: onSplit,
         detach: onDetach,
         ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
+        ...(project ? { localHistory: (path: string) => { void localHistory.openView(project, path).catch(notifyFailure) } } : {}),
         ...(onShowHistory ? { history: onShowHistory } : {}),
         ...(onProperties ? { properties: onProperties } : {}),
       })

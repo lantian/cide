@@ -27,7 +27,7 @@ const modules = {
   `,
   control: `
     export const control = {
-      records: new Map(), canvases: new Map(), tool: new Set(), git: new Set(),
+      records: new Map(), canvases: new Map(), tool: new Set(), git: new Set(), history: new Set(), historyMounts: new Map(), acks: [], nextMount: 0,
       dirty: [], reads: [], writes: [], mounts: 0, unmounts: 0, nextId: 0, nextStat: null, refreshes: [],
     };
   `,
@@ -41,7 +41,15 @@ const modules = {
     export const diag = { log: async () => {} };
     export const fileChanged = error => error?.changed === true;
     const listen = set => async handler => { set.add(handler); return () => set.delete(handler); };
-    export const events = { onSessionTool: listen(control.tool), onGitStatus: listen(control.git) };
+    export const events = { onSessionTool: listen(control.tool), onGitStatus: listen(control.git), onLocalHistoryEditorGate: listen(control.history) };
+    export const localHistory = {
+      registerEditor: async (editor, canonicalPath) => {
+        const registration = { window: 'test', editor, canonicalPath, mount: String(++control.nextMount) };
+        control.historyMounts.set(editor, registration); return registration;
+      },
+      unregisterEditor: async (editor, mount) => { if (control.historyMounts.get(editor)?.mount === mount) control.historyMounts.delete(editor); },
+      acknowledge: async (editor, mount, request, dirty) => { control.acks.push({ editor, mount, request, dirty }); },
+    };
     export const file = {
       readBytes: async path => {
         control.reads.push(path);
@@ -95,6 +103,7 @@ const modules = {
           getAppState: () => state, getFiles: () => files,
           getSceneElements: () => elements.filter(e => !e.isDeleted),
           getSceneElementsIncludingDeleted: () => elements,
+          updateScene: ({ appState }) => { Object.assign(state, appState); emit(); },
           view: patch => { Object.assign(state, patch); emit(); },
           edit: () => {
             undo.push(structuredClone(elements)); redo.length = 0;
@@ -200,6 +209,11 @@ try {
     return control.canvases.get(document.querySelector('#root [data-canvas]').dataset.canvas)
   }
   const emitTool = async path => act(async () => { for (const fn of control.tool) fn('agent', [path]) })
+  const emitGate = async (editor, request, phase, restored = false) => act(async () => {
+    const registration = control.historyMounts.get(editor);
+    assert.ok(registration, 'the live editor registered its mount identity');
+    for (const fn of control.history) fn({ editors: [registration], request, phase, restored });
+  })
   const latestDirty = tab => control.dirty.filter(change => change.tab === tab).at(-1)?.dirty
   const diskVersion = path => JSON.parse(new TextDecoder().decode(control.records.get(path).bytes)).elements[0].version
 
@@ -238,6 +252,16 @@ try {
   assert.equal(focus, 1, 'reattached nested roots still raise pane focus')
   assert.equal(menus, 0, 'drawing context menu does not open the pane menu')
   assert.equal(control.mounts, 2)
+
+  await emitGate('pane-p', 'dirty-restore', 'prepare')
+  assert.equal(a.getAppState().viewModeEnabled, true, 'drawing freezes before a live dirty acknowledgement')
+  assert.equal(control.acks.at(-1).dirty, true)
+  const writesBeforeGate = control.writes.length
+  await act(async () => { await saveTab('t-p') })
+  assert.equal(control.writes.length, writesBeforeGate, 'a gated drawing cannot save')
+  await emitGate('pane-p', 'dirty-restore', 'release')
+  assert.equal(a.getAppState().viewModeEnabled, false)
+  assert.equal(control.canvases.get(a.id), a, 'refused restore retains the engine and undo stack')
 
   await show('q')
   await act(async () => { await saveTab('t-p') })
@@ -291,7 +315,19 @@ try {
   assert.equal(reloaded.getSceneElements()[0].version, 30, 'reload cannot undo into the discarded scene')
   await act(async () => button('Reload').click())
   await waitFor(() => !control.canvases.has(reloaded.id))
-  const current = control.canvases.get(document.querySelector('#root [data-canvas]').dataset.canvas)
+  let current = control.canvases.get(document.querySelector('#root [data-canvas]').dataset.canvas)
+  await emitGate('pane-p', 'clean-restore', 'prepare')
+  assert.equal(control.acks.at(-1).dirty, false)
+  assert.equal(current.getAppState().viewModeEnabled, true)
+  const beforeRestore = current
+  record(p, 40)
+  await emitGate('pane-p', 'clean-restore', 'release', true)
+  await waitFor(() => !control.canvases.has(beforeRestore.id))
+  current = control.canvases.get(document.querySelector('#root [data-canvas]').dataset.canvas)
+  assert.equal(current.getSceneElements()[0].version, 40, 'successful restore reloads disk bytes')
+  assert.equal(current.getAppState().viewModeEnabled, false, 'replacement engine releases the restore gate')
+  await act(async () => current.undo())
+  assert.equal(current.getSceneElements()[0].version, 40, 'restored drawing cannot undo into pre-restore contents')
 
   await show('q')
   const renamed = '/p/renamed.excalidraw.json'
@@ -334,6 +370,8 @@ try {
   assert.equal(control.mounts, control.unmounts)
   assert.equal(control.tool.size, 0)
   assert.equal(control.git.size, 0)
+  assert.equal(control.history.size, 0)
+  assert.equal(control.historyMounts.size, 0)
 
   // A late cleanup from an old split slot must not steal a newer attachment.
   const registry = createDrawingHosts(props => React.createElement('span', null, props.path))
@@ -348,7 +386,7 @@ try {
   assert.equal(second.textContent, 'second')
   await act(async () => { releaseNew(); registry.reconcile(new Map()) })
   first.remove(); second.remove()
-  console.log('Excalidraw sessions: tab/project switches, undo, saving, reloads, rename, ownership and cleanup: ok')
+  console.log('Excalidraw sessions: tab/project switches, undo, saving, reloads, restore gates, rename, ownership and cleanup: ok')
 } finally {
   if (outer) await act(async () => outer.unmount())
   if (testModule) await act(async () => {

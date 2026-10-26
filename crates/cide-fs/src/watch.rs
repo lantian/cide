@@ -62,6 +62,48 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debounc
 
 use crate::filter::Filter;
 
+pub type HistoryAdmission = dyn Fn(&Path, bool) -> bool + Send + Sync;
+
+/// Independent from tree visibility. Directory discovery may continue after watcher startup.
+pub struct HistorySubscription {
+    pub directories: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>,
+    pub admits: Arc<HistoryAdmission>,
+    pub changed: Arc<dyn Fn(FsChange) + Send + Sync>,
+    pub degraded: Arc<dyn Fn(String) + Send + Sync>,
+    pub ready: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
+}
+impl std::fmt::Debug for HistorySubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HistorySubscription")
+    }
+}
+impl HistorySubscription {
+    pub fn accepts(&self, path: &Path, is_dir: bool) -> bool {
+        (self.admits)(path, is_dir)
+    }
+    pub fn deliver(&self, mut change: FsChange) {
+        change
+            .paths
+            .retain(|p| self.accepts(Path::new(p), Path::new(p).is_dir()));
+        if change.truncated || !change.paths.is_empty() {
+            (self.changed)(change);
+        }
+    }
+}
+
+fn subscriber_admission(
+    filter: &Filter,
+    history_only: bool,
+    history: Option<&HistorySubscription>,
+    path: &Path,
+    directory: bool,
+) -> (bool, bool) {
+    (
+        !history_only && filter.watchable(path, directory),
+        history.is_some_and(|h| h.accepts(path, directory)),
+    )
+}
+
 /// What the watcher tells the app about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchEvent {
@@ -73,6 +115,9 @@ pub enum WatchEvent {
 
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
+    /// Startup observation without a tree subscriber must use only history admission.
+    pub history_only: bool,
+    pub history: Option<Arc<HistorySubscription>>,
     pub budget: Arc<crate::budget::Budget>,
     pub files: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
@@ -104,6 +149,8 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
+            history: None,
+            history_only: false,
             budget: crate::budget::Budget::standalone(),
             files: Vec::new(),
             roots: Vec::new(),
@@ -175,10 +222,62 @@ fn run(
     let (tx, rx) = mpsc::sync_channel::<DebounceEventResult>(8);
     let (mut backend, mut status) = Backend::start(&config, &filter, tx.clone());
     sink(WatchEvent::Status(status.clone()));
+    if let Some(history) = &config.history
+        && let Some(reason) = &status.reason
+    {
+        (history.degraded)(reason.clone());
+    }
 
     let mut coalescer = Coalescer::new(config.quiet, config.max_wait, config.max_paths);
+    let mut history_changes = Coalescer::new(config.quiet, config.max_wait, config.max_paths);
+    let mut history_dirs = HashSet::<PathBuf>::new();
 
     while !stop.load(Ordering::Acquire) && !config.budget.cancelled() {
+        if let Some(history) = &config.history {
+            let desired: HashSet<_> = (history.directories)()
+                .into_iter()
+                .filter(|p| history.accepts(p, true))
+                .collect();
+            for path in desired.difference(&history_dirs) {
+                // Non-recursive descriptors preserve ignore/dependency pruning at every depth.
+                if let Err(error) = backend.watch_history_directory(path) {
+                    (history.degraded)(format!("History directory could not be watched: {error}"));
+                    if matches!(error.kind, ErrorKind::MaxFilesWatch) && !backend.is_polling() {
+                        let mut fallback = config.clone();
+                        fallback.dirs = backend
+                            .aliases
+                            .directories
+                            .iter()
+                            .chain(desired.iter())
+                            .cloned()
+                            .collect();
+                        (backend, status) = Backend::start_polling(
+                            &fallback,
+                            &filter,
+                            tx.clone(),
+                            enospc_reason(backend.watched.len()),
+                        );
+                        sink(WatchEvent::Status(status.clone()));
+                    }
+                }
+            }
+            for path in history_dirs.difference(&desired) {
+                if !config.dirs.contains(path)
+                    && (config.history_only || !filter.watchable(path, true))
+                    && let Ok(real) = std::fs::canonicalize(path)
+                {
+                    backend.unwatch_real(&real);
+                }
+            }
+            history_dirs = desired
+                .into_iter()
+                .filter(|p| {
+                    backend.watched.contains(p)
+                        || backend.recursive.iter().any(|r| p.starts_with(r))
+                })
+                .collect();
+            (history.ready)(history_dirs.iter().cloned().collect());
+        }
         match rx.recv_timeout(TICK) {
             Ok(Ok(events)) => {
                 for event in events {
@@ -213,7 +312,14 @@ fn run(
                         // directory map first, then filter each logical alias independently.
                         for path in backend.aliases.paths(physical) {
                             let is_dir = path.is_dir();
-                            if !filter.watchable(&path, is_dir) {
+                            let (tree, history) = subscriber_admission(
+                                &filter,
+                                config.history_only,
+                                config.history.as_deref(),
+                                &path,
+                                is_dir,
+                            );
+                            if !tree && !history {
                                 continue;
                             }
                             let known = backend.aliases.directories.contains(&path);
@@ -235,12 +341,29 @@ fn run(
                                     .keys()
                                     .filter(|p| !previous.contains(*p))
                                 {
-                                    coalescer.push(child.clone(), filter.is_git_path(child));
+                                    let (tree, history) = subscriber_admission(
+                                        &filter,
+                                        config.history_only,
+                                        config.history.as_deref(),
+                                        child,
+                                        child.is_dir(),
+                                    );
+                                    if tree {
+                                        coalescer.push(child.clone(), filter.is_git_path(child));
+                                    }
+                                    if history {
+                                        history_changes.push(child.clone(), false);
+                                    }
                                 }
                             } else if is_dir && !known {
                                 backend.watch_tree(&path, &filter);
                             }
-                            coalescer.push(path.clone(), filter.is_git_path(&path));
+                            if tree {
+                                coalescer.push(path.clone(), filter.is_git_path(&path));
+                            }
+                            if history {
+                                history_changes.push(path.clone(), false);
+                            }
                         }
                     }
                 }
@@ -251,6 +374,9 @@ fn run(
                     .any(|e| matches!(e.kind, ErrorKind::MaxFilesWatch));
                 for error in &errors {
                     tracing::warn!(kind = ?error.kind, paths = ?error.paths, "watcher error");
+                    if let Some(history) = &config.history {
+                        (history.degraded)(format!("Filesystem observer reported a gap: {error}"));
+                    }
                 }
                 if exhausted && !backend.is_polling() {
                     let reason = enospc_reason(backend.watched.len());
@@ -273,13 +399,20 @@ fn run(
 
         if backend.overflow.swap(false, Ordering::AcqRel) {
             coalescer.truncated = true;
+            history_changes.truncated = true;
             for root in &config.roots {
                 backend.watch_tree(root, &filter);
                 coalescer.push(root.clone(), false);
+                history_changes.push(root.clone(), false);
             }
         }
         if let Some(change) = coalescer.take_due(Instant::now()) {
             sink(WatchEvent::Changed(change));
+        }
+        if let Some(change) = history_changes.take_due(Instant::now())
+            && let Some(history) = &config.history
+        {
+            history.deliver(change);
         }
     }
 
@@ -287,6 +420,11 @@ fn run(
     // project closing, but a stop during a build would otherwise drop a real change.
     if let Some(change) = coalescer.take_pending() {
         sink(WatchEvent::Changed(change));
+    }
+    if let Some(change) = history_changes.take_pending()
+        && let Some(history) = &config.history
+    {
+        history.deliver(change);
     }
 }
 
@@ -380,6 +518,8 @@ impl<W: notify::Watcher> notify::Watcher for LiveCreates<W> {
 }
 
 struct Backend {
+    history_only: bool,
+    history: Option<Arc<HistorySubscription>>,
     overflow: Arc<AtomicBool>,
     budget: Arc<crate::budget::Budget>,
     inner: Inner,
@@ -555,6 +695,8 @@ impl Backend {
         };
 
         let mut backend = Self {
+            history: config.history.clone(),
+            history_only: config.history_only,
             overflow,
             budget: Arc::clone(&config.budget),
             inner: Inner::Native(debouncer),
@@ -587,14 +729,20 @@ impl Backend {
                 // the decision in `crate::filter`, next to the comment explaining what it
                 // costs — the alternative is a watcher that watches `refs` non-recursively
                 // because a second file said so.
-                .chain(filter.watched_paths().iter().map(|w| {
-                    let mode = if w.recursive {
-                        RecursiveMode::Recursive
-                    } else {
-                        RecursiveMode::NonRecursive
-                    };
-                    (w.path.clone(), mode)
-                }))
+                .chain(
+                    filter
+                        .watched_paths()
+                        .iter()
+                        .filter(|_| !config.history_only)
+                        .map(|w| {
+                            let mode = if w.recursive {
+                                RecursiveMode::Recursive
+                            } else {
+                                RecursiveMode::NonRecursive
+                            };
+                            (w.path.clone(), mode)
+                        }),
+                )
                 .collect()
         } else {
             tracing::info!(
@@ -677,6 +825,8 @@ impl Backend {
         .expect("PollWatcher has no resources to run out of");
 
         let mut backend = Self {
+            history: config.history.clone(),
+            history_only: config.history_only,
             overflow,
             budget: Arc::clone(&config.budget),
             inner: Inner::Polling(debouncer),
@@ -695,6 +845,18 @@ impl Backend {
             }
             let _ = backend.watch(path, RecursiveMode::NonRecursive);
         }
+        // A native-to-polling transition retains the known history directories, but
+        // the tree's file list need not contain their hidden children.
+        if let Some(history) = &config.history {
+            for dir in &config.dirs {
+                if backend.budget.stopped() {
+                    break;
+                }
+                if history.accepts(dir, true) {
+                    let _ = backend.watch_history_directory(dir);
+                }
+            }
+        }
         // Standalone callers may have only directory paths; discover their children using
         // the same admission budget, never the dependency's recursive polling cache.
         if config.files.is_empty() {
@@ -702,7 +864,11 @@ impl Backend {
                 backend.watch_tree(root, filter);
             }
         }
-        for watched in filter.watched_paths() {
+        for watched in filter
+            .watched_paths()
+            .iter()
+            .filter(|_| !config.history_only)
+        {
             backend.watch_tree(&watched.path, filter);
         }
         let status = WatchStatus {
@@ -715,6 +881,31 @@ impl Backend {
 
     fn is_polling(&self) -> bool {
         matches!(self.inner, Inner::Polling(_))
+    }
+
+    fn watch_history_directory(&mut self, path: &Path) -> notify::Result<()> {
+        self.watch(path, RecursiveMode::NonRecursive)?;
+        // Catalog polling only stats admitted paths. A directory watch alone misses
+        // edits to existing hidden files, which the visible tree's catalog omits.
+        if self.is_polling()
+            && let Ok(entries) = std::fs::read_dir(path)
+        {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if self.budget.stopped() {
+                    break;
+                }
+                if child.is_file()
+                    && self
+                        .history
+                        .as_ref()
+                        .is_some_and(|h| h.accepts(&child, false))
+                {
+                    self.watch(&child, RecursiveMode::NonRecursive)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
@@ -899,7 +1090,14 @@ impl Backend {
                 // watched list, so no entry on that list, present or future, can turn this
                 // descent loose on a 256-way object fanout.
                 let is_dir = child.is_dir();
-                if !filter.watchable(&child, is_dir) {
+                let (tree, history) = subscriber_admission(
+                    filter,
+                    self.history_only,
+                    self.history.as_deref(),
+                    &child,
+                    is_dir,
+                );
+                if !tree && !history {
                     continue;
                 }
                 if !is_dir && !self.is_polling() && !child.is_symlink() {
@@ -1000,6 +1198,105 @@ impl Coalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn polling_history_admits_hidden_files_outside_the_tree_catalog() {
+        let root = crate::testing::scratch("poll-hidden-history");
+        let hidden = root.join(".hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        let captured = hidden.join("source.rs");
+        let excluded = hidden.join("secret.env");
+        let visible = root.join("visible.rs");
+        for path in [&captured, &excluded, &visible] {
+            std::fs::write(path, "before").unwrap();
+        }
+        let history = Arc::new(HistorySubscription {
+            directories: Arc::new(Vec::new),
+            ready: Arc::new(|_| {}),
+            changed: Arc::new(|_| {}),
+            degraded: Arc::new(|_| {}),
+            admits: Arc::new(|path, _| path.file_name().is_some_and(|name| name != "secret.env")),
+        });
+        let filter = Filter::build(
+            &[root.to_path_buf()],
+            vec![root.path()],
+            crate::Visibility::CONSERVATIVE,
+        );
+        let config = WatchConfig {
+            roots: vec![root.to_path_buf()],
+            dirs: vec![root.to_path_buf()],
+            files: vec![visible],
+            history: Some(history),
+            poll_interval: Duration::from_millis(30),
+            debounce: Duration::from_millis(10),
+            ..WatchConfig::default()
+        };
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let (mut backend, _) = Backend::start_polling(&config, &filter, tx, "test".into());
+        assert!(!backend.aliases.logical.contains_key(&captured));
+        backend.watch_history_directory(&hidden).unwrap();
+        assert!(backend.aliases.logical.contains_key(&captured));
+        assert!(!backend.aliases.logical.contains_key(&excluded));
+        assert_eq!(
+            subscriber_admission(&filter, false, config.history.as_deref(), &captured, false),
+            (false, true)
+        );
+        // Rebuilding after native watch exhaustion must preserve the independently
+        // admitted files even though config.files still contains only visible rows.
+        drop(backend);
+        let mut fallback = config;
+        fallback.dirs.push(hidden);
+        let (tx, rx) = mpsc::sync_channel(8);
+        let (_backend, _) = Backend::start_polling(&fallback, &filter, tx, "fallback".into());
+        std::fs::write(&captured, "after external edit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(Ok(events)) = rx.recv_timeout(left)
+                && events.iter().any(|event| event.paths.contains(&captured))
+            {
+                return;
+            }
+        }
+        panic!("polling missed the hidden file's external edit");
+    }
+
+    #[test]
+    fn history_only_subscription_does_not_expand_dependency_or_tree_visibility_watches() {
+        let root = crate::testing::scratch("history-subscription");
+        let filter = Filter::build(
+            &[root.to_path_buf()],
+            vec![root.path()],
+            crate::Visibility::CONSERVATIVE,
+        );
+        let history = HistorySubscription {
+            directories: Arc::new(Vec::new),
+            ready: Arc::new(|_| {}),
+            changed: Arc::new(|_| {}),
+            degraded: Arc::new(|_| {}),
+            admits: Arc::new(|path, _| path.file_name().is_some_and(|n| n != "node_modules")),
+        };
+        assert_eq!(
+            subscriber_admission(&filter, true, Some(&history), &root.join(".hidden"), true),
+            (false, true)
+        );
+        assert_eq!(
+            subscriber_admission(
+                &filter,
+                true,
+                Some(&history),
+                &root.join("node_modules"),
+                true
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            subscriber_admission(&filter, false, Some(&history), &root.join("source"), true),
+            (true, true)
+        );
+        assert_eq!(
+            subscriber_admission(&filter, false, Some(&history), &root.join(".hidden"), true),
+            (false, true)
+        );
+    }
 
     /// Replay FSEvents' create flag, followed by its remove flag when the entry is gone.
     struct ReplayWatcher(Box<dyn notify::EventHandler>);

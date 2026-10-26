@@ -166,10 +166,14 @@ impl FsRegistry {
     /// `fs_close` hands it to a blocking worker rather than doing it on the async runtime.
     #[must_use = "dropping the entry here does the watcher teardown on this thread"]
     pub fn remove(&self, project: ProjectId) -> Option<Arc<ProjectFs>> {
-        self.projects.remove(&project).map(|(_, fs)| {
+        let removed = self.projects.remove(&project).map(|(_, fs)| {
             fs.cancel();
             fs
-        })
+        });
+        if removed.is_some() {
+            crate::local_history::tree_unsubscribed(project);
+        }
+        removed
     }
 
     /// Signal shutdown without synchronously freeing arenas on the lifecycle thread.
@@ -380,6 +384,7 @@ impl Indexing {
         drop(guard);
 
         let config = WatchConfig {
+            history: crate::local_history::history_subscription(project),
             budget: Arc::clone(&fs.budget),
             files: fs.with_index(|index| index.file_paths()),
             roots: root_paths,

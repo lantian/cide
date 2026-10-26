@@ -343,6 +343,19 @@ impl WorkspaceState {
                 }
             }
             crate::emit::workspace_changed(app, &snapshot);
+            if content_before
+                .projects
+                .iter()
+                .map(|(id, p)| (id, &p.roots))
+                .collect::<Vec<_>>()
+                != snapshot
+                    .projects
+                    .iter()
+                    .map(|(id, p)| (id, &p.roots))
+                    .collect::<Vec<_>>()
+            {
+                crate::local_history::sync(app, &snapshot);
+            }
             // The OS window title is a **level over this tree**, so the one place that knows
             // the tree just moved is the one place that can hold it true. A title now names
             // the active project *and its active tab* (`cmd::window::title_for`), and the
