@@ -196,3 +196,30 @@ are recorded in [local-history-verification.md](local-history-verification.md).
    and baseline behavior. Clear from one window and observe invalidation in another. Check
    the confirmation explains fresh capture if enabled. In an isolated profile, constrain
    the budget and check visible degradation with ordinary editing still available.
+
+### Display-review handoff
+
+Implementation and automated verification are complete; native-window acceptance and visual
+sign-off are pending reviewer execution. Do these on a normal desktop with a disposable
+project/profile. This sandbox has no display/audio and refuses Unix sockets. No GUI app,
+virtual display, screenshot tool or renderer was launched here.
+
+- Repeat the native linked-folder watcher test listed in the verification record outside
+  the sandbox, then confirm actual external edits to unopened hidden files reach Local
+  History. The existing failure also occurs on the pre-change commit; record the desktop
+  result separately from the socket-free observer fixtures.
+- Execute the acceptance sequence above in shell and detached windows, especially a live
+  dirty buffer, close-during-prepare, stale disk refusal and clean reload after restoration.
+  Verify keyboard access to the root selector, filters, revisions, comparison selector,
+  settings and confirmation dialogs; Cancel must remain the safe initial confirmation focus.
+- Review dark and light themes at UI sizes 11, 13 and 17, plus a narrow window/bottom panel.
+  Check source/time labels, long paths, lifecycle text, absent/unavailable sides, large-file
+  scrolling, focus indicators, resizing and dialog overflow without obscured actions.
+- Capture the non-Git context menu, populated project/deleted-path browser, read-only diff
+  and absence comparison, settings/clear confirmation, and dirty/stale restore errors in
+  both themes. Include baseline/degraded/empty states where useful. Inspect captures and any
+  documentation renders for clipping, contrast and stale contents; attach the resulting
+  artifacts and observed outcomes to the review using the reviewer's normal workflow.
+
+This handoff records the remaining acceptance work, not a claim that screenshots, renders
+or native multi-window behavior have been verified.
