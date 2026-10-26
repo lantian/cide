@@ -473,7 +473,9 @@ export function ExcalidrawPane({ path, root, project, tab, pane, onScreen, attac
   const onChange = useCallback<SceneChange>(
     (elements, appState, files) => {
       const surface = surfaceRef.current
-      if (surface === null || apiRef.current === null) return
+      // Gate cleanup can toggle view mode after unmount; a discarded engine must not
+      // report dirty or re-arm a timer after the pane's cleanup has cancelled it.
+      if (!aliveRef.current || surface === null || apiRef.current === null) return
       const fingerprint = surface.fingerprintOfChange(elements, appState, files)
       if (savedRef.current === null) {
         if (surface.liveElementIds(elements) !== loadedIdsRef.current) return
