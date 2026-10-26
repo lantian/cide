@@ -27,7 +27,7 @@
 
 - [x] 5.1 Register active-file/project Local History commands and file-tree/editor-tab menu actions, plus backend-owned deduplicated view identity/layout; preserve existing Git history dispatch and support projects without Git.
 - [x] 5.2 Build the project path/deleted-file browser and paginated per-file revision list with timestamps, known source, rename/lifecycle details and explicit loading/empty/excluded/degraded/error states.
-- [ ] 5.3 Add read-only selected-versus-current and revision-versus-revision diffs, absence rendering, stale-request cancellation and restore confirmation with actionable dirty/stale/unavailable errors; invalidate selections across windows on clear/cleanup.
+- [x] 5.3 Add read-only selected-versus-current and revision-versus-revision diffs, absence rendering, stale-request cancellation and restore confirmation with actionable dirty/stale/unavailable errors; invalidate selections across windows on clear/cleanup.
 - [ ] 5.4 Add root-scoped enablement, exclusion, retention/budget, used-space and confirmed-clear controls; explain default limits, existing retained excluded content, baseline progress and observational coverage. Add behavior/SSR checks for menus, selection races, restore gating and settings validation.
 
 ## 6. Verification and handoff

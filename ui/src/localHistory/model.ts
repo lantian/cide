@@ -11,3 +11,6 @@ export function appendUnique<T>(before: T[], after: T[], key: (item: T) => strin
 export const HISTORY_SOURCES: Record<string, string> = { baseline: 'Baseline', reopen: 'Reopen observation', cideSave: 'cide save', external: 'External observation', restore: 'Restore', fileOperation: 'cide file operation' }
 export function historyTime(ms: number): string { return new Date(ms).toLocaleString() }
 export interface HistoryPage<T, Cursor> { items: T[]; next: Cursor | null; loading: boolean; error: string | null; excluded?: string | null }
+export function comparisonMatches(comparison: { token: { generation: number; path: string; target: string }; right: { revision: string | null } } | null, path: string | null, target: string | null, other: string | null, generation: number): boolean {
+  return comparison !== null && comparison.token.generation === generation && comparison.token.path === path && comparison.token.target === target && comparison.right.revision === other
+}
