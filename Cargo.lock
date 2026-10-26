@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "cide-agents"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "chrono",
  "cide-claude",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "cide-app"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "block2",
  "cide-agents",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "cide-claude"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "blake3",
  "cide-core",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "cide-core"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "cide-deps"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-core",
  "serde",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "cide-docker"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "bollard",
  "cide-core",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "cide-ext"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "cide-fs"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-ipc",
  "cide-search",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "cide-git"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "blake3",
  "cide-core",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "cide-gitlab"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "cide-headless"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-agents",
  "cide-core",
@@ -916,14 +916,14 @@ dependencies = [
 
 [[package]]
 name = "cide-hook"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cide-ide-mcp"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-ipc",
  "futures-util",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "cide-ipc"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "indexmap 2.14.0",
  "serde",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "cide-lang"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-ipc",
  "ignore",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "cide-lsp"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "cide-pty"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-ipc",
  "crossbeam-channel",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "cide-remote"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "cide-search"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-fs",
  "cide-ipc",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "cide-spec"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "cide-tasks"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "cide-core",
  "cide-ipc",
@@ -7235,7 +7235,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.16.2-dev"
+version = "0.16.2"
 dependencies = [
  "anyhow",
  "serde_json",
