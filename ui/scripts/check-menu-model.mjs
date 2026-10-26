@@ -272,6 +272,13 @@ try {
     item(entries, 'close-right').run()
     eq(bulk.calls, [['t2']], 'Close to the right closes only what follows this tab, in one call')
 
+    const localCalls = []
+    const localEntries = tabMenuEntries(tabs, file, 't1', { localHistory: (path) => localCalls.push(path) })
+    const local = item(localEntries, 'local-history').submenu()
+    eq(local[0].command, 'local-history.file', 'Local History has its own dispatch identity')
+    local[0].run()
+    eq(localCalls, ['/repo/src/main.rs'], 'Local History passes the absolute file without requiring a Git callback')
+
     // --- Show history for this file (M18) ---------------------------------------------
     //
     // The item hands a path to a command that resolves it through `git_locate`, so it must be

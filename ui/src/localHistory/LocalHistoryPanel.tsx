@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import type { HistoryComparison, HistoryPath, HistoryStatus, LocalHistoryView, LocalRevision, ProjectId } from '@/ipc/generated'
+import type { HistoryPolicy, HistoryComparison, HistoryPath, HistoryStatus, LocalHistoryView, LocalRevision, ProjectId } from '@/ipc/generated'
 import { events, localHistory } from '@/ipc/client'
 import { EmptyState, Spinner } from '@/kit/components/Feedback'
 import { Button } from '@/kit/components/Button'
+import { Modal } from '@/overlays/ModalShell'
+import { HistoryPolicyForm } from './HistoryPolicyForm'
 import { ConfirmDestructive } from '@/chrome/ConfirmDestructive'
+import { HistoryTextDiff } from './HistoryTextDiff'
 import { HistoryComparisonView } from './HistoryComparisonView'
 import { comparisonMatches, historyTime } from './model'
 import { notify, notifyFailure } from '@/chrome/notices'
@@ -23,6 +26,11 @@ export function LocalHistoryPanel({ project, view }: { project: ProjectId; view:
   const [compareError, setCompareError] = useState<string | null>(null)
   const [selectionNotice, setSelectionNotice] = useState<string | null>(null)
   const [confirmation, setConfirmation] = useState<HistoryComparison | null>(null)
+  const [policySaving, setPolicySaving] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [clearConfirmation, setClearConfirmation] = useState<HistoryStatus | null>(null)
+  const [clearing, setClearing] = useState(false)
+  const [clearError, setClearError] = useState<string | null>(null)
   const [restoring, setRestoring] = useState(false)
   const comparisonRequests = useRef(new HistoryRequests())
   const [filter, setFilter] = useState('')
@@ -96,6 +104,20 @@ export function LocalHistoryPanel({ project, view }: { project: ProjectId; view:
     } catch (error) { setConfirmation(null); setSelectionNotice(String(error)); setComparison(null) }
     finally { setRestoring(false); setRefresh((n) => n + 1) }
   }
+  const savePolicy = async (policy: HistoryPolicy, generation: number): Promise<void> => {
+    setPolicySaving(true)
+    try { await localHistory.setPolicy(project, view.root, generation, policy); setSettingsOpen(false); setRefresh((n) => n + 1) } finally { setPolicySaving(false) }
+  }
+  const clear = async (): Promise<void> => {
+    if (!clearConfirmation || clearing) return
+    setClearing(true); setClearError(null)
+    try {
+      await localHistory.clear(project, clearConfirmation.root, clearConfirmation.generation, true)
+      comparisonRequests.current.cancel(); setComparison(null); setSelected(null); setOther(null); setRevisions(empty()); setPaths(empty()); if (view.path === null) setPath(null)
+      setClearConfirmation(null); setSelectionNotice('History cleared. If capture is enabled, a fresh baseline records current files.'); setRefresh((n) => n + 1)
+    } catch (why) { setClearError(String(why)) }
+    finally { setClearing(false) }
+  }
   const morePaths = (): void => {
     if (!status || paths.next === null || paths.loading) return
     const request = pathRequests.current.begin(); setPaths((p) => ({ ...p, loading: true }))
@@ -117,7 +139,10 @@ export function LocalHistoryPanel({ project, view }: { project: ProjectId; view:
     onPath={(value) => { revisionRequests.current.cancel(); comparisonRequests.current.cancel(); setComparison(null); setConfirmation(null); setSelected(null); setPath(value) }} onRevision={(value) => { comparisonRequests.current.cancel(); setComparison(null); setConfirmation(null); setSelectionNotice(null); setSelected(value) }}
     onRoot={(root) => { void localHistory.openView(project, null, root).catch(notifyFailure) }} onProject={() => { void localHistory.openView(project, null, view.root).catch(notifyFailure) }}
     onMorePaths={morePaths} onMoreRevisions={moreRevisions} onRefresh={() => setRefresh((n) => n + 1)} notice={rootError ?? selectionNotice}
-    preview={<HistoryComparisonView comparison={comparison} loading={comparing} error={compareError} revisions={revisions.items} other={other} onOther={(value) => { comparisonRequests.current.cancel(); setComparison(null); setConfirmation(null); setOther(value) }} canRestore={canRestore} restoring={restoring} onRestore={() => { if (canRestore) setConfirmation(comparison) }} />} />
+    tools={<Button size="sm" variant="quiet" disabled={restoring} onClick={() => setSettingsOpen(true)}>Settings</Button>}
+    preview={<HistoryComparisonView diff={comparison && <HistoryTextDiff comparison={comparison} />} comparison={comparison} loading={comparing} error={compareError} revisions={revisions.items} other={other} onOther={(value) => { comparisonRequests.current.cancel(); setComparison(null); setConfirmation(null); setOther(value) }} canRestore={canRestore} restoring={restoring} onRestore={() => { if (canRestore) setConfirmation(comparison) }} />} />
+    {settingsOpen && <Modal onDismiss={() => { if (!policySaving) setSettingsOpen(false) }}><HistoryPolicyForm status={status} onSave={savePolicy} onCancel={() => setSettingsOpen(false)} onClear={() => { setSettingsOpen(false); setClearError(null); setClearConfirmation(status) }} /></Modal>}
+    {clearConfirmation !== null && <ConfirmDestructive state={{ title: 'Clear this root’s Local History?', body: 'This permanently removes retained contents without changing project files. If capture remains enabled, a fresh baseline immediately starts recording current files.', files: [clearConfirmation.canonicalRoot], confirmLabel: 'Clear history', run: () => { void clear() } }} busy={clearing} error={clearError} onCancel={() => { if (!clearing) setClearConfirmation(null) }} onConfirm={() => { void clear() }} />}
     {confirmation !== null && <ConfirmDestructive state={{
       title: 'Restore Local History revision?',
       body: `Restore revision ${confirmation.token.target} from ${confirmation.left.observedMs === null ? 'its observation' : historyTime(confirmation.left.observedMs)}. ${confirmation.left.content.kind === 'absent' ? 'This revision records absence and will delete the current file.' : 'This replaces the current file contents.'} The current state is retained first. Dirty editors or changed disk contents will abort the restore.`,
