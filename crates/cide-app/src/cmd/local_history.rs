@@ -24,6 +24,8 @@ fn path_in(store: &HistoryStore, path: &str) -> Result<String, String> {
         if owner.status().root != store.eligibility.root.id {
             return Err("This file belongs to a deeper open history root".into());
         }
+    } else {
+        return Err("This history root is no longer open".into());
     }
     Ok(relative)
 }
@@ -145,6 +147,50 @@ pub async fn local_history_clear(
             s.check_generation(generation)?;
             s.clear(confirmed)
         })
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn local_history_restore(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    root: HistoryRootId,
+    token: HistoryCompareToken,
+    confirmed: bool,
+) -> Result<HistoryRestoreResult, String> {
+    use tauri::Manager;
+    if !confirmed {
+        return Err("Confirm the path and revision before restoring".into());
+    }
+    let coordinator = scope(&state, project, &root)?;
+    blocking(move || {
+        let physical = coordinator.with_store(|s| {
+            path_in(s, &token.path)?;
+            s.validate_restore(&token)
+        })?;
+        let state = app.state::<WorkspaceState>();
+        let mut prepared =
+            crate::local_history_restore::PreparedEditors::prepare(&app, &state, physical.clone())?;
+        let result = coordinator.with_store(|s| {
+            path_in(s, &token.path)?;
+            s.restore_with(&token, |write| prepared.commit(&state, write))
+        })?;
+        if result.restored {
+            prepared.restored();
+            let change = cide_ipc::FsChange {
+                paths: vec![physical.clone()],
+                truncated: false,
+                git: false,
+            };
+            crate::emit::fs_changed(&app, project, &change);
+            crate::files::FsEvents::files_changed(&app, project, &change.paths);
+            if result.degraded.is_some() {
+                coordinator.observe(vec![physical], false);
+            }
+        }
+        Ok(result)
     })
     .await
 }

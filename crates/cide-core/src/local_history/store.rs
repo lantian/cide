@@ -47,7 +47,8 @@ pub struct HistoryStore {
     lineage: BTreeMap<String, Vec<u32>>,
     pub coverage: HistoryCoverage,
     revision: u32,
-    pins: HashSet<String>,
+    pins: BTreeMap<String, u32>,
+    pending_safety: BTreeMap<String, LocalRevisionId>,
 }
 
 pub fn now_ms() -> u64 {
@@ -154,7 +155,8 @@ impl HistoryStore {
             lineage: BTreeMap::new(),
             coverage: HistoryCoverage::default(),
             revision: 0,
-            pins: HashSet::new(),
+            pins: BTreeMap::new(),
+            pending_safety: BTreeMap::new(),
         };
         store.load_index()?;
         Ok(store)
@@ -340,11 +342,16 @@ impl HistoryStore {
     }
     pub fn pin(&mut self, id: &LocalRevisionId) -> Result<(), String> {
         self.get(id)?;
-        self.pins.insert(id.0.clone());
+        *self.pins.entry(id.0.clone()).or_default() += 1;
         Ok(())
     }
     pub fn unpin(&mut self, id: &LocalRevisionId) {
-        self.pins.remove(&id.0);
+        if let Some(count) = self.pins.get_mut(&id.0) {
+            *count -= 1;
+            if *count == 0 {
+                self.pins.remove(&id.0);
+            }
+        }
     }
 
     fn evict(&mut self, sequence: u32) -> Result<(), String> {
@@ -364,7 +371,7 @@ impl HistoryStore {
         let expired: Vec<u32> = self
             .records
             .values()
-            .filter(|r| r.observed_ms < cutoff && !self.pins.contains(&r.id.0))
+            .filter(|r| r.observed_ms < cutoff && !self.pins.contains_key(&r.id.0))
             .map(|r| r.sequence)
             .collect();
         for n in expired {
@@ -374,7 +381,7 @@ impl HistoryStore {
             let Some(n) = self
                 .records
                 .values()
-                .find(|r| !self.pins.contains(&r.id.0))
+                .find(|r| !self.pins.contains_key(&r.id.0))
                 .map(|r| r.sequence)
             else {
                 return Err("History budget cannot fit pinned revisions and metadata".into());
@@ -411,7 +418,7 @@ impl HistoryStore {
             let Some(n) = self
                 .records
                 .values()
-                .find(|r| !self.pins.contains(&r.id.0))
+                .find(|r| !self.pins.contains_key(&r.id.0))
                 .map(|r| r.sequence)
             else {
                 return Err(
@@ -449,7 +456,11 @@ impl HistoryStore {
         if !confirmed {
             return Err("Confirm clearing this root's Local History".into());
         }
-        if !self.pins.is_empty() {
+        if self
+            .pins
+            .keys()
+            .any(|id| !self.pending_safety.values().any(|pending| &pending.0 == id))
+        {
             return Err("A restore is using history; retry after it finishes".into());
         }
         let mut next = self.meta.clone();
@@ -465,6 +476,8 @@ impl HistoryStore {
         self.ids.clear();
         self.paths.clear();
         self.lineage.clear();
+        self.pins.clear();
+        self.pending_safety.clear();
         self.coverage = HistoryCoverage::default();
         self.revision = self.revision.wrapping_add(1);
         for entry in fs::read_dir(self.dir.join("records")).map_err(|e| e.to_string())? {
@@ -612,7 +625,15 @@ impl HistoryStore {
         bytes: Option<&[u8]>,
         source: HistorySource,
     ) -> Result<LocalRevisionId, String> {
-        self.capture_record(generation, path, bytes, source, None)
+        let result = self.capture_record(generation, path, bytes, source, None);
+        if result.is_ok() {
+            if let Ok((_, relative)) = self.eligibility.root.resolve(Path::new(path)) {
+                if let Some(safety) = self.pending_safety.remove(&relative) {
+                    self.unpin(&safety);
+                }
+            }
+        }
+        result
     }
     fn capture_record(
         &mut self,
@@ -714,10 +735,242 @@ impl HistoryStore {
     }
 }
 
+impl HistoryStore {
+    pub fn ensure_durable(&self, id: &LocalRevisionId) -> Result<(), String> {
+        let revision = self.get(id)?;
+        let mut bytes = Vec::new();
+        File::open(self.record_path(revision))
+            .map_err(|_| "The safety revision is not durable")?
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 65536 {
+            return Err("Invalid safety revision record".into());
+        }
+        let record: Record =
+            serde_json::from_slice(&bytes).map_err(|_| "The safety revision record is corrupt")?;
+        if record.schema != SCHEMA
+            || record.generation < self.meta.min_generation
+            || record.generation > self.generation()
+            || record.revision.id != *id
+            || record.revision.content != revision.content
+            || record.revision.path != revision.path
+            || record.revision.lifecycle != revision.lifecycle
+            || record.revision.sequence != revision.sequence
+        {
+            return Err("The safety revision record is unavailable".into());
+        }
+        self.bytes(&revision.content)?;
+        Ok(())
+    }
+
+    /// `commit` runs the last check and mutation under the app's editor/window gates.
+    pub fn restore_with(
+        &mut self,
+        token: &HistoryCompareToken,
+        commit: impl FnOnce(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>,
+    ) -> Result<HistoryRestoreResult, String> {
+        self.validate_restore(token)?;
+        self.ensure_durable(&token.target)?;
+        let target = self.get(&token.target)?.content.clone();
+        let desired = self.bytes(&target)?;
+        self.pin(&token.target)?;
+        let mut safety: Option<LocalRevisionId> = None;
+        let mut mutated = false;
+        let result = (|| {
+            let (_, before) = self.eligibility.read(Path::new(&token.path))?;
+            if Self::content(before.as_deref()) != token.current {
+                return Err("The file changed; refresh the comparison".into());
+            }
+            let id = self.capture(
+                self.generation(),
+                &token.path,
+                before.as_deref(),
+                HistorySource::External,
+            )?;
+            self.ensure_durable(&id)?;
+            self.pin(&id)?;
+            safety = Some(id.clone());
+            let mut durability_warning = None;
+            let committed = commit(&mut || {
+                if mutated {
+                    return Err("The restore mutation already ran".into());
+                }
+                let physical = self.validate_restore(token)?;
+                let written = match &desired {
+                    Some(bytes) if physical.exists() => {
+                        crate::document::write_bytes(&physical, bytes).map_err(|e| e.to_string())
+                    }
+                    Some(bytes) => crate::persist::write_atomic_with_mode(
+                        &physical,
+                        bytes,
+                        crate::persist::SHARED_MODE,
+                    )
+                    .map_err(|e| e.to_string()),
+                    None if physical.exists() => fs::remove_file(&physical)
+                        .map_err(|e| e.to_string())
+                        .and_then(|_| {
+                            crate::persist::sync_dir(physical.parent().unwrap())
+                                .map_err(|e| e.to_string())
+                        }),
+                    None => Ok(()),
+                };
+                if let Err(reason) = written {
+                    // Atomic publication may have succeeded before directory fsync failed.
+                    if self
+                        .eligibility
+                        .read(Path::new(&token.path))
+                        .ok()
+                        .is_some_and(|(_, actual)| actual == desired)
+                    {
+                        durability_warning = Some(format!(
+                            "File restored, but durability could not be confirmed: {reason}"
+                        ));
+                    } else {
+                        return Err(reason);
+                    }
+                }
+                mutated = true;
+                Ok(())
+            });
+            if let Err(reason) = committed {
+                if !mutated {
+                    return Err(reason);
+                }
+                durability_warning = Some(format!(
+                    "File restored, but completing preparation failed: {reason}"
+                ));
+            }
+            if !mutated {
+                return Err("Restore preparation did not commit the mutation".into());
+            }
+            let post = self.capture(
+                self.generation(),
+                &token.path,
+                desired.as_deref(),
+                HistorySource::Restore,
+            );
+            let degraded = post.err().map(|reason| format!("File restored; the safety revision is retained, but recording the restored state failed: {reason}")).or(durability_warning);
+            if let Some(reason) = &degraded {
+                self.coverage.degraded = Some(reason.clone());
+                self.pending_safety.insert(token.path.clone(), id.clone());
+            }
+            Ok(HistoryRestoreResult {
+                restored: true,
+                safety_revision: id,
+                degraded,
+            })
+        })();
+        self.unpin(&token.target);
+        if let Some(id) = safety {
+            if !mutated || result.as_ref().is_ok_and(|r| r.degraded.is_none()) {
+                self.unpin(&id);
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cide_fs::testing::scratch;
+    #[test]
+    fn restore_preserves_safety_bytes_and_can_reverse_recreation_with_absence() {
+        let project = scratch("history-restore-bytes");
+        let state = scratch("history-restore-bytes-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let retained = s
+            .capture(1, "a", Some(b"old\r\ntext\r\n"), HistorySource::Baseline)
+            .unwrap();
+        fs::write(project.join("a"), "current").unwrap();
+        let token = s.compare("a", &retained, None).unwrap().token;
+        let restored = s.restore_with(&token, |write| write()).unwrap();
+        assert_eq!(fs::read(project.join("a")).unwrap(), b"old\r\ntext\r\n");
+        assert_eq!(
+            s.bytes(&s.get(&restored.safety_revision).unwrap().content)
+                .unwrap()
+                .unwrap(),
+            b"current"
+        );
+        assert_eq!(s.latest("a").unwrap().source, HistorySource::Restore);
+        fs::remove_file(project.join("a")).unwrap();
+        let token = s.compare("a", &retained, None).unwrap().token;
+        let recreated = s.restore_with(&token, |write| write()).unwrap();
+        assert!(project.join("a").exists());
+        let absence = s
+            .compare("a", &recreated.safety_revision, None)
+            .unwrap()
+            .token;
+        s.restore_with(&absence, |write| write()).unwrap();
+        assert!(!project.join("a").exists());
+        assert!(s.pins.is_empty());
+    }
+
+    #[test]
+    fn failed_safety_capture_or_last_check_never_mutates_disk() {
+        let project = scratch("history-restore-refused");
+        let state = scratch("history-restore-refused-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let retained = s
+            .capture(1, "a", Some(b"old"), HistorySource::Baseline)
+            .unwrap();
+        fs::write(project.join("a"), "current").unwrap();
+        let token = s.compare("a", &retained, None).unwrap().token;
+        assert!(
+            s.restore_with(&token, |write| {
+                fs::write(project.join("a"), "raced").unwrap();
+                write()
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(project.join("a")).unwrap(), "raced");
+        assert!(s.pins.is_empty());
+        let token = s.compare("a", &retained, None).unwrap().token;
+        fs::rename(state.join("records"), state.join("records-held")).unwrap();
+        fs::write(state.join("records"), "not a directory").unwrap();
+        assert!(s.restore_with(&token, |write| write()).is_err());
+        assert_eq!(fs::read_to_string(project.join("a")).unwrap(), "raced");
+        assert!(s.pins.is_empty());
+    }
+
+    #[test]
+    fn successful_restore_with_post_record_failure_reports_success_and_pins_safety() {
+        let project = scratch("history-restore-post-failed");
+        let state = scratch("history-restore-post-state");
+        let mut s =
+            HistoryStore::open(RootIdentity::new(&project).unwrap(), state.to_path_buf()).unwrap();
+        let retained = s
+            .capture(1, "a", Some(b"old"), HistorySource::Baseline)
+            .unwrap();
+        fs::write(project.join("a"), "current").unwrap();
+        let token = s.compare("a", &retained, None).unwrap().token;
+        let restored = s
+            .restore_with(&token, |write| {
+                write()?;
+                fs::rename(state.join("records"), state.join("records-held")).unwrap();
+                fs::write(state.join("records"), "blocked").unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(restored.restored);
+        assert!(restored.degraded.is_some());
+        assert_eq!(fs::read_to_string(project.join("a")).unwrap(), "old");
+        assert!(s.pins.contains_key(&restored.safety_revision.0));
+        assert_eq!(
+            s.bytes(&s.get(&restored.safety_revision).unwrap().content)
+                .unwrap()
+                .unwrap(),
+            b"current"
+        );
+        fs::remove_file(state.join("records")).unwrap();
+        fs::rename(state.join("records-held"), state.join("records")).unwrap();
+        s.capture(s.generation(), "a", Some(b"old"), HistorySource::External)
+            .unwrap();
+        assert!(s.pins.is_empty());
+    }
     #[test]
     fn shared_blobs_survive_pins_and_age_cleanup_reclaims_them() {
         let project = scratch("history-retention-root");
