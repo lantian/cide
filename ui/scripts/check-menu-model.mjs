@@ -222,6 +222,16 @@ try {
   const file = tab('t1', { kind: 'file', path: '/repo/src/main.rs', dirty: false })
   const extra = tab('t2', { kind: 'claudeFull', title: 'Claude' })
   const tabs = [console_, file, extra]
+  {
+    let compared = null
+    const actions = { compareClipboard: path => { compared = path } }
+    item(tabMenuEntries(tabs, file, 't0', actions), 'compare-clipboard').run()
+    eq(compared, file.kind.path, 'Compare to Clipboard targets the clicked background tab')
+    const comparison = tab('comparison', { kind: 'clipboardDiff', path: file.kind.path, snapshotId: 'clip', dirty: true })
+    ok(item(tabMenuEntries([comparison], comparison, 'comparison', actions), 'compare-clipboard'), 'a comparison can refresh its clipboard snapshot')
+    eq(item(tabMenuEntries(tabs, console_, 't0', actions), 'compare-clipboard'), undefined, 'non-file tabs have no clipboard comparison action')
+    eq(absolutePathOf(comparison), file.kind.path, 'comparison paths are ordinary file paths')
+  }
 
   /**
    * Record every bulk close as **one call with a list**, not as N calls.

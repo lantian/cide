@@ -578,6 +578,13 @@ pub fn diagnostics(app: &AppHandle, project: cide_ipc::ProjectId) {
 /// `project_close`, `window_close`) refuses in its return value, which is stronger: a
 /// command that is never issued cannot lose anything.
 pub const CLOSE_BLOCKED: &str = "cide://close-blocked";
+pub const EDITOR_REDOCK_REQUESTED: &str = "cide://editor-redock-requested";
+
+pub fn editor_redock_requested(app: &AppHandle, window: &cide_ipc::WindowLabel) {
+    if let Err(error) = app.emit(EDITOR_REDOCK_REQUESTED, window) {
+        tracing::warn!(%error, "could not request editor redock");
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1442,6 +1449,15 @@ pub fn user_requests_changed(
         serde_json::json!({ "project": project, "view": view }),
     );
     tee(|| cide_remote::RemoteEvent::UserRequestsChanged { project });
+}
+
+/// Only a fetch key goes to other windows; editor text never rides workspace broadcasts.
+pub const SHARED_DOCUMENT_CHANGED: &str = "cide://shared-document-changed";
+pub fn shared_document_changed(app: &AppHandle, path: &str, version: u32) {
+    let _ = app.emit(
+        SHARED_DOCUMENT_CHANGED,
+        serde_json::json!({ "path": path, "version": version }),
+    );
 }
 
 #[cfg(test)]

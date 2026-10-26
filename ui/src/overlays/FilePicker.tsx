@@ -262,6 +262,7 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
               equivalent nobody knows. It sits in the footer rather than beside the counter
               because that row is prompt + field + counter and is the one place the eye is
               while typing. */}
+          {frame?.incomplete && <span>Index incomplete · Refresh after indexing or adjust Files settings</span>}
           <ScopeToggle on={libraries} onToggle={toggleLibraries} />
         </>
       }

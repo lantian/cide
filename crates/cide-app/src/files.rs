@@ -18,9 +18,10 @@
 //! the thread.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use cide_fs::budget::{Budget, MIB, SharedBudget};
 use cide_fs::filter::FilterInput;
 use cide_fs::{
     BuildOptions, Filter, Index, Root, Visibility, WalkItem, WatchConfig, WatchEvent, Watcher,
@@ -109,12 +110,51 @@ pub fn visibility_of(settings: &Settings) -> Visibility {
 }
 
 /// Every open project's file state.
-#[derive(Default)]
 pub struct FsRegistry {
     projects: DashMap<ProjectId, Arc<ProjectFs>>,
+    shared: Arc<SharedBudget>,
+    limits: Mutex<(u64, u64)>,
+    claims: Mutex<()>,
+}
+
+impl Default for FsRegistry {
+    fn default() -> Self {
+        Self {
+            projects: DashMap::new(),
+            shared: SharedBudget::new(2048 * MIB),
+            limits: Mutex::new((512 * MIB, 2048 * MIB)),
+            claims: Mutex::new(()),
+        }
+    }
 }
 
 impl FsRegistry {
+    pub fn configure(&self, settings: &cide_ipc::ExplorerSettings) {
+        let settings = settings.clamped();
+        let next = (
+            settings.index_memory_mib as u64 * MIB,
+            settings.total_index_memory_mib as u64 * MIB,
+        );
+        let _claims = self.claims.lock();
+        let mut limits = self.limits.lock();
+        if *limits == next {
+            return;
+        }
+        let shrinking = next.0 < limits.0 || next.1 < limits.1;
+        *limits = next;
+        self.shared.set_limit(next.1);
+        let entries: Vec<_> = self
+            .projects
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for fs in entries {
+            if shrinking || fs.budget.reason().is_some() {
+                fs.cancel();
+            }
+        }
+    }
+
     pub fn get(&self, project: ProjectId) -> Option<Arc<ProjectFs>> {
         self.projects.get(&project).map(|e| Arc::clone(e.value()))
     }
@@ -126,15 +166,34 @@ impl FsRegistry {
     /// `fs_close` hands it to a blocking worker rather than doing it on the async runtime.
     #[must_use = "dropping the entry here does the watcher teardown on this thread"]
     pub fn remove(&self, project: ProjectId) -> Option<Arc<ProjectFs>> {
-        let removed = self.projects.remove(&project).map(|(_, fs)| fs);
+        let removed = self.projects.remove(&project).map(|(_, fs)| {
+            fs.cancel();
+            fs
+        });
         if removed.is_some() {
             crate::local_history::tree_unsubscribed(project);
         }
         removed
     }
 
+    /// Signal shutdown without synchronously freeing arenas on the lifecycle thread.
+    pub fn cancel_all(&self) {
+        for entry in self.projects.iter() {
+            entry.budget.cancel();
+        }
+    }
+
     pub fn close_all(&self) {
+        self.cancel_all();
+        let entries: Vec<_> = self
+            .projects
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
         self.projects.clear();
+        for fs in entries {
+            fs.cancel();
+        }
     }
 
     /// Every project with an entry here, with the roots it was walked over.
@@ -201,18 +260,21 @@ impl FsRegistry {
         // cannot have them removed without re-deriving the ignore verdict for every node it
         // holds. Either way the answer is a fresh walk, and treating a changed setting as
         // "already indexed" is how a toggle comes to do nothing at all.
-        let stale = self
-            .projects
-            .get(&project)
-            .is_some_and(|entry| entry.root_paths() != roots || entry.visibility != visibility);
+        let _claims = self.claims.lock();
+        let stale = self.projects.get(&project).is_some_and(|entry| {
+            entry.root_paths() != roots
+                || entry.visibility != visibility
+                || entry.budget.cancelled()
+        });
         if stale {
-            self.projects.remove(&project);
+            drop(self.remove(project));
         }
 
         let entry = self.projects.entry(project).or_insert_with(|| {
-            Arc::new(ProjectFs::new(
+            Arc::new(ProjectFs::controlled(
                 roots.iter().cloned().map(Root::new).collect(),
                 visibility,
+                Budget::new(Arc::clone(&self.shared), self.limits.lock().0),
             ))
         });
         let fs = Arc::clone(entry.value());
@@ -256,6 +318,7 @@ impl Indexing {
     /// `spawn_blocking`; `cmd::fs::fs_index` is the only caller in the app and does.
     pub fn run(self, events: Arc<dyn FsEvents>, project: ProjectId) -> FsStatus {
         let Indexing { fs, guard } = self;
+        *fs.events.lock() = Some((project, Arc::downgrade(&events)));
 
         // A re-index of an already-indexed project starts from an empty picker, or the old
         // paths would be offered alongside the new ones for ever. The old watcher goes with
@@ -263,10 +326,13 @@ impl Indexing {
         // to be thrown away, and its watch list is the one the previous walk produced.
         *fs.watcher.lock() = None;
         fs.matcher.clear();
+        if fs.budget.cancelled() {
+            return fs.status();
+        }
         events.status(project, &fs.status());
 
         let matcher = Arc::clone(&fs.matcher);
-        let index = Index::build(
+        let index = Index::build_controlled(
             fs.roots.clone(),
             BuildOptions {
                 // The user's setting, taken from the entry rather than read again here: the
@@ -277,6 +343,7 @@ impl Indexing {
                 visibility: fs.visibility,
                 ..BuildOptions::default()
             },
+            Arc::clone(&fs.budget),
             &move |batch: &[WalkItem]| {
                 for item in batch.iter().filter(|i| !i.is_dir) {
                     matcher.push(Candidate::new(
@@ -287,28 +354,39 @@ impl Indexing {
             },
         );
 
+        if fs.budget.cancelled() {
+            return fs.status();
+        }
         let root_paths: Vec<PathBuf> = fs.roots.iter().map(|r| r.path.clone()).collect();
         // Every visited directory, so that every `.gitignore` under the roots is found — which
         // with *Show ignored files* on includes the ones inside `target/`.
         let dirs = index.dir_paths();
-        let filter = Arc::new(Filter::build_with(FilterInput {
-            roots: &root_paths,
-            dirs: &dirs,
-            git_dirs: &git_watch_dirs(&root_paths),
-            visibility: fs.visibility,
-        }));
+        let filter = Arc::new(Filter::build_controlled(
+            FilterInput {
+                roots: &root_paths,
+                dirs: &dirs,
+                git_dirs: &git_watch_dirs(&root_paths),
+                visibility: fs.visibility,
+            },
+            &|| fs.budget.cancelled(),
+        ));
         // NOT `dirs`. With ignored entries shown the tree holds thousands of directories the
         // watcher must not take a descriptor on — see `cide_fs::filter`'s module note, which
         // owns that trade — and `watch_dirs` is where the two lists are told apart.
         let watched = index.watch_dirs(&filter);
         let links = index.watch_links(&filter);
 
+        if fs.budget.cancelled() {
+            return fs.status();
+        }
         *fs.index.write() = index;
         *fs.filter.write() = Arc::clone(&filter);
         drop(guard);
 
         let config = WatchConfig {
             history: crate::local_history::history_subscription(project),
+            budget: Arc::clone(&fs.budget),
+            files: fs.with_index(|index| index.file_paths()),
             roots: root_paths,
             dirs: watched,
             links,
@@ -319,7 +397,15 @@ impl Indexing {
             let weak = Arc::downgrade(&fs);
             move |event| on_watch_event(&events, project, &weak, event)
         });
-        *fs.watcher.lock() = Some(watcher);
+        {
+            let mut slot = fs.watcher.lock();
+            if fs.budget.cancelled() {
+                drop(slot);
+                drop(watcher);
+                return fs.status();
+            }
+            *slot = Some(watcher);
+        }
 
         // Last, and only on this path. `FsRegistry::claim` reads it to turn a repeat
         // `fs.index` into a no-op, so it must mean "this tree has been walked and is being
@@ -328,7 +414,9 @@ impl Indexing {
         fs.walked.store(true, Ordering::Release);
 
         let status = fs.status();
-        events.status(project, &status);
+        if !fs.budget.cancelled() {
+            events.status(project, &status);
+        }
         status
     }
 }
@@ -397,6 +485,9 @@ impl Drop for IndexingGuard {
 
 /// One project's index, picker and watcher.
 pub struct ProjectFs {
+    events: Mutex<Option<(ProjectId, Weak<dyn FsEvents>)>>,
+    pub budget: Arc<Budget>,
+    generation: u64,
     pub roots: Vec<Root>,
     /// What this project's index was walked with.
     ///
@@ -456,6 +547,7 @@ pub struct ProjectFs {
     /// frame, and what stops a watcher burst from parsing files for a project whose symbol index
     /// nobody has ever asked for.
     symbols_started: AtomicBool,
+    symbol_catalog_count: AtomicU32,
 
     // --- M16: the library scope of the file picker ---------------------------------------
     //
@@ -483,8 +575,14 @@ pub struct ProjectFs {
 }
 
 impl ProjectFs {
-    fn new(roots: Vec<Root>, visibility: Visibility) -> Self {
+    fn controlled(roots: Vec<Root>, visibility: Visibility, budget: Arc<Budget>) -> Self {
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        // Matcher pools, bounded parser/file buffers, batches and fixed watcher overhead.
+        budget.reserve(32 * MIB);
         Self {
+            events: Mutex::new(None),
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+            budget: Arc::clone(&budget),
             index: RwLock::new(Index::empty(roots.clone(), visibility)),
             // Empty, and it stays empty until the first tree read probes for a manifest. Opening
             // a project must cost nothing here — see `crate::libraries`.
@@ -496,7 +594,7 @@ impl ProjectFs {
             ))),
             roots,
             visibility,
-            matcher: Arc::new(NucleoMatcher::new()),
+            matcher: Arc::new(NucleoMatcher::with_owner(budget)),
             watcher: Mutex::new(None),
             watch_status: Mutex::new(WatchStatus {
                 backend: WatchBackend::Native,
@@ -510,11 +608,39 @@ impl ProjectFs {
             symbols_stale: AtomicU32::new(0),
             symbols_indexing: AtomicBool::new(false),
             symbols_started: AtomicBool::new(false),
+            symbol_catalog_count: AtomicU32::new(0),
             library_matcher: OnceLock::new(),
             libraries_indexing: AtomicBool::new(false),
             libraries_walked: AtomicBool::new(false),
             library_packages: AtomicU32::new(0),
         }
+    }
+
+    fn cancel(&self) {
+        self.budget.cancel();
+        // No registry shard is held while the watcher joins its thread.
+        let watcher = self.watcher.lock().take();
+        drop(watcher);
+    }
+
+    fn publish_status(&self) {
+        if self.budget.cancelled() {
+            return;
+        }
+        let target = self.events.lock().clone();
+        if let Some((project, weak)) = target
+            && let Some(events) = weak.upgrade()
+        {
+            events.status(project, &self.status());
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn incomplete(&self) -> bool {
+        self.is_indexing() || self.budget.reason().is_some() || self.budget.cancelled()
     }
 
     // --- M12: symbols ---------------------------------------------------------------------
@@ -523,7 +649,7 @@ impl ProjectFs {
     /// interleave with the lock-order rule `NucleoMatcher` documents.
     fn symbol_matcher_arc(&self) -> &Arc<NucleoMatcher> {
         self.symbol_matcher
-            .get_or_init(|| Arc::new(NucleoMatcher::new()))
+            .get_or_init(|| Arc::new(NucleoMatcher::with_owner(self.budget.clone())))
     }
 
     pub fn symbol_matcher(&self) -> &NucleoMatcher {
@@ -554,7 +680,13 @@ impl ProjectFs {
     /// [`FsRegistry::claim`] applies to the file index, and for the same reason: re-walking would
     /// clear the matcher the first caller's overlay is reading from.
     pub fn index_symbols(&self) -> cide_ipc::SymbolIndexStatus {
-        if self.symbols_started() || self.symbols_indexing.swap(true, Ordering::AcqRel) {
+        if self.budget.stopped() {
+            self.symbols_started.store(true, Ordering::Release);
+            self.symbol_store.write().truncated = true;
+            self.publish_status();
+            return self.symbol_status();
+        }
+        if self.symbols_indexing.swap(true, Ordering::AcqRel) {
             return self.symbol_status();
         }
         // Cleared by a guard, so a panic in the walk cannot leave the flag set for ever — which
@@ -568,45 +700,31 @@ impl ProjectFs {
         let _guard = Guard(&self.symbols_indexing);
         // Another walk may have finished after our first started check but before the
         // swap. The guard must still release the flag on this idempotent return.
-        if self.symbols_started() {
+        let Some(_worker) = cide_fs::budget::Worker::acquire_until(&|| self.budget.cancelled())
+        else {
+            return self.symbol_status();
+        };
+        let catalog = self.matcher.candidates();
+        if self.symbols_started()
+            && self.symbol_catalog_count.load(Ordering::Acquire) == catalog.len() as u32
+        {
             return self.symbol_status();
         }
-
-        let roots: Vec<cide_lang::WalkRoot> = self
-            .roots
-            .iter()
-            .map(|root| cide_lang::WalkRoot {
-                path: root.path.clone(),
-                label: root
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned()),
-            })
-            .collect();
-        // The same ignore decision the file tree and the content search use, injected rather than
-        // recomputed — three implementations of "is this file ignored" is how a picker starts
-        // offering rows the explorer does not show.
-        let filter = self.filter();
-        let admits = |path: &std::path::Path, is_dir: bool| filter.admits(path, is_dir);
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-
-        cide_lang::walk_symbols(
-            &roots,
+        let outcome = cide_lang::catalog_symbols(
+            catalog
+                .iter()
+                .filter(|c| !self.symbol_store.read().contains(&c.value))
+                .map(|c| (c.value.as_str(), c.text.as_str())),
             cide_lang::Limits::default(),
-            Some(&admits),
-            &cancel,
-            &mut |file| {
-                let (candidates, stale) = self.symbol_store.write().insert(file);
-                for candidate in candidates {
-                    self.symbol_matcher().push(candidate);
-                }
-                if stale > 0 {
-                    self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
-                }
-            },
+            &|| self.budget.stopped(),
+            &mut |file| self.insert_symbols(file),
         );
+        self.symbol_store.write().truncated = outcome.truncated || self.incomplete();
+        self.symbol_catalog_count
+            .store(catalog.len() as u32, Ordering::Release);
 
         self.symbols_started.store(true, Ordering::Release);
+        self.publish_status();
         self.symbol_status()
     }
 
@@ -615,7 +733,7 @@ impl ProjectFs {
     /// Built on first use, like [`Self::symbol_matcher_arc`].
     fn library_matcher_arc(&self) -> &Arc<NucleoMatcher> {
         self.library_matcher
-            .get_or_init(|| Arc::new(NucleoMatcher::new()))
+            .get_or_init(|| Arc::new(NucleoMatcher::with_owner(self.budget.clone())))
     }
 
     pub fn library_matcher(&self) -> &NucleoMatcher {
@@ -689,7 +807,7 @@ impl ProjectFs {
          * Asking the cheap, idempotent question first also makes the claim mean what it says:
          * whoever wins the swap is the one doing a walk, and is holding the guard.
          */
-        if self.libraries_walked() {
+        if self.budget.stopped() || self.libraries_walked() {
             return false;
         }
         if self.libraries_indexing.swap(true, Ordering::AcqRel) {
@@ -752,16 +870,15 @@ impl ProjectFs {
             .store(roots.len() as u32, Ordering::Release);
 
         let matcher = Arc::clone(self.library_matcher_arc());
-        Index::walk_roots(
+        Index::walk_roots_controlled(
             &roots,
-            // `threads: 1`, and the default is the trap. See `Index::walk_roots`: 593 roots at
-            // the default `threads: 0` costs 1.24 s against 130 ms here, all of it in spawning
-            // and joining 32 walker threads per package directory.
+            // Serial package walks share the app-wide four-worker gate.
             BuildOptions {
                 threads: 1,
                 ..BuildOptions::default()
             },
             true,
+            &self.budget,
             &move |batch: &[WalkItem]| {
                 for item in batch.iter().filter(|i| !i.is_dir) {
                     // `item.root` is the index into `roots`, which is parallel to `sources` by
@@ -800,6 +917,7 @@ impl ProjectFs {
         if !roots.is_empty() {
             self.libraries_walked.store(true, Ordering::Release);
         }
+        self.publish_status();
         true
     }
 
@@ -828,50 +946,68 @@ impl ProjectFs {
     /// Only ever called when [`Self::symbols_started`] — a project nobody has asked for symbols in
     /// must not start parsing because somebody ran `cargo build`.
     pub fn refresh_symbols(&self, paths: &[PathBuf]) {
-        let filter = self.filter();
+        let Some(_worker) = cide_fs::budget::Worker::acquire_until(&|| self.budget.cancelled())
+        else {
+            return;
+        };
         for path in paths {
-            if cide_lang::Lang::of_path(path).is_none() {
-                continue;
+            if self.budget.cancelled() {
+                break;
             }
             if !path.is_file() {
-                // Deleted, or moved out. Forgetting it is what stops the picker offering rows for
-                // a file that is gone.
                 let stale = self.symbol_store.write().remove(&path.to_string_lossy());
                 self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
                 continue;
             }
-            if !filter.admits(path, false) {
+            if !self.with_index(|index| index.contains(path)) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let Some(lang) = cide_lang::Lang::of_path(path) else {
-                continue;
-            };
-            let Some((symbols, _)) =
-                cide_lang::outline_symbols(lang, &text, cide_lang::Limits::default())
-            else {
-                continue;
-            };
             let rel = self
                 .roots
                 .iter()
                 .find_map(|root| path.strip_prefix(&root.path).ok())
-                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| path.to_string_lossy().into_owned());
-            let (candidates, stale) = self.symbol_store.write().insert(cide_lang::WalkedFile {
-                path: path.to_string_lossy().into_owned(),
-                rel,
-                lang,
-                symbols,
-            });
-            for candidate in candidates {
-                self.symbol_matcher().push(candidate);
-            }
-            self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let absolute = path.to_string_lossy();
+            cide_lang::catalog_symbols(
+                std::iter::once((absolute.as_ref(), rel.as_str())),
+                cide_lang::Limits::default(),
+                &|| self.budget.stopped(),
+                &mut |file| self.insert_symbols(file),
+            );
         }
         self.rebuild_symbols_if_stale();
+        self.publish_status();
+    }
+
+    fn insert_symbols(&self, file: cide_lang::WalkedFile) -> bool {
+        fn bytes(symbols: &[cide_ipc::Symbol]) -> u64 {
+            symbols
+                .iter()
+                .map(|s| {
+                    512 + 16
+                        * (s.name.len()
+                            + s.detail.as_ref().map_or(0, String::len)
+                            + s.container.as_ref().map_or(0, String::len))
+                            as u64
+                        + bytes(&s.children)
+                })
+                .sum()
+        }
+        // Includes store capacity, interned strings, matcher entries and rebuild scratch.
+        if !self
+            .budget
+            .reserve(1024 + 8 * (file.path.len() + file.rel.len()) as u64 + bytes(&file.symbols))
+        {
+            self.symbol_store.write().truncated = true;
+            return false;
+        }
+        let (candidates, stale) = self.symbol_store.write().insert(file);
+        for candidate in candidates {
+            self.symbol_matcher().push(candidate);
+        }
+        self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
+        true
     }
 
     /// Rebuild the matcher from the store once enough of it is dead weight.
@@ -901,12 +1037,32 @@ impl ProjectFs {
             indexing: self.is_symbol_indexing(),
             files: store.files(),
             symbols: store.symbols(),
-            truncated: store.truncated,
+            truncated: store.truncated || self.incomplete(),
         }
     }
 
     pub fn root_paths(&self) -> Vec<PathBuf> {
         self.roots.iter().map(|r| r.path.clone()).collect()
+    }
+
+    /// Reclaim append-only stale candidates after deletes/renames. New admissions remain
+    /// charged until the generation is released, including capacity held by old readers.
+    pub fn compact_files(&self) {
+        let live = self.index.read().files() as usize;
+        if self.matcher.candidate_count().saturating_sub(live) < (live / 10).max(2000) {
+            return;
+        }
+        let candidates = self.matcher.candidates();
+        let index = self.index.read();
+        let mut seen = std::collections::HashSet::new();
+        self.matcher.clear();
+        for item in candidates {
+            if index.kind_of(std::path::Path::new(&item.value)) == Some(cide_ipc::TreeRowKind::File)
+                && seen.insert(item.value.clone())
+            {
+                self.matcher.push_shared(item);
+            }
+        }
     }
 
     pub fn matcher(&self) -> &NucleoMatcher {
@@ -988,6 +1144,9 @@ impl ProjectFs {
     pub fn status(&self) -> FsStatus {
         let index = self.index.read();
         FsStatus {
+            generation: self.generation,
+            index_bytes: self.budget.used(),
+            index_limit: self.budget.reason(),
             indexing: self.indexing.load(Ordering::Acquire),
             files: index.files(),
             dirs: index.dirs(),
@@ -1012,6 +1171,9 @@ fn on_watch_event(
         // The project closed while this event was in flight.
         return;
     };
+    if fs.budget.cancelled() {
+        return;
+    }
     match event {
         WatchEvent::Changed(change) => {
             let filter = Arc::clone(&fs.filter.read());
@@ -1022,6 +1184,7 @@ fn on_watch_event(
                     item.path.to_string_lossy().into_owned(),
                 ));
             }
+            fs.compact_files();
             // Keep the symbol index in step — but only for a project that has one. A project
             // nobody has pressed Ctrl+Alt+Shift+N in must not start parsing because somebody ran
             // `cargo build`.
@@ -1053,6 +1216,10 @@ fn on_watch_event(
              * question of which paths matter to which server — including the build manifests,
              * which `cide_lang::Lang::of_path` above deliberately does not know about.
              */
+            if fs.budget.cancelled() {
+                return;
+            }
+            events.status(project, &fs.status());
             events.files_changed(project, &change.paths);
             events.changed(project, &change);
         }
@@ -1060,5 +1227,90 @@ fn on_watch_event(
             *fs.watch_status.lock() = status;
             events.status(project, &fs.status());
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    struct Events(AtomicU32);
+    impl FsEvents for Events {
+        fn status(&self, _: ProjectId, _: &FsStatus) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn changed(&self, _: ProjectId, _: &FsChange) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn replaced_and_closed_claims_never_emit_or_start_watchers() {
+        let dir = cide_fs::testing::scratch("cancel-generation");
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let first = registry
+            .claim(project, vec![dir.to_path_buf()], Visibility::CONSERVATIVE)
+            .unwrap();
+        let old = registry.get(project).unwrap();
+        let second = registry
+            .claim(
+                project,
+                vec![dir.to_path_buf()],
+                Visibility {
+                    hidden: true,
+                    ignored: true,
+                },
+            )
+            .unwrap();
+        let current = registry.get(project).unwrap();
+        assert!(old.budget.cancelled());
+        assert_ne!(old.generation, current.generation);
+        let events = Arc::new(Events(AtomicU32::new(0)));
+        first.run(events.clone(), project);
+        assert!(old.watcher.lock().is_none());
+        drop(registry.remove(project));
+        second.run(events.clone(), project);
+        assert_eq!(events.0.load(Ordering::Acquire), 0);
+        assert!(current.watcher.lock().is_none());
+    }
+
+    #[test]
+    fn budget_changes_cancel_affected_generations_and_keep_old_readers_accounted() {
+        let dir = cide_fs::testing::scratch("budget-settings");
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let claim = registry
+            .claim(project, vec![dir.to_path_buf()], Visibility::CONSERVATIVE)
+            .unwrap();
+        let old = registry.get(project).unwrap();
+        registry.configure(&cide_ipc::ExplorerSettings {
+            index_memory_mib: 64,
+            ..Default::default()
+        });
+        assert!(old.budget.cancelled());
+        let next = registry
+            .claim(project, vec![dir.to_path_buf()], Visibility::CONSERVATIVE)
+            .unwrap();
+        assert_eq!(registry.shared.used(), 64 * MIB);
+        drop(claim);
+        drop(old);
+        assert_eq!(registry.shared.used(), 32 * MIB);
+        drop(next);
+        registry.close_all();
+        assert_eq!(registry.shared.used(), 0);
+    }
+    #[test]
+    fn shutdown_cancels_claims_without_waiting_for_their_owners() {
+        let dir = cide_fs::testing::scratch("index-shutdown");
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let claim = registry
+            .claim(project, vec![dir.to_path_buf()], Visibility::CONSERVATIVE)
+            .unwrap();
+        registry.cancel_all();
+        assert!(registry.get(project).unwrap().budget.cancelled());
+        let events = Arc::new(Events(AtomicU32::new(0)));
+        claim.run(events.clone(), project);
+        assert_eq!(events.0.load(Ordering::Acquire), 0);
     }
 }

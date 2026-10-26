@@ -114,6 +114,7 @@ import {
 } from '@/ipc/client'
 import { Icon, FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+import { canCompareClipboard, compareToClipboard } from '@/editor/compareClipboard'
 import { COMPOSE_LABEL, COMPOSE_VERBS, isComposePath } from '@/chrome/composeModel'
 import { runCompose } from '@/chrome/composeRun'
 // The sentence, not a second copy of it. `NO_HOST` is user-visible prose that now appears on
@@ -1763,12 +1764,11 @@ export function FileTree({
        * The string *Search in Folder* would put in the panel's box, or `null` when this row
        * names no folder the search can reach.
        *
-       * Computed here beside the other two refusals rather than inside the item, so the label
-       * and the enabled-ness are decided from one answer. `roots` and not `writable`: the
+       * Only folders offer this menu action. `roots` and not `writable`: the
        * search walks the project's roots, and the *Scratches* drawer is writable and outside
        * every one of them.
        */
-      const searchScope = row === null ? null : scopeFor(row.path, row.isDir)
+      const searchScope = row?.isDir ? scopeFor(row.path, true) : null
       /*
        * And the narrower one: a row cide may *rename* but whose directory nobody fills.
        *
@@ -2087,6 +2087,24 @@ export function FileTree({
                   'cide opens a file manager only on paths inside the project',
               }),
         },
+        ...(!row.isDir
+          ? ([
+              {
+                id: 'openExternal',
+                label: 'Open in Default Application',
+                // Like Reveal, act on the clicked row even with a multi-file selection.
+                ...(rowRefusal === null
+                  ? {
+                      run: () => void fsReveal.openExternal(project, row.path)
+                        .catch(fail('Open in Default Application')),
+                    }
+                  : {
+                      disabledReason:
+                        'cide opens files externally only inside the project or its scratches',
+                    }),
+              },
+            ] satisfies MenuEntry[])
+          : []),
         {
           /*
            * *Refresh* — re-scan everything under this folder against the disk.
@@ -2097,7 +2115,7 @@ export function FileTree({
            * drifts from the rows until something re-reads the disk. cide's own tree
            * gestures fold themselves in; this is for everyone else's writes.
            *
-           * A folder verb, like *Search in Folder* above — a refresh is about a subtree,
+           * A folder verb, like *Search in Folder* below — a refresh is about a subtree,
            * and a file row has no subtree to re-scan. Disabled with a sentence rather than
            * absent, per the house treatment: the two non-folder cases get different words
            * because "click the folder instead" and "outside the project" are different
@@ -2113,44 +2131,26 @@ export function FileTree({
                   : 'A file has nothing to re-scan — refresh its folder instead',
               }),
         },
-        {
-          /*
-           * *Search in Folder*.
-           *
-           * The clicked row and not the selection, for the reason *Reveal in File Manager*
-           * above gives: a scope is one place, and there is no way to express "these five
-           * folders" on the wire or in the box. A **file** row means its containing folder,
-           * which is what `scopeFor` resolves and what the label has to say out loud — an item
-           * reading *Search in Folder* on a `.rs` file would be ambiguous about whether it
-           * searched the file.
-           *
-           * Carries the command id so the row draws whatever chord the live keymap has for
-           * `sidebar.search` — ⌃⇧F, which is exactly the key that does this when the tree has
-           * focus. That is the point of the chip here: it teaches the shortcut for the gesture
-           * the user has just performed with the mouse.
-           *
-           * Disabled with a sentence for a row under no project root — a dependency source, a
-           * scratch, a group heading. The search only ever walks roots, so scoping to one of
-           * those could not produce a hit, and an enabled item that reports *outside this
-           * project* after the fact is the dead control this panel has already shipped twice.
-           */
-          id: 'searchIn',
-          label: row.isDir ? 'Search in Folder' : 'Search in Containing Folder',
-          command: 'sidebar.search',
-          ...(searchScope === null
-            ? {
-                disabledReason: row.isDir
-                  ? 'cide searches only inside the project\u2019s own folders'
-                  : 'This file is outside the project, so there is no folder here to search',
-              }
-            : {
-                run: () => {
-                  if (!searchInFolder(searchScope)) {
-                    setProblem('This window has no sidebar to show the search panel in.')
-                  }
-                },
-              }),
-        },
+        // Search the clicked folder, never the selection. The keyboard command still
+        // supports a file's containing folder, but the menu action is folder-only.
+        ...(row.isDir
+          ? ([
+              {
+                id: 'searchIn',
+                label: 'Search in Folder',
+                command: 'sidebar.search',
+                ...(searchScope === null
+                  ? { disabledReason: 'cide searches only inside the project\u2019s own folders' }
+                  : {
+                      run: () => {
+                        if (!searchInFolder(searchScope)) {
+                          setProblem('This window has no sidebar to show the search panel in.')
+                        }
+                      },
+                    }),
+              },
+            ] satisfies MenuEntry[])
+          : []),
         ...(!row.isDir ? [{
           id: 'local-history', label: 'Local History', submenu: () => [{
             id: 'show-local-history', label: 'Show History', command: 'local-history.file',
@@ -2202,6 +2202,10 @@ export function FileTree({
          * the system clipboard — so the text a Copy leaves behind and the text these two write
          * are the same shape, and pasting either into a terminal works.
          */
+        ...(!row.isDir && canCompareClipboard(row.path) ? [{
+          id: 'compareClipboard', label: 'Compare to Clipboard',
+          run: () => { void compareToClipboard(project, row.path) },
+        }] : []),
         {
           id: 'copyPath',
           label: many ? `Copy ${scope.length} Paths` : 'Copy Path',

@@ -83,12 +83,17 @@ pub async fn fs_index(
     // Both out of one `with`: the roots and the visibility have to describe the same instant,
     // and two reads with a settings write between them would walk one answer and filter by the
     // other.
-    let (roots, visibility) = state.with(|ws| {
+    let (roots, visibility, explorer) = state.with(|ws| {
         let roots = cide_core::workspace::project(ws, project)
             .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
-        (roots, crate::files::visibility_of(&ws.settings))
+        (
+            roots,
+            crate::files::visibility_of(&ws.settings),
+            ws.settings.explorer,
+        )
     });
+    registry.configure(&explorer);
     index_project(Arc::new(app), &registry, project, roots, visibility).await
 }
 
@@ -564,6 +569,17 @@ pub async fn fs_refresh(
     path: PathBuf,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    // An explicit root refresh retries an incomplete generation, reclaiming its stale
+    // arena/matcher capacity. Exhaustion itself never schedules a retry loop.
+    if fs.budget.reason().is_some() && fs.root_paths().contains(&path) {
+        let roots = fs.root_paths();
+        let visibility = fs.with_index(|index| index.visibility());
+        drop(fs);
+        drop(registry.remove(project));
+        return index_project(Arc::new(app), &registry, project, roots, visibility)
+            .await
+            .map(|status| status.rows);
+    }
     let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_refresh", move || {
         ops::check_within(&fs.root_paths(), &path)?;
@@ -575,6 +591,8 @@ pub async fn fs_refresh(
                 item.path.to_string_lossy().into_owned(),
             ));
         }
+        fs.compact_files();
+        events.status(project, &fs.status());
         let change = cide_ipc::FsChange {
             paths: vec![path],
             truncated: false,
@@ -823,6 +841,48 @@ pub async fn fs_show_in_manager(
         Ok(target)
     })
     .await?
+}
+
+/// Open the saved file in the desktop's default application, including from detached windows.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_open_external(
+    app: tauri::AppHandle,
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    path: PathBuf,
+) -> Result<(), FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_open_external", move || {
+        use tauri_plugin_opener::OpenerExt;
+
+        open_external_file(&fs.writable_paths(), &path, |path| {
+            app.opener()
+                .open_path(path.to_string_lossy(), None::<&str>)
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await?
+}
+
+/// Keep validation and launch together so rejected paths never reach the OS opener.
+fn open_external_file(
+    roots: &[PathBuf],
+    path: &std::path::Path,
+    open: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), FsError> {
+    ops::check_within(roots, path)?;
+    // Follow symlinks just as Reveal does, but refuse directories and special files.
+    let metadata = std::fs::metadata(path).map_err(|error| FsError::io(path, error))?;
+    if !metadata.is_file() {
+        return Err(FsError::Io {
+            path: path.display().to_string(),
+            message: "Only files can be opened in a default application".into(),
+        });
+    }
+    open(path).map_err(|message| FsError::Io {
+        path: path.display().to_string(),
+        message,
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1992,6 +2052,107 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn external_open_passes_the_exact_file_to_the_desktop() {
+        let root = scratch("external-open");
+        let drawer = scratch("external-open-scratches");
+        let roots = [root.path().to_path_buf(), drawer.path().to_path_buf()];
+        for path in [
+            root.path().join("index.html"),
+            root.path().join("image with spaces.png"),
+            drawer.path().join("note.txt"),
+        ] {
+            std::fs::write(&path, "saved contents").unwrap();
+            let mut opened = Vec::new();
+            open_external_file(&roots, &path, |target| {
+                opened.push(target.to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(opened, [path]);
+        }
+    }
+
+    #[test]
+    fn external_open_refuses_invalid_targets_before_launch() {
+        let root = scratch("external-open-refusals");
+        let outside = scratch("external-open-outside");
+        let roots = [root.path().to_path_buf()];
+        let outside_file = outside.path().join("index.html");
+        std::fs::write(&outside_file, "outside").unwrap();
+        let refuse_launch = |_: &Path| -> Result<(), String> {
+            panic!("a rejected path must never reach the desktop opener")
+        };
+
+        assert!(matches!(
+            open_external_file(&roots, &outside_file, refuse_launch),
+            Err(FsError::OutsideProject(_))
+        ));
+        for path in [
+            PathBuf::from("index.html"),
+            root.path().join("../index.html"),
+        ] {
+            assert!(matches!(
+                open_external_file(&roots, &path, refuse_launch),
+                Err(FsError::InvalidPath(_))
+            ));
+        }
+        for path in [root.path().to_path_buf(), root.path().join("missing.html")] {
+            assert!(matches!(
+                open_external_file(&roots, &path, refuse_launch),
+                Err(FsError::Io { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn external_open_reports_desktop_failures_with_the_file_path() {
+        let root = scratch("external-open-failure");
+        let path = root.path().join("index.html");
+        std::fs::write(&path, "saved contents").unwrap();
+        let error = open_external_file(&[root.path().to_path_buf()], &path, |_| {
+            Err("No application is associated with this file".into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            FsError::Io {
+                path: path.display().to_string(),
+                message: "No application is associated with this file".into(),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_open_follows_file_symlinks_and_refuses_other_targets() {
+        let root = scratch("external-open-links");
+        let target = scratch("external-open-target");
+        let roots = [root.path().to_path_buf()];
+        let file = target.path().join("index.html");
+        std::fs::write(&file, "linked contents").unwrap();
+        let link = root.path().join("index.html");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        open_external_file(&roots, &link, |path| {
+            assert_eq!(path, link);
+            Ok(())
+        })
+        .unwrap();
+
+        let directory = root.path().join("directory");
+        let broken = root.path().join("broken");
+        let device = root.path().join("device");
+        std::os::unix::fs::symlink(target.path(), &directory).unwrap();
+        std::os::unix::fs::symlink(target.path().join("missing"), &broken).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &device).unwrap();
+        for path in [directory, broken, device] {
+            assert!(matches!(
+                open_external_file(&roots, &path, |_| panic!("not a regular file")),
+                Err(FsError::Io { .. })
+            ));
+        }
+    }
 
     /// The fuzzy needle. `q` and `z` appear nowhere else in the corpus, so a query for it
     /// cannot be satisfied by filler — fuzzy matching is subsequence matching, and a needle

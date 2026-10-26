@@ -27,12 +27,12 @@
  * the merge, every one-sided hunk already applied, so the resolver parses what git wrote rather
  * than re-deriving a merge that could disagree with the index cide is about to commit.
  *
- * # Size guards, borrowed wholesale from `DiffPane`
+ * # Size guard
  *
- * Three CodeMirror documents laid side by side force `height: auto` on their content and defeat
- * the viewport windowing that makes a large file survivable. `cide_git::conflict::read` refuses
- * over `MAX_SIDE_BYTES` and reports `tooLarge`; this pane draws the one-click answers and no
- * editors at all for that case, and for a binary conflict.
+ * Each editor fills its pane and scrolls independently, preserving CodeMirror's viewport
+ * windowing. `cide_git::conflict::read` still caps each version at `MAX_SIDE_BYTES` to bound
+ * transfer and merge-model memory. Above that it reports `tooLarge`; this pane offers taking
+ * either side whole without mounting editors, as it does for a binary conflict.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Compartment, EditorState } from '@codemirror/state'

@@ -195,6 +195,7 @@ export function projectTabEntries(
 // --- workspace tabs -------------------------------------------------------------------------
 
 export interface TabActions {
+  compareClipboard?: ((path: string) => void) | undefined
   close?: ((id: TabId) => void) | undefined
   /**
    * Close several tabs as one gesture — what the three bulk items below run.
@@ -255,7 +256,7 @@ export function closable(tab: Tab): boolean {
 
 /** The path a tab is *about*, or `null` when it is not about one. */
 export function pathOf(tab: Tab): string | null {
-  if (tab.kind.kind === 'file') return tab.kind.path
+  if (tab.kind.kind === 'file' || tab.kind.kind === 'clipboardDiff') return tab.kind.path
   if (tab.kind.kind === 'diff') return tab.kind.spec.newPath
   if (tab.kind.kind === 'revision') return tab.kind.path
   return null
@@ -279,7 +280,7 @@ export function pathOf(tab: Tab): string | null {
  * slash-separated and does *not*.
  */
 export function absolutePathOf(tab: Tab): string | null {
-  if (tab.kind.kind === 'file') return tab.kind.path
+  if (tab.kind.kind === 'file' || tab.kind.kind === 'clipboardDiff') return tab.kind.path
   if (tab.kind.kind === 'diff') {
     const path = tab.kind.spec.newPath
     return path.startsWith('/') ? path : null
@@ -305,7 +306,7 @@ export function tabMenuEntries(
   activeTab: TabId,
   actions: TabActions,
 ): MenuEntry[] {
-  const { close, closeMany, split, detach, copy, history, localHistory, properties } = actions
+  const { close, closeMany, split, detach, copy, history, localHistory, properties, compareClipboard } = actions
   const index = tabs.indexOf(tab)
   const others = tabs.filter((t) => t !== tab && closable(t))
   /*
@@ -381,6 +382,9 @@ export function tabMenuEntries(
       ...(detach && active ? { run: detach } : { disabledReason: active ? NO_HOST : NOT_ACTIVE }),
     },
     { kind: 'separator' },
+    ...((tab.kind.kind === 'file' || tab.kind.kind === 'clipboardDiff') && compareClipboard && absolute !== null ? [{
+      id: 'compare-clipboard', label: 'Compare to Clipboard', run: () => compareClipboard(absolute),
+    }] : []),
     {
       id: 'copy-path',
       label: 'Copy path',
@@ -479,6 +483,8 @@ function overflowLabel(tab: Tab): string {
       return 'Claude'
     case 'claudeFull':
       return tab.kind.title
+    case 'clipboardDiff':
+      return `${basename(tab.kind.path)} vs Clipboard`
     case 'file':
       return basename(tab.kind.path)
     case 'diff':

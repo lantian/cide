@@ -371,6 +371,9 @@ fn run_teardown(app: &AppHandle) {
     // Deliberately not `cmd::fs::close_all`, which would drop every project's index here:
     // that is the teardown `fs_close` hands to a blocking worker precisely because it is too
     // slow for a shared thread, and the memory is about to go back to the kernel anyway.
+    if let Some(files) = app.try_state::<crate::files::FsRegistry>() {
+        files.cancel_all();
+    }
     if let Some(searches) = app.try_state::<crate::cmd::search::SearchRegistry>() {
         searches.cancel_all();
     }

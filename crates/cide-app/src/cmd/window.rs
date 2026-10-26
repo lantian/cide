@@ -922,6 +922,18 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
     // shell is deliberately not drawing a detached tab, so a native close would leave an
     // open file (and any session split beside it) shown by nothing, with the stale role
     // reopening the window on the next launch as the only way back.
+    // File views acknowledge pending shared-document edits before the webview is destroyed.
+    if let Some(WindowRole::DetachedTab { project, tab }) = &role
+        && workspace::tab(&snapshot, *project, *tab).is_ok_and(|t| {
+            matches!(
+                t.kind,
+                cide_ipc::TabKind::File { .. } | cide_ipc::TabKind::ClipboardDiff { .. }
+            )
+        })
+    {
+        crate::emit::editor_redock_requested(app, label);
+        return true;
+    }
     let redock: fn(&mut cide_ipc::Workspace, &WindowLabel) -> Result<WindowLabel, CoreError> =
         match role {
             Some(WindowRole::DetachedPane { .. }) => workspace::redock_pane,

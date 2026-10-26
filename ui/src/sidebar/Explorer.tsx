@@ -9,14 +9,17 @@
  * This is also where the store is pointed at a project and where the watcher is subscribed,
  * so `FileTree` stays a pure render target over `treeStore`.
  */
-import { memo, useEffect } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { FileTree } from './FileTree'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { groupDigits } from '@/overlays/format'
-import { events, type ProjectId } from '@/ipc/client'
+import { events, fs, type FsStatus, type ProjectId } from '@/ipc/client'
 import { Icon } from '@/icons/Icon'
 
+import { Button } from '@/kit/components/Button'
+import { Banner } from '@/kit/components/Feedback'
+import { requestSettingsFrame } from '@/chrome/panelRequests'
 import styles from './FileTree.module.css'
 
 export interface ExplorerProps {
@@ -111,6 +114,16 @@ function ExplorerImpl({
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
 
+  const [status, setStatus] = useState<FsStatus | null>(null)
+  useEffect(() => {
+    setStatus(null)
+    if (project === null) return
+    let cancelled = false
+    void fs.status(project).then((next) => {
+      if (!cancelled) setStatus((old) => old && old.generation > next.generation ? old : next)
+    }).catch(() => { /* A newly opened project may not yet have an index. */ })
+    return () => { cancelled = true }
+  }, [project])
   useEffect(() => {
     void useFileTree.getState().attach(project)
   }, [project])
@@ -189,8 +202,9 @@ function ExplorerImpl({
     let cancelled = false
     let unlisten: (() => void) | null = null
     void events
-      .onFsStatus((changed) => {
-        if (changed !== project) return
+      .onFsStatus((changed, next) => {
+        if (changed !== project || cancelled) return
+        setStatus((old) => old && old.generation > next.generation ? old : next)
         void useFileTree.getState().refresh()
       })
       .then((fn) => {
@@ -323,6 +337,10 @@ function ExplorerImpl({
           </button>
         )}
       </div>
+      {status?.indexLimit && <Banner tone="warn"
+        action={<Button size="sm" variant="quiet" onClick={() => { requestSettingsFrame('files') }}>Settings</Button>}>
+        Index incomplete: memory limit reached
+      </Banner>}
       <FileTree
         project={project}
         onOpen={onOpenFile}

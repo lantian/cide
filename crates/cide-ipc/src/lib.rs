@@ -12,6 +12,7 @@ pub mod conversations;
 pub mod git;
 pub mod gitlab;
 pub mod headless;
+pub mod shared_document;
 // The Git tool window: the commit log and its graph, one commit's contents, revisions, blame and
 // the commit-level actions. (M18)
 //
@@ -110,8 +111,9 @@ pub mod fs;
 pub mod search;
 
 pub use fs::{
-    FileClip, FsChange, FsStatus, NO_ROOT, PasteChoice, PasteCollision, PasteDecision, PasteMode,
-    PastedEntry, TreeMatch, TreeMatches, TreeRow, TreeRowKind, WatchBackend, WatchStatus,
+    FileClip, FsChange, FsStatus, IndexLimit, NO_ROOT, PasteChoice, PasteCollision, PasteDecision,
+    PasteMode, PastedEntry, TreeMatch, TreeMatches, TreeRow, TreeRowKind, WatchBackend,
+    WatchStatus,
 };
 pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section

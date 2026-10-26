@@ -89,6 +89,10 @@ impl SymbolStore {
         Self::default()
     }
 
+    pub fn contains(&self, path: &str) -> bool {
+        self.by_path.contains_key(path)
+    }
+
     pub fn files(&self) -> u32 {
         self.by_path.len() as u32
     }

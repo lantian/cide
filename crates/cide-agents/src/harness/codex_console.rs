@@ -51,6 +51,9 @@ impl Protocol {
     pub fn current_thread(&self) -> Option<&str> {
         self.active.as_deref()
     }
+    pub fn current_turn(&self) -> Option<&str> {
+        self.turn.as_deref()
+    }
     pub fn current_model(&self) -> Option<&str> {
         self.model.as_deref()
     }
@@ -272,11 +275,15 @@ impl Protocol {
                         payload,
                     });
                 } else {
-                    hooks.extend(self.hook(if params["turn"]["status"] == "interrupted" {
+                    let mut completed = self.hook(if params["turn"]["status"] == "interrupted" {
                         "Interrupt"
                     } else {
                         "Stop"
-                    }));
+                    });
+                    for hook in &mut completed {
+                        hook.payload["turn_id"] = params["turn"]["id"].clone();
+                    }
+                    hooks.extend(completed);
                 }
             }
             "serverRequest/resolved" => {
@@ -289,10 +296,16 @@ impl Protocol {
                 payload: self.readout(Some(&params["tokenUsage"])),
             }),
             "item/completed" if params["item"]["type"] == "agentMessage" => {
-                self.last_answer = params["item"]["text"].as_str().unwrap_or("").to_string();
+                if !self.late_item(params) {
+                    self.last_answer = params["item"]["text"].as_str().unwrap_or("").to_string();
+                }
             }
             "item/completed" if params["item"]["type"] == "fileChange" => {
                 let mut payload = self.payload();
+                if let Some(turn) = params.get("turnId") {
+                    payload["turn_id"] = turn.clone();
+                }
+                payload["cide_late_turn"] = json!(self.late_item(params));
                 payload["tool_name"] = json!("Write");
                 for path in params["item"]["changes"]
                     .as_array()
@@ -312,14 +325,24 @@ impl Protocol {
         hooks
     }
 
+    fn late_item(&self, params: &Value) -> bool {
+        self.turn_ended
+            || params["turnId"].as_str().is_some_and(|turn| {
+                self.completed_turns.iter().any(|old| old == turn)
+                    || self.turn.as_deref().is_some_and(|current| current != turn)
+            })
+    }
+
     fn status(&mut self, status: &Value) -> Vec<Hook> {
+        if self.turn_ended && status["type"] == "active" {
+            return Vec::new();
+        }
         self.ready = status["type"] == "idle";
         let kind = match status["type"].as_str() {
             // Native completion already emits Stop. A second Stop would clear Cide's
             // AwaitingInput attention marker by moving it back to Idle. Status supplies
             // readiness; only the turn event establishes that work finished.
             Some("idle") => return Vec::new(),
-            Some("active") if self.turn_ended => return Vec::new(),
             Some("active")
                 if status["activeFlags"]
                     .as_array()
@@ -341,8 +364,7 @@ impl Protocol {
     }
 
     fn payload(&self) -> Value {
-        let mut payload =
-            json!({"session_id": self.active, "last_assistant_message": self.last_answer});
+        let mut payload = json!({"session_id": self.active, "turn_id": self.turn, "last_assistant_message": self.last_answer});
         if let Some(model) = &self.model {
             payload["model"] = json!(model);
         }
@@ -816,6 +838,29 @@ mod tests {
     }
 
     #[test]
+    fn late_native_items_keep_file_changes_without_replacing_the_new_turn() {
+        let mut p = opened();
+        p.from_server(
+            &json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"old"}}}),
+        );
+        p.from_server(&json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"old","status":"completed"}}}));
+        p.from_server(
+            &json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"new"}}}),
+        );
+        p.from_server(&json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":"new","item":{"type":"agentMessage","text":"New answer"}}}));
+        p.from_server(&json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":"old","item":{"type":"agentMessage","text":"Old answer"}}}));
+        let edits = p.from_server(&json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":"old","item":{"type":"fileChange","changes":[{"path":"/repo/a.rs"}]}}}));
+        assert_eq!(edits[0].kind, "PostToolUse");
+        assert_eq!(edits[0].payload["turn_id"], "old");
+        assert_eq!(edits[0].payload["cide_late_turn"], true);
+        assert_eq!(edits[0].payload["tool_input"]["file_path"], "/repo/a.rs");
+        assert_eq!(p.current_turn(), Some("new"));
+        assert!(p.receiver().is_none());
+        let stopped = p.from_server(&json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"new","status":"completed"}}}));
+        assert_eq!(stopped[0].payload["last_assistant_message"], "New answer");
+    }
+
+    #[test]
     fn only_a_real_native_user_prompt_can_resume_a_paused_pair() {
         let mut p = opened();
         p.from_terminal(&json!({"id":2,"method":"turn/start","params":{"threadId":THREAD,"toolOutput":{"name":"check","output":"ok"},"input":[]}}));
@@ -879,6 +924,10 @@ mod tests {
         );
         assert!(p.from_server(&failed("planning")).is_empty());
         assert!(p.from_server(&json!({"method":"thread/status/changed","params":{"threadId":THREAD,"status":{"type":"active","activeFlags":[]}}})).is_empty());
+        assert!(
+            p.receiver().is_some(),
+            "late activity cannot close a completed turn's delivery gate"
+        );
         assert_eq!(p.from_server(&start("retry"))[0].kind, "UserPromptSubmit");
         assert!(
             p.from_server(&failed("planning")).is_empty(),

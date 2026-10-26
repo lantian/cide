@@ -19,8 +19,11 @@ fn editors_with(
     let mut expected = BTreeSet::new();
     for project in ws.projects.values() {
         for tab in &project.tabs {
-            let TabKind::File { path, dirty } = &tab.kind else {
-                continue;
+            let (path, dirty) = match &tab.kind {
+                TabKind::File { path, dirty } | TabKind::ClipboardDiff { path, dirty, .. } => {
+                    (path, dirty)
+                }
+                _ => continue,
             };
             if resolve(path).as_deref() != Some(target) {
                 continue;
@@ -238,6 +241,43 @@ mod tests {
         assert_ne!(
             editors_with(&ws, &path, |p| Some(p.into())).unwrap(),
             before
+        );
+
+        let file = ws
+            .projects
+            .get_mut(&project)
+            .unwrap()
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .unwrap();
+        file.kind = TabKind::ClipboardDiff {
+            path: path.clone(),
+            snapshot_id: "clipboard".into(),
+            dirty: true,
+        };
+        assert!(
+            editors_with(&ws, &path, |p| Some(p.into()))
+                .unwrap_err()
+                .contains("unsaved")
+        );
+        if let TabKind::ClipboardDiff { dirty, .. } = &mut ws
+            .projects
+            .get_mut(&project)
+            .unwrap()
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .unwrap()
+            .kind
+        {
+            *dirty = false;
+        }
+        assert!(
+            editors_with(&ws, &path, |p| Some(p.into()))
+                .unwrap()
+                .0
+                .contains(&original.id.to_string())
         );
     }
 }

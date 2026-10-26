@@ -59,6 +59,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import { localHistory } from '@/ipc/client'
 import { notifyFailure } from '@/chrome/notices'
+import { canCompareClipboard, compareToClipboard } from '@/editor/compareClipboard'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
 import { useRunningInTab } from '@/panes/running'
@@ -325,6 +326,8 @@ export function TabStrip({
       // a reason, never drawn and dead — WebKitGTK does not always expose one.
       const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
       return tabMenuEntries(tabs, tab, activeTab, {
+        ...(project && (tab.kind.kind === 'file' || tab.kind.kind === 'clipboardDiff') && canCompareClipboard(tab.kind.path)
+          ? { compareClipboard: (path: string) => { void compareToClipboard(project, path) } } : {}),
         close: onClose,
         closeMany: onCloseMany,
         split: onSplit,
@@ -668,6 +671,7 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
         audit: 'conversationArchiveTab',
       }
 
+    case 'clipboardDiff':
     case 'file': {
       const badge = badgeFor(kind.path)
       return {
@@ -677,7 +681,7 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
             <span className={`${styles.badge} ${badge.tone}`} data-audit="fileTabBadge">
               {badge.label}
             </span>
-            <span>{basename(kind.path)}</span>
+            <span>{basename(kind.path)}{kind.kind === 'clipboardDiff' ? ' vs Clipboard' : ''}</span>
           </>
         ),
         closable: true,

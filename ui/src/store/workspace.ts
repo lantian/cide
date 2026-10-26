@@ -217,7 +217,8 @@ async function tabCloseRisk(
   return {
     // Narrowed to this tab: the decision answers for the whole project, and listing a dirty
     // file from a tab that is not closing would be a dialog about work that is not at risk.
-    unsaved: decision.unsaved.filter((u) => u.tab === tab),
+    unsaved: decision.unsaved.filter(u => u.tab === tab && !boot?.workspace.projects[project]?.tabs.some(t =>
+      t.id !== tab && (t.kind.kind === 'file' || t.kind.kind === 'clipboardDiff') && t.kind.path === u.path)),
     sessions: decision.blocking.filter((s) => bound.has(s.session)),
   }
 }
@@ -262,7 +263,12 @@ async function tabsCloseRisk(
 
   const decision = await appApi.quitRequested(project)
   return {
-    unsaved: decision.unsaved.filter((u) => closing.has(u.tab)),
+    unsaved: decision.unsaved.flatMap(u => {
+      const views = open.filter(t => (t.kind.kind === 'file' || t.kind.kind === 'clipboardDiff') && t.kind.path === u.path)
+      if (views.length === 0) return closing.has(u.tab) ? [u] : []
+      if (views.some(t => !closing.has(t.id))) return []
+      return [{ ...u, tab: views[0]!.id }]
+    }),
     sessions: decision.blocking.filter((s) => bound.has(s.session)),
   }
 }
@@ -1027,6 +1033,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   },
   closeTabs: async (project, tabs, force = false) => {
     if (tabs.length === 0) return
+    await (await import('@/editor/sharedDocuments')).flushDocuments()
     if (!force) {
       // One question for the whole gesture. See `tabsCloseRisk` for why this is not
       // `tabCloseRisk` in a loop, and `CloseScope`'s `tabs` variant for why the wording differs.
@@ -1076,6 +1083,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await synced(rev)
   },
   closeTab: async (project, tab, force = false) => {
+    await (await import('@/editor/sharedDocuments')).flushDocuments()
     // Mostly no pre-flight question here, unlike `closeProject`: the unsaved case comes back
     // from Rust as a refusal that already names the file, so asking first would be a second
     // round trip for an answer the failure path hands over anyway — and it would be the
@@ -1276,6 +1284,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await synced(rev)
   },
   detachTab: async (project, tab) => {
+    await (await import('@/editor/sharedDocuments')).flushDocuments()
     // Read before the call: the ids do not change — the tab stays in `project.tabs` — but
     // reading them now means the release below cannot miss a pane over a mirror that
     // happens to be mid-refresh.
@@ -1298,6 +1307,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     for (const pane of panes) releaseHost(pane)
   },
   redockTab: async (label) => {
+    await (await import('@/editor/sharedDocuments')).flushDocuments()
     const { rev } = await windowApi.redockTab(label)
     await synced(rev)
   },

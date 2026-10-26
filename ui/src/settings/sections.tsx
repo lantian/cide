@@ -927,6 +927,16 @@ function Files({ settings, patch }: SectionProps) {
 
   return (
     <Group>
+      <Row label="Index memory per project" hint="MiB for file, symbol and library indexes. Default: 512."
+        info="Conservative indexing allocation budget, including watcher metadata. This does not cap total app, language server or agent memory. When reached, search covers the files already indexed."
+        {...resetTo(explorer.indexMemoryMiB, def?.indexMemoryMiB, (v) => set({ indexMemoryMiB: v }))}
+        control={<NumberField label="Index memory per project (MiB)" value={explorer.indexMemoryMiB}
+          min={64} max={4096} step={64} onChange={(v) => set({ indexMemoryMiB: v })} />} />
+      <Row label="Combined index memory" hint="MiB shared by all open projects. Default: 2048."
+        info="Reducing a budget rebuilds indexes. Increasing it retries incomplete indexes. Ignored folders and external directory links use the remaining budget after ordinary source files."
+        {...resetTo(explorer.totalIndexMemoryMiB, def?.totalIndexMemoryMiB, (v) => set({ totalIndexMemoryMiB: v }))}
+        control={<NumberField label="Combined index memory (MiB)" value={explorer.totalIndexMemoryMiB}
+          min={256} max={16384} step={256} onChange={(v) => set({ totalIndexMemoryMiB: v })} />} />
       <ToggleRow
         label="Show hidden files"
         hint="Dot-prefixed entries — .claude, .github, .env — in the tree and Ctrl+P."
@@ -956,7 +966,7 @@ function Files({ settings, patch }: SectionProps) {
               It is the expensive setting: on a Rust project it is hundreds of thousands of extra
               rows to walk, hold and offer to Ctrl+P. One ignore decision serves every surface, so
               this widens Find in Files and the symbol index with the tree — a find-in-files over a
-              built project will read your object files.
+              built project searches admitted text files within the indexing budget.
             </InfoPara>
             <InfoPara>
               They are shown but not watched: changes inside an ignored directory appear when the

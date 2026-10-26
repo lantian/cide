@@ -47,6 +47,6 @@ export function PinnedSearch({ session, onOpenHit }: { session: SearchSession; o
       <span className={styles.querySummary} title={summary}>{summary}</span>
     </div>
     <ResultsView project={session.project} id={session.id} items={items} mode={descriptor.source} pinned running={frame?.running ?? true} error={status} onOpen={open} />
-    <div className={styles.footer}>{frame?.running ? 'Searching…' : `${items.length.toLocaleString()} results`}{limited ? ' · Result limit reached' : ''}</div>
+    <div className={styles.footer}>{frame?.running ? 'Searching…' : `${items.length.toLocaleString()} results`}{limited ? ' · Result limit reached' : ''}{frame?.incomplete ? ' · Index incomplete — Refresh for latest coverage' : ''}</div>
   </section>
 }

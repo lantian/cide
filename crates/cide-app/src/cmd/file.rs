@@ -84,10 +84,12 @@ pub(crate) fn open_file_tab(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let dirty = workspace::project(ws, project)?.tabs.iter().any(|t|
+            matches!(&t.kind, TabKind::ClipboardDiff { path: p, dirty: true, .. } if p == &path));
         workspace::open_tab(
             ws,
             project,
-            TabKind::File { path, dirty: false },
+            TabKind::File { path, dirty },
             Pane {
                 id: PaneId::new(),
                 kind: PaneKind::Editor,
@@ -1318,18 +1320,37 @@ pub fn tab_set_dirty(
     dirty: bool,
 ) -> Result<Mutated> {
     state.update_cosmetic(|ws| {
-        let t = workspace::tab_mut(ws, project, tab)?;
-        let TabKind::File { dirty: flag, .. } = &mut t.kind else {
-            return Err(CoreError::Invariant(format!(
-                "tab {tab} is not a file tab and has no dirty state"
-            )));
+        let path = match &workspace::tab(ws, project, tab)?.kind {
+            TabKind::File { path, .. } | TabKind::ClipboardDiff { path, .. } => path.clone(),
+            _ => {
+                return Err(CoreError::Invariant(format!(
+                    "tab {tab} is not a file tab and has no dirty state"
+                )));
+            }
         };
-        // Bumping `rev` on a no-op would broadcast a snapshot per keystroke: the editor
-        // reports on every transaction, and only the transitions are news.
-        if *flag == dirty {
+        let mut changed = false;
+        // Every view names one document. In particular, a save in the comparison must clear
+        // the regular tab's dot, and an edit must protect both before either view can close.
+        for t in ws.projects.values_mut().flat_map(|p| &mut p.tabs) {
+            match &mut t.kind {
+                TabKind::File {
+                    path: p,
+                    dirty: flag,
+                }
+                | TabKind::ClipboardDiff {
+                    path: p,
+                    dirty: flag,
+                    ..
+                } if p == &path && *flag != dirty => {
+                    *flag = dirty;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if !changed {
             return Ok(Mutated { rev: ws.rev });
         }
-        *flag = dirty;
         workspace::bump(ws);
         Ok(Mutated { rev: ws.rev })
     })
@@ -1738,7 +1759,8 @@ pub fn sweep_backups(ws: &cide_ipc::Workspace) {
             .tabs
             .iter()
             .filter_map(|tab| match &tab.kind {
-                cide_ipc::TabKind::File { path, .. } => Some(path.display().to_string()),
+                cide_ipc::TabKind::File { path, .. }
+                | cide_ipc::TabKind::ClipboardDiff { path, .. } => Some(path.display().to_string()),
                 _ => None,
             })
             .collect()

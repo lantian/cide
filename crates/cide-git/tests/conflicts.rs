@@ -134,6 +134,44 @@ fn reading_a_conflict_gives_three_sides_and_labels_them() {
 }
 
 #[test]
+fn reading_large_conflicts_checks_the_largest_of_all_three_versions() {
+    let work = TempRepo::new("read-size");
+    let repo = git2::Repository::open(&work.root).expect("repo");
+
+    // The reported 1346 KiB journal must open, as must a version exactly at the 10 MiB cap.
+    // Check every index stage: the base can be larger than either of the visible side panes.
+    for size in [1346 * 1024, 10 * 1024 * 1024, 10 * 1024 * 1024 + 1] {
+        let large = vec![b'x'; size];
+        for large_side in 0..3 {
+            let mut sides: [&[u8]; 3] = [b"base\n", b"ours\n", b"theirs\n"];
+            sides[large_side] = &large;
+            let mut entries = String::new();
+            for (side, bytes) in sides.iter().enumerate() {
+                let oid = repo.blob(bytes).expect("blob");
+                entries.push_str(&format!("100644 {oid} {}\tjournal.md\n", side + 1));
+            }
+            let (ok, output) =
+                work.try_git_stdin(&["update-index", "--index-info"], entries.as_bytes());
+            assert!(ok, "write conflict stages: {output}");
+
+            let file = conflict::read(&work.root, "journal.md").expect("read");
+            assert!(!file.binary);
+            let contents = [file.base, file.ours, file.theirs];
+            if size <= 10 * 1024 * 1024 {
+                assert_eq!(file.too_large, None);
+                for (text, expected) in contents.iter().zip(sides) {
+                    assert_eq!(text.as_ref().map(String::len), Some(expected.len()));
+                    assert!(text.as_ref().unwrap().as_bytes() == expected);
+                }
+            } else {
+                assert_eq!(file.too_large, Some(size as u64));
+                assert!(contents.iter().all(Option::is_none));
+            }
+        }
+    }
+}
+
+#[test]
 fn a_delete_modify_conflict_has_a_missing_side() {
     // The case a three-pane view would otherwise render as an empty document, saying "they
     // deleted every line" where the truth is "they deleted the file".

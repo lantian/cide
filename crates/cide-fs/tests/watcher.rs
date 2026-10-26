@@ -84,11 +84,12 @@ fn five_thousand_touched_files_produce_one_notification() {
 
     let change = next_change(&rx, Duration::from_secs(20)).expect("the burst should arrive");
     assert!(
-        change.paths.len() >= 4_900,
-        "expected the whole burst in one change, got {}",
+        change.paths.len() >= 4_900
+            || (change.truncated && change.paths.contains(&dir.to_path_buf())),
+        "expected the whole burst or an explicit root reconciliation, got {}",
         change.paths.len()
     );
-    assert!(!change.git);
+    assert!(!change.git || change.truncated);
     assert!(
         next_change(&rx, QUIET * 3).is_none(),
         "a second notification means the burst was not coalesced"

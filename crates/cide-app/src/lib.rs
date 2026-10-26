@@ -325,6 +325,7 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default()
         .manage(image_snapshots::ImageSnapshots::default())
+        .manage(cmd::compare_clipboard::Comparisons::default())
         // `cide-ext://localhost/<marketplace>/<extension>/<path>`. Registered here rather than
         // in `setup`
         // because a scheme handler has to exist before the first webview is created — a window
@@ -611,6 +612,9 @@ pub fn run() {
             cmd::file::tab_reopen_file,
             cmd::file::terminal_open_path,
             cmd::file::tab_open_diff,
+            cmd::compare_clipboard::tab_open_clipboard_diff,
+            cmd::compare_clipboard::clipboard_diff_content,
+            cmd::compare_clipboard::shared_document_sync,
             cmd::file::tab_retarget_diff,
             cmd::file::tab_open_revision_diff,
             cmd::file::tab_retarget_revision_diff,
@@ -729,6 +733,7 @@ pub fn run() {
             cmd::fs::fs_expand_all,
             cmd::fs::fs_reveal,
             cmd::fs::fs_show_in_manager,
+            cmd::fs::fs_open_external,
             cmd::fs::fs_paths_exist,
             cmd::fs::fs_stat_paths,
             cmd::fs::fs_read_file,

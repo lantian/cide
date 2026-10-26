@@ -38,11 +38,8 @@
 //! exactly the events it produced before. `crate::filter`'s module note has the trade this
 //! buys and what it costs.
 //!
-//! The exception is scale: past [`WatchConfig::max_dir_watches`] the setup cost of
-//! individual watches (`notify-debouncer-full` keeps its watch roots in a `Vec` and scans it
-//! on every `watch` call, so N watches cost O(N²)) dominates, and one recursive watch per
-//! root is used instead. Events are filtered either way, so the difference is descriptors
-//! and setup time, never correctness.
+//! At scale, switch to polling the admitted paths. Recursive root watches and the
+//! debouncer's file-id cache must never discover a second, unbounded tree behind the index.
 //!
 //! # ENOSPC
 //!
@@ -61,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use cide_ipc::{FsChange, WatchBackend, WatchStatus};
 use notify::{ErrorKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 
 use crate::filter::Filter;
 
@@ -119,6 +116,8 @@ pub struct WatchConfig {
     /// Startup observation without a tree subscriber must use only history admission.
     pub history_only: bool,
     pub history: Option<Arc<HistorySubscription>>,
+    pub budget: Arc<crate::budget::Budget>,
+    pub files: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
     /// Every non-ignored directory, from the walk.
     pub dirs: Vec<PathBuf>,
@@ -132,7 +131,7 @@ pub struct WatchConfig {
     pub max_wait: Duration,
     /// The most paths one `FsChange` will carry before it is marked truncated.
     pub max_paths: usize,
-    /// Past this many directories, watch roots recursively instead.
+    /// Past this many directories, poll admitted files and directory timestamps instead.
     pub max_dir_watches: usize,
     /// Start in polling mode without waiting for inotify to fail.
     ///
@@ -150,6 +149,8 @@ impl Default for WatchConfig {
         Self {
             history: None,
             history_only: false,
+            budget: crate::budget::Budget::standalone(),
+            files: Vec::new(),
             roots: Vec::new(),
             dirs: Vec::new(),
             links: Vec::new(),
@@ -214,7 +215,9 @@ fn run(
     stop: &AtomicBool,
     sink: &mut impl FnMut(WatchEvent),
 ) {
-    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    // A bounded notification queue; overflow requests a bounded reconciliation instead
+    // of retaining another burst. Never block a backend callback during shutdown.
+    let (tx, rx) = mpsc::sync_channel::<DebounceEventResult>(8);
     let (mut backend, mut status) = Backend::start(&config, &filter, tx.clone());
     sink(WatchEvent::Status(status.clone()));
     if let Some(history) = &config.history {
@@ -227,7 +230,7 @@ fn run(
     let mut history_changes = Coalescer::new(config.quiet, config.max_wait, config.max_paths);
     let mut history_dirs = HashSet::<PathBuf>::new();
 
-    while !stop.load(Ordering::Acquire) {
+    while !stop.load(Ordering::Acquire) && !config.budget.cancelled() {
         if let Some(history) = &config.history {
             let desired: HashSet<_> = (history.directories)()
                 .into_iter()
@@ -235,7 +238,7 @@ fn run(
                 .collect();
             for path in desired.difference(&history_dirs) {
                 // Non-recursive descriptors preserve ignore/dependency pruning at every depth.
-                if let Err(error) = backend.watch(path, RecursiveMode::NonRecursive) {
+                if let Err(error) = backend.watch_history_directory(path) {
                     (history.degraded)(format!("History directory could not be watched: {error}"));
                     if matches!(error.kind, ErrorKind::MaxFilesWatch) && !backend.is_polling() {
                         let mut fallback = config.clone();
@@ -248,6 +251,7 @@ fn run(
                             .collect();
                         (backend, status) = Backend::start_polling(
                             &fallback,
+                            &filter,
                             tx.clone(),
                             enospc_reason(backend.watched.len()),
                         );
@@ -276,6 +280,13 @@ fn run(
         match rx.recv_timeout(TICK) {
             Ok(Ok(events)) => {
                 for event in events {
+                    if event.need_rescan() {
+                        backend.overflow.store(true, Ordering::Release);
+                        coalescer.truncated = true;
+                        for root in &config.roots {
+                            coalescer.push(root.clone(), true);
+                        }
+                    }
                     // A read is not a change. `cargo check` opens every source file in the
                     // workspace, and under inotify each open/read/close-for-read arrives
                     // here as an `EventKind::Access(..)`. Treating those as changes closed
@@ -319,18 +330,32 @@ fn run(
                                     | notify::EventKind::Remove(_)
                                     | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
                             );
-                            if linked || (known && replaced) {
+                            if linked || (known && (replaced || backend.is_polling())) {
+                                let previous: HashSet<_> =
+                                    backend.aliases.logical.keys().cloned().collect();
                                 backend.refresh_directory(&path, &filter);
-                            } else if is_dir && !known {
-                                if filter.is_recursive_watch(&path) {
-                                    if let Err(err) = backend.watch(&path, RecursiveMode::Recursive)
-                                    {
-                                        tracing::debug!(path = %path.display(), %err, "could not take a recursive watch");
-                                        backend.watch_tree(&path, &filter);
+                                for child in backend
+                                    .aliases
+                                    .logical
+                                    .keys()
+                                    .filter(|p| !previous.contains(*p))
+                                {
+                                    let (tree, history) = subscriber_admission(
+                                        &filter,
+                                        config.history_only,
+                                        config.history.as_deref(),
+                                        child,
+                                        child.is_dir(),
+                                    );
+                                    if tree {
+                                        coalescer.push(child.clone(), filter.is_git_path(child));
                                     }
-                                } else {
-                                    backend.watch_tree(&path, &filter);
+                                    if history {
+                                        history_changes.push(child.clone(), false);
+                                    }
                                 }
+                            } else if is_dir && !known {
+                                backend.watch_tree(&path, &filter);
                             }
                             if tree {
                                 coalescer.push(path.clone(), filter.is_git_path(&path));
@@ -361,7 +386,8 @@ fn run(
                     let mut fallback = config.clone();
                     fallback.dirs = backend.aliases.directories.iter().cloned().collect();
                     fallback.links = backend.aliases.links.keys().cloned().collect();
-                    (backend, status) = Backend::start_polling(&fallback, tx.clone(), reason);
+                    (backend, status) =
+                        Backend::start_polling(&fallback, &filter, tx.clone(), reason);
                     sink(WatchEvent::Status(status.clone()));
                 }
             }
@@ -370,6 +396,15 @@ fn run(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
+        if backend.overflow.swap(false, Ordering::AcqRel) {
+            coalescer.truncated = true;
+            history_changes.truncated = true;
+            for root in &config.roots {
+                backend.watch_tree(root, &filter);
+                coalescer.push(root.clone(), false);
+                history_changes.push(root.clone(), false);
+            }
+        }
         if let Some(change) = coalescer.take_due(Instant::now()) {
             sink(WatchEvent::Changed(change));
         }
@@ -407,8 +442,8 @@ fn enospc_reason(watched: usize) -> String {
 /// and the two instantiations are different types; there are exactly two and there will not
 /// be a third.
 enum Inner {
-    Native(Debouncer<LiveCreates<RecommendedWatcher>, RecommendedCache>),
-    Polling(Debouncer<notify::PollWatcher, RecommendedCache>),
+    Native(Debouncer<LiveCreates<RecommendedWatcher>, NoCache>),
+    Polling(Debouncer<LiveCreates<crate::poll::CatalogPoller>, NoCache>),
 }
 
 /// FSEvents can repeat an old create flag alongside a removal. Debouncer 0.7
@@ -422,8 +457,30 @@ impl<W: notify::Watcher> notify::Watcher for LiveCreates<W> {
         mut handler: F,
         config: notify::Config,
     ) -> notify::Result<Self> {
+        let mut window = Instant::now();
+        let mut received = 0;
         W::new(
             move |event: notify::Result<notify::Event>| {
+                // Reads never consume the event budget or cause rescan feedback loops.
+                if event.as_ref().is_ok_and(|event| {
+                    matches!(event.kind,
+                    notify::EventKind::Access(kind) if !matches!(kind,
+                    notify::event::AccessKind::Close(notify::event::AccessMode::Write)))
+                }) {
+                    return;
+                }
+                if window.elapsed() >= Duration::from_millis(300) {
+                    window = Instant::now();
+                    received = 0;
+                }
+                received += 1;
+                if received > 256 {
+                    if received == 257 {
+                        handler.handle_event(Ok(notify::Event::new(notify::EventKind::Other)
+                            .set_flag(notify::event::Flag::Rescan)));
+                    }
+                    return;
+                }
                 if let Ok(event) = &event
                     && event.kind.is_create()
                     && !event.paths.is_empty()
@@ -462,6 +519,8 @@ impl<W: notify::Watcher> notify::Watcher for LiveCreates<W> {
 struct Backend {
     history_only: bool,
     history: Option<Arc<HistorySubscription>>,
+    overflow: Arc<AtomicBool>,
+    budget: Arc<crate::budget::Budget>,
     inner: Inner,
     /// Everything currently under a watch, so a directory created twice is not watched
     /// twice and the ENOSPC message can say how far it got.
@@ -593,34 +652,52 @@ impl Backend {
     fn start(
         config: &WatchConfig,
         filter: &Filter,
-        tx: mpsc::Sender<DebounceEventResult>,
+        tx: mpsc::SyncSender<DebounceEventResult>,
     ) -> (Self, WatchStatus) {
         if config.polling {
             let reason = "Polling was requested for this project. Changes are noticed within \
                           one poll interval rather than immediately."
                 .to_string();
-            return Self::start_polling(config, tx, reason);
+            return Self::start_polling(config, filter, tx, reason);
         }
 
-        let per_directory = config.history.is_some() || config.dirs.len() <= config.max_dir_watches;
-        let debouncer =
-            match new_debouncer_opt::<_, LiveCreates<RecommendedWatcher>, RecommendedCache>(
-                config.debounce,
-                None,
-                tx.clone(),
-                RecommendedCache::new(),
-                notify::Config::default().with_follow_symlinks(false),
-            ) {
-                Ok(d) => d,
-                Err(err) => {
-                    let reason = format!("The native file watcher could not start ({err}).");
-                    return Self::start_polling(config, tx, reason);
+        if config.dirs.len() > config.max_dir_watches {
+            return Self::start_polling(
+                config,
+                filter,
+                tx,
+                "Directory watch limit reached; polling indexed paths.".into(),
+            );
+        }
+        let per_directory = true;
+        let overflow = Arc::new(AtomicBool::new(false));
+        let debouncer = match new_debouncer_opt::<_, LiveCreates<RecommendedWatcher>, NoCache>(
+            config.debounce,
+            None,
+            {
+                let tx = tx.clone();
+                let overflow = overflow.clone();
+                move |event| {
+                    if tx.try_send(event).is_err() {
+                        overflow.store(true, Ordering::Release);
+                    }
                 }
-            };
+            },
+            NoCache::new(),
+            notify::Config::default().with_follow_symlinks(false),
+        ) {
+            Ok(d) => d,
+            Err(err) => {
+                let reason = format!("The native file watcher could not start ({err}).");
+                return Self::start_polling(config, filter, tx, reason);
+            }
+        };
 
         let mut backend = Self {
             history: config.history.clone(),
             history_only: config.history_only,
+            overflow,
+            budget: Arc::clone(&config.budget),
             inner: Inner::Native(debouncer),
             watched: HashSet::new(),
             per_directory,
@@ -692,11 +769,18 @@ impl Backend {
             )
         }));
         for (path, mode) in targets {
+            if backend.budget.cancelled() {
+                break;
+            }
+            if mode == RecursiveMode::Recursive {
+                backend.watch_tree(&path, filter);
+                continue;
+            }
             if let Err(err) = backend.watch(&path, mode) {
                 if matches!(err.kind, ErrorKind::MaxFilesWatch) {
                     let reason = enospc_reason(backend.watched.len());
                     tracing::warn!(%reason, "degrading the file watcher to polling");
-                    return Self::start_polling(config, tx, reason);
+                    return Self::start_polling(config, filter, tx, reason);
                 }
                 // A directory that vanished between the walk and the watch is ordinary.
                 tracing::debug!(path = %path.display(), kind = ?err.kind, "could not watch");
@@ -713,7 +797,8 @@ impl Backend {
 
     fn start_polling(
         config: &WatchConfig,
-        tx: mpsc::Sender<DebounceEventResult>,
+        filter: &Filter,
+        tx: mpsc::SyncSender<DebounceEventResult>,
         reason: String,
     ) -> (Self, WatchStatus) {
         // Contents deliberately not compared: polling already means stat-ing every file in
@@ -723,11 +808,17 @@ impl Backend {
             .with_poll_interval(config.poll_interval)
             .with_follow_symlinks(false)
             .with_compare_contents(false);
-        let debouncer = new_debouncer_opt::<_, notify::PollWatcher, RecommendedCache>(
+        let overflow = Arc::new(AtomicBool::new(false));
+        let signal = overflow.clone();
+        let debouncer = new_debouncer_opt::<_, LiveCreates<crate::poll::CatalogPoller>, NoCache>(
             config.debounce,
             None,
-            tx,
-            RecommendedCache::new(),
+            move |event| {
+                if tx.try_send(event).is_err() {
+                    signal.store(true, Ordering::Release);
+                }
+            },
+            NoCache::new(),
             notify_config,
         )
         .expect("PollWatcher has no resources to run out of");
@@ -735,9 +826,11 @@ impl Backend {
         let mut backend = Self {
             history: config.history.clone(),
             history_only: config.history_only,
+            overflow,
+            budget: Arc::clone(&config.budget),
             inner: Inner::Polling(debouncer),
             watched: HashSet::new(),
-            per_directory: config.history.is_some(),
+            per_directory: true,
             aliases: DirectoryAliases::default(),
             recursive: HashSet::new(),
             guards: HashSet::new(),
@@ -745,26 +838,37 @@ impl Backend {
         // Polling must cover external targets as well as the project's physical roots.
         // The same alias map translates events in both backends.
         backend.seed_aliases(config);
-        let poll_dirs = if config.history.is_some() {
-            &config.dirs
-        } else {
-            &config.roots
-        };
-        let mode = if config.history.is_some() {
-            RecursiveMode::NonRecursive
-        } else {
-            RecursiveMode::Recursive
-        };
-        for root in poll_dirs {
-            if let Err(err) = backend.watch(root, mode) {
-                tracing::warn!(path = %root.display(), kind = ?err.kind, "could not poll-watch a root");
+        for path in config.dirs.iter().chain(&config.files).chain(&config.links) {
+            if backend.budget.cancelled() {
+                break;
+            }
+            let _ = backend.watch(path, RecursiveMode::NonRecursive);
+        }
+        // A native-to-polling transition retains the known history directories, but
+        // the tree's file list need not contain their hidden children.
+        if let Some(history) = &config.history {
+            for dir in &config.dirs {
+                if backend.budget.stopped() {
+                    break;
+                }
+                if history.accepts(dir, true) {
+                    let _ = backend.watch_history_directory(dir);
+                }
             }
         }
-        let links: Vec<_> = backend.aliases.links.keys().cloned().collect();
-        for link in links {
-            if let Err(err) = backend.watch(&link, RecursiveMode::Recursive) {
-                tracing::debug!(path = %link.display(), %err, "could not poll-watch a link target");
+        // Standalone callers may have only directory paths; discover their children using
+        // the same admission budget, never the dependency's recursive polling cache.
+        if config.files.is_empty() {
+            for root in &config.roots {
+                backend.watch_tree(root, filter);
             }
+        }
+        for watched in filter
+            .watched_paths()
+            .iter()
+            .filter(|_| !config.history_only)
+        {
+            backend.watch_tree(&watched.path, filter);
         }
         let status = WatchStatus {
             backend: WatchBackend::Polling,
@@ -778,9 +882,50 @@ impl Backend {
         matches!(self.inner, Inner::Polling(_))
     }
 
+    fn watch_history_directory(&mut self, path: &Path) -> notify::Result<()> {
+        self.watch(path, RecursiveMode::NonRecursive)?;
+        // Catalog polling only stats admitted paths. A directory watch alone misses
+        // edits to existing hidden files, which the visible tree's catalog omits.
+        if self.is_polling()
+            && let Ok(entries) = std::fs::read_dir(path)
+        {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if self.budget.stopped() {
+                    break;
+                }
+                if child.is_file()
+                    && self
+                        .history
+                        .as_ref()
+                        .is_some_and(|h| h.accepts(&child, false))
+                {
+                    self.watch(&child, RecursiveMode::NonRecursive)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
-        let real = std::fs::canonicalize(path)
-            .map_err(|e| notify::Error::io(e).add_path(path.to_path_buf()))?;
+        if self.budget.cancelled() {
+            return Ok(());
+        }
+        if !self.aliases.logical.contains_key(path) && !self.budget.reserve_path(path, "") {
+            return Ok(());
+        }
+        let real = match std::fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(error) => {
+                if let Some(target) = link_destination(path) {
+                    self.aliases.insert(path, &target);
+                    if self.is_polling() {
+                        return self.watch_real(&target, RecursiveMode::NonRecursive);
+                    }
+                }
+                return Err(notify::Error::io(error).add_path(path.to_path_buf()));
+            }
+        };
         self.aliases.insert(path, &real);
         let mode = if path.is_dir() {
             mode
@@ -809,6 +954,9 @@ impl Backend {
 
     fn seed_aliases(&mut self, config: &WatchConfig) {
         for path in config.dirs.iter().chain(&config.links) {
+            if self.budget.cancelled() {
+                break;
+            }
             if config
                 .roots
                 .iter()
@@ -872,6 +1020,9 @@ impl Backend {
     }
 
     fn refresh_directory(&mut self, path: &Path, filter: &Filter) {
+        if self.budget.stopped() {
+            return;
+        }
         let previous = self.aliases.links.get(path).cloned();
         let real = std::fs::canonicalize(path).ok();
         // Polling watches compare paths, not inodes. Re-registering a still-present
@@ -907,6 +1058,9 @@ impl Backend {
     fn watch_tree(&mut self, path: &Path, filter: &Filter) {
         let mut stack = vec![path.to_path_buf()];
         while let Some(dir) = stack.pop() {
+            if self.budget.stopped() {
+                break;
+            }
             if filter
                 .root_of(&dir)
                 .is_some_and(|root| crate::index::directory_cycle(&dir, root))
@@ -934,15 +1088,29 @@ impl Backend {
                 // `Filter::classify` refuses `crate::filter::GIT_NEVER` before it consults the
                 // watched list, so no entry on that list, present or future, can turn this
                 // descent loose on a 256-way object fanout.
+                let is_dir = child.is_dir();
                 let (tree, history) = subscriber_admission(
                     filter,
                     self.history_only,
                     self.history.as_deref(),
                     &child,
-                    true,
+                    is_dir,
                 );
-                if child.is_dir() && (tree || history) {
+                if !tree && !history {
+                    continue;
+                }
+                if !is_dir && !self.is_polling() && !child.is_symlink() {
+                    continue;
+                }
+                if !self.aliases.logical.contains_key(&child)
+                    && !self.budget.reserve_path(&child, "")
+                {
+                    break;
+                }
+                if is_dir {
                     stack.push(child);
+                } else {
+                    let _ = self.watch(&child, RecursiveMode::NonRecursive);
                 }
             }
         }
@@ -1030,6 +1198,67 @@ impl Coalescer {
 mod tests {
     use super::*;
     #[test]
+    fn polling_history_admits_hidden_files_outside_the_tree_catalog() {
+        let root = crate::testing::scratch("poll-hidden-history");
+        let hidden = root.join(".hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        let captured = hidden.join("source.rs");
+        let excluded = hidden.join("secret.env");
+        let visible = root.join("visible.rs");
+        for path in [&captured, &excluded, &visible] {
+            std::fs::write(path, "before").unwrap();
+        }
+        let history = Arc::new(HistorySubscription {
+            directories: Arc::new(Vec::new),
+            ready: Arc::new(|_| {}),
+            changed: Arc::new(|_| {}),
+            degraded: Arc::new(|_| {}),
+            admits: Arc::new(|path, _| path.file_name().is_some_and(|name| name != "secret.env")),
+        });
+        let filter = Filter::build(
+            &[root.to_path_buf()],
+            vec![root.path()],
+            crate::Visibility::CONSERVATIVE,
+        );
+        let config = WatchConfig {
+            roots: vec![root.to_path_buf()],
+            dirs: vec![root.to_path_buf()],
+            files: vec![visible],
+            history: Some(history),
+            poll_interval: Duration::from_millis(30),
+            debounce: Duration::from_millis(10),
+            ..WatchConfig::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(8);
+        let (mut backend, _) = Backend::start_polling(&config, &filter, tx, "test".into());
+        assert!(!backend.aliases.logical.contains_key(&captured));
+        backend.watch_history_directory(&hidden).unwrap();
+        assert!(backend.aliases.logical.contains_key(&captured));
+        assert!(!backend.aliases.logical.contains_key(&excluded));
+        assert_eq!(
+            subscriber_admission(&filter, false, config.history.as_deref(), &captured, false),
+            (false, true)
+        );
+        // Rebuilding after native watch exhaustion must preserve the independently
+        // admitted files even though config.files still contains only visible rows.
+        drop(backend);
+        let mut fallback = config;
+        fallback.dirs.push(hidden);
+        let (tx, rx) = mpsc::sync_channel(8);
+        let (_backend, _) = Backend::start_polling(&fallback, &filter, tx, "fallback".into());
+        std::fs::write(&captured, "after external edit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(Ok(events)) = rx.recv_timeout(left)
+                && events.iter().any(|event| event.paths.contains(&captured))
+            {
+                return;
+            }
+        }
+        panic!("polling missed the hidden file's external edit");
+    }
+
+    #[test]
     fn history_only_subscription_does_not_expand_dependency_or_tree_visibility_watches() {
         let root = crate::testing::scratch("history-subscription");
         let filter = Filter::build(
@@ -1102,12 +1331,14 @@ mod tests {
     }
 
     fn replay_create(path: &Path) -> Vec<notify_debouncer_full::DebouncedEvent> {
-        let (tx, rx) = mpsc::channel();
-        let mut debouncer = new_debouncer_opt::<_, LiveCreates<ReplayWatcher>, RecommendedCache>(
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut debouncer = new_debouncer_opt::<_, LiveCreates<ReplayWatcher>, NoCache>(
             Duration::from_millis(10),
             None,
-            tx,
-            RecommendedCache::new(),
+            move |event| {
+                let _ = tx.try_send(event);
+            },
+            NoCache::new(),
             notify::Config::default(),
         )
         .unwrap();
@@ -1168,8 +1399,8 @@ mod tests {
             debounce: Duration::from_millis(10),
             ..WatchConfig::default()
         };
-        let (tx, rx) = mpsc::channel();
-        let (mut backend, _) = Backend::start_polling(&config, tx, "test".into());
+        let (tx, rx) = mpsc::sync_channel(8);
+        let (mut backend, _) = Backend::start_polling(&config, &filter, tx, "test".into());
         let wait_for = |path: &Path| {
             let deadline = Instant::now() + Duration::from_secs(5);
             while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -1189,7 +1420,7 @@ mod tests {
         // Observe a scan before editing, leaving a full interval for the refresh.
         let marker = fixture.join("marker");
         std::fs::write(&marker, "scan barrier").unwrap();
-        wait_for(&marker);
+        wait_for(fixture.path());
         std::fs::remove_file(&one).unwrap();
         std::os::unix::fs::symlink(&replacement, &one).unwrap();
         backend.refresh_directory(&one, &filter);

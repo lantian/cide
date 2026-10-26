@@ -567,6 +567,15 @@ export function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | null = null
+    let gone = false
+    void import('@/ipc/client').then(({ sharedDocument }) => sharedDocument.onRedockRequested(() => {
+      void redockTab(windowLabel()).catch(error => notify(String(error), { kind: 'error' }))
+    })).then(fn => { if (gone) fn(); else unlisten = fn })
+    return () => { gone = true; unlisten?.() }
+  }, [redockTab])
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
     void events
       .onCloseBlocked((label, unsaved) => {
         requestCloseConfirm({
@@ -910,7 +919,7 @@ export function App() {
   const currentProblemFile = focusedTabPath(boot)
   if (activeProjectId && currentProblemFile) problemFiles.current.set(activeProjectId, currentProblemFile)
   const rememberedProblemFile = activeProjectId ? problemFiles.current.get(activeProjectId) ?? null : null
-  const problemFile = currentProblemFile ?? (activeProject?.tabs.some(tab => tab.kind.kind === 'file' && tab.kind.path === rememberedProblemFile) ? rememberedProblemFile : null)
+  const problemFile = currentProblemFile ?? (activeProject?.tabs.some(tab => (tab.kind.kind === 'file' || tab.kind.kind === 'clipboardDiff') && tab.kind.path === rememberedProblemFile) ? rememberedProblemFile : null)
   const diagnostics = useMemo(
     () => applyFilters(rawDiagnostics, diagnosticFilters),
     [rawDiagnostics, diagnosticFilters],
@@ -1727,7 +1736,7 @@ export function App() {
           * lights, the drag region and the way back.
           */}
         {tabWindow ? (
-          <DetachedTabHeader tab={windowTab} onRedock={() => void redockTab(windowLabel())} />
+          <DetachedTabHeader tab={windowTab} project={activeProjectId} onRedock={() => void redockTab(windowLabel())} />
         ) : (
         <AppHeader
           projects={projects}
@@ -2839,7 +2848,7 @@ const TabPane = memo(function TabPane({
   )
   // The same object for as long as the path is: `PaneBody` hands it on, and a literal here
   // would be a new prop every render — the thing this component exists to stop.
-  const filePath = tabKind.kind === 'file' ? tabKind.path : null
+  const filePath = tabKind.kind === 'file' || tabKind.kind === 'clipboardDiff' ? tabKind.path : null
   const editor = useMemo(
     () => (filePath === null ? undefined : { tab, path: filePath }),
     [tab, filePath],
@@ -2871,7 +2880,7 @@ const TabPane = memo(function TabPane({
       tabScoped={tabScoped}
       // A file tab's pane gets no corner cluster: the header's split/detach and the tab
       // strip's × cover it, and the cluster sat on the code being read.
-      bare={tabKind.kind === 'file'}
+      bare={tabKind.kind === 'file' || tabKind.kind === 'clipboardDiff'}
       onFocus={() => void focusPane(project, tab, pane.id)}
       // `row` is a tile beside this one, in this pane's own row — the axis
       // the command layer routes to `add_tile`. The row gesture is on the

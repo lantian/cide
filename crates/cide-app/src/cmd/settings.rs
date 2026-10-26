@@ -292,6 +292,8 @@ pub fn settings_set(
     // the rows they ask for were never walked, so the index has to be built again. See
     // `reindex_open_projects`.
     if settings.explorer != was_explorer {
+        app.state::<crate::files::FsRegistry>()
+            .configure(&settings.explorer);
         reindex_open_projects(&app, crate::files::visibility_of(&settings));
     }
     // A server whose Builtin/System choice moved is running the wrong binary right now, in
@@ -598,7 +600,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // Nothing to clamp — two booleans — but the *consequence* is the largest of any field on
     // this type: see `settings_set`, which re-walks every open project when this one moves.
     if let Some(v) = explorer {
-        settings.explorer = v;
+        settings.explorer = v.clamped();
     }
     // Clamped for the same reason, and the failure is louder than a bad width. `pushToClaude`
     // writes a line into a live Claude pane's PTY; with a debounce of zero, one `cargo check`
