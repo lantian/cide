@@ -242,16 +242,22 @@ fn apply_files(root: &Path, files: &[ProposedFile], proposal: &Proposal) -> Resu
             // new one goes through `persist`'s writer instead, with the mode set on the temp
             // file: a new shell script is made executable, since a gate names it as a command.
             Some(text) => {
-                if path.exists() {
-                    cide_core::document::write_bytes(&path, text.as_bytes())
-                } else {
-                    let mode = if f.path.ends_with(".sh") {
-                        0o755
-                    } else {
-                        cide_core::persist::SHARED_MODE
-                    };
-                    cide_core::persist::write_atomic_with_mode(&path, text.as_bytes(), mode)
-                }
+                crate::local_history::mutate(
+                    &path,
+                    cide_ipc::local_history::HistorySource::FileOperation,
+                    || {
+                        if path.exists() {
+                            cide_core::document::write_bytes(&path, text.as_bytes())
+                        } else {
+                            let mode = if f.path.ends_with(".sh") {
+                                0o755
+                            } else {
+                                cide_core::persist::SHARED_MODE
+                            };
+                            cide_core::persist::write_atomic_with_mode(&path, text.as_bytes(), mode)
+                        }
+                    },
+                )
                 .map_err(|e| format!("{}: {e}", f.path))?;
             }
             None => {

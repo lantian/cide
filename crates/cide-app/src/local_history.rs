@@ -112,6 +112,17 @@ pub fn for_path(path: &Path) -> Option<Arc<HistoryCoordinator>> {
         .map(|(e, _)| e.coordinator.clone())
 }
 
+pub fn mutate<T, E>(
+    path: &Path,
+    source: cide_ipc::local_history::HistorySource,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    match for_path(path) {
+        Some(coordinator) => coordinator.mutate(path, source, operation),
+        None => operation(),
+    }
+}
+
 pub fn project_roots(project: ProjectId) -> Vec<Arc<HistoryCoordinator>> {
     ROOTS
         .lock()

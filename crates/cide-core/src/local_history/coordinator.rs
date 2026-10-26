@@ -543,6 +543,54 @@ mod tests {
     use cide_fs::testing::scratch;
     use std::time::Instant;
     #[test]
+    fn refused_save_never_records_requested_content_and_creation_keeps_absence() {
+        let project = scratch("history-refused-save");
+        let state = scratch("history-refused-save-state");
+        let path = project.join("a");
+        fs::write(&path, "A").unwrap();
+        let c = HistoryCoordinator::start(
+            RootIdentity::new(&project).unwrap(),
+            state.to_path_buf(),
+            vec![],
+            |_, _| {},
+        );
+        wait_done(&c);
+        let old = crate::document::stamp_at(&path).unwrap();
+        fs::write(&path, "external contents with a different length").unwrap();
+        assert!(
+            c.mutate(&path, HistorySource::CideSave, || {
+                crate::document::write_bytes_if_unchanged(
+                    &path,
+                    b"refused editor buffer",
+                    Some(old),
+                )
+            })
+            .is_err()
+        );
+        c.with_store(|s| {
+            for r in s.list("a", None)?.revisions {
+                assert_ne!(
+                    s.bytes(&r.content)?.as_deref(),
+                    Some(b"refused editor buffer".as_slice())
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        let created = project.join("new");
+        c.mutate(&created, HistorySource::FileOperation, || {
+            fs::write(&created, "new")
+        })
+        .unwrap();
+        c.with_store(|s| {
+            let page = s.list("new", None)?;
+            assert_eq!(page.revisions.len(), 2);
+            assert_eq!(page.revisions[1].content, HistoryContent::Absent);
+            Ok(())
+        })
+        .unwrap();
+    }
+    #[test]
     fn observer_barrier_captures_unopened_hidden_edits_and_external_deletion() {
         let project = scratch("history-hidden-feed");
         let state = scratch("history-hidden-feed-state");

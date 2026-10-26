@@ -849,7 +849,11 @@ pub async fn fs_write_file(
     let fs = project_fs(&registry, project)?;
     blocking("fs_write_file", move || {
         ops::check_within(&fs.writable_paths(), &path)?;
-        ops::write(&path, &contents)?;
+        crate::local_history::mutate(
+            &path,
+            cide_ipc::local_history::HistorySource::FileOperation,
+            || ops::write(&path, &contents),
+        )?;
         // Nothing watches the drawer, so a write that created a file there has to say so or
         // the row appears the next time somebody folds the group. Guarded, so the ordinary
         // write — a project file — costs one lock and a prefix test.
@@ -869,7 +873,15 @@ pub async fn fs_create(
     let fs = project_fs(&registry, project)?;
     blocking("fs_create", move || {
         ops::check_within(&fs.writable_paths(), &path)?;
-        ops::create(&path, directory)?;
+        if directory {
+            ops::create(&path, directory)?;
+        } else {
+            crate::local_history::mutate(
+                &path,
+                cide_ipc::local_history::HistorySource::FileOperation,
+                || ops::create(&path, false),
+            )?;
+        }
         let _ = relist_if_scratch(&fs, std::slice::from_ref(&path));
         Ok(())
     })
@@ -923,7 +935,15 @@ pub(crate) fn create_entry(
     name: &str,
     directory: bool,
 ) -> Result<PathBuf, FsError> {
-    let created = ops::create_in(&fs.writable_paths(), parent, name, directory)?;
+    let created = if directory {
+        ops::create_in(&fs.writable_paths(), parent, name, true)?
+    } else {
+        crate::local_history::mutate(
+            &parent.join(name),
+            cide_ipc::local_history::HistorySource::FileOperation,
+            || ops::create_in(&fs.writable_paths(), parent, name, false),
+        )?
+    };
     Ok(show_now(fs, created))
 }
 
