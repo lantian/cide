@@ -130,6 +130,7 @@
     "check:task-links": "node scripts/check-task-links.mjs",
     "check:task-proposals": "node scripts/check-task-proposals.mjs",
     "check:task-questions": "node scripts/check-task-questions.mjs",
+    "check:task-navigation": "node scripts/check-task-navigation.mjs",
     "check:terminal-find": "node scripts/check-terminal-find.mjs",
     "check:terminal-keys": "node scripts/check-terminal-keys.mjs",
     "check:theme": "node scripts/check-theme.mjs",
