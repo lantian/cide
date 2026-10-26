@@ -1534,6 +1534,37 @@ mod tests {
         assert_eq!(h.observe(RunState::Running, Observation::Line("…")), None);
     }
 
+    #[test]
+    fn a_claude_plan_approval_waits_for_permission_until_execution_resumes() {
+        let h = ClaudeHarness;
+        let asking = HookFrame::new(
+            "Notification",
+            json!({
+                "notification_type": "permission_prompt",
+                "message": "Claude Code needs your approval for the plan",
+            }),
+        );
+        let waiting = h
+            .observe(RunState::Running, Observation::Hook(&asking))
+            .expect("plan approval blocks the running turn without a Stop hook");
+        assert_eq!(waiting, RunState::AwaitingPermission);
+        assert_eq!(h.observe(waiting.clone(), Observation::Hook(&asking)), None);
+
+        let approved = HookFrame::new("PostToolUse", json!({ "tool_name": "ExitPlanMode" }));
+        assert_eq!(
+            h.observe(waiting, Observation::Hook(&approved)),
+            Some(RunState::Running),
+        );
+        let unrelated = HookFrame::new(
+            "Notification",
+            json!({ "notification_type": "idle_prompt", "message": "No approval needed" }),
+        );
+        assert_eq!(
+            h.observe(RunState::Running, Observation::Hook(&unrelated)),
+            None,
+        );
+    }
+
     /// The two states no observation may move, and the one observation that moves anything.
     #[test]
     fn a_frozen_or_finished_run_is_not_moved_by_a_late_frame() {

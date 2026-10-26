@@ -1384,7 +1384,7 @@ struct ResumePoint {
 
 enum RequestDelivery {
     Waiting,
-    Delivered,
+    Submitted,
     Send(SessionId, Harness),
     Queued,
 }
@@ -2596,6 +2596,14 @@ fn compose_note(
 /// what should happen — holding a checkout and holding a slot are two decisions, which is the
 /// distinction `RunState::Idle`'s doc draws.
 fn holds_its_checkout(live: &LiveRun) -> bool {
+    if live.state == RunState::Idle
+        && live
+            .planning
+            .as_ref()
+            .is_some_and(cide_agents::native_plan::State::pending)
+    {
+        return true;
+    }
     if live
         .stop
         .as_ref()
@@ -3172,25 +3180,91 @@ impl AgentRegistry {
         project: ProjectId,
         origin: &cide_ipc::sessions::SessionRecord,
         line: &str,
-    ) -> Result<bool> {
+        begin: &dyn Fn() -> Result<bool>,
+    ) -> Result<cide_core::user_requests::AnswerSubmission> {
+        use cide_core::user_requests::AnswerSubmission;
         let run = origin
             .run
             .ok_or_else(|| CoreError::Io("No originating run.".into()))?;
         let planned =
             self.plan_user_request_delivery(project, run, origin.harness, &origin.id, line)?;
         match planned {
-            RequestDelivery::Waiting => Ok(false),
-            RequestDelivery::Delivered => Ok(true),
+            RequestDelivery::Waiting => Ok(AnswerSubmission::Waiting),
+            RequestDelivery::Submitted => {
+                if begin()? {
+                    Ok(AnswerSubmission::Submitted)
+                } else {
+                    Ok(AnswerSubmission::Waiting)
+                }
+            }
             RequestDelivery::Send(session, harness) => {
+                if harness == Harness::Codex
+                    && let Some(console) = app
+                        .state::<crate::peer_chat::Runtime>()
+                        .codex_console(session)
+                {
+                    let Some(receiver) = console.receiver().map_err(CoreError::Io)? else {
+                        return Ok(AnswerSubmission::Waiting);
+                    };
+                    if receiver.thread != origin.id || !begin()? {
+                        return Ok(AnswerSubmission::Waiting);
+                    }
+                    let registry = Arc::clone(self);
+                    let conversation = origin.id.clone();
+                    let valid = Box::new(move || {
+                        registry
+                            .inner
+                            .lock()
+                            .runs
+                            .get(&run)
+                            .filter(|live| {
+                                live.project == project
+                                    && live.session == Some(session)
+                                    && live.stop.is_none()
+                                    && live.frozen.is_none()
+                                    && resume_point(live)
+                                        .is_some_and(|p| p.conversation == conversation)
+                            })
+                            .map(|_| ())
+                            .ok_or_else(|| "The asking run changed before submission".into())
+                    });
+                    return match console.peer_prompt(receiver, line.to_owned(), valid) {
+                        Ok(true) => Ok(AnswerSubmission::Confirmed),
+                        Ok(false) => Ok(AnswerSubmission::Waiting),
+                        Err((false, error)) => Ok(AnswerSubmission::NotSent(error)),
+                        Err((true, error)) => Err(CoreError::Io(error)),
+                    };
+                }
+                if harness == Harness::Codex {
+                    let Some(pty) = app
+                        .state::<SessionRegistry>()
+                        .get(session)
+                        .filter(|pty| !pty.has_exited())
+                    else {
+                        return Ok(AnswerSubmission::Waiting);
+                    };
+                    if !cide_core::conversations::composer(harness, &pty.capture_screen())
+                        .is_some_and(|text| text.trim().is_empty())
+                        || !begin()?
+                    {
+                        return Ok(AnswerSubmission::Waiting);
+                    }
+                    crate::peer_chat::submit_mobile(app, session, &pty, harness, line)
+                        .map_err(CoreError::Io)?;
+                    return Ok(AnswerSubmission::Submitted);
+                }
+                if !begin()? {
+                    return Ok(AnswerSubmission::Waiting);
+                }
                 self.send_prompt(app, project, run, session, line, harness)?;
                 self.mark_changed(app, project);
-                Ok(true)
+                Ok(AnswerSubmission::Submitted)
             }
             RequestDelivery::Queued => {
                 self.save_snapshot();
                 self.mark_changed(app, project);
                 self.pump(app);
-                Ok(false)
+                Ok(AnswerSubmission::Waiting)
             }
         }
     }
@@ -3221,7 +3295,12 @@ impl AgentRegistry {
         if live.prompt == line {
             match live.state {
                 RunState::Running | RunState::Idle | RunState::Finished { .. } => {
-                    return Ok(RequestDelivery::Delivered);
+                    return Ok(RequestDelivery::Submitted);
+                }
+                // Admission consumes requeued before spawning. A restart after
+                // that point cannot prove the opening answer was never sent.
+                RunState::Interrupted if live.requeued.is_none() => {
+                    return Ok(RequestDelivery::Submitted);
                 }
                 RunState::Failed { .. } => {
                     return Err(CoreError::Io(
@@ -3531,17 +3610,14 @@ impl AgentRegistry {
         let Some(live) = inner.runs.get_mut(&run) else {
             return Some(false);
         };
-        // A native plan's hand-back is internal to this assignment. Keep its slot and
-        // checkout until the approved implementation actually hands back.
-        if matches!(next, RunState::Idle)
+        // The conversation is idle even when planning still owns this assignment.
+        // Keep ownership, but expose the boundary so a saved answer can resume it.
+        let planning_boundary = matches!(next, RunState::Idle)
             && live
                 .planning
                 .as_ref()
                 .is_some_and(cide_agents::native_plan::State::pending)
-            && live.stop.is_none()
-        {
-            return Some(false);
-        }
+            && live.stop.is_none();
         if from.is_some_and(|from| live.state != *from) {
             return None;
         }
@@ -3671,7 +3747,7 @@ impl AgentRegistry {
             false => Vec::new(),
         };
         let follow_project = live.project;
-        if handed_back || over || blocked {
+        if (handed_back && !planning_boundary) || over || blocked {
             let key = live.key();
             let project = live.project;
             let held = live.slot;
@@ -4692,6 +4768,13 @@ fn move_to(live: &mut LiveRun, next: RunState, now_ms: u64) {
 /// SessionStart → Idle window from an actual hand-back; the saved park distinguishes an idle
 /// child's loss at restart from a turn cut off while working. Never infer completion from files.
 fn spec_turn_complete(live: &LiveRun) -> bool {
+    if live
+        .planning
+        .as_ref()
+        .is_some_and(cide_agents::native_plan::State::pending)
+    {
+        return false;
+    }
     match live.state {
         RunState::Idle => !live.slot,
         RunState::Interrupted => live.parked_at_quit == Some(ParkedAtQuit::Idle),
@@ -10638,7 +10721,11 @@ pub(crate) fn refresh_paths_and_pump(app: &AppHandle, project: ProjectId) {
 ///
 /// Only a turn still working holds paths. A handed-back child can receive another turn, but
 /// it has released the scheduler's claim; an unmerged review branch is likewise not a worker.
-fn path_holders(runs: &[cide_ipc::AgentRun], rows: &[cide_ipc::TaskRow]) -> Vec<(TaskId, AgentId)> {
+fn path_holders(
+    runs: &[cide_ipc::AgentRun],
+    rows: &[cide_ipc::TaskRow],
+    planning: impl Fn(RunId) -> bool,
+) -> Vec<(TaskId, AgentId)> {
     let mut seen: Vec<TaskId> = Vec::new();
     let mut out: Vec<(TaskId, AgentId)> = Vec::new();
     for run in runs {
@@ -10649,7 +10736,7 @@ fn path_holders(runs: &[cide_ipc::AgentRun], rows: &[cide_ipc::TaskRow]) -> Vec<
                 | RunState::Running
                 | RunState::AwaitingPermission
                 | RunState::Paused { .. }
-        );
+        ) || (run.state == RunState::Idle && planning(run.run));
         if let (true, Some(task)) = (live, run.task.as_ref())
             && !seen.contains(task)
         {
@@ -10689,7 +10776,9 @@ fn path_table(
         table.touches.insert(row.id.clone(), row.touches.clone());
     }
     let runs = registry.runs_for(project);
-    let candidates = path_holders(&runs, &rows);
+    let candidates = path_holders(&runs, &rows, |run| {
+        registry.planning(run).is_some_and(|p| p.pending())
+    });
     for (task, agent) in candidates {
         let name = cide_agents::checkout_name(&agent, Some(&task));
         let mut files =
@@ -11698,10 +11787,21 @@ mod tests {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
         let mut work = spec(project, "developer", 1, 1);
+        work.harness = Harness::Codex;
+        work.task = Some(TaskId("t-planning".into()));
         work.planning = Some(Default::default());
         let run = registry.enqueue(work);
         let waiting = registry.enqueue(spec(project, "other", 1, 1));
         assert_eq!(registry.take_admissions().len(), 1);
+        let session = SessionId::new();
+        registry.bind_session(run, session);
+        registry
+            .inner
+            .lock()
+            .runs
+            .get_mut(&run)
+            .unwrap()
+            .harness_session = Some("asking-thread".into());
         registry.set_state(None, run, RunState::Running);
         for phase in [
             cide_agents::native_plan::Phase::Planning,
@@ -11717,10 +11817,41 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .phase = phase;
-            assert!(!registry.set_state(None, run, RunState::Idle));
+            registry.set_state(None, run, RunState::Running);
+            assert!(registry.set_state(None, run, RunState::Idle));
             assert!(registry.take_admissions().is_empty());
-            assert!(registry.inner.lock().runs[&run].slot);
+            let inner = registry.inner.lock();
+            let live = &inner.runs[&run];
+            assert!(live.slot);
+            assert!(holds_its_checkout(live));
+            assert!(!spec_turn_complete(live));
+            assert!(live.working_since_unix_ms.is_none());
+            drop(inner);
+            assert!(
+                registry
+                    .idle_children_in(project, "developer-t-planning", waiting)
+                    .is_empty()
+            );
+            assert!(
+                registry
+                    .plan_retire(project, |_| true, &HashSet::new())
+                    .is_empty()
+            );
+            assert_eq!(
+                path_holders(&registry.runs_for(project), &[], |_| true).len(),
+                1
+            );
+            assert!(
+                matches!(registry.plan_user_request_delivery(project, run, Harness::Codex, "asking-thread", "Saved answer").unwrap(), RequestDelivery::Send(id, Harness::Codex) if id == session)
+            );
         }
+        let path = std::env::temp_dir().join(format!("cide-planning-idle-{}.json", RunId::new()));
+        registry.write_snapshot_now(&path);
+        let restored = AgentRegistry::default();
+        restored.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| true);
+        assert!(!spec_turn_complete(&restored.inner.lock().runs[&run]));
+        assert!(restored.planning(run).unwrap().pending());
+        std::fs::remove_file(path).unwrap();
         registry
             .inner
             .lock()
@@ -11731,6 +11862,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .phase = cide_agents::native_plan::Phase::Implementing;
+        registry.set_state(None, run, RunState::Running);
         assert!(registry.set_state(None, run, RunState::Idle));
         assert_eq!(registry.take_admissions()[0].run, waiting);
     }
@@ -14196,20 +14328,20 @@ mod tests {
         // Closed by the reviewer: the open run releases its hold at once.
         let done = [row("t-20", "done")];
         assert!(
-            path_holders(&runs, &done).is_empty(),
+            path_holders(&runs, &done, |_| false).is_empty(),
             "a done task holds nothing even under a live run"
         );
 
         // Still in review: the idle child can receive a follow-up, but holds no paths.
         let review = [row("t-20", "review")];
-        let holders = path_holders(&runs, &review);
+        let holders = path_holders(&runs, &review, |_| false);
         assert!(
             holders.is_empty(),
             "review cannot hold the queue after hand-back"
         );
 
         // A task the board has no row for keeps the old conservative hold.
-        assert!(path_holders(&runs, &[]).is_empty());
+        assert!(path_holders(&runs, &[], |_| false).is_empty());
     }
 
     #[test]
@@ -14441,8 +14573,26 @@ mod tests {
                     "User approved A"
                 )
                 .unwrap(),
-            RequestDelivery::Delivered
+            RequestDelivery::Submitted
         ));
+        // Once admission has consumed the queue, a crash cannot establish whether
+        // the opening prompt reached Codex. Preserve it for transcript reconciliation.
+        after.write_snapshot_now(&path);
+        let admitted = AgentRegistry::default();
+        admitted.restore_snapshot_from(&path, |_| true, |_| Some(dir.clone()), |_, _, _| true);
+        assert!(matches!(
+            admitted
+                .plan_user_request_delivery(
+                    project,
+                    run,
+                    Harness::Codex,
+                    "original-thread",
+                    "User approved A"
+                )
+                .unwrap(),
+            RequestDelivery::Submitted
+        ));
+        assert!(admitted.take_admissions().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

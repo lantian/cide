@@ -111,9 +111,36 @@ pub struct Transcript {
     pub revision: u64,
     indexes: HashMap<String, usize>,
     codex_items: bool,
+    pub codex_turn: Option<String>,
+    codex_completed_turns: std::collections::BTreeSet<String>,
+    // Only model-context response items populate these. UI item-completed events
+    // may arrive after task_complete and do not prove an answer reached the model.
+    codex_answers: Vec<(Option<String>, String, cide_ipc::UserRequestResponse)>,
 }
 
 impl Transcript {
+    pub fn tool_reply_turns_finished(
+        &self,
+        turns: &std::collections::BTreeSet<Option<String>>,
+    ) -> bool {
+        turns.iter().all(|turn| {
+            turn.as_ref()
+                .is_some_and(|turn| self.codex_completed_turns.contains(turn))
+        })
+    }
+
+    pub fn received_tool_answer(
+        &self,
+        request: &cide_ipc::UserRequest,
+        turns: &std::collections::BTreeSet<Option<String>>,
+    ) -> bool {
+        self.codex_answers.iter().any(|(turn, id, response)| {
+            id == &request.id
+                && request.response.as_ref() == Some(response)
+                && (turns.contains(&None) || turns.contains(turn))
+        })
+    }
+
     fn put(
         &mut self,
         id: String,
@@ -393,6 +420,14 @@ impl Transcript {
         }
         if ty == "event_msg" {
             let p = &v["payload"];
+            if p["type"] == "task_started" {
+                self.codex_turn = p["turn_id"].as_str().map(str::to_owned);
+            }
+            if matches!(p["type"].as_str(), Some("task_complete" | "turn_aborted"))
+                && let Some(turn) = p["turn_id"].as_str().or(self.codex_turn.as_deref())
+            {
+                self.codex_completed_turns.insert(turn.to_owned());
+            }
             if p["type"] == "item_completed" {
                 self.codex_items = true;
                 let item = &p["item"];
@@ -471,6 +506,18 @@ impl Transcript {
                     None,
                 ),
                 "function_call_output" | "custom_tool_call_output" => {
+                    let turn = p["internal_chat_message_metadata_passthrough"]["turn_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| self.codex_turn.clone());
+                    let mut answers = Vec::new();
+                    tool_answers(&p["output"], &mut answers, 0);
+                    for (id, response) in answers {
+                        let receipt = (turn.clone(), id, response);
+                        if !self.codex_answers.contains(&receipt) {
+                            self.codex_answers.push(receipt);
+                        }
+                    }
                     self.tool(key, "", &Value::Null, Some(&p["output"]), false, None)
                 }
                 _ => {}
@@ -642,6 +689,51 @@ impl Transcript {
             }
         }
         false
+    }
+}
+
+/// Decode MCP text nested in exec/wait output, without treating call arguments,
+/// UI notifications, or an assistant's description of a result as a receipt.
+fn tool_answers(
+    value: &Value,
+    answers: &mut Vec<(String, cide_ipc::UserRequestResponse)>,
+    depth: u8,
+) {
+    if depth > 12 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            if value["pending"] == false
+                && let Some(id) = value["id"].as_str()
+                && let Ok(response) = serde_json::from_value(value["response"].clone())
+            {
+                answers.push((id.to_owned(), response));
+            }
+            for key in ["content", "text", "output", "result"] {
+                if let Some(value) = object.get(key) {
+                    tool_answers(value, answers, depth + 1);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                tool_answers(value, answers, depth + 1);
+            }
+        }
+        Value::String(text) => {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                tool_answers(&value, answers, depth + 1);
+            } else {
+                // exec/wait prefixes its printed results with timing/status lines.
+                for line in text.lines() {
+                    if let Ok(value) = serde_json::from_str::<Value>(line) {
+                        tool_answers(&value, answers, depth + 1);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -885,6 +977,52 @@ pub fn composer(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn codex_answer_receipts_require_model_output_and_the_matching_turn_and_response() {
+        let request: cide_ipc::UserRequest = serde_json::from_value(json!({
+            "id":"request", "title":"Which?", "message":"Which?", "task":null,
+            "author":{"kind":"orchestrator"}, "request":{"kind":"question","question":"Which?"},
+            "origin":{"id":"thread","known":true,"kind":"console","harness":"codex","title":"Codex","cwd":"/repo","startedUnixMs":1,"lastSeenUnixMs":1},
+            "wait":true,"createdUnixMs":1,"response":{"kind":"cancel"},"applying":false,"delivered":false,"deliveryError":null
+        })).unwrap();
+        let turns = [Some("asking".to_owned())].into_iter().collect();
+        let result = json!({"id":"request","pending":false,"response":{"kind":"cancel"}});
+        let mut transcript = Transcript::default();
+        transcript.feed(
+            &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"asking"}}),
+            "start",
+        );
+        assert!(!transcript.tool_reply_turns_finished(&turns));
+        for event in [
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"McpToolCall","result":result}}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"input","name":"cide_user_request","arguments":result.to_string()}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":result.to_string()}]}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"other-turn","output":result.to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":"other"}}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"wrong-response","output":json!({"id":"request","pending":false,"response":{"kind":"reject","note":"No"}}).to_string()}}),
+        ] {
+            transcript.feed(&event, "unconfirmed");
+            assert!(!transcript.received_tool_answer(&request, &turns));
+        }
+        transcript.feed(&json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"answer","output":result.to_string()}}), "confirmed");
+        assert!(transcript.received_tool_answer(&request, &turns));
+        // A native ready signal may precede the rollout flush. Only a matching
+        // transcript boundary makes absence of a tool result conclusive.
+        transcript.feed(
+            &json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"other"}}),
+            "other-end",
+        );
+        assert!(!transcript.tool_reply_turns_finished(&turns));
+        transcript.feed(
+            &json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"asking"}}),
+            "end",
+        );
+        assert!(transcript.tool_reply_turns_finished(&turns));
+        assert!(
+            !Transcript::default().received_tool_answer(&request, &turns),
+            "another conversation has no receipt"
+        );
+    }
     #[test]
     fn native_cli_exports_from_both_generations_are_readable() {
         // Imported synthetic transcripts, exported by the installed CLIs without a model turn.
