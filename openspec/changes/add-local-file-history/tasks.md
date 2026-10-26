@@ -1,7 +1,7 @@
 ## 1. History types and policy
 
 - [x] 1.1 Add local-history DTOs for root/revision identity, sources, absence/lifecycle records, pages, comparisons, coverage, validated policy and restore results; give added workspace/view fields backward-compatible defaults.
-- [ ] 1.2 Implement canonical-root/path identity, deepest-root selection, symlink containment, text/size checks, gitignore and default/user exclusions independently of tree visibility; cover non-Git, hidden files, nested roots and separate worktrees with fixtures.
+- [x] 1.2 Implement canonical-root/path identity, deepest-root selection, symlink containment, text/size checks, gitignore and default/user exclusions independently of tree visibility; cover non-Git, hidden files, nested roots and separate worktrees with fixtures.
 
 ## 2. Durable store
 

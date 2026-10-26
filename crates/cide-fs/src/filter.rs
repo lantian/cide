@@ -599,7 +599,7 @@ impl Filter {
 
     /// A retargeted directory link can bring a different set of ignore rules under an
     /// existing logical path. Refresh on directory reads, without changing the shared roots.
-    pub(crate) fn refresh_rules(&self, dir: &Path) {
+    pub fn refresh_rules(&self, dir: &Path) {
         let file = dir.join(".gitignore");
         let rules = file
             .is_file()
@@ -736,7 +736,7 @@ impl Filter {
     /// Separate from [`Filter::admits`] because with *show ignored files* on, the tree needs
     /// the paths and the watcher needs the verdict about them, and one function cannot answer
     /// both.
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         // Deepest first — a `.gitignore` nearer the file wins, including when it whitelists
         // something a shallower one ignored. `matched_path_or_any_parents` also applies the
         // rule that nothing inside an ignored directory can be brought back.
