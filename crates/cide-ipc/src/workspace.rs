@@ -339,6 +339,10 @@ pub const TOOL_WINDOW_MAX_HEIGHT: u16 = 900;
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ToolWindowState {
+    #[serde(default)]
+    pub local_history: Vec<crate::local_history::LocalHistoryView>,
+    #[serde(default)]
+    pub active_local_history: Option<crate::local_history::LocalHistoryView>,
     /// Closed by default. A tool window that opens itself on first launch is a strip of chrome
     /// the user has to dismiss before they have asked anything of it.
     pub open: bool,
@@ -403,6 +407,8 @@ fn files_as_tree_default() -> bool {
 impl Default for ToolWindowState {
     fn default() -> Self {
         Self {
+            local_history: Vec::new(),
+            active_local_history: None,
             open: false,
             height: 260,
             history: Vec::new(),

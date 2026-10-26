@@ -2557,6 +2557,8 @@ mod tests {
         {
             let project = workspace.projects.values_mut().next().expect("a project");
             project.tool_window = cide_ipc::ToolWindowState {
+                local_history: Vec::new(),
+                active_local_history: None,
                 open: true,
                 height: 320,
                 history: vec![cide_ipc::HistoryTab {
