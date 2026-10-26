@@ -508,6 +508,16 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "bool",
         "The file tree shows gitignored files. Changing it re-indexes open projects.",
     ),
+    doc(
+        "explorer.indexMemoryMiB",
+        "number 64–4096",
+        "Per-project indexing allocation budget in MiB (default 512). Not a process memory cap.",
+    ),
+    doc(
+        "explorer.totalIndexMemoryMiB",
+        "number 256–16384",
+        "Combined indexing allocation budget in MiB (default 2048). Changes rebuild affected indexes.",
+    ),
     // --- inspections ---------------------------------------------------------------------
     doc(
         "inspections.severities.error",

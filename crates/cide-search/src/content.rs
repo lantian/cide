@@ -414,6 +414,93 @@ impl Search<'_> {
     /// **Blocking**, for as long as the tree takes. `sink` is called on this thread — the
     /// walker threads send batches over a channel rather than calling it — so it can be an
     /// `FnMut` over the caller's buffer with no lock of its own.
+    /// Search only the admitted catalog. No filesystem traversal or visibility overrides.
+    pub fn run_catalog<'a>(
+        &self,
+        files: impl IntoIterator<Item = (&'a str, &'a str)>,
+        stopped: &dyn Fn() -> bool,
+        sink: &mut dyn FnMut(&[SearchHit]),
+    ) -> Outcome {
+        use std::io::Read;
+        let mut outcome = Outcome::default();
+        let overrides: Vec<_> = self
+            .roots
+            .iter()
+            .map(|r| (r, self.include.map(|g| g.overrides(&r.path))))
+            .collect();
+        for (absolute, rel) in files {
+            if self.cancel.load(Ordering::Acquire) || stopped() {
+                break;
+            }
+            let path = Path::new(absolute);
+            if self.admits.is_some_and(|admits| !admits(path, false)) {
+                continue;
+            }
+            if let Some((_, Some(globs))) =
+                overrides.iter().find(|(r, _)| path.starts_with(&r.path))
+                && globs.matched(path, false).is_ignore()
+            {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(path) else {
+                continue;
+            };
+            if file
+                .metadata()
+                .is_ok_and(|m| !m.is_file() || m.len() > self.limits.max_file_bytes)
+            {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if file
+                .take(self.limits.max_file_bytes + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() as u64 > self.limits.max_file_bytes
+                || is_binary(&bytes[..bytes.len().min(self.limits.probe_bytes)])
+            {
+                continue;
+            }
+            outcome.scanned += 1;
+            if let Some(progress) = self.progress {
+                progress.store(outcome.scanned, Ordering::Relaxed);
+            }
+            let mut batch = Vec::new();
+            hits_in_text(
+                &String::from_utf8_lossy(&bytes),
+                self.regex,
+                &self.limits,
+                &mut |line, hit| {
+                    batch.push(SearchHit {
+                        path: absolute.to_string(),
+                        rel: rel.to_string(),
+                        line,
+                        text: hit.text.to_string(),
+                        start: hit.start,
+                        end: hit.end,
+                    });
+                },
+            );
+            let room = self.limits.max_hits.saturating_sub(outcome.hits as usize);
+            if batch.len() >= room {
+                batch.truncate(room);
+                outcome.truncated = true;
+            }
+            if self.cancel.load(Ordering::Acquire) || stopped() {
+                break;
+            }
+            if !batch.is_empty() {
+                outcome.hits += batch.len() as u32;
+                outcome.files += 1;
+                sink(&batch);
+            }
+            if outcome.truncated {
+                break;
+            }
+        }
+        outcome
+    }
+
     pub fn run(&self, sink: &mut dyn FnMut(&[SearchHit])) -> Outcome {
         let mut outcome = Outcome::default();
         if self.roots.is_empty() {

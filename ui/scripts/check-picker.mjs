@@ -793,7 +793,7 @@ try {
 
   {
     const files = stripRust(repoFile('crates/cide-app/src/files.rs'))
-    const walk = files.slice(files.indexOf('Index::walk_roots('))
+    const walk = files.slice(files.indexOf('Index::walk_roots_controlled('))
     ok(
       /threads:\s*1/.test(walk.slice(0, 400)),
       'the library walk asks for ONE thread per package. `BuildOptions::default()` is ' +

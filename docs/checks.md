@@ -552,6 +552,12 @@ array-splice control still exceeds the limit under these measurement conditions.
 
 `cargo test --locked -p cide-core shell_history`, `cargo test --locked -p cide-app --test bash_history`, `cargo test --locked -p cide-app --lib cmd::session`, `cargo test --locked -p cide-pty`, `check:input`, `check:exit`, `check:awaiting`, `check:attach`, `check:terminal-keys`, and `./scripts/check-bash32.sh`. The history tests use real PTYs and Up-arrow recall after forced termination: replaying a screen must not masquerade as restoring Readline history. They also pin global-file isolation, prompt hooks (scalar and exported indexed array), exit status, filters, login startup and paths with spaces/quotes. Set `CIDE_TEST_BASH` to an older Bash executable to run the same tests on it.
 
+The PTY fixtures substitute a controlled system-profile path in a copy of the real initializer;
+a temporary `HOME` alone does not isolate `/etc/profile`. Explicit fixtures cover a system
+profile overriding the inherited prompt hook and enabling timestamps with `history -a`.
+The ordinary fixtures remove inherited `HISTTIMEFORMAT` so exact history-file assertions
+remain independent of the machine running the tests.
+
 ### Rewriting a session's output
 
 **Touches:** rewriting a session's output — `cide_pty::LineRender`/`Rendered`, `render_lines`, `cide_core::jsonlog`, `lifecycle::json_log_render`, and the click-to-expand road — `logring`, `session_log_detail`, `terminal/logLink.ts`, `chrome/LogDetailCard`, `chrome/logDetailModel`

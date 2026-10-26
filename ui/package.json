@@ -1,7 +1,7 @@
 {
   "name": "cide-ui",
   "private": true,
-  "version": "0.16.2-dev",
+  "version": "0.16.3-dev",
   "type": "module",
   "scripts": {
     "check:diagnostics-status": "node scripts/check-diagnostics-status.mjs",
@@ -35,6 +35,8 @@
     "check:decision": "node scripts/check-decision.mjs && node scripts/check-decision-plugin.mjs",
     "check:demo": "node scripts/check-demo.mjs",
     "check:detached": "node scripts/check-detached.mjs",
+    "check:clipboard-diff": "node scripts/check-clipboard-diff.mjs",
+    "audit:clipboard-diff": "node scripts/audit-clipboard-diff.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",
     "check:diff-render": "node scripts/check-diff-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",

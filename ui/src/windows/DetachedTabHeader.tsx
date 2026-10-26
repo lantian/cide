@@ -20,7 +20,9 @@
  * button is the same outcome asked for by name, exactly as the pane window offers both.
  */
 import type { ReactNode } from 'react'
-import type { Tab, TabKind } from '@/ipc/client'
+import type { ProjectId, Tab, TabKind } from '@/ipc/client'
+import { useContextMenu } from '@/menus'
+import { canCompareClipboard, compareToClipboard } from '@/editor/compareClipboard'
 import { WindowLights } from '@/chrome/AppHeader'
 import { currentUserAgent, windowControlLayout } from '@/chrome/windowControls'
 import { consoleName } from '@/chrome/consoleName'
@@ -44,6 +46,8 @@ function tabTitle(kind: TabKind, console: string): string {
       return kind.title
     case 'conversation':
       return kind.title
+    case 'clipboardDiff':
+      return `${kind.path.split('/').at(-1) ?? kind.path} vs Clipboard`
     case 'file':
       return kind.path.split('/').at(-1) ?? kind.path
     case 'diff':
@@ -70,14 +74,22 @@ function tabTitle(kind: TabKind, console: string): string {
 export interface DetachedTabHeaderProps {
   /** `null` while the mirror has not caught up, or after the project closed under the window. */
   tab: Tab | null
+  project?: ProjectId | null
   /** Put the tab back in its shell's strip and close this window. */
   onRedock: () => void
 }
 
-export function DetachedTabHeader({ tab, onRedock }: DetachedTabHeaderProps): ReactNode {
+export function DetachedTabHeader({ tab, project, onRedock }: DetachedTabHeaderProps): ReactNode {
   const title = tab === null ? 'cide' : tabTitle(tab.kind, consoleName(tab))
+  const menu = useContextMenu({ label: 'Tab', items: () => {
+    const kind = tab?.kind
+    return project && (kind?.kind === 'file' || kind?.kind === 'clipboardDiff') && canCompareClipboard(kind.path)
+      ? [{ id: 'compare-clipboard', label: 'Compare to Clipboard', run: () => { void compareToClipboard(project, kind.path) } }]
+      : []
+  } })
   return (
-    <div className={styles.header} data-audit="detachedHeader">
+    <div className={styles.header} data-audit="detachedHeader" onContextMenu={menu.onContextMenu}>
+      {menu.menu}
       {CONTROLS.side === 'left' ? <WindowLights /> : null}
 
       {/* `title` as well as the text, for the reason the pane window gives: the strip is

@@ -18830,7 +18830,102 @@ inspected. The global UI-scale check found an existing unrelated `font-size: 0.7
 `ConversationArchivePane.module.css`; that file was left untouched. Native Tauri display
 behavior was not exercised.
 
-## M190 — Desktop files can cross the Explorer boundary
+## M190 — Compare to Clipboard with editable file hunks
+
+Text files offer **Compare to Clipboard** in the editor, tab (including a detached tab),
+and file-tree context menus. The action captures the clipboard and opens a separate,
+file-backed comparison tab. Repeating it refreshes that tab's snapshot. Split and unified
+layouts both offer per-hunk **Copy from Clipboard** controls; the clipboard stays read-only.
+The file side shares unsaved text, Undo/Redo and Save with the ordinary editor. Read-only
+files omit copy controls, and comparisons beyond 1 MiB or 12,000 combined lines retain an
+ordinary file editor with an explanatory notice.
+
+Shared documents keep local views synchronous and arbitrate updates between windows through
+native compare-and-swap snapshots, including CodeMirror history. A rejected revision rebases
+pending edits. Tab close/detach/redock flush pending changes; compositor close of a detached
+file requests the same acknowledgement before destroying its webview. Dirty flags and close
+checks describe the shared file, so closing one view preserves edits in the other. Renames
+move the session, recovery backups survive while either view remains, and normal typing
+retains its Undo grouping across acknowledgements. Clipboard snapshots and history are never
+written into workspace persistence. Restart converts comparison tabs to ordinary file views,
+deduplicating plain editors while preserving auxiliary sessions.
+
+Validation: production UI build and typecheck; IPC codegen and contract checks; Rust workspace,
+persistence, file/window and shared-document tests; editor (5,462 checks), clipboard model and
+real CodeMirror merge controls, menu model/menus, close, detached, sidebar, diff render, merge,
+scheme, markdown, keyboard, tab overflow, selectors, theme, UI scale, motion and kit checks.
+The mounted Chromium audit exercises the editor context menu, unsaved text, hunk copying,
+shared Undo/Save, clipboard refresh and layout switching. Light/dark split screenshots were
+inspected. Native Tauri clipboard access and compositor detach/redock were not manually
+exercised.
+
+The subsequent shared CI run reported 141 passing checks and four failures. Follow-up fixes
+apply Rust formatting, move production helpers before test modules, collapse nested conditions,
+and use plain `vs Clipboard` labels. The Select opened file check now drives both keyboard and
+menu path resolution, including clipboard comparisons, instead of matching a branch's source
+text. All four failing checks (`rust/fmt`, `rust/clippy`, `check:select-opened`, `check:ui-icons`)
+pass on rerun; UI typecheck and `check:menu-model` also pass. The entire suite was not rerun
+after these fixes.
+
+## M191 — Bound filesystem indexing across projects and external links
+
+An ignored packaging directory can contain a Wine `dosdevices/z:` link to a much larger
+filesystem. With hidden and ignored files shown, eager indexing previously retained the
+whole traversal, and macOS's debouncer cache could traverse the link independently. The file
+index now admits paths against configurable 512 MiB/project and 2048 MiB combined allocation
+budgets. Ordinary source files precede ignored and linked contents. Four shared workers,
+synchronous batches, cancellation on replacement/close/shutdown, and generation-owned
+reservations bound ongoing work without changing the visibility defaults.
+
+Filename snapshots share candidates. Text and symbol searches use that catalog, preserve
+file/parsing/hit limits, and include ignored/external sources that were admitted. Searches
+report partial coverage, old generations cannot supply current session results, and Refresh
+gets newer coverage. Watcher caches, native event bursts, polling and incremental additions
+are bounded; aliases, retargeted links, Git metadata and manual ignored-folder refresh retain
+regression coverage. The explorer shows “Index incomplete: memory limit reached” with a
+Settings action. These budgets describe indexing allocations, not total app or child-process
+RSS.
+
+Validation: the filesystem/search/language/IPC suites and app indexing/search/settings tests
+passed, including synthetic external links, shared accounting, snapshot ownership, cancellation,
+visibility changes and native/polling watcher behavior. All 134 UI checks passed, including
+production build, settings search/copy, picker, tree, search, kit and theme checks. The full
+shared runner passed 142 checks; its lint failure was corrected and the workspace Clippy rerun
+passed. Four failures remain in the unchanged Bash-history integration tests (timestamped
+history and a missing fixture output); all other workspace test targets passed. Native
+watcher tests require unsandboxed macOS event delivery and use temporary fixtures. The live
+IDE was not restarted or replaced.
+
+The isolated `cide-fs/examples/index_budget.rs` benchmark uses a synthetic external drive,
+never `/`. At an 8 MiB budget, both 10,000- and 100,000-file fixtures admitted 2,709 files and
+charged 8,387,152 bytes. Peak RSS was 11,599,872 and 11,583,488 bytes respectively (about
+11.1 MiB), demonstrating a plateau as the external tree grows. Cancellation is also covered
+by the local fixture's under-one-second assertion.
+
+
+## M192 — Isolate Bash history tests from host login profiles
+
+The four Bash-history failures recorded in M191 came from the host's managed `/etc/profile`:
+it enabled timestamped history and replaced the inherited `PROMPT_COMMAND`. A temporary
+`HOME` did not isolate either setting, so exact file comparisons and the inherited-hook
+fixture depended on the machine running the suite. PTY fixtures now copy the real initializer
+with only its system-profile path redirected to a controlled fixture and remove inherited
+`HISTTIMEFORMAT`. Production startup and system-profile loading are unchanged.
+
+Two additional PTY regressions explicitly cover a system profile replacing the inherited
+prompt hook and enabling timestamps with an append hook, including persistence before exit
+and Up-arrow recall after forced restart. All seven history tests pass on Apple's Bash 3.2,
+including a run with timestamp and prompt-hook settings exported by the parent process.
+The full workspace test rerun passed 4,771 tests with zero failures and 104 ignored tests;
+state and data roots were isolated under `/private/tmp` and native watcher tests had macOS
+event access.
+
+Investigation also reproduced duplicate entries with timestamped files and `history -a;
+history -n` in plain Bash 3.2 without Cide. This upstream behavior is not changed here; the
+timestamp fixture covers the managed profile's `history -a` hook, while the existing
+append/read-hook fixture retains its explicit untimestamped history format.
+
+## M193 — Desktop files can cross the Explorer boundary
 
 Files and folders dropped from the desktop into Explorer now highlight the receiving folder,
 including when the pointer is over one of its files. Resting on a collapsed folder expands it;

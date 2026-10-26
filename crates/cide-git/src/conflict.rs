@@ -50,11 +50,11 @@ use crate::{Result, Wrap, changelist, commit, repo as repo_mod, sidecar, status}
 
 /// The largest side a text resolver will load, in bytes.
 ///
-/// Matched to the diff pane's own `MAX_DIFF_CHARS`, and for the same reason it has one: three
-/// CodeMirror documents laid out side by side force `height: auto`, which defeats the viewport
-/// windowing that makes a large file survivable at all. Over this the row still offers
-/// *Yours* and *Theirs*, which are the two answers that need no editor.
-pub const MAX_SIDE_BYTES: u64 = 1024 * 1024;
+/// The resolver uses three independently scrolling CodeMirror editors, so viewport windowing
+/// keeps their DOM bounded. The cap limits the text transferred and held by the merge model;
+/// it need not match the inline diff's smaller cap for its fully laid-out documents. Above it,
+/// taking either side whole remains available without loading the text into the editors.
+pub const MAX_SIDE_BYTES: u64 = 10 * 1024 * 1024;
 
 // --- the roster ------------------------------------------------------------------------------
 

@@ -324,6 +324,10 @@ pub enum RunState {
     /// delivers the next turn into it or winds it down first, and it now has a state in which to
     /// tell the difference.
     ///
+    /// A native plan awaiting a decision is still the same assignment. Its idle boundary
+    /// permits answer delivery and stops the worked clock, but retains the slot, checkout
+    /// and path claims until implementation hands back or the run is stopped.
+    ///
     /// # One variant where [`crate::SessionState`] deliberately has two
     ///
     /// `SessionState` distinguishes `Idle` — not working — from `AwaitingInput` — the turn ended

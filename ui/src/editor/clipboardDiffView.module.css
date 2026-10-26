@@ -1,0 +1,14 @@
+.host { display: flex; flex-direction: column; min-height: 0; }
+.host :global(.cm-mergeView) { height: 100%; overflow: auto; }
+.host :global(.cm-mergeViewEditors) { min-height: 100%; }
+.host :global(.cm-mergeViewEditor) { min-width: 0; }
+.host .clipboard :global(.cm-scroller) { margin-right: 0; }
+.host :global(.cm-merge-revert) { width: calc(28px * var(--ui-scale)); background: var(--panel); }
+.host :global(.cm-merge-revert) .copy {
+  padding: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.copy { composes: button sm secondary from '../kit/components/Button.module.css'; }
+.notice { padding: calc(8px * var(--ui-scale)); color: var(--dim); font-size: var(--fs-ui-12); }

@@ -123,7 +123,17 @@ pub struct SearchRegistry {
 
 impl SearchRegistry {
     /// The job answering `query`, starting one if the standing job answers something else.
+    #[cfg(test)]
     fn job_for(&self, project: ProjectId, query: &SearchQuery) -> Arc<Job> {
+        self.job_for_generation(project, query, 0)
+    }
+
+    fn job_for_generation(
+        &self,
+        project: ProjectId,
+        query: &SearchQuery,
+        generation: u64,
+    ) -> Arc<Job> {
         // The comparison and the insert are separate statements: `DashMap::insert` while a
         // `Ref` into the same shard is alive is a self-deadlock, and letting the guard live
         // to the end of an `if let` block is how that happens. `FsRegistry::claim` has the
@@ -131,13 +141,15 @@ impl SearchRegistry {
         let standing = self
             .jobs
             .get(&project)
-            .filter(|job| job.query == *query)
+            .filter(|job| job.query == *query && job.generation == generation)
             .map(|job| Arc::clone(job.value()));
         if let Some(job) = standing {
             return job;
         }
 
-        let job = Arc::new(Job::new(query.clone()));
+        let mut job = Job::new(query.clone());
+        job.generation = generation;
+        let job = Arc::new(job);
         // The old job is cancelled only after the new one has replaced it, so a poll racing
         // this can find either job answering a query it echoes back — never a cancelled job
         // presented as the live one.
@@ -174,6 +186,7 @@ impl SearchRegistry {
 
 /// One running or finished search, and everything it has found.
 struct Job {
+    generation: u64,
     query: SearchQuery,
     /// Set to stop the walk; see [`cide_search::content::Search::cancel`].
     stop: AtomicBool,
@@ -201,6 +214,7 @@ struct Found {
 impl Job {
     fn new(query: SearchQuery) -> Self {
         Self {
+            generation: 0,
             query,
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
@@ -248,6 +262,7 @@ impl Job {
         regex: Regex,
         scope: Option<PathBuf>,
         include: Option<Globs>,
+        catalog: Option<&crate::files::ProjectFs>,
     ) {
         // The very object the file tree and the watcher consult — `ProjectFs::filter` — and
         // not a second one built from the same `dir_paths()`. Rebuilding it here cost a `stat`
@@ -276,7 +291,7 @@ impl Job {
                     .is_none_or(|scope| within_scope(path, is_dir, scope))
         };
 
-        let outcome = Search {
+        let search = Search {
             roots: &roots,
             regex: &regex,
             limits: Limits::default(),
@@ -284,17 +299,36 @@ impl Job {
             include: include.as_ref(),
             cancel: &self.stop,
             progress: Some(&self.scanned),
-        }
-        .run(&mut |batch| {
+        };
+        let mut sink = |batch: &[cide_ipc::SearchHit]| {
             let mut found = self.found.lock();
             found.hits.extend_from_slice(batch);
             // One batch is one file's hits, by construction in `content::Visitor`. Counting
             // here rather than deduplicating paths afterwards is what keeps the figure live
             // while the walk runs.
             found.files += 1;
-        });
+        };
+        let outcome = if let Some(fs) = catalog {
+            let Some(_worker) = cide_fs::budget::Worker::acquire_until(&|| {
+                self.stop.load(Ordering::Acquire) || fs.budget.cancelled()
+            }) else {
+                self.running.store(false, Ordering::Release);
+                return;
+            };
+            let candidates = fs.matcher().candidates();
+            search.run_catalog(
+                candidates
+                    .iter()
+                    .map(|c| (c.value.as_str(), c.text.as_str())),
+                &|| fs.budget.cancelled(),
+                &mut sink,
+            )
+        } else {
+            search.run(&mut sink)
+        };
 
-        self.found.lock().truncated = outcome.truncated;
+        self.found.lock().truncated =
+            outcome.truncated || catalog.is_some_and(|fs| fs.incomplete());
         // Last, and after the results are visible: a panel that saw `running: false` with the
         // final batch not yet appended would stop polling one page short.
         self.running.store(false, Ordering::Release);
@@ -346,7 +380,7 @@ pub async fn search_query(
     // `NoIndex` the picker answers with, which the frontend already knows how to read.
     let project_fs = fs.get(project).ok_or(FsError::NoIndex)?;
 
-    let job = searches.job_for(project, &query);
+    let job = searches.job_for_generation(project, &query, project_fs.generation());
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = offset.unwrap_or(0);
 
@@ -378,7 +412,14 @@ pub async fn search_query(
                     // Not awaited. The frame below is the empty first one, and the panel
                     // polls for the rest.
                     tauri::async_runtime::spawn_blocking(move || {
-                        job.walk(roots, filter, plan.regex, plan.scope, plan.include)
+                        job.walk(
+                            roots,
+                            filter,
+                            plan.regex,
+                            plan.scope,
+                            plan.include,
+                            Some(&project_fs),
+                        )
                     });
                 }
                 Err(problem) => {
@@ -807,6 +848,7 @@ mod tests {
             roots,
             Arc::clone(&filter),
             cide_search::content::compile(&job.query).unwrap(),
+            None,
             None,
             None,
         );

@@ -122,13 +122,15 @@ try {
   const page = (entries, total, generation = 0) => ({ inputs: entries.map(n => ({ id: String(n), ordinal: n, text: `prompt ${n}\nsecond line\nthird line` })), total, generation, available: true, hasPrevious: entries[0] > 1 })
   const resolveNext = async value => { const request = pending.shift(); assert(request); await act(async () => request.resolve(value)); return request.args }
   releases.push(m.retainRecap('project', 'conversation', false))
-  await resolveNext(page([51, 52], 52))
+  const initialPage = page([51, 52], 52)
+  initialPage.inputs[1].text = 'short prompt'
+  await resolveNext(initialPage)
   let unlistened = 0
   const subscription = subscriptions.shift()
   subscription.resolve(() => unlistened++)
   const revealed = []
   const navigator = {current:{pause(){},async reveal(ordinal){revealed.push(ordinal);return 'shown'}}}
-  const draw = async () => act(async () => root.render(React.createElement(m.UserInputRecap, { feature: { key, project: 'project', id: 'conversation', state: m.useRecaps.getState().conversations[key],navigator } })))
+  const draw = async (patch = {}) => act(async () => root.render(React.createElement(m.UserInputRecap, { feature: { key, project: 'project', id: 'conversation', state: {...m.useRecaps.getState().conversations[key], ...patch},navigator } })))
   await draw()
   assert(document.body.textContent.includes('52 / 52'))
   const click = async label => act(async () => { document.querySelector(`[aria-label="${label}"]`).click() })
@@ -162,6 +164,14 @@ try {
   await click('Latest input')
   await draw()
   assert(document.body.textContent.includes('52 / 52'))
+  assert.equal(document.querySelector('[aria-label="Collapse input"]').getAttribute('aria-expanded'), 'true',
+    'switching an expanded recap to short text must preserve expansion')
+  await draw({ status: 'error', total: 0 })
+  assert(document.body.textContent.includes('Could not read'))
+  assert(document.querySelector('[aria-label="Collapse input"]'), 'a status message must retain the collapse control')
+  await click('Collapse input'); await draw()
+  assert.equal(m.useRecaps.getState().conversations[key].expanded, false)
+  assert.equal(document.querySelector('[aria-expanded]'), null, 'collapsed short text needs no disclosure')
   // A new prompt can arrive while navigation waits for a historical page. Its count and
   // the selected historical prompt must survive the older response's stale total.
   m.chooseInput(key, 50); await draw()

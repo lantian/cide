@@ -324,6 +324,14 @@ impl Console {
         Ok(selected.receiver())
     }
 
+    pub fn turn(&self, conversation: &str) -> Option<String> {
+        let selected = self.protocol.lock();
+        let protocol = selected.protocol.lock();
+        (protocol.current_thread() == Some(conversation))
+            .then(|| protocol.current_turn().map(str::to_owned))
+            .flatten()
+    }
+
     pub fn peer_prompt(&self, receiver: Receiver, body: String, valid: Valid) -> Reply {
         let (reply, receive) = mpsc::channel();
         let expired = Arc::new(AtomicBool::new(false));
