@@ -1,5 +1,6 @@
 /** Every Waiting row opens a decision; task cards and image viewers are child views. */
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { flushSync } from 'react-dom'
 import type { UserRequest, UserRequestResponse } from '@/ipc/generated'
 import { Button } from '@/kit/components/Button'
 import { Checkbox } from '@/kit/components/Choice'
@@ -171,7 +172,10 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
               <div className={styles.details}>
                 {request && <p className={styles.message}>{request.origin.title} · {request.origin.harness} · {request.wait ? 'Waiting for your decision' : 'Independent work may continue'}</p>}
                 <div className={styles.relatedActions}>
-                  {request && props.onOpenSession && <Button variant="link" onClick={() => props.onOpenSession?.(request.origin.id)}>Open original conversation</Button>}
+                  {request && props.onOpenSession && <Button variant="link" onClick={() => {
+                    flushSync(onClose)
+                    props.onOpenSession?.(request.origin.id)
+                  }}>Open original conversation</Button>}
                   {task && <Button variant="link" data-audit="waitingDialogOpenTask" onClick={(e) => openTask(task, e.currentTarget)}>Open task {task}</Button>}
                   {move && <Button variant="link" onClick={(e) => openTask(move.goal, e.currentTarget)}>Open milestone task {move.goal}</Button>}
                 </div>

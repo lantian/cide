@@ -474,7 +474,7 @@ try {
    * asked, and every answer `false`, which is the same screen as no `data-drag` at all.
    */
   ok(
-    /new Set\(drag\.state\.drag\.paths\)/.test(tree)
+    /new Set\(flightState\.drag\.paths\)/.test(tree)
       && /inFlight !== null && inDrag\(inFlight, row\.path\)/.test(tree),
     'and the dim is asked against the paths actually in flight, built once per drag rather than '
       + 'rescanned per row per frame',
@@ -490,7 +490,7 @@ try {
       + 'naive version erases the very set the drag is carrying',
   )
   ok(
-    /drag\.state !== null && <TreeDragGhost state=\{drag\.state\} \/>/.test(tree)
+    /flightState !== null && <TreeDragGhost state=\{flightState\} \/>/.test(tree)
       && /state\.outcome\.hint/.test(tree),
     'the ghost is mounted and draws the verdict — the refusal is a sentence, and a colour alone '
       + 'says "no" to everyone who can see it and nothing to everyone who cannot',
@@ -512,7 +512,7 @@ try {
     'a drop is a CUT into the destination, sent through the one transfer path',
   )
   ok(
-    /void planEntries\(project, transfer\.sources, transfer\.destDir, transfer\.mode(, transfer\.from(, transfer\.clip\?\.id)?)?\)[\s\S]{0,400}?setPendingPaste\(\{ transfer, ask: startAsk\(collisions\) \}\)/.test(
+    /planEntries\(project, transfer\.sources, transfer\.destDir, transfer\.mode(, transfer\.from(, transfer\.clip\?\.id)?)?\)[\s\S]{0,400}?setPendingPaste\(\{ transfer, ask: startAsk\(collisions\) \}\)/.test(
       tree,
     ),
     'and it is PLANNED first, so a collision raises `PasteConfirm` instead of overwriting — the '
@@ -547,7 +547,7 @@ try {
    * name. An assertion that a symbol is imported is not an assertion that it is used.
    */
   ok(
-    /setNote\(fromClip \? cancelledNote\(\) : moveCancelledNote\(\)\)/.test(tree),
+    /setNote\(fromClip \? cancelledNote\(\) : copying \? [^:]+ : moveCancelledNote\(\)\)/.test(tree),
     'a cancelled drop says "Move cancelled" and a cancelled paste says "Paste cancelled" — a '
       + 'message that names a gesture the user did not make is how people learn to stop reading '
       + 'them',

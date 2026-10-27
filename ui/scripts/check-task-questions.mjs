@@ -74,6 +74,16 @@ try {
     author: { kind: 'orchestrator' }, wait: false, createdUnixMs: 1, response: null, applying: false, delivered: false, deliveryError: null,
     request: { kind: 'question', question: referenceQuestion } }
   const referenceProps = { ...waitingProps, questions: [], review: [], requests: [referenceRequest], onOpenSession() {}, onRespondRequest: async () => {} }
+  let originalConversationOpened = false
+  await mount(WaitingPanel, { ...referenceProps, onOpenSession: (id) => {
+    assert.equal(id, origin.id)
+    const decision = document.querySelector('[data-audit="waitingDecisionDialog"]')
+    assert.ok(!decision || decision.closest('[inert]'), 'Waiting closes before opening the original conversation')
+    originalConversationOpened = true
+  } }, 'leave-waiting')
+  await click(button('Choose model sources'))
+  await click(button('Open original conversation'))
+  assert.ok(originalConversationOpened)
   const savedRequest = { ...referenceRequest, response: { kind: 'answer', text: 'Production only', selectedIds: ['wait_production'] } }
   let failDismiss = true
   const dismissCalls = []

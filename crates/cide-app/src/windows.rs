@@ -345,6 +345,17 @@ pub fn create(
         .always_on_top(std::env::var_os("CIDE_ON_TOP").is_some())
         .build()?;
 
+    let drop_app = app.clone();
+    let drop_window = window.label().to_string();
+    // A WindowContent webview's drag events are synthesized as WINDOW events by Tauri.
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+            drop_app
+                .state::<crate::file_drag::DesktopDrops>()
+                .record(&drop_window, paths);
+        }
+    });
+
     if let Some((width, height)) = forced {
         // After build, so it wins over any geometry the window-state plugin restored.
         let _ = window.set_size(LogicalSize::new(width, height));

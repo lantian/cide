@@ -348,6 +348,9 @@ export type TreeKeyAction = 'rename' | 'delete'
  *   app has no such operation (`fs_delete` always goes to the trash). Answering it with the
  *   ordinary trash delete would silently do something other than what the user asked for, and
  *   the one thing worse than not supporting a destructive gesture is appearing to.
+ * * **Backspace or ⌘Backspace on macOS** opens the same trash confirmation. Control,
+ *   Option and Shift remain unclaimed. An active speed search or inline input handles its
+ *   own Backspace before this rule is consulted.
  * * **Ctrl+R** (or ⌘R) renames, with **no** Alt and **no** Shift. `ctrl+shift+r` stays free —
  *   it is "hard reload" muscle memory and belongs to nobody here yet.
  * * Everything else is `null`, so the caller leaves the keystroke alone. Notably `F2`: it is
@@ -355,11 +358,12 @@ export type TreeKeyAction = 'rename' | 'delete'
  *   the brief asked for Ctrl+R and a second undocumented binding for the same action is a
  *   thing to decide rather than to slip in.
  */
-export function treeKeyAction(key: string, mods: KeyMods): TreeKeyAction | null {
+export function treeKeyAction(key: string, mods: KeyMods, macos = false): TreeKeyAction | null {
   const primary = mods.ctrl || mods.meta
   if (key === 'Delete') {
     return primary || mods.alt || mods.shift ? null : 'delete'
   }
+  if (key === 'Backspace' && macos && !mods.ctrl && !mods.alt && !mods.shift) return 'delete'
   if (key.toLowerCase() === 'r' && primary && !mods.alt && !mods.shift) return 'rename'
   return null
 }

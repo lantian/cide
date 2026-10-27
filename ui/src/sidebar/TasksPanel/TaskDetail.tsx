@@ -65,6 +65,7 @@
 import type { AnswerHandler } from './QuestionAnswer'
 import type { TaskQuestion } from './model'
 import { useRef, useState, type JSX } from 'react'
+import { flushSync } from 'react-dom'
 import {
   agentColor,
   authorColor,
@@ -770,6 +771,8 @@ export interface TaskDetailProps {
   onEditing?: ((edit: FieldEdit | null) => void) | undefined
   /** Close the card. Required — a modal with no way out is a trap. */
   onClose: () => void
+  /** Leave the complete task/decision trail when a control opens another surface. */
+  onNavigateAway?: (() => void) | undefined
   onSetTitle?: ((task: string, title: string) => void) | undefined
   onSetStatus?: ((task: string, status: TaskStatus) => void) | undefined
   onSetAssignee?: ((task: string, agent: string | null) => void) | undefined
@@ -898,12 +901,36 @@ function authorStyle(
 
 export function TaskDetailModal(props: TaskDetailProps) {
   const { task, roles, editing = null } = props
+  // All outbound controls share this boundary. Closing in individual host callbacks let new
+  // Open buttons bypass it, and select(null) can mean Back rather than leaving the task trail.
+  const leave = () => flushSync(() => runIntent(
+    { ...props, onClose: props.onNavigateAway ?? props.onClose }, closeCard(task, editing, 'dismiss'),
+  ))
+  function navigate<Args extends unknown[]>(action: ((...args: Args) => void) | undefined) {
+    return action === undefined ? undefined : (...args: Args) => { leave(); action(...args) }
+  }
+  const dispatchTo = props.onDispatchTo
   return (
     <OverlayCard
       label={`Task ${task.id}: ${restText(task, 'title', roles)}`}
       onDismiss={() => runIntent(props, closeCard(task, editing, 'dismiss'))}
+      onEscapeFromOutside={() => runIntent(props, closeCard(task, editing, 'escape'))}
     >
-      <TaskDetail {...props} />
+      <TaskDetail {...props}
+        onOpenRun={navigate(props.onOpenRun)}
+        onOpenWorkflowSession={navigate(props.onOpenWorkflowSession)}
+        onOpenSession={navigate(props.onOpenSession)}
+        onOpenSpec={navigate(props.onOpenSpec)}
+        onOpenSpecFile={navigate(props.onOpenSpecFile)}
+        onOpenMilestone={navigate(props.onOpenMilestone)}
+        onOpenAttachment={navigate(props.onOpenAttachment)}
+        onRevealAttachment={navigate(props.onRevealAttachment)}
+        onProposeChange={navigate(props.onProposeChange)}
+        onDispatchTo={dispatchTo === undefined ? undefined : (id, target) => {
+          if (target.kind !== 'role') leave()
+          dispatchTo(id, target)
+        }}
+      />
     </OverlayCard>
   )
 }
@@ -942,7 +969,7 @@ export interface TaskDetailPendingProps {
  */
 export function TaskDetailPendingModal(props: TaskDetailPendingProps) {
   return (
-    <OverlayCard label={`Task ${props.task.id}`} onDismiss={props.onClose}>
+    <OverlayCard label={`Task ${props.task.id}`} onDismiss={props.onClose} onEscapeFromOutside={props.onClose}>
       <TaskDetailPending {...props} />
     </OverlayCard>
   )

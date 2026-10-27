@@ -386,6 +386,13 @@ of keyboard focus and the floating controls' hover state.
 These draw the surface only. Positioning, anchoring and Escape are the caller's job, as with
 `overlays/OverlayCard.tsx` today.
 
+The app's `OverlayCard` in `overlays/ModalShell.tsx` accepts an optional
+`onEscapeFromOutside` fallback. Task cards use it when a background pane has taken focus:
+only the top visible modal may handle that Escape, and controls inside the modal retain
+their normal key handling. It uses the caller's cancellation policy, so cancelling a field
+still precedes closing the card. A control that navigates out of a task must commit dismissal
+before its destination takes focus; opening a child dialog or following Back stays local.
+
 ### App chrome: `Chrome.tsx`
 
 - **`Rail`** + **`RailButton`**: the activity rail. 32px buttons in the 46px gutter; the current

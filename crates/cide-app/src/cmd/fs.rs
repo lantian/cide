@@ -41,7 +41,7 @@ use crate::workspace_state::WorkspaceState;
 /// answer, not a serialised megabyte.
 const MAX_ROWS: usize = 2048;
 
-fn project_fs(
+pub(crate) fn project_fs(
     registry: &FsRegistry,
     project: ProjectId,
 ) -> Result<std::sync::Arc<crate::files::ProjectFs>, FsError> {
@@ -1853,7 +1853,7 @@ pub(crate) fn paste_into(
     paste_with_source_roots(fs, source, None, sources, dest_dir, mode, decisions)
 }
 
-fn paste_with_source_roots(
+pub(crate) fn paste_with_source_roots(
     fs: &crate::files::ProjectFs,
     source: Option<&crate::files::ProjectFs>,
     source_roots: Option<&[PathBuf]>,

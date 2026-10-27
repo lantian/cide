@@ -15,20 +15,14 @@
  *    than the documented Windows certainty — which is an argument *for* pointer events, not
  *    against: a gesture that works in `pnpm dev` in a browser and does nothing in the shipped app
  *    is the worse failure, and it is the one this repo has shipped repeatedly.
- * 2. **The useful half of the native API is unused anyway.** `dragover` reports the element under
- *    the pointer; this tree needs the *folder* that element resolves to (a file row means its
- *    parent), which is a lookup either way. What remains is a `dataTransfer` payload that only
- *    ever travels to the same component.
+ * 2. **Native incoming drops use Tauri events.** Their paths and physical coordinates are
+ *    routed by `files/desktopDrop.ts`; HTML5 dataTransfer is not involved.
  * 3. **One drag mechanism in one app.** `layout/Splitter.tsx`, `chrome/SidebarSplitter.tsx`, the
  *    editor minimap and `useChangesDrag.ts` are all pointer capture plus window listeners.
  *
- * Cost, accepted and already the stated non-goal of the clipboard (`clipboardModel.ts`'s header):
- * no drag *into* cide from Dolphin or Nautilus, and none *out*. Those need the desktop's own
- * selection flavours, which a webview cannot serve; this feature does not make that worse.
- * (Since M39 one surface does take a desktop drop — the task card, for attachments — and it
- * can because it wants *paths*, which Tauri's own drag-drop event hands the page after it has
- * swallowed the HTML5 one. `sidebar/TasksPanel/fileDrop.ts` has the argument; the tree still
- * cannot, because a drop here would mean a copy and this hook is a move.)
+ * When the pointer leaves the tree, `onExport` hands the load to the desktop's native
+ * file-URL drag. `files/desktopDrop.ts` routes incoming native events back to the tree or
+ * the tab strip. The in-tree pointer path stays intact, including its move and refusal rules.
  *
  * # What is deliberately **not** copied from the git panel's hook
  *
@@ -103,6 +97,9 @@ export interface UseTreeDragOptions {
    * pretending: a drag that cannot land is a drag that should not start.
    */
   onMove?: ((sources: readonly string[], destDir: string) => void) | undefined
+  /** Hand a gesture leaving the tree to the desktop's file-URL drag session. */
+  onExport?: ((drag: TreeDragSet) => void) | undefined
+  onOpen?: ((paths: readonly string[]) => void) | undefined
 }
 
 export interface TreeDrag {
@@ -121,7 +118,7 @@ export interface TreeDrag {
 }
 
 export function useTreeDrag(options: UseTreeDragOptions): TreeDrag {
-  const { carried, roots, writable, container, rowFor, onSpring, onMove } = options
+  const { carried, roots, writable, container, rowFor, onSpring, onMove, onExport, onOpen } = options
   const [state, setState] = useState<TreeDragState | null>(null)
 
   /*
@@ -130,8 +127,8 @@ export function useTreeDrag(options: UseTreeDragOptions): TreeDrag {
    * the roots as they were at mousedown would drop into a folder that has since moved. Refs
    * rather than dependencies, because re-subscribing window listeners mid-drag loses the capture.
    */
-  const live = useRef({ carried, roots, writable, rowFor, onSpring, onMove })
-  live.current = { carried, roots, writable, rowFor, onSpring, onMove }
+  const live = useRef({ carried, roots, writable, rowFor, onSpring, onMove, onExport, onOpen })
+  live.current = { carried, roots, writable, rowFor, onSpring, onMove, onExport, onOpen }
 
   /** Everything about the gesture in flight. `null` between gestures. */
   const gesture = useRef<{
@@ -265,6 +262,25 @@ export function useTreeDrag(options: UseTreeDragOptions): TreeDrag {
         const drag = active.drag
         if (drag === null) return
         const under = document.elementFromPoint(ev.clientX, ev.clientY)
+        const tabs = under?.closest('[data-file-drop-project]') ?? null
+        if (tabs !== null && live.current.onOpen !== undefined) {
+          const canOpen = drag.paths.every(path => live.current.rowFor(path)?.kind === 'file')
+          const hint = canOpen ? `Open ${drag.label}` : 'Drop files here to open them in editor tabs'
+          const outcome: TreeDropOutcome = canOpen
+            ? { kind: 'open', paths: drag.paths, hint, mark: null }
+            : { kind: 'refuse', reason: hint, hint, mark: null }
+          active.outcome = outcome
+          setState({ drag, x: ev.clientX, y: ev.clientY, outcome })
+          springOn(null)
+          return
+        }
+        if (live.current.onExport !== undefined &&
+          (under === null || !container.current?.contains(under))) {
+          const exportDrag = live.current.onExport
+          finish(false)
+          exportDrag(drag)
+          return
+        }
         const path =
           under instanceof Element
             ? (under.closest<HTMLElement>('[data-row-path]')?.dataset['rowPath'] ?? null)
@@ -280,6 +296,16 @@ export function useTreeDrag(options: UseTreeDragOptions): TreeDrag {
       const up = (ev: PointerEvent) => {
         const active = gesture.current
         if (active === null || ev.pointerId !== active.pointerId) return
+        const drag = active.drag
+        const under = document.elementFromPoint(ev.clientX, ev.clientY)
+        if (drag !== null && live.current.onOpen !== undefined &&
+          under?.closest('[data-file-drop-project]')) {
+          finish(false)
+          if (drag.paths.every(path => live.current.rowFor(path)?.kind === 'file')) {
+            live.current.onOpen(drag.paths)
+          }
+          return
+        }
         finish(active.drag !== null)
       }
       const cancel = () => finish(false)

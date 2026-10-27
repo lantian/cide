@@ -113,6 +113,7 @@ import {
 import type { ArmedDelete, FieldEdit, LinkChip, LinkTargetOption, RunRef } from './model'
 import type { LinkAdd } from './TaskDetail'
 import { openTaskSpec, approveTaskSpec } from './openSpec'
+import { leaveTaskDetails } from './taskNavigation'
 import { taskSpecSessions, taskSpecPhase } from './specSessions'
 import { openSession as openSpecSession, useSpecRuns } from '../OpenSpecPanel/specRuns'
 
@@ -133,6 +134,7 @@ function TaskDetailHostImpl() {
   const dispatchAgent = useTasks((s) => s.dispatchAgent)
   const decisionBackStack = useTasks((s) => s.decisionBackStack)
   const select = useTasks((s) => s.select)
+  const closeDetails = useTasks((s) => s.closeDetails)
   const editTask = useTasks((s) => s.edit)
   const respondTask = useTasks((s) => s.respond)
   const removeTask = useTasks((s) => s.remove)
@@ -645,21 +647,18 @@ function TaskDetailHostImpl() {
    * mirrored one. `mode` decides whether the task is handed back to the conversation or it is
    * merely put on screen.
    *
-   * `select(null)` **first**, and only for a gesture that is going to succeed: the reveal raises
-   * a window and moves focus, and doing that under a modal scrim is what the close is for. A
-   * refusal still reaches `guarded`, so a card that closed and then failed would report into
-   * nothing — which is why the close is inside the promise rather than beside it.
+   * TaskDetailModal commits the departure before invoking this callback. Errors still reach
+   * the window's notices through `guarded`, even after the card has unmounted.
    */
   const openSession = useCallback(
     async (id: string, mode: 'open' | 'resume') => {
       if (project === null) return
-      select(null)
       await openTaskSession(id, {
         project,
         ...(mode === 'resume' && open !== null ? { task: open.id } : {}),
       })
     },
-    [project, select, open],
+    [project, open],
   )
 
   /*
@@ -765,16 +764,13 @@ function TaskDetailHostImpl() {
       verify={verify}
       onOpenVerifyLog={() => setVerifyLog(true)}
       onOpenMilestone={(id) => {
-        // The card closes first: it is a modal over everything, and the milestone's own modal
-        // opens in the Tasks panel beneath it.
-        select(null)
         useMilestones.getState().reveal(id)
       }}
       runs={runs}
       workflowSessions={workflowSessions}
       onOpenWorkflowSession={(run) => {
         const row = taskSpecSessions(specRuns, selected, change).find((candidate) => candidate.run === run)
-        if (project !== null && row) guarded(openSpecSession(project, row).then(() => select(null)))
+        if (project !== null && row) guarded(openSpecSession(project, row))
       }}
       roles={roles}
       roleColors={roleColors}
@@ -786,6 +782,7 @@ function TaskDetailHostImpl() {
       editing={edit}
       onEditing={setEditing}
       onClose={() => select(null)}
+      onNavigateAway={closeDetails}
       /*
        * The session ref is merged in here rather than stored in `specCard`, so it follows the
        * workspace tree and the awaiting set instead of the last four-subprocess read. See
@@ -928,10 +925,7 @@ function TaskDetailHostImpl() {
               if (project === null) return
               guarded(
                 specApi.proposeForTask(project, task as never).then((session) => {
-                  // Closed and revealed, `onDispatchTo`'s rule and its reason: the line has gone
-                  // into a pane, and leaving the modal over it hides the thing the press was
-                  // about. Chained, so a refusal leaves the card up carrying it.
-                  select(null)
+                  // The modal already committed its departure before starting the proposal.
                   return openTaskSession(String(session), { project })
                 }),
               )
@@ -989,15 +983,13 @@ function TaskDetailHostImpl() {
           /*
            * And then show it. Choosing a conversation left the modal standing over the pane it
            * had just typed the task into — the thing the user asked to see, behind a scrim. The
-           * reveal is chained rather than fired alongside, so a dispatch that Rust refuses (a
-           * pane closed while the picker was open) leaves the card up with the refusal on it
-           * instead of navigating away from the error.
+           * reveal follows the dispatch, so a refusal (a pane closed while the picker was open)
+           * reaches the window's notices without trying to focus an unavailable conversation.
            */
           guarded(
             specApi
               .dispatchToSession(project, task as never, target.id as never)
               .then(() => {
-                select(null)
                 return openTaskSession(target.id, { project })
               }),
           )
@@ -1025,7 +1017,6 @@ function TaskDetailHostImpl() {
               await specApi.dispatchToSession(project, task as never, session as never)
               // The pane was made a moment ago and is not on screen unless its tab is the one
               // showing; reveal it for the same reason the branch above does.
-              select(null)
               await openTaskSession(String(session), { project })
             },
           ),
@@ -1105,7 +1096,10 @@ function TaskDetailHostImpl() {
         onStep={setLightbox}
         onRequestPreview={(image) => { if (project !== null) requestPreview(project, open.id, image) }}
         onOpen={(attachment) => {
-          if (project !== null) guarded(attachmentsApi.open(project, open.id as never, attachment))
+          if (project !== null) {
+            leaveTaskDetails(project, open.id)
+            guarded(attachmentsApi.open(project, open.id as never, attachment))
+          }
         }}
       />
     )}

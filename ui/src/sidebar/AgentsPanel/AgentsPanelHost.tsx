@@ -203,6 +203,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
   const dismissRequest = useUserRequests((s) => s.dismiss)
   const selectedTask = useTasks((s) => s.selected)
   const decisionBackStack = useTasks((s) => s.decisionBackStack)
+  const decisionEpoch = useTasks((s) => s.decisionEpoch)
   const selectFromDecision = useTasks((s) => s.selectFromDecision)
   const pendingRequests = useMemo(() => requestView?.requests.filter((r) => !r.delivered) ?? [], [requestView])
   const panelTab = useAgentsTab((s) => s.tab)
@@ -479,6 +480,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
   if (project !== null && panelTab === 'waiting') {
     return (
       <WaitingPanel
+        key={`${project}:${decisionEpoch}`}
         project={project}
         title={<AgentsPanelTabs tab="waiting" onTab={setPanelTab} waiting={waitingTotal} />}
         review={waiting.review}

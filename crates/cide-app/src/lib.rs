@@ -64,6 +64,7 @@ mod spec_triggers;
 pub mod spinner;
 // M8: one file index, picker and watcher per project.
 mod file_clipboard;
+mod file_drag;
 pub mod files;
 pub mod graphics;
 pub mod groups;
@@ -399,6 +400,7 @@ pub fn run() {
     // resolve its state.
     builder = builder.manage(files::FsRegistry::default());
     builder = builder.manage(cmd::fs::FileClipState::default());
+    builder = builder.manage(file_drag::DesktopDrops::default());
     // Likewise: empty until the search panel asks for something, and managed from the start
     // so that `search.query` resolves its state and answers `NoIndex` rather than failing to
     // resolve at all.
@@ -735,6 +737,11 @@ pub fn run() {
             cmd::fs::fs_delete,
             cmd::fs::fs_paste,
             cmd::fs::fs_paste_plan,
+            file_drag::fs_drop_claim,
+            file_drag::fs_drop_plan,
+            file_drag::fs_drop_paste,
+            file_drag::fs_drop_open,
+            file_drag::fs_drag_start,
             cmd::fs::fs_clip_get,
             cmd::fs::fs_clip_set,
             cmd::fs::fs_clip_clear,
