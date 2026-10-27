@@ -338,6 +338,22 @@ pub async fn user_requests_list(app: AppHandle, project: ProjectId) -> Result<Us
         .map_err(|e| CoreError::Io(e.to_string()))?
 }
 #[tauri::command(rename_all = "camelCase")]
+pub async fn user_request_dismiss(
+    app: AppHandle,
+    project: ProjectId,
+    id: String,
+) -> Result<UserRequestsView> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = root(&app, project)?;
+        let requests = store(&app)?;
+        requests.dismiss(&root, &id)?;
+        broadcast(&app, project);
+        Ok(requests.view(&root))
+    })
+    .await
+    .map_err(|e| CoreError::Io(e.to_string()))?
+}
+#[tauri::command(rename_all = "camelCase")]
 pub async fn user_request_respond(
     app: AppHandle,
     project: ProjectId,

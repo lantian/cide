@@ -18959,3 +18959,20 @@ bare Backspace still edits an active speed-search query. The rule tests cover al
 combinations on macOS and other platforms. Both shortcuts opened the confirmation in the
 running macOS test copy; cancelling preserved the file. Tree/status/selection, speed-search,
 key-gate checks and TypeScript pass.
+
+## Removing obsolete saved requests from Waiting
+
+A saved answer or cancellation could remain in Waiting indefinitely after its original run
+or task disappeared. Its decision dialog now offers **Remove from Waiting**. This retires
+delivery durably while keeping the saved decision, uses the existing terminal request state,
+and broadcasts the updated view to open windows. Unanswered requests still require an answer
+or explicit cancellation; applying task changes must finish before removal. Already submitted
+input cannot be recalled. Delivery errors no longer accompany a promise to deliver at the end
+of the current turn.
+
+Validation: all 16 core user-request tests pass, including restart, preserved decisions,
+wrong-project and applying guards, and repeated native events. The mounted question check
+covers removing an orphaned cancellation, failure/retry, duplicate clicks, Close versus removal,
+and disabled removal during application. Agent rendering, UI kit, TypeScript, production UI
+build, app compilation and command contract checks pass. A running desktop build has not been
+restarted or used to remove a real request.

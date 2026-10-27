@@ -35,6 +35,7 @@ export interface WaitingPanelProps {
   onSendBack: (task: string, note: string) => void | Promise<void>
   onAnswer: AnswerHandler
   onRespondRequest?: ((id: string, response: UserRequestResponse) => Promise<void>) | undefined
+  onDismissRequest?: ((id: string) => Promise<void>) | undefined
   previews?: Readonly<Record<string, AttachmentPreview>> | undefined
   onRequestPreview?: ((task: string, image: string) => void) | undefined
 }
@@ -84,6 +85,7 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
   const [error, setError] = useState<string | null>(null)
   const [viewing, setViewing] = useState<ImageGallery | null>(null)
   const request = item.request
+  const dismissRequest = props.onDismissRequest
   const move = request?.request.kind === 'moveTasks' ? request.request : null
   const [checked, setChecked] = useState<string[]>(() => move?.tasks.map((t) => t.id) ?? [])
   const returnFocus = useRef<HTMLButtonElement | null>(null)
@@ -108,7 +110,11 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
     return props.onRespondRequest(request.id, response)
   }
   const openTask = (id: string, button: HTMLButtonElement) => { returnFocus.current = button; props.onOpenTask(id) }
-  const actions = resolved ? <Button onClick={onClose}>Close</Button> : (
+  const actions = resolved ? <>
+    {request && dismissRequest && <Button disabled={busy} busy={sending} data-audit="waitingDismiss"
+      onClick={() => void run(() => dismissRequest(request.id))}>Remove from Waiting</Button>}
+    <Button onClick={onClose}>Close</Button>
+  </> : (
     <>
       {request && <Button variant="link" disabled={busy} onClick={() => void run(() => respond({ kind: 'cancel' }))}>Cancel request</Button>}
       {move ? <>
@@ -132,7 +138,10 @@ function Decision({ item, onClose, open, ...props }: WaitingPanelProps & { item:
           onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); onClose() } }}>
           <div className={styles.content}>
             {(error || request?.deliveryError) && <p role="alert" className={styles.error}>{error ?? request?.deliveryError}</p>}
-            {resolved && request ? <SavedDecision request={request} /> : move ? <>
+            {resolved && request ? <>
+              <SavedDecision request={request} />
+              {props.onDismissRequest && <p className={styles.message}>If this request is no longer relevant, remove it from Waiting to stop delivery retries. Your saved decision is kept.</p>}
+            </> : move ? <>
               <p className={styles.message}>{request?.message}</p>
               <p>Move selected tasks into <Code>{move.milestone}</Code>. Inbox tasks become Todo.</p>
               <List label="Proposed task moves">
@@ -201,6 +210,7 @@ function SavedDecision({ request }: { request: UserRequest }) {
     <div className={styles.details}>
       <p className={styles.message} role="status">{request.applying
         ? request.request.kind === 'moveTasks' ? 'Applying the approved moves…' : 'Saving your answer on the task…'
+        : request.deliveryError ? 'Your decision is saved, but delivery has not completed.'
         : request.wait ? 'Your decision is saved. Sending it to the original conversation…'
           : 'Your decision is saved. The agent continued working without pausing; cide will deliver it when the current turn ends.'}</p>
       <div data-audit="waitingSavedDecision">

@@ -268,6 +268,10 @@ Every Waiting row opens one decision dialog: the question, approval, or proposed
 its main content, and the actions stay in the footer. Details and related tasks are expandable
 below. Opening a task or an image offers **Back** to the decision and keeps text and selections.
 Closing the dialog leaves the request waiting; **Cancel request** explicitly cancels it.
+If an answered or cancelled request remains because its original conversation is unavailable,
+open it and choose **Remove from Waiting**. This retires the request and stops future delivery
+retries, even if its task or run no longer exists. The saved decision is kept; input already
+sent cannot be recalled. Removal is unavailable while task changes are being applied.
 
 Questions can include any number of choices with a title, optional description, and optional
 image. Single-select, multi-select and custom text are available. A failed submission preserves

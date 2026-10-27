@@ -8,6 +8,7 @@ interface State {
   attach: (project: string | null) => Promise<void>
   adopt: (project: string, view: UserRequestsView) => void
   respond: (id: string, response: UserRequestResponse) => Promise<void>
+  dismiss: (id: string) => Promise<void>
 }
 let generation = 0
 export const useUserRequests = create<State>((set, get) => ({
@@ -31,6 +32,11 @@ export const useUserRequests = create<State>((set, get) => ({
     const project = get().project
     if (project === null) throw new Error('The project is no longer open.')
     get().adopt(project, await userRequests.respond(project, id, response))
+  },
+  dismiss: async (id) => {
+    const project = get().project
+    if (project === null) throw new Error('The project is no longer open.')
+    get().adopt(project, await userRequests.dismiss(project, id))
   },
 }))
 void events.onUserRequestsChanged(({ project, view }) => useUserRequests.getState().adopt(project, view))

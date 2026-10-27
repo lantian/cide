@@ -802,6 +802,7 @@ pub fn run() {
             cmd::tasks::task_edit,
             cmd::tasks::task_respond,
             user_requests::user_requests_list,
+            user_requests::user_request_dismiss,
             user_requests::user_request_respond,
             cmd::tasks::task_delete,
             // M39: attachments.
