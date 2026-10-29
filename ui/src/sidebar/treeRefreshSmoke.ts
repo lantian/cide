@@ -41,7 +41,7 @@ function row(path: string, depth = 0): TreeRow {
     kind: 'file',
     expanded: false,
     hasChildren: false,
-    symlink: false,
+    symlink: false, excludedFromIndex: false, exclusionRule: null, browsePage: null,
     root: 0,
     // `null` for every walked row; only a synthetic group row carries one. Present because
     // `TreeRow` requires it — which is exactly the compile error `ROW_FIELDS` is there to force.

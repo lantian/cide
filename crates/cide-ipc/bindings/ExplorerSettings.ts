@@ -49,4 +49,4 @@ showHiddenFiles: boolean,
  * *directory* travels as one entry and its contents inherit it, which is what keeps this
  * affordable on the wire.
  */
-showIgnoredFiles: boolean, };
+showIgnoredFiles: boolean, indexExcludedFolders: Array<string>, };

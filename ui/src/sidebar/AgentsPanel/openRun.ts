@@ -85,7 +85,7 @@ import {
 import { activeProjectOf, consolePaneOf } from '@/keys/target'
 import { paneSessionId } from '@/layout/paneHosts'
 import { useWorkspace } from '@/store/workspace'
-import { canOpen, type RunView } from './model'
+import { canOpen, paneShowsRun, type RunView } from './model'
 
 /**
  * What a window with nothing to open into refuses with.
@@ -113,11 +113,6 @@ function sessionOf(pane: Pane): string | null {
   return paneSessionId(pane.id) ?? pane.session
 }
 
-/** Whether two conversation records name the same conversation of the same harness. */
-function sameConversation(a: HarnessSession | null, b: HarnessSession | null): boolean {
-  return a !== null && b !== null && a.harness === b.harness && a.id === b.id
-}
-
 /**
  * A pane of this project already showing `session` — or, when the run's conversation is known,
  * a pane that was opened onto that conversation — or `undefined`.
@@ -141,10 +136,8 @@ function paneShowing(
     ...project.tabs.flatMap((tab) => Object.values(tab.tree.panes)),
     ...Object.values(project.detached),
   ]
-  return panes.find(
-    (pane) =>
-      (session !== null && sessionOf(pane) === session) ||
-      sameConversation(pane.continues, conversation),
+  return panes.find((pane) =>
+    paneShowsRun(sessionOf(pane), pane.continues, session, conversation),
   )?.id
 }
 

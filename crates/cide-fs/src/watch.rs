@@ -721,7 +721,11 @@ impl Backend {
         if self.budget.cancelled() {
             return Ok(());
         }
-        if !self.aliases.logical.contains_key(path) && !self.budget.reserve_path(path, "") {
+        if !self.aliases.logical.contains_key(path)
+            && !self
+                .budget
+                .reserve_path_for(path, "", cide_ipc::IndexAllocation::Watcher)
+        {
             return Ok(());
         }
         let real = match std::fs::canonicalize(path) {
@@ -906,7 +910,9 @@ impl Backend {
                     continue;
                 }
                 if !self.aliases.logical.contains_key(&child)
-                    && !self.budget.reserve_path(&child, "")
+                    && !self
+                        .budget
+                        .reserve_path_for(&child, "", cide_ipc::IndexAllocation::Watcher)
                 {
                     break;
                 }

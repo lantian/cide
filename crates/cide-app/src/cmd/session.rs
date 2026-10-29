@@ -16,7 +16,9 @@ pub enum SessionError {
     #[error("no such session")]
     NoSuchSession,
     /// A plain resume naming a conversation this app already has open. See `session_spawn`.
-    #[error("session {0} is already open in this window; a conversation cannot be resumed twice")]
+    #[error(
+        "session {0} already owns this conversation in a console, which may be in the background; use Open to return to it, or exit its harness before retrying"
+    )]
     AlreadyOpen(SessionId),
     /// The configured Claude binary cannot be executed. (M16)
     ///
@@ -1316,12 +1318,12 @@ pub(crate) async fn spawn_session(
     });
     // Desktop and mobile continuations share one admission gate, held until the new
     // child's identity is registered. Forks deliberately create a separate conversation.
-    let _resume_guard = if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork))
-    {
+    let mut resume_identity = continues.clone().filter(|_| !wants_fork(fork));
+    let mut resume_guard = if let Some(conversation) = &resume_identity {
         let guard = registry.resume_gate(conversation).lock_owned().await;
-        if let Some(held) = registry.native_in_use(conversation) {
-            return Err(SessionError::AlreadyOpen(held));
-        }
+        registry
+            .require_available(conversation)
+            .map_err(SessionError::AlreadyOpen)?;
         Some(guard)
     } else {
         None
@@ -1593,6 +1595,26 @@ pub(crate) async fn spawn_session(
     }
     let is_claude = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Claude);
     let is_codex = console.is_some_and(|c| c.harness == cide_ipc::ConsoleHarness::Codex);
+    // Restored Codex panes often carry only resume, not continues. Resolve the
+    // actual thread first, then use the same gate as explicit continuations.
+    if is_codex
+        && !wants_fork(fork)
+        && codex_settings.cli.inject.resume
+        && resume_identity.is_none()
+        && let Some(thread) = console.and_then(|c| c.thread)
+    {
+        let conversation = cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: thread.to_string(),
+            cwd: spec.cwd.clone(),
+        };
+        let guard = registry.resume_gate(&conversation).lock_owned().await;
+        registry
+            .require_available(&conversation)
+            .map_err(SessionError::AlreadyOpen)?;
+        resume_identity = Some(conversation);
+        resume_guard = Some(guard);
+    }
     // Either CLI. Everything that is about "a console" rather than about claude's own argv —
     // the proxy scope, `CIDE_SESSION`, the task tools' socket, *not* watching jobs or rewriting
     // output — keys on this.
@@ -2455,7 +2477,7 @@ pub(crate) async fn spawn_session(
         plan.watch_terminal(&session);
     }
     agent_sessions_launch.commit();
-    if let Some(conversation) = continues.as_ref().filter(|_| !wants_fork(fork)) {
+    if let Some(conversation) = &resume_identity {
         registry.note_native_conversation(id, conversation.clone());
     }
     if let Some(events) = qwen_events {
@@ -2482,6 +2504,7 @@ pub(crate) async fn spawn_session(
         observer.observe(app.clone(), id, &session);
     }
     if let Some(console) = codex {
+        console.register_writer(registry, id);
         app.state::<crate::peer_chat::Runtime>()
             .note_codex_console(id, console.clone());
         console.observe(&session);
@@ -2537,6 +2560,7 @@ pub(crate) async fn spawn_session(
     {
         agents.note_attached(conversation, id);
     }
+    drop(resume_guard);
     Ok(id)
 }
 

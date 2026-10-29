@@ -4,6 +4,8 @@
   "version": "0.16.4-dev",
   "type": "module",
   "scripts": {
+    "check:indexing-exclusions": "node scripts/check-indexing-exclusions.mjs",
+    "check:index-diagnostics": "node scripts/check-index-diagnostics.mjs",
     "check:diagnostics-status": "node scripts/check-diagnostics-status.mjs",
     "audit:diagnostics": "node scripts/audit-diagnostics.mjs",
     "check:settings-prompts": "node scripts/check-settings-prompts.mjs",

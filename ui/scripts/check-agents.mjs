@@ -141,6 +141,17 @@ try {
   )
 
   const agents = await import(`file://${join(out, 'AgentsPanel', 'model.js')}`)
+  const conversation = { harness: 'codex', id: 'thread' }
+  eq(agents.paneShowsRun('stale', conversation, 'owner', conversation), false,
+    'Open does not reveal a stale/read-only pane instead of the live owner')
+  eq(agents.paneShowsRun('owner', null, 'owner', conversation), true,
+    'Open reveals the owning session even before its pane has conversation metadata')
+  eq(agents.paneShowsRun(null, conversation, 'owner', conversation), false,
+    'a hidden owner gets a new attached view rather than an unbound stale pane')
+  eq(agents.paneShowsRun('continued', conversation, null, conversation), true,
+    'a continuation without a known owner still reveals its existing pane')
+  eq(agents.paneShowsRun(null, { harness: 'claude', id: 'thread' }, null, conversation), false,
+    'conversation matching remains scoped to its harness')
   const tasks = await import(`file://${join(out, 'TasksPanel', 'model.js')}`)
   const mentions = await import(`file://${join(out, 'TasksPanel', 'mentionModel.js')}`)
   const mdTools = await import(`file://${join(out, 'TasksPanel', 'markdownTools.js')}`)

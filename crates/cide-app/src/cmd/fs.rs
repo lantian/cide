@@ -83,18 +83,35 @@ pub async fn fs_index(
     // Both out of one `with`: the roots and the visibility have to describe the same instant,
     // and two reads with a settings write between them would walk one answer and filter by the
     // other.
-    let (roots, visibility, explorer) = state.with(|ws| {
+    let (roots, visibility, explorer, rules, project_override) = state.with(|ws| {
         let roots = cide_core::workspace::project(ws, project)
             .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         (
             roots,
             crate::files::visibility_of(&ws.settings),
-            ws.settings.explorer,
+            ws.settings.explorer.clone(),
+            cide_core::indexing_settings::effective(ws, project),
+            cide_core::indexing_settings::overrides(ws, project)
+                .ok()
+                .flatten()
+                .is_some(),
         )
     });
     registry.configure(&explorer);
-    index_project(Arc::new(app), &registry, project, roots, visibility).await
+    let exclusions = Arc::new(
+        cide_fs::Exclusions::compile(roots.clone(), &rules).map_err(FsError::InvalidPath)?,
+    );
+    index_project_configured(
+        Arc::new(app),
+        &registry,
+        project,
+        roots,
+        visibility,
+        exclusions,
+        project_override,
+    )
+    .await
 }
 
 /// [`fs_index`] with its two Tauri-injected arguments already resolved to values.
@@ -103,6 +120,7 @@ pub async fn fs_index(
 /// when a walk for this project is already running, rather than starting a second walk of
 /// the same tree. Two windows both reacting to `project.open` is the ordinary case, not an
 /// error one.
+#[cfg(test)]
 pub(crate) async fn index_project(
     events: Arc<dyn FsEvents>,
     registry: &FsRegistry,
@@ -110,13 +128,92 @@ pub(crate) async fn index_project(
     roots: Vec<PathBuf>,
     visibility: Visibility,
 ) -> Result<FsStatus, FsError> {
+    index_project_configured(
+        events,
+        registry,
+        project,
+        roots,
+        visibility,
+        Default::default(),
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn index_project_configured(
+    events: Arc<dyn FsEvents>,
+    registry: &FsRegistry,
+    project: ProjectId,
+    roots: Vec<PathBuf>,
+    visibility: Visibility,
+    exclusions: Arc<cide_fs::Exclusions>,
+    project_override: bool,
+) -> Result<FsStatus, FsError> {
     if roots.is_empty() {
         return Err(FsError::NoIndex);
     }
-    match registry.claim(project, roots, visibility) {
+    match registry.claim_configured(
+        project,
+        roots,
+        visibility,
+        exclusions,
+        project_override,
+        None,
+    ) {
         Ok(walk) => blocking("fs_index", move || walk.run(events, project)).await,
         Err(already_running) => Ok(already_running),
     }
+}
+
+/// Explicitly rebuild the file index after the user fixes a memory/coverage problem.
+/// Teardown, claiming and walking all run off the async runtime: dropping the old index
+/// stops its watcher and can free a large arena. Other generations stay budget-accounted
+/// until their last reader exits, just as for a settings-triggered rebuild.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_restart_index(
+    app: tauri::AppHandle,
+    project: ProjectId,
+    generation: u64,
+) -> Result<FsStatus, FsError> {
+    blocking("fs_restart_index", move || {
+        let state = app.state::<WorkspaceState>();
+        let registry = app.state::<FsRegistry>();
+        // Resolve the current project/settings here, not from the diagnostic snapshot.
+        let (roots, visibility, explorer, rules, project_override) = state.with(|ws| {
+            let roots = cide_core::workspace::project(ws, project)
+                .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            (
+                roots,
+                crate::files::visibility_of(&ws.settings),
+                ws.settings.explorer.clone(),
+                cide_core::indexing_settings::effective(ws, project),
+                cide_core::indexing_settings::overrides(ws, project)
+                    .ok()
+                    .flatten()
+                    .is_some(),
+            )
+        });
+        if roots.is_empty() {
+            return Err(FsError::NoIndex);
+        }
+        registry.configure(&explorer);
+        let exclusions = Arc::new(
+            cide_fs::Exclusions::compile(roots.clone(), &rules).map_err(FsError::InvalidPath)?,
+        );
+        match registry.claim_configured(
+            project,
+            roots,
+            visibility,
+            exclusions,
+            project_override,
+            Some(generation),
+        ) {
+            Ok(walk) => Ok(walk.run(Arc::new(app.clone()), project)),
+            Err(current) => Ok(current),
+        }
+    })
+    .await?
 }
 
 /// Drop a project's index, stop watching it, and stop any search or log walk over it. Idempotent.
@@ -194,6 +291,22 @@ pub(crate) async fn status_of(
 ) -> Result<FsStatus, FsError> {
     let fs = project_fs(registry, project)?;
     blocking("fs_status", move || fs.status()).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_index_diagnostics(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<cide_ipc::FsIndexDiagnostics, FsError> {
+    index_diagnostics_of(&registry, project).await
+}
+
+pub(crate) async fn index_diagnostics_of(
+    registry: &FsRegistry,
+    project: ProjectId,
+) -> Result<cide_ipc::FsIndexDiagnostics, FsError> {
+    let fs = project_fs(registry, project)?;
+    blocking("fs_index_diagnostics", move || fs.index_diagnostics()).await
 }
 
 // --- one tree out of two ------------------------------------------------------------------
@@ -509,6 +622,22 @@ pub async fn fs_collapse(
     .await?
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_browse_page(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    path: PathBuf,
+    direction: i8,
+) -> Result<u32, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_browse_page", move || {
+        fs.with_index_mut(|index| index.browse_page(&path, direction))
+            .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?;
+        Ok(tree_count(&fs) as u32)
+    })
+    .await?
+}
+
 /// *Expand all* in the Explorer header. Returns the new row count. (M96)
 ///
 /// Opens every walked directory that [`cide_fs::Filter::watchable`] admits, so with *Show
@@ -574,11 +703,23 @@ pub async fn fs_refresh(
     if fs.budget.reason().is_some() && fs.root_paths().contains(&path) {
         let roots = fs.root_paths();
         let visibility = fs.with_index(|index| index.visibility());
+        let exclusions = Arc::clone(&fs.exclusions);
+        let project_override = fs
+            .project_exclusions
+            .load(std::sync::atomic::Ordering::Acquire);
         drop(fs);
         drop(registry.remove(project));
-        return index_project(Arc::new(app), &registry, project, roots, visibility)
-            .await
-            .map(|status| status.rows);
+        return index_project_configured(
+            Arc::new(app),
+            &registry,
+            project,
+            roots,
+            visibility,
+            exclusions,
+            project_override,
+        )
+        .await
+        .map(|status| status.rows);
     }
     let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_refresh", move || {
@@ -3588,6 +3729,9 @@ mod compose_tests {
                 .skip(offset)
                 .take(len)
                 .map(|name| TreeRow {
+                    excluded_from_index: false,
+                    exclusion_rule: None,
+                    browse_page: None,
                     path: PathBuf::from(*name),
                     name: (*name).to_string(),
                     depth: 0,

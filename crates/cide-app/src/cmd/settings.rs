@@ -69,6 +69,43 @@ pub fn project_harness_get(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub fn project_indexing_get(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Option<Vec<String>>, CoreError> {
+    state.with(|ws| cide_core::indexing_settings::overrides(ws, project))
+}
+
+/// `None` inherits the global rules; an empty list deliberately excludes no folders.
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_indexing_set(
+    state: State<'_, WorkspaceState>,
+    app: AppHandle,
+    project: ProjectId,
+    exclusions: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, CoreError> {
+    if let Some(rules) = &exclusions {
+        cide_fs::Exclusions::compile(vec![], rules).map_err(CoreError::Serde)?;
+    }
+    state.update(|ws| {
+        let key = cide_core::harness_settings::project_key(ws, project)?;
+        let path = persist::config_dir().join("indexing-settings.json");
+        let mut projects = cide_core::indexing_settings::load(&path)?;
+        if let Some(rules) = &exclusions {
+            projects.insert(key, rules.clone());
+        } else {
+            projects.remove(&key);
+        }
+        cide_core::indexing_settings::save(&path, &projects)?;
+        ws.project_indexing = projects;
+        workspace::bump(ws);
+        Ok(())
+    })?;
+    reindex_open_projects(&app);
+    Ok(exclusions)
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub fn project_harness_effective(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
@@ -246,7 +283,7 @@ pub fn settings_set(
     ) = state.with(|ws| {
         (
             ws.settings.theme,
-            ws.settings.explorer,
+            ws.settings.explorer.clone(),
             ws.settings.inspections.server_binaries.clone(),
             ws.settings.inspections.server_index_working_set_pct,
             ws.settings.inspections.server_memory_limit_mb,
@@ -260,6 +297,10 @@ pub fn settings_set(
     // unapplied — half a patch landing is a form that shows one thing and saves another.
     if let Some(value) = &patch.decision {
         cide_core::decision::validate_connection(value).map_err(CoreError::Serde)?;
+    }
+    if let Some(explorer) = &patch.explorer {
+        cide_fs::Exclusions::compile(vec![], &explorer.index_excluded_folders)
+            .map_err(CoreError::Serde)?;
     }
     if let Some(AccentPatch::Set { base }) = &patch.accent {
         cide_core::accent::fit(base).map_err(|e| CoreError::AccentRefused(e.to_string()))?;
@@ -294,7 +335,7 @@ pub fn settings_set(
     if settings.explorer != was_explorer {
         app.state::<crate::files::FsRegistry>()
             .configure(&settings.explorer);
-        reindex_open_projects(&app, crate::files::visibility_of(&settings));
+        reindex_open_projects(&app);
     }
     // A server whose Builtin/System choice moved is running the wrong binary right now, in
     // every project that has it — the choice is global. Restarting is the honest reaction and
@@ -408,20 +449,57 @@ fn rebinaried(
 /// several projects open, freeze it for the sum of them. The tree is not left guessing in the
 /// meantime — `Indexing::run` emits `cide://fs-status` at the start of the walk and again at
 /// the end, which is exactly what `Explorer` already re-reads its rows on.
-fn reindex_open_projects(app: &AppHandle, visibility: cide_fs::Visibility) {
+fn reindex_open_projects(app: &AppHandle) {
     let open = app.state::<crate::files::FsRegistry>().indexed();
-    for (project, roots) in open {
+    for (project, _) in open {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
+            // Resolve here so a queued rebuild always uses the latest effective rules.
+            let Some((roots, visibility, rules, project_override)) =
+                app.state::<WorkspaceState>().with(|ws| {
+                    let opened = workspace::project(ws, project).ok()?;
+                    Some((
+                        opened
+                            .roots
+                            .iter()
+                            .map(|r| r.path.clone())
+                            .collect::<Vec<_>>(),
+                        crate::files::visibility_of(&ws.settings),
+                        cide_core::indexing_settings::effective(ws, project),
+                        cide_core::indexing_settings::overrides(ws, project)
+                            .ok()
+                            .flatten()
+                            .is_some(),
+                    ))
+                })
+            else {
+                return;
+            };
+            let exclusions = match cide_fs::Exclusions::compile(roots.clone(), &rules) {
+                Ok(policy) => std::sync::Arc::new(policy),
+                Err(error) => {
+                    tracing::warn!(?project, %error, "invalid indexing exclusions");
+                    return;
+                }
+            };
             let registry = app.state::<crate::files::FsRegistry>();
             let events: std::sync::Arc<dyn crate::files::FsEvents> =
                 std::sync::Arc::new(app.clone());
-            match crate::cmd::fs::index_project(events, &registry, project, roots, visibility).await
+            match crate::cmd::fs::index_project_configured(
+                events,
+                &registry,
+                project,
+                roots,
+                visibility,
+                exclusions,
+                project_override,
+            )
+            .await
             {
                 Ok(status) => tracing::debug!(
                     ?project,
                     files = status.files,
-                    "re-indexed a project for a visibility change"
+                    "reconciled project indexing settings"
                 ),
                 // `NoIndex` (a project with no roots) is the only error this can produce, and
                 // a project with no roots had nothing to re-walk. Logged rather than surfaced:
@@ -2398,11 +2476,12 @@ mod tests {
             .expect("a rooted project opens");
 
         let first = open_settings_tab(&mut ws, project, Some(SettingsSection::Git)).expect("opens");
-        let again =
-            open_settings_tab(&mut ws, project, Some(SettingsSection::Agents)).expect("re-opens");
-
-        assert_eq!(first, again);
-        assert_eq!(settings_tabs(&ws, project), vec![SettingsSection::Agents]);
+        // Explorer's memory warning must also re-point the existing tab to Files.
+        for section in [SettingsSection::Agents, SettingsSection::Files] {
+            let again = open_settings_tab(&mut ws, project, Some(section)).expect("re-opens");
+            assert_eq!(first, again);
+            assert_eq!(settings_tabs(&ws, project), vec![section]);
+        }
         assert_eq!(
             workspace::project(&ws, project).expect("open").active_tab,
             first

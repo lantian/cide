@@ -56,4 +56,4 @@ projects: { [key in ProjectId]: Project }, windows: { [key in WindowLabel]: Wind
  * ever want a fresh install to open the empty frame's tool window uninvited — which is the
  * claim `ToolWindowState::open`'s own doc already makes for the per-project one.
  */
-toolWindow: ToolWindowState, };
+toolWindow: ToolWindowState, projectIndexing: { [key in string]: Array<string> }, };

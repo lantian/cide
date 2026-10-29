@@ -853,6 +853,7 @@ version = "0.16.4-dev"
 dependencies = [
  "cide-ipc",
  "cide-search",
+ "globset",
  "ignore",
  "libc",
  "notify",

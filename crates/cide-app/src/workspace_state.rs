@@ -116,6 +116,12 @@ impl WorkspaceState {
             Ok(projects) => workspace.project_harness = projects,
             Err(error) => tracing::warn!(%error, "could not load project harness settings"),
         }
+        match cide_core::indexing_settings::load(
+            &persist::config_dir().join("indexing-settings.json"),
+        ) {
+            Ok(projects) => workspace.project_indexing = projects,
+            Err(error) => tracing::warn!(%error, "could not load project indexing settings"),
+        }
         for project in workspace.projects.values_mut() {
             for tab in &mut project.tabs {
                 if let Some(chat) = &mut tab.peer_chat {

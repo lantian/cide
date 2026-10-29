@@ -24,6 +24,7 @@ struct Fake {
     caller: CallerKind,
     settings: Mutex<Settings>,
     project_harness: Mutex<cide_ipc::ProjectHarnessSettings>,
+    project_indexing: Mutex<Option<Vec<String>>>,
     window_mode: Mutex<Option<cide_ipc::WindowMode>>,
     user_keymap: Mutex<Vec<Binding>>,
     edits: Mutex<Vec<Vec<KeymapEdit>>>,
@@ -43,6 +44,7 @@ impl Fake {
             caller,
             settings: Mutex::new(Settings::default()),
             project_harness: Mutex::new(Default::default()),
+            project_indexing: Mutex::new(None),
             window_mode: Mutex::new(None),
             user_keymap: Mutex::new(Vec::new()),
             edits: Mutex::new(Vec::new()),
@@ -139,6 +141,16 @@ impl AgentSink for Fake {
     }
     fn settings(&self) -> Result<Settings, String> {
         Ok(self.settings.lock().unwrap().clone())
+    }
+    fn project_indexing(&self) -> Result<Option<Vec<String>>, String> {
+        Ok(self.project_indexing.lock().unwrap().clone())
+    }
+    fn set_project_indexing(
+        &self,
+        rules: Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, String> {
+        *self.project_indexing.lock().unwrap() = rules.clone();
+        Ok(rules)
     }
     fn project_harness(&self) -> Result<cide_ipc::ProjectHarnessSettings, String> {
         Ok(self.project_harness.lock().unwrap().clone())
@@ -888,4 +900,35 @@ fn local_harness_overrides_reset_and_redact_launch_secrets() {
         json!({"action":"set", "section":"harness", "field":"consoleHarness", "value":"opencode"}),
         &Fake::as_caller(CallerKind::Worker),
     ));
+}
+
+#[test]
+fn indexing_project_tools_preserve_empty_overrides_and_reset_inheritance() {
+    let sink = Fake::new();
+    let get = || {
+        ask(
+            tool::PROJECT_SETTINGS,
+            json!({"action":"get","section":"indexing"}),
+            &sink,
+        )
+    };
+    ok(get());
+    ok(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"set","section":"indexing","field":"indexExcludedFolders","value":[]}),
+        &sink,
+    ));
+    assert_eq!(*sink.project_indexing.lock().unwrap(), Some(vec![]));
+    ok(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"reset","section":"indexing","field":"indexExcludedFolders"}),
+        &sink,
+    ));
+    assert_eq!(*sink.project_indexing.lock().unwrap(), None);
+    refused(ask(
+        tool::PROJECT_SETTINGS,
+        json!({"action":"set","section":"indexing","field":"indexExcludedFolders","value":false}),
+        &sink,
+    ));
+    assert_eq!(*sink.project_indexing.lock().unwrap(), None);
 }

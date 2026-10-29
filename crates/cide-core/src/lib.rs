@@ -37,6 +37,7 @@ pub mod handshake;
 pub mod harness_settings;
 /// Images: what a file is, from its own bytes. The sibling of [`document`], never its pixels.
 pub mod image;
+pub mod indexing_settings;
 /// A worktree's own copies of the per-user XDG directories, for a run and its verify alike.
 pub mod isolated_env;
 pub mod jsonlog;

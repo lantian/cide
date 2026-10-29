@@ -1354,6 +1354,15 @@ pub trait AgentSink: Send + Sync {
     fn project_harness(&self) -> Result<cide_ipc::ProjectHarnessSettings, String> {
         Err("project harness settings are not available here".into())
     }
+    fn project_indexing(&self) -> Result<Option<Vec<String>>, String> {
+        Err("project indexing settings are not available here".into())
+    }
+    fn set_project_indexing(
+        &self,
+        _exclusions: Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, String> {
+        Err("project indexing settings are not available here".into())
+    }
     fn set_project_harness(
         &self,
         _edit: cide_ipc::ProjectHarnessEdit,

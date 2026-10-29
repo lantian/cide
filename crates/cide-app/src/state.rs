@@ -32,6 +32,10 @@ pub struct SessionRegistry {
     /// Latest hook identity, retained even when its pane has not bound yet.
     conversations: DashMap<SessionId, Conversation>,
     native_conversations: DashMap<SessionId, cide_ipc::HarnessSession>,
+    /// Native console servers own the writer lock beyond the terminal's exit.
+    /// Keep their liveness separate from the PTY used to display the console.
+    writers: DashMap<SessionId, Arc<PtySession>>,
+    start_failures: DashMap<SessionId, String>,
     resume_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Ad hoc tab access captured before a harness launches. Kept across MCP reconnects,
     /// replaced by the next launch, never persisted with a conversation's history.
@@ -263,7 +267,7 @@ impl SessionRegistry {
     }
     pub fn native_in_use(&self, conversation: &cide_ipc::HarnessSession) -> Option<SessionId> {
         self.ids().into_iter().find(|id| {
-            if self.get(*id).is_none_or(|pty| pty.has_exited()) || self.codex_cleared(*id) {
+            if !self.writer_alive(*id) || self.codex_cleared(*id) {
                 return false;
             }
             if let Some((current, _)) = self.conversation_of(*id) {
@@ -273,6 +277,35 @@ impl SessionRegistry {
             self.native_conversation(*id)
                 .is_some_and(|c| c.harness == conversation.harness && c.id == conversation.id)
         })
+    }
+    pub fn note_writer(&self, id: SessionId, server: Arc<PtySession>) {
+        self.writers.insert(id, server);
+    }
+    pub fn note_start_failure(&self, id: SessionId, reason: String) {
+        self.start_failures.insert(id, reason);
+    }
+    pub fn take_start_failure(&self, id: SessionId) -> Option<String> {
+        // A reply can precede publication. Leave it for bring_up in that case.
+        self.get(id)?;
+        self.start_failures.remove(&id).map(|(_, reason)| reason)
+    }
+    pub fn writer_alive(&self, id: SessionId) -> bool {
+        self.get(id).is_some_and(|pty| pty.exit_status().is_none())
+            || self
+                .writers
+                .get(&id)
+                .is_some_and(|server| server.exit_status().is_none())
+    }
+    /// Call under resume_gate, and keep that gate until the child and its known
+    /// identity have been published. Both pane and worker launches use this check.
+    pub fn require_available(
+        &self,
+        conversation: &cide_ipc::HarnessSession,
+    ) -> Result<(), SessionId> {
+        match self.native_in_use(conversation) {
+            Some(owner) => Err(owner),
+            None => Ok(()),
+        }
     }
     pub fn resume_gate(
         &self,
@@ -345,6 +378,8 @@ impl SessionRegistry {
         self.conversations.remove(&id);
         self.native_conversations.remove(&id);
         self.agent_sessions.remove(&id);
+        self.writers.remove(&id);
+        self.start_failures.remove(&id);
         self.sessions.remove(&id).map(|(_, v)| v)
     }
 
@@ -460,6 +495,93 @@ mod tests {
         assert!(registry.resume_gate(&conversation).try_lock().is_err());
         conversation.harness = cide_ipc::Harness::Qwen;
         assert!(registry.resume_gate(&conversation).try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_resumes_publish_one_owner_before_releasing_admission() {
+        let registry = Arc::new(SessionRegistry::default());
+        let conversation = cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: SessionId::new().to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        let pty = idle_session();
+        let owner = SessionId::new();
+        let launch = || {
+            let registry = registry.clone();
+            let conversation = conversation.clone();
+            let pty = pty.clone();
+            async move {
+                let _guard = registry.resume_gate(&conversation).lock_owned().await;
+                if registry.require_available(&conversation).is_err() {
+                    return false;
+                }
+                // Force the other caller to try admission before publication.
+                tokio::task::yield_now().await;
+                registry.note_native_conversation(owner, conversation);
+                registry.insert(owner, pty);
+                true
+            }
+        };
+        let (a, b) = tokio::join!(launch(), launch());
+        let held = registry.native_in_use(&conversation);
+        pty.kill();
+        assert_ne!(a, b, "exactly one launch is admitted");
+        assert_eq!(held, Some(owner));
+        // An early spawn error simply drops its gate; it cannot poison retries.
+        let fresh = cide_ipc::HarnessSession {
+            id: SessionId::new().to_string(),
+            ..conversation
+        };
+        drop(registry.resume_gate(&fresh).lock_owned().await);
+        assert!(registry.resume_gate(&fresh).try_lock().is_ok());
+        assert!(registry.require_available(&fresh).is_ok());
+    }
+
+    #[test]
+    fn a_native_writer_outlives_its_terminal_until_the_server_is_reaped() {
+        let registry = SessionRegistry::default();
+        let owner = SessionId::new();
+        let conversation = cide_ipc::HarnessSession {
+            harness: cide_ipc::Harness::Codex,
+            id: SessionId::new().to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        let tui = idle_session();
+        let server = idle_session();
+        registry.note_native_conversation(owner, conversation.clone());
+        registry.note_writer(owner, server.clone());
+        registry.insert(owner, tui.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tui.on_exit(move |_| {
+            let _ = tx.send(());
+        });
+        tui.kill();
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let held = registry.native_in_use(&conversation);
+        let (tx, rx) = std::sync::mpsc::channel();
+        server.on_exit(move |_| {
+            let _ = tx.send(());
+        });
+        server.kill();
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(held, Some(owner));
+        assert!(registry.require_available(&conversation).is_ok());
+    }
+
+    #[test]
+    fn startup_rejection_waits_for_publication_and_is_consumed_once() {
+        let registry = SessionRegistry::default();
+        let owner = SessionId::new();
+        registry.note_start_failure(owner, "conversation is locked".into());
+        assert_eq!(registry.take_start_failure(owner), None);
+        let pty = idle_session();
+        registry.insert(owner, pty.clone());
+        let failure = registry.take_start_failure(owner);
+        let duplicate = registry.take_start_failure(owner);
+        pty.kill();
+        assert_eq!(failure.as_deref(), Some("conversation is locked"));
+        assert_eq!(duplicate, None);
     }
     #[cfg(unix)]
     #[test]

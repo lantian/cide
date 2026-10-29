@@ -650,6 +650,14 @@ struct Native {
 }
 impl Native {
     fn start(dir: &Temp, provider: &Provider, resume: Option<&str>) -> Self {
+        Self::start_observed(dir, provider, resume, Arc::new(|_| {}))
+    }
+    fn start_observed(
+        dir: &Temp,
+        provider: &Provider,
+        resume: Option<&str>,
+        observe: Observe,
+    ) -> Self {
         let scratch = cide_core::peer_chat::reviewer::Scratch::new().unwrap();
         let mut spec =
             SpawnSpec::new("codex", &dir.0).apply(cide_core::child_env::terminal_child_env(
@@ -705,7 +713,7 @@ impl Native {
         spec.output_observer = Some(cide_pty::OutputObserver::new(move |bytes| {
             let _ = output.send(bytes.to_vec());
         }));
-        let (spec, console) = Console::start(spec, Arc::new(|_| {})).unwrap();
+        let (spec, console) = Console::start(spec, observe).unwrap();
         let tui = PtySession::spawn(spec).unwrap();
         console.observe(&tui);
         Self {
@@ -768,6 +776,71 @@ impl Drop for Native {
         self.console.stop();
         self.tui.kill();
     }
+}
+
+#[test]
+#[ignore = "installed Codex, local fake provider and isolated state only; no model quota"]
+fn real_codex_native_lock_conflict_reports_failure_and_recovers_after_owner_exit() {
+    let dir = Temp::new();
+    let provider = Provider::new();
+    let owner = Native::start(&dir, &provider, None);
+    owner.wait("owner ready", || {
+        owner.console.receiver().is_ok_and(|r| r.is_some())
+    });
+    let receiver = owner.console.receiver().unwrap().unwrap();
+    let thread = receiver.thread.clone();
+    assert_eq!(
+        owner.console.peer_prompt(
+            receiver,
+            "Chat from Peer: Persist the local fixture".into(),
+            Box::new(|| Ok(()))
+        ),
+        Ok(true)
+    );
+    owner.wait("owner turn complete", || {
+        provider.requests.lock().len() == 1 && owner.console.receiver().is_ok_and(|r| r.is_some())
+    });
+
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let captured = failures.clone();
+    let duplicate = Native::start_observed(
+        &dir,
+        &provider,
+        Some(&thread),
+        Arc::new(move |hooks| {
+            captured.lock().extend(
+                hooks
+                    .into_iter()
+                    .filter(|hook| hook.kind == "CideStartFailed"),
+            );
+        }),
+    );
+    duplicate.wait("native writer conflict", || !failures.lock().is_empty());
+    assert!(duplicate.console.receiver().unwrap().is_none());
+    assert_eq!(owner.console.receiver().unwrap().unwrap().thread, thread);
+    drop(duplicate);
+    assert_eq!(
+        owner.console.peer_prompt(
+            owner.console.receiver().unwrap().unwrap(),
+            "Chat from Peer: Owner still works".into(),
+            Box::new(|| Ok(()))
+        ),
+        Ok(true)
+    );
+    owner.wait("owner still writable", || {
+        provider.requests.lock().len() == 2 && owner.console.receiver().is_ok_and(|r| r.is_some())
+    });
+    let (tx, rx) = mpsc::channel();
+    owner.console.server.on_exit(move |_| {
+        let _ = tx.send(());
+    });
+    drop(owner);
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let resumed = Native::start(&dir, &provider, Some(&thread));
+    resumed.wait("released conversation resumes", || {
+        resumed.console.receiver().is_ok_and(|r| r.is_some())
+    });
+    assert_eq!(resumed.console.receiver().unwrap().unwrap().thread, thread);
 }
 
 #[test]

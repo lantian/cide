@@ -197,7 +197,7 @@ impl Walk {
 fn walk_until_partial(corpus: &Corpus, opts: BuildOptions, attempts: usize) -> Walk {
     let mut last = None;
     for _ in 0..attempts {
-        let walk = walk_while_polling(corpus, opts);
+        let walk = walk_while_polling(corpus, opts.clone());
         if walk.from_inside_the_walk.is_some() && !walk.partial_frames(corpus.files).is_empty() {
             return walk;
         }

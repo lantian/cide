@@ -1,0 +1,6 @@
+.editor {
+  display: grid;
+  gap: var(--sp-4);
+  padding: var(--sp-5) 0;
+}
+.editor > p { margin: 0; color: var(--dim); }

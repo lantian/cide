@@ -1,3 +1,4 @@
+import { IndexingExclusions } from './IndexingExclusions'
 import { DecisionSection } from './DecisionSection'
 import { GitLabSettings } from '@/gitlab/GitLabSettings'
 /**
@@ -236,6 +237,7 @@ export const SECTION_TABS: Partial<Record<SettingsSection, readonly { value: str
 }
 
 export interface SectionProps {
+  project?: import('@/ipc/client').ProjectId | null
   settings: Settings
   testDecision?: (settings: import('@/ipc/generated').DecisionSettings) => Promise<string>
   projectHarness?: ProjectHarnessSettings
@@ -920,12 +922,14 @@ type EditorFlag = {
  * being told that has a slow Ctrl+P and no idea why — which is why "slows indexing" stayed in
  * its visible hint when M133 moved the rest behind the (i).
  */
-function Files({ settings, patch }: SectionProps) {
+function Files({ settings, patch, project = null }: SectionProps) {
   const explorer = settings.explorer
   const set = (next: Partial<ExplorerSettings>) => patch({ explorer: { ...explorer, ...next } })
   const def = useSettingsDefaults()?.explorer
 
   return (
+    <>
+    <IndexingExclusions project={project} explorer={explorer} />
     <Group>
       <Row label="Index memory per project" hint="MiB for file, symbol and library indexes. Default: 512."
         info="Conservative indexing allocation budget, including watcher metadata. This does not cap total app, language server or agent memory. When reached, search covers the files already indexed."
@@ -955,7 +959,7 @@ function Files({ settings, patch }: SectionProps) {
       />
       <ToggleRow
         label="Show ignored files"
-        hint="target/, node_modules/ and the rest, drawn muted. Slows indexing a big project."
+        hint="Gitignored entries, drawn muted. Indexing exclusions still apply."
         info={
           <>
             <InfoPara>
@@ -980,6 +984,7 @@ function Files({ settings, patch }: SectionProps) {
         onChange={(v) => set({ showIgnoredFiles: v })}
       />
     </Group>
+    </>
   )
 }
 

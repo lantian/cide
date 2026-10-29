@@ -272,7 +272,7 @@ function docsTree(): TreeRow[] {
     kind,
     expanded: false,
     hasChildren: kind === 'dir',
-    symlink: false,
+    symlink: false, excludedFromIndex: false, exclusionRule: null, browsePage: null,
     root: 0,
     detail: null,
   })

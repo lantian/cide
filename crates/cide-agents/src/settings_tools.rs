@@ -110,7 +110,7 @@ pub(crate) fn description(name: &str) -> Option<&'static str> {
              panel, never here). `action: get` shows the section; `set` with `field` and `value` \
              changes one field. `section: \"harness\"` reads local project overrides: consoleHarness, \
              claude, codex or opencode launch configuration, and decision experiment settings; set overrides one field, reset removes \
-             that field to inherit global settings. How roles run is cide_agents_config and cide_agent_override."
+             that field to inherit global settings. `section: \"indexing\"` reads local indexExcludedFolders overrides; paths and globs replace global rules, [] excludes none, reset inherits. How roles run is cide_agents_config and cide_agent_override."
         }
         tool::COMMAND_RUN => {
             "Run one of cide's commands in the window showing this project, exactly as if the user \
@@ -211,7 +211,7 @@ pub(crate) fn input_schema(name: &str) -> Option<Value> {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["get", "set", "reset"] },
-                "section": { "type": "string", "enum": ["openspec", "gitlab", "harness"] },
+                "section": { "type": "string", "enum": ["openspec", "gitlab", "harness", "indexing"] },
                 "field": {
                     "type": "string",
                     "description": "For set: the camelCase field name, as get prints it.",
@@ -1294,6 +1294,44 @@ fn project_settings(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         (Ok(action), Ok(section)) => (action, section),
         (Err(why), _) | (_, Err(why)) => return fail(name, why),
     };
+    if section == "indexing" {
+        let result = match action.as_str() {
+            "get" => sink.project_indexing(),
+            "set" | "reset" => {
+                if let Some(refused) = write_refusal(name, sink) {
+                    return refused;
+                }
+                if arguments.get("field").and_then(Value::as_str) != Some("indexExcludedFolders") {
+                    return fail(name, "indexing field must be indexExcludedFolders");
+                }
+                let value = if action == "reset" {
+                    Value::Null
+                } else {
+                    match arguments.get("value") {
+                        Some(value) => value.clone(),
+                        None => return fail(name, "value is required for set"),
+                    }
+                };
+                let rules = match serde_json::from_value::<Option<Vec<String>>>(value) {
+                    Ok(rules) => rules,
+                    Err(error) => return fail(name, error.to_string()),
+                };
+                sink.set_project_indexing(rules)
+            }
+            _ => return fail(name, "action must be get, set or reset"),
+        };
+        return match result {
+            Ok(rules) => match sink.settings() {
+                Ok(global) => ToolResult::text(json!({
+                    "effectiveIndexExcludedFolders": rules.as_ref().unwrap_or(&global.explorer.index_excluded_folders),
+                    "indexExcludedFolders": rules,
+                    "source": if rules.is_some() { "project" } else { "global" },
+                }).to_string()),
+                Err(error) => fail(name, error),
+            },
+            Err(error) => fail(name, error),
+        };
+    }
     if section == "harness" {
         let result = if action == "get" {
             sink.project_harness()

@@ -69,6 +69,9 @@ pub struct Workspace {
     /// claim `ToolWindowState::open`'s own doc already makes for the per-project one.
     #[serde(default)]
     pub tool_window: ToolWindowState,
+    // Machine-local indexing overrides, keyed by canonical primary root. Empty lists are explicit.
+    #[serde(default)]
+    pub project_indexing: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Workspace {
@@ -139,6 +142,7 @@ impl Default for Workspace {
             rev: 0,
             settings: Settings::default(),
             project_harness: Default::default(),
+            project_indexing: Default::default(),
             projects: IndexMap::new(),
             windows: IndexMap::new(),
             tool_window: ToolWindowState::default(),

@@ -360,6 +360,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
       ? null
       : {
           settings,
+          project,
           testDecision: decisionApi.probe,
           ...(scopedProject !== null && projectValues?.project === scopedProject ? { projectHarness: projectValues.overrides, editProjectHarness } : {}),
           opencodeSupport,

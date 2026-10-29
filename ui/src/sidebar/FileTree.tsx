@@ -2484,6 +2484,7 @@ export function FileTree({
                 renaming={row.path === renaming}
                 project={project}
                 onAct={apply}
+                onBrowsePage={(row, direction) => { void useFileTree.getState().browsePage(row, direction) }}
                 onPick={drag.onPointerDown}
                 onRelease={releasePress}
                 onEndRename={() => setRenaming(null)}
@@ -2860,6 +2861,7 @@ function cutAction(
 }
 
 interface RowProps {
+  onBrowsePage: (row: TreeRow, direction: number) => void
   row: TreeRow
   index: number
   statuses: TreeStatusMap['statuses']
@@ -2935,6 +2937,7 @@ function Row({
   renaming,
   project,
   onAct,
+  onBrowsePage,
   match,
   onPick,
   onRelease,
@@ -3031,7 +3034,7 @@ function Row({
          synthetic row's `path` is a `cide://…` sentinel that names nothing, so it gets its own
          text instead — a tooltip reading `cide://group/externalLibraries` would look like a
          leaked internal, which is what it is. */
-      title={synthetic ? row.name : row.symlink ? `${row.path}\nSymbolic link` : row.path}
+      title={synthetic ? row.name : `${row.path}${row.symlink ? '\nSymbolic link' : ''}${row.exclusionRule ? `\nExcluded from indexing: ${row.exclusionRule}` : ''}${row.browsePage?.error ? `\n${row.browsePage.error}` : ''}`}
       aria-label={row.symlink ? `${row.name}, symbolic link` : undefined}
       /*
        * First, and deliberately separate from the click handling below: a press only becomes a
@@ -3162,6 +3165,14 @@ function Row({
       {row.detail !== null && row.detail !== '' && (
         <span className={styles.detail}>{row.detail}</span>
       )}
+      {row.expanded && row.browsePage && <span className={styles.browseControls}
+        onPointerDown={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}>
+        {row.browsePage.error && <span role="alert" title={row.browsePage.error}><Icon name="triangle-alert" size={1} /> {row.browsePage.error}</span>}
+        {row.browsePage.previous && <button type="button" aria-label={`Previous page of ${row.name}`} title="Previous page (up to 512 entries)" onClick={() => onBrowsePage(row, -1)}>Previous</button>}
+        {row.browsePage.next && <button type="button" aria-label={`Next page of ${row.name}`} title="Next page (up to 512 entries)" onClick={() => onBrowsePage(row, 1)}>Next</button>}
+      </span>}
       <span
         className={
           status.letterClass === undefined ? styles.tag : `${styles.tag} ${status.letterClass}`

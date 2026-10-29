@@ -272,6 +272,7 @@ pub struct FilterInput<'a> {
 /// Ignore rules, reusable from any thread.
 #[derive(Debug)]
 pub struct Filter {
+    exclusions: std::sync::Arc<crate::Exclusions>,
     roots: Vec<PathBuf>,
     /// One entry per visited directory that contains a `.gitignore`.
     per_dir: std::sync::RwLock<HashMap<PathBuf, Gitignore>>,
@@ -364,9 +365,11 @@ impl Filter {
             // indexed could never report it. A watch on a directory that is not there simply
             // fails, which `crate::watch` already treats as ordinary (a directory can vanish
             // between the walk and the watch), and the create arrives on the root's own watch.
+            // Recursion is a filtered walk of maintenance paths (is_watched_path),
+            // never an unconditional native recursive watch of worktree checkouts.
             watched_paths.push(WatchedPath {
                 path: root.join(CIDE_DIR),
-                recursive: false,
+                recursive: true,
                 git: false,
             });
 
@@ -401,7 +404,7 @@ impl Filter {
             // a roster. This is `openspec/`'s bargain — recursive, but over a bounded subtree of
             // documents — and not `.git`'s.
             //
-            // `recursive: true` rather than `.cide`'s `false` because the files that matter are
+            // `recursive: true` because the files that matter are
             // one level *inside* this directory, and Claude Code allows a nested layout
             // (`agents/team/reviewer.md`) that cide reads as flat but must still notice changing.
             //
@@ -453,6 +456,7 @@ impl Filter {
         }
 
         Self {
+            exclusions: Default::default(),
             roots: roots.to_vec(),
             per_dir: std::sync::RwLock::new(per_dir),
             excludes,
@@ -494,6 +498,12 @@ impl Filter {
             git_dirs: &git_dirs,
             visibility,
         })
+    }
+
+    /// The same immutable policy used by the generation’s file walk.
+    pub fn with_exclusions(mut self, exclusions: std::sync::Arc<crate::Exclusions>) -> Self {
+        self.exclusions = exclusions;
+        self
     }
 
     /// What this filter was built to show.
@@ -557,7 +567,23 @@ impl Filter {
     }
 
     pub fn is_watched_path(&self, path: &Path) -> bool {
-        self.watched_paths.iter().any(|w| path.starts_with(&w.path))
+        self.watched_paths.iter().any(|w| {
+            path == w.path
+                || (w.recursive && !w.path.ends_with(CIDE_DIR) && path.starts_with(&w.path))
+        }) || self.roots.iter().any(|root| {
+            let Ok(rel) = path.strip_prefix(root.join(CIDE_DIR)) else {
+                return false;
+            };
+            let parts: Vec<_> = rel.components().collect();
+            if parts.len() <= 1 {
+                return true;
+            }
+            let first = parts[0].as_os_str();
+            if first == "agents" || first == "tasks" {
+                return true;
+            }
+            first == "worktrees" && (parts.len() <= 2 || parts[2].as_os_str() == SPEC_DIR)
+        })
     }
 
     /// Whether a path is inside one of [`GIT_NEVER`]'s directories.
@@ -639,6 +665,11 @@ impl Filter {
     /// as `build/` matches a directory only — and the alternative is dropping deletions,
     /// which is worse than occasionally reporting one that was ignored.
     pub fn admits(&self, path: &Path, is_dir: bool) -> bool {
+        self.exclusions.matching_rule(path, is_dir).is_none() && self.browsable(path, is_dir)
+    }
+
+    /// Visibility without indexing exclusions, for an explicit lazy directory read.
+    pub fn browsable(&self, path: &Path, is_dir: bool) -> bool {
         match self.classify(path) {
             Verdict::Refused => false,
             Verdict::Always => true,
@@ -668,6 +699,9 @@ impl Filter {
          */
         if self.is_git_path(path) || self.is_watched_path(path) {
             return true;
+        }
+        if self.exclusions.matching_rule(path, is_dir).is_some() {
+            return false;
         }
         match self.classify(path) {
             Verdict::Refused => false,
@@ -1102,8 +1136,8 @@ mod tests {
             "openspec/ asks for recursion, and the event loop has to be able to find that out"
         );
         assert!(
-            !filter.is_recursive_watch(&dir.join(".cide")),
-            "…and .cide does not: it is one directory of small files"
+            filter.is_recursive_watch(&dir.join(".cide")),
+            "…and .cide requests a filtered walk for nested task, agent and worktree OpenSpec updates"
         );
         // Exact, not a prefix: a child of a recursive watch needs no descriptor of its own, and
         // answering `true` for one would have the event loop take a second recursive watch

@@ -382,6 +382,10 @@ impl Console {
             }
         });
     }
+
+    pub fn register_writer(&self, registry: &crate::state::SessionRegistry, routing: SessionId) {
+        registry.note_writer(routing, self.server.clone());
+    }
 }
 impl Drop for Console {
     fn drop(&mut self) {
@@ -1021,6 +1025,19 @@ pub(crate) fn observer(app: AppHandle, routing: SessionId) -> Observe {
     let previous = Arc::new(Mutex::new(None::<String>));
     Arc::new(move |hooks| {
         for mut hook in hooks {
+            if hook.kind == "CideStartFailed" {
+                if let Some(sessions) = app.try_state::<crate::state::SessionRegistry>() {
+                    let reason = hook.payload["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Codex rejected the conversation startup")
+                        .to_string();
+                    sessions.note_start_failure(routing, reason);
+                    if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+                        agents.fail_native_start(&app, routing);
+                    }
+                }
+                continue;
+            }
             if hook.kind == "SessionStart" {
                 let id = hook.payload["session_id"]
                     .as_str()

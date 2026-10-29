@@ -25,9 +25,11 @@ use std::sync::Arc;
 
 use crate::budget::{Budget, Worker};
 
-use cide_ipc::{FsChange, TreeMatch, TreeRow, TreeRowKind};
+use cide_ipc::{FsChange, IndexAllocation, IndexFolderUsage, TreeMatch, TreeRow, TreeRowKind};
 
 use crate::filter::{Filter, Visibility};
+
+mod browse;
 
 pub type NodeId = u32;
 
@@ -62,9 +64,10 @@ pub struct WalkItem {
     pub symlink: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BuildOptions {
     /// Retained for compatibility. Walks use one of four app-wide worker permits.
+    pub exclusions: Arc<crate::Exclusions>,
     pub threads: usize,
     /// How many entries accumulate before a worker hands them to the sink. Small enough
     /// that the picker fills visibly during a long walk, large enough that the channel is
@@ -87,6 +90,7 @@ impl Default for BuildOptions {
     /// are nobody's file tree.
     fn default() -> Self {
         Self {
+            exclusions: Default::default(),
             threads: 0,
             batch: 512,
             visibility: Visibility::CONSERVATIVE,
@@ -97,6 +101,9 @@ impl Default for BuildOptions {
 #[derive(Debug)]
 struct Node {
     name: String,
+    browse: bool,
+    cache_bytes: u64,
+    page: Option<cide_ipc::TreeBrowsePage>,
     parent: Option<NodeId>,
     children: Vec<NodeId>,
     kind: TreeRowKind,
@@ -115,6 +122,8 @@ struct Node {
 #[derive(Debug)]
 pub struct Index {
     budget: Arc<Budget>,
+    exclusions: Arc<crate::Exclusions>,
+    browse_bytes: u64,
     nodes: Vec<Node>,
     /// Slots freed by deletions, reused before the arena grows.
     free: Vec<NodeId>,
@@ -138,6 +147,18 @@ pub struct Index {
 }
 
 impl Index {
+    /// Also used while the initial walk runs: explicit refreshes must obey its policy.
+    pub fn empty_controlled(
+        roots: Vec<Root>,
+        visibility: Visibility,
+        budget: Arc<Budget>,
+        exclusions: Arc<crate::Exclusions>,
+    ) -> Self {
+        let mut index = Self::empty(roots, visibility);
+        index.budget = budget;
+        index.exclusions = exclusions;
+        index
+    }
     /// An index with the roots recorded and nothing walked yet.
     ///
     /// The app registers this before starting the walk so that a picker query arriving in
@@ -145,6 +166,8 @@ impl Index {
     pub fn empty(roots: Vec<Root>, visibility: Visibility) -> Self {
         let mut index = Self {
             budget: Budget::standalone(),
+            exclusions: Default::default(),
+            browse_bytes: 0,
             nodes: Vec::new(),
             free: Vec::new(),
             by_path: HashMap::new(),
@@ -165,6 +188,9 @@ impl Index {
             let name = index.roots[i as usize].label.clone();
             let node = index.push_node(Node {
                 name,
+                browse: false,
+                cache_bytes: 0,
+                page: None,
                 parent: None,
                 children: Vec::new(),
                 kind: TreeRowKind::Dir,
@@ -209,6 +235,88 @@ impl Index {
         self.dirs
     }
 
+    /// Ten largest live directory subtrees, including descendants but excluding roots.
+    /// One postorder traversal, with O(depth + ten paths) scratch, and no filesystem reads.
+    /// In particular, do not build a path map the size of an already memory-limited index.
+    pub fn largest_folders(&self) -> Vec<IndexFolderUsage> {
+        struct Frame {
+            node: NodeId,
+            next: usize,
+            files: u32,
+            dirs: u32,
+            bytes: u64,
+        }
+        let mut top: Vec<IndexFolderUsage> = Vec::with_capacity(10);
+        for &root_node in &self.root_nodes {
+            let root = &self.roots[self.nodes[root_node as usize].root as usize];
+            let mut path = root.path.clone();
+            let mut stack = vec![Frame {
+                node: root_node,
+                next: 0,
+                files: 0,
+                dirs: 0,
+                bytes: 0,
+            }];
+            while let Some(frame) = stack.last_mut() {
+                let node = &self.nodes[frame.node as usize];
+                if let Some(&child) = node.children.get(frame.next) {
+                    frame.next += 1;
+                    let child_node = &self.nodes[child as usize];
+                    if child_node.browse {
+                        continue;
+                    }
+                    path.push(&child_node.name);
+                    let bytes = Budget::path_bytes(&path, &self.rel_of(&path, child_node.root));
+                    let is_dir = child_node.kind == TreeRowKind::Dir;
+                    stack.push(Frame {
+                        node: child,
+                        next: 0,
+                        files: u32::from(!is_dir),
+                        dirs: u32::from(is_dir),
+                        bytes,
+                    });
+                    continue;
+                }
+                let done = stack.pop().unwrap();
+                if done.node != root_node
+                    && self.nodes[done.node as usize].kind == TreeRowKind::Dir
+                    && (top.len() < 10 || done.bytes >= top.last().unwrap().bytes)
+                {
+                    let entry = IndexFolderUsage {
+                        root: root.path.to_string_lossy().into_owned(),
+                        path: path.to_string_lossy().into_owned(),
+                        relative_path: path
+                            .strip_prefix(&root.path)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        files: done.files,
+                        dirs: done.dirs,
+                        bytes: done.bytes,
+                    };
+                    let at = top.partition_point(|old| {
+                        old.bytes > entry.bytes
+                            || (old.bytes == entry.bytes && old.path <= entry.path)
+                    });
+                    if at < 10 {
+                        // Remove before inserting so capacity stays bounded to ten entries.
+                        if top.len() == 10 {
+                            top.pop();
+                        }
+                        top.insert(at, entry);
+                    }
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.files += done.files;
+                    parent.dirs += done.dirs;
+                    parent.bytes += done.bytes;
+                    path.pop();
+                }
+            }
+        }
+        top
+    }
+
     /// Every directory in the tree.
     ///
     /// This used to be described as the watcher's watch list, and with *show ignored files* it
@@ -218,7 +326,10 @@ impl Index {
     pub fn file_paths(&self) -> Vec<PathBuf> {
         self.by_path
             .iter()
-            .filter(|(_, id)| matches!(self.nodes[**id as usize].kind, TreeRowKind::File))
+            .filter(|(_, id)| {
+                !self.nodes[**id as usize].browse
+                    && matches!(self.nodes[**id as usize].kind, TreeRowKind::File)
+            })
             .map(|(path, _)| path.clone())
             .collect()
     }
@@ -226,7 +337,10 @@ impl Index {
     pub fn dir_paths(&self) -> Vec<PathBuf> {
         self.by_path
             .iter()
-            .filter(|&(_, &id)| matches!(self.nodes[id as usize].kind, TreeRowKind::Dir))
+            .filter(|&(_, &id)| {
+                !self.nodes[id as usize].browse
+                    && matches!(self.nodes[id as usize].kind, TreeRowKind::Dir)
+            })
             .map(|(p, _)| p.clone())
             .collect()
     }
@@ -242,7 +356,10 @@ impl Index {
         self.by_path
             .iter()
             .take_while(|_| !self.budget.cancelled())
-            .filter(|&(_, &id)| matches!(self.nodes[id as usize].kind, TreeRowKind::Dir))
+            .filter(|&(_, &id)| {
+                !self.nodes[id as usize].browse
+                    && matches!(self.nodes[id as usize].kind, TreeRowKind::Dir)
+            })
             .filter(|(path, id)| {
                 filter.watchable(path, true)
                     && !directory_cycle(
@@ -348,11 +465,19 @@ impl Index {
 
     /// Expand a directory. Returns the new total row count.
     pub fn expand(&mut self, path: &Path) -> Option<usize> {
+        let id = *self.by_path.get(path)?;
+        if self.nodes[id as usize].browse
+            && self.nodes[id as usize].kind == TreeRowKind::Dir
+            && self.nodes[id as usize].page.is_none()
+        {
+            self.load_browse_page(id, 0, None);
+        }
         self.set_expanded(path, true)
     }
 
     /// Collapse a directory. Returns the new total row count.
     pub fn collapse(&mut self, path: &Path) -> Option<usize> {
+        self.release_browse_below(path);
         self.set_expanded(path, false)
     }
 
@@ -370,12 +495,17 @@ impl Index {
     /// `recompute_up` climbs to the root each time, which on a 100k-entry tree is a depth's
     /// worth of child sums per directory where one sum each is enough.
     pub fn set_all_expanded(&mut self, expanded: bool, keep: impl Fn(&Path) -> bool) -> usize {
+        if !expanded {
+            for root in self.roots.clone() {
+                self.release_browse_below(&root.path);
+            }
+        }
         for (path, &id) in &self.by_path {
             let node = &mut self.nodes[id as usize];
             if !matches!(node.kind, TreeRowKind::Dir) || self.root_nodes.contains(&id) {
                 continue;
             }
-            if !expanded || keep(path) {
+            if !expanded || (!node.browse && keep(path)) {
                 node.expanded = expanded;
             }
         }
@@ -388,6 +518,7 @@ impl Index {
     /// `None` when the path is not in the index — ignored, deleted, or outside every root.
     /// The caller shows nothing rather than scrolling somewhere arbitrary.
     pub fn reveal(&mut self, path: &Path) -> Option<usize> {
+        self.reveal_browse(path);
         let node = *self.by_path.get(path)?;
         let mut chain = Vec::new();
         let mut cur = self.nodes[node as usize].parent;
@@ -450,13 +581,17 @@ impl Index {
         budget: Arc<Budget>,
         sink: &(dyn Fn(&[WalkItem]) + Sync),
     ) -> Self {
-        let mut index = Self::empty(roots, opts.visibility);
-        index.budget = Arc::clone(&budget);
+        let mut index = Self::empty_controlled(
+            roots,
+            opts.visibility,
+            Arc::clone(&budget),
+            Arc::clone(&opts.exclusions),
+        );
         let multi = index.roots.len() > 1;
         // Finish ordinary sources in every root before spending capacity on ignored trees
         // or linked targets. The second pass skips known paths without charging them twice.
         for extras in [false, true] {
-            let mut pass = opts;
+            let mut pass = opts.clone();
             if !extras {
                 pass.visibility.ignored = false;
             }
@@ -466,7 +601,7 @@ impl Index {
                     &root.path,
                     i as u16,
                     multi,
-                    pass,
+                    pass.clone(),
                     extras,
                     &budget,
                     |batch| {
@@ -536,13 +671,19 @@ impl Index {
                 &root.path,
                 i as u16,
                 multi,
-                opts,
+                opts.clone(),
                 false,
                 budget,
                 |batch| {
                     let admitted: Vec<_> = batch
                         .iter()
-                        .take_while(|item| budget.reserve_path(&item.path, &item.rel))
+                        .take_while(|item| {
+                            budget.reserve_path_for(
+                                &item.path,
+                                &item.rel,
+                                IndexAllocation::Libraries,
+                            )
+                        })
                         .cloned()
                         .collect();
                     sink(&admitted)
@@ -590,7 +731,9 @@ impl Index {
             let node = self.new_child(parent, name, &item);
             self.by_path.insert(item.path.clone(), node);
             touched.insert(parent);
-            inserted.push(item);
+            if !self.nodes[node as usize].browse {
+                inserted.push(item);
+            }
         }
 
         if finish {
@@ -604,15 +747,22 @@ impl Index {
 
     fn new_child(&mut self, parent: NodeId, name: String, item: &WalkItem) -> NodeId {
         let depth = self.nodes[parent as usize].depth + 1;
+        let browse = self
+            .exclusions
+            .matching_rule(&item.path, item.is_dir)
+            .is_some();
         let kind = if item.is_dir {
-            self.dirs += 1;
+            self.dirs += u32::from(!browse);
             TreeRowKind::Dir
         } else {
-            self.files += 1;
+            self.files += u32::from(!browse);
             TreeRowKind::File
         };
         let node = self.push_node(Node {
             name,
+            browse,
+            cache_bytes: 0,
+            page: None,
             parent: Some(parent),
             children: Vec::new(),
             kind,
@@ -778,6 +928,28 @@ impl Index {
     /// Returns the entries that appeared, for the picker, exactly as [`Self::apply`] does —
     /// and, like `apply`, does not report deletions to it (see `apply`'s note on `nucleo`).
     pub fn refresh_subtree(&mut self, root: &Path, filter: &Filter) -> Vec<WalkItem> {
+        if self
+            .by_path
+            .get(root)
+            .is_some_and(|&id| self.nodes[id as usize].browse)
+        {
+            return self.rescan_dir(root, filter);
+        }
+        let browse: Vec<_> = self
+            .by_path
+            .iter()
+            .filter(|(p, id)| {
+                p.starts_with(root)
+                    && self.nodes[**id as usize].browse
+                    && self.nodes[**id as usize].expanded
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in browse {
+            if let Some(&id) = self.by_path.get(&path) {
+                self.load_browse_page(id, 0, None);
+            }
+        }
         // `Path::starts_with` compares whole components, so `target-old/` is not swept up
         // by a refresh of `target/`.
         let dirs: Vec<PathBuf> = self
@@ -808,6 +980,16 @@ impl Index {
             let children = self.nodes[node as usize].children.clone();
             for child in children {
                 self.remove_node(child);
+            }
+            return Vec::new();
+        }
+        if self.nodes[node as usize].browse {
+            if std::fs::symlink_metadata(dir)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                self.remove_node(node);
+            } else if self.nodes[node as usize].expanded {
+                self.load_browse_page(node, 0, None);
             }
             return Vec::new();
         }
@@ -844,7 +1026,7 @@ impl Index {
                 Err(_) => continue,
             };
             let is_dir = meta.is_dir() || (meta.is_symlink() && path.is_dir());
-            if !filter.admits(&path, is_dir) {
+            if !filter.browsable(&path, is_dir) {
                 continue;
             }
             if self.by_path.get(&path).is_none_or(|id| {
@@ -913,9 +1095,14 @@ impl Index {
             let expanded = reopen.contains(&name);
             let child = self.new_child(node, name, &item);
             self.by_path.insert(path.clone(), child);
-            added.push(item);
+            if !self.nodes[child as usize].browse {
+                added.push(item);
+            }
             changed = true;
-            if is_dir && !directory_cycle(&path, &self.roots[root as usize].path) {
+            if is_dir
+                && !self.nodes[child as usize].browse
+                && !directory_cycle(&path, &self.roots[root as usize].path)
+            {
                 added.extend(self.graft_subtree(&path, root, filter));
             }
             if expanded {
@@ -974,6 +1161,7 @@ impl Index {
         let boundary = self.roots[root_index as usize].path.clone();
         let opts = BuildOptions {
             visibility: self.visibility,
+            exclusions: Arc::clone(&self.exclusions),
             ..BuildOptions::default()
         };
         let mut added = Vec::new();
@@ -991,7 +1179,7 @@ impl Index {
                 }
                 let entries = batch
                     .iter()
-                    .filter(|item| filter.admits(&item.path, item.is_dir))
+                    .filter(|item| filter.browsable(&item.path, item.is_dir))
                     .map(|item| {
                         let mut item = item.clone();
                         item.rel = self.rel_of(&item.path, root_index);
@@ -1020,21 +1208,32 @@ impl Index {
         let mut doomed = Vec::new();
         while let Some(id) = stack.pop() {
             let n = &self.nodes[id as usize];
-            match n.kind {
-                TreeRowKind::Dir => self.dirs = self.dirs.saturating_sub(1),
-                TreeRowKind::File => self.files = self.files.saturating_sub(1),
-                // The walk produces none of these. Every synthetic row — a group header, a
-                // note, a pin — is a second row source that never enters this arena; see
-                // `crate::groups` for why it is beside the index rather than grafted into it.
-                TreeRowKind::Group | TreeRowKind::Note | TreeRowKind::Pin => {}
+            if !n.browse {
+                match n.kind {
+                    TreeRowKind::Dir => self.dirs = self.dirs.saturating_sub(1),
+                    TreeRowKind::File => self.files = self.files.saturating_sub(1),
+                    // The walk produces none of these. Every synthetic row — a group header, a
+                    // note, a pin — is a second row source that never enters this arena; see
+                    // `crate::groups` for why it is beside the index rather than grafted into it.
+                    TreeRowKind::Group | TreeRowKind::Note | TreeRowKind::Pin => {}
+                }
             }
+            self.browse_bytes = self.browse_bytes.saturating_sub(n.cache_bytes);
             stack.extend_from_slice(&n.children);
             doomed.push(id);
         }
-        for id in doomed {
+        for &id in &doomed {
             let path = self.path_of(id);
             self.by_path.remove(&path);
             self.free.push(id);
+        }
+        for id in doomed {
+            let n = &mut self.nodes[id as usize];
+            n.name = String::new();
+            n.children = Vec::new();
+            n.link_target = None;
+            n.page = None;
+            n.cache_bytes = 0;
         }
         self.recompute_up(parent);
         true
@@ -1155,6 +1354,12 @@ impl Index {
     fn row(&self, node: NodeId) -> TreeRow {
         let n = &self.nodes[node as usize];
         TreeRow {
+            excluded_from_index: n.browse,
+            exclusion_rule: self
+                .exclusions
+                .matching_rule(&self.path_of(node), n.kind == TreeRowKind::Dir)
+                .map(str::to_owned),
+            browse_page: n.page.clone(),
             path: self.path_of(node),
             name: n.name.clone(),
             // With one root its children are the top rows, so their depth-1 becomes 0.
@@ -1165,12 +1370,12 @@ impl Index {
             },
             kind: n.kind,
             expanded: n.expanded,
-            has_children: !n.children.is_empty(),
+            has_children: !n.children.is_empty() || (n.browse && n.kind == TreeRowKind::Dir),
             symlink: n.symlink,
             root: n.root,
             // A walked row has nothing dim to say after its name. `detail` exists for the
             // synthetic groups (`crate::groups`), which are a second row source entirely.
-            detail: None,
+            detail: n.browse.then(|| "Excluded from indexing".into()),
         }
     }
 
@@ -1229,6 +1434,9 @@ fn walk_root(
     budget: &Budget,
     mut on_batch: impl FnMut(&[WalkItem]),
 ) {
+    if opts.exclusions.matching_rule(&root.path, true).is_some() {
+        return;
+    }
     let Some(_worker) = Worker::acquire(budget) else {
         return;
     };
@@ -1304,7 +1512,11 @@ fn walk_root(
             on_batch(&batch);
             batch.clear();
         }
-        if is_dir && !budget.stopped() && !directory_cycle(path, boundary) {
+        if is_dir
+            && opts.exclusions.matching_rule(path, true).is_none()
+            && !budget.stopped()
+            && !directory_cycle(path, boundary)
+        {
             filter.refresh_rules(path);
             stack.push(shallow(path));
         }

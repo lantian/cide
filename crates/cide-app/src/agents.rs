@@ -902,6 +902,16 @@ fn viewed_by(inner: &Inner, sessions: &SessionRegistry, live: &LiveRun) -> Optio
         Harness::Claude | Harness::Qwen => live.session?.to_string(),
         Harness::Opencode | Harness::Codex | Harness::Mimo => live.harness_session.clone()?,
     };
+    if let Some(owner) = sessions
+        .native_in_use(&HarnessSession {
+            harness: live.harness,
+            id: id.clone(),
+            cwd: PathBuf::new(),
+        })
+        .filter(|owner| Some(*owner) != live.session)
+    {
+        return Some(owner);
+    }
     let viewer = *inner.viewers.get(&(live.harness, id))?;
     sessions
         .get(viewer)
@@ -910,9 +920,9 @@ fn viewed_by(inner: &Inner, sessions: &SessionRegistry, live: &LiveRun) -> Optio
 }
 
 /// The sentence a refused continuation carries when a pane holds the conversation. (M42)
-const VIEWED_IN_A_PANE: &str = "this run's conversation is open in a pane, and two harness \
-                                processes must not write one conversation. Close that pane to \
-                                continue the run here — or type the follow-up into it yourself.";
+pub(crate) const VIEWED_IN_A_PANE: &str = "this run's conversation is open in a pane or background console. \
+    Open returns to that console; continue there, or exit its harness before retrying this run. \
+    Closing a normal tab leaves its session running.";
 
 /// What a freeze remembers. See [`LiveRun::frozen`].
 #[derive(Debug, Clone)]
@@ -3606,6 +3616,17 @@ impl AgentRegistry {
         from: Option<&RunState>,
         next: RunState,
     ) -> Option<bool> {
+        self.set_state_from_session(app, run, from, None, next)
+    }
+
+    fn set_state_from_session(
+        &self,
+        app: Option<&AppHandle>,
+        run: RunId,
+        from: Option<&RunState>,
+        failed_start: Option<SessionId>,
+        next: RunState,
+    ) -> Option<bool> {
         let mut inner = self.inner.lock();
         let Some(live) = inner.runs.get_mut(&run) else {
             return Some(false);
@@ -3618,8 +3639,15 @@ impl AgentRegistry {
                 .as_ref()
                 .is_some_and(cide_agents::native_plan::State::pending)
             && live.stop.is_none();
-        if from.is_some_and(|from| live.state != *from) {
+        if from.is_some_and(|from| live.state != *from)
+            || failed_start.is_some_and(|session| live.session != Some(session))
+        {
             return None;
+        }
+        if failed_start.is_some() {
+            // A rejected launch owns no turn. Its eventual exit must not replace
+            // this failure, or reach a successor rebound to another session.
+            live.session = None;
         }
         let observed_next = next.clone();
         let next = match (&next, live.stop.as_ref()) {
@@ -4381,6 +4409,19 @@ impl AgentRegistry {
             .ok_or_else(|| CoreError::Io(format!("no such run in this project: {run}")))?;
         let cwd = run_cwd(root, live);
         let conversation = conversation_of(live, &cwd);
+
+        // A restored or hidden console can own the conversation without belonging
+        // to this run or appearing in the workspace/viewer table.
+        if let Some(conversation) = conversation.as_ref()
+            && conversation.harness == Harness::Codex
+            && let Some(owner) = sessions.native_in_use(conversation)
+            && sessions.get(owner).is_some_and(|pty| !pty.has_exited())
+        {
+            return Ok(RunOpen::Mirror {
+                session: owner,
+                continues: Some(conversation.clone()),
+            });
+        }
 
         // An opencode-shaped run behind a live server opens as the **full TUI attached to it**
         // (M104 follow-up), not as a mirror of its turn's rendered JSON — the user's ask: open a
@@ -8204,6 +8245,10 @@ struct Started {
     events: Option<PathBuf>,
     /// What the harness's sandbox will deny this run, for the row beside its checkout. (M118)
     caveat: Option<&'static str>,
+    // Held across the blocking spawn and registry publication, including hooks
+    // that have not arrived yet. A second launcher must see the seeded identity.
+    resume_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    resumed: Option<HarnessSession>,
 }
 
 impl AgentRegistry {
@@ -8333,7 +8378,24 @@ impl AgentRegistry {
         self.watch_exit(&app, session_id, &started.session);
 
         if let Some(sessions) = app.try_state::<SessionRegistry>() {
+            if let Some(conversation) = &started.resumed {
+                sessions.note_harness(session_id, conversation.harness);
+                sessions.note_native_conversation(session_id, conversation.clone());
+            }
             sessions.insert(session_id, Arc::clone(&started.session));
+        }
+        drop(started.resume_guard);
+        if self.fail_native_start(&app, session_id) {
+            return;
+        }
+        if self
+            .inner
+            .lock()
+            .runs
+            .get(&run)
+            .is_none_or(|live| live.session != Some(session_id))
+        {
+            return;
         }
 
         if let Some(opening) = started.opening {
@@ -8594,6 +8656,54 @@ impl AgentRegistry {
         // The slot this run was holding is free again, so the next queued run of that role may
         // now start. Without this the queue stalls on the first failure, silently.
         after_transition(app, self, run);
+    }
+
+    /// Native resume errors are replies, not turn completions. They may arrive
+    /// before the child is published; the session registry retains them until then.
+    pub(crate) fn fail_native_start(self: &Arc<Self>, app: &AppHandle, session: SessionId) -> bool {
+        let run = self
+            .inner
+            .lock()
+            .runs
+            .values()
+            .find(|live| {
+                live.session == Some(session)
+                    && matches!(live.state, RunState::Starting | RunState::Idle)
+            })
+            .map(|live| (live.run, live.state.clone()));
+        let Some((run, state)) = run else {
+            return false;
+        };
+        let sessions = app.state::<SessionRegistry>();
+        let Some(reason) = sessions.take_start_failure(session) else {
+            return false;
+        };
+        if self.set_state_from_session(
+            Some(app),
+            run,
+            Some(&state),
+            Some(session),
+            RunState::Failed { reason },
+        ) != Some(true)
+        {
+            return false;
+        }
+        after_transition(app, self, run);
+        // Cleanup is off the native socket/reaper threads. Never stop the other
+        // console that rejected this startup by holding the conversation lock.
+        let pty = sessions.get(session);
+        let console = app
+            .state::<crate::peer_chat::Runtime>()
+            .codex_console(session);
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Some(console) = console {
+                console.stop();
+            }
+            if let Some(pty) = pty {
+                end_tree(&pty, "a rejected Codex startup");
+            }
+        });
+        true
     }
 
     /// Report the child's real exit into the run, from `cide-pty`'s reaper thread.
@@ -9646,6 +9756,55 @@ fn start_child(
         return Err(CoreError::Io(why));
     }
 
+    // What this role actually runs as *here*: the committed definition folded with this
+    // machine's local override. Pure, and computed before anything is forked or written, so its
+    // one refusal costs nothing when it fires. (M45)
+    // A review is pinned to the harness the user picked in the MR panel: a local override that
+    // redirects "every role that names nothing" is about the project's roles, not this one.
+    let resolved = match &admission.purpose {
+        RunPurpose::Work(options) => match options.overrides(&admission.agent, &facts.overrides) {
+            Some(overrides) => facts.resolve_with(agent, &overrides),
+            None => facts.resolve(agent),
+        },
+        RunPurpose::MrReview { .. } => facts.resolve_pinned(agent),
+        // The main model is pinned to the harness the dialog resolved; a role resolves as a
+        // dispatch of it would.
+        RunPurpose::Spec(spec) => match spec.launcher {
+            cide_ipc::SpecLauncher::Harness { .. } => facts.resolve_pinned(agent),
+            cide_ipc::SpecLauncher::Role { .. } => facts.resolve(agent),
+        },
+    };
+    // The only refusal this fold produces: an override naming a pool that is not configured
+    // here. Refused rather than degraded, because falling back would answer with a model nobody
+    // chose and bill for it — and people build a pool to *cap* spend. See `overrides::resolve`.
+    if let Some(refusal) = resolved.refusal {
+        return Err(CoreError::Io(refusal));
+    }
+    // The registry has been holding the *definition's* harness since the dispatch. From here the
+    // run has a child, and the child is `resolved.harness`'s — above all for `observe`, which
+    // picks the state machine that reads this stream. See `note_harness`.
+    registry.note_harness(admission.run, resolved.harness);
+    let mut resumed = resume
+        .filter(|_| resolved.harness == Harness::Codex)
+        .map(|id| HarnessSession {
+            harness: resolved.harness,
+            id: id.into(),
+            cwd: facts.root.clone(),
+        });
+    let resume_guard = if let Some(conversation) = &resumed {
+        // Save the intended identity even if admission fails, so Open can find
+        // the owner rather than an uninitialized worker PTY.
+        registry.note_harness_session(admission.run, conversation.id.clone());
+        let sessions = app.state::<SessionRegistry>();
+        let guard = sessions.resume_gate(conversation).blocking_lock_owned();
+        sessions
+            .require_available(conversation)
+            .map_err(|_| CoreError::Io(VIEWED_IN_A_PANE.into()))?;
+        Some(guard)
+    } else {
+        None
+    };
+
     // Where the run stands. `run_checkout` is the one rule, shared with `plan_dispatch`'s stamp
     // so the admission gate and this fork cannot disagree. Read off the same fresh `project.get`
     // as the refusal, so a role's `worktree: false` flipped mid-queue is honoured at the fork —
@@ -9744,6 +9903,10 @@ fn start_child(
         },
     };
 
+    if let Some(conversation) = &mut resumed {
+        conversation.cwd = cwd.clone();
+    }
+
     // The project's isolated XDG directories for this worktree (`agents.isolateEnv`), from the
     // same fresh `project.get` as the rest of the fork. Only a run in a checkout of its own: a
     // run in the project root stands where the user stands, in the user's environment, and an
@@ -9777,34 +9940,6 @@ fn start_child(
         Vec::new()
     };
 
-    // What this role actually runs as *here*: the committed definition folded with this
-    // machine's local override. Pure, and computed before anything is forked or written, so its
-    // one refusal costs nothing when it fires. (M45)
-    // A review is pinned to the harness the user picked in the MR panel: a local override that
-    // redirects "every role that names nothing" is about the project's roles, not this one.
-    let resolved = match &admission.purpose {
-        RunPurpose::Work(options) => match options.overrides(&admission.agent, &facts.overrides) {
-            Some(overrides) => facts.resolve_with(agent, &overrides),
-            None => facts.resolve(agent),
-        },
-        RunPurpose::MrReview { .. } => facts.resolve_pinned(agent),
-        // The main model is pinned to the harness the dialog resolved; a role resolves as a
-        // dispatch of it would.
-        RunPurpose::Spec(spec) => match spec.launcher {
-            cide_ipc::SpecLauncher::Harness { .. } => facts.resolve_pinned(agent),
-            cide_ipc::SpecLauncher::Role { .. } => facts.resolve(agent),
-        },
-    };
-    // The only refusal this fold produces: an override naming a pool that is not configured
-    // here. Refused rather than degraded, because falling back would answer with a model nobody
-    // chose and bill for it — and people build a pool to *cap* spend. See `overrides::resolve`.
-    if let Some(refusal) = resolved.refusal {
-        return Err(CoreError::Io(refusal));
-    }
-    // The registry has been holding the *definition's* harness since the dispatch. From here the
-    // run has a child, and the child is `resolved.harness`'s — above all for `observe`, which
-    // picks the state machine that reads this stream. See `note_harness`.
-    registry.note_harness(admission.run, resolved.harness);
     // The definition as the harness reads it: this machine's single-model and effort overrides
     // folded **into** it. Every harness reads `plan.agent.def.model` and `plan.agent.effort`, and
     // until this fold existed the resolution's `model` and `effort` were computed and read by
@@ -10460,6 +10595,7 @@ fn start_child(
         console.observe(app.clone(), session, &pty);
     }
     if let Some(console) = codex_decision {
+        console.register_writer(&app.state::<SessionRegistry>(), session);
         app.state::<crate::peer_chat::Runtime>()
             .note_codex_console(session, console.clone());
         console.observe(&pty);
@@ -10471,6 +10607,8 @@ fn start_child(
         cwd,
         events,
         caveat,
+        resume_guard,
+        resumed,
     })
 }
 
@@ -17672,6 +17810,155 @@ mod tests {
     /// The registry never starts a second harness process on a conversation a pane is driving
     /// (M42): a single-run Resume is refused with the sentence, the project scope skips the run
     /// and writes the sentence on its row, and once the pane's child is gone the run continues.
+    #[test]
+    fn opening_a_codex_run_reuses_its_hidden_console_owner() {
+        let registry = Arc::new(AgentRegistry::default());
+        let sessions = SessionRegistry::default();
+        let project = ProjectId::new();
+        let mut dispatch = spec(project, "developer", 1, 4);
+        dispatch.harness = Harness::Codex;
+        let run = registry.enqueue(dispatch);
+        registry.take_admissions();
+        let thread = SessionId::new().to_string();
+        registry.note_harness_session(run, thread.clone());
+        registry.set_state(None, run, RunState::Finished { code: 0 });
+        let owner = SessionId::new();
+        let pty = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("read pending"),
+        )
+        .unwrap();
+        sessions.insert(owner, pty.clone());
+        sessions.note_harness(owner, Harness::Codex);
+        sessions.note_native_conversation(
+            owner,
+            HarnessSession {
+                harness: Harness::Codex,
+                id: thread,
+                cwd: std::env::temp_dir(),
+            },
+        );
+        // Restored consoles do not necessarily pass through note_viewer. The
+        // session remains alive even after its last tab disappears from layout.
+        let plan = registry
+            .open_plan_with(
+                project,
+                run,
+                &sessions,
+                &std::env::temp_dir(),
+                true,
+                |_, _, _| true,
+            )
+            .unwrap();
+        pty.kill();
+        wait_exited(&pty);
+        assert!(
+            matches!(plan, RunOpen::Mirror { session, .. } if session == owner),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn codex_resume_finds_a_hidden_owner_without_a_viewer_registration() {
+        let registry = Arc::new(AgentRegistry::default());
+        let sessions = SessionRegistry::default();
+        let project = ProjectId::new();
+        let mut dispatch = spec(project, "developer", 1, 1);
+        dispatch.harness = Harness::Codex;
+        let run = registry.enqueue(dispatch);
+        registry.take_admissions();
+        registry.bind_session(run, SessionId::new());
+        let thread = SessionId::new().to_string();
+        registry.note_harness_session(run, thread.clone());
+        registry.set_state(None, run, RunState::Interrupted);
+        let owner = SessionId::new();
+        let pty = PtySession::spawn(
+            SpawnSpec::new("sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("read pending"),
+        )
+        .unwrap();
+        sessions.insert(owner, pty.clone());
+        sessions.note_native_conversation(
+            owner,
+            HarnessSession {
+                harness: Harness::Codex,
+                id: thread,
+                cwd: std::env::temp_dir(),
+            },
+        );
+        let refused = registry.requeue_interrupted(
+            project,
+            Some(run),
+            Some(&sessions),
+            &|_| None,
+            Requeue::Resume,
+        );
+        let unchanged = state_of(&registry, run);
+        pty.kill();
+        wait_exited(&pty);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("Open returns to that console")
+        );
+        assert_eq!(unchanged, RunState::Interrupted);
+        registry
+            .requeue_interrupted(
+                project,
+                Some(run),
+                Some(&sessions),
+                &|_| None,
+                Requeue::Resume,
+            )
+            .unwrap();
+        assert_eq!(state_of(&registry, run), RunState::Queued);
+    }
+
+    #[test]
+    fn rejected_codex_start_releases_its_slot_and_cannot_fail_a_successor() {
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let run = registry.enqueue(spec(project, "developer", 1, 1));
+        registry.take_admissions();
+        let old = SessionId::new();
+        let new = SessionId::new();
+        registry.bind_session(run, old);
+        let mut waiting = spec(project, "developer", 1, 1);
+        waiting.task = Some(TaskId("t-next".into()));
+        let next = registry.enqueue(waiting);
+        registry.bind_session(run, new);
+        assert_eq!(
+            registry.set_state_from_session(
+                None,
+                run,
+                Some(&RunState::Starting),
+                Some(old),
+                RunState::Failed {
+                    reason: "stale".into()
+                }
+            ),
+            None
+        );
+        assert!(registry.take_admissions().is_empty());
+        assert_eq!(
+            registry.set_state_from_session(
+                None,
+                run,
+                Some(&RunState::Starting),
+                Some(new),
+                RunState::Failed {
+                    reason: "conversation is locked".into()
+                }
+            ),
+            Some(true)
+        );
+        assert!(registry.inner.lock().runs[&run].session.is_none());
+        assert_eq!(registry.take_admissions()[0].run, next);
+    }
+
     #[test]
     fn a_conversation_open_in_a_pane_is_not_continued_by_the_registry() {
         let registry = Arc::new(AgentRegistry::default());

@@ -497,6 +497,11 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "number 180–640",
         "Extensions panel width, in pixels.",
     ),
+    doc(
+        "explorer.indexExcludedFolders",
+        "string[]",
+        "Root-relative folder paths or globs excluded from indexing, still browsable. Defaults: .cide/worktrees, .cide/tasks. Project-local overrides replace this list.",
+    ),
     // --- explorer ------------------------------------------------------------------------
     doc(
         "explorer.showHiddenFiles",

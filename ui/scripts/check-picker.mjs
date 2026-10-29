@@ -789,7 +789,20 @@ try {
    */
   const repoFile = (rel) =>
     readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), 'utf8')
-  const stripRust = (src) => strip(src.split(/#\[cfg\(test\)\]/)[0])
+  // These files end in test modules, but also have test-only helper functions before
+  // production code. Only a module marks the end of the source we need to inspect.
+  const stripRust = (src) => strip(src).split(/#\[cfg\(test\)\]\s*mod\s/)[0]
+  {
+    const source = stripRust(`
+      #[cfg(test)]
+      fn helper() {}
+      fn production() {}
+      #[cfg(test)]
+      mod tests { fn test_only() {} }
+    `)
+    ok(source.includes('fn production()'), 'a test-only helper does not hide later production code')
+    ok(!source.includes('fn test_only()'), 'test modules cannot satisfy production source checks')
+  }
 
   {
     const files = stripRust(repoFile('crates/cide-app/src/files.rs'))

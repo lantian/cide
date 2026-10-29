@@ -304,6 +304,7 @@ interface FileTreeStore {
    */
   selectAll: () => Promise<string | null>
   /** Expand or collapse a directory row. */
+  browsePage: (row: TreeRow, direction: number) => Promise<void>
   toggle: (row: TreeRow) => Promise<void>
   /**
    * The Explorer header's *Expand all* / *Collapse all* (M96). Rust decides what "all" means
@@ -488,6 +489,9 @@ const ROW_FIELDS: Readonly<Record<keyof TreeRow, true>> = {
   // call the two identical and the count would never appear — the exact silent staleness the
   // compiler-checked census exists to prevent, arriving in the same batch that added the field.
   detail: true,
+  excludedFromIndex: true,
+  exclusionRule: true,
+  browsePage: true,
 }
 const ROW_KEYS = Object.keys(ROW_FIELDS) as Array<keyof TreeRow>
 
@@ -507,7 +511,9 @@ function sameRows(a: readonly TreeRow[] | undefined, b: readonly TreeRow[]): boo
   if (a === undefined || a.length !== b.length) return false
   return a.every((row, i) => {
     const other = b[i]
-    return other !== undefined && ROW_KEYS.every((key) => row[key] === other[key])
+    return other !== undefined && ROW_KEYS.every((key) => key === 'browsePage'
+      ? row.browsePage?.previous === other.browsePage?.previous && row.browsePage?.next === other.browsePage?.next && row.browsePage?.error === other.browsePage?.error
+      : row[key] === other[key])
   })
 }
 
@@ -688,6 +694,15 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     if (paths === null || paths.length === 0 || get().selection !== before) return null
     set({ selection: { paths: new Set(paths), anchor: paths[0] ?? null } })
     return null
+  },
+
+  async browsePage(row, direction) {
+    const { project } = get()
+    if (project === null) return
+    const count = await tree('fs_browse_page', () => fsApi.browsePage(project, row.path, direction), get().count)
+    if (get().project !== project) return
+    resetCache()
+    set({ count, chunks: new Map(), degraded: isDegraded('fs_browse_page') })
   },
 
   async toggle(row) {

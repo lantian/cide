@@ -1068,6 +1068,20 @@ pub(crate) async fn dispatch_or_duplicate(
     let (agent, task) = (spec.agent.clone(), spec.task.clone());
     let (enqueued, continued, why) = match route {
         Ok((from, conversation)) => {
+            if spec.harness == cide_ipc::Harness::Codex {
+                let identity = cide_ipc::HarnessSession {
+                    harness: spec.harness,
+                    id: conversation.clone(),
+                    cwd: std::path::PathBuf::new(),
+                };
+                if app
+                    .state::<crate::state::SessionRegistry>()
+                    .native_in_use(&identity)
+                    .is_some()
+                {
+                    return Err(CoreError::Io(crate::agents::VIEWED_IN_A_PANE.into()));
+                }
+            }
             if let Some(task) = spec.task.as_ref() {
                 spec.prompt = crate::agents::handed_back_prompt(
                     task,

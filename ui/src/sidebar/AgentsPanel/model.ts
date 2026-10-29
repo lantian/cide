@@ -47,6 +47,18 @@
  */
 export type Harness = 'claude' | 'opencode' | 'qwen' | 'codex' | 'mimo'
 
+/** A known live owner outranks stale panes that merely name the same conversation. */
+export function paneShowsRun(
+  paneSession: string | null,
+  paneConversation: { harness: Harness; id: string } | null,
+  owner: string | null,
+  conversation: { harness: Harness; id: string } | null,
+): boolean {
+  if (owner !== null) return paneSession === owner
+  return paneConversation !== null && conversation !== null &&
+    paneConversation.harness === conversation.harness && paneConversation.id === conversation.id
+}
+
 /**
  * The harnesses, as data, so membership is a lookup rather than a type assertion.
  *

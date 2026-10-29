@@ -55,6 +55,23 @@ pub struct TreeRow {
     /// icon lookup, the rename box and the sibling-name check all read — folding `serde 1.0.229`
     /// into it would mean an icon chosen from a version number.
     pub detail: Option<String>,
+    // Browse-only entries are real paths; page controls and errors belong to their folder.
+    #[serde(default)]
+    pub excluded_from_index: bool,
+    #[serde(default)]
+    pub exclusion_rule: Option<String>,
+    #[serde(default)]
+    pub browse_page: Option<TreeBrowsePage>,
+}
+
+/// A bounded, explicitly opened directory listing. Controls belong to its directory row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TreeBrowsePage {
+    pub previous: bool,
+    pub next: bool,
+    pub error: Option<String>,
 }
 
 /// One row of the tree that a speed-search query matched, and where in its name.
@@ -195,6 +212,82 @@ pub struct FsStatus {
 pub enum IndexLimit {
     ProjectBudget,
     TotalBudget,
+}
+
+/// The allocation being attempted, not necessarily the largest contributor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum IndexAllocation {
+    Files,
+    Libraries,
+    Symbols,
+    Watcher,
+    Overhead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IndexBudgetUsage {
+    #[ts(type = "number")]
+    pub project_bytes: u64,
+    #[ts(type = "number")]
+    pub project_limit_bytes: u64,
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+    #[ts(type = "number")]
+    pub total_limit_bytes: u64,
+}
+
+/// First refused reservation in a generation; later attempts must not replace it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IndexRefusal {
+    pub reason: IndexLimit,
+    pub allocation: IndexAllocation,
+    pub path: Option<String>,
+    pub folder: Option<String>,
+    #[ts(type = "number")]
+    pub requested_bytes: u64,
+    pub usage: IndexBudgetUsage,
+}
+
+/// Inclusive subtree estimates for currently indexed files, not disk or resident sizes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IndexFolderUsage {
+    pub root: String,
+    pub path: String,
+    pub relative_path: String,
+    pub files: u32,
+    pub dirs: u32,
+    #[ts(type = "number")]
+    pub bytes: u64,
+}
+
+/// Requested explicitly; never attached to the frequent fs-status broadcasts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FsIndexDiagnostics {
+    pub index_excluded_folders: Vec<String>,
+    pub exclusions_source: String,
+    #[ts(type = "number")]
+    pub browse_cache_bytes: u64,
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub indexing: bool,
+    pub files: u32,
+    pub dirs: u32,
+    pub roots: Vec<String>,
+    pub show_hidden_files: bool,
+    pub show_ignored_files: bool,
+    pub usage: IndexBudgetUsage,
+    pub refusal: Option<IndexRefusal>,
+    pub folders: Vec<IndexFolderUsage>,
 }
 
 /// How the watcher is watching, and why.

@@ -94,6 +94,7 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'editor', label: 'Suggest completions', keywords: 'autocomplete intellisense language server' },
   { section: 'editor', label: 'Open suggestions while typing', keywords: 'autocomplete popup ctrl+space' },
   // Files
+  { section: 'files', label: 'Indexing exclusions', keywords: 'ignore folders glob .cide worktrees tasks project local global index' },
   { section: 'files', label: 'Index memory per project', keywords: 'memory budget MiB limit index symbols libraries' },
   { section: 'files', label: 'Combined index memory', keywords: 'memory budget MiB total projects limit' },
   { section: 'files', label: 'Show hidden files', keywords: 'dotfiles dot .env tree explorer' },

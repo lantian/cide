@@ -35,6 +35,7 @@ import type {
   FormatRange,
   FsChange,
   FsStatus,
+  FsIndexDiagnostics,
   GraphicsStatus,
   HarnessSession,
   HeadlessRequest,
@@ -603,6 +604,9 @@ export const fs = {
   close: (projectId: ProjectId) => invoke<boolean>('fs_close', { project: projectId }),
 
   status: (projectId: ProjectId) => invoke<FsStatus>('fs_status', { project: projectId }),
+  indexDiagnostics: (projectId: ProjectId) => invoke<FsIndexDiagnostics>('fs_index_diagnostics', { project: projectId }),
+  browsePage: (project: ProjectId, path: string, direction: number) => invoke<number>('fs_browse_page', { project, path, direction }),
+  restartIndex: (projectId: ProjectId, generation: number) => invoke<FsStatus>('fs_restart_index', { project: projectId, generation }),
 
   /** Total visible rows — the virtual scroller's range. */
   treeCount: (projectId: ProjectId) => invoke<number>('fs_tree_count', { project: projectId }),
@@ -1133,6 +1137,8 @@ export interface HarnessCliVersion {
  * it stays `windows.setMode`; see `SettingsPatch` in the Rust DTOs.
  */
 export const settings = {
+  projectIndexing: (project: ProjectId) => invoke<string[] | null>('project_indexing_get', { project }),
+  setProjectIndexing: (project: ProjectId, exclusions: string[] | null) => invoke<string[] | null>('project_indexing_set', { project, exclusions }),
   get: () => invoke<SettingsDto>('settings_get'),
   projectHarness: (project: ProjectId) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_get', { project }),
   setProjectHarness: (project: ProjectId, edit: import('./generated').ProjectHarnessEdit) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_set', { project, edit }),

@@ -1,7 +1,7 @@
 use cide_fs::budget::{Budget, SharedBudget};
 use cide_fs::testing::scratch;
 use cide_fs::{BuildOptions, Index, Root, Visibility};
-use cide_ipc::IndexLimit;
+use cide_ipc::{IndexAllocation, IndexLimit};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,65 @@ fn shrinking_a_shared_budget_refuses_more_allocations_without_unaccounting_live_
     assert_eq!(shared.used(), 4096);
     drop(budget);
     assert_eq!(shared.used(), 0);
+}
+
+#[test]
+fn diagnostics_preserve_the_first_refusal_and_its_usage() {
+    let shared = SharedBudget::new(8192);
+    let budget = Budget::new(shared.clone(), 4096);
+    assert!(budget.reserve(4000));
+    let path = std::path::Path::new("project/cache/large.rs");
+    assert!(!budget.reserve_for(100, IndexAllocation::Symbols, Some(path)));
+    let first = budget.refusal().unwrap();
+    assert_eq!(first.reason, IndexLimit::ProjectBudget);
+    assert_eq!(first.allocation, IndexAllocation::Symbols);
+    assert_eq!(first.path.as_deref(), Some("project/cache/large.rs"));
+    assert_eq!(first.folder.as_deref(), Some("project/cache"));
+    assert_eq!(first.requested_bytes, 100);
+    assert_eq!(first.usage.project_bytes, 4000);
+    assert_eq!(first.usage.total_bytes, 4000);
+    shared.set_limit(1);
+    assert!(!budget.reserve_for(
+        9000,
+        IndexAllocation::Watcher,
+        Some(std::path::Path::new("other"))
+    ));
+    assert_eq!(budget.refusal(), Some(first));
+    assert_eq!(budget.usage().total_limit_bytes, 1);
+    let next = Budget::new(SharedBudget::new(8192), 4096);
+    assert_eq!(next.refusal(), None);
+}
+
+#[test]
+fn diagnostics_explain_combined_limit_without_inventing_a_path() {
+    let shared = SharedBudget::new(4096);
+    let first = Budget::new(shared.clone(), 8192);
+    let second = Budget::new(shared, 8192);
+    assert!(first.reserve(4000));
+    assert!(!second.reserve(100));
+    let refusal = second.refusal().unwrap();
+    assert_eq!(refusal.reason, IndexLimit::TotalBudget);
+    assert_eq!(refusal.allocation, IndexAllocation::Overhead);
+    assert_eq!(refusal.path, None);
+    assert_eq!(refusal.folder, None);
+    assert_eq!(
+        refusal.usage.project_bytes, 0,
+        "failed reservation is rolled back"
+    );
+    assert_eq!(refusal.usage.total_bytes, 4000);
+}
+
+#[test]
+fn diagnostic_path_reservations_identify_the_provider() {
+    for allocation in [
+        IndexAllocation::Files,
+        IndexAllocation::Libraries,
+        IndexAllocation::Watcher,
+    ] {
+        let budget = Budget::new(SharedBudget::new(4096), 1);
+        assert!(!budget.reserve_path_for(std::path::Path::new("root/file"), "file", allocation));
+        assert_eq!(budget.refusal().unwrap().allocation, allocation);
+    }
 }
 
 #[cfg(unix)]

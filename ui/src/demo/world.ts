@@ -209,7 +209,7 @@ export function treeRows(): TreeRow[] {
       kind,
       expanded: Boolean(expanded),
       hasChildren: kind === 'dir',
-      symlink: false,
+      symlink: false, excludedFromIndex: false, exclusionRule: null, browsePage: null,
       root: 0,
       detail: null,
     }
@@ -221,7 +221,7 @@ export function treeRows(): TreeRow[] {
     kind,
     expanded: false,
     hasChildren: kind === 'group',
-    symlink: false,
+    symlink: false, excludedFromIndex: false, exclusionRule: null, browsePage: null,
     root: 0,
     detail,
   })

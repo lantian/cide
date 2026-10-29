@@ -268,7 +268,7 @@ pub struct Accent {
 /// moves. That is a visible cost (a fresh walk, an empty picker for its duration) and it is why
 /// these live here, in stored settings, rather than being a per-panel toggle that could be
 /// flipped by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct ExplorerSettings {
@@ -288,6 +288,8 @@ pub struct ExplorerSettings {
     /// *directory* travels as one entry and its contents inherit it, which is what keeps this
     /// affordable on the wire.
     pub show_ignored_files: bool,
+    // Root-relative directory paths or globs, excluded from background indexing.
+    pub index_excluded_folders: Vec<String>,
 }
 
 impl ExplorerSettings {
@@ -318,6 +320,7 @@ impl Default for ExplorerSettings {
             total_index_memory_mib: 2048,
             show_hidden_files: true,
             show_ignored_files: true,
+            index_excluded_folders: vec![".cide/worktrees".into(), ".cide/tasks".into()],
         }
     }
 }

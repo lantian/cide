@@ -1547,6 +1547,29 @@ impl AgentSink for RegistrySink {
             .ok_or_else(|| gone().to_string())?;
         crate::cmd::settings::project_harness_get(state, self.project).map_err(|e| e.to_string())
     }
+    fn project_indexing(&self) -> Result<Option<Vec<String>>, String> {
+        let state = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        crate::cmd::settings::project_indexing_get(state, self.project).map_err(|e| e.to_string())
+    }
+    fn set_project_indexing(
+        &self,
+        exclusions: Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, String> {
+        let state = self
+            .app
+            .try_state::<WorkspaceState>()
+            .ok_or_else(|| gone().to_string())?;
+        crate::cmd::settings::project_indexing_set(
+            state,
+            self.app.clone(),
+            self.project,
+            exclusions,
+        )
+        .map_err(|e| e.to_string())
+    }
     fn set_project_harness(
         &self,
         edit: cide_ipc::ProjectHarnessEdit,

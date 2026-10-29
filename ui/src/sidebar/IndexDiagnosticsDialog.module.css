@@ -1,0 +1,10 @@
+.content { display: flex; flex-direction: column; gap: 16px; }
+.content p { margin: 6px 0; }
+.content h3 { margin: 0 0 8px; font-size: inherit; }
+.path { overflow-wrap: anywhere; font-family: var(--font-mono); }
+.root { display: block; margin-top: 4px; }
+.table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.table th, .table td { padding: 8px; text-align: right; vertical-align: top; border-bottom: 1px solid var(--border); }
+.table th:first-child, .table td:first-child { text-align: left; }
+.table td:first-child { max-width: 300px; }
+.actions { display: flex; gap: 4px; }

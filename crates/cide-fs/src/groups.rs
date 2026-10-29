@@ -383,6 +383,9 @@ impl Groups {
             }
             if at >= offset {
                 out.push(TreeRow {
+                    excluded_from_index: false,
+                    exclusion_rule: None,
+                    browse_page: None,
                     path: group_path(&group.id),
                     name: group.label.clone(),
                     // Depth 0 for a pin too: it sits at the same indentation as a header and as
@@ -836,6 +839,9 @@ fn emit(
     }
     if *at >= offset {
         out.push(TreeRow {
+            excluded_from_index: false,
+            exclusion_rule: None,
+            browse_page: None,
             path: node
                 .path
                 .clone()

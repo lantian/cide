@@ -110,9 +110,10 @@ pub mod fs;
 pub mod search;
 
 pub use fs::{
-    FileClip, FsChange, FsStatus, IndexLimit, NO_ROOT, PasteChoice, PasteCollision, PasteDecision,
-    PasteMode, PastedEntry, TreeMatch, TreeMatches, TreeRow, TreeRowKind, WatchBackend,
-    WatchStatus,
+    FileClip, FsChange, FsIndexDiagnostics, FsStatus, IndexAllocation, IndexBudgetUsage,
+    IndexFolderUsage, IndexLimit, IndexRefusal, NO_ROOT, PasteChoice, PasteCollision,
+    PasteDecision, PasteMode, PastedEntry, TreeBrowsePage, TreeMatch, TreeMatches, TreeRow,
+    TreeRowKind, WatchBackend, WatchStatus,
 };
 pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section

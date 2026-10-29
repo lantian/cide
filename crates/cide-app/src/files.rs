@@ -26,7 +26,10 @@ use cide_fs::filter::FilterInput;
 use cide_fs::{
     BuildOptions, Filter, Index, Root, Visibility, WalkItem, WatchConfig, WatchEvent, Watcher,
 };
-use cide_ipc::{FsChange, FsStatus, ProjectId, Settings, WatchBackend, WatchStatus};
+use cide_ipc::{
+    FsChange, FsIndexDiagnostics, FsStatus, IndexAllocation, ProjectId, Settings, WatchBackend,
+    WatchStatus,
+};
 use cide_search::{Candidate, Matcher as _, NucleoMatcher};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -130,7 +133,7 @@ impl Default for FsRegistry {
 
 impl FsRegistry {
     pub fn configure(&self, settings: &cide_ipc::ExplorerSettings) {
-        let settings = settings.clamped();
+        let settings = settings.clone().clamped();
         let next = (
             settings.index_memory_mib as u64 * MIB,
             settings.total_index_memory_mib as u64 * MIB,
@@ -196,7 +199,7 @@ impl FsRegistry {
     ///
     /// The answer to "which projects would a settings change have to re-walk". Collected into a
     /// `Vec` rather than handing out an iterator over the map, because the caller starts a walk
-    /// per entry and a walk takes the same map's lock through [`FsRegistry::claim`] — iterating
+    /// per entry and a walk takes the same map's lock through [`FsRegistry::claim_configured`] — iterating
     /// a `DashMap` while a task re-enters it is a self-deadlock, and it is the kind that only
     /// shows up when a second project is open.
     pub fn indexed(&self) -> Vec<(ProjectId, Vec<PathBuf>)> {
@@ -236,11 +239,44 @@ impl FsRegistry {
     /// A project whose **roots changed** is not either case — its entry is dropped below and
     /// it is walked again. That distinction is the whole reason this is keyed on the root
     /// list rather than on the project id.
+    #[cfg(test)]
     pub fn claim(
         &self,
         project: ProjectId,
         roots: Vec<PathBuf>,
         visibility: Visibility,
+    ) -> Result<Indexing, FsStatus> {
+        self.claim_configured(project, roots, visibility, Default::default(), false, None)
+    }
+
+    /// Restart the generation the caller inspected. A duplicate click or another window
+    /// still looking at the previous generation must not replace the new walk.
+    #[cfg(test)]
+    pub fn restart(
+        &self,
+        project: ProjectId,
+        roots: Vec<PathBuf>,
+        visibility: Visibility,
+        generation: u64,
+    ) -> Result<Indexing, FsStatus> {
+        self.claim_configured(
+            project,
+            roots,
+            visibility,
+            Default::default(),
+            false,
+            Some(generation),
+        )
+    }
+
+    pub fn claim_configured(
+        &self,
+        project: ProjectId,
+        roots: Vec<PathBuf>,
+        visibility: Visibility,
+        exclusions: Arc<cide_fs::Exclusions>,
+        project_override: bool,
+        restart_generation: Option<u64>,
     ) -> Result<Indexing, FsStatus> {
         // A project can gain or lose a root between two indexings. Reusing the old entry
         // would then walk the old set for ever, with no error anywhere to say so — the tree
@@ -257,9 +293,17 @@ impl FsRegistry {
         // holds. Either way the answer is a fresh walk, and treating a changed setting as
         // "already indexed" is how a toggle comes to do nothing at all.
         let _claims = self.claims.lock();
+        if let Some(generation) = restart_generation
+            && let Some(entry) = self.projects.get(&project)
+            && (entry.generation != generation || entry.is_indexing())
+        {
+            return Err(entry.status());
+        }
         let stale = self.projects.get(&project).is_some_and(|entry| {
-            entry.root_paths() != roots
+            restart_generation == Some(entry.generation)
+                || entry.root_paths() != roots
                 || entry.visibility != visibility
+                || entry.exclusions.rules() != exclusions.rules()
                 || entry.budget.cancelled()
         });
         if stale {
@@ -267,13 +311,16 @@ impl FsRegistry {
         }
 
         let entry = self.projects.entry(project).or_insert_with(|| {
-            Arc::new(ProjectFs::controlled(
+            Arc::new(ProjectFs::controlled_with_exclusions(
                 roots.iter().cloned().map(Root::new).collect(),
                 visibility,
                 Budget::new(Arc::clone(&self.shared), self.limits.lock().0),
+                exclusions,
             ))
         });
         let fs = Arc::clone(entry.value());
+        fs.project_exclusions
+            .store(project_override, Ordering::Release);
         drop(entry);
 
         // Checked before the flag is taken, so a repeat call neither walks nor disturbs the
@@ -337,6 +384,7 @@ impl Indexing {
                 // the workspace a second time would open a window in which the walk and the
                 // filter disagree.
                 visibility: fs.visibility,
+                exclusions: Arc::clone(&fs.exclusions),
                 ..BuildOptions::default()
             },
             Arc::clone(&fs.budget),
@@ -357,15 +405,18 @@ impl Indexing {
         // Every visited directory, so that every `.gitignore` under the roots is found — which
         // with *Show ignored files* on includes the ones inside `target/`.
         let dirs = index.dir_paths();
-        let filter = Arc::new(Filter::build_controlled(
-            FilterInput {
-                roots: &root_paths,
-                dirs: &dirs,
-                git_dirs: &git_watch_dirs(&root_paths),
-                visibility: fs.visibility,
-            },
-            &|| fs.budget.cancelled(),
-        ));
+        let filter = Arc::new(
+            Filter::build_controlled(
+                FilterInput {
+                    roots: &root_paths,
+                    dirs: &dirs,
+                    git_dirs: &git_watch_dirs(&root_paths),
+                    visibility: fs.visibility,
+                },
+                &|| fs.budget.cancelled(),
+            )
+            .with_exclusions(Arc::clone(&fs.exclusions)),
+        );
         // NOT `dirs`. With ignored entries shown the tree holds thousands of directories the
         // watcher must not take a descriptor on — see `cide_fs::filter`'s module note, which
         // owns that trade — and `watch_dirs` is where the two lists are told apart.
@@ -402,7 +453,7 @@ impl Indexing {
             *slot = Some(watcher);
         }
 
-        // Last, and only on this path. `FsRegistry::claim` reads it to turn a repeat
+        // Last, and only on this path. `FsRegistry::claim_configured` reads it to turn a repeat
         // `fs.index` into a no-op, so it must mean "this tree has been walked and is being
         // watched" and nothing weaker — set it before `Watcher::start` and a walk that failed
         // to start a watcher would be permanently unwatchable with no way to ask again.
@@ -480,13 +531,15 @@ impl Drop for IndexingGuard {
 
 /// One project's index, picker and watcher.
 pub struct ProjectFs {
+    pub exclusions: Arc<cide_fs::Exclusions>,
+    pub project_exclusions: AtomicBool,
     events: Mutex<Option<(ProjectId, Weak<dyn FsEvents>)>>,
     pub budget: Arc<Budget>,
     generation: u64,
     pub roots: Vec<Root>,
     /// What this project's index was walked with.
     ///
-    /// Immutable for the life of the entry: [`FsRegistry::claim`] drops and rebuilds the whole
+    /// Immutable for the life of the entry: [`FsRegistry::claim_configured`] drops and rebuilds the whole
     /// entry when the user's setting moves, rather than mutating this and leaving an arena that
     /// disagrees with it. That is what makes [`ProjectFs::filter`] — handed to the content
     /// search and to `Index::apply` — provably the same answer the walk used.
@@ -512,7 +565,7 @@ pub struct ProjectFs {
     /// A walk has run to completion over [`Self::roots`] and a watcher is installed.
     ///
     /// Distinct from `!indexing`, which is also true *before* the first walk. This is what
-    /// makes a repeat `fs.index` a no-op; see [`FsRegistry::claim`].
+    /// makes a repeat `fs.index` a no-op; see [`FsRegistry::claim_configured`].
     walked: AtomicBool,
 
     // --- M12: symbols -------------------------------------------------------------------
@@ -570,23 +623,43 @@ pub struct ProjectFs {
 }
 
 impl ProjectFs {
+    #[cfg(test)]
     fn controlled(roots: Vec<Root>, visibility: Visibility, budget: Arc<Budget>) -> Self {
+        Self::controlled_with_exclusions(roots, visibility, budget, Default::default())
+    }
+
+    fn controlled_with_exclusions(
+        roots: Vec<Root>,
+        visibility: Visibility,
+        budget: Arc<Budget>,
+        exclusions: Arc<cide_fs::Exclusions>,
+    ) -> Self {
         static GENERATION: AtomicU64 = AtomicU64::new(1);
         // Matcher pools, bounded parser/file buffers, batches and fixed watcher overhead.
         budget.reserve(32 * MIB);
         Self {
+            project_exclusions: AtomicBool::new(false),
+            exclusions: Arc::clone(&exclusions),
             events: Mutex::new(None),
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             budget: Arc::clone(&budget),
-            index: RwLock::new(Index::empty(roots.clone(), visibility)),
+            index: RwLock::new(Index::empty_controlled(
+                roots.clone(),
+                visibility,
+                Arc::clone(&budget),
+                Arc::clone(&exclusions),
+            )),
             // Empty, and it stays empty until the first tree read probes for a manifest. Opening
             // a project must cost nothing here — see `crate::libraries`.
             groups: crate::groups::ProjectGroups::new(),
-            filter: RwLock::new(Arc::new(Filter::build(
-                &roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
-                Vec::new(),
-                visibility,
-            ))),
+            filter: RwLock::new(Arc::new(
+                Filter::build(
+                    &roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+                    Vec::new(),
+                    visibility,
+                )
+                .with_exclusions(exclusions),
+            )),
             roots,
             visibility,
             matcher: Arc::new(NucleoMatcher::with_owner(budget)),
@@ -672,7 +745,7 @@ impl ProjectFs {
     ///
     /// A second call while a walk is running, or after one finished, reports the index that
     /// exists rather than starting a second walk over the same tree — the same rule
-    /// [`FsRegistry::claim`] applies to the file index, and for the same reason: re-walking would
+    /// [`FsRegistry::claim_configured`] applies to the file index, and for the same reason: re-walking would
     /// clear the matcher the first caller's overlay is reading from.
     pub fn index_symbols(&self) -> cide_ipc::SymbolIndexStatus {
         if self.budget.stopped() {
@@ -870,6 +943,7 @@ impl ProjectFs {
             // Serial package walks share the app-wide four-worker gate.
             BuildOptions {
                 threads: 1,
+                exclusions: Arc::clone(&self.exclusions),
                 ..BuildOptions::default()
             },
             true,
@@ -954,7 +1028,8 @@ impl ProjectFs {
                 self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
                 continue;
             }
-            if !self.with_index(|index| index.contains(path)) {
+            if !self.filter().admits(path, false) || !self.with_index(|index| index.contains(path))
+            {
                 continue;
             }
             let rel = self
@@ -990,10 +1065,11 @@ impl ProjectFs {
                 .sum()
         }
         // Includes store capacity, interned strings, matcher entries and rebuild scratch.
-        if !self
-            .budget
-            .reserve(1024 + 8 * (file.path.len() + file.rel.len()) as u64 + bytes(&file.symbols))
-        {
+        if !self.budget.reserve_for(
+            1024 + 8 * (file.path.len() + file.rel.len()) as u64 + bytes(&file.symbols),
+            IndexAllocation::Symbols,
+            Some(std::path::Path::new(&file.path)),
+        ) {
             self.symbol_store.write().truncated = true;
             return false;
         }
@@ -1136,6 +1212,34 @@ impl ProjectFs {
         paths
     }
 
+    pub fn index_diagnostics(&self) -> FsIndexDiagnostics {
+        let index = self.index.read();
+        FsIndexDiagnostics {
+            index_excluded_folders: self.exclusions.rules().to_vec(),
+            exclusions_source: if self.project_exclusions.load(Ordering::Acquire) {
+                "project"
+            } else {
+                "global"
+            }
+            .into(),
+            browse_cache_bytes: index.browse_cache_bytes(),
+            generation: self.generation,
+            indexing: self.is_indexing(),
+            files: index.files(),
+            dirs: index.dirs(),
+            roots: self
+                .roots
+                .iter()
+                .map(|r| r.path.to_string_lossy().into_owned())
+                .collect(),
+            show_hidden_files: self.visibility.hidden,
+            show_ignored_files: self.visibility.ignored,
+            usage: self.budget.usage(),
+            refusal: self.budget.refusal(),
+            folders: index.largest_folders(),
+        }
+    }
+
     pub fn status(&self) -> FsStatus {
         let index = self.index.read();
         FsStatus {
@@ -1236,6 +1340,229 @@ mod budget_tests {
         fn changed(&self, _: ProjectId, _: &FsChange) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn effective_exclusions_control_generation_and_diagnostics() {
+        let dir = cide_fs::testing::scratch("index-exclusion-generation");
+        std::fs::create_dir(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/generated.rs"), "fn generated() {}").unwrap();
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let other = ProjectId::new();
+        let roots = vec![dir.to_path_buf()];
+        let policy =
+            Arc::new(cide_fs::Exclusions::compile(roots.clone(), &["build".into()]).unwrap());
+        let visibility = Visibility {
+            hidden: true,
+            ignored: true,
+        };
+        let events: Arc<dyn FsEvents> = Arc::new(Events(AtomicU32::new(0)));
+        registry
+            .claim_configured(
+                project,
+                roots.clone(),
+                visibility,
+                policy.clone(),
+                false,
+                None,
+            )
+            .unwrap()
+            .run(events.clone(), project);
+        registry
+            .claim(other, roots.clone(), visibility)
+            .unwrap()
+            .run(events.clone(), other);
+        let generation = registry.get(project).unwrap().generation;
+        let other_generation = registry.get(other).unwrap().generation;
+        let same = registry
+            .claim_configured(project, roots.clone(), visibility, policy, true, None)
+            .err()
+            .unwrap();
+        assert_eq!(same.generation, generation);
+        let fs = registry.get(project).unwrap();
+        assert_eq!(fs.index_diagnostics().exclusions_source, "project");
+        assert_eq!(fs.index_diagnostics().index_excluded_folders, ["build"]);
+        fs.with_index_mut(|index| {
+            index.expand(&dir.join("build"));
+        });
+        fs.refresh_symbols(&[dir.join("build/generated.rs")]);
+        assert_eq!(fs.symbol_store.read().symbols(), 0);
+        assert_eq!(fs.index_diagnostics().files, 0);
+        assert!(fs.matcher().candidates().is_empty());
+        let empty = Arc::new(cide_fs::Exclusions::compile(roots.clone(), &[]).unwrap());
+        let status = registry
+            .claim_configured(
+                project,
+                roots.clone(),
+                visibility,
+                empty.clone(),
+                true,
+                None,
+            )
+            .unwrap()
+            .run(events.clone(), project);
+        assert_ne!(status.generation, generation);
+        assert_eq!(status.files, 1);
+        assert_eq!(registry.get(other).unwrap().generation, other_generation);
+        let restarted = registry
+            .claim_configured(
+                project,
+                roots,
+                visibility,
+                empty,
+                true,
+                Some(status.generation),
+            )
+            .unwrap()
+            .run(events, project);
+        assert_ne!(restarted.generation, status.generation);
+        assert_eq!(restarted.files, 1);
+        assert!(
+            registry
+                .get(project)
+                .unwrap()
+                .index_diagnostics()
+                .index_excluded_folders
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restart_rebuilds_after_a_fix_and_leaves_other_projects_alone() {
+        let dir = cide_fs::testing::scratch("index-restart");
+        let other_dir = cide_fs::testing::scratch("index-restart-other");
+        std::fs::create_dir(dir.join("generated")).unwrap();
+        std::fs::write(dir.join("generated/old.txt"), "old").unwrap();
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let other = ProjectId::new();
+        let events: Arc<dyn FsEvents> = Arc::new(Events(AtomicU32::new(0)));
+        let status = registry
+            .claim(project, vec![dir.to_path_buf()], Visibility::CONSERVATIVE)
+            .unwrap()
+            .run(events.clone(), project);
+        let other_claim = registry
+            .claim(
+                other,
+                vec![other_dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+            )
+            .unwrap();
+        let other_generation = registry.get(other).unwrap().generation;
+        let old = registry.get(project).unwrap();
+        assert!(!old.budget.reserve(512 * MIB));
+        assert!(old.index_diagnostics().refusal.is_some());
+
+        std::fs::remove_dir_all(dir.join("generated")).unwrap();
+        std::fs::write(dir.join("fixed.rs"), "fn fixed() {}\n").unwrap();
+        let next = registry
+            .restart(
+                project,
+                vec![dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+                status.generation,
+            )
+            .unwrap()
+            .run(events, project);
+        let current = registry.get(project).unwrap();
+        assert!(old.budget.cancelled());
+        assert_ne!(next.generation, status.generation);
+        assert!(!next.indexing);
+        assert!(current.index_diagnostics().refusal.is_none());
+        assert!(current.with_index(|i| i.contains(&dir.join("fixed.rs"))));
+        assert!(!current.with_index(|i| i.contains(&dir.join("generated/old.txt"))));
+        assert_eq!(registry.get(other).unwrap().generation, other_generation);
+        assert!(!registry.get(other).unwrap().budget.cancelled());
+        drop(other_claim);
+        registry.close_all();
+    }
+
+    #[test]
+    fn restart_does_not_replace_running_or_newer_generations() {
+        let dir = cide_fs::testing::scratch("index-restart-duplicate");
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let initial = registry
+            .claim(project, vec![dir.to_path_buf()], Visibility::CONSERVATIVE)
+            .unwrap();
+        let generation = registry.get(project).unwrap().generation;
+        let running = registry
+            .restart(
+                project,
+                vec![dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+                generation,
+            )
+            .err()
+            .expect("a running walk must be reused");
+        assert!(running.indexing);
+        assert_eq!(running.generation, generation);
+        drop(initial);
+
+        let replacement = registry
+            .restart(
+                project,
+                vec![dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+                generation,
+            )
+            .unwrap();
+        let next_generation = registry.get(project).unwrap().generation;
+        assert_ne!(next_generation, generation);
+        let duplicate = registry
+            .restart(
+                project,
+                vec![dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+                generation,
+            )
+            .err()
+            .expect("a duplicate must reuse the new walk");
+        assert_eq!(duplicate.generation, next_generation);
+        replacement.run(Arc::new(Events(AtomicU32::new(0))), project);
+        let stale = registry
+            .restart(
+                project,
+                vec![dir.to_path_buf()],
+                Visibility::CONSERVATIVE,
+                generation,
+            )
+            .err()
+            .expect("a stale dialog must not rebuild even after the new walk finishes");
+        assert_eq!(stale.generation, next_generation);
+        assert!(!stale.indexing);
+        registry.close_all();
+    }
+
+    #[test]
+    fn index_diagnostics_follow_the_generation_and_fixed_overhead() {
+        let dir = cide_fs::testing::scratch("diagnostics-generation");
+        let shared = SharedBudget::new(64 * MIB);
+        let budget = Budget::new(shared.clone(), 64 * MIB);
+        let fs = ProjectFs::controlled(
+            vec![Root::new(dir.path())],
+            Visibility::CONSERVATIVE,
+            budget.clone(),
+        );
+        assert!(!budget.reserve_for(
+            64 * MIB,
+            IndexAllocation::Symbols,
+            Some(&dir.join("main.rs"))
+        ));
+        let report = fs.index_diagnostics();
+        assert_eq!(report.usage.project_bytes, 32 * MIB);
+        assert_eq!(report.refusal.unwrap().allocation, IndexAllocation::Symbols);
+        assert_eq!(report.roots, vec![dir.to_string_lossy().into_owned()]);
+        assert!(report.folders.is_empty());
+        let next = ProjectFs::controlled(
+            vec![Root::new(dir.path())],
+            Visibility::CONSERVATIVE,
+            Budget::new(shared, 64 * MIB),
+        );
+        let fresh = next.index_diagnostics();
+        assert_ne!(fresh.generation, report.generation);
+        assert!(fresh.refusal.is_none());
     }
 
     #[test]

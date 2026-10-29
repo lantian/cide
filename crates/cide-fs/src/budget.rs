@@ -5,11 +5,12 @@
 //! deliberately not refunded on a deletion: arenas and append-only matchers still own that
 //! capacity. A replacement generation releases it when its final reader goes away.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use cide_ipc::IndexLimit;
+use cide_ipc::{IndexAllocation, IndexBudgetUsage, IndexLimit, IndexRefusal};
 
 pub const MIB: u64 = 1024 * 1024;
 
@@ -42,7 +43,7 @@ pub struct Budget {
     limit: u64,
     used: AtomicU64,
     cancelled: AtomicBool,
-    reason: Mutex<Option<IndexLimit>>,
+    refusal: Mutex<Option<IndexRefusal>>,
 }
 
 impl Budget {
@@ -52,7 +53,7 @@ impl Budget {
             limit,
             used: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
-            reason: Mutex::new(None),
+            refusal: Mutex::new(None),
         })
     }
 
@@ -73,18 +74,38 @@ impl Budget {
         &self.cancelled
     }
     pub fn reason(&self) -> Option<IndexLimit> {
-        *self.reason.lock().unwrap()
+        self.refusal.lock().unwrap().as_ref().map(|r| r.reason)
+    }
+    pub fn refusal(&self) -> Option<IndexRefusal> {
+        self.refusal.lock().unwrap().clone()
+    }
+    pub fn usage(&self) -> IndexBudgetUsage {
+        IndexBudgetUsage {
+            project_bytes: self.used(),
+            project_limit_bytes: self.limit,
+            total_bytes: self.shared.used(),
+            total_limit_bytes: self.shared.limit.load(Ordering::Acquire),
+        }
     }
     pub fn stopped(&self) -> bool {
         self.cancelled() || self.reason().is_some()
     }
 
     pub fn reserve(&self, bytes: u64) -> bool {
+        self.reserve_for(bytes, IndexAllocation::Overhead, None)
+    }
+
+    pub fn reserve_for(
+        &self,
+        bytes: u64,
+        allocation: IndexAllocation,
+        path: Option<&Path>,
+    ) -> bool {
         if self.stopped() {
             return false;
         }
         if !take(&self.used, self.limit, bytes) {
-            *self.reason.lock().unwrap() = Some(IndexLimit::ProjectBudget);
+            self.refuse(IndexLimit::ProjectBudget, bytes, allocation, path);
             return false;
         }
         if !take(
@@ -93,16 +114,53 @@ impl Budget {
             bytes,
         ) {
             self.used.fetch_sub(bytes, Ordering::AcqRel);
-            *self.reason.lock().unwrap() = Some(IndexLimit::TotalBudget);
+            self.refuse(IndexLimit::TotalBudget, bytes, allocation, path);
             return false;
         }
         true
     }
 
+    fn refuse(
+        &self,
+        reason: IndexLimit,
+        bytes: u64,
+        allocation: IndexAllocation,
+        path: Option<&Path>,
+    ) {
+        // Competing workers may already have passed stopped(). Preserve the first refusal,
+        // and allocate only one diagnostic path even when many subsequent attempts fail.
+        self.refusal
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| IndexRefusal {
+                reason,
+                allocation,
+                path: path.map(|p| p.to_string_lossy().into_owned()),
+                folder: path
+                    .and_then(Path::parent)
+                    .map(|p| p.to_string_lossy().into_owned()),
+                requested_bytes: bytes,
+                usage: self.usage(),
+            });
+    }
+
     /// Covers the node, hash table capacity, path copies, matcher UTF-32 column and watcher
     /// metadata. Eight times UTF-8 length bounds UTF-32 plus the retained UTF-8 copies.
     pub fn reserve_path(&self, path: &std::path::Path, relative: &str) -> bool {
-        self.reserve(1024 + 8 * (path.as_os_str().len() + relative.len()) as u64)
+        self.reserve_path_for(path, relative, IndexAllocation::Files)
+    }
+
+    pub fn reserve_path_for(
+        &self,
+        path: &Path,
+        relative: &str,
+        allocation: IndexAllocation,
+    ) -> bool {
+        self.reserve_for(Self::path_bytes(path, relative), allocation, Some(path))
+    }
+
+    pub fn path_bytes(path: &Path, relative: &str) -> u64 {
+        1024 + 8 * (path.as_os_str().len() + relative.len()) as u64
     }
 }
 

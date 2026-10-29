@@ -17,9 +17,7 @@ import { groupDigits } from '@/overlays/format'
 import { events, fs, type FsStatus, type ProjectId } from '@/ipc/client'
 import { Icon } from '@/icons/Icon'
 
-import { Button } from '@/kit/components/Button'
-import { Banner } from '@/kit/components/Feedback'
-import { requestSettingsFrame } from '@/chrome/panelRequests'
+import { IndexWarning } from './IndexWarning'
 import styles from './FileTree.module.css'
 
 export interface ExplorerProps {
@@ -337,10 +335,7 @@ function ExplorerImpl({
           </button>
         )}
       </div>
-      {status?.indexLimit && <Banner tone="warn"
-        action={<Button size="sm" variant="quiet" onClick={() => { requestSettingsFrame('files') }}>Settings</Button>}>
-        Index incomplete: memory limit reached
-      </Banner>}
+      {project && status && <IndexWarning key={project} project={project} status={status} />}
       <FileTree
         project={project}
         onOpen={onOpenFile}

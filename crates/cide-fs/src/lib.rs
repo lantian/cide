@@ -18,6 +18,7 @@
 pub mod budget;
 pub mod copy;
 pub mod error;
+pub mod exclusions;
 pub mod filter;
 pub mod groups;
 pub mod index;
@@ -30,6 +31,7 @@ pub mod trash;
 pub mod watch;
 
 pub use error::{FsError, Result};
+pub use exclusions::Exclusions;
 pub use filter::{Filter, Visibility};
 pub use groups::{Entry, Expanded, GroupState, Groups};
 pub use index::{BuildOptions, Index, Root, WalkItem};

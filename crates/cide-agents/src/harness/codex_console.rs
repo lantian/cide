@@ -45,6 +45,7 @@ pub struct Protocol {
 struct Request {
     method: String,
     user_prompt: bool,
+    thread: Option<String>,
 }
 
 impl Protocol {
@@ -123,6 +124,7 @@ impl Protocol {
                         Request {
                             method: method.to_string(),
                             user_prompt: false,
+                            thread: frame["params"]["threadId"].as_str().map(str::to_owned),
                         },
                     );
                 }
@@ -142,6 +144,7 @@ impl Protocol {
                         Request {
                             method: method.to_string(),
                             user_prompt,
+                            thread: self.active.clone(),
                         },
                     );
                 }
@@ -172,6 +175,20 @@ impl Protocol {
             && let Some(request) = self.pending.remove(&id)
         {
             if frame.get("error").is_some() {
+                if matches!(
+                    request.method.as_str(),
+                    "thread/start" | "thread/resume" | "thread/fork"
+                ) {
+                    hooks.push(Hook {
+                        kind: "CideStartFailed",
+                        payload: json!({"session_id":request.thread,"error":frame["error"]}),
+                    });
+                } else if request.method == "turn/start" {
+                    hooks.push(Hook {
+                        kind: "CideTurnFailed",
+                        payload: json!({"session_id":request.thread,"error":frame["error"]}),
+                    });
+                }
                 return hooks;
             }
             if matches!(
@@ -644,6 +661,34 @@ pub fn apply_policy(frame: &mut Value, policy: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_resume_reports_startup_failure_without_claiming_the_thread() {
+        let thread = SessionId::new().to_string();
+        let mut protocol = Protocol::default();
+        protocol.from_terminal(&json!({"method":"initialized"}));
+        protocol
+            .from_terminal(&json!({"id":1,"method":"thread/resume","params":{"threadId":thread}}));
+        let hooks = protocol.from_server(&json!({"id":1,"error":{"code":-32600,"message":"Conversation is open in another app"}}));
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].kind, "CideStartFailed");
+        assert_eq!(hooks[0].payload["session_id"], thread);
+        assert!(protocol.receiver().is_none());
+        assert!(protocol.current_thread().is_none());
+        // An ephemeral helper failure is not a failure of the visible console.
+        protocol
+            .from_terminal(&json!({"id":2,"method":"thread/start","params":{"ephemeral":true}}));
+        assert!(
+            protocol
+                .from_server(&json!({"id":2,"error":{"message":"helper failed"}}))
+                .is_empty()
+        );
+        assert!(
+            protocol
+                .from_server(&json!({"id":99,"error":{"message":"unrelated"}}))
+                .is_empty()
+        );
+    }
     const THREAD: &str = "00000000-0000-4000-8000-000000000001";
 
     fn opened() -> Protocol {
