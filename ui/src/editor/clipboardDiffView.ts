@@ -9,7 +9,13 @@ import { polarityExtension, polaritySlot, watchPolarity } from './cmPolarity'
 import { exceedsBytes } from './byteSize'
 import styles from './clipboardDiffView.module.css'
 
-export interface ClipboardComparison { id: string; text: string; layout: 'split' | 'unified' }
+export interface ClipboardComparison {
+  id: string
+  text: string
+  layout: 'split' | 'unified'
+  /** What the left side is. Absent reads as the clipboard; a Local History version names itself. */
+  label?: string | undefined
+}
 
 export function tooLargeForClipboardDiff(a: string, b: string): boolean {
   if (a.length + b.length > 1024 * 1024) return true
@@ -19,13 +25,13 @@ export function tooLargeForClipboardDiff(a: string, b: string): boolean {
   return false
 }
 
-function copyButton(): HTMLButtonElement {
+function copyButton(source: string): HTMLButtonElement {
   const button = document.createElement('button')
   button.type = 'button'
   button.className = styles.copy ?? ''
   button.textContent = '→'
-  button.title = 'Copy this block from Clipboard to the file'
-  button.setAttribute('aria-label', 'Copy from Clipboard')
+  button.title = `Copy this block from ${source} to the file`
+  button.setAttribute('aria-label', `Copy from ${source}`)
   return button
 }
 
@@ -35,6 +41,7 @@ export function createClipboardDiff(
   comparison: ClipboardComparison, readOnly: boolean,
 ): { view: EditorView; clipboard: EditorView | null; destroy: () => void } {
   if (readOnly) extensions = [...extensions, EditorState.readOnly.of(true), EditorView.editable.of(false)]
+  const source = comparison.label ?? 'Clipboard'
   const isolated = EditorState.transactionExtender.of(tr => tr.isUserEvent('revert')
     ? { annotations: isolateHistory.of('full') } : null)
   const clipboardText = EditorState.create({ doc: comparison.text }).doc.toString()
@@ -54,8 +61,8 @@ export function createClipboardDiff(
         mergeControls: readOnly ? false : (type, action) => {
           // Accept rewrites the baseline; a clipboard snapshot must remain fixed.
           if (type === 'accept') { const hidden = document.createElement('span'); hidden.hidden = true; return hidden }
-          const button = copyButton()
-          button.textContent = 'Copy from Clipboard'
+          const button = copyButton(source)
+          button.textContent = `Copy from ${source}`
           button.addEventListener('click', action)
           return button
         },
@@ -68,11 +75,11 @@ export function createClipboardDiff(
     a: { doc: clipboardText, extensions: [lineNumbers(), polarityExtension(polarity),
       syntaxHighlighting(cideHighlightStyle), EditorState.readOnly.of(true), EditorView.editable.of(false),
       keymap.of(defaultKeymap),
-      EditorView.contentAttributes.of({ 'aria-label': 'Clipboard (read only)', tabindex: '0' })] },
+      EditorView.contentAttributes.of({ 'aria-label': `${source} (read only)`, tabindex: '0' })] },
     b: { doc, extensions: [...extensions, isolated] },
     ...(readOnly ? {} : { revertControls: 'a-to-b' as const }),
     renderRevertControl: () => {
-      const button = copyButton()
+      const button = copyButton(source)
       // MergeView handles pointer mousedown; bridge native button keyboard activation too.
       button.addEventListener('click', event => {
         if (event.detail === 0) button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))

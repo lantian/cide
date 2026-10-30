@@ -28,6 +28,9 @@ crates/
   cide-tasks/     The tracker: `.cide/tasks.json` as an index and `.cide/tasks/<id>/task.json`
                   per task (schema 2, M68). One owning store, a repairing loader, a stale-file
                   merge per half, and a migration that converts a schema 1 file on open.
+  cide-local-history/  Every version of a project's files, kept apart from git: packs, a log,
+                  retention and the restore planner (ADR 0016). No threads; `cide-app`'s
+                  `local_history` runs one worker per store.
   cide-spec/      OpenSpec, by running its CLI — never by parsing its markdown (ADR 0012).
   cide-docker/    A Docker daemon over the Engine API — never by running `docker` (ADR 0013).
   cide-agents/    `.cide/` roles and config, and the `cide_task_*` MCP vocabulary. Spawns nothing yet.
@@ -231,6 +234,11 @@ none of it does. Inspect a profile's with `CIDE_PROFILE=<name> ./target/debug/ci
   resetting removes an override. Written atomically with mode 0600, never into the project.
   The workspace carries a mirror for UI updates; this file is authoritative on startup and
   survives closing or reopening projects under new IDs.
+- `$XDG_CONFIG_HOME/cide/local-history-settings.json` — whether a project keeps a Local History,
+  keyed the same way. No entry inherits `Settings::local_history`.
+- `$XDG_STATE_HOME/cide/local-history/<key>/` — a project's versions: `log.jsonl`, `packs/`, and a
+  `lock` that makes a second opener read-only. `<key>.json` beside it names the project. Mode
+  0700/0600, and never in the project (ADR 0016). Inspect with `cide-headless history <root>`.
 - `$XDG_CONFIG_HOME/cide/schemes/<id>.json` — imported editor colour schemes, one file each.
   The *converted* scheme, not the source VS Code theme: re-converting at launch would let a
   change to `cide_core::scheme::SCOPES` repaint a buffer somebody was happy with. `cide` is

@@ -32,6 +32,7 @@
  * The selection lives in `treeStore`, not here, because it has to outlive both a refresh of
  * the rows underneath it and an unmount of this panel; see the field's comment there.
  */
+import { openLocalHistory, requestPutLabel } from '@/localhistory/actions'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { blurLeftTheTree } from '@/sidebar/speedSearch'
 import { claimTreeFocus, releaseTreeFocus } from './treeFocus'
@@ -2210,6 +2211,29 @@ export function FileTree({
                   ? 'This path is outside the project, so it is in no repository cide has opened'
                   : NO_HOST,
               }),
+        },
+        /*
+         * Beside git's history and unlike it: this one is offered with no repository at all, and
+         * on any row, because whether a path has versions is answered by the tab it opens. A
+         * folder is how a deleted file is reached, so it must be a row that can be asked.
+         */
+        {
+          id: 'localHistory',
+          label: 'Local History',
+          submenu: () => [
+            {
+              id: 'localHistory.show',
+              label: 'Show History',
+              command: 'localHistory.show',
+              run: () => openLocalHistory(project, row.path, row.isDir),
+            },
+            {
+              id: 'localHistory.putLabel',
+              label: 'Put Label\u2026',
+              command: 'localHistory.putLabel',
+              run: () => requestPutLabel(project),
+            },
+          ],
         },
         /*
          * The two that copy *names* rather than files, and they follow the selection: with

@@ -523,6 +523,27 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "number 256–16384",
         "Combined indexing allocation budget in MiB (default 2048). Changes rebuild affected indexes.",
     ),
+    // --- local history -------------------------------------------------------------------
+    doc(
+        "localHistory.enabled",
+        "bool",
+        "Keep versions of project files, independently of git. A project can override this locally. Turning it off keeps existing versions.",
+    ),
+    doc(
+        "localHistory.daysToKeep",
+        "number 1–3650",
+        "Working days of history kept per file, counted by the days that file changed (default 5).",
+    ),
+    doc(
+        "localHistory.maxFileSizeMiB",
+        "number 1–1024",
+        "Larger files are recorded as changed with no copy kept (default 5).",
+    ),
+    doc(
+        "localHistory.maxStorageMiB",
+        "number 64–1048576",
+        "Stored bytes per project (default 1024). The newest version of a live file is never evicted, so this can be exceeded by the size of the tree.",
+    ),
     // --- inspections ---------------------------------------------------------------------
     doc(
         "inspections.severities.error",

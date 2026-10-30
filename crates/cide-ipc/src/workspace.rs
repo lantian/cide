@@ -72,6 +72,9 @@ pub struct Workspace {
     // Machine-local indexing overrides, keyed by canonical primary root. Empty lists are explicit.
     #[serde(default)]
     pub project_indexing: std::collections::BTreeMap<String, Vec<String>>,
+    // Machine-local Local History switches, keyed the same way. No entry inherits the global one.
+    #[serde(default)]
+    pub project_local_history: std::collections::BTreeMap<String, bool>,
 }
 
 impl Workspace {
@@ -143,6 +146,7 @@ impl Default for Workspace {
             settings: Settings::default(),
             project_harness: Default::default(),
             project_indexing: Default::default(),
+            project_local_history: Default::default(),
             projects: IndexMap::new(),
             windows: IndexMap::new(),
             tool_window: ToolWindowState::default(),
@@ -659,6 +663,22 @@ pub enum TabKind {
         path: PathBuf,
         dirty: bool,
     },
+    /// Local History for a file, a folder, or with no path the whole project.
+    ///
+    /// A page rather than a tab in the bottom tool window, where git's per-file history lives.
+    /// That window is git-shaped and only in shell windows, a project with no repository still
+    /// has this, and a side-by-side diff needs the width.
+    ///
+    /// Durable, because the tab is a question the store answers afresh on every mount. The path
+    /// is identity only: nothing about any version is written into `workspace.json`.
+    LocalHistory {
+        #[ts(type = "string | null")]
+        path: Option<PathBuf>,
+        /// Recorded rather than read from the disk, because this view is exactly how a folder
+        /// that no longer exists gets its files back.
+        #[serde(default)]
+        folder: bool,
+    },
     /// An editable view of a live file against a process-local clipboard snapshot.
     /// Only the identifier is durable; startup turns these into ordinary file tabs.
     ClipboardDiff {
@@ -666,6 +686,10 @@ pub enum TabKind {
         path: PathBuf,
         snapshot_id: String,
         dirty: bool,
+        /// What the left side is, when it is not the clipboard: a Local History version, whose
+        /// per-block arrows are this feature's partial restore. `None` reads as *Clipboard*.
+        #[serde(default)]
+        label: Option<String>,
     },
     Diff {
         spec: DiffSpec,
@@ -917,11 +941,23 @@ impl TabKind {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-            Self::ClipboardDiff { path, .. } => format!(
-                "{} vs Clipboard",
+            Self::LocalHistory { path, .. } => path.as_ref().map_or_else(
+                || "Local History".to_owned(),
+                |path| {
+                    format!(
+                        "History: {}",
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                    )
+                },
+            ),
+            Self::ClipboardDiff { path, label, .. } => format!(
+                "{} vs {}",
                 path.file_name()
                     .unwrap_or(path.as_os_str())
-                    .to_string_lossy()
+                    .to_string_lossy(),
+                label.as_deref().unwrap_or("Clipboard")
             ),
             Self::Diff { spec, .. } => spec.title.clone(),
             Self::Revision { title, .. } => title.clone(),

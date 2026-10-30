@@ -15,7 +15,7 @@ use ts_rs::TS;
 use crate::Theme;
 use crate::settings::{
     ClaudeSettings, EditorSettings, ExplorerSettings, GitSettings, GraphicsSettings,
-    InspectionSettings, ProxySettings, SidebarSettings, TerminalSettings,
+    InspectionSettings, LocalHistorySettings, ProxySettings, SidebarSettings, TerminalSettings,
 };
 
 /// How [`SettingsPatch::accent`] moves the accent. A separate `Reset` rather than
@@ -127,6 +127,10 @@ pub struct SettingsPatch {
     /// showing entries it never walked.
     #[ts(optional)]
     pub explorer: Option<ExplorerSettings>,
+    /// Local History's switch and limits. Clamped in `apply_patch`; `settings_set` then attaches
+    /// or detaches every open project, because the switch has to take effect without a restart.
+    #[ts(optional)]
+    pub local_history: Option<LocalHistorySettings>,
     /// The Inspections screen, sent whole like every other group.
     ///
     /// `push_debounce_ms` is clamped where this lands (`cmd::settings::apply_patch`) rather

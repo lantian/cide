@@ -78,6 +78,7 @@ pub fn tab_open_clipboard_diff(
     project: ProjectId,
     path: String,
     text: String,
+    label: Option<String>,
 ) -> Result<TabId> {
     let path = PathBuf::from(path);
     if !path.is_absolute() {
@@ -88,7 +89,7 @@ pub fn tab_open_clipboard_diff(
     // Register before broadcasting the new tab, so its first mount can fetch the snapshot.
     let snapshot_id = uuid::Uuid::new_v4().to_string();
     let result = state.update(|ws| {
-        let tab = open_comparison(ws, project, path, snapshot_id.clone())?;
+        let tab = open_comparison(ws, project, path, snapshot_id.clone(), label)?;
         comparisons.clips.lock().insert(snapshot_id.clone(), text);
         Ok(tab)
     });
@@ -108,16 +109,20 @@ fn open_comparison(
     project: ProjectId,
     path: PathBuf,
     snapshot_id: String,
+    label: Option<String>,
 ) -> Result<TabId> {
     let existing = workspace::project(ws, project)?.tabs.iter().find_map(|t| {
         matches!(&t.kind, TabKind::ClipboardDiff { path: p, .. } if p == &path).then_some(t.id)
     });
     if let Some(id) = existing {
         if let TabKind::ClipboardDiff {
-            snapshot_id: slot, ..
+            snapshot_id: slot,
+            label: caption,
+            ..
         } = &mut workspace::tab_mut(ws, project, id)?.kind
         {
             *slot = snapshot_id.clone();
+            *caption = label;
         }
         workspace::activate_tab(ws, project, id)?;
         return Ok(id);
@@ -130,6 +135,7 @@ fn open_comparison(
         path: path.clone(),
         snapshot_id: snapshot_id.clone(),
         dirty,
+        label,
     };
     let mut pane = super::file::diff_pane(kind.title());
     pane.kind = PaneKind::Editor;
@@ -244,10 +250,10 @@ mod tests {
             .clips
             .lock()
             .insert("first".into(), "sensitive clipboard".into());
-        let tab = open_comparison(&mut ws, project, path.clone(), "first".into()).unwrap();
+        let tab = open_comparison(&mut ws, project, path.clone(), "first".into(), None).unwrap();
         runtime.clips.lock().insert("second".into(), String::new());
         assert_eq!(
-            open_comparison(&mut ws, project, path, "second".into()).unwrap(),
+            open_comparison(&mut ws, project, path, "second".into(), None).unwrap(),
             tab
         );
         runtime.reconcile(&ws);
@@ -270,7 +276,7 @@ mod tests {
             workspace::open_project(&mut ws, vec!["/tmp/clipboard-test".into()], None).unwrap();
         let runtime = Comparisons::default();
         let path = PathBuf::from("/tmp/clipboard-test/file.txt");
-        let tab = open_comparison(&mut ws, project, path.clone(), "clip".into()).unwrap();
+        let tab = open_comparison(&mut ws, project, path.clone(), "clip".into(), None).unwrap();
         let (initial, changed) = runtime
             .sync(&ws, &path, None, Some(snapshot("first")))
             .unwrap();

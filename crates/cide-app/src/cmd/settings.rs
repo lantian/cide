@@ -106,6 +106,41 @@ pub fn project_indexing_set(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub fn project_local_history_get(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Option<bool>, CoreError> {
+    state.with(|ws| cide_core::local_history_settings::overrides(ws, project))
+}
+
+/// `None` inherits the global switch. Takes effect at once, with no re-index: turning a project
+/// off stops its worker, and turning one on starts a pass that catches up with the disk.
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_local_history_set(
+    state: State<'_, WorkspaceState>,
+    app: AppHandle,
+    project: ProjectId,
+    enabled: Option<bool>,
+) -> Result<Option<bool>, CoreError> {
+    state.update(|ws| {
+        let key = cide_core::harness_settings::project_key(ws, project)?;
+        let path = persist::config_dir().join("local-history-settings.json");
+        let mut projects = cide_core::local_history_settings::load(&path)?;
+        if let Some(enabled) = enabled {
+            projects.insert(key, enabled);
+        } else {
+            projects.remove(&key);
+        }
+        cide_core::local_history_settings::save(&path, &projects)?;
+        ws.project_local_history = projects;
+        workspace::bump(ws);
+        Ok(())
+    })?;
+    crate::local_history::settings_changed(&app);
+    Ok(enabled)
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub fn project_harness_effective(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
@@ -274,6 +309,7 @@ pub fn settings_set(
     let (
         was_theme,
         was_explorer,
+        was_local_history,
         was_binaries,
         was_working_set,
         was_memory_limit,
@@ -284,6 +320,7 @@ pub fn settings_set(
         (
             ws.settings.theme,
             ws.settings.explorer.clone(),
+            ws.settings.local_history.clone(),
             ws.settings.inspections.server_binaries.clone(),
             ws.settings.inspections.server_index_working_set_pct,
             ws.settings.inspections.server_memory_limit_mb,
@@ -336,6 +373,9 @@ pub fn settings_set(
         app.state::<crate::files::FsRegistry>()
             .configure(&settings.explorer);
         reindex_open_projects(&app);
+    }
+    if settings.local_history != was_local_history {
+        crate::local_history::settings_changed(&app);
     }
     // A server whose Builtin/System choice moved is running the wrong binary right now, in
     // every project that has it — the choice is global. Restarting is the honest reaction and
@@ -538,6 +578,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         decision,
         sidebar,
         explorer,
+        local_history,
         inspections,
         git,
         llm,
@@ -679,6 +720,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // this type: see `settings_set`, which re-walks every open project when this one moves.
     if let Some(v) = explorer {
         settings.explorer = v.clamped();
+    }
+    if let Some(v) = local_history {
+        settings.local_history = v.clamped();
     }
     // Clamped for the same reason, and the failure is louder than a bad width. `pushToClaude`
     // writes a line into a live Claude pane's PTY; with a debounce of zero, one `cargo check`

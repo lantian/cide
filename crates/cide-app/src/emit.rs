@@ -297,6 +297,21 @@ pub fn project_running(app: &AppHandle, set: &cide_ipc::ProjectRunningSet) {
     }
 }
 
+/// Versions landed or were removed for this project. No payload beyond the project: a history tab
+/// refetches what it is showing, and the worker throttles this to twice a second.
+pub const LOCAL_HISTORY_CHANGED: &str = "cide://local-history-changed";
+
+#[derive(Clone, serde::Serialize)]
+struct LocalHistoryChanged {
+    project: cide_ipc::ProjectId,
+}
+
+pub fn local_history_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
+    if let Err(error) = app.emit(LOCAL_HISTORY_CHANGED, LocalHistoryChanged { project }) {
+        tracing::debug!(%error, "local-history-changed reached no window");
+    }
+}
+
 pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
     if paths.is_empty() {
         return;

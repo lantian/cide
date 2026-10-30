@@ -373,6 +373,11 @@ fn run_teardown(app: &AppHandle) {
     if let Some(files) = app.try_state::<crate::files::FsRegistry>() {
         files.cancel_all();
     }
+    // A flag and nothing else. No join and no compaction: the store is crash-only, the next
+    // start's reconcile recovers whatever was queued, and an OS shutdown allows five seconds.
+    if let Some(history) = app.try_state::<std::sync::Arc<crate::local_history::Registry>>() {
+        history.stop_all();
+    }
     if let Some(searches) = app.try_state::<crate::cmd::search::SearchRegistry>() {
         searches.cancel_all();
     }

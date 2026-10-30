@@ -538,6 +538,46 @@ pub fn hunk_views(file: &RawFile) -> Vec<DiffHunkView> {
         .collect()
 }
 
+/// The hunks between two byte strings that need not be in any repository.
+///
+/// `Patch::from_buffers` takes no `Repository`, which is what lets a GitLab review and a Local
+/// History version share the hunk mapping above instead of each growing a diff of their own: the
+/// `LineOrigin` translation and the [`strip_newline`] rule are the same two places [`hunk_views`]
+/// exists to keep from drifting. It lived in `cide-gitlab` as a private helper until Local
+/// History needed it, which is a project with no git at all.
+///
+/// The patch is rendered and parsed back rather than walked directly because [`raw_file_at`] is
+/// the one reader of a libgit2 diff here, and its `eofnl` handling is the part that matters.
+///
+/// Empty for identical inputs, and for content libgit2 calls binary. Whether a file *is* binary
+/// is the caller's question: this answers what to draw, not what the bytes are.
+pub fn hunks_between(
+    old: &[u8],
+    old_path: &Path,
+    new: &[u8],
+    new_path: &Path,
+) -> Result<Vec<DiffHunkView>> {
+    let mut patch = Patch::from_buffers(old, Some(old_path), new, Some(new_path), None).wrap()?;
+    if patch.num_hunks() == 0 {
+        return Ok(Vec::new());
+    }
+    let buffer = patch.to_buf().wrap()?;
+    let diff = Diff::from_buffer(&buffer).wrap()?;
+    Ok(raw_file_at(&diff, 0)?
+        .map(|raw| hunk_views(&raw))
+        .unwrap_or_default())
+}
+
+/// A unified patch between two byte strings, as `git apply` reads it.
+///
+/// Beside [`hunks_between`] and with no repository for the same reason. Binary content renders
+/// as libgit2's one-line notice, which is what `git diff` prints too.
+pub fn patch_between(old: &[u8], old_path: &Path, new: &[u8], new_path: &Path) -> Result<String> {
+    let mut patch = Patch::from_buffers(old, Some(old_path), new, Some(new_path), None).wrap()?;
+    let buffer = patch.to_buf().wrap()?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
 /// The frontend's view of a file diff.
 ///
 /// Takes the repository because the view now carries the whole file alongside the hunks —
@@ -796,5 +836,29 @@ mod tests {
         assert_eq!(strip_newline(b"abc\n"), b"abc");
         assert_eq!(strip_newline(b"abc\r\n"), b"abc");
         assert_eq!(strip_newline(b"abc"), b"abc");
+    }
+
+    /// No repository anywhere in this test, which is the property: a project with no git at all
+    /// gets the same hunks a commit diff draws.
+    #[test]
+    fn two_byte_strings_diff_with_no_repository() {
+        let path = Path::new("a.rs");
+        let hunks = hunks_between(b"one\ntwo\n", path, b"one\nthree\n", path).unwrap();
+        assert_eq!(hunks.len(), 1);
+        let origins: Vec<_> = hunks[0].lines.iter().map(|l| l.origin).collect();
+        assert_eq!(
+            origins,
+            [
+                LineOrigin::Context,
+                LineOrigin::Deletion,
+                LineOrigin::Addition
+            ]
+        );
+
+        let same = hunks_between(b"one\n", path, b"one\n", path).unwrap();
+        assert!(
+            same.is_empty(),
+            "identical inputs are no hunks, not an error"
+        );
     }
 }

@@ -55,6 +55,7 @@
  * and a horizontal reserve taken out of the thing being reserved against has been rejected in
  * this app once already (the pane cluster over the find bar, README's M16).
  */
+import { openLocalHistory } from '@/localhistory/actions'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import { canCompareClipboard, compareToClipboard } from '@/editor/compareClipboard'
@@ -336,6 +337,9 @@ export function TabStrip({
         ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
         ...(onShowHistory ? { history: onShowHistory } : {}),
         ...(onProperties ? { properties: onProperties } : {}),
+        ...(project
+          ? { localHistory: (path: string) => openLocalHistory(project, path, false) }
+          : {}),
       })
     },
   })
@@ -664,6 +668,16 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
         audit: undefined,
       }
 
+    case 'localHistory':
+      return {
+        shape: styles.shapeSettings,
+        body: <span>{kind.path === null ? 'Local History' : `History: ${basename(kind.path)}`}</span>,
+        closable: true,
+        dirty: false,
+        hint: kind.path ?? 'Local History for this project',
+        audit: undefined,
+      }
+
     case 'conversation':
       return {
         shape: styles.shapeSettings,
@@ -684,7 +698,7 @@ function viewFor(kind: TabKind, console: ConsoleName): TabView {
             <span className={`${styles.badge} ${badge.tone}`} data-audit="fileTabBadge">
               {badge.label}
             </span>
-            <span>{basename(kind.path)}{kind.kind === 'clipboardDiff' ? ' vs Clipboard' : ''}</span>
+            <span>{basename(kind.path)}{kind.kind === 'clipboardDiff' ? ` vs ${kind.label ?? 'Clipboard'}` : ''}</span>
           </>
         ),
         closable: true,

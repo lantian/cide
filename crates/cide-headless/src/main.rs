@@ -50,6 +50,7 @@ usage:
   cide-headless properties <path>         what the properties card would say about a path
   cide-headless remote                    what a remote listener would bind, and who is paired
   cide-headless sessions <root>           the session journal's rows for a project, newest first
+  cide-headless history <root> [path]     Local History: a project's timeline, or one file's
   cide-headless version                   print this binary's version";
 
 fn main() {
@@ -75,12 +76,128 @@ fn main() {
         "properties" => properties(rest),
         "remote" => remote(),
         "sessions" => sessions(rest),
+        "history" => history(rest),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         "version" | "-V" | "--version" => emit(&format!("{}\n", version())),
         other => {
             eprintln!("cide-headless: unknown subcommand `{other}`");
             usage_and_exit();
         }
+    }
+}
+
+/// A project's Local History, as its store holds it.
+///
+/// Opened through the store rather than read as a file, so a damaged log is reported the way the
+/// app would see it. With cide running this comes up read-only, which is the point of the store's
+/// lock: an inspector must not become a second writer. With nothing running it is the writer for
+/// as long as this takes, and the only thing that does is cut a torn tail.
+fn history(args: &[String]) {
+    let Some(raw) = args.first() else {
+        eprintln!("cide-headless: history needs a project root");
+        usage_and_exit();
+    };
+    let root = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+    let dir = cide_local_history::dir_for(&root);
+    if !cide_local_history::exists(&dir) {
+        emit(&format!(
+            "{}: no Local History at {}\n",
+            root.display(),
+            dir.display()
+        ));
+        return;
+    }
+    let store = match cide_local_history::Store::open(&dir) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("cide-headless: {}: {error}", dir.display());
+            std::process::exit(1);
+        }
+    };
+    let Some(id) = root.to_str().and_then(|root| store.root_id(root)) else {
+        emit(&format!("{}: not a root of this store\n", root.display()));
+        return;
+    };
+    let stats = store.stats();
+    let mut out = format!(
+        "{}\n  {} rows over {} paths, {} of live blobs in {} on disk, log {}{}{}\n",
+        dir.display(),
+        stats.rows,
+        stats.paths,
+        byte_size(stats.live_bytes),
+        byte_size(stats.disk_bytes),
+        byte_size(stats.log_bytes),
+        if store.is_writable() {
+            ""
+        } else {
+            ", read-only"
+        },
+        if stats.skipped_lines > 0 {
+            format!(", {} unreadable log lines", stats.skipped_lines)
+        } else {
+            String::new()
+        },
+    );
+    out.push_str(if store.baseline_done(id) {
+        "  first scan finished\n"
+    } else {
+        "  first scan not finished\n"
+    });
+    match args.get(1) {
+        Some(path) => {
+            let rel = path.trim_start_matches("./").trim_end_matches('/');
+            let versions = store.versions(id, rel);
+            out.push_str(&format!("{rel}: {} version(s)\n", versions.len()));
+            for version in versions {
+                out.push_str(&format!(
+                    "  {:>8}  {}  {:<9} {:<9} {:>10}{}{}\n",
+                    version.id,
+                    stamp(version.ts),
+                    format!("{:?}", version.kind),
+                    format!("{:?}", version.source),
+                    byte_size(version.size),
+                    if version.omitted { "  (not kept)" } else { "" },
+                    version
+                        .moved
+                        .map_or(String::new(), |other| format!("  (moved: {other})")),
+                ));
+            }
+        }
+        None => {
+            for group in store.groups(id, "", None, 50) {
+                let what = match (&group.label, group.snapshot) {
+                    (Some(label), _) => format!("label: {label}"),
+                    (None, true) => format!("first snapshot, {} files", group.files),
+                    (None, false) => format!("{} file(s)", group.files),
+                };
+                out.push_str(&format!(
+                    "  {}  {:<9} {what}\n",
+                    stamp(group.ts),
+                    format!("{:?}", group.source),
+                ));
+            }
+        }
+    }
+    emit(&out);
+}
+
+/// A timestamp in local time, to the second.
+fn stamp(ts_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms as i64).map_or_else(
+        || ts_ms.to_string(),
+        |time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        },
+    )
+}
+
+fn byte_size(bytes: u64) -> String {
+    match bytes {
+        0..1_024 => format!("{bytes} B"),
+        1_024..1_048_576 => format!("{:.1} KiB", bytes as f64 / 1_024.0),
+        _ => format!("{:.1} MiB", bytes as f64 / 1_048_576.0),
     }
 }
 

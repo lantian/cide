@@ -47,6 +47,17 @@
 //!
 //! Nothing else in the crate is allowed to re-derive either answer: `Index` asks `admits`, the
 //! watcher asks `watchable`, and the app's watch list is `dir_paths()` put through `watchable`.
+//!
+//! # A third question: [`Filter::capturable`]
+//!
+//! "Is this one of the project's files, as far as keeping old versions of it goes?" Neither answer
+//! above is that question, and using either would have been wrong in a way nobody sees until a
+//! file cannot be recovered. `admits` follows [`Visibility`], so with *show ignored files* on
+//! (the shipped default) it says yes to everything under `target/`, and a pass built on it would
+//! copy a build directory into Local History. `watchable` also follows `hidden`, and says yes to
+//! `.git/HEAD` and to all of `.cide/`, which are watched for reasons that have nothing to do with
+//! their being the user's source. So `capturable` is a third function here, beside the other two
+//! and built from the same matchers, rather than a re-derivation in `cide-app` that would drift.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -710,6 +721,42 @@ impl Filter {
         }
     }
 
+    /// Whether Local History keeps versions of this path. See the module note.
+    ///
+    /// Independent of [`Visibility`] on purpose, so turning *show hidden files* off does not
+    /// quietly stop `.github/` being versioned, and turning *show ignored files* on does not
+    /// start `target/` being versioned. It follows the user's indexing exclusions, which are the
+    /// one place they can say "not this folder".
+    ///
+    /// `.cide/` is refused as a whole rather than down to the two folders the default exclusions
+    /// name. The exclusions are editable and `[]` is a valid list, and the things under there are
+    /// the worst possible input: `worktrees/` holds a complete checkout per agent run, and the
+    /// tracker rewrites its files on every status change. Being a committed directory it also
+    /// has git to recover it from, which is the point of Local History's own files.
+    ///
+    /// A path outside every root is refused too, and that includes a linked worktree's git
+    /// directory, which `watchable` lets through.
+    ///
+    /// `..` is refused rather than resolved. [`Filter::root_of`] is `starts_with`, which is
+    /// lexical, so `<root>/../elsewhere/a.rs` is "under" the root as far as it knows. What this
+    /// answers becomes a path a restore writes to, so a spelling that can climb out is not one
+    /// to give the benefit of the doubt.
+    pub fn capturable(&self, path: &Path, is_dir: bool) -> bool {
+        let Some(root) = self.root_of(path) else {
+            return false;
+        };
+        let Ok(rel) = path.strip_prefix(root) else {
+            return false;
+        };
+        let reserved = rel.components().any(|c| match c {
+            Component::Normal(name) => name == GIT_DIR || name == CIDE_DIR,
+            _ => true,
+        });
+        !reserved
+            && self.exclusions.matching_rule(path, is_dir).is_none()
+            && !self.is_ignored(path, is_dir)
+    }
+
     /// The part of the decision [`Visibility`] has no say in.
     fn classify(&self, path: &Path) -> Verdict {
         // [`GIT_NEVER`] before everything, including the watched list. That order *is* the
@@ -1259,6 +1306,54 @@ mod tests {
             "including a whitelisted path inside an ignored glob"
         );
         assert_eq!(filter.visibility(), shown);
+    }
+
+    /// `capturable` must give one answer under all four visibilities, because the setting that
+    /// decides what the tree draws has no business deciding which files can be recovered.
+    #[test]
+    fn what_local_history_keeps_does_not_follow_what_the_tree_shows() {
+        let dir = scratch("filter-capturable");
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(dir.join(".cide/worktrees/run/src")).unwrap();
+        std::fs::create_dir_all(dir.join("big/assets")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n*.log\n").unwrap();
+        let exclusions = std::sync::Arc::new(
+            crate::Exclusions::compile(vec![dir.to_path_buf()], &["big".to_owned()]).unwrap(),
+        );
+
+        for (hidden, ignored) in [(false, false), (false, true), (true, false), (true, true)] {
+            let filter = Filter::build(
+                &[dir.to_path_buf()],
+                vec![dir.path()],
+                Visibility { hidden, ignored },
+            )
+            .with_exclusions(std::sync::Arc::clone(&exclusions));
+            let keeps = |path: &str| filter.capturable(&dir.join(path), false);
+
+            assert!(keeps("src/main.rs"), "hidden={hidden} ignored={ignored}");
+            assert!(
+                keeps(".github/workflows/ci.yml"),
+                "a dotfile is a project file with hidden files off too"
+            );
+            assert!(
+                !keeps("target/debug/x.o"),
+                "show ignored files must not copy a build directory into the store"
+            );
+            assert!(!keeps("noise.log"));
+            assert!(!keeps(".git/HEAD"), "watched is not the same as kept");
+            assert!(!keeps(".cide/config.json"));
+            assert!(
+                !keeps(".cide/worktrees/run/src/main.rs"),
+                "an agent's checkout, which the default exclusions name but a user can clear"
+            );
+            assert!(
+                !keeps("big/assets/a.bin"),
+                "the user's exclusions are honoured"
+            );
+            assert!(!filter.capturable(&dir.join("../elsewhere/a.rs"), false));
+        }
     }
 
     #[test]

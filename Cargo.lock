@@ -722,6 +722,7 @@ dependencies = [
  "cide-ide-mcp",
  "cide-ipc",
  "cide-lang",
+ "cide-local-history",
  "cide-lsp",
  "cide-pty",
  "cide-remote",
@@ -904,11 +905,13 @@ dependencies = [
 name = "cide-headless"
 version = "0.16.4-dev"
 dependencies = [
+ "chrono",
  "cide-agents",
  "cide-core",
  "cide-docker",
  "cide-ext",
  "cide-ipc",
+ "cide-local-history",
  "cide-pty",
  "cide-remote",
  "cide-spec",
@@ -965,6 +968,21 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "cide-local-history"
+version = "0.16.4-dev"
+dependencies = [
+ "blake3",
+ "chrono",
+ "cide-core",
+ "cide-ipc",
+ "flate2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

@@ -1001,6 +1001,30 @@ fn build() -> Vec<Command> {
          * command nobody runs hourly is the wrong trade, and `git.history.file` — the command
          * this one sits beside in every menu — ships with no chord for the same reason.
          */
+        // Local History, in `FILE` and not in `GIT`: it works in a project with no repository, and
+        // `git.history.file` beside it is a different question with a nearly identical name.
+        // `fileTabActive` for the same reason that one has it. No chord on any of the three, on
+        // `file.properties`' reasoning: the context menus are where these are reached from.
+        Command::new("localHistory.show", "Local History: show history", FILE)
+            .when("projectOpen && fileTabActive")
+            .keywords(&[
+                "file history",
+                "versions",
+                "restore",
+                "revert",
+                "backup",
+                "undo",
+            ]),
+        Command::new(
+            "localHistory.showProject",
+            "Local History: show project history",
+            FILE,
+        )
+        .when("projectOpen")
+        .keywords(&["file history", "versions", "restore", "deleted", "recover"]),
+        Command::new("localHistory.putLabel", "Local History: put label", FILE)
+            .when("projectOpen")
+            .keywords(&["checkpoint", "bookmark", "snapshot", "version"]),
         Command::new("file.properties", "File properties", FILE)
             .when("projectOpen && fileTabActive")
             .keywords(&[

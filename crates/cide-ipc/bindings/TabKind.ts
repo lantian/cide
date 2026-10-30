@@ -43,7 +43,17 @@ export type TabKind = { "kind": "claudeHome" } | { "kind": "conversation", id: s
  * learnt the same way. `false` is also the right answer for such a tab: the user opened
  * it.
  */
-ephemeral: boolean, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "clipboardDiff", path: string, snapshotId: string, dirty: boolean, } | { "kind": "diff", spec: DiffSpec, 
+ephemeral: boolean, } | { "kind": "file", path: string, dirty: boolean, } | { "kind": "localHistory", path: string | null, 
+/**
+ * Recorded rather than read from the disk, because this view is exactly how a folder
+ * that no longer exists gets its files back.
+ */
+folder: boolean, } | { "kind": "clipboardDiff", path: string, snapshotId: string, dirty: boolean, 
+/**
+ * What the left side is, when it is not the clipboard: a Local History version, whose
+ * per-block arrows are this feature's partial restore. `None` reads as *Clipboard*.
+ */
+label: string | null, } | { "kind": "diff", spec: DiffSpec, 
 /**
  * A **preview** tab: the one slot a single click in the git panel is allowed to
  * re-point at another file. VS Code's preview tab, and taken deliberately.

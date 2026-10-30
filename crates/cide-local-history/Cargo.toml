@@ -1,0 +1,29 @@
+[package]
+name = "cide-local-history"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# `VersionKind` and `VersionSource` are the disk format and the wire format at once, the same
+# arrangement `cide-tasks` has with its DTOs and for the same reason.
+cide-ipc = { workspace = true }
+# `state_dir`, `sync_dir`, `write_atomic` and the project key. The store's location comes from the
+# same place every other per-project directory does, so a profile isolates it without being told.
+cide-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Both already in the build. `blake3` names a blob, as it names an image snapshot and a buffer.
+# `flate2` with its default `rust_backend` is `miniz_oxide`, which the image decoders build anyway:
+# deflate is not the best ratio available, and `zstd` would be better at both ratio and speed, but
+# it is a C build and a new line in the root `Cargo.toml` for a store of mostly small text files.
+blake3 = { workspace = true }
+flate2 = { workspace = true }
+# A "working day" is a local calendar day, which nothing in `std` can answer.
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# No dev-dependencies, as in `cide-tasks`: the tests build scratch directories from
+# `std::env::temp_dir()`, and a temp-dir crate would be the workspace's first.

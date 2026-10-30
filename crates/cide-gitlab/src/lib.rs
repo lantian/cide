@@ -1566,25 +1566,13 @@ fn comparison_from_text(
         git::FileState,
         history::{RevSide, RevisionDiff},
     };
-    let mut patch = git2::Patch::from_buffers(
+    let hunks = cide_git::diff::hunks_between(
         old.as_bytes(),
-        Some(std::path::Path::new(&doc.old_path)),
+        std::path::Path::new(&doc.old_path),
         new.as_bytes(),
-        Some(std::path::Path::new(&doc.path)),
-        None,
+        std::path::Path::new(&doc.path),
     )
-    .map_err(|e| e.to_string())?;
-    let buffer = patch.to_buf().map_err(|e| e.to_string())?;
-    let hunks = if patch.num_hunks() == 0 {
-        vec![]
-    } else {
-        let diff = git2::Diff::from_buffer(&buffer).map_err(|e| e.to_string())?;
-        cide_git::diff::raw_file_at(&diff, 0)
-            .map_err(|e| format!("{e:?}"))?
-            .map(|raw| cide_git::diff::hunk_views(&raw))
-            .unwrap_or_default()
-    };
-    drop(patch);
+    .map_err(|e| format!("{e:?}"))?;
     Ok(RevisionDiff {
         images: None,
         path: doc.path.clone(),

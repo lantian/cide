@@ -193,6 +193,46 @@ pub fn create_in(roots: &[PathBuf], parent: &Path, name: &str, directory: bool) 
     Ok(target)
 }
 
+/// Create a file at exactly this path, with these bytes, or fail. Parents are created.
+///
+/// For putting a deleted file back. [`write_new_bytes`] answers a collision with the next free
+/// name, which is right when the name was invented and wrong here, where the name is the point.
+/// `create_new`, for the same reason it gives: a second writer taking the path between any check
+/// and this call gets [`FsError::Exists`] rather than being overwritten. A temp-and-rename would
+/// replace it, silently, and the one thing a restore must not do is destroy a newer file.
+///
+/// A failed write removes what it made, for that function's reason too.
+pub fn create_exact(roots: &[PathBuf], path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    check_within(roots, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?;
+    std::fs::create_dir_all(parent).map_err(|err| FsError::io(parent, err))?;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(FsError::Exists(path.display().to_string()));
+        }
+        Err(err) => return Err(FsError::io(path, err)),
+    };
+    if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(FsError::io(path, err));
+    }
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| FsError::io(parent, err))
+}
+
 /// Write `bytes` into `parent` under `name`, or the nearest free variation of it. (M35)
 ///
 /// The one route in this workspace that writes **binary** contents to a file. Everything else —
@@ -306,6 +346,37 @@ pub fn delete(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reason this exists instead of a rename: a file that appeared since the check must be
+    /// refused, not replaced, because restoring over it would lose the newer one.
+    #[test]
+    fn create_exact_refuses_a_path_that_exists_and_makes_parents_for_one_that_does_not() {
+        let dir = crate::testing::scratch("create-exact");
+        let roots = [dir.path().to_path_buf()];
+        let file = dir.join("deep/er/a.txt");
+
+        create_exact(&roots, &file, b"one", 0o640).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"one");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+
+        let again = create_exact(&roots, &file, b"two", 0o640);
+        assert!(matches!(again, Err(FsError::Exists(_))));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"one",
+            "the newer file is untouched"
+        );
+
+        let outside = create_exact(
+            &roots,
+            std::path::Path::new("/elsewhere/a.txt"),
+            b"x",
+            0o644,
+        );
+        assert!(matches!(outside, Err(FsError::OutsideProject(_))));
+    }
     use crate::testing::scratch;
 
     #[test]

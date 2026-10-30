@@ -129,6 +129,8 @@ pub struct Settings {
     pub proxy: ProxySettings,
     pub sidebar: SidebarSettings,
     pub explorer: ExplorerSettings,
+    /// The versions cide keeps of a project's files. See [`LocalHistorySettings`].
+    pub local_history: LocalHistorySettings,
     pub inspections: InspectionSettings,
     pub git: GitSettings,
     /// Which models an opencode run may use, and in what order. (M45) See [`crate::llm`].
@@ -151,6 +153,53 @@ pub struct Settings {
     /// Whether cide asks GitHub for a newer release on start, and which one the user said to
     /// stop mentioning. (`cide-app`'s `updater` module)
     pub update: UpdateSettings,
+}
+
+/// What Local History keeps, machine-wide. A project can only override [`Self::enabled`], from
+/// `local-history-settings.json`: the limits are about this machine's disk, not about a project.
+///
+/// **No `0 days disables it`**, which is how JetBrains spells off. A retention setting that means
+/// "stop" at one value is a number field with a hidden switch in it, and here there is a real
+/// switch at two levels, so [`Self::days_to_keep`] clamps to at least one. Turning the feature
+/// off never deletes anything either: that is a separate, explicit action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct LocalHistorySettings {
+    pub enabled: bool,
+    /// Working days of history per file, where a working day is a day that file changed.
+    pub days_to_keep: u32,
+    /// Files larger than this get a row saying they changed, and no copy.
+    #[serde(rename = "maxFileSizeMiB")]
+    pub max_file_size_mib: u32,
+    /// Stored bytes per project. Soft by the size of the tree as it stands today, because the
+    /// newest version of a live file is never evicted. See `cide_local_history`'s `retention`.
+    #[serde(rename = "maxStorageMiB")]
+    pub max_storage_mib: u32,
+}
+
+impl Default for LocalHistorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            days_to_keep: 5,
+            max_file_size_mib: 5,
+            max_storage_mib: 1024,
+        }
+    }
+}
+
+impl LocalHistorySettings {
+    /// Applied where a patch lands, for the reason every other clamp is: the Settings control
+    /// clamps too, and a clamp that lives only there is one `invoke` away from being bypassed.
+    pub fn clamped(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            days_to_keep: self.days_to_keep.clamp(1, 3650),
+            max_file_size_mib: self.max_file_size_mib.clamp(1, 1024),
+            max_storage_mib: self.max_storage_mib.clamp(64, 1024 * 1024),
+        }
+    }
 }
 
 /// A global modal preference, independent of bottom tool-window layout.
@@ -189,6 +238,7 @@ impl Default for Settings {
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
             explorer: ExplorerSettings::default(),
+            local_history: LocalHistorySettings::default(),
             inspections: InspectionSettings::default(),
             git: GitSettings::default(),
             llm: crate::llm::LlmSettings::default(),

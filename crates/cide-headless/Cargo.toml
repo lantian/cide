@@ -24,6 +24,9 @@ cide-pty = { workspace = true }
 # and `cide_agents::load_project` — so an `AppHandle` reached for in either crate stops this
 # binary building the same way one in `cide-core` does.
 cide-tasks = { workspace = true }
+cide-local-history = { workspace = true }
+# `history` prints timestamps in local time.
+chrono = { workspace = true }
 # And `cide-spec`, for the same reason: M28 added it, and a crate this binary does not link is a
 # crate the no-tauri proof does not cover. It is also the only way to see whether this machine's
 # `openspec` is findable from a launch whose PATH is not a shell's.

@@ -47,7 +47,9 @@ function tabTitle(kind: TabKind, console: string): string {
     case 'conversation':
       return kind.title
     case 'clipboardDiff':
-      return `${kind.path.split('/').at(-1) ?? kind.path} vs Clipboard`
+      return `${kind.path.split('/').at(-1) ?? kind.path} vs ${kind.label ?? 'Clipboard'}`
+    case 'localHistory':
+      return kind.path === null ? 'Local History' : `History: ${kind.path.split('/').at(-1) ?? kind.path}`
     case 'file':
       return kind.path.split('/').at(-1) ?? kind.path
     case 'diff':

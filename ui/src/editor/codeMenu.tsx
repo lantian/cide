@@ -60,6 +60,7 @@
  * conversations for the range under the caret. Two different acts. `Alt-Enter` in the buffer is
  * bound in `EditorSurface` and is the keyboard route to the *automatic* destination.
  */
+import { openLocalHistory, requestPutLabel } from '@/localhistory/actions'
 import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/commands'
 import { openSearchPanel } from '@codemirror/search'
 import type { EditorView } from '@codemirror/view'
@@ -686,6 +687,32 @@ export function useCodeMenu({
               : () => {
                   onShowHistory(path)
                 },
+        },
+        {
+          id: 'localHistory',
+          label: 'Local History',
+          // Works with no repository and in any window, so nothing here asks about a tool window.
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is no history to show'
+              : undefined,
+          submenu:
+            project === undefined
+              ? undefined
+              : () => [
+                  {
+                    id: 'localHistory.show',
+                    label: 'Show History',
+                    command: 'localHistory.show',
+                    run: () => openLocalHistory(project, path, false),
+                  },
+                  {
+                    id: 'localHistory.putLabel',
+                    label: 'Put Label\u2026',
+                    command: 'localHistory.putLabel',
+                    run: () => requestPutLabel(project),
+                  },
+                ],
         },
         { kind: 'separator' },
         /*

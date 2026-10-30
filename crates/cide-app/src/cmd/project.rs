@@ -1696,6 +1696,7 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
         (TabKind::Conversation { id: a, .. }, TabKind::Conversation { id: b, .. }) => a == b,
         (TabKind::File { path: a, .. }, TabKind::File { path: b, .. }) => a == b,
         (TabKind::Settings { .. }, TabKind::Settings { .. }) => true,
+        (TabKind::LocalHistory { path: a, .. }, TabKind::LocalHistory { path: b, .. }) => a == b,
         // A documentation tab is its subject — the question, never the title, which is a
         // caption written from one answer. (M60)
         (TabKind::Docs { subject: a, .. }, TabKind::Docs { subject: b, .. }) => a == b,

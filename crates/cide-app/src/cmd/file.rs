@@ -1362,7 +1362,7 @@ pub fn tab_set_dirty(
 /// has never taken one, and the question these roots answer is not "which project is this file
 /// in" but "has the user opened this directory at all". A file that is a project root in the
 /// window behind this one is still the user's own code.
-fn open_roots(state: &WorkspaceState) -> Vec<PathBuf> {
+pub(crate) fn open_roots(state: &WorkspaceState) -> Vec<PathBuf> {
     state.with(|ws| {
         ws.projects
             .iter()
@@ -1533,14 +1533,22 @@ pub(crate) fn read_document(path: &Path, roots: &[PathBuf], caches: &[PathBuf]) 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn file_write(
     state: State<'_, WorkspaceState>,
+    history: State<'_, std::sync::Arc<crate::local_history::Registry>>,
     path: String,
     text: String,
     if_unchanged: Option<cide_ipc::FileStamp>,
 ) -> Result<Option<cide_ipc::FileStamp>> {
     let roots = open_roots(&state);
     let caches = cide_core::toolchain::dependency_roots();
-    blocking(move || write_document(&PathBuf::from(path), &text, &roots, &caches, if_unchanged))
-        .await
+    let history = std::sync::Arc::clone(&history);
+    blocking(move || {
+        let path = PathBuf::from(path);
+        let save = crate::local_history::PendingSave::begin(&history, &path);
+        let stamp = write_document(&path, &text, &roots, &caches, if_unchanged)?;
+        save.finish(text.into_bytes());
+        Ok(stamp)
+    })
+    .await
 }
 
 /// [`file_write`]'s body, over values. See [`read_document`].
@@ -1657,19 +1665,19 @@ pub async fn file_read_bytes(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn file_write_bytes(
     state: State<'_, WorkspaceState>,
+    history: State<'_, std::sync::Arc<crate::local_history::Registry>>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<Option<cide_ipc::FileStamp>> {
     let (write, bytes) = bytes_request(request.body())?;
     let roots = open_roots(&state);
     let caches = cide_core::toolchain::dependency_roots();
+    let history = std::sync::Arc::clone(&history);
     blocking(move || {
-        write_document_bytes(
-            &PathBuf::from(write.path),
-            &bytes,
-            &roots,
-            &caches,
-            write.if_unchanged,
-        )
+        let path = PathBuf::from(write.path);
+        let save = crate::local_history::PendingSave::begin(&history, &path);
+        let stamp = write_document_bytes(&path, &bytes, &roots, &caches, write.if_unchanged)?;
+        save.finish(bytes);
+        Ok(stamp)
     })
     .await
 }

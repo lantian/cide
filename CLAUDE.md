@@ -14,7 +14,7 @@ backend, React 19 + Vite 8 frontend, Linux-first (developed on KDE/Wayland; macO
 | [`docs/running.md`](docs/running.md) | launching, profiles, the sibling forks, `openspec`, the one-instance guard, `run.sh` flags |
 | [`docs/checks.md`](docs/checks.md) | what to run after touching a surface, and the silent failures each surface has paid for |
 | [`docs/architecture.md`](docs/architecture.md) | crate graph, state loop, wire contract, command registry, pane hosts, PTY/Claude hosting, on-disk files |
-| [`docs/adr/`](docs/adr/) | decisions a refactor would otherwise undo — 0001–0003 before anything structural, 0009 before conflicts, 0010 before `ui/src/ext/` |
+| [`docs/adr/`](docs/adr/) | decisions a refactor would otherwise undo — 0001–0003 before anything structural, 0009 before conflicts, 0010 before `ui/src/ext/`, 0016 before Local History |
 | [`docs/journal.md`](docs/journal.md) | the honest milestone record, including what was never confirmed on a display. **Read before assuming a feature works end to end; append to it (not the README) when finishing a milestone.** Take the next `Mnn` from its own headings |
 | [`docs/platforms.md`](docs/platforms.md) | what is known off Linux, and type-checking macOS arms from Linux |
 | [`docs/forks.md`](docs/forks.md) | the rust-analyzer, salsa and gopls forks (`../forks/*`); each fork has its own `CLAUDE.md` — read it before touching that repo |
@@ -41,7 +41,7 @@ pnpm --dir ui install     # once
 - Per-machine overrides (`CIDE_RA_PATH`, `CIDE_GOPLS_PATH`, `CIDE_OPENSPEC_PATH`, …) go in a
   gitignored `.env`, which `run.sh` sources.
 - `run.sh` must stay bash-3.2-clean (macOS): `./scripts/check-bash32.sh`.
-- Inspect state without a GUI: `./target/debug/cide-headless tree|tasks|agents|spec|docker|remote|properties|ext|…`.
+- Inspect state without a GUI: `./target/debug/cide-headless tree|tasks|agents|spec|docker|remote|properties|ext|history|…`.
 
 ## Checking it
 
@@ -173,6 +173,7 @@ before you change it.
 | [What survives a crash, a power cut or an OS shutdown](docs/checks.md#what-survives-a-crash-a-power-cut-or-an-os-shutdown) | `cargo test -p cide-core -- persist buffers document`, `cargo test -p cide-app -- agents workspace_state lifecycle`, `cargo test -p cide-tasks`, `cargo test -p cide-git`, `cargo test -p cide-gitlab`, `cargo test -p cide-remote`, `cargo test -p cide-fs`, `check:editor` |
 | [The updater](docs/checks.md#the-updater) | `cargo test -p cide-app updater`, `cargo test -p cide-app app_menu`, `cargo test -p xtask`, `python3 scripts/updater-manifest.py --self-test`, `cargo --locked xtask contract-check`, `cargo --locked xtask codegen --check`, `check:commands`, `check:keys`, `check:switcher`, `check:selectors` |
 | [The session journal and the Sessions tab](docs/checks.md#the-session-journal-and-the-sessions-tab) | `cargo test -p cide-core sessions`, `cargo test -p cide-app -- agents workspace_state lifecycle`, `check:sessions`, `check:agents-render`, `check:selectors`, `cargo --locked xtask codegen --check`, `cargo --locked xtask contract-check` |
+| [Local History](docs/checks.md#local-history) | `cargo test -p cide-local-history`, `cargo test -p cide-app local_history`, `cargo test -p cide-fs -- filter create_exact`, `cargo test -p cide-core local_history`, `cargo test -p cide-git diff`, `cargo test -p cide-agents settings_`, `check:local-history`, `check:tab-overflow`, `check:tab-drag`, `check:menu-model`, `check:commands`, `check:settings-copy`, `check:ui-scale`, `check:unlisten`, `cargo --locked xtask codegen --check`, `cargo --locked xtask contract-check` |
 | [Added, renamed or moved any file](docs/checks.md#added-renamed-or-moved-any-file) | `check:casing` |
 | [The Settings screen](docs/checks.md#the-settings-screen) | `check:settings-copy`, `check:kit`, `check:claude-env`, `check:claude-cli`, `check:handshake`, `check:ext`, `check:ext-render`, `check:pools`, `check:settings-agents`, `check:remote`, `check:keymap`, `check:proxy`, `check:editor`, `check:sidebar`, `check:scheme`, `check:ui-scale`, `check:motion`, `cargo --locked xtask contract-check` |
 | [The UI kit, or any new UI](docs/checks.md#the-ui-kit-or-any-new-ui) | `check:kit`, `check:ui-scale`, `check:motion`, `check:theme`, `check:ui-icons`, `check:menus` |

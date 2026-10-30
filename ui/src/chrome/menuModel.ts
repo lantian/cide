@@ -240,6 +240,8 @@ export interface TabActions {
    * that is conditionally drawn, not the whole gesture.
    */
   properties?: ((path: string) => void) | undefined
+  /** *Local History* — opens the history tab for a file. Any window: it is a tab of the project. */
+  localHistory?: ((path: string) => void) | undefined
 }
 
 /**
@@ -305,7 +307,17 @@ export function tabMenuEntries(
   activeTab: TabId,
   actions: TabActions,
 ): MenuEntry[] {
-  const { close, closeMany, split, detach, copy, history, properties, compareClipboard } = actions
+  const {
+    close,
+    closeMany,
+    split,
+    detach,
+    copy,
+    history,
+    properties,
+    compareClipboard,
+    localHistory,
+  } = actions
   const index = tabs.indexOf(tab)
   const others = tabs.filter((t) => t !== tab && closable(t))
   /*
@@ -411,6 +423,17 @@ export function tabMenuEntries(
           }),
     },
     {
+      id: 'localHistory',
+      label: 'Show Local History',
+      command: 'localHistory.show',
+      ...(absolute !== null && localHistory
+        ? { run: () => localHistory(absolute) }
+        : {
+            disabledReason:
+              path === null ? NOT_A_FILE : absolute === null ? RELATIVE_DIFF_PATH : NO_HOST,
+          }),
+    },
+    {
       // Carries the command id for the chord chip, like `history` above — nothing today, and
       // correct: this is the same act as the palette row.
       //
@@ -477,7 +500,9 @@ function overflowLabel(tab: Tab): string {
     case 'claudeFull':
       return tab.kind.title
     case 'clipboardDiff':
-      return `${basename(tab.kind.path)} vs Clipboard`
+      return `${basename(tab.kind.path)} vs ${tab.kind.label ?? 'Clipboard'}`
+    case 'localHistory':
+      return tab.kind.path === null ? 'Local History' : `History: ${basename(tab.kind.path)}`
     case 'file':
       return basename(tab.kind.path)
     case 'diff':

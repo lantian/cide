@@ -97,6 +97,7 @@
     "check:paths": "node scripts/check-paths.mjs",
     "check:peer-chat": "node scripts/check-peer-chat.mjs",
     "check:picker": "node scripts/check-picker.mjs",
+    "check:local-history": "node scripts/check-local-history.mjs",
     "check:pools": "node scripts/check-pools.mjs",
     "check:problems": "node scripts/check-problems.mjs",
     "check:properties": "node scripts/check-properties.mjs",

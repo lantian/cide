@@ -122,6 +122,12 @@ impl WorkspaceState {
             Ok(projects) => workspace.project_indexing = projects,
             Err(error) => tracing::warn!(%error, "could not load project indexing settings"),
         }
+        match cide_core::local_history_settings::load(
+            &persist::config_dir().join("local-history-settings.json"),
+        ) {
+            Ok(projects) => workspace.project_local_history = projects,
+            Err(error) => tracing::warn!(%error, "could not load project Local History settings"),
+        }
         for project in workspace.projects.values_mut() {
             for tab in &mut project.tabs {
                 if let Some(chat) = &mut tab.peer_chat {

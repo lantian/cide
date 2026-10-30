@@ -78,6 +78,7 @@ import { openFileProperties } from '@/chrome/filePropertiesOpen'
 import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { notify, notifyFailure } from '@/chrome/notices'
+import { openLocalHistory, requestPutLabel } from '@/localhistory/actions'
 import { checkForUpdates } from '@/chrome/updates'
 import { beginGitOp } from '@/chrome/gitOpStore'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
@@ -438,6 +439,12 @@ function pathArg(args: unknown): string | null {
   if (typeof args !== 'object' || args === null) return null
   const path = (args as { path?: unknown }).path
   return typeof path === 'string' ? path : null
+}
+
+/** `args.folder` — the tree row a Local History menu was opened on is a directory. */
+function folderArg(args: unknown): boolean {
+  if (typeof args !== 'object' || args === null) return false
+  return (args as { folder?: unknown }).folder === true
 }
 
 /** `args.rev` — a full oid from a log row, for the commands a context menu opens on one. */
@@ -1572,6 +1579,49 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
               if (current()) notifyFailure(error)
             })
         })
+        return
+      }
+
+      /*
+       * The three Local History commands, with no window guard and no repository: an overlay and
+       * a tab open from any window of any project. A sentence on every refusal, `file.properties`'
+       * reason: these are bindable, and a key that does nothing is the defect.
+       */
+      case 'localHistory.show': {
+        const path = pathArg(args) ?? focusedTabPath(boot())
+        const project = activeProjectOf(boot())
+        if (project === null) {
+          notify('No project is open, so there is no history to show.', { kind: 'warn' })
+          return
+        }
+        if (path === null) {
+          notify('No file tab is active, so there is no file to show history for.', {
+            kind: 'warn',
+            hint: 'Right-click a row in the file tree to see any file\u2019s history.',
+          })
+          return
+        }
+        openLocalHistory(project.id, path, folderArg(args))
+        return
+      }
+
+      case 'localHistory.showProject': {
+        const project = activeProjectOf(boot())
+        if (project === null) {
+          notify('No project is open, so there is no history to show.', { kind: 'warn' })
+          return
+        }
+        openLocalHistory(project.id, null, true)
+        return
+      }
+
+      case 'localHistory.putLabel': {
+        const project = activeProjectOf(boot())
+        if (project === null) {
+          notify('No project is open, so there is nothing to label.', { kind: 'warn' })
+          return
+        }
+        requestPutLabel(project.id)
         return
       }
 

@@ -11,6 +11,7 @@ import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
+import type { LocalHistorySettings } from "./LocalHistorySettings";
 import type { OpenRunIn } from "./OpenRunIn";
 import type { OpencodeSettings } from "./OpencodeSettings";
 import type { ProxySettings } from "./ProxySettings";
@@ -145,7 +146,11 @@ codex: CodexSettings,
 /**
  * OpenCode launch configuration, shared by consoles, runs and one-shots.
  */
-opencode: OpencodeSettings, decision: DecisionSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, 
+opencode: OpencodeSettings, decision: DecisionSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, 
+/**
+ * The versions cide keeps of a project's files. See [`LocalHistorySettings`].
+ */
+localHistory: LocalHistorySettings, inspections: InspectionSettings, git: GitSettings, 
 /**
  * Which models an opencode run may use, and in what order. (M45) See [`crate::llm`].
  *

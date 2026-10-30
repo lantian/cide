@@ -29,6 +29,7 @@ pub mod ids;
 pub mod image;
 pub mod keymap;
 pub mod llm;
+pub mod local_history;
 pub mod milestones;
 /// The New project wizard: a probe of a path, a request, a checklist. (M97)
 pub mod new_project;
@@ -85,12 +86,12 @@ pub use settings::{
     Accent, AwaitingHighlight, ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections,
     ClaudeSettings, CodexCli, CodexInjections, CodexPermissionMode, CodexSettings, ConsoleHarness,
     DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
-    GraphicsSettings, HighlightLevel, InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS,
-    MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, OpenRunIn,
-    ProxyMode, ProxyScope, ProxySettings, ProxyTarget, RemoteBind, RemoteSettings,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings, SeverityFilter, SidebarSettings,
-    TaskProposalRunMode, TerminalRenderer, TerminalSettings, UpdateSettings, clamp_font_size,
-    clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
+    GraphicsSettings, HighlightLevel, InspectionSettings, LocalHistorySettings, MAX_CODE_FONT_SIZE,
+    MAX_PUSH_DEBOUNCE_MS, MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS,
+    MIN_UI_FONT_SIZE, OpenRunIn, ProxyMode, ProxyScope, ProxySettings, ProxyTarget, RemoteBind,
+    RemoteSettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings, SeverityFilter,
+    SidebarSettings, TaskProposalRunMode, TerminalRenderer, TerminalSettings, UpdateSettings,
+    clamp_font_size, clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     AccentPatch, GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem,

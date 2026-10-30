@@ -77,6 +77,7 @@ pub mod ide;
 pub mod instance;
 pub mod libraries;
 pub mod lifecycle;
+pub mod local_history;
 #[cfg(target_os = "linux")]
 pub mod logind;
 pub mod logring;
@@ -423,6 +424,9 @@ pub fn run() {
     // Behind an `Arc` because the flusher thread outlives the call that starts it; Tauri's
     // `State` hands out a reference, which a `thread::spawn` cannot keep.
     builder = builder.manage(std::sync::Arc::new(tasks_state::TasksStores::default()));
+    // Which projects keep a Local History. Beside the tracker for the same reason: a per-project
+    // registry that outlives no window and is reached from commands and the watcher alike.
+    builder = builder.manage(std::sync::Arc::new(local_history::Registry::default()));
     // M28. Behind an `Arc` for the same reason and one more: its coalescer spawns the flusher
     // thread that reads a board and emits it, and being the *only* thing that does so is what
     // lets `cide://spec-changed` carry no revision. See `emit::spec_changed`.
@@ -601,6 +605,20 @@ pub fn run() {
             cmd::file::terminal_open_path,
             cmd::file::tab_open_diff,
             cmd::compare_clipboard::tab_open_clipboard_diff,
+            cmd::local_history::local_history_status,
+            cmd::local_history::local_history_file,
+            cmd::local_history::local_history_groups,
+            cmd::local_history::local_history_group_files,
+            cmd::local_history::local_history_diff,
+            cmd::local_history::local_history_text,
+            cmd::local_history::local_history_patch,
+            cmd::local_history::local_history_label,
+            cmd::local_history::local_history_restore,
+            cmd::local_history::local_history_search,
+            cmd::local_history::local_history_clear,
+            cmd::local_history::local_history_plan,
+            cmd::local_history::local_history_restore_tree,
+            cmd::local_history::tab_open_local_history,
             cmd::compare_clipboard::clipboard_diff_content,
             cmd::compare_clipboard::shared_document_sync,
             cmd::file::tab_retarget_diff,
@@ -666,6 +684,8 @@ pub fn run() {
             cmd::settings::settings_defaults,
             cmd::settings::project_harness_get,
             cmd::settings::project_indexing_get,
+            cmd::settings::project_local_history_get,
+            cmd::settings::project_local_history_set,
             cmd::settings::project_indexing_set,
             cmd::settings::project_harness_set,
             decision::decision_snapshot,

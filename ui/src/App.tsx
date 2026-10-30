@@ -121,6 +121,8 @@ import { useUpdateNotices } from '@/chrome/updates'
 import { LogDetailCard } from '@/chrome/LogDetailCard'
 import { PullStrategyGate } from '@/chrome/PullStrategyGate'
 import { FileProperties } from '@/chrome/FileProperties'
+import { LocalHistoryTab } from '@/localhistory/LocalHistoryTab'
+import { PutLabelDialog } from '@/localhistory/PutLabelDialog'
 import { PushDialog } from '@/chrome/PushDialog'
 import { NewProjectWizard } from '@/chrome/newProject/NewProjectWizard'
 import { ConflictsDialog } from '@/chrome/ConflictsDialog'
@@ -1708,6 +1710,7 @@ export function App() {
         <NewProjectWizard />
         {overlay === 'projects' && <ProjectPicker onDismiss={closeOverlay} />}
         <ConflictsDialog />
+        <PutLabelDialog />
         {/*
           * The properties card, and `onOpenHistory` is deliberately **not** passed here.
           *
@@ -2676,6 +2679,19 @@ const WorkspaceContent = memo(function WorkspaceContent({
                       />
                     ) : tab.kind.kind === 'settings' ? (
                       <SettingsTab project={activeProject.id} section={tab.kind.section} />
+                    ) : tab.kind.kind === 'localHistory' ? (
+                      /*
+                       * Versions of a file or a folder, replacing the pane tree for the reasons
+                       * the arms around it give: a page about a file's past, and nothing for a
+                       * split to split. `active` because every tab stays mounted, and this one
+                       * must not fetch while hidden.
+                       */
+                      <LocalHistoryTab
+                        project={activeProject.id}
+                        path={tab.kind.path}
+                        folder={tab.kind.folder}
+                        active={active}
+                      />
                     ) : tab.kind.kind === 'extension' ? (
                       /*
                        * An extension's page, replacing the pane tree the way Settings does — and

@@ -1,4 +1,5 @@
 import { IndexingExclusions } from './IndexingExclusions'
+import { LocalHistoryGroup } from './LocalHistoryGroup'
 import { DecisionSection } from './DecisionSection'
 import { GitLabSettings } from '@/gitlab/GitLabSettings'
 /**
@@ -925,7 +926,9 @@ type EditorFlag = {
 function Files({ settings, patch, project = null }: SectionProps) {
   const explorer = settings.explorer
   const set = (next: Partial<ExplorerSettings>) => patch({ explorer: { ...explorer, ...next } })
-  const def = useSettingsDefaults()?.explorer
+  const defaults = useSettingsDefaults()
+  const def = defaults?.explorer
+  const localHistoryDefaults = defaults?.localHistory
 
   return (
     <>
@@ -984,6 +987,12 @@ function Files({ settings, patch, project = null }: SectionProps) {
         onChange={(v) => set({ showIgnoredFiles: v })}
       />
     </Group>
+    <LocalHistoryGroup
+      project={project}
+      value={settings.localHistory}
+      defaults={localHistoryDefaults}
+      onChange={(localHistory) => patch({ localHistory })}
+    />
     </>
   )
 }

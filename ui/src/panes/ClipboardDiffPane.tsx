@@ -6,7 +6,11 @@ import { Button } from '@/kit/components/Button'
 import { EditorPane, type EditorPaneProps } from './EditorPane'
 import styles from './ClipboardDiffPane.module.css'
 
-export function ClipboardDiffPane({ snapshotId, ...props }: EditorPaneProps & { snapshotId: string }) {
+export function ClipboardDiffPane({ snapshotId, label, ...props }: EditorPaneProps & {
+  snapshotId: string
+  /** What the left side is, when it is not the clipboard. */
+  label?: string | null | undefined
+}) {
   const [clip, setClip] = useState<{ id: string; text: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const layout = useSyncExternalStore(subscribeDiffView, getDiffView, getServerDiffView)
@@ -20,7 +24,7 @@ export function ClipboardDiffPane({ snapshotId, ...props }: EditorPaneProps & { 
   }, [snapshotId])
   return <div className={styles.pane}>
     <header className={styles.header}>
-      <span className={styles.label}>Clipboard vs {props.path.split('/').at(-1)}</span>
+      <span className={styles.label}>{label ?? 'Clipboard'} vs {props.path.split('/').at(-1)}</span>
       <div role="group" aria-label="Diff layout" className={styles.buttons}>
         {(['split', 'unified'] as const).map(mode => <Button key={mode} size="sm"
           aria-pressed={layout.view === mode} disabled={!layout.writable}
@@ -30,7 +34,7 @@ export function ClipboardDiffPane({ snapshotId, ...props }: EditorPaneProps & { 
     </header>
     {error ? <div role="alert">{error}</div> : null}
     <div className={styles.editor}>
-      {clip ? <EditorPane {...props} comparison={{ text: clip.text, id: clip.id, layout: layout.view }} />
+      {clip ? <EditorPane {...props} comparison={{ text: clip.text, id: clip.id, layout: layout.view, label: label ?? undefined }} />
         : <div role="status">Reading clipboard comparison…</div>}
     </div>
   </div>

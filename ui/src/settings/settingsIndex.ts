@@ -99,6 +99,12 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'files', label: 'Combined index memory', keywords: 'memory budget MiB total projects limit' },
   { section: 'files', label: 'Show hidden files', keywords: 'dotfiles dot .env tree explorer' },
   { section: 'files', label: 'Show ignored files', keywords: 'gitignore target node_modules tree explorer indexing slow' },
+  { section: 'files', label: 'Keep Local History', keywords: 'file history versions restore revert backup undo disable off' },
+  { section: 'files', label: 'Local History for this project', keywords: 'file history versions disable off override project local' },
+  { section: 'files', label: 'Days to keep', keywords: 'local history retention working days versions' },
+  { section: 'files', label: 'Largest file to keep', keywords: 'local history size limit MiB versions' },
+  { section: 'files', label: 'Storage per project', keywords: 'local history disk cap limit MiB versions' },
+  { section: 'files', label: "Clear this project's history", keywords: 'local history delete versions wipe disk' },
   // Inspections
   { section: 'inspections', label: 'Errors', keywords: 'severity diagnostics problems' },
   { section: 'inspections', label: 'Warnings', keywords: 'severity diagnostics problems' },

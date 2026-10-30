@@ -232,6 +232,7 @@ pub async fn fs_close(
     searches: State<'_, SearchRegistry>,
     logs: State<'_, LogRegistry>,
     clips: State<'_, FileClipState>,
+    history: State<'_, std::sync::Arc<crate::local_history::Registry>>,
     project: ProjectId,
 ) -> Result<bool, FsError> {
     // Serialize closure with Copy/Cut: a write already in flight must be cancelled too,
@@ -252,6 +253,10 @@ pub async fn fs_close(
     // is competing for. Nothing else sweeps them: without this they run to the end of the page's
     // scan budget, which on a large repository is the whole point of having a budget.
     logs.cancel_project(project);
+    // Here and not in `close_project`, or `FsRegistry::remove`, both of which a rebuild reaches:
+    // a re-index must not stop capture. The stopped worker is joined by the next one on this
+    // store, so a quick reopen cannot find the store's lock still held.
+    history.detach(project);
     close_project(&registry, &searches, project).await
 }
 
@@ -1415,12 +1420,14 @@ pub async fn fs_reveal_roots(
 /// is a buffer the user can still type into and **cannot save at all**, with `ENOENT` in the log
 /// and a dirty dot that nothing can clear. See [`cide_core::workspace::retarget_paths`], which is
 /// where the rule lives and where the reasoning is written down.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_rename(
     app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     state: State<'_, WorkspaceState>,
     positions: State<'_, Arc<crate::positions_state::PositionsState>>,
+    history: State<'_, Arc<crate::local_history::Registry>>,
     project: ProjectId,
     from: PathBuf,
     to: PathBuf,
@@ -1428,10 +1435,15 @@ pub async fn fs_rename(
     let fs = project_fs(&registry, project)?;
     let events: Arc<dyn FsEvents> = Arc::new(app);
     let moved = (from.clone(), to.clone());
+    let history = Arc::clone(&history);
+    let rename = moved.clone();
     blocking("fs_rename", move || {
         if rename_entry(&fs, &from, &to)? {
             events.status(project, &fs.status());
         }
+        // Before the event below, so that it arrives as one move and not as a file vanishing
+        // here and an unrelated one appearing there.
+        crate::local_history::moved(&history, &[rename]);
         // After the `?`, so a refused rename stays silent — and for `fs_delete`'s reason:
         // inside an ignored directory this event is the only road the move has into any
         // other window's tree.
@@ -1920,6 +1932,7 @@ pub async fn fs_paste(
     registry: State<'_, FsRegistry>,
     state: State<'_, WorkspaceState>,
     positions: State<'_, Arc<crate::positions_state::PositionsState>>,
+    history: State<'_, Arc<crate::local_history::Registry>>,
     project: ProjectId,
     source_project: Option<ProjectId>,
     clip_id: Option<String>,
@@ -1969,6 +1982,10 @@ pub async fn fs_paste(
             .map(|entry| (entry.source.clone(), entry.dest.clone()))
             .collect();
         follow_moves(&state, &positions, &moves);
+        // After the tree has heard, unlike `fs_rename`: `paste_into` emits as it goes, and only
+        // here are the destinations known. The store never drops a move's row as a duplicate,
+        // which is what keeps the link even though the destination may already be recorded.
+        crate::local_history::moved(&history, &moves);
     }
     Ok(pasted)
 }

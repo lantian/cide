@@ -1,0 +1,103 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--fs-ui-13);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.path {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: var(--fs-ui-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* Fixed, as the log's list is. A draggable split is not in the kit, and this page does not
+   need one: the column holds a time, a word and a badge. */
+.split {
+  display: grid;
+  flex: 1;
+  grid-template-columns: calc(320px * var(--ui-scale)) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.search {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+}
+
+.timeline {
+  flex: 1;
+  min-height: 0;
+}
+
+.scroller {
+  height: 100%;
+}
+
+.rowHost {
+  display: contents;
+}
+
+.day {
+  padding: var(--sp-3) var(--sp-3) var(--sp-1);
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+  font-weight: 600;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.hint {
+  color: var(--faint);
+  font-size: var(--fs-ui-11);
+}
+
+.files {
+  flex: 0 1 auto;
+  max-height: 30%;
+  overflow: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.diff {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}

@@ -274,10 +274,22 @@ try {
         '--',
         'copy-path',
         'history',
+        'localHistory',
         'properties',
       ],
-      'the workspace tab menu is the nine items, in three groups, with left before right',
+      'the workspace tab menu is these items, in three groups, with left before right',
     )
+    // Local History works with no repository, so unlike `history` it needs only a real path.
+    let asked_local = null
+    item(
+      tabMenuEntries(tabs, file, 't1', {
+        localHistory: (path) => {
+          asked_local = path
+        },
+      }),
+      'localHistory',
+    ).run()
+    eq(asked_local, file.kind.path, 'Show Local History hands over the absolute path')
     item(entries, 'close-right').run()
     eq(bulk.calls, [['t2']], 'Close to the right closes only what follows this tab, in one call')
 

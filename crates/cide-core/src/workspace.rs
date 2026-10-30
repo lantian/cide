@@ -521,6 +521,7 @@ pub fn tab_outlives_close(kind: &TabKind) -> bool {
         | TabKind::Conversation { .. }
         | TabKind::ClaudeFull { .. }
         | TabKind::File { .. }
+        | TabKind::LocalHistory { .. }
         | TabKind::Revision { .. }
         | TabKind::Extension { .. }
         | TabKind::OpenSpec { .. }
@@ -1254,9 +1255,13 @@ pub fn retarget_paths(ws: &mut Workspace, moves: &[(PathBuf, PathBuf)]) {
         .iter()
         .flat_map(|(id, p)| {
             p.tabs.iter().filter_map(move |t| {
-                let (TabKind::File { path, .. } | TabKind::ClipboardDiff { path, .. }) = &t.kind
-                else {
-                    return None;
+                let path = match &t.kind {
+                    TabKind::File { path, .. }
+                    | TabKind::ClipboardDiff { path, .. }
+                    | TabKind::LocalHistory {
+                        path: Some(path), ..
+                    } => path,
+                    _ => return None,
                 };
                 let next = moves
                     .iter()
@@ -1278,7 +1283,12 @@ pub fn retarget_paths(ws: &mut Workspace, moves: &[(PathBuf, PathBuf)]) {
         let Ok(t) = tab_mut(ws, project, tab) else {
             continue;
         };
-        if let TabKind::File { path, .. } | TabKind::ClipboardDiff { path, .. } = &mut t.kind {
+        if let TabKind::File { path, .. }
+        | TabKind::ClipboardDiff { path, .. }
+        | TabKind::LocalHistory {
+            path: Some(path), ..
+        } = &mut t.kind
+        {
             *path = next;
         }
         for pane in t.tree.panes.values_mut() {
@@ -3761,6 +3771,7 @@ mod tests {
                 path: "/tmp/clipboard/file.txt".into(),
                 snapshot_id: "clip".into(),
                 dirty: true,
+                label: None,
             },
             demo_pane(PaneKind::Editor, "Clipboard", false),
         )
@@ -3794,6 +3805,7 @@ mod tests {
                 path: "/tmp/clipboard/a.txt".into(),
                 snapshot_id: "clip".into(),
                 dirty: true,
+                label: None,
             },
             demo_pane(PaneKind::Editor, "Clipboard", false),
         )
@@ -3805,6 +3817,7 @@ mod tests {
                 path: "/tmp/clipboard/b.txt".into(),
                 snapshot_id: "only".into(),
                 dirty: true,
+                label: None,
             },
             demo_pane(PaneKind::Editor, "Clipboard", false),
         )

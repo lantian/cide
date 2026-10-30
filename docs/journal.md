@@ -18976,3 +18976,65 @@ covers removing an orphaned cancellation, failure/retry, duplicate clicks, Close
 and disabled removal during application. Agent rendering, UI kit, TypeScript, production UI
 build, app compilation and command contract checks pass. A running desktop build has not been
 restarted or used to remove a real request.
+
+## M194 — Local History keeps every version of a project's files, without git
+
+Every project file is now recorded as it changes, independently of git, so a version or a deleted
+file can be restored in a project with no repository at all. It is called Local History everywhere
+because *Show File History* and `history` already mean git here. On first open a background pass
+copies the project's files, compressed, so a file an agent breaks can be recovered even if cide
+never opened it. After that the watcher, cide's own saves and a reconcile pass feed one worker per
+store, and content hashes make the same change one version however it arrived. ADR 0016 has the
+five decisions: the store is in the state directory and not the project, it is packs and a JSONL
+log and not SQLite or loose blobs, one thread does every write, a walk sighting is never a creation,
+and off is a switch that never deletes.
+
+Show History opens a tab from the file tree, the tab strip, the editor menu or the palette, for a
+file, a folder or the project. A file lists its versions beside a diff against the current file, or
+between two rows with Shift-click; versions can be searched by content. Restore This Version makes
+the file what the left side shows, which is deliberately not JetBrains' *Revert Selected and Later
+Changes*. Show Difference opens the existing editable compare for block-by-block restore, Copy
+Patch and Put Label are there, and a folder's timeline has one row per capture burst with a
+confirmation naming every file before Restore All to This Point. Every restore saves the current
+file first, past every limit, and stops if it cannot. Settings gains a global switch, a
+Use global / On / Off override per project, retention by working days per file (default 5), a size
+limit, a per-project storage cap and Clear History.
+
+The bug worth recording is the one review found in the design. A file's first row says when cide
+first saw it, not when it appeared, and a folder restore that took a first sighting for a creation
+would trash a file that had been there for years. So `Baseline` and `Created` are separate kinds
+and only a watcher event after a durable marker may write `Created`. Then retention turned out to
+reintroduce the same false proof by two routes: a file that was deleted and came back has a
+`Created` for a first row once the older rows age out, and if all of them expired there is no row
+left to correct it. The first fix demoted the row at compaction and could not cover the second
+route, so the log's header now carries `trimmed_through`, and a moment at or before it gets no proof
+of absence at all. Those files are left alone and reported.
+
+Measured with `crates/cide-local-history/examples/baseline.rs` on ext4 over NVMe, this repository's
+source cycled to 100,000 files with a unique line per copy: 28 s to baseline 1.35 GiB into 444 MiB
+of packs (33%) and 20 MiB of log, 0.08 s to reopen, about 10 ms per single-file commit on the worker,
+and a peak RSS of 102 MiB of which about half is the benchmark's own corpus. The defaults stood.
+
+Validation: 54 store tests and 49 capture and restore tests, the latter over real files and walks,
+including one over a real `ProjectFs` and real inotify from the first `Status` through baseline,
+edit, creation, deletion and an external folder rename, with build output staying out. A log
+truncated at every byte, a crash between the two fsyncs, a second opener, a FIFO in the tree, links
+out of the project, an empty or missing root and a quick off-and-on are all covered. The first run of
+the worker tests caught a first pass that could never start, which would have shipped as a feature
+that silently recorded nothing. `check:local-history` is new. The full Rust group and all UI checks
+pass.
+
+The real app was launched once, under a throwaway profile seeded from a workspace that predated the
+feature, on a scratch project. Capture started on its own, baselined the 3 eligible files and left
+`.env` and `target/` out. Edits made from a shell then arrived as `Modified`, `Created` and
+`Deleted` versions, read back with `cide-headless history`, and the store survived a clean stop.
+
+**Not confirmed on a display:** the tab, its diff, the menus, the Settings group and every restore
+through the UI. Restore is tested at the worker and never through a window, and the live run did not
+touch the webview, because nothing here takes screenshots on this machine. Also known: a burst
+containing a deletion shows as two timeline rows, because deletions wait 500 ms for an editor's
+save-by-rename; gitignored files are not kept, even when saved in the editor, so `.env` has no
+history; moving a project starts a new history; agent worktrees are invisible until integrated; and
+an external rename reads as a deletion and a creation, with only cide's own renames carrying the
+history across. Selection history, automatic labels and an activity view are not built. macOS was
+not exercised.

@@ -68,6 +68,20 @@ pub trait FsEvents: Send + Sync + 'static {
     fn files_changed(&self, project: ProjectId, paths: &[PathBuf]) {
         let _ = (project, paths);
     }
+
+    /// The watcher's backend is up: from here on a change produces an event.
+    ///
+    /// The moment a consumer that must not miss a change can start, because anything it reads
+    /// after this is covered by an event if it moves again. The end of the walk is **not** that
+    /// moment, though it looks like one: `Watcher::start` only spawns a thread, and the
+    /// descriptors exist once that thread's `Backend::start` has returned. A pass started at
+    /// `walked` has a window where a file it has just read can change with no event ever arriving.
+    ///
+    /// Fires again if the watcher swaps to polling after running out of inotify descriptors,
+    /// which is a gap of its own and deserves the same treatment.
+    fn watching(&self, project: ProjectId, fs: &Arc<ProjectFs>) {
+        let _ = (project, fs);
+    }
 }
 
 impl FsEvents for AppHandle {
@@ -76,7 +90,14 @@ impl FsEvents for AppHandle {
     }
 
     fn changed(&self, project: ProjectId, change: &FsChange) {
+        // Before the webview hears, though the two are independent. This one only enqueues: it
+        // runs on the watcher's thread, and on every synthetic change from a file operation.
+        crate::local_history::changed(self, project, change);
         crate::emit::fs_changed(self, project, change);
+    }
+
+    fn watching(&self, project: ProjectId, fs: &Arc<ProjectFs>) {
+        crate::local_history::attach(self, project, fs, true);
     }
 
     fn files_changed(&self, project: ProjectId, paths: &[PathBuf]) {
@@ -1325,6 +1346,7 @@ fn on_watch_event(
         WatchEvent::Status(status) => {
             *fs.watch_status.lock() = status;
             events.status(project, &fs.status());
+            events.watching(project, &fs);
         }
     }
 }

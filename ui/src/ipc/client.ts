@@ -1139,6 +1139,8 @@ export interface HarnessCliVersion {
 export const settings = {
   projectIndexing: (project: ProjectId) => invoke<string[] | null>('project_indexing_get', { project }),
   setProjectIndexing: (project: ProjectId, exclusions: string[] | null) => invoke<string[] | null>('project_indexing_set', { project, exclusions }),
+  projectLocalHistory: (project: ProjectId) => invoke<boolean | null>('project_local_history_get', { project }),
+  setProjectLocalHistory: (project: ProjectId, enabled: boolean | null) => invoke<boolean | null>('project_local_history_set', { project, enabled }),
   get: () => invoke<SettingsDto>('settings_get'),
   projectHarness: (project: ProjectId) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_get', { project }),
   setProjectHarness: (project: ProjectId, edit: import('./generated').ProjectHarnessEdit) => invoke<import('./generated').ProjectHarnessSettings>('project_harness_set', { project, edit }),
@@ -1613,6 +1615,11 @@ export const events = {
   onSessionTool: (handler: (session: string, paths: string[]) => void) =>
     listen<{ session: string; paths: string[] }>('cide://session-tool', (e) =>
       handler(e.payload.session, e.payload.paths),
+    ),
+  /** Versions landed or expired. An open history tab refetches what it is showing. */
+  onLocalHistoryChanged: (handler: (project: ProjectId) => void) =>
+    listen<{ project: ProjectId }>('cide://local-history-changed', (e) =>
+      handler(e.payload.project),
     ),
 
   /**
@@ -5778,10 +5785,56 @@ export const languageServers = {
   logs: (project: ProjectId, source: string, after: number) => invoke<import('./generated').LanguageServerLogs>('language_servers_logs', { project, source, after }),
 }
 
+import type {
+  LocalFileHistory,
+  LocalHistoryGroup,
+  LocalHistoryStatus,
+  LocalRestorePlan,
+  LocalRestoreReport,
+  LocalRestored,
+  LocalSearchResult,
+  LocalSide,
+  LocalVersion,
+} from './generated'
+
+/**
+ * Local History: versions of project files, independent of git. Not `history`, which is git's.
+ * Every read is scoped to a project, because a store is, and a window never holds rows it is not
+ * drawing: the store can hold millions.
+ */
+export const localHistory = {
+  status: (project: ProjectId) => invoke<LocalHistoryStatus>('local_history_status', { project }),
+  file: (project: ProjectId, path: string) =>
+    invoke<LocalFileHistory>('local_history_file', { project, path }),
+  groups: (project: ProjectId, path: string | null, before: number | null, limit: number) =>
+    invoke<LocalHistoryGroup[]>('local_history_groups', { project, path, before, limit }),
+  groupFiles: (project: ProjectId, path: string | null, group: number) =>
+    invoke<LocalVersion[]>('local_history_group_files', { project, path, group }),
+  diff: (project: ProjectId, path: string, from: LocalSide, to: LocalSide) =>
+    invoke<RevisionDiff>('local_history_diff', { project, path, from, to }),
+  text: (project: ProjectId, version: number) =>
+    invoke<string>('local_history_text', { project, version }),
+  patch: (project: ProjectId, path: string, from: LocalSide, to: LocalSide) =>
+    invoke<string>('local_history_patch', { project, path, from, to }),
+  label: (project: ProjectId, text: string) =>
+    invoke<void>('local_history_label', { project, text }),
+  restore: (project: ProjectId, path: string, version: number) =>
+    invoke<LocalRestored>('local_history_restore', { project, path, version }),
+  search: (project: ProjectId, path: string, query: string) =>
+    invoke<LocalSearchResult>('local_history_search', { project, path, query }),
+  clear: (project: ProjectId) => invoke<void>('local_history_clear', { project }),
+  plan: (project: ProjectId, path: string | null, group: number) =>
+    invoke<LocalRestorePlan>('local_history_plan', { project, path, group }),
+  restoreTree: (project: ProjectId, path: string | null, group: number, label: string) =>
+    invoke<LocalRestoreReport>('local_history_restore_tree', { project, path, group, label }),
+  open: (project: ProjectId, path: string | null, folder: boolean) =>
+    invoke<TabId>('tab_open_local_history', { project, path, folder }),
+}
+
 /** Clipboard snapshots and shared file buffers live in the native process, never the layout. */
 export const clipboardComparison = {
-  open: (project: ProjectId, path: string, text: string) =>
-    invoke<TabId>('tab_open_clipboard_diff', { project, path, text }),
+  open: (project: ProjectId, path: string, text: string, label: string | null = null) =>
+    invoke<TabId>('tab_open_clipboard_diff', { project, path, text, label }),
   content: (snapshotId: string) => invoke<string>('clipboard_diff_content', { snapshotId }),
 }
 export const sharedDocument = {

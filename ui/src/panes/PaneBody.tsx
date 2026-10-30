@@ -256,6 +256,7 @@ export function PaneBody({
   }
   if (clipboardTab?.kind.kind === 'clipboardDiff' && pane.kind === 'editor') {
     return <ClipboardDiffPane snapshotId={clipboardTab.kind.snapshotId}
+      label={clipboardTab.kind.label}
       path={clipboardTab.kind.path} tab={clipboardTab.id} project={project}
       pane={pane.id} root={cwd} onScreen={onScreen} onShowHistory={onShowHistory} />
   }

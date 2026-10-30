@@ -11,6 +11,7 @@ import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { LlmSettings } from "./LlmSettings";
+import type { LocalHistorySettings } from "./LocalHistorySettings";
 import type { OpenRunIn } from "./OpenRunIn";
 import type { OpencodeSettings } from "./OpencodeSettings";
 import type { ProxySettings } from "./ProxySettings";
@@ -94,6 +95,11 @@ sidebar?: SidebarSettings,
  * showing entries it never walked.
  */
 explorer?: ExplorerSettings, 
+/**
+ * Local History's switch and limits. Clamped in `apply_patch`; `settings_set` then attaches
+ * or detaches every open project, because the switch has to take effect without a restart.
+ */
+localHistory?: LocalHistorySettings, 
 /**
  * The Inspections screen, sent whole like every other group.
  *
