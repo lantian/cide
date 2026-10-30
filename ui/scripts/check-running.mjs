@@ -104,6 +104,18 @@ try {
   ])
 
   eq(runningIn(table, 'a'), 3, 'a project s count is its runs plus its console panes')
+  const applyProject = foldRunning([{
+    project: 'apply-project', runs: 1, panes: 1, waiting: 0,
+    tabs: [{ tab: 'home', panes: 1 }, { tab: 'apply', panes: 1 }],
+  }])
+  eq(runningIn(applyProject, 'apply-project'), 2, 'a run mirror does not inflate the project total')
+  eq(runningInTab(applyProject, 'apply-project', 'home'), 1, 'the home console is working')
+  eq(runningInTab(applyProject, 'apply-project', 'apply'), 1, 'the Apply mirror is also working')
+  const applyIdle = foldRunning([{
+    project: 'apply-project', runs: 0, panes: 1, waiting: 0,
+    tabs: [{ tab: 'home', panes: 1 }],
+  }])
+  eq(runningInTab(applyIdle, 'apply-project', 'apply'), 0, 'a handed-back run clears its tab spinner')
   eq(runsIn(table, 'a'), 2, 'and the run half alone is what the tooltip words itself from')
 
   // Absence is zero, not unknown. Rust omits every project with nothing running, on the rule

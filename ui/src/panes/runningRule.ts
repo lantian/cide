@@ -44,8 +44,8 @@ export interface Tally {
    * Consoles mid-turn per tab id, for the in-project tab strip's spinner. (M115)
    *
    * Only tabs with a count above zero, and a *narrower* reading than `panes`: Rust counts a
-   * session here only while it is `Busy`, so a permission prompt is the awaiting badge's and never
-   * also a turning tab. `ProjectRunning::tabs` in `cide-ipc` carries the argument.
+   * ordinary session here only while it is `Busy`, and a run mirror while its owner is starting
+   * or running. A permission prompt belongs to the awaiting badge, never a turning tab.
    */
   readonly tabs: ReadonlyMap<string, number>
   /**

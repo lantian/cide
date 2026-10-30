@@ -492,8 +492,8 @@ function TabItem({
 
   // The other half of a console tab's three states: turning while a turn runs, the awaiting chip
   // once it ends unseen, plain once looked at. Rust's per-tab count (`ProjectRunning::tabs`), which
-  // counts only `Busy` sessions so the two chips never describe one session. Asked of console
-  // tabs alone: no other kind hosts a Claude-kind pane, so any other tab reads 0 from an empty key.
+  // counts busy consoles and starting/running run mirrors, leaving waiting to the other chip.
+  // Asked of console tabs alone: other tab kinds read 0 from an empty key.
   const isConsole = tab.kind.kind === 'claudeHome' || tab.kind.kind === 'claudeFull'
   const turning = useRunningInTab(isConsole ? (project ?? '') : '', tab.id)
   // The pinned grid always spells its figure, like the header's chip: "how many are working in

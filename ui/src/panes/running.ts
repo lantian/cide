@@ -166,7 +166,7 @@ export function useRunsInProject(project: string): number {
  * A scalar snapshot, for `useRunsInProject`'s reason: a tab re-renders only when *its* number
  * moves, not on every tool call of every console in the app. Rust's answer rather than a fold of
  * `cide://session-state` in this window, because two of the facts behind it — whether the child
- * is alive, and whether the session is a run's mirror — are not in any window's tree.
+ * is alive, and the state of a run owning a mirrored session — are not in any window's tree.
  */
 export function useRunningInTab(project: string, tab: string): number {
   return useSyncExternalStore(

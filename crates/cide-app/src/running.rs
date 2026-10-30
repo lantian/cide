@@ -296,8 +296,8 @@ pub(crate) fn counts_for(
             .and_then(|id| tasks.iter().find(|row| &row.id == id))
             .map(|row| row.status)
     };
-    let runs = registry
-        .runs_for(project)
+    let project_runs = registry.runs_for(project);
+    let runs = project_runs
         .iter()
         .filter(|run| run_is_busy(&run.state, task_status(&run.task), asking))
         .count();
@@ -353,21 +353,22 @@ pub(crate) fn counts_for(
             .count(),
     };
 
-    // Per tab, for the strip. Asked only of the sessions a tab shows, and with the narrower
-    // reading `ProjectRunning::tabs` documents: `Busy` alone, so a permission prompt is the
-    // awaiting badge's and never also a turning spinner on the same one-console tab. No hook
-    // server means no tab spins — unlike the project count's fallback above there is no
-    // conservative direction worth taking for a decoration.
-    let tabs = match &hooks {
-        Some(hooks) => tabs_working(&found, |session| {
-            pane_is_turning(
-                alive(session),
-                registry.owns_session(session),
-                hooks.state(session),
-            )
-        }),
-        None => Vec::new(),
-    };
+    // Project totals exclude mirrors to avoid counting a run twice. A tab must still show
+    // that run's activity, including harnesses that do not report console hooks. Only consult
+    // a run while it owns the child: a continuation of an ended run is an ordinary console.
+    let tabs = tabs_working(&found, |session| {
+        let run = project_runs
+            .iter()
+            .find(|run| run.session == Some(session))
+            .filter(|_| registry.owns_session(session));
+        pane_is_turning(
+            alive(session),
+            run.map(|run| &run.state),
+            hooks
+                .as_ref()
+                .map_or(SessionState::Spawning, |hooks| hooks.state(session)),
+        )
+    });
 
     ProjectRunning {
         project,
@@ -383,11 +384,14 @@ pub(crate) fn waiting_for(app: &AppHandle, project: ProjectId) -> usize {
     crate::user_requests::waiting_count(app, project, rows_of(&board_of(app, project)))
 }
 
-/// Whether a console pane should turn its **tab's** spinner: [`pane_is_busy`]'s `Working`
-/// reading, narrowed to a live turn. `ProjectRunning::tabs` says why a permission prompt is left
-/// to the awaiting badge.
-pub(crate) fn pane_is_turning(alive: bool, owned_by_run: bool, state: SessionState) -> bool {
-    state == SessionState::Busy && pane_is_busy(alive, owned_by_run, state, Busy::Working, false)
+/// Whether a console pane should turn its tab's spinner. Owned runs use their registry state;
+/// ordinary consoles use hooks. Permission prompts belong to the existing awaiting badge.
+pub(crate) fn pane_is_turning(alive: bool, run: Option<&RunState>, state: SessionState) -> bool {
+    alive
+        && match run {
+            Some(run) => matches!(run, RunState::Starting | RunState::Running),
+            None => state == SessionState::Busy,
+        }
 }
 
 /// Group `(tab, session)` pairs into per-tab counts of turning sessions.
@@ -919,10 +923,10 @@ mod tests {
     /// while the header's wider reading still counts it.
     #[test]
     fn a_tab_turns_only_for_a_live_turn() {
-        assert!(pane_is_turning(true, false, SessionState::Busy));
+        assert!(pane_is_turning(true, None, SessionState::Busy));
         assert!(!pane_is_turning(
             true,
-            false,
+            None,
             SessionState::AwaitingPermission
         ));
         assert!(pane_is_busy(
@@ -940,11 +944,89 @@ mod tests {
             SessionState::Splash,
             SessionState::Exited { code: 0 },
         ] {
-            assert!(!pane_is_turning(true, false, quiet));
+            assert!(!pane_is_turning(true, None, quiet));
         }
-        // A dead child, and a run's mirror, are not the tab's to spin for either.
-        assert!(!pane_is_turning(false, false, SessionState::Busy));
-        assert!(!pane_is_turning(true, true, SessionState::Busy));
+        assert!(!pane_is_turning(false, None, SessionState::Busy));
+    }
+
+    #[test]
+    fn run_tabs_follow_the_owner_even_without_hooks() {
+        for state in [RunState::Starting, RunState::Running] {
+            assert!(pane_is_turning(true, Some(&state), SessionState::Spawning));
+            assert!(!pane_is_turning(false, Some(&state), SessionState::Busy));
+        }
+        for state in [
+            RunState::Queued,
+            RunState::Idle,
+            RunState::AwaitingPermission,
+            RunState::Paused { since_unix_ms: 0 },
+            RunState::Blocked {
+                reason: "blocked".into(),
+            },
+            RunState::Interrupted,
+            RunState::Finished { code: 0 },
+            RunState::Cancelled {
+                reason: "stopped".into(),
+                code: None,
+            },
+            RunState::Failed {
+                reason: "failed".into(),
+            },
+        ] {
+            // Stale hook state must not keep an owned run's tab spinning.
+            assert!(!pane_is_turning(true, Some(&state), SessionState::Busy));
+        }
+    }
+
+    #[test]
+    fn apply_mirror_lights_its_tab_without_inflating_the_project_count() {
+        let (home, apply) = (TabId::new(), TabId::new());
+        let (console, worker) = (SessionId::new(), SessionId::new());
+        let panes = [(Some(home), console), (Some(apply), worker)];
+        let turning = |session| {
+            pane_is_turning(
+                true,
+                (session == worker).then_some(&RunState::Running),
+                if session == worker {
+                    SessionState::Spawning
+                } else {
+                    SessionState::Busy
+                },
+            )
+        };
+        let expected = vec![
+            TabRunning {
+                tab: home,
+                panes: 1,
+            },
+            TabRunning {
+                tab: apply,
+                panes: 1,
+            },
+        ];
+        assert_eq!(tabs_working(&panes, turning), expected);
+        let runs = u32::from(run_is_busy(&RunState::Running, None, Busy::Working));
+        let consoles = [false, true]
+            .into_iter()
+            .filter(|owned| pane_is_busy(true, *owned, SessionState::Busy, Busy::Working, false))
+            .count() as u32;
+        assert_eq!((runs, consoles, runs + consoles), (1, 1, 2));
+
+        // Closing the view, or tearing its pane out, removes only that tab's indicator.
+        assert_eq!(tabs_working(&panes[..1], turning), expected[..1]);
+        assert_eq!(
+            tabs_working(&[(Some(home), console), (None, worker)], turning),
+            expected[..1]
+        );
+        assert_eq!(tabs_working(&panes, turning), expected); // reopen the view
+        assert_eq!(
+            tabs_working(&panes, |session| pane_is_turning(
+                true,
+                (session == worker).then_some(&RunState::Idle),
+                SessionState::Busy,
+            )),
+            expected[..1]
+        );
     }
 
     /// Per-tab grouping: a mirror within one tab is one console, a session shown in two tabs
