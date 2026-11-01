@@ -221,8 +221,8 @@ pub use spec::{
     SpecArtifact, SpecArtifactRules, SpecArtifactText, SpecBoard, SpecChange, SpecChanged,
     SpecCommand, SpecConfig, SpecConfigEdit, SpecDelta, SpecInvalidation, SpecIssue,
     SpecOperationGuidance, SpecOrigin, SpecProgress, SpecRename, SpecRequirement,
-    SpecRequirementSet, SpecScenario, SpecSchema, SpecSnapshot, SpecSummary, SpecTask, SpecTouch,
-    SpecValidation, SpecWriteOutcome,
+    SpecRequirementSet, SpecScenario, SpecSchema, SpecSnapshot, SpecSummary, SpecTask, SpecTaskSet,
+    SpecTouch, SpecValidation, SpecWriteOutcome,
 };
 pub use spec::{
     SpecCheckout, SpecIntegrated, SpecLauncher, SpecOp, SpecPublished, SpecRunRow,

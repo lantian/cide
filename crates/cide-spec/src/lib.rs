@@ -46,6 +46,7 @@
 //! that is the one command that rewrites files cide did not open, and it stays a gesture.
 
 pub mod block;
+pub mod checklist;
 pub mod claude;
 pub mod cli;
 pub mod config;

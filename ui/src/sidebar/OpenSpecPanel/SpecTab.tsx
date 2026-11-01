@@ -27,7 +27,7 @@ import {
 } from 'react'
 import { Icon, asIcon } from '@/icons/Icon'
 import { notify, notifyFailure } from '@/chrome/notices'
-import { changePath, readChange, readArtifact, resourceRevision, useSpecData } from './specData'
+import { adoptChange, changePath, readChange, readArtifact, resourceRevision, useSpecData } from './specData'
 import { parseMarkdown } from '@/editor/markdown/blocks'
 import { MarkdownPreview } from '@/editor/markdown/MarkdownPreview'
 import { dirOf, resolveLocal, targetKind } from '@/editor/markdown/links'
@@ -104,6 +104,9 @@ export interface SpecTabViewProps {
   view: ChangeView | null
   /** Why there is no view, when there is none and the read has finished. */
   failed: string | null
+  onTaskToggle?: ((index: number, done: boolean) => void) | undefined
+  taskSaving?: boolean | undefined
+  taskError?: string | null | undefined
   onRetry?: (() => void) | undefined
   reading: boolean
   /**
@@ -672,6 +675,8 @@ export function SpecTabView(props: SpecTabViewProps) {
       )}
 
       <Block id="steps" title="Steps">
+        {props.taskError && <p role="alert">{props.taskError}</p>}
+        {props.taskSaving && <p role="status">Saving checklist…</p>}
         {view.tasks.length === 0 ? (
           <p className={styles.empty}>
             Nothing in the task list yet — that is what OpenSpec’s propose writes, and what an agent
@@ -686,7 +691,16 @@ export function SpecTabView(props: SpecTabViewProps) {
                 data-audit="specTabStep"
                 data-done={step.done ? 'true' : 'false'}
               >
-                <Icon name={asIcon(step.done ? 'check' : 'square')} size={1} />
+                <input
+                  className={styles.stepToggle}
+                  type="checkbox"
+                  aria-label={step.description}
+                  checked={step.done}
+                  disabled={props.taskSaving || !props.onTaskToggle || view.archivedAs != null}
+                  onChange={(event) => props.onTaskToggle?.(index, event.target.checked)}
+                  data-audit="specTabStepToggle"
+                  data-write="true"
+                />
                 <span>
                   <Marked text={step.description} query={query} counter={counter} current={current} />
                 </span>
@@ -940,13 +954,50 @@ function ChangeTab({
       ? `${root}/.cide/worktrees/spec-${change}`
       : undefined
 
+  const [taskSaving, setTaskSaving] = useState(false)
+  const [taskError, setTaskError] = useState<string | null>(null)
+  const taskWriting = useRef(false)
+  const taskWriteVersion = useRef(0)
+  const checkoutKey = `${project}:${change}:${worktree ?? root}`
+  const currentCheckout = useRef(checkoutKey)
+  currentCheckout.current = checkoutKey
+  useEffect(() => { setTaskError(null) }, [checkoutKey])
+  const onTaskToggle = useCallback((index: number, done: boolean) => {
+    if (!view || taskWriting.current || view.archivedAs != null) return
+    taskWriting.current = true
+    taskWriteVersion.current++
+    setTaskSaving(true)
+    setTaskError(null)
+    const key = checkoutKey
+    void specApi.setTask({ project, change: change as ChangeName, index, done,
+      expected: { tasks: [...view.tasks], completed: view.completed, total: view.total },
+    }, worktree).then(async (outcome) => {
+      if (currentCheckout.current !== key) return
+      if (outcome.kind === 'written') {
+        adoptChange(project, root ?? '', change, worktree, outcome.change)
+        setView(adaptChange(outcome.change))
+      } else {
+        setTaskError('The checklist changed before it could be saved. Reloaded the latest state; try again.')
+        const latest = await specApi.change(project, change as ChangeName, worktree)
+        if (currentCheckout.current === key) setView(adaptChange(latest))
+      }
+    }).catch((error: unknown) => {
+      if (currentCheckout.current === key) setTaskError(String(error))
+    }).finally(() => {
+      taskWriting.current = false
+      setTaskSaving(false)
+      void useSpec.getState().refresh(true).catch(notifyFailure)
+    })
+  }, [project, change, root, worktree, checkoutKey, view])
+
   const detailRevision = useSpecData((state) => resourceRevision(state.epochs, project, changePath(worktree ?? root ?? '', change), true))
   useEffect(() => {
     if (!active || root === null) return
     let live = true
+    const writeVersion = taskWriteVersion.current
     void readChange(project, root, change, worktree)
       .then((wire) => {
-        if (!live) return
+        if (!live || taskWriting.current || writeVersion !== taskWriteVersion.current) return
         setReading(false)
         const next = adaptChange(wire)
         setView(next)
@@ -957,7 +1008,7 @@ function ChangeTab({
         )
       })
       .catch((error: unknown) => {
-        if (!live) return
+        if (!live || taskWriting.current || writeVersion !== taskWriteVersion.current) return
         setReading(false)
         setFailed(String(error))
       })
@@ -1364,6 +1415,9 @@ function ChangeTab({
         setDraft(null)
         setProblem(null)
       }}
+      onTaskToggle={onTaskToggle}
+      taskSaving={taskSaving}
+      taskError={taskError}
       onEditSave={onEditSave}
     />
   )

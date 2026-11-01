@@ -1,6 +1,6 @@
 /** Shared reads and content generations. Summary equality never decides content freshness. */
 import { create } from 'zustand'
-import { spec, type ProjectId, type ChangeName } from '@/ipc/client'
+import { spec, type ProjectId, type ChangeName, type SpecChange } from '@/ipc/client'
 import type { SpecInvalidation, SpecSnapshot } from '@/ipc/generated'
 
 export const useSpecData = create<{ epochs: Readonly<Record<string, number>> }>(() => ({ epochs: {} }))
@@ -103,4 +103,14 @@ export function retainSpecProjects(projects: readonly ProjectId[]): void {
   const epochs = useSpecData.getState().epochs
   const next = Object.fromEntries(Object.entries(epochs).filter(([key]) => keep.has(key.split('\0')[0] as ProjectId)))
   if (Object.keys(next).length !== Object.keys(epochs).length) useSpecData.setState({ epochs: next })
+}
+
+/** Adopt a mutation response so a tab activation cannot reuse the pre-write snapshot. */
+export function adoptChange(project: ProjectId, root: string, change: string, worktree: string | undefined, value: SpecChange): void {
+  const path = changePath(worktree ?? root, change)
+  const revision = ++clock
+  let cache = caches.get(project)
+  if (!cache) { cache = new Map(); caches.set(project, cache) }
+  cache.set(`change:${path}`, { revision, value })
+  useSpecData.setState({ epochs: { ...useSpecData.getState().epochs, [prefix(project) + path]: revision } })
 }

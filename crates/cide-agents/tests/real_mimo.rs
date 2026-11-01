@@ -58,6 +58,7 @@ fn role(prompt: &str) -> LoadedAgent {
 
 fn plan<'a>(agent: &'a LoadedAgent, cwd: &Path, prompt: &str) -> RunPlan<'a> {
     RunPlan {
+        images: Vec::new(),
         run: RunId::new(),
         session: SessionId::new(),
         agent,

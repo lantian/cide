@@ -637,6 +637,8 @@ enum Control {
     /// A control message rather than a shared atomic so the watch keeps exactly one writer —
     /// see [`PtySession::set_job_announce_after`].
     JobThreshold(Duration),
+    /// Writer waits for this acknowledgement before delivering Ctrl+C to the child.
+    JobInterrupt(Sender<()>),
 }
 
 /// What the coalescer sends to sinks.
@@ -913,6 +915,7 @@ impl PtySession {
             _ => None,
         };
 
+        let interrupt_control = probe.as_ref().map(|_| control_tx.clone());
         spawn_reader(reader, raw_tx);
         spawn_coalescer(
             raw_rx,
@@ -925,7 +928,7 @@ impl PtySession {
             spec.render.clone(),
             spec.output_observer.clone(),
         );
-        spawn_writer(writer, writer_rx);
+        spawn_writer(writer, writer_rx, interrupt_control);
 
         let exit = Arc::new(Mutex::new(ExitSlot::Running(Vec::new())));
         spawn_reaper(wait, Arc::clone(&exited), Arc::clone(&exit));
@@ -1607,6 +1610,17 @@ fn serve_control(
             }
             let _ = reply.send(snapshot);
         }
+        Control::JobInterrupt(reply) => {
+            if let Some(probe) = probe.as_mut() {
+                let foreground = probe.transport.foreground_pgid();
+                if let Some(event) = probe.watch.interrupt(foreground, Instant::now()) {
+                    for listener in probe.listeners.lock().iter() {
+                        listener(event);
+                    }
+                }
+            }
+            let _ = reply.send(());
+        }
         Control::JobThreshold(after) => {
             // Absent for every session that watches no jobs — a Claude pane — where the
             // retune has nothing to reach and correctly changes nothing.
@@ -2000,11 +2014,25 @@ fn broadcast(
     });
 }
 
-fn spawn_writer(mut writer: Box<dyn Write + Send>, rx: Receiver<Vec<u8>>) {
+fn spawn_writer(
+    mut writer: Box<dyn Write + Send>,
+    rx: Receiver<Vec<u8>>,
+    interrupt_control: Option<Sender<Control>>,
+) {
     thread::Builder::new()
         .name("cide-pty-write".into())
         .spawn(move || {
             while let Ok(bytes) = rx.recv() {
+                if bytes.contains(&0x03)
+                    && let Some(control) = &interrupt_control
+                {
+                    // Serialize with job observations before the child can return to its
+                    // prompt. Merely queuing the control would race the output poll.
+                    let (reply, acknowledged) = bounded(1);
+                    if control.send(Control::JobInterrupt(reply)).is_ok() {
+                        let _ = acknowledged.recv();
+                    }
+                }
                 if writer.write_all(&bytes).is_err() {
                     break;
                 }
@@ -2275,6 +2303,38 @@ mod tests {
             }
             other => panic!("expected a finished job, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_shell_interrupt_is_quiet_and_the_next_completion_still_notifies() {
+        let spec = SpawnSpec::new("/bin/bash", std::env::temp_dir())
+            .arg("--norc")
+            .arg("-i")
+            .watch_jobs(Duration::from_millis(100));
+        let session = PtySession::spawn(spec).expect("spawn bash");
+        let (tx, rx) = mpsc::channel();
+        session.on_job(move |event| {
+            let _ = tx.send(event);
+        });
+        let (sink, _out) = collect_sink();
+        session.attach(sink);
+        thread::sleep(Duration::from_millis(400));
+        session.write(b"sleep 30\n".to_vec());
+        assert_eq!(rx.recv_timeout(DEADLINE).unwrap(), JobEvent::Started);
+        session.write(vec![0x03]);
+        assert!(matches!(
+            rx.recv_timeout(DEADLINE).unwrap(),
+            JobEvent::Interrupted { .. }
+        ));
+        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+        session.write(b"sleep 1\n".to_vec());
+        assert_eq!(rx.recv_timeout(DEADLINE).unwrap(), JobEvent::Started);
+        assert!(matches!(
+            rx.recv_timeout(DEADLINE).unwrap(),
+            JobEvent::Finished { .. }
+        ));
+        session.write(b"exit\n".to_vec());
     }
 
     /// The pane every user already has: no watching asked for, nothing observed, no events.

@@ -4840,6 +4840,9 @@ export const spec = {
   splitWork: (project: ProjectId, change: ChangeName) =>
     invoke<SessionId>('spec_split_work', { project, change }),
 
+  setTask: (req: import('./generated').SpecTaskSet, worktree?: string) =>
+    invoke<SpecWriteOutcome>('spec_task_set', { req, worktree }),
+
   setRequirement: (
     req: {
       project: ProjectId
@@ -5791,4 +5794,11 @@ export const sharedDocument = {
     invoke<import('./generated').SharedDocumentSnapshot | null>('shared_document_sync', { path, expected, next }),
   onChanged: (handler: (event: { path: string; version: number }) => void) =>
     listen<{ path: string; version: number }>('cide://shared-document-changed', event => handler(event.payload)),
+}
+
+/** Images owned by an OpenSpec draft, then copied into retained run storage. */
+export const specImages = {
+  stage: (paths?: readonly string[]) => invoke<ImageDoc[]>('spec_images_stage', { paths: paths ?? null }),
+  release: (paths: readonly string[]) => invoke<void>('spec_images_release', { paths }),
+  pick: () => invoke<string[]>('spec_images_pick'),
 }

@@ -96,3 +96,5 @@ pub mod spec_sessions;
 pub mod gitlab;
 
 pub mod peer_chat;
+
+pub mod spec_images;

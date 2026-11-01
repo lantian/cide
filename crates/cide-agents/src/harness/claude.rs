@@ -877,6 +877,7 @@ mod tests {
 
     fn plan_for<'a>(agent: &'a LoadedAgent, session: SessionId) -> RunPlan<'a> {
         RunPlan {
+            images: Vec::new(),
             run: RunId::new(),
             session,
             agent,

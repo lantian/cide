@@ -233,3 +233,11 @@ clauses, or a table, gets exactly the file they wrote.
   exactly one flusher per burst, so only one read is ever in flight per project and two boards
   cannot land out of order. That is a property of the coalescer — a second path that read a board
   and emitted it directly would break it.
+
+### Checklist mark edits
+
+The change view can set an individual checklist mark. The CLI still supplies task order and
+progress; the writer matches that complete snapshot against CLI-reported artifact files and
+refuses missing or ambiguous matches. A byte-range scanner changes only the selected marker,
+checks the file for concurrent edits, and returns refreshed CLI details. Completing the last
+step refreshes completion actions immediately; Archive retains its validation and confirmation.

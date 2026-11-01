@@ -34,10 +34,10 @@
 //! not flash the dot, both badges and the window title, so the rule below does not announce a
 //! job until it has already been running for [`JobWatch::announce_after`] — a job shorter
 //! than that produces no `Started` and therefore no `Finished`, and the frontend never hears
-//! it existed. Suppressing at the *end* instead is not possible and it is worth writing down
-//! why: `AwaitingInput` raises the marker regardless of what the frontend saw before it (the
-//! same unconditional reading a finished Claude turn relies on), so a job announced once
-//! notifies at its end whatever came after the announcement.
+//! it existed. `AwaitingInput` raises the marker regardless of what the frontend saw before
+//! it (the same unconditional reading a finished Claude turn relies on). Ctrl+C instead
+//! suppresses an unannounced job, or produces `Interrupted` for an announced one when the
+//! prompt returns, allowing the consumer to return to idle without requesting attention.
 //!
 //! ## Why a fullscreen TUI is not a job
 //!
@@ -58,6 +58,8 @@ pub enum JobEvent {
     /// maps this to `SessionState::Busy`, which both arms the awaiting rule and keeps the
     /// pane's host out of the eviction sweep for as long as the job runs.
     Started,
+    /// An announced job returned to the prompt after Ctrl+C; no attention is needed.
+    Interrupted { ran_for: Duration },
     /// The announced job ended and the shell has the terminal back.
     ///
     /// Only ever follows a [`JobEvent::Started`] for the same run of work, so a consumer can
@@ -79,8 +81,10 @@ enum Phase {
         since: Instant,
         /// [`JobEvent::Started`] has been emitted, so an end is worth reporting.
         announced: bool,
-        /// A fullscreen TUI held the screen, so this run is not a job anybody is waiting on.
+        /// A fullscreen TUI or Ctrl+C makes this run ineligible for announcement.
         suppressed: bool,
+        /// Ctrl+C was sent during this run. Reset only when the shell regains the terminal.
+        interrupted: bool,
     },
 }
 
@@ -132,6 +136,38 @@ impl JobWatch {
         self.announce_after = announce_after;
     }
 
+    /// Record Ctrl+C before it reaches the child, using a fresh foreground observation.
+    /// At a prompt this only reconciles a job that already finished on its own.
+    pub fn interrupt(&mut self, foreground: Option<i32>, now: Instant) -> Option<JobEvent> {
+        let foreground = foreground?;
+        if foreground == self.shell {
+            return self.observe(Some(foreground), false, now);
+        }
+        if !self.seen_prompt {
+            return None;
+        }
+        match &mut self.phase {
+            Phase::AtPrompt => {
+                // Input can arrive before the first periodic observation of this job.
+                self.phase = Phase::Running {
+                    since: now,
+                    announced: false,
+                    suppressed: true,
+                    interrupted: true,
+                };
+            }
+            Phase::Running {
+                suppressed,
+                interrupted,
+                ..
+            } => {
+                *suppressed = true;
+                *interrupted = true;
+            }
+        }
+        None
+    }
+
     /// Fold one observation in, and say whether it changed anything worth reporting.
     ///
     /// `foreground` is `tcgetpgrp`'s answer and `None` means it had none — a pty that has
@@ -154,10 +190,16 @@ impl JobWatch {
                 Phase::Running {
                     since,
                     announced: true,
+                    interrupted,
                     ..
-                } => Some(JobEvent::Finished {
-                    ran_for: now.saturating_duration_since(since),
-                }),
+                } => {
+                    let ran_for = now.saturating_duration_since(since);
+                    Some(if interrupted {
+                        JobEvent::Interrupted { ran_for }
+                    } else {
+                        JobEvent::Finished { ran_for }
+                    })
+                }
                 _ => None,
             };
             self.phase = Phase::AtPrompt;
@@ -175,6 +217,7 @@ impl JobWatch {
                     since: now,
                     announced: false,
                     suppressed: alternate_screen,
+                    interrupted: false,
                 };
                 None
             }
@@ -182,6 +225,7 @@ impl JobWatch {
                 since,
                 announced,
                 suppressed,
+                ..
             } => {
                 if *announced || *suppressed {
                     // A pgid that changes from one job to the next without the shell being
@@ -219,6 +263,63 @@ mod tests {
         // state a pane is in the moment a user can type into it.
         assert_eq!(w.observe(Some(SHELL), false, t0), None);
         (w, t0)
+    }
+
+    #[test]
+    fn interrupt_returns_announced_work_to_idle_and_resets_for_the_next_job() {
+        let (mut w, t0) = watch();
+        assert_eq!(w.observe(Some(JOB), false, t0), None);
+        assert_eq!(
+            w.observe(Some(JOB), false, t0 + AFTER),
+            Some(JobEvent::Started)
+        );
+        assert_eq!(w.interrupt(Some(JOB), t0 + AFTER), None);
+        assert_eq!(w.interrupt(Some(JOB), t0 + AFTER), None);
+        assert_eq!(w.observe(Some(JOB), false, t0 + AFTER * 2), None);
+        assert_eq!(
+            w.observe(Some(SHELL), false, t0 + AFTER * 3),
+            Some(JobEvent::Interrupted { ran_for: AFTER * 3 })
+        );
+        assert_eq!(w.observe(Some(SHELL), false, t0 + AFTER * 3), None);
+        assert_eq!(w.observe(Some(JOB), false, t0 + AFTER * 4), None);
+        assert_eq!(
+            w.observe(Some(JOB), false, t0 + AFTER * 5),
+            Some(JobEvent::Started)
+        );
+        assert_eq!(
+            w.observe(Some(SHELL), false, t0 + AFTER * 6),
+            Some(JobEvent::Finished { ran_for: AFTER * 2 })
+        );
+    }
+
+    #[test]
+    fn an_unannounced_interrupted_job_stays_silent_even_during_slow_shutdown() {
+        for observed in [false, true] {
+            let (mut w, t0) = watch();
+            if observed {
+                assert_eq!(w.observe(Some(JOB), false, t0), None);
+            }
+            assert_eq!(w.interrupt(Some(JOB), t0), None);
+            assert_eq!(w.observe(Some(JOB), false, t0 + AFTER * 2), None);
+            assert_eq!(w.observe(Some(SHELL), false, t0 + AFTER * 3), None);
+        }
+    }
+
+    #[test]
+    fn interrupt_at_a_prompt_or_without_foreground_information_does_not_poison_work() {
+        let (mut w, t0) = watch();
+        assert_eq!(w.interrupt(Some(SHELL), t0), None);
+        assert_eq!(w.observe(Some(JOB), false, t0), None);
+        assert_eq!(w.interrupt(None, t0), None);
+        assert_eq!(
+            w.observe(Some(JOB), false, t0 + AFTER),
+            Some(JobEvent::Started)
+        );
+        // The job finished before Ctrl+C: retain its ordinary completion.
+        assert_eq!(
+            w.interrupt(Some(SHELL), t0 + AFTER * 2),
+            Some(JobEvent::Finished { ran_for: AFTER * 2 })
+        );
     }
 
     #[test]

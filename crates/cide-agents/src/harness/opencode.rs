@@ -3645,6 +3645,7 @@ mod tests {
 
     fn plan_for(agent: &LoadedAgent) -> RunPlan<'_> {
         RunPlan {
+            images: Vec::new(),
             run: RunId::new(),
             session: SessionId::new(),
             agent,

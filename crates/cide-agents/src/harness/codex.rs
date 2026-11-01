@@ -493,6 +493,10 @@ fn assemble(plan: &RunPlan<'_>, resume: Option<&str>) -> Result<HarnessSpawn, Ha
         }
     }
 
+    for image in &plan.images {
+        args.push(format!("--image={}", image.display()));
+    }
+
     // ---- 9. last, and nothing may be added after them ----
     if let Some(thread) = resume {
         args.push(thread.to_string());
@@ -1084,6 +1088,7 @@ mod tests {
 
     fn plan_for<'a>(agent: &'a LoadedAgent, session: SessionId) -> RunPlan<'a> {
         RunPlan {
+            images: Vec::new(),
             run: RunId::new(),
             session,
             agent,
@@ -1160,6 +1165,17 @@ mod tests {
 
     /// The whole shape: the TUI (no `exec`), at the pane's geometry, bound by the caller, the
     /// prompt positional and last, and cide's routing keys in the environment.
+    #[test]
+    fn opening_images_are_separate_arguments() {
+        let agent = role();
+        let mut plan = plan_for(&agent, SessionId::new());
+        plan.images = vec!["/tmp/a b.png".into(), "/tmp/Привет.png".into()];
+        let args = CodexHarness.spawn_spec(&plan).unwrap().spec.args;
+        assert!(args.contains(&"--image=/tmp/a b.png".into()));
+        assert!(args.contains(&"--image=/tmp/Привет.png".into()));
+        assert_eq!(args.last(), Some(&plan.prompt));
+    }
+
     #[test]
     fn a_run_is_the_interactive_tui_with_the_prompt_last() {
         let agent = role();

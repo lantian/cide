@@ -36,7 +36,9 @@
  * propose, which is a round trip we had the user's attention for and gave away.
  */
 import { create } from 'zustand'
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
+import { useImages } from './useImages'
+import { useDesktopDrop } from '@/files/desktopDrop'
 import { OverlayCard } from '@/overlays/ModalShell'
 import { notifyFailure } from '@/chrome/notices'
 import type { ProjectId } from '@/ipc/client'
@@ -79,6 +81,15 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
   const board = useSpec((state) => state.board)
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
+  const images = useImages(`${project}:${command}`)
+  const dropArea = useRef<HTMLDivElement>(null)
+  const [dropHot, setDropHot] = useState(false)
+  useDesktopDrop(dropArea, {
+    hover: event => setDropHot(event !== null && !busy),
+    drop: event => { if (!busy && command !== null) images.drop(event.paths) },
+  })
+  const dismiss = () => { if (!busy) { images.clear(); setText(''); close() } }
+
   const plan = usePlanMode(project, command === 'explore' ? 'explore' : 'propose', command !== null)
 
   const [choice, setChoice] = useState<LauncherChoice>(DEFAULT_CHOICE)
@@ -96,17 +107,19 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
    * The harness is the user's choice here, as in the MR reviewer — Default is Settings → Harness.
    */
   const onSend = useCallback(() => {
-    if (project === null || command === null || !plan.ready || !('launcher' in resolved)) return
+    if (busy || images.pending || !text.trim() || project === null || command === null || !plan.ready || !('launcher' in resolved)) return
     if (command !== 'propose' && command !== 'explore') return
     setBusy(true)
     void startSession(project, {
       op: command,
+      images: images.docs.map(doc => doc.path),
       planMode: plan.value,
       ...(text.trim() === '' ? {} : { text }),
       launcher: resolved.launcher,
     })
       .then(() => {
         setBusy(false)
+        images.clear()
         setText('')
         close()
       })
@@ -116,36 +129,39 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
         setBusy(false)
         notifyFailure(error)
       })
-  }, [project, command, text, close, resolved, plan.ready, plan.value])
+  }, [project, command, text, close, resolved, plan.ready, plan.value, busy, images])
 
   if (command === null) return null
   return (
-    <OverlayCard label={askTitle(command)} onDismiss={busy ? () => {} : close}>
-      <ProposeFormView
-        command={command}
-        line={invocation(board, command)}
-        text={text}
-        busy={busy}
-        ready={plan.ready && 'launcher' in resolved}
-        onText={setText}
-        onSend={'launcher' in resolved ? onSend : () => {}}
-        picker={
-          <>
-            <LauncherPicker
-              choice={choice}
-              onChange={setChoice}
-              allowRoles={false}
-              onResolved={setResolved}
-            />
-            <PlanMode preference={plan} busy={busy} />
-          </>
-        }
-        onCancel={() => {
-          if (busy) return
-          setText('')
-          close()
-        }}
-      />
+    <OverlayCard label={askTitle(command)} onDismiss={dismiss}>
+      <div ref={dropArea} data-drop-hot={dropHot || undefined}>
+        <ProposeFormView
+          command={command}
+          line={invocation(board, command)}
+          text={text}
+          busy={busy}
+          ready={!images.pending && plan.ready && 'launcher' in resolved}
+          images={images.previews}
+          staging={images.pending}
+          onPasteImage={images.paste}
+          onPickImages={images.pick}
+          onRemoveImage={images.remove}
+          onText={setText}
+          onSend={'launcher' in resolved ? onSend : () => {}}
+          picker={
+            <>
+              <LauncherPicker
+                choice={choice}
+                onChange={setChoice}
+                allowRoles={false}
+                onResolved={setResolved}
+              />
+              <PlanMode preference={plan} busy={busy} />
+            </>
+          }
+          onCancel={dismiss}
+        />
+      </div>
     </OverlayCard>
   )
 }

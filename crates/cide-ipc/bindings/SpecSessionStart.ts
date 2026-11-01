@@ -8,6 +8,10 @@ import type { SpecOp } from "./SpecOp";
  */
 export type SpecSessionStart = { 
 /**
+ * Private staged image copies, in attachment order.
+ */
+images?: Array<string>, 
+/**
  * Start a main-model tab in native planning, with user approval.
  */
 planMode?: boolean, op: SpecOp, 

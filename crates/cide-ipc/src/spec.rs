@@ -484,6 +484,18 @@ pub struct SpecRequirementSet {
     pub block: String,
 }
 
+/// Set one checklist mark, conditional on the progress the user saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct SpecTaskSet {
+    pub project: ProjectId,
+    pub change: ChangeName,
+    pub index: u32,
+    pub expected: SpecProgress,
+    pub done: bool,
+}
+
 /// What writing a requirement block did.
 ///
 /// Three arms rather than `Result<(), String>`, because two of the three failures are *states the
@@ -800,6 +812,10 @@ pub enum SpecLauncher {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct SpecSessionStart {
+    /// Private staged image copies, in attachment order.
+    #[serde(default)]
+    #[ts(optional)]
+    pub images: Option<Vec<std::path::PathBuf>>,
     /// Start a main-model tab in native planning, with user approval.
     #[serde(default)]
     #[ts(optional)]

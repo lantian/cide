@@ -1386,6 +1386,7 @@ pub fn watch_jobs(app: AppHandle, id: SessionId, session: &Arc<PtySession>) {
 fn job_state(event: JobEvent) -> SessionState {
     match event {
         JobEvent::Started => SessionState::Busy,
+        JobEvent::Interrupted { .. } => SessionState::Idle,
         JobEvent::Finished { .. } => SessionState::AwaitingInput,
     }
 }
@@ -2644,6 +2645,16 @@ mod tests {
         // And the arming half: `Busy` is what both starts the turn the rule is looking for
         // and keeps the pane's host out of the eviction sweep while the job runs.
         assert_eq!(job_state(JobEvent::Started), SessionState::Busy);
+    }
+
+    #[test]
+    fn an_interrupted_shell_job_goes_idle_without_asking_for_attention() {
+        assert_eq!(
+            job_state(JobEvent::Interrupted {
+                ran_for: Duration::from_secs(42)
+            }),
+            SessionState::Idle
+        );
     }
 
     #[test]

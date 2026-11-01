@@ -22,10 +22,16 @@
  * in the middle would submit the first half on its own.
  */
 import type { ReactNode } from 'react'
+import { wantsImagePaste } from '@/editor/pasteImage'
 import styles from './OpenSpecPanel.module.css'
 import { ASK_CANCEL, ASK_SEND, askPlaceholder, askTitle, canAsk, commandLine } from './model'
 
 export interface ProposeFormProps {
+  images?: readonly { path: string; label: string; name: string; src: string }[]
+  staging?: boolean
+  onPasteImage?: () => void
+  onPickImages?: () => void
+  onRemoveImage?: (path: string) => void
   /** `propose` or `explore` — cide's handle, never the invocation. */
   command: string
   /** The line this project would actually type, off its board. See [`invocation`]. */
@@ -80,8 +86,24 @@ export function ProposeFormView(props: ProposeFormProps) {
             props.onCancel()
           }
         }}
+        onPaste={(event) => {
+          if (!busy && props.onPasteImage && wantsImagePaste([...event.clipboardData.types, ...Array.from(event.clipboardData.items, item => item.type)])) {
+            event.preventDefault()
+            props.onPasteImage()
+          }
+        }}
         onChange={(event) => props.onText(event.target.value)}
       />
+      {props.onPickImages && <div className={styles.imageAttachments}>
+        <button type="button" className={styles.button} disabled={busy} onClick={props.onPickImages}>Attach images</button>
+        <span>Paste with Ctrl+V or drop images here</span>
+        {props.staging && <span role="status">Adding images…</span>}
+        {(props.images ?? []).map(item => <div key={item.path} className={styles.imageAttachment}>
+          <img src={item.src} alt={item.label} />
+          <span title={item.name}>{item.label}: {item.name}</span>
+          <button type="button" disabled={busy} aria-label={`Remove ${item.label}`} onClick={() => props.onRemoveImage?.(item.path)}>Remove</button>
+        </div>)}
+      </div>}
       <p className={styles.askPreview} data-audit="openspecAskPreview">
         {commandLine(line, text)}
       </p>

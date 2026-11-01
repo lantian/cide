@@ -361,6 +361,36 @@ pub async fn spec_requirement_set(
     Ok(outcome)
 }
 
+/// Save a checklist mark in the checkout displayed by the change tab.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn spec_task_set(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    boards: State<'_, Arc<SpecBoards>>,
+    req: cide_ipc::SpecTaskSet,
+    worktree: Option<PathBuf>,
+) -> Result<SpecWriteOutcome> {
+    let cwd = working_dir(&state, req.project, worktree)?;
+    let project = req.project;
+    let changed = cwd.join("openspec/changes").join(req.change.as_str());
+    let root = tasks_state::project_root(&state, project)?;
+    let result = blocking(move || {
+        let os = open(cwd)?;
+        cide_spec::checklist::set_task(
+            &os,
+            &req.change,
+            req.index as usize,
+            &req.expected,
+            req.done,
+        )
+        .map_err(|error| CoreError::Io(error.to_string()))
+    })
+    .await;
+    // Even a failed post-write read must invalidate previously cached content.
+    boards.mark_paths(&app, project, &[changed], &root);
+    result
+}
+
 /// Type one of OpenSpec's workflow commands into this project's Claude tab. (M28)
 ///
 /// # Why cide types a command instead of explaining the workflow itself

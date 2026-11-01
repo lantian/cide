@@ -738,3 +738,40 @@ fn archive_refusals_preserve_the_active_change() {
     );
     assert!(scratch.0.join("openspec/changes/add-dark-mode").is_dir());
 }
+
+#[test]
+#[ignore = "spawns the real openspec CLI"]
+fn checklist_toggle_persists_and_returns_completed_change() {
+    let (scratch, os, change, _) = seeded("toggle");
+    let path = scratch.0.join("openspec/changes/add-dark-mode/tasks.md");
+    let original = "# Tasks\r\n- [x] 1. First\r\n  * [ ] 2. Last\r\n";
+    write_file(&path, original);
+    let before = os.change(&change).unwrap().progress;
+    let result = cide_spec::checklist::set_task(&os, &change, 1, &before, true).unwrap();
+    let SpecWriteOutcome::Written {
+        change: updated, ..
+    } = result
+    else {
+        panic!("expected write")
+    };
+    assert!(updated.progress.complete());
+    assert!(updated.validation.valid);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace("[ ]", "[x]")
+    );
+    assert!(matches!(
+        cide_spec::checklist::set_task(&os, &change, 0, &before, false).unwrap(),
+        SpecWriteOutcome::Conflicted { .. }
+    ));
+    let result = cide_spec::checklist::set_task(&os, &change, 1, &updated.progress, false).unwrap();
+    assert!(matches!(result, SpecWriteOutcome::Written { .. }));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    // A second artifact holding the same list is ambiguous, never a guess.
+    write_file(
+        &scratch.0.join("openspec/changes/add-dark-mode/design.md"),
+        original,
+    );
+    assert!(cide_spec::checklist::set_task(&os, &change, 1, &before, true).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}

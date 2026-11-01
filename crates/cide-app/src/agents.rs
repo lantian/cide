@@ -1218,6 +1218,8 @@ pub enum Dismissed {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpecPurpose {
+    #[serde(default)]
+    pub images: Vec<PathBuf>,
     pub op: cide_ipc::SpecOp,
     /// A proposal requested while creating an existing task. Kept in the purpose, rather than
     /// the implementation run's task slot: proposing must not change assignment or task status.
@@ -4645,6 +4647,7 @@ impl AgentRegistry {
         project: ProjectId,
         run: RunId,
     ) -> std::result::Result<Dismissed, String> {
+        let mut images = Vec::new();
         {
             let mut inner = self.inner.lock();
             let Some(live) = inner
@@ -4664,7 +4667,11 @@ impl AgentRegistry {
                 | RunState::Cancelled { .. }
                 | RunState::Failed { .. }
                 | RunState::Interrupted => {
-                    inner.runs.remove(&run);
+                    if let Some(removed) = inner.runs.remove(&run)
+                        && let RunPurpose::Spec(spec) = removed.purpose
+                    {
+                        images.extend(spec.images);
+                    }
                 }
                 // Mid-turn: the user may want what it is doing. Stop is a separate, explicit act.
                 RunState::Starting | RunState::Running => {
@@ -4686,6 +4693,7 @@ impl AgentRegistry {
                 }
             }
         }
+        crate::cmd::spec_images::release_retained(&images);
         let server = self.inner.lock().servers.remove(&run);
         if let Some(server) = server {
             end_tree(&server.pty, "a dismissed session's server");
@@ -4696,6 +4704,7 @@ impl AgentRegistry {
 
     /// Drop the oldest finished runs of every project past [`RECENT_KEPT`].
     fn forget_old(&self) {
+        let mut images = Vec::new();
         let mut inner = self.inner.lock();
         let mut done: HashMap<ProjectId, Vec<(u64, RunId)>> = HashMap::new();
         for run in inner.runs.values() {
@@ -4714,9 +4723,15 @@ impl AgentRegistry {
             }
             runs.sort_unstable();
             for (_, run) in runs.drain(..runs.len() - RECENT_KEPT) {
-                inner.runs.remove(&run);
+                if let Some(removed) = inner.runs.remove(&run)
+                    && let RunPurpose::Spec(spec) = removed.purpose
+                {
+                    images.extend(spec.images);
+                }
             }
         }
+        drop(inner);
+        crate::cmd::spec_images::release_retained(&images);
     }
 }
 
@@ -7705,6 +7720,18 @@ impl AgentRegistry {
         self.restore_snapshot_from(&snapshot_path(), keep, root_of, |harness, cwd, session| {
             crate::lifecycle::resumable_on(harness, cwd, session, resume_enabled)
         });
+        let retained = self
+            .inner
+            .lock()
+            .runs
+            .values()
+            .filter_map(|run| match &run.purpose {
+                RunPurpose::Spec(spec) => Some(spec.images.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        crate::cmd::spec_images::sweep(&retained);
     }
 
     /// The read, path-parameterised for the same reason as the write's.
@@ -9982,7 +10009,15 @@ fn start_child(
     // every run and *made* only for a harness that hands it back — see the destructure below.
     let events_path = event_tap::path_for(facts.agent_sock.as_deref(), admission.run);
 
+    let images = match &admission.purpose {
+        RunPurpose::Spec(spec) if admission.resume.is_none() => spec.images.clone(),
+        _ => Vec::new(),
+    };
+    crate::cmd::spec_images::validate_retained(&images)?;
+    let prompt =
+        crate::cmd::spec_images::opening_prompt(resolved.harness, &admission.prompt, &images);
     let plan = RunPlan {
+        images,
         planning: registry.planning(admission.run),
         run: admission.run,
         session,
@@ -10003,7 +10038,7 @@ fn start_child(
             cide_ipc::Harness::Codex => facts.spec_apply_codex.clone(),
             _ => facts.spec_apply.clone(),
         },
-        prompt: admission.prompt.clone(),
+        prompt,
         hook_bin: facts.hook_bin.clone(),
         hook_sock: facts.hook_sock.clone(),
         agent_sock: facts.agent_sock.clone(),
@@ -12050,6 +12085,7 @@ mod tests {
             .expect("task implementation");
         let mut apply = spec(project, "openspec", 2, 4);
         apply.purpose = RunPurpose::Spec(SpecPurpose {
+            images: Vec::new(),
             op: cide_ipc::SpecOp::Apply,
             task: None,
             suppress_reveal: false,
@@ -12143,6 +12179,7 @@ mod tests {
         let task = TaskId("t-42".into());
         let mut session = spec(project, "openspec", 4, 4);
         session.purpose = RunPurpose::Spec(SpecPurpose {
+            images: Vec::new(),
             op: cide_ipc::SpecOp::Propose,
             task: Some(task.clone()),
             suppress_reveal: true,
@@ -12189,6 +12226,7 @@ mod tests {
         let mut proposal = spec(project, "openspec", 4, 4);
         proposal.harness = Harness::Codex;
         proposal.purpose = RunPurpose::Spec(SpecPurpose {
+            images: Vec::new(),
             op: cide_ipc::SpecOp::Propose,
             task: Some(TaskId("t-1".into())),
             suppress_reveal: true,
@@ -12312,6 +12350,7 @@ mod tests {
         let project = ProjectId::new();
         let mut session = spec(project, "openspec", 4, 4);
         session.purpose = RunPurpose::Spec(SpecPurpose {
+            images: Vec::new(),
             op: cide_ipc::SpecOp::Propose,
             task: None,
             suppress_reveal: false,

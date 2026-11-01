@@ -597,3 +597,8 @@ button.caption:hover {
 
 .readyBody { display: flex; flex-direction: column; overflow: hidden; }
 .rows { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
+.imageAttachments { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: var(--fs-ui-12); }
+.imageAttachment { display: flex; align-items: center; gap: 6px; }
+.imageAttachment img { width: 64px; height: 48px; object-fit: contain; border-radius: 4px; }
+[data-drop-hot="true"] > .ask { outline: 2px solid var(--accent); }

@@ -753,6 +753,8 @@ pub enum StepEdge {
 /// nothing.
 #[derive(Debug, Clone)]
 pub struct RunPlan<'a> {
+    /// Images belonging to the opening user prompt.
+    pub images: Vec<PathBuf>,
     /// Native planning progress for this assignment. Absent for legacy runs and reviewers.
     pub planning: Option<crate::native_plan::State>,
     /// This run's own identity, for the whole of its life. `CIDE_RUN` in the child.
@@ -1463,6 +1465,7 @@ mod tests {
             let spawn = |env: Vec<(String, Option<String>)>| {
                 let run = RunId::new();
                 let plan = RunPlan {
+                    images: Vec::new(),
                     run,
                     session: SessionId::new(),
                     agent: &agent,
@@ -1865,6 +1868,7 @@ mod tests {
             instructions: Option<&str>,
         ) -> RunPlan<'a> {
             RunPlan {
+                images: Vec::new(),
                 run: RunId::new(),
                 session: SessionId::new(),
                 agent,

@@ -495,3 +495,10 @@
   color: var(--bg);
   border-radius: 2px;
 }
+
+.stepToggle {
+  flex: none;
+  margin: 2px 0 0;
+  cursor: pointer;
+}
+.stepToggle:disabled { cursor: default; }

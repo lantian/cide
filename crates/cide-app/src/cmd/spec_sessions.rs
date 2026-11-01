@@ -163,7 +163,11 @@ fn start_session(
         .and_then(|change| registry.change_holding(project, change.as_str()));
     // Plan before changing statuses: a missing change or workflow must leave the board alone.
     let spec = if held.is_none() {
-        let spec = plan_session(root, project, request.clone())?;
+        let mut spec = plan_session(root, project, request.clone())?;
+        if let RunPurpose::Spec(purpose) = &mut spec.purpose {
+            purpose.images =
+                super::spec_images::retain(request.images.as_deref().unwrap_or_default())?;
+        }
         // Planning Apply can create a worktree after spec_checkouts cached an empty list.
         // File events inside openspec invalidate progress, but not that git metadata. Publish
         // a fresh snapshot now so both the sidebar and change tab discover the checkout.
@@ -312,6 +316,7 @@ pub(crate) fn apply_task(
         &root,
         project,
         SpecSessionStart {
+            images: None,
             plan_mode: None,
             op: SpecOp::Apply,
             change: task.change.clone(),
@@ -328,6 +333,16 @@ fn plan_session(
     project: ProjectId,
     request: SpecSessionStart,
 ) -> Result<DispatchSpec> {
+    if request
+        .images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty())
+        && !matches!(request.op, SpecOp::Propose | SpecOp::Explore)
+    {
+        return Err(CoreError::Io(
+            "Images are supported for Propose and Explore only".into(),
+        ));
+    }
     let loaded = cide_agents::load_project(root);
     let text = request
         .text
@@ -495,6 +510,7 @@ fn plan_session(
         // panel's chip is where its state is read.
         notify: cide_ipc::RunNotify::Silent,
         purpose: RunPurpose::Spec(SpecPurpose {
+            images: Vec::new(),
             op: request.op,
             task: None,
             suppress_reveal: false,
@@ -522,6 +538,7 @@ pub(super) fn plan_task_proposal(
         root,
         project,
         SpecSessionStart {
+            images: None,
             plan_mode: None,
             op: SpecOp::Propose,
             change: None,
@@ -1072,6 +1089,7 @@ mod tests {
                     &root,
                     project,
                     SpecSessionStart {
+                        images: None,
                         op: SpecOp::Propose,
                         change: None,
                         text: Some("A proposal".into()),
