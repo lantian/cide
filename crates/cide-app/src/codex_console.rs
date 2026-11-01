@@ -725,7 +725,7 @@ async fn forward_connection(
                             continue;
                         }
                         acceptance = if let Some(plan) = &planning
-                            && plan.pending() && plan.valid()
+                            && !plan.user_approval() && plan.pending() && plan.valid()
                             && selected.lock().connection == Some(connection)
                             && protocol.lock().owns_thread(&parsed) {
                             let id = format!("cide-plan-{}", SessionId::new());

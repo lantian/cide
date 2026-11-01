@@ -18976,3 +18976,23 @@ covers removing an orphaned cancellation, failure/retry, duplicate clicks, Close
 and disabled removal during application. Agent rendering, UI kit, TypeScript, production UI
 build, app compilation and command contract checks pass. A running desktop build has not been
 restarted or used to remove a real request.
+
+## OpenSpec tab plan-mode preferences
+
+Propose, Explore and main-model Apply now have a Start in plan mode switch.
+Each workflow saves its choice immediately in the project's OpenSpec settings,
+including when the launch dialog is cancelled. Role launches hide the switch;
+task-driven sessions do not inherit these preferences. Settings updates merge
+individual fields so the worktree option and planning choices preserve each other.
+
+Opted-in tabs use native planning with persisted user approval. They do not
+automatically approve plans or submit implementation turns. Native approval
+advances the same session into execution; revisions, follow-ups and restored
+sessions preserve the approval policy. Existing delegated workers retain their
+automatic planning behavior.
+
+Validation: the preference hook checks cover project/workflow isolation, reopening,
+save failures and stale saves. Apply passes 67 DOM assertions. OpenSpec model,
+configuration and render checks, TypeScript, 17 focused agent tests and 14 app
+planning/session tests pass. Adapter socket tests required execution outside the
+sandbox. No paid model sessions or live desktop approval flows were exercised.

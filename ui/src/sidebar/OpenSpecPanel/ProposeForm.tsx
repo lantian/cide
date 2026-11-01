@@ -32,6 +32,7 @@ export interface ProposeFormProps {
   line: string
   text: string
   busy: boolean
+  ready?: boolean
   onText: (text: string) => void
   onSend: () => void
   onCancel: () => void
@@ -51,7 +52,7 @@ export interface ProposeFormProps {
  */
 export function ProposeFormView(props: ProposeFormProps) {
   const { command, line, text, busy } = props
-  const ready = canAsk(command, text) && !busy
+  const ready = canAsk(command, text) && !busy && props.ready !== false
   return (
     <div className={styles.ask} data-audit="openspecAsk" data-command={command}>
       <p className={styles.askHeading}>{askTitle(command)}</p>

@@ -462,6 +462,15 @@ impl Console {
                                     && info["sessionID"].as_str()
                                         == Some(this.conversation().id.as_str())
                                 {
+                                    if let Some(plan) = &this.planning
+                                        && plan.user_approval()
+                                        && plan.pending()
+                                        && info["agent"] == "build"
+                                    {
+                                        plan.transition(
+                                            cide_agents::native_plan::Phase::Implementing,
+                                        );
+                                    }
                                     crate::peer_chat::note_native_prompt(&event_app, routing);
                                 }
                             }
@@ -514,7 +523,7 @@ impl Console {
                                     }
                                 } else { questions.retain(|_, (_, q)| q.active()); !questions.is_empty() };
                                 if asking { state = SessionState::AwaitingInput; }
-                                if !asking && plan.pending() && plan.valid() && matches!(state, SessionState::Idle | SessionState::AwaitingInput) {
+                                if !asking && !plan.user_approval() && plan.pending() && plan.valid() && matches!(state, SessionState::Idle | SessionState::AwaitingInput) {
                                     let transition = (|| -> Result<bool, String> {
                                         if this.api.approve_plan_question(&conversation.id)? {
                                             plan.transition(cide_agents::native_plan::Phase::Implementing);
@@ -534,6 +543,10 @@ impl Console {
                                         Ok(false) => {},
                                         Err(error) => { plan.fail(&error); this.stop(); break; }
                                     }
+                                }
+                                if plan.user_approval() && plan.pending() && plan.valid()
+                                    && this.api.native_build_started(&conversation.id).unwrap_or(false) {
+                                    plan.transition(cide_agents::native_plan::Phase::Implementing);
                                 }
                                 plan.state(state);
                             }

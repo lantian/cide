@@ -6,7 +6,11 @@ import type { SpecOp } from "./SpecOp";
 /**
  * Start an OpenSpec session. Inbound.
  */
-export type SpecSessionStart = { op: SpecOp, 
+export type SpecSessionStart = { 
+/**
+ * Start a main-model tab in native planning, with user approval.
+ */
+planMode?: boolean, op: SpecOp, 
 /**
  * The change an Apply implements. Required for `Apply`, ignored otherwise.
  */

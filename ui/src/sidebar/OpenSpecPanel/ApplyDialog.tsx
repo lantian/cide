@@ -23,6 +23,7 @@ import { specSessions, type ProjectId } from '@/ipc/client'
 import type { SpecLauncher } from '@/ipc/generated'
 import { DEFAULT_CHOICE, LauncherPicker, type LauncherChoice } from './LauncherPicker'
 import { startSession } from './specRuns'
+import { PlanMode, usePlanMode } from './PlanMode'
 import { useApplyDialog } from './applyStore'
 
 export { useApplyDialog }
@@ -36,6 +37,7 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
   })
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
+  const plan = usePlanMode(project, 'apply', change !== null)
   const [worktree, setWorktree] = useState<boolean | null>(null)
   const instructions = useRef<HTMLTextAreaElement>(null)
 
@@ -68,9 +70,11 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
 
   const onApply = useCallback(() => {
     if (project === null || change === null || !('launcher' in resolved)) return
+    if (resolved.launcher.kind === 'harness' && !plan.ready) return
     setBusy(true)
     void startSession(project, {
       op: 'apply',
+      planMode: resolved.launcher.kind === 'harness' && plan.value,
       change,
       ...(text.trim() === '' ? {} : { text }),
       launcher: resolved.launcher,
@@ -85,10 +89,10 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
         setBusy(false)
         notifyFailure(error)
       })
-  }, [project, change, resolved, text, close])
+  }, [project, change, resolved, text, close, plan.ready, plan.value])
 
   if (change === null) return null
-  const ready = 'launcher' in resolved && !busy
+  const ready = 'launcher' in resolved && !busy && (resolved.launcher.kind === 'role' || plan.ready)
   return (
     <Modal onDismiss={dismiss}>
       <Dialog
@@ -140,6 +144,7 @@ export function ApplyDialog({ project }: { project: ProjectId | null }) {
           allowRoles
           onResolved={setResolved}
         />
+        {choice.mode === 'main' && <PlanMode preference={plan} busy={busy} />}
         <Field label="Instructions" optional hint="Typed after the apply command, on one line.">
           {({ id, describedBy }) => (
             <Textarea

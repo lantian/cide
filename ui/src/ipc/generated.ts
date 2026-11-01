@@ -9020,13 +9020,14 @@ panes: number,
  * The in-project tab strip's spinner: consoles mid-turn, per tab. (M115)
  *
  * **Only tabs with a count above zero**, in tab order — the set's own "absence is zero" rule
- * one level down. A detached pane is in no tab and counts toward `panes` alone; a session
+ * one level down. A detached pane is in no tab and counts toward project totals alone; a session
  * mirrored into two tabs counts once in each, because each tab is showing it.
  *
  * # Narrower than `panes`, on purpose
  *
- * A tab counts a session only while it is `Busy` — a permission prompt is **not** a
- * spinning tab. The strip gives each console tab three states: turning (working), the
+ * A tab counts ordinary consoles while `Busy`, and run mirrors while their owner is
+ * `Starting` or `Running`. Project totals still count a mirrored run only once, in `runs`.
+ * A permission prompt is **not** a spinning tab. Each console tab has three states: turning (working), the
  * awaiting badge (finished, or asking, and not yet looked at), and plain. A session at a
  * permission prompt is the badge's — it is waiting on a person — and counting it here too
  * would light both chips on a one-console tab, which is the "never describe the same
@@ -12389,7 +12390,11 @@ source: string | null, };
 /**
  * Start an OpenSpec session. Inbound.
  */
-export type SpecSessionStart = { op: SpecOp, 
+export type SpecSessionStart = { 
+/**
+ * Start a main-model tab in native planning, with user approval.
+ */
+planMode?: boolean, op: SpecOp, 
 /**
  * The change an Apply implements. Required for `Apply`, ignored otherwise.
  */
@@ -12405,7 +12410,7 @@ text?: string, launcher: SpecLauncher, };
 /**
  * `.cide/config.json`'s `openspec` key, as the panel's gear edits it.
  */
-export type SpecSettings = { 
+export type SpecSettings = { proposePlanMode: boolean, explorePlanMode: boolean, applyPlanMode: boolean, 
 /**
  * Apply a change in `.cide/worktrees/spec-<change>` on branch `cide/spec-<change>` rather
  * than in the project root. Only Apply: a proposal written in a worktree would be invisible

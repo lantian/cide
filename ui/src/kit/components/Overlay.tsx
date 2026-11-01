@@ -120,7 +120,7 @@ export function Dialog({
       {actions !== undefined && (
         <div className={styles.dialogFoot}>
           <span className={styles.footNote}>{footNote}</span>
-          {actions}
+          <div className={styles.dialogActions}>{actions}</div>
         </div>
       )}
     </div>
@@ -196,7 +196,7 @@ export function Wizard({
           <div className={styles.wizardBody}>{children}</div>
           <div className={styles.dialogFoot}>
             <span className={styles.footNote}>{footNote}</span>
-            {actions}
+            <div className={styles.dialogActions}>{actions}</div>
           </div>
         </div>
       </div>

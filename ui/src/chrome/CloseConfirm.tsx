@@ -101,7 +101,6 @@ export function CloseConfirm({
       <Dialog
         title={title}
         lead={confirmBody(scope, risk)}
-        width="narrow"
         flush
         onKeyDown={onKeyDown}
         data-audit="closeConfirm"

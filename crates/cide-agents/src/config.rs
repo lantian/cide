@@ -1754,6 +1754,9 @@ mod tests {
         assert_eq!(load_spec_settings(&root), SpecSettings::default());
         let on = SpecSettings {
             apply_in_worktree: true,
+            propose_plan_mode: true,
+            explore_plan_mode: false,
+            apply_plan_mode: true,
         };
         write_spec_settings(&root, &on).unwrap();
         assert_eq!(load_spec_settings(&root), on);

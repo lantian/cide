@@ -1,5 +1,5 @@
-//! Cide owns the native plan-approval transition for delegated workers only.
-//! Ordinary consoles, questions and tool permissions never enter this controller.
+//! Native planning for delegated workers and explicitly opted-in OpenSpec tabs.
+//! Workers approve automatically; interactive tabs leave approval to the user.
 use cide_agents::native_plan::{Phase, State};
 use cide_ipc::{Harness, HarnessSession, ProjectId, RunId, SessionId};
 use cide_pty::PtySession;
@@ -283,6 +283,9 @@ impl Handle {
             questions,
         )
     }
+    pub fn user_approval(&self) -> bool {
+        self.0.state.lock().user_approval
+    }
     pub fn phase(&self) -> Phase {
         self.0.state.lock().phase
     }
@@ -504,10 +507,13 @@ impl Handle {
             .lock()
             .as_deref()
             .and_then(|call| cide_agents::native_plan::qwen_plan_result(value, call));
-        if self.phase() == Phase::Approving {
+        if self.phase() == Phase::Approving || self.user_approval() {
             match result {
                 Some(true) => self.transition(Phase::Implementing),
-                Some(false) => self.fail("Qwen rejected its native plan transition"),
+                Some(false) if !self.user_approval() => {
+                    self.fail("Qwen rejected its native plan transition")
+                }
+                Some(false) => {}
                 None => {}
             }
         }
@@ -552,7 +558,10 @@ impl Handle {
         let child = Arc::downgrade(pty);
         let ended = self.clone();
         pty.on_exit(move |_| ended.cancel());
-        if !matches!(self.0.harness, Harness::Claude | Harness::Qwen) || !self.pending() {
+        if self.user_approval()
+            || !matches!(self.0.harness, Harness::Claude | Harness::Qwen)
+            || !self.pending()
+        {
             return;
         }
         let generation = handle.0.state.lock().generation;
@@ -678,7 +687,7 @@ pub(crate) fn observe_hook(app: &AppHandle, frame: &cide_claude::HookFrame) {
                 frame.payload["tool_name"].as_str(),
                 Some("ExitPlanMode" | "exit_plan_mode")
             )
-            && handle.phase() == Phase::Approving
+            && (handle.phase() == Phase::Approving || handle.user_approval())
         {
             handle.transition(Phase::Implementing);
         }

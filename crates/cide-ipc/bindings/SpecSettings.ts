@@ -3,7 +3,7 @@
 /**
  * `.cide/config.json`'s `openspec` key, as the panel's gear edits it.
  */
-export type SpecSettings = { 
+export type SpecSettings = { proposePlanMode: boolean, explorePlanMode: boolean, applyPlanMode: boolean, 
 /**
  * Apply a change in `.cide/worktrees/spec-<change>` on branch `cide/spec-<change>` rather
  * than in the project root. Only Apply: a proposal written in a worktree would be invisible

@@ -27,7 +27,8 @@ const { createRoot } = await import('react-dom/client')
 
 const mocks = {
   ipc: `export const specSessions = {
-    settings: async () => ({ applyInWorktree: false }),
+    settings: async () => window.applyCheck.preferences,
+    setSettings: async (_project, patch) => Object.assign(window.applyCheck.preferences, patch),
     harnesses: async () => [{ harness: 'codex', unavailable: null }],
   };
   export const settings = { effective: async () => ({ consoleHarness: 'codex' }) };`,
@@ -41,7 +42,7 @@ const mocks = {
 }
 
 let checks = 0
-window.applyCheck = { launches: [], failures: [], launch: async () => 'mock-run' }
+window.applyCheck = { launches: [], failures: [], launch: async () => 'mock-run', preferences: { applyInWorktree: false, proposePlanMode: true, explorePlanMode: false, applyPlanMode: false } }
 const mock = window.applyCheck
 let documentEscapes = 0, parentEscapes = 0
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape') documentEscapes++; })
@@ -124,11 +125,19 @@ try {
   assert(mock.launches.length === 0, 'immediate Escape never launches')
 
   await open()
+  const planSwitch = () => dialog().querySelector('[role="switch"]')
+  assert(planSwitch().getAttribute('aria-checked') === 'false', 'plan mode defaults off')
+  commit(() => planSwitch().click())
+  await settle()
+  assert(mock.preferences.applyPlanMode === true, 'changing the switch persists Apply')
+  assert(mock.preferences.proposePlanMode === true && mock.preferences.explorePlanMode === false,
+    'saving Apply preserves other workflows')
   type('keep the old API')
   assert(instructions().value === 'keep the old API', 'instructions accept input')
   escape()
   closed()
   await open()
+  assert(planSwitch().getAttribute('aria-checked') === 'true', 'cancel and reopen preserves plan mode')
   assert(instructions().value === '', 'dismissal clears draft instructions on reopening')
   const ordinary = key('a')
   assert(!ordinary.defaultPrevented && !!dialog(), 'other keys retain normal handling')
@@ -165,8 +174,10 @@ try {
   assert(!dialog() && mock.launches.length === 1, 'successful launch closes Apply once')
   assert(mock.launches[0].project === 'test-project'
     && mock.launches[0].request.text === 'launch instructions'
-    && mock.launches[0].request.launcher.harness === 'codex', 'launch receives the selected launcher and instructions')
+    && mock.launches[0].request.launcher.harness === 'codex'
+    && mock.launches[0].request.planMode === true, 'launch receives the selected launcher and instructions')
   await open()
+  assert(planSwitch().getAttribute('aria-checked') === 'true', 'cancel and reopen preserves plan mode')
   assert(instructions().value === '', 'successful launch clears instructions before reopening')
   escape()
   closed()
@@ -191,6 +202,7 @@ try {
   const failed = deferred()
   mock.launch = () => failed.promise
   await open()
+  assert(planSwitch().getAttribute('aria-checked') === 'true', 'cancel and reopen preserves plan mode')
   assert(instructions().value === '', 'pending success clears instructions')
   type('failed instructions')
   commit(() => dialog().querySelector('[data-audit="openspecApplyStart"]').click())
@@ -203,6 +215,7 @@ try {
   escape()
   closed()
   await open()
+  assert(planSwitch().getAttribute('aria-checked') === 'true', 'cancel and reopen preserves plan mode')
   assert(instructions().value === '', 'Escape after failure clears instructions')
   escape()
   closed()

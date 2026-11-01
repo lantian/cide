@@ -88,10 +88,24 @@ pub async fn spec_settings_get(
 pub async fn spec_settings_set(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
-    settings: SpecSettings,
+    settings: serde_json::Map<String, serde_json::Value>,
 ) -> Result<SpecSettings> {
     let root = tasks_state::project_root(&state, project)?;
     blocking(move || {
+        static SAVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SAVE.lock().unwrap_or_else(|error| error.into_inner());
+        let mut current = serde_json::to_value(cide_agents::config::load_spec_settings(&root))
+            .map_err(|error| CoreError::Io(error.to_string()))?;
+        for (key, value) in settings {
+            if current.get(&key).is_none() || !value.is_boolean() {
+                return Err(CoreError::Io(format!(
+                    "Unknown or invalid OpenSpec setting: {key}"
+                )));
+            }
+            current[&key] = value;
+        }
+        let settings: SpecSettings =
+            serde_json::from_value(current).map_err(|error| CoreError::Io(error.to_string()))?;
         cide_agents::config::write_spec_settings(&root, &settings)?;
         Ok(cide_agents::config::load_spec_settings(&root))
     })
@@ -134,6 +148,13 @@ fn start_session(
     request: SpecSessionStart,
     author: cide_ipc::TaskAuthor,
 ) -> Result<RunId> {
+    if request.plan_mode.unwrap_or(false)
+        && (matches!(request.launcher, SpecLauncher::Role { .. }) || request.op == SpecOp::Merge)
+    {
+        return Err(CoreError::Io(
+            "Plan mode is only available for main-model Propose, Explore and Apply tabs".into(),
+        ));
+    }
     let change = (request.op == SpecOp::Apply)
         .then(|| request.change.clone())
         .flatten();
@@ -291,6 +312,7 @@ pub(crate) fn apply_task(
         &root,
         project,
         SpecSessionStart {
+            plan_mode: None,
             op: SpecOp::Apply,
             change: task.change.clone(),
             text: None,
@@ -449,7 +471,13 @@ fn plan_session(
         checkout.is_some(),
     );
     Ok(DispatchSpec {
-        planning: None,
+        planning: request
+            .plan_mode
+            .unwrap_or(false)
+            .then(|| cide_agents::native_plan::State {
+                user_approval: true,
+                ..Default::default()
+            }),
         project,
         agent,
         agent_label: label,
@@ -494,6 +522,7 @@ pub(super) fn plan_task_proposal(
         root,
         project,
         SpecSessionStart {
+            plan_mode: None,
             op: SpecOp::Propose,
             change: None,
             text: Some(format!("{} {}", task.title, task.body)),
@@ -1022,8 +1051,40 @@ mod tests {
         let task = store
             .create(&req, cide_ipc::TaskAuthor::User)
             .expect("task");
+        cide_agents::config::write_spec_settings(
+            &root,
+            &SpecSettings {
+                propose_plan_mode: true,
+                explore_plan_mode: true,
+                apply_plan_mode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for harness in [Harness::Claude, Harness::Codex] {
             let planned = plan_task_proposal(&root, project, &task, harness).expect("proposal");
+            assert!(
+                planned.planning.is_none(),
+                "task proposal ignores tab preferences"
+            );
+            for enabled in [false, true] {
+                let tab = plan_session(
+                    &root,
+                    project,
+                    SpecSessionStart {
+                        op: SpecOp::Propose,
+                        change: None,
+                        text: Some("A proposal".into()),
+                        launcher: SpecLauncher::Harness { harness },
+                        plan_mode: Some(enabled),
+                    },
+                )
+                .unwrap();
+                assert_eq!(tab.planning.is_some(), enabled);
+                if let Some(state) = tab.planning {
+                    assert!(state.user_approval);
+                }
+            }
             assert!(
                 planned.task.is_none(),
                 "no implementation binding or status lifecycle"

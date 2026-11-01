@@ -5003,7 +5003,7 @@ export const specSessions = {
   /** `.cide/config.json`'s `openspec` key. */
   settings: (project: ProjectId) => invoke<SpecSettings>('spec_settings_get', { project }),
 
-  setSettings: (project: ProjectId, settings: SpecSettings) =>
+  setSettings: (project: ProjectId, settings: Partial<SpecSettings>) =>
     invoke<SpecSettings>('spec_settings_set', { project, settings }),
 
   /** Start a session; answers the run at once, before it has a child. */

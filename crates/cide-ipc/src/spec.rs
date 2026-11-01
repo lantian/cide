@@ -800,6 +800,10 @@ pub enum SpecLauncher {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct SpecSessionStart {
+    /// Start a main-model tab in native planning, with user approval.
+    #[serde(default)]
+    #[ts(optional)]
+    pub plan_mode: Option<bool>,
     pub op: SpecOp,
     /// The change an Apply implements. Required for `Apply`, ignored otherwise.
     #[ts(optional)]
@@ -938,6 +942,9 @@ pub enum SpecIntegrated {
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct SpecSettings {
+    pub propose_plan_mode: bool,
+    pub explore_plan_mode: bool,
+    pub apply_plan_mode: bool,
     /// Apply a change in `.cide/worktrees/spec-<change>` on branch `cide/spec-<change>` rather
     /// than in the project root. Only Apply: a proposal written in a worktree would be invisible
     /// to the panel (which reads the root) until it was merged.

@@ -17,6 +17,26 @@ pub struct Api {
     pub generation: Generation,
 }
 
+fn native_build_message(messages: &Value, generation: Generation) -> bool {
+    let Some(messages) = messages.get("items").unwrap_or(messages).as_array() else {
+        return false;
+    };
+    let ordered: Box<dyn Iterator<Item = &Value>> = if generation == Generation::V2 {
+        Box::new(messages.iter())
+    } else {
+        Box::new(messages.iter().rev())
+    };
+    ordered
+        .map(|message| message.get("info").unwrap_or(message))
+        .find(|info| {
+            matches!(
+                info["type"].as_str().or_else(|| info["role"].as_str()),
+                Some("user" | "assistant")
+            )
+        })
+        .is_some_and(|info| info["agent"] == "build")
+}
+
 impl Api {
     /// Only model-authored questions. Authentication/provider forms and native plan
     /// exits retain their own controllers.
@@ -308,6 +328,18 @@ impl Api {
         }
         Ok(false)
     }
+    /// Observe a user-selected Build turn without submitting or approving anything.
+    pub fn native_build_started(&self, id: &str) -> Result<bool, String> {
+        validate_id(id)?;
+        let route = if self.generation == Generation::V2 {
+            format!("/session/{id}/message?order=desc&limit=16")
+        } else {
+            format!("/session/{id}/message")
+        };
+        let messages = self.request(reqwest::Method::GET, &route, None)?;
+        Ok(native_build_message(&messages, self.generation))
+    }
+
     pub fn completed_native_plan(&self, id: &str) -> Result<Option<String>, String> {
         validate_id(id)?;
         let route = if self.generation == Generation::V2 {
@@ -537,6 +569,24 @@ pub fn decode_event(line: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_plan_observes_only_the_latest_native_build_turn() {
+        use super::*;
+        let plan = json!({"info":{"role":"assistant","agent":"plan"}});
+        let build = json!({"info":{"role":"user","agent":"build"}});
+        assert!(native_build_message(&json!([plan, build]), Generation::V1));
+        assert!(!native_build_message(&json!([build, plan]), Generation::V1));
+        assert!(native_build_message(
+            &json!({"items":[build, plan]}),
+            Generation::V2
+        ));
+        assert!(!native_build_message(
+            &json!({"items":[plan, build]}),
+            Generation::V2
+        ));
+        assert!(!native_build_message(&json!([]), Generation::V1));
+    }
+
     use super::*;
     use std::{
         io::{Read, Write},

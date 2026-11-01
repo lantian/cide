@@ -144,11 +144,30 @@
 .dialogFoot {
   flex: none;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-4);
   padding: var(--sp-5) calc(28px * var(--ui-scale));
   border-top: 1px solid var(--border);
   background: var(--chrome);
+}
+
+.dialogActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-4);
+  margin-left: auto;
+  min-width: 0;
+}
+
+/* A long destructive label may itself exceed a small window at larger UI scales. */
+.dialogActions > button {
+  max-width: 100%;
+  height: auto;
+  min-height: calc(30px * var(--ui-scale));
+  white-space: normal;
 }
 
 .footNote {
@@ -159,6 +178,14 @@
   white-space: nowrap;
   font-size: var(--fs-ui-11);
   color: var(--faint);
+}
+
+/* Recovery actions must stay readable; only prose may be truncated. If the footer
+   cannot fit both groups, move the closing actions to the next line. */
+.footNote:has(button) {
+  flex-shrink: 0;
+  min-width: min-content;
+  overflow: visible;
 }
 
 /* --- wizard shell ---------------------------------------------------------------------------- */

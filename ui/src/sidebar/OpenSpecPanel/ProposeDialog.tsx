@@ -46,6 +46,7 @@ import { ProposeFormView } from './ProposeForm'
 import { askTitle, invocation } from './model'
 import { DEFAULT_CHOICE, LauncherPicker, type LauncherChoice } from './LauncherPicker'
 import { startSession } from './specRuns'
+import { PlanMode, usePlanMode } from './PlanMode'
 
 /**
  * Which command the composer is open on, or `null`.
@@ -78,6 +79,7 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
   const board = useSpec((state) => state.board)
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
+  const plan = usePlanMode(project, command === 'explore' ? 'explore' : 'propose', command !== null)
 
   const [choice, setChoice] = useState<LauncherChoice>(DEFAULT_CHOICE)
   const [resolved, setResolved] = useState<{ launcher: SpecLauncher } | { why: string }>({
@@ -94,11 +96,12 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
    * The harness is the user's choice here, as in the MR reviewer — Default is Settings → Harness.
    */
   const onSend = useCallback(() => {
-    if (project === null || command === null || !('launcher' in resolved)) return
+    if (project === null || command === null || !plan.ready || !('launcher' in resolved)) return
     if (command !== 'propose' && command !== 'explore') return
     setBusy(true)
     void startSession(project, {
       op: command,
+      planMode: plan.value,
       ...(text.trim() === '' ? {} : { text }),
       launcher: resolved.launcher,
     })
@@ -113,7 +116,7 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
         setBusy(false)
         notifyFailure(error)
       })
-  }, [project, command, text, close, resolved])
+  }, [project, command, text, close, resolved, plan.ready, plan.value])
 
   if (command === null) return null
   return (
@@ -123,15 +126,19 @@ export function ProposeDialog({ project }: { project: ProjectId | null }) {
         line={invocation(board, command)}
         text={text}
         busy={busy}
+        ready={plan.ready && 'launcher' in resolved}
         onText={setText}
         onSend={'launcher' in resolved ? onSend : () => {}}
         picker={
-          <LauncherPicker
-            choice={choice}
-            onChange={setChoice}
-            allowRoles={false}
-            onResolved={setResolved}
-          />
+          <>
+            <LauncherPicker
+              choice={choice}
+              onChange={setChoice}
+              allowRoles={false}
+              onResolved={setResolved}
+            />
+            <PlanMode preference={plan} busy={busy} />
+          </>
         }
         onCancel={() => {
           if (busy) return

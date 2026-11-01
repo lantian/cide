@@ -1,7 +1,8 @@
 //! Native planning is a worker lifecycle, independent of its execution permissions.
 //!
 //! Nothing here writes instructions into a prompt. A harness enters its own planning mode;
-//! the host approves only that mode's completed plan, once per assignment.
+//! automatic workers approve only that mode's completed plan, once per assignment.
+//! Interactive OpenSpec tabs persist a user-approval policy instead.
 use cide_ipc::SessionId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,6 +18,9 @@ pub enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
+    /// Human approval for interactive tabs; legacy workers remain automatic.
+    #[serde(default)]
+    pub user_approval: bool,
     pub generation: SessionId,
     pub phase: Phase,
 }
@@ -24,6 +28,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            user_approval: false,
             generation: SessionId::new(),
             phase: Phase::Planning,
         }
@@ -225,6 +230,27 @@ impl Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_approval_survives_restore_and_legacy_workers_stay_automatic() {
+        let state = State {
+            user_approval: true,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            serde_json::from_value::<State>(encoded.clone()).unwrap(),
+            state
+        );
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("userApproval");
+        assert!(
+            !serde_json::from_value::<State>(legacy)
+                .unwrap()
+                .user_approval
+        );
+        assert!(!State::default().user_approval);
+    }
 
     #[test]
     fn native_modes_preserve_the_model_and_use_builtin_instructions() {

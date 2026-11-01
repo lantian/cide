@@ -3389,7 +3389,10 @@ impl AgentRegistry {
             && let Some(handle) = crate::native_plan::get(app, session)
             && handle.pending()
         {
-            let state = cide_agents::native_plan::State::default();
+            let state = cide_agents::native_plan::State {
+                user_approval: handle.user_approval(),
+                ..Default::default()
+            };
             if let Some(live) = self.inner.lock().runs.get_mut(&run) {
                 live.planning = Some(state.clone());
             }
@@ -12011,6 +12014,7 @@ mod tests {
         let project = ProjectId::new();
         let mut work = spec(project, "developer", 1, 1);
         let state = cide_agents::native_plan::State {
+            user_approval: true,
             phase: cide_agents::native_plan::Phase::Implementing,
             ..Default::default()
         };
