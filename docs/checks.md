@@ -374,6 +374,15 @@ points even though Tauri calls them physical positions. Single-webview windows d
 drops as `WindowEvent::DragDrop`. Confirm actual OS transfers on a display; JS fixtures cannot
 validate the pasteboard formats received by Finder or another application.
 
+Linux/BSD exports use the GTK adapter in `file_drag/gtk_drag.rs`: data handlers must survive
+`drop-performed` until `drag-end`. Run the separate-process delayed receiver check on an
+isolated display:
+`xvfb-run -a env GDK_BACKEND=x11 CIDE_NATIVE_DRAG_TEST=1 cargo test --locked -p cide-app --lib file_drag_native_delayed_receiver -- --ignored --nocapture`.
+It requires Xvfb and xdotool and checks URI escaping, actual file contents, completion order,
+repeated transfers, rejected startup, Escape cancellation and source-window destruction. Also verify Telegram Desktop's attachment preview
+on Wayland and X11; the Xvfb check does not establish Wayland or Telegram compatibility.
+
+
 **Touches:** the file tree, fs ops
 
 Directory links: `cargo test --locked -p cide-fs -p cide-search`,

@@ -5,6 +5,15 @@ use parking_lot::Mutex;
 use tauri::State;
 
 use crate::{files::FsRegistry, workspace_state::WorkspaceState};
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+mod gtk_drag;
+
 use cide_fs::FsError;
 use cide_ipc::{PasteCollision, PasteDecision, PasteMode, PastedEntry, ProjectId, TabId};
 
@@ -214,6 +223,21 @@ pub async fn fs_drag_start(
                 target_os = "netbsd"
             )))]
             let native: Result<_, String> = Ok(native_window);
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            ))]
+            let result = native.and_then(|native| gtk_drag::start(&native, &paths, complete));
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            )))]
             let result = native.and_then(|native| {
                 drag::start_drag(
                     &native,
