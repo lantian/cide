@@ -391,6 +391,7 @@
   "task_new",
   "task_new_with_proposal",
   "task_pick_attachments",
+  "task_propose",
   "task_respond",
   "task_search",
   "tasks_board",

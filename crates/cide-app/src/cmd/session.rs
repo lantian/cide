@@ -836,7 +836,8 @@ const SESSIONS_PARAGRAPH: &str = "This project in cide has no subagent roles to 
      find with `mcp__cide__cide_task_list`), or anything else, such as an issue you read from \
      another system through its own tools, as `title` + a one-line `brief` (+ `ref`). \
      `harness` picks the CLI for that tab (claude, codex or opencode) when the user asks for \
-     one. Each session commits on its own branch and, for a board task, sets it to review when \
+     one. `worktree: false` runs it in the project root instead, with no branch of its own \
+     (use it for one session at a time). Each session commits on its own branch and, for a board task, sets it to review when \
      done; you review the branch and merge it with git.";
 
 /// [`SESSIONS_PARAGRAPH`] for a project whose tracker is off: the same road without the board.

@@ -73,6 +73,7 @@ import {
   attachments as attachmentsApi,
   spec as specApi,
   tasks as tasksApi,
+  specSessions,
   claudeSend,
   file,
   type ChangeName,
@@ -113,9 +114,10 @@ import {
 import type { ArmedDelete, FieldEdit, LinkChip, LinkTargetOption, RunRef } from './model'
 import type { LinkAdd } from './TaskDetail'
 import { openTaskSpec, approveTaskSpec } from './openSpec'
+import { useApplyDialog } from '../OpenSpecPanel/applyStore'
 import { leaveTaskDetails } from './taskNavigation'
 import { taskSpecSessions, taskSpecPhase } from './specSessions'
-import { openSession as openSpecSession, useSpecRuns } from '../OpenSpecPanel/specRuns'
+import { followRunTab, openSession as openSpecSession, useSpecRuns } from '../OpenSpecPanel/specRuns'
 
 /** How often the comment log's ages are recomputed. See the header for why it is not 1 s. */
 const TICK_MS = 30_000
@@ -796,6 +798,7 @@ function TaskDetailHostImpl() {
             : { ...specCard, session: sessionRef }
       }
       onOpenSession={(id, mode) => guarded(openSession(id, mode))}
+      onApplyChange={change !== null ? () => useApplyDialog.getState().open(change) : undefined}
       specProblem={specProblem}
       specEdit={
         change === null || specCard === null
@@ -923,11 +926,15 @@ function TaskDetailHostImpl() {
         canPropose
           ? (task) => {
               if (project === null) return
+              /*
+               * A run in a tab of its own, like the missing-change page's *Propose*, not a line
+               * typed into whichever console is open. The remembered plan-mode choice for the
+               * propose workflow applies; the agent links the change back to the task.
+               */
               guarded(
-                specApi.proposeForTask(project, task as never).then((session) => {
-                  // The modal already committed its departure before starting the proposal.
-                  return openTaskSession(String(session), { project })
-                }),
+                specSessions.settings(project).then((settings) =>
+                  tasksApi.propose(project, task as never, settings.proposePlanMode),
+                ).then((run) => followRunTab(project, run, `Propose · ${task}`)),
               )
             }
           : undefined

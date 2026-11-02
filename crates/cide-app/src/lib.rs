@@ -804,6 +804,7 @@ pub fn run() {
             cmd::tasks::task_search,
             cmd::tasks::task_new,
             cmd::tasks::task_new_with_proposal,
+            cmd::tasks::task_propose,
             cmd::tasks::task_edit,
             cmd::tasks::task_respond,
             user_requests::user_requests_list,

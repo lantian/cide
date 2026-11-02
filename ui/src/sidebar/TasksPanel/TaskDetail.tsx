@@ -716,6 +716,13 @@ export interface TaskDetailProps {
    */
   onOpenSession?: ((session: string, mode: 'open' | 'resume') => void) | undefined
   /**
+   * *Apply…* on the linked change — the OpenSpec panel's own action, shown in place of the
+   * Resume / Reopen / Hand it elsewhere trio once the task's conversation is closed. Those three
+   * could leave a task stranded (Resume went to a pane in the console tab, the others did
+   * nothing visible); Apply opens the dialog that starts a run in a tab, with the plan-mode choice.
+   */
+  onApplyChange?: (() => void) | undefined
+  /**
    * The requirement editor, when one is open. (M28)
    *
    * `undefined` means no editor and — more importantly — **no pencils**: with it absent the
@@ -922,6 +929,7 @@ export function TaskDetailModal(props: TaskDetailProps) {
         onOpenRun={navigate(props.onOpenRun)}
         onOpenWorkflowSession={navigate(props.onOpenWorkflowSession)}
         onOpenSession={navigate(props.onOpenSession)}
+        onApplyChange={navigate(props.onApplyChange)}
         onOpenSpec={navigate(props.onOpenSpec)}
         onOpenSpecFile={navigate(props.onOpenSpecFile)}
         onOpenMilestone={navigate(props.onOpenMilestone)}
@@ -1057,6 +1065,7 @@ export function TaskDetail(props: TaskDetailProps) {
     onOpenSpecFile,
     onOpenSpec,
     onOpenSession,
+    onApplyChange,
     specEdit,
     onSpecEditOpen,
     links,
@@ -1823,7 +1832,19 @@ export function TaskDetail(props: TaskDetailProps) {
                   * did this work is exactly the thing worth keeping a record of, and reading it
                   * back writes nothing.
                   */}
-                {onOpenSession !== undefined && spec.archived === null && (
+                {!spec.session.open && spec.archived === null && onApplyChange !== undefined && (
+                  <button
+                    type="button"
+                    className={styles.specSessionResume}
+                    data-audit="specSessionApply"
+                    data-write="true"
+                    title="Start a new run on this change, in a tab of its own"
+                    onClick={onApplyChange}
+                  >
+                    Apply…
+                  </button>
+                )}
+                {spec.session.open && onOpenSession !== undefined && spec.archived === null && (
                   <button
                     type="button"
                     className={styles.specSessionResume}
@@ -1839,7 +1860,7 @@ export function TaskDetail(props: TaskDetailProps) {
                     Resume
                   </button>
                 )}
-                {onOpenSession !== undefined && (
+                {(spec.session.open || spec.archived !== null) && onOpenSession !== undefined && (
                   <button
                     type="button"
                     className={styles.specSessionOpen}
@@ -1860,7 +1881,7 @@ export function TaskDetail(props: TaskDetailProps) {
                   * matters most in the `closed` state, where there is no conversation left to
                   * carry on in.
                   */}
-                {dispatchTargets !== undefined && spec.archived === null && (
+                {spec.session.open && dispatchTargets !== undefined && spec.archived === null && (
                   <button
                     type="button"
                     className={styles.specSessionElsewhere}
@@ -1875,7 +1896,7 @@ export function TaskDetail(props: TaskDetailProps) {
                 )}
               </div>
             )}
-            {spec.session !== null && (
+            {spec.session !== null && (spec.session.open || spec.archived !== null) && (
               <p className={styles.specHint} data-audit="specSessionHint">
                 {sessionHint(spec.session, spec.archived !== null)}
               </p>

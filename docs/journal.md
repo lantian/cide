@@ -19111,3 +19111,38 @@ Validation: all 23 cmd::agents tests passed. The exact regression also passed in
 process with PATH limited to /usr/bin:/bin. Formatting, scoped diff whitespace checks and
 strict OpenSpec validation passed. The fix is submitted to the existing PR for a new CI run;
 the full installed-harness live matrix remains task 6.3.
+
+
+## M194 — OpenSpec and tasks stop taking each other over
+
+Four fixes where a linked task replaced OpenSpec behaviour it should have left alone. Checks pass
+(`check:openspec`, `check:openspec-render`, `check:agents-render`, `contract-check`); **none of it
+was run on a display.**
+
+- The panel row keeps *Apply…* beside a linked task; *Open task* is added next to it rather than
+  replacing it (`OpenSpecPanel.tsx` `ChangeRow`; `rowAction` is unchanged for the change page).
+- The task card's closed-conversation row no longer draws Resume / Reopen / Hand it elsewhere
+  (they stranded tasks); it offers *Apply…* (`onApplyChange`). Live and archived rows are as before.
+- A change page whose change cannot be read but has a linked task says so and offers *Propose*:
+  new `task_propose` command → `plan_task_proposal` (now takes `plan_mode`), opens a run tab.
+  `SpecTab` also stopped printing `[object Object]` (`errorText`).
+- Task-card *Approve* opens the Apply dialog (with the plan-mode switch) instead of launching.
+
+Not done: the card's "Make a proposal" still types into a console via `spec_propose_for_task`;
+a change living in a role's worktree is still read from the root only, so it reads as missing.
+
+
+### CI follow-up: synchronize the worker policy branch with master
+
+After the fixture fix was pushed, GitHub reported a merge conflict and did not start a
+new pull-request workflow. Merged master 2b6e8a5, retaining both the assignment planning
+policy and the upstream cide_session_open `worktree: false` option. The session response
+reports its planning policy and correctly describes root-directory sessions without a
+branch. Both sides' tests and journal records were preserved.
+
+Validation after the merge: 228 focused Rust tests passed (147 MCP tools, 23 dispatch,
+54 session and four native-plan tests). The policy test now covers required/skip combined
+with worktree=false. TypeScript plus task-dispatch, agents-render, task-navigation and
+OpenSpec-render UI checks passed. Formatting and scoped diff whitespace checks passed.
+The user's local tracker changes were left out of the merge commit. Full CI is rerun on
+the combined branch; the installed-harness live matrix remains task 6.3.

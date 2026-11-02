@@ -31,13 +31,15 @@ import { adoptChange, changePath, readChange, readArtifact, resourceRevision, us
 import { parseMarkdown } from '@/editor/markdown/blocks'
 import { MarkdownPreview } from '@/editor/markdown/MarkdownPreview'
 import { dirOf, resolveLocal, targetKind } from '@/editor/markdown/links'
-import { file, spec as specApi, type ChangeName, type ProjectId, type SpecId } from '@/ipc/client'
+import { file, spec as specApi, tasks as tasksApi, type ChangeName, type ProjectId, type SpecId, type TaskId } from '@/ipc/client'
+import { errorText } from '@/ipc/errorText'
+import { PlanMode, usePlanMode } from './PlanMode'
 import { useSpec } from '../specStore'
 import { useTasks } from '../tasksStore'
 import { useAgents } from '../agentsStore'
 import { useApplyDialog } from './applyStore'
 import { Badge } from '@/kit/components/Status'
-import { openSession, useSpecRuns } from './specRuns'
+import { followRunTab, openSession, useSpecRuns } from './specRuns'
 import { runReadyAct } from './specActs'
 import { adaptChange } from './adapt'
 import { RequirementEditor } from './RequirementEditor'
@@ -158,6 +160,19 @@ export interface SpecTabViewProps {
    */
   startAction: RowAction
   onStart: () => void
+  /** The change's name, for the missing-change sentence. */
+  changeName?: string | undefined
+  /**
+   * Set when a task names this change and the change cannot be read — the agent linked a
+   * proposal it never wrote, or it is still in a worktree nobody integrated. The page then says
+   * so and offers *Propose*, which starts a propose run from the task. Absent otherwise.
+   */
+  propose?: {
+    task: string
+    busy: boolean
+    plan: ReturnType<typeof usePlanMode>
+    onPropose: () => void
+  } | undefined
   /** Approval uses the task card's Apply flow; completion actions remain separate. */
   onApprove?: (() => void) | undefined
   approvalBusy?: boolean | undefined
@@ -309,6 +324,33 @@ export function SpecTabView(props: SpecTabViewProps) {
         <p className={styles.reading} data-audit="specTabReading">
           Reading…
         </p>
+      </div>
+    )
+  }
+
+  if (view === null && props.propose !== undefined) {
+    const { propose } = props
+    return (
+      <div className={styles.page} data-audit="specTab">
+        <p className={styles.failed} data-audit="specTabMissing">
+          Change <code>{props.changeName}</code> does not exist yet. Task {propose.task} links to it,
+          but there is no such change in the project (it may still be in another worktree, or was never written).
+        </p>
+        <PlanMode preference={propose.plan} busy={propose.busy} />
+        <div>
+          <button
+            type="button"
+            className={cx(styles.button, styles.primary)}
+            data-audit="specTabPropose"
+            data-write="true"
+            disabled={propose.busy}
+            title="Opens an agent tab that proposes this change from the linked task."
+            onClick={propose.onPropose}
+          >
+            Propose
+          </button>
+          {props.onRetry && <button type="button" className={styles.button} onClick={props.onRetry}>Retry</button>}
+        </div>
       </div>
     )
   }
@@ -982,7 +1024,7 @@ function ChangeTab({
         if (currentCheckout.current === key) setView(adaptChange(latest))
       }
     }).catch((error: unknown) => {
-      if (currentCheckout.current === key) setTaskError(String(error))
+      if (currentCheckout.current === key) setTaskError(errorText(error))
     }).finally(() => {
       taskWriting.current = false
       setTaskSaving(false)
@@ -1010,7 +1052,7 @@ function ChangeTab({
       .catch((error: unknown) => {
         if (!live || taskWriting.current || writeVersion !== taskWriteVersion.current) return
         setReading(false)
-        setFailed(String(error))
+        setFailed(errorText(error))
       })
     return () => {
       live = false
@@ -1045,7 +1087,7 @@ function ChangeTab({
         )
       })
       .catch((error: unknown) => {
-        if (live) setArtifactError(`Could not read the proposal: ${String(error)}`)
+        if (live) setArtifactError(`Could not read the proposal: ${errorText(error)}`)
       })
     return () => {
       live = false
@@ -1082,6 +1124,22 @@ function ChangeTab({
   }, [roster, task])
 
   const startAction = rowAction(task === null ? null : task.id, tasks.kind)
+  /*
+   * A task names this change and nothing can read it: offer to propose it. `reading` is off and
+   * `view` is null only after a read answered, so a change still loading never shows this.
+   */
+  const missing = view === null && !reading && task !== null
+  const proposePlan = usePlanMode(project, 'propose', missing)
+  const [proposing, setProposing] = useState(false)
+  const onPropose = useCallback(() => {
+    if (task === null || proposing) return
+    setProposing(true)
+    void tasksApi
+      .propose(project, task.id as TaskId, proposePlan.ready ? proposePlan.value : null)
+      .then((run) => followRunTab(project, run, `Propose · ${change}`))
+      .catch(notifyFailure)
+      .finally(() => setProposing(false))
+  }, [project, task, proposing, proposePlan.ready, proposePlan.value, change])
   const trackerOn = useAgents((s) => s.config?.trackerEnabled) !== false
   /**
    * *Split work*'s offer. Takes no task id — the button is drawn only while there is none — but
@@ -1386,6 +1444,8 @@ function ChangeTab({
       roleWorktree={roleWorktree}
       edit={{ target, draft, busy, problem }}
       startAction={startAction}
+      changeName={change}
+      propose={missing && task !== null ? { task: task.id, busy: proposing, plan: proposePlan, onPropose } : undefined}
       onStart={onStart}
       onApprove={onApprove}
       approvalBusy={approvalBusy}
@@ -1456,7 +1516,7 @@ function CapabilityPage({ project, spec, active }: { project: ProjectId; spec: s
         setPath(answer === null ? null : file)
       })
       .catch((error: unknown) => {
-        if (live) setError(String(error))
+        if (live) setError(errorText(error))
       })
     return () => {
       live = false
