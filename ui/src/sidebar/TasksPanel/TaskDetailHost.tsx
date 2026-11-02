@@ -1025,6 +1025,7 @@ function TaskDetailHostImpl() {
       onOpenTask={(task) => select(task)}
       onSetTitle={(task, title) => guarded(editTask(task, { kind: 'setTitle', title }))}
       onSetStatus={(task, status) => guarded(editTask(task, { kind: 'setStatus', status }))}
+      onLaunchAgent={(task, agent, planning) => useAgents.getState().dispatch(agent as never, task as never, undefined, planning)}
       onSetAssignee={(task, agent) => guarded(editTask(task, { kind: 'assign', agent }))}
       onSetBody={(task, body) => guarded(editTask(task, { kind: 'setBody', body }))}
       // M132's rows. `supersede` is the fourth new edit and is never sent from here: it is a

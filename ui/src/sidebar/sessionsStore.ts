@@ -29,6 +29,8 @@ import type { SessionKindName, SessionView } from '@/sidebar/AgentsPanel/session
 export function adaptSession(row: SessionRow): SessionView {
   const r = row.record
   return {
+    planningPolicy: r.planningPolicy,
+    planningPhase: r.planningPhase,
     id: r.id,
     kind: r.kind as SessionKindName,
     harness: r.harness,

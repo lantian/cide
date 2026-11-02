@@ -62,6 +62,7 @@ fn a_real_turn_ends_in_a_result_event_and_the_child_stays_interactive() {
     let agent = role();
     let session = SessionId::new();
     let plan = RunPlan {
+        planning_policy: cide_ipc::PlanningPolicy::Skip,
         images: Vec::new(),
         run: RunId::new(),
         session,

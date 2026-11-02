@@ -67,6 +67,8 @@ export function harnessLabel(harness: string): string {
 
 /** One row, as the view draws it. */
 export interface SessionView {
+  planningPolicy?: 'required' | 'skip' | null
+  planningPhase?: 'planning' | 'approving' | 'implementing' | null
   /** The conversation id — the row's key, and what Open and the search name it by. */
   id: string
   kind: SessionKindName

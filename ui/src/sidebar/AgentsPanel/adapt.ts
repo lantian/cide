@@ -165,6 +165,8 @@ function state(from: WireState): {
 
 function run(from: WireRun): RunView {
   return {
+    planningPolicy: from.planningPolicy,
+    planningPhase: from.planningPhase,
     run: from.run,
     agent: from.agent,
     // Copied at dispatch by Rust and copied again here, never joined against the roster. A row

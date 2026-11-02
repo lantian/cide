@@ -573,6 +573,7 @@ pub enum Work {
 /// `cide_session_open`'s arguments, validated. (M104)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRequest {
+    pub planning: Option<cide_ipc::PlanningPolicy>,
     pub work: Work,
     /// `None` is Settings → Harness, the CLI the user's own consoles run.
     pub harness: Option<Harness>,
@@ -584,6 +585,7 @@ pub struct SessionRequest {
 /// What `cide_session_open` did. (M104)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenedSession {
+    pub planning_policy: cide_ipc::PlanningPolicy,
     pub title: String,
     pub harness: Harness,
     pub cwd: PathBuf,
@@ -600,6 +602,7 @@ pub struct OpenedSession {
 /// [`AgentSink::dispatch_with`] takes this and falls back to `dispatch` for the ordinary case.
 #[derive(Debug, Clone, Copy)]
 pub struct DispatchArgs<'a> {
+    pub planning: Option<cide_ipc::PlanningPolicy>,
     pub agent: &'a AgentId,
     pub task: Option<&'a TaskId>,
     pub external: Option<&'a cide_ipc::ExternalWork>,
@@ -617,6 +620,7 @@ pub struct DispatchArgs<'a> {
 /// second run that does not exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dispatched {
+    pub planning_policy: cide_ipc::PlanningPolicy,
     pub run: RunId,
     pub how: DispatchHow,
 }
@@ -1114,6 +1118,7 @@ pub trait AgentSink: Send + Sync {
         }
         let run = self.dispatch(args.agent, args.task, args.instructions, args.notify)?;
         Ok(Dispatched {
+            planning_policy: args.planning.unwrap_or_default(),
             run,
             how: DispatchHow::Started { why: None },
         })
@@ -2657,6 +2662,11 @@ pub fn input_schema(name: &str) -> Value {
         tool::AGENT_DISPATCH => json!({
             "type": "object",
             "properties": {
+                "planning": {
+                    "type": "string", "enum": ["required", "skip"],
+                    "description": "New assignments execute by default (skip). Choose required for unresolved investigation, architecture or approach selection; the native plan is accepted automatically. Prepared frontend/backend tasks omit this or use skip. On corrections/reuse omit it to retain policy and phase; an explicit mismatch is refused. This choice grants no permissions.",
+                },
+
                 "agent": {
                     "type": "string",
                     "description":
@@ -2733,6 +2743,11 @@ pub fn input_schema(name: &str) -> Value {
         tool::SESSION_OPEN => json!({
             "type": "object",
             "properties": {
+                "planning": {
+                    "type": "string", "enum": ["required", "skip"],
+                    "description": "New assignments execute by default (skip). Choose required for unresolved investigation, architecture or approach selection; the native plan is accepted automatically. Prepared frontend/backend tasks omit this or use skip. On corrections/reuse omit it to retain policy and phase; an explicit mismatch is refused. This choice grants no permissions.",
+                },
+
                 "task": {
                     "type": "string",
                     "description":
@@ -6165,7 +6180,17 @@ fn optional_entries(arguments: &Value) -> Result<Option<Vec<PoolEntry>>, String>
     Ok(Some(entries))
 }
 
+fn requested_planning(arguments: &Value) -> Result<Option<cide_ipc::PlanningPolicy>, ToolResult> {
+    arguments.get("planning").map(|value| serde_json::from_value(value.clone())
+        .map_err(|_| ToolResult::error("planning must be required or skip; omit the field to retain an existing assignment's choice (null is invalid)."))).transpose()
+}
+
 fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let planning = match requested_planning(arguments) {
+        Ok(policy) => policy,
+        Err(error) => return error,
+    };
+
     let agent = match required_role(arguments, "agent", tool::AGENT_DISPATCH) {
         Ok(agent) => agent,
         Err(result) => return result,
@@ -6276,6 +6301,7 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         false => "",
     };
     let args = DispatchArgs {
+        planning,
         agent: &agent,
         task: task.as_ref(),
         external: external.as_ref(),
@@ -6286,6 +6312,13 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         fresh,
     };
     let dispatched = sink.dispatch_with(&args);
+    let announced = format!(
+        "{announced} Planning policy: {}.",
+        dispatched
+            .as_ref()
+            .map(|d| d.planning_policy.wire())
+            .unwrap_or("unresolved")
+    );
     // An external piece of work reads like a task in the answer: it has a worktree and a branch.
     if let (Ok(Dispatched { run, .. }), Some(work)) = (&dispatched, &external) {
         return ToolResult::text(format!(
@@ -6314,6 +6347,7 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(Dispatched {
             run,
             how: DispatchHow::Told,
+            ..
         }) => ToolResult::text(format!(
             "Told run {run} (`{agent}`){}: your instructions go into its own conversation — now \
              if its turn is over, else at its next hand-back. No new run, same worktree; read \
@@ -6322,7 +6356,7 @@ fn agent_dispatch(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
                 .map(|t| format!(" on {t}"))
                 .unwrap_or_default(),
         )),
-        Ok(Dispatched { run, how }) => match task {
+        Ok(Dispatched { run, how, .. }) => match task {
             Some(task) => ToolResult::text(format!(
                 "Dispatched `{agent}` on {task}{}. Run {run}.\nNothing waits on it: it may be \
                  queued behind the role's other runs, the project's cap or its pool's running \
@@ -6425,6 +6459,11 @@ fn chosen_harness(
 
 /// `cide_session_open`: one tab, one worktree, one piece of work. (M104)
 fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
+    let planning = match requested_planning(arguments) {
+        Ok(policy) => policy,
+        Err(error) => return error,
+    };
+
     if !sink.agent_sessions_enabled() {
         return ToolResult::error("no such tool");
     }
@@ -6491,6 +6530,7 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
     };
 
     let request = SessionRequest {
+        planning,
         work,
         harness,
         model,
@@ -6500,7 +6540,11 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(opened) if opened.reused => ToolResult::text(format!(
             "\"{}\" already has a live session, in its own tab ({} in {}); no second one was \
              opened.",
-            opened.title,
+            format_args!(
+                "{} (planning: {})",
+                opened.title,
+                opened.planning_policy.wire()
+            ),
             harness_wire(opened.harness),
             opened.cwd.display()
         )),
@@ -6518,7 +6562,11 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
             ToolResult::text(format!(
                 "Opened \"{}\" in a new tab, on {}, in {}{}. Nothing waits on it. {report} \
                  When it is done, review the branch and merge it yourself.",
-                opened.title,
+                format_args!(
+                    "{} (planning: {})",
+                    opened.title,
+                    opened.planning_policy.wire()
+                ),
                 harness_wire(opened.harness),
                 opened.cwd.display(),
                 opened
@@ -6824,6 +6872,17 @@ fn render_run(run: &AgentRun, now: u64) -> String {
             Some(task) => format!(" | read {task}'s comments"),
             None => " | its edits are in the project root".to_string(),
         });
+    }
+    line.push_str(&format!(" | planning: {}", run.planning_policy.wire()));
+    if let Some(phase) = run.planning_phase {
+        line.push_str(&format!(
+            " | phase: {}",
+            match phase {
+                cide_ipc::PlanningPhase::Planning => "planning",
+                cide_ipc::PlanningPhase::Approving => "approving",
+                cide_ipc::PlanningPhase::Implementing => "implementing",
+            }
+        ));
     }
     line.push('\n');
     line
@@ -11555,7 +11614,11 @@ mod tests {
                 .lock()
                 .clone()
                 .unwrap_or(DispatchHow::Started { why: None });
-            Ok(super::Dispatched { run, how })
+            Ok(super::Dispatched {
+                run,
+                how,
+                planning_policy: args.planning.unwrap_or_default(),
+            })
         }
 
         fn open_session(&self, request: &SessionRequest) -> Result<OpenedSession, String> {
@@ -11565,6 +11628,7 @@ mod tests {
                 Work::External(work) => (work.title.clone(), work.title.to_lowercase()),
             };
             Ok(OpenedSession {
+                planning_policy: request.planning.unwrap_or_default(),
                 title,
                 harness: request.harness.unwrap_or(Harness::Claude),
                 cwd: PathBuf::from(format!("/p/.cide/worktrees/task-{key}")),
@@ -11767,6 +11831,8 @@ mod tests {
     ) -> AgentRun {
         let working = state.counts_as_work();
         AgentRun {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
+            planning_phase: None,
             run: RunId::new(),
             agent: AgentId(agent.to_string()),
             agent_label: agent.to_string(),
@@ -12203,12 +12269,57 @@ mod tests {
         assert_eq!(
             *unavailable.sessions.lock(),
             vec![SessionRequest {
+                planning: None,
                 work: Work::Task(TaskId("t-7".into())),
                 harness: Some(Harness::Opencode),
                 model: Some("anthropic/claude-sonnet-5".into()),
                 instructions: None,
             }]
         );
+    }
+
+    #[test]
+    fn planning_is_strict_at_both_tool_boundaries_and_reported() {
+        for name in [tool::AGENT_DISPATCH, tool::SESSION_OPEN] {
+            for value in [
+                json!(null),
+                json!(false),
+                json!(1),
+                json!([]),
+                json!({}),
+                json!("auto"),
+            ] {
+                let mut sink = roster();
+                if name == tool::SESSION_OPEN {
+                    sink.defs.clear();
+                }
+                let result = ask(
+                    name,
+                    json!({ "agent": "developer", "task": "t-7", "planning": value }),
+                    &sink,
+                );
+                assert!(result.is_error, "{name}: {}", text_of(&result));
+                assert!(text_of(&result).contains("required or skip"));
+                assert!(sink.dispatched.lock().is_empty());
+                assert!(sink.sessions.lock().is_empty());
+            }
+            for policy in ["required", "skip"] {
+                let mut sink = roster();
+                if name == tool::SESSION_OPEN {
+                    sink.defs.clear();
+                }
+                let result = ask(
+                    name,
+                    json!({ "agent": "developer", "task": "t-7", "planning": policy }),
+                    &sink,
+                );
+                assert!(!result.is_error, "{}", text_of(&result));
+                assert!(text_of(&result).contains(policy));
+                if name == tool::SESSION_OPEN {
+                    assert_eq!(sink.sessions.lock()[0].planning.unwrap().wire(), policy);
+                }
+            }
+        }
     }
 
     /// Work that is not on the board: `title` + `brief` (+ `ref`), and one or the other only.
@@ -12221,6 +12332,8 @@ mod tests {
             &sink,
         );
         assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(text_of(&answer).contains("planning: skip"));
+        assert_eq!(sink.sessions.lock()[0].planning, None);
         assert!(text_of(&answer).contains("no task on this board"));
         assert_eq!(
             sink.sessions.lock()[0].work,

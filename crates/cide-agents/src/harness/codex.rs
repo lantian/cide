@@ -1088,6 +1088,7 @@ mod tests {
 
     fn plan_for<'a>(agent: &'a LoadedAgent, session: SessionId) -> RunPlan<'a> {
         RunPlan {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             images: Vec::new(),
             run: RunId::new(),
             session,

@@ -279,7 +279,9 @@ function SessionItem({
       </Button>
     )
   // The role is already the title of a run's row, so the facts are where and on what.
-  const facts = [harnessLabel(v.harness), v.branch]
+  const facts = [harnessLabel(v.harness), v.branch,
+    v.planningPolicy == null ? null : v.planningPolicy === 'required' ? 'Plan before execution' : 'Direct execution',
+    v.planningPhase == null ? null : { planning: 'Planning', approving: 'Accepting plan', implementing: 'Implementing' }[v.planningPhase]]
     .filter((s): s is string => s !== null && s !== '')
     .join(' · ')
   return (

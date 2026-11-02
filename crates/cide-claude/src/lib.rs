@@ -30,6 +30,7 @@ pub mod roster;
 pub mod session;
 pub mod settings;
 pub mod state;
+pub mod task_access;
 pub mod version;
 
 pub use headless::{Headless, ToolAccess};

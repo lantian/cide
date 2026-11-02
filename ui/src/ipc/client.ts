@@ -4013,7 +4013,7 @@ export const agentRuns = {
    * stands in the project root rather than a worktree. `request.notify` is left unset here,
    * which Rust reads as the primary pane: a click has no session of its own to name.
    */
-  dispatch: (request: DispatchRequest) => invoke<RunId>('agents_dispatch', { request }),
+  dispatch: (request: DispatchRequest) => invoke<import('./generated').DispatchResult>('agents_dispatch', { request }),
 
   /**
    * End a run **now**: cancel it if it is still queued, kill its child if it has one.

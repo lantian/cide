@@ -1861,6 +1861,7 @@ impl AgentSink for RegistrySink {
             harness: None,
             model: None,
             fresh: false,
+            planning: None,
         })
         .map(|dispatched| dispatched.run)
     }
@@ -1880,9 +1881,11 @@ impl AgentSink for RegistrySink {
             harness,
             model,
             fresh,
+            planning,
         } = *args;
         let (workspace, agents, tasks) = self.dispatch_state()?;
         let request = DispatchRequest {
+            planning,
             project: self.project,
             agent: agent.clone(),
             task: task.cloned(),
@@ -1907,6 +1910,7 @@ impl AgentSink for RegistrySink {
         };
         // The outcome rather than `agents_dispatch`'s bare run id (M116): the tool's answer has
         // to say whether this was a new context, the old one resumed, or no new run at all.
+        let policy_registry = Arc::clone(&agents);
         let outcome = tauri::async_runtime::block_on(crate::cmd::agents::dispatch_or_duplicate(
             self.app.clone(),
             workspace,
@@ -1918,14 +1922,17 @@ impl AgentSink for RegistrySink {
         match outcome {
             DispatchOutcome::Started { run, why } => Ok(Dispatched {
                 run,
+                planning_policy: policy_registry.planning_policy(run),
                 how: DispatchHow::Started { why },
             }),
             DispatchOutcome::Continued { run, from } => Ok(Dispatched {
                 run,
+                planning_policy: policy_registry.planning_policy(run),
                 how: DispatchHow::Continued { from },
             }),
             DispatchOutcome::Told(run) => Ok(Dispatched {
                 run,
+                planning_policy: policy_registry.planning_policy(run),
                 how: DispatchHow::Told,
             }),
             DispatchOutcome::Duplicate { why, .. } => Err(why),
@@ -1993,7 +2000,12 @@ impl AgentSink for RegistrySink {
                 if let Some(session) = task.session
                     && self.live_session(session)
                 {
+                    let retained = crate::native_plan::assignment_policy(&self.app, session);
+                    let planning_policy =
+                        cide_ipc::PlanningPolicy::resolve(request.planning, Some(retained))
+                            .map_err(|error| format!("Worker session {session}: {error}"))?;
                     return Ok(OpenedSession {
+                        planning_policy,
                         title: format!("{} · {}", task.id, one_line(&task.title)),
                         harness: chosen,
                         cwd: cide_git::worktree::path_of(
@@ -2066,6 +2078,7 @@ impl AgentSink for RegistrySink {
                 cwd: Some(checkout.path.clone()),
                 harness: Some(tab_harness),
                 model: request.model.as_deref(),
+                planning: request.planning,
                 voice: crate::cmd::session::Voice::Worker,
                 origin: Some(cide_ipc::PaneOrigin::Worker),
             },
@@ -2096,6 +2109,7 @@ impl AgentSink for RegistrySink {
         }
 
         Ok(OpenedSession {
+            planning_policy: request.planning.unwrap_or_default(),
             title,
             harness: chosen,
             cwd: checkout.path,
@@ -4098,6 +4112,7 @@ fn hand_back_to_run_with_view(
             None => line,
         };
         let request = DispatchRequest {
+            planning: None,
             project,
             agent: agent.clone(),
             task: Some(task.clone()),

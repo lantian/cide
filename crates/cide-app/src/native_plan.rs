@@ -16,9 +16,13 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SavedWorker {
     conversation: HarnessSession,
-    state: State,
+    #[serde(default)]
+    planning_policy: Option<cide_ipc::PlanningPolicy>,
+    #[serde(default)]
+    state: Option<State>,
     execution: String,
 }
 
@@ -26,6 +30,7 @@ struct SavedWorker {
 pub(crate) struct Runtime {
     active: Mutex<HashMap<SessionId, Weak<Worker>>>,
     saved: Mutex<Option<Vec<SavedWorker>>>,
+    assignments: Mutex<HashMap<SessionId, cide_ipc::PlanningPolicy>>,
 }
 
 #[derive(Clone)]
@@ -83,25 +88,8 @@ pub(crate) fn claude_args(args: &[String], execution: &str) -> Vec<String> {
     if execution == "bypassPermissions" {
         result.push("--allow-dangerously-skip-permissions".into());
     }
-    // Native plan mode can ask about MCP calls even though these two tools only read.
-    // Preapprove task discovery without approving task mutations or arbitrary tools.
-    let reads = [
-        "mcp__cide__cide_task_get".to_string(),
-        "mcp__cide__cide_task_list".to_string(),
-    ];
-    if let Some(index) = result
-        .iter()
-        .position(|arg| arg == "--allowedTools" || arg == "--allowed-tools")
-    {
-        let end = result[index + 1..]
-            .iter()
-            .position(|arg| arg.starts_with('-'))
-            .map_or(result.len(), |end| index + 1 + end);
-        result.splice(end..end, reads);
-    } else {
-        result.push("--allowedTools".into());
-        result.extend(reads);
-    }
+    // Task workflow grants come from the worker launcher when it attaches Cide's bridge.
+    // A planning rewrite preserves them without granting access to a user server.
     // Only delegated Plan-mode invocations get a blocking question hook. Ordinary
     // telemetry hooks retain their short, fire-and-forget socket contract.
     for index in 0..result.len().saturating_sub(1) {
@@ -176,21 +164,98 @@ pub(crate) fn get(app: &AppHandle, session: SessionId) -> Option<Handle> {
         .map(Handle)
 }
 
-/// Workers restored from before this feature have no saved state and retain their behavior.
-pub(crate) fn restored(app: &AppHandle, conversation: &HarnessSession) -> Option<(State, String)> {
-    let runtime = app.try_state::<Runtime>()?;
-    let mut saved = runtime.saved.lock();
-    let records = saved.get_or_insert_with(|| {
-        std::fs::read(path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
-    });
-    records
+fn records(runtime: &Runtime) -> parking_lot::MappedMutexGuard<'_, Vec<SavedWorker>> {
+    parking_lot::MutexGuard::map(runtime.saved.lock(), |saved| {
+        saved.get_or_insert_with(|| cide_core::persist::read_or_quarantine(&path()))
+    })
+}
+
+type RestoredAssignment = (cide_ipc::PlanningPolicy, Option<State>, String);
+
+pub(crate) fn restored_assignment(
+    app: &AppHandle,
+    conversation: &HarnessSession,
+) -> Result<Option<RestoredAssignment>, String> {
+    let Some(runtime) = app.try_state::<Runtime>() else {
+        return Ok(None);
+    };
+    records(&runtime)
         .iter()
         .rev()
         .find(|record| record.conversation == *conversation)
-        .map(|record| (record.state.clone(), record.execution.clone()))
+        .map(|record| {
+            cide_agents::native_plan::saved_policy(record.planning_policy, record.state.as_ref())
+                .map(|policy| (policy, record.state.clone(), record.execution.clone()))
+        })
+        .transpose()
+}
+
+pub(crate) fn record_assignment(
+    app: &AppHandle,
+    session: SessionId,
+    policy: cide_ipc::PlanningPolicy,
+) {
+    if let Some(runtime) = app.try_state::<Runtime>() {
+        runtime.assignments.lock().insert(session, policy);
+    }
+}
+
+pub(crate) fn assignment_policy(app: &AppHandle, session: SessionId) -> cide_ipc::PlanningPolicy {
+    if let Some(runtime) = app.try_state::<Runtime>()
+        && let Some(policy) = runtime.assignments.lock().get(&session)
+    {
+        return *policy;
+    }
+    if let Some(handle) = get(app, session) {
+        return if handle.user_approval() {
+            cide_ipc::PlanningPolicy::Skip
+        } else {
+            cide_ipc::PlanningPolicy::Required
+        };
+    }
+    cide_ipc::PlanningPolicy::Skip
+}
+
+fn save_record(runtime: &Runtime, record: SavedWorker) -> Result<(), String> {
+    let mut records = records(runtime);
+    records.retain(|old| old.conversation != record.conversation);
+    records.push(record);
+    if records.len() > 512 {
+        let excess = records.len() - 512;
+        records.drain(..excess);
+    }
+    let bytes = serde_json::to_vec(&*records).map_err(|e| e.to_string())?;
+    cide_core::persist::write_atomic(&path(), &bytes).map_err(|e| e.to_string())
+}
+
+/// Direct workers persist independently of a planning controller, once their native id is known.
+pub(crate) fn bind_assignment(
+    app: &AppHandle,
+    session: SessionId,
+    conversation: HarnessSession,
+) -> Result<(), String> {
+    let Some(runtime) = app.try_state::<Runtime>() else {
+        return Ok(());
+    };
+    let policy = runtime.assignments.lock().get(&session).copied();
+    if policy != Some(cide_ipc::PlanningPolicy::Skip) {
+        return Ok(());
+    }
+    if records(&runtime)
+        .iter()
+        .any(|r| r.conversation == conversation && r.planning_policy == policy)
+    {
+        return Ok(());
+    }
+    save_record(
+        &runtime,
+        SavedWorker {
+            conversation,
+            planning_policy: policy,
+            state: None,
+            execution: String::new(),
+        },
+    )
 }
 
 pub(crate) fn register(
@@ -379,25 +444,12 @@ impl Handle {
         };
         let record = SavedWorker {
             conversation,
-            state: self.0.state.lock().clone(),
+            planning_policy: Some(cide_ipc::PlanningPolicy::Required),
+            state: Some(self.0.state.lock().clone()),
             execution: self.0.execution.clone(),
         };
-        let mut saved = runtime.saved.lock();
-        let records = saved.get_or_insert_with(|| {
-            std::fs::read(path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default()
-        });
-        records.retain(|old| old.conversation != record.conversation);
-        records.push(record);
-        if records.len() > 512 {
-            records.drain(..records.len() - 512);
-        }
-        if let Ok(bytes) = serde_json::to_vec(records)
-            && let Err(error) = cide_core::persist::write_atomic(&path(), &bytes)
-        {
-            tracing::warn!(%error, "could not persist worker planning state");
+        if let Err(error) = save_record(&runtime, record) {
+            tracing::error!(%error, "could not persist worker planning state");
         }
     }
     pub fn state(&self, state: cide_ipc::SessionState) {
@@ -708,10 +760,50 @@ pub(crate) fn observe_hook(app: &AppHandle, frame: &cide_claude::HookFrame) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_metadata_records_both_modes_and_migrates_legacy_conversations() {
+        use cide_ipc::PlanningPolicy::{Required, Skip};
+        let identity =
+            serde_json::json!({"harness":"codex","id":"thread-worker","cwd":"/tmp/isolated"});
+        for phase in ["planning", "approving", "implementing"] {
+            let legacy = serde_json::json!({"conversation":identity,"state":{"generation": cide_ipc::SessionId::new(),"phase":phase},"execution":"auto"});
+            let record: super::SavedWorker = serde_json::from_value(legacy).unwrap();
+            assert_eq!(
+                cide_agents::native_plan::saved_policy(
+                    record.planning_policy,
+                    record.state.as_ref()
+                )
+                .unwrap(),
+                Required
+            );
+            let mut saved = serde_json::to_value(&record).unwrap();
+            saved["planningPolicy"] = serde_json::json!("skip");
+            let record: super::SavedWorker = serde_json::from_value(saved).unwrap();
+            assert!(
+                cide_agents::native_plan::saved_policy(
+                    record.planning_policy,
+                    record.state.as_ref()
+                )
+                .is_err()
+            );
+        }
+        let direct = serde_json::json!({"conversation":identity,"planningPolicy":"skip","state":null,"execution":""});
+        let record: super::SavedWorker = serde_json::from_value(direct).unwrap();
+        assert_eq!(
+            cide_agents::native_plan::saved_policy(record.planning_policy, record.state.as_ref())
+                .unwrap(),
+            Skip
+        );
+        let restored: super::SavedWorker =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        assert_eq!(restored.conversation.id, "thread-worker");
+        assert!(restored.state.is_none());
+    }
+
     use super::*;
     #[test]
     fn native_claude_launch_preserves_the_role_tools_model_and_prompt() {
-        let args = [
+        let mut args = [
             "--agent",
             "developer",
             "--model",
@@ -721,7 +813,9 @@ mod tests {
             "original role",
             "--dangerously-skip-permissions",
         ]
-        .map(str::to_string);
+        .map(str::to_string)
+        .to_vec();
+        cide_claude::task_access::allow_worker_task_tools(&mut args);
         let plan = claude_args(&args, "bypassPermissions");
         for expected in [
             ["--agent", "developer"],
@@ -733,7 +827,9 @@ mod tests {
         }
         assert!(plan.iter().any(|arg| arg == "Read,Grep"));
         assert!(plan.iter().any(|arg| arg == "mcp__cide__cide_task_get"));
-        assert!(!plan.iter().any(|arg| arg == "mcp__cide__cide_task_update"));
+        assert!(plan.iter().any(|arg| arg == "mcp__cide__cide_task_update"));
+        assert!(plan.iter().any(|arg| arg == "mcp__cide__cide_task_comment"));
+        assert!(!plan.iter().any(|arg| arg == "mcp__cide__cide_task_create"));
         assert!(
             !plan
                 .iter()
@@ -752,6 +848,11 @@ mod tests {
     #[test]
     fn native_claude_refuses_an_unobservable_plan_instead_of_waiting_forever() {
         assert!(!claude_observable(&[]));
+        assert!(
+            !claude_args(&[], "auto")
+                .iter()
+                .any(|arg| arg == "--allowedTools")
+        );
         let settings = serde_json::json!({"hooks":{"PreToolUse":[{"hooks":[{"command":"/app/cide-hook PreToolUse"}]}],"PostToolUse":[{"hooks":[{"command":"/app/cide-hook PostToolUse"}]}]}}).to_string();
         assert!(claude_observable(&["--settings".into(), settings.clone()]));
         assert!(!claude_observable(&[

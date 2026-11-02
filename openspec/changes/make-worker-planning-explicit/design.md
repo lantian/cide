@@ -132,3 +132,7 @@ New request omission defaults change at creation; saved assignment omission is a
 3. Add manual launch selection, inspection and orchestrator examples; update the native-planning check guide to exercise both modes.
 4. Run focused Rust, wire and UI behavior checks, then the shared validation suite. Check both policies on installed harnesses without claiming fixture tests prove a live model/desktop transition.
 5. Roll back implementation if necessary; snapshots retain legacy progress fields. Returning to an older binary restores its old compulsory-planning behavior for newly created work, so do not promise old binaries honor explicit skip. No source/task/role migration needs undoing.
+
+### Follow-up: task workflow permissions
+
+Claude's native planning adapter previously added task-get/list grants, while the direct execution path did not. Both worker launch paths now share exact task-get/list/update/comment grants whenever Cide attaches its own bridge. The user explicitly included task updates and comments so workers can report completion without another approval prompt. The shared argv helper merges existing grants, leaves explicit denies and permission modes intact, and is idempotent across the native planning rewrite. Other task mutations and MCP servers retain their existing permissions, and the bridge continues to enforce its existing caller and task-scope rules. Anonymous worker identity is resolved before MCP injection, including restored worker panes; ordinary consoles retain their prior argv.

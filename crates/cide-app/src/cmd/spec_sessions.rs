@@ -486,6 +486,11 @@ fn plan_session(
         checkout.is_some(),
     );
     Ok(DispatchSpec {
+        planning_policy: if request.plan_mode.unwrap_or(false) {
+            cide_ipc::PlanningPolicy::Required
+        } else {
+            cide_ipc::PlanningPolicy::Skip
+        },
         planning: request
             .plan_mode
             .unwrap_or(false)

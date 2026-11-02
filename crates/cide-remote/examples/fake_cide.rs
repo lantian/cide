@@ -445,6 +445,8 @@ impl RemoteHost for Constants {
             return Vec::new();
         }
         let base = cide_ipc::AgentRun {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
+            planning_phase: None,
             run: "00000000-0000-4000-8000-00000000000a"
                 .parse()
                 .expect("a uuid"),
@@ -472,6 +474,8 @@ impl RemoteHost for Constants {
         vec![
             base.clone(),
             cide_ipc::AgentRun {
+                planning_policy: cide_ipc::PlanningPolicy::Skip,
+                planning_phase: None,
                 run: "00000000-0000-4000-8000-00000000000b"
                     .parse()
                     .expect("a uuid"),

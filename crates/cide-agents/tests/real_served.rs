@@ -89,6 +89,7 @@ fn plan<'a>(
     server: RunServer,
 ) -> RunPlan<'a> {
     RunPlan {
+        planning_policy: cide_ipc::PlanningPolicy::Skip,
         images: Vec::new(),
         run: RunId::new(),
         session: SessionId::new(),

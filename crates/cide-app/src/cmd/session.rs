@@ -481,15 +481,21 @@ fn agent_mcp_config() -> Option<String> {
 /// `cide-hook` beside the running binary is a packaging failure nobody chose, and it is the
 /// only one of the two that gets a line.
 fn with_task_tools(
-    spec: SpawnSpec,
+    mut spec: SpawnSpec,
     inject: &cide_core::claude_cli::Injected,
+    worker: bool,
     config: impl FnOnce() -> Option<String>,
 ) -> SpawnSpec {
     let Some(flag) = inject.flag(cide_core::claude_cli::Injection::McpConfig) else {
         return spec;
     };
     match config() {
-        Some(json) => spec.arg(flag).arg(json),
+        Some(json) => {
+            if worker {
+                cide_claude::task_access::allow_worker_task_tools(&mut spec.args);
+            }
+            spec.arg(flag).arg(json)
+        }
         None => {
             tracing::warn!("cannot locate cide-hook; this session gets no task tools");
             spec
@@ -716,11 +722,17 @@ fn project_paragraph(
     } else {
         String::new()
     };
-    [roster.as_str(), sessions, IDE_SENTENCE, &requests]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    [
+        roster.as_str(),
+        sessions,
+        WORKER_PLANNING_SENTENCE,
+        IDE_SENTENCE,
+        &requests,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 /// What every pane served the orchestration tools is told about cide itself. (M134)
@@ -729,6 +741,15 @@ fn project_paragraph(
 /// answers from its memory of VS Code — confidently, and wrong for cide's own bindings or for a
 /// user who rebound them. The tools are listed to it, but a deferred tool list is names only, and
 /// a name is not a reason to call it. Not for a worker, which is not served these tools.
+const WORKER_PLANNING_SENTENCE: &str = "Delegated assignments execute directly by default. \
+     For unresolved investigation, architecture, decomposition or approach selection, pass \
+     `planning: required` to role dispatch or worker-session creation: Cide accepts the native \
+     plan automatically, then execution starts with the existing permissions. For an architect's \
+     prepared frontend/backend tasks or an OpenSpec implementation handoff, omit planning or use \
+     `planning: skip`. On review corrections or continuation omit it to retain the assignment's \
+     policy and current phase; a conflicting explicit choice is refused. Role names, task type \
+     and prompt wording do not select the mode, and this choice grants no tool permissions.";
+
 const IDE_SENTENCE: &str = "When the user asks about cide itself — a setting, a keyboard \
      shortcut, how to open or do something in the IDE — answer from \
      `mcp__cide__cide_keymap` (commands and their keys), `mcp__cide__cide_settings` and \
@@ -1204,6 +1225,7 @@ pub async fn session_spawn(
         &app,
         &registry,
         SpawnRequest {
+            planning: None,
             program,
             harness,
             args,
@@ -1237,6 +1259,7 @@ pub async fn session_spawn(
 /// usual advice and is right for the stated reason: the command's parameters *are* its JSON, and
 /// this is an internal call where the `too_many_arguments` allow would be buying nothing.
 pub(crate) struct SpawnRequest {
+    pub planning: Option<cide_ipc::PlanningPolicy>,
     pub program: String,
     pub harness: Option<cide_ipc::ConsoleHarness>,
     pub args: Vec<String>,
@@ -1289,6 +1312,7 @@ pub(crate) async fn spawn_session(
     request: SpawnRequest,
 ) -> Result<SessionId, SessionError> {
     let SpawnRequest {
+        planning,
         program,
         harness: explicit_harness,
         args,
@@ -2102,6 +2126,15 @@ pub(crate) async fn spawn_session(
     // cide's own, so no task tracker and, on the console pane, no subagents. The roster paragraph
     // above is gated on the same switch, or it would be a system prompt naming tools this session
     // does not have.
+    let worker = voice == Some(Voice::Worker)
+        || project.is_some_and(|project| {
+            app.state::<crate::workspace_state::WorkspaceState>()
+                .with(|ws| {
+                    pane.and_then(|pane| restored_pane_voice(ws, project, pane))
+                        .or_else(|| resume.and_then(|session| restored_voice(ws, project, session)))
+                        == Some(Voice::Worker)
+                })
+        });
     if is_console && let Some(agents) = app.try_state::<crate::agent_rpc::AgentRpcServer>() {
         spec = spec.env(
             "CIDE_AGENT_SOCK",
@@ -2109,7 +2142,7 @@ pub(crate) async fn spawn_session(
         );
         // Codex's server is already in its argv, as `-c mcp_servers.cide.*` — `codex_console_argv`.
         if is_claude {
-            spec = with_task_tools(spec, &plan.inject, agent_mcp_config);
+            spec = with_task_tools(spec, &plan.inject, worker, agent_mcp_config);
         }
     }
 
@@ -2254,59 +2287,60 @@ pub(crate) async fn spawn_session(
     } else {
         None
     };
-    let worker = voice == Some(Voice::Worker)
-        || project.is_some_and(|project| {
-            app.state::<crate::workspace_state::WorkspaceState>()
-                .with(|ws| {
-                    pane.and_then(|pane| restored_pane_voice(ws, project, pane))
-                        .or_else(|| resume.and_then(|session| restored_voice(ws, project, session)))
-                        == Some(Voice::Worker)
-                })
-        });
     let native_planning = if worker {
+        let harness = if is_codex {
+            cide_ipc::Harness::Codex
+        } else if is_opencode {
+            cide_ipc::Harness::Opencode
+        } else {
+            cide_ipc::Harness::Claude
+        };
         let conversation = native.clone().or_else(|| continues.clone()).or_else(|| {
             resume.map(|session| cide_ipc::HarnessSession {
-                harness: if is_codex {
-                    cide_ipc::Harness::Codex
-                } else if is_opencode {
-                    cide_ipc::Harness::Opencode
-                } else {
-                    cide_ipc::Harness::Claude
-                },
+                harness,
                 id: session.to_string(),
                 cwd: spec.cwd.clone(),
             })
         });
         let restored = conversation
             .as_ref()
-            .and_then(|conversation| crate::native_plan::restored(&app, conversation));
-        let initial = (voice == Some(Voice::Worker) && resume.is_none() && continues.is_none())
-            .then(|| {
-                (
-                    cide_agents::native_plan::State::default(),
-                    spec.args
-                        .windows(2)
-                        .rfind(|args| args[0] == "--permission-mode")
-                        .map(|args| args[1].clone())
-                        .unwrap_or_else(|| "auto".into()),
-                )
-            });
-        restored.or(initial).map(|(state, execution)| {
-            crate::native_plan::register(
-                &app,
-                project,
-                id,
-                None,
-                if is_codex {
-                    cide_ipc::Harness::Codex
-                } else if is_opencode {
-                    cide_ipc::Harness::Opencode
-                } else {
-                    cide_ipc::Harness::Claude
-                },
-                state,
-                execution,
-            )
+            .map(|c| crate::native_plan::restored_assignment(&app, c))
+            .transpose()
+            .map_err(SessionError::Pty)?
+            .flatten();
+        let retained = restored.as_ref().map(|(policy, _, _)| *policy).or_else(|| {
+            conversation
+                .as_ref()
+                .map(|_| cide_ipc::PlanningPolicy::Skip)
+        });
+        let policy =
+            cide_ipc::PlanningPolicy::resolve(planning, retained).map_err(SessionError::Pty)?;
+        let execution = spec
+            .args
+            .windows(2)
+            .rfind(|args| args[0] == "--permission-mode")
+            .map(|args| args[1].clone())
+            .unwrap_or_else(|| "auto".into());
+        policy
+            .validate_execution(Some(&execution))
+            .map_err(SessionError::Pty)?;
+        let state = restored.map(|(_, state, _)| state).unwrap_or_else(|| {
+            (policy == cide_ipc::PlanningPolicy::Required).then(Default::default)
+        });
+        crate::native_plan::record_assignment(&app, id, policy);
+        // Claude's identity exists at spawn; other harnesses bind their native id on sighting.
+        if let Some(conversation) = conversation.or_else(|| {
+            (harness == cide_ipc::Harness::Claude).then(|| cide_ipc::HarnessSession {
+                harness,
+                id: id.to_string(),
+                cwd: spec.cwd.clone(),
+            })
+        }) {
+            crate::native_plan::bind_assignment(&app, id, conversation)
+                .map_err(SessionError::Pty)?;
+        }
+        state.map(|state| {
+            crate::native_plan::register(&app, project, id, None, harness, state, execution)
         })
     } else {
         None
@@ -4460,9 +4494,44 @@ mod tests {
         let spec = with_task_tools(
             SpawnSpec::new("claude", std::env::temp_dir()),
             &inject,
+            false,
             || Some("{\"mcpServers\":{}}".to_string()),
         );
         assert_eq!(spec.args, ["--mcp-config", "{\"mcpServers\":{}}"]);
+    }
+
+    #[test]
+    fn a_worker_gets_only_task_workflow_grants_with_a_present_bridge() {
+        for enabled in [true, false] {
+            for bridge in [Some("{}".to_string()), None] {
+                let mut cli = cide_ipc::ClaudeCli::default();
+                cli.inject.mcp_config.enabled = enabled;
+                let inject = cide_core::claude_cli::plan(&cli, None).inject;
+                let present = bridge.is_some();
+                let spec = with_task_tools(
+                    SpawnSpec::new("claude", std::env::temp_dir()),
+                    &inject,
+                    true,
+                    || bridge,
+                );
+                if enabled && present {
+                    assert_eq!(
+                        spec.args,
+                        [
+                            "--allowedTools",
+                            "mcp__cide__cide_task_get",
+                            "mcp__cide__cide_task_list",
+                            "mcp__cide__cide_task_update",
+                            "mcp__cide__cide_task_comment",
+                            "--mcp-config",
+                            "{}",
+                        ]
+                    );
+                } else {
+                    assert!(spec.args.is_empty(), "{:?}", spec.args);
+                }
+            }
+        }
     }
 
     /// The switch, and the whole reason it exists: **off, the flag is simply absent**.
@@ -4479,6 +4548,7 @@ mod tests {
         let spec = with_task_tools(
             SpawnSpec::new("claude", std::env::temp_dir()),
             &inject,
+            false,
             || panic!("a switched-off injection must not even look for cide-hook"),
         );
         assert!(spec.args.is_empty(), "{:?}", spec.args);
@@ -4495,6 +4565,7 @@ mod tests {
         let spec = with_task_tools(
             SpawnSpec::new("claude", std::env::temp_dir()),
             &inject,
+            false,
             || Some("{}".to_string()),
         );
         assert_eq!(spec.args, ["--mcp", "{}"]);
@@ -4509,6 +4580,7 @@ mod tests {
         let spec = with_task_tools(
             SpawnSpec::new("claude", std::env::temp_dir()),
             &inject,
+            false,
             || None,
         );
         assert!(spec.args.is_empty(), "{:?}", spec.args);

@@ -7,13 +7,7 @@ use cide_ipc::SessionId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Phase {
-    Planning,
-    Approving,
-    Implementing,
-}
+pub use cide_ipc::PlanningPhase as Phase;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +33,19 @@ impl State {
     pub fn pending(&self) -> bool {
         self.phase != Phase::Implementing
     }
+}
+
+/// Decode saved metadata separately from request omission. Never create a new generation.
+pub fn saved_policy(
+    explicit: Option<cide_ipc::PlanningPolicy>,
+    state: Option<&State>,
+) -> Result<cide_ipc::PlanningPolicy, String> {
+    use cide_ipc::PlanningPolicy::{Required, Skip};
+    let policy = explicit.unwrap_or(if state.is_some() { Required } else { Skip });
+    if (policy == Skip && state.is_some()) || (policy == Required && state.is_none()) {
+        return Err("Inconsistent worker planning metadata: planningPolicy disagrees with saved progress. Restore a consistent snapshot or stop this assignment and start fresh.".into());
+    }
+    Ok(policy)
 }
 
 /// Select the harness's built-in instructions, never a Cide-authored planning prompt.
@@ -420,5 +427,33 @@ mod tests {
         assert_eq!(qwen_plan_result(&result("other", false), "exit"), None);
         assert_eq!(qwen_plan_result(&result("exit", true), "exit"), Some(false));
         assert_eq!(qwen_plan_result(&result("exit", false), "exit"), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod policy_recovery_tests {
+    use super::*;
+    use cide_ipc::PlanningPolicy::{Required, Skip};
+    #[test]
+    fn saved_policy_migrates_progress_without_replaying_it() {
+        assert_eq!(saved_policy(None, None).unwrap(), Skip);
+        assert_eq!(saved_policy(Some(Skip), None).unwrap(), Skip);
+        for phase in [Phase::Planning, Phase::Approving, Phase::Implementing] {
+            let state = State {
+                phase,
+                ..Default::default()
+            };
+            for policy in [None, Some(Required)] {
+                assert_eq!(saved_policy(policy, Some(&state)).unwrap(), Required);
+                let encoded = serde_json::to_value(&state).unwrap();
+                assert_eq!(serde_json::from_value::<State>(encoded).unwrap(), state);
+            }
+            assert!(
+                saved_policy(Some(Skip), Some(&state))
+                    .unwrap_err()
+                    .contains("Restore")
+            );
+        }
+        assert!(saved_policy(Some(Required), None).is_err());
     }
 }

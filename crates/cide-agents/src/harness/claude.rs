@@ -543,6 +543,11 @@ fn assemble(
         args.extend(plan.agent.tools.iter().cloned());
         args.extend(allowed);
     }
+    // Reading or reporting on the task must not park an unattended worker at an MCP
+    // permission prompt. This is independent of its planning/execution policy.
+    if tracker.is_some() {
+        cide_claude::task_access::allow_worker_task_tools(&mut args);
+    }
 
     // ---- 4b. and, for a Claude Code subagent, the definition itself ----
     //
@@ -877,6 +882,7 @@ mod tests {
 
     fn plan_for<'a>(agent: &'a LoadedAgent, session: SessionId) -> RunPlan<'a> {
         RunPlan {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             images: Vec::new(),
             run: RunId::new(),
             session,
@@ -947,6 +953,30 @@ mod tests {
                 .map(|args| args[1].clone())
         };
         assert_eq!(prompt(&planned.spec.args), prompt(&baseline.spec.args));
+    }
+
+    #[test]
+    fn skip_preserves_execution_permissions_and_explicit_plan_only_roles() {
+        for mode in [
+            "auto",
+            "default",
+            "acceptEdits",
+            "plan",
+            "bypassPermissions",
+        ] {
+            let mut agent = role();
+            agent.permission_mode = Some(mode.into());
+            let plan = plan_for(&agent, SessionId::new());
+            assert_eq!(plan.planning_policy, cide_ipc::PlanningPolicy::Skip);
+            assert!(plan.planning.is_none());
+            let args = spawn(&plan).spec.args;
+            assert_eq!(value_of(&args, "--permission-mode"), mode);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "--allow-dangerously-skip-permissions")
+            );
+        }
     }
 
     /// The index of a token in an argv, for the ordering assertions.
@@ -1176,6 +1206,47 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
     }
 
+    #[test]
+    fn ordinary_workers_can_read_and_report_tasks_on_fresh_and_resumed_launches() {
+        let agent = role();
+        let session = SessionId::new();
+        let mut plan = plan_for(&agent, session);
+        for mode in [Unattended::Ask, Unattended::Auto, Unattended::Bypass] {
+            plan.unattended = mode;
+            for args in [
+                spawn(&plan).spec.args,
+                ClaudeHarness
+                    .respawn_spec(&plan, &session.to_string())
+                    .unwrap()
+                    .spec
+                    .args,
+            ] {
+                let start = at(&args, "--allowedTools") + 1;
+                let grants: Vec<_> = args[start..]
+                    .iter()
+                    .take_while(|arg| !arg.starts_with('-'))
+                    .collect();
+                assert_eq!(
+                    grants,
+                    [
+                        "mcp__cide__cide_task_get",
+                        "mcp__cide__cide_task_list",
+                        "mcp__cide__cide_task_update",
+                        "mcp__cide__cide_task_comment"
+                    ]
+                );
+            }
+        }
+        plan.hook_bin = None;
+        assert!(
+            !spawn(&plan)
+                .spec
+                .args
+                .iter()
+                .any(|arg| arg == "--allowedTools")
+        );
+    }
+
     /// A quoted path is the case serde is used for, so it is the case that is asserted.
     #[test]
     fn a_hook_path_with_a_quote_in_it_still_parses() {
@@ -1228,7 +1299,8 @@ mod tests {
 
     /// What a definition did not say, cide does not say either. The CLI's own defaults are the
     /// safe end of every one of these ranges, and a value invented here is a behaviour the role's
-    /// author never wrote and cannot find in their file.
+    /// author never wrote and cannot find in their file. Cide's own task workflow grants
+    /// are covered separately and do not come from the role definition.
     #[test]
     fn nothing_the_definition_left_out_reaches_the_command_line() {
         let agent = role();
@@ -1239,7 +1311,6 @@ mod tests {
             "--model",
             "--effort",
             "--permission-mode",
-            "--allowedTools",
             "--disallowedTools",
         ] {
             assert!(
@@ -1269,8 +1340,17 @@ mod tests {
         // its own values. That is the ordering rule, checked rather than asserted in prose.
         let tools = at(&args, "--allowedTools");
         assert_eq!(&args[tools + 1..tools + 4], ["Read", "Edit", "Bash"]);
+        assert_eq!(
+            &args[tools + 4..tools + 8],
+            [
+                "mcp__cide__cide_task_get",
+                "mcp__cide__cide_task_list",
+                "mcp__cide__cide_task_update",
+                "mcp__cide__cide_task_comment"
+            ]
+        );
         assert!(
-            args[tools + 4].starts_with('-'),
+            args[tools + 8].starts_with('-'),
             "a variadic flag must be followed by an option, not a bare token: {args:?}"
         );
     }
@@ -1618,8 +1698,8 @@ mod tests {
     }
 
     /// **The whole of the dispatch decision, in one assertion.** `--agent` names the definition
-    /// and the four flags cide would otherwise have re-derived are absent, because the CLI reads
-    /// all four out of the file itself — and a second copy on the command line would *win*.
+    /// and role flags are absent, because the CLI reads them from the file itself.
+    /// Only cide's task workflow grants are added; the role's tools are never copied.
     #[test]
     fn a_subagent_is_named_rather_than_re_derived() {
         let agent = subagent();
@@ -1628,12 +1708,23 @@ mod tests {
 
         assert_eq!(value_of(&args, "--agent"), "code-reviewer");
 
-        for flag in ["--model", "--effort", "--allowedTools"] {
+        for flag in ["--model", "--effort"] {
             assert!(
                 !args.iter().any(|a| a == flag),
                 "{flag} is the definition's to state, not cide's: {args:?}"
             );
         }
+        let tools = at(&args, "--allowedTools");
+        assert_eq!(
+            &args[tools + 1..tools + 5],
+            [
+                "mcp__cide__cide_task_get",
+                "mcp__cide__cide_task_list",
+                "mcp__cide__cide_task_update",
+                "mcp__cide__cide_task_comment"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "Read" || arg == "Grep"));
         // The role names a mode, so cide neither passes it nor substitutes its own.
         assert!(!args.iter().any(|a| a == "--permission-mode"), "{args:?}");
     }

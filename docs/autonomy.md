@@ -467,3 +467,13 @@ A tracker that uses `touches`, `acceptance` or a text `question` is written as s
 questions require schema 5 while present. An older cide
 refuses that board rather than silently dropping those fields when it writes the file back. The
 same happened with schema 3 for the inbox (M83). Open such a project with a build from M132 on.
+
+### Choosing a delegated worker's planning stage
+
+New role and worker-session assignments execute directly. Request `planning: required` when
+the worker must investigate an unresolved question, choose architecture or decompose work;
+its native plan is automatically accepted before implementation. Prepared frontend/backend
+tasks and OpenSpec apply handoffs omit the field or use `skip`. Review corrections omit it
+to preserve the assignment's current phase. Role names and task keywords never select this
+policy. It does not change sandbox, tool approvals or a role's explicit plan-only restriction.
+Ordinary consoles, automated reviewers/planners and OpenSpec authoring keep their lifecycle.

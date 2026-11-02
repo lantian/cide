@@ -2,6 +2,7 @@
 import type { AgentId } from "./AgentId";
 import type { ExternalWork } from "./ExternalWork";
 import type { Harness } from "./Harness";
+import type { PlanningPolicy } from "./PlanningPolicy";
 import type { ProjectId } from "./ProjectId";
 import type { RunNotify } from "./RunNotify";
 import type { TaskId } from "./TaskId";
@@ -9,7 +10,7 @@ import type { TaskId } from "./TaskId";
 /**
  * Dispatch one run. Inbound.
  */
-export type DispatchRequest = { project: ProjectId, agent: AgentId, 
+export type DispatchRequest = { planning?: PlanningPolicy, project: ProjectId, agent: AgentId, 
 /**
  * The task this run is for.
  *

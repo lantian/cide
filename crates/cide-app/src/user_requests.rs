@@ -643,6 +643,7 @@ impl AnswerTarget for ConversationDelivery<'_> {
             app,
             project,
             crate::claude_tab::Open {
+                planning: None,
                 title: &origin.title,
                 session_name: None,
                 prompt: &line,

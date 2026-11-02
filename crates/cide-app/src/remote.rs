@@ -682,7 +682,9 @@ impl RemoteHost for AppRemoteHost {
             let state = app.state::<WorkspaceState>();
             let agents = app.state::<std::sync::Arc<AgentRegistry>>();
             let tasks = app.state::<std::sync::Arc<crate::tasks_state::TasksStores>>();
-            crate::cmd::agents::agents_dispatch(app.clone(), state, agents, tasks, request).await
+            crate::cmd::agents::agents_dispatch(app.clone(), state, agents, tasks, request)
+                .await
+                .map(|result| result.run)
         })?
         .map_err(|error| error.to_string())
     }

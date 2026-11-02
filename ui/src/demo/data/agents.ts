@@ -91,6 +91,8 @@ function run(
   const working = state.state === 'running' || state.state === 'starting'
   const started = NOW - startedAgo
   return {
+    planningPolicy: 'skip',
+    planningPhase: null,
     run: `r-${(++seq).toString().padStart(4, '0')}`,
     agent: agentId,
     agentLabel: def?.label ?? agentId,

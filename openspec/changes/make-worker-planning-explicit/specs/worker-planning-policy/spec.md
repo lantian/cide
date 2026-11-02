@@ -109,3 +109,21 @@ Dispatch and session-creation responses, run inspection and run details SHALL di
 #### Scenario: Reused worker response
 - **WHEN** a worker-session request reuses an existing assignment without specifying `planning`
 - **THEN** the response reports the retained effective policy instead of claiming that a new default was applied
+
+### Requirement: Worker task discovery and reporting do not require repeated permission approval
+
+When Cide attaches its own MCP bridge to a Claude worker, it SHALL preapprove only `mcp__cide__cide_task_get`, `mcp__cide__cide_task_list`, `mcp__cide__cide_task_update` and `mcp__cide__cide_task_comment` independently of the assignment's planning policy. This SHALL cover role dispatches and anonymous worker sessions, including resumed conversations. Existing execution modes, explicit deny rules, other task mutations and MCP tools SHALL retain their existing permission behavior. Ordinary consoles SHALL retain their current grants.
+
+#### Scenario: Prepared task starts with a read
+- **WHEN** a fresh or resumed Claude worker with `planning: skip` reads its assigned task through Cide's bridge
+- **THEN** task discovery is allowed without a per-worktree approval prompt
+- **AND** Cide has not granted other task mutations or changed the worker's execution permission mode
+
+#### Scenario: Cide bridge is unavailable or disabled
+- **WHEN** a worker is launched without Cide's MCP bridge
+- **THEN** Cide does not add task workflow permission grants for a user-configured server
+
+#### Scenario: Worker reports completed work
+- **WHEN** a fresh or resumed Claude worker under either planning policy updates task fields or posts its completion comment through Cide's bridge
+- **THEN** task_update and task_comment do not require a per-worktree approval prompt
+- **AND** explicit deny rules and Cide's existing caller and task-scope restrictions still apply

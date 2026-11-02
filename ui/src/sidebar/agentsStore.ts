@@ -237,7 +237,7 @@ interface AgentsStore {
    * says why at length. The run id is deliberately dropped: nothing in this window can act on
    * a run that is not in the roster yet, and returning it would invite a caller to try.
    */
-  dispatch: (agent: AgentId, task?: TaskId, prompt?: string) => Promise<void>
+  dispatch: (agent: AgentId, task?: TaskId, prompt?: string, planning?: import('@/ipc/generated').PlanningPolicy) => Promise<void>
   /** Cancel a queued run, or kill a running one. Its row moves to Recent; nothing is removed. */
   stop: (run: RunId) => Promise<void>
   /**
@@ -458,7 +458,7 @@ export const useAgents = create<AgentsStore>((set, get) => ({
     await settingsApi.openTab(project, 'agents')
   },
 
-  dispatch: async (agent, task, prompt) => {
+  dispatch: async (agent, task, prompt, planning) => {
     const project = get().project
     if (project === null) return
     /*
@@ -473,6 +473,7 @@ export const useAgents = create<AgentsStore>((set, get) => ({
      * `cide-agents` would then append to the prompt as an empty line.
      */
     const request: DispatchRequest = {
+      ...(planning === undefined ? {} : { planning }),
       project,
       agent,
       ...(task === undefined ? {} : { task }),

@@ -1726,6 +1726,8 @@ mod tests {
         worktree: bool,
     ) -> cide_ipc::AgentRun {
         cide_ipc::AgentRun {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
+            planning_phase: None,
             run: cide_ipc::RunId::new(),
             agent: AgentId(agent.into()),
             agent_label: agent.into(),

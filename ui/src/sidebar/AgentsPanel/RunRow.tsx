@@ -605,6 +605,10 @@ function GateNotes({
         * the Waiting tab is where it is answered beside every other thing owed. Plain words with
         * no handler, `onOpenReviewer`'s rule below.
         */}
+      <p className={styles.rowNote} data-audit="agentsPlanningPolicy">
+        {run.planningPolicy === 'required' ? 'Plan before execution' : 'Direct execution'}
+        {run.planningPhase != null && ` · ${{ planning: 'Planning', approving: 'Accepting plan', implementing: 'Implementing' }[run.planningPhase]}`}
+      </p>
       {row.gate !== null && (
         <p className={styles.rowNote} data-audit="agentsGate">
           {row.asks && onShowWaiting !== undefined ? (

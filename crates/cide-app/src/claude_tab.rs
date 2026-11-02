@@ -103,6 +103,7 @@ pub(crate) enum TabHarness {
 /// A struct because the list grew past what a reader can match positionally: two of M79's
 /// parameters were already `Option`s of the same shape, and M104 adds four more.
 pub(crate) struct Open<'a> {
+    pub planning: Option<cide_ipc::PlanningPolicy>,
     pub title: &'a str,
     /// `claude --name`: what the CLI shows in its prompt box and in `/resume`. `None` leaves the
     /// session unnamed, which is what a reviewer wants — its tab title is a task, not a name.
@@ -142,6 +143,7 @@ pub(crate) fn open_with_prompt(
         app,
         project,
         Open {
+            planning: None,
             title,
             session_name,
             prompt,
@@ -182,6 +184,7 @@ pub(crate) fn open_continuing(
     conversation: Option<cide_ipc::HarnessSession>,
 ) -> Result<(SessionId, TabId), CoreError> {
     let Open {
+        planning,
         title,
         session_name,
         prompt,
@@ -320,6 +323,7 @@ pub(crate) fn open_continuing(
         // system prompt calling it a bystander who could orchestrate left it arguing with itself
         // about whether it was allowed to. Reported as exactly that.
         voice: Some(voice),
+        planning,
         // Console integration and provider configuration are added by the spawn adapter.
         env,
         // Codex takes its opening line in the argv; claude's is typed below.
@@ -614,6 +618,7 @@ pub(crate) async fn resume_closed(
             .as_ref()
             .map_or(root.clone(), |conversation| conversation.cwd.clone());
         let request = crate::cmd::session::SpawnRequest {
+            planning: None,
             program: console.program().to_string(),
             harness: Some(console),
             // A `continues` pane's argv is its harness's `continue_spec`, which replaces these;

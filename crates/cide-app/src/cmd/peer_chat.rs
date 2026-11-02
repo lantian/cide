@@ -60,6 +60,7 @@ pub async fn peer_chat_configure(
                 &app,
                 &registry,
                 crate::cmd::session::SpawnRequest {
+                    planning: None,
                     program: "claude".into(),
                     harness: None,
                     args: vec![],

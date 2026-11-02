@@ -69,6 +69,10 @@ impl SessionKind {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub planning_policy: Option<crate::PlanningPolicy>,
+    #[serde(default)]
+    pub planning_phase: Option<crate::PlanningPhase>,
     /// The harness's conversation id, or cide's session handle standing in until the harness
     /// names one — see [`Self::known`].
     pub id: String,

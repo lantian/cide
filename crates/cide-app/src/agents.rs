@@ -135,6 +135,10 @@ use crate::event_tap;
 use crate::state::SessionRegistry;
 
 type Result<T> = std::result::Result<T, CoreError>;
+type AssignmentProgress = (
+    cide_ipc::PlanningPolicy,
+    Option<cide_agents::native_plan::State>,
+);
 
 /// Trailing debounce on `cide://agents-changed`. See the module header.
 const COALESCE: Duration = Duration::from_millis(120);
@@ -182,6 +186,7 @@ type AgentKey = (ProjectId, AgentId);
 /// [`SessionRegistry`], and so does this. See the module header.
 #[derive(Debug, Clone)]
 struct LiveRun {
+    planning_policy: cide_ipc::PlanningPolicy,
     planning: Option<cide_agents::native_plan::State>,
     run: RunId,
     agent: AgentId,
@@ -670,6 +675,7 @@ fn insert_run(inner: &mut Inner, spec: DispatchSpec) -> RunId {
     inner.runs.insert(
         run,
         LiveRun {
+            planning_policy: spec.planning_policy,
             planning: spec.planning,
             run,
             agent: spec.agent,
@@ -1028,6 +1034,8 @@ impl LiveRun {
     fn wire(&self) -> AgentRun {
         let (model, pool_position) = self.using();
         AgentRun {
+            planning_policy: self.planning_policy,
+            planning_phase: self.planning.as_ref().map(|state| state.phase),
             run: self.run,
             agent: self.agent.clone(),
             agent_label: self.agent_label.clone(),
@@ -1063,6 +1071,31 @@ impl LiveRun {
 }
 
 impl AgentRegistry {
+    /// Resolve before tell/queue/bookkeeping. Policy is immutable for an assignment.
+    pub(crate) fn retained_planning(
+        &self,
+        run: RunId,
+        requested: Option<cide_ipc::PlanningPolicy>,
+    ) -> Result<AssignmentProgress> {
+        let inner = self.inner.lock();
+        let live = inner
+            .runs
+            .get(&run)
+            .ok_or_else(|| CoreError::Io(format!("Run {run} no longer exists")))?;
+        let policy = cide_ipc::PlanningPolicy::resolve(requested, Some(live.planning_policy))
+            .map_err(|error| CoreError::Io(format!("Run {run}: {error}")))?;
+        Ok((policy, live.planning.clone()))
+    }
+
+    pub(crate) fn planning_policy(&self, run: RunId) -> cide_ipc::PlanningPolicy {
+        self.inner
+            .lock()
+            .runs
+            .get(&run)
+            .map(|live| live.planning_policy)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn planning(&self, run: RunId) -> Option<cide_agents::native_plan::State> {
         self.inner
             .lock()
@@ -1313,6 +1346,7 @@ impl WorkOptions {
 /// the refusal short-circuits.
 #[derive(Debug, Clone)]
 pub struct DispatchSpec {
+    pub planning_policy: cide_ipc::PlanningPolicy,
     pub planning: Option<cide_agents::native_plan::State>,
     pub project: ProjectId,
     pub agent: AgentId,
@@ -7015,6 +7049,8 @@ struct RunsFile {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SavedRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planning_policy: Option<cide_ipc::PlanningPolicy>,
     /// Preserve a failed turn's reason when shutdown has already marked its child Interrupted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_reason: Option<String>,
@@ -7456,6 +7492,8 @@ impl AgentRegistry {
                     ),
                 };
                 SessionRecord {
+                    planning_policy: Some(live.planning_policy),
+                    planning_phase: live.planning.as_ref().map(|p| p.phase),
                     id,
                     known,
                     kind,
@@ -7635,6 +7673,7 @@ impl AgentRegistry {
                             }
                             _ => None,
                         },
+                        planning_policy: Some(live.planning_policy),
                         planning: live.planning.clone(),
                         run: live.run,
                         project: live.project,
@@ -7771,6 +7810,16 @@ impl AgentRegistry {
         }
         let mut restored: std::collections::HashSet<String> = std::collections::HashSet::new();
         for saved in file.runs {
+            let planning_policy = match cide_agents::native_plan::saved_policy(
+                saved.planning_policy,
+                saved.planning.as_ref(),
+            ) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    tracing::error!(run=%saved.run, %error, "cannot restore worker assignment");
+                    continue;
+                }
+            };
             if !keep(saved.project) || inner.runs.contains_key(&saved.run) {
                 continue;
             }
@@ -7840,6 +7889,7 @@ impl AgentRegistry {
             inner.runs.insert(
                 saved.run,
                 LiveRun {
+                    planning_policy,
                     planning: saved.planning,
                     run: saved.run,
                     agent: saved.agent,
@@ -10017,6 +10067,7 @@ fn start_child(
     let prompt =
         crate::cmd::spec_images::opening_prompt(resolved.harness, &admission.prompt, &images);
     let plan = RunPlan {
+        planning_policy: registry.planning_policy(admission.run),
         images,
         planning: registry.planning(admission.run),
         run: admission.run,
@@ -10363,12 +10414,14 @@ fn start_child(
     }
     .map_err(|error| CoreError::Io(error.to_string()))?;
 
+    plan.planning_policy
+        .validate_execution(plan.agent.permission_mode.as_deref())
+        .map_err(CoreError::Io)?;
     let native_planning = plan.planning.clone().map(|state| {
         let execution = plan
             .agent
             .permission_mode
             .as_deref()
-            .filter(|mode| *mode != "plan")
             .unwrap_or(match plan.unattended {
                 cide_agents::Unattended::Auto => "auto",
                 cide_agents::Unattended::Bypass => "bypassPermissions",
@@ -11718,6 +11771,7 @@ mod tests {
     /// names explicitly.
     fn spec(project: ProjectId, agent: &str, agent_limit: u16, project_limit: u16) -> DispatchSpec {
         DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             planning: None,
             project,
             agent: AgentId(agent.into()),
@@ -11827,6 +11881,7 @@ mod tests {
         let mut work = spec(project, "developer", 1, 1);
         work.harness = Harness::Codex;
         work.task = Some(TaskId("t-capacity".into()));
+        work.planning_policy = cide_ipc::PlanningPolicy::Required;
         work.planning = Some(Default::default());
         let run = registry.enqueue(work);
         registry.take_admissions();
@@ -11965,6 +12020,7 @@ mod tests {
         let mut work = spec(project, "developer", 1, 1);
         work.harness = Harness::Codex;
         work.task = Some(TaskId("t-planning".into()));
+        work.planning_policy = cide_ipc::PlanningPolicy::Required;
         work.planning = Some(Default::default());
         let run = registry.enqueue(work);
         let waiting = registry.enqueue(spec(project, "other", 1, 1));
@@ -12044,6 +12100,121 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_reuse_has_no_assignment_side_effects() {
+        use cide_agents::native_plan::{Phase, State};
+        use cide_ipc::PlanningPolicy::{Required, Skip};
+        for policy in [Required, Skip] {
+            let registry = AgentRegistry::default();
+            let project = ProjectId::new();
+            let mut work = spec(project, "developer", 1, 1);
+            work.planning_policy = policy;
+            work.planning = (policy == Required).then(|| State {
+                phase: Phase::Implementing,
+                ..Default::default()
+            });
+            let run = registry.enqueue(work);
+            let before = format!("{:?}", registry.inner.lock().runs[&run]);
+            let opposite = if policy == Required { Skip } else { Required };
+            let error = registry
+                .retained_planning(run, Some(opposite))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&run.to_string()));
+            assert!(error.contains("fresh"));
+            assert_eq!(before, format!("{:?}", registry.inner.lock().runs[&run]));
+            for request in [None, Some(policy)] {
+                let (retained, state) = registry.retained_planning(run, request).unwrap();
+                assert_eq!(retained, policy);
+                assert_eq!(
+                    state.as_ref().map(|s| s.phase),
+                    (policy == Required).then_some(Phase::Implementing)
+                );
+                assert_eq!(before, format!("{:?}", registry.inner.lock().runs[&run]));
+            }
+        }
+    }
+
+    #[test]
+    fn architect_handoff_preserves_worker_policies_corrections_and_restart() {
+        use cide_agents::native_plan::{Phase, State};
+        use cide_ipc::PlanningPolicy::{Required, Skip};
+        let registry = AgentRegistry::default();
+        let project = ProjectId::new();
+        let mut design = spec(project, "architect", 1, 2);
+        design.task = Some(TaskId("design".into()));
+        design.planning_policy = Required;
+        design.planning = Some(State::default());
+        let architect = registry.enqueue(design);
+        assert_eq!(registry.take_admissions().len(), 1);
+        let session = SessionId::new();
+        registry.bind_session(architect, session);
+        registry.set_state(None, architect, RunState::Running);
+        let mut progress = registry.planning(architect).unwrap();
+        // Feed native protocol observations, rather than treating a checklist as a plan.
+        let mut adapter = cide_agents::native_plan::Codex::default();
+        let mut request = serde_json::json!({"method":"turn/start","params":{"threadId":"architect-thread","input":[{"type":"text","text":"Choose the frontend/backend approach"}]}});
+        assert!(adapter.prepare(&mut request, "fixture-model"));
+        assert_eq!(request["params"]["collaborationMode"]["mode"], "plan");
+        adapter.observe(&serde_json::json!({"method":"turn/started","params":{"threadId":"architect-thread","turn":{"id":"design"}}}), "accept");
+        adapter.observe(&serde_json::json!({"method":"item/completed","params":{"threadId":"architect-thread","turnId":"design","item":{"type":"plan","text":"Prepared frontend/backend tasks"}}}), "accept");
+        let acceptance = adapter.observe(&serde_json::json!({"method":"turn/completed","params":{"threadId":"architect-thread","turn":{"id":"design","status":"completed"}}}), "accept").unwrap();
+        assert_eq!(acceptance["params"]["collaborationMode"]["mode"], "default");
+        progress.phase = Phase::Approving;
+        registry.note_planning(architect, session, &progress);
+        progress.phase = Phase::Implementing;
+        registry.note_planning(architect, session, &progress);
+        registry.set_state(None, architect, RunState::Idle);
+        let mut workers = Vec::new();
+        for role in ["frontend", "backend"] {
+            let mut work = spec(project, role, 1, 2);
+            work.task = Some(TaskId(format!("prepared-{role}")));
+            work.checkout = Some(format!("{role}-prepared-{role}"));
+            workers.push(registry.enqueue_unique(work).unwrap());
+        }
+        let admitted = registry.take_admissions();
+        assert_eq!(admitted.len(), 2);
+        for run in &workers {
+            assert_eq!(registry.planning_policy(*run), Skip);
+            assert!(registry.planning(*run).is_none());
+            let session = SessionId::new();
+            registry.bind_session(*run, session);
+            registry.set_state(None, *run, RunState::Running);
+            registry.set_state(None, *run, RunState::Idle);
+            assert_eq!(
+                cide_ipc::PlanningPolicy::resolve(None, Some(registry.planning_policy(*run)))
+                    .unwrap(),
+                Skip
+            );
+            assert!(
+                cide_ipc::PlanningPolicy::resolve(
+                    Some(Required),
+                    Some(registry.planning_policy(*run))
+                )
+                .is_err()
+            );
+            assert!(registry.planning(*run).is_none());
+        }
+        {
+            let inner = registry.inner.lock();
+            assert_ne!(
+                inner.runs[&workers[0]].checkout,
+                inner.runs[&workers[1]].checkout
+            );
+        }
+        let path = std::env::temp_dir().join(format!("cide-handoff-{}.json", RunId::new()));
+        registry.write_snapshot_now(&path);
+        let restored = AgentRegistry::default();
+        restored.restore_snapshot_from(&path, |_| true, |_| None, |_, _, _| true);
+        assert_eq!(restored.planning_policy(architect), Required);
+        assert_eq!(restored.planning(architect).unwrap(), progress);
+        for run in workers {
+            assert_eq!(restored.planning_policy(run), Skip);
+            assert!(restored.planning(run).is_none());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn native_planning_snapshots_preserve_progress_and_missing_state_is_legacy() {
         let registry = AgentRegistry::default();
         let project = ProjectId::new();
@@ -12053,6 +12224,7 @@ mod tests {
             phase: cide_agents::native_plan::Phase::Implementing,
             ..Default::default()
         };
+        work.planning_policy = cide_ipc::PlanningPolicy::Required;
         work.planning = Some(state.clone());
         let run = registry.enqueue(work);
         let path = std::env::temp_dir().join(format!("cide-native-planning-{}.json", RunId::new()));
@@ -12062,6 +12234,10 @@ mod tests {
         assert_eq!(restored.planning(run), Some(state));
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("planningPolicy");
         legacy["runs"][0]
             .as_object_mut()
             .unwrap()
@@ -12719,6 +12895,7 @@ mod tests {
         assert_eq!(index_of(&registry, first), 1);
 
         let second = registry.enqueue(DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             agent: AgentId("qa".into()),
             ..pooled_spec(project, &pool)
         });
@@ -12802,6 +12979,7 @@ mod tests {
         assert_eq!(index_of(&registry, first), 1, "entry 1 is now full");
 
         let second = registry.enqueue(DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             agent: AgentId("qa".into()),
             ..pooled_spec(project, &pool)
         });
@@ -12829,6 +13007,7 @@ mod tests {
         registry.inner.lock().benched[0].until_unix_ms = now_unix_ms() - 1;
 
         let second = registry.enqueue(DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             agent: AgentId("qa".into()),
             ..pooled_spec(project, &pool)
         });
@@ -12897,6 +13076,7 @@ mod tests {
             pool_entry("deepseek", "flash"),
         ];
         let run = registry.enqueue(DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             agent: AgentId("qa".into()),
             ..pooled_spec(project, &other)
         });
@@ -12921,6 +13101,7 @@ mod tests {
         );
         // A waiting run that a failover had already walked past entry 0.
         let waiting = registry.enqueue(DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             agent: AgentId("qa".into()),
             project_limit: 1,
             ..pooled_spec(project, &pool)
@@ -12972,6 +13153,7 @@ mod tests {
         let pool = limited_pool(&[None, Some(1)]);
         // Something else holds entry 1.
         let other = registry.enqueue(DispatchSpec {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             agent: AgentId("other".into()),
             ..pooled_spec(project, &pool)
         });
