@@ -1,3 +1,4 @@
+import { TaskLaunch } from './TaskLaunch'
 /**
  * One task, opened — **a modal card, read-only until a field is put into edit**. (M18)
  *
@@ -782,6 +783,7 @@ export interface TaskDetailProps {
   onNavigateAway?: (() => void) | undefined
   onSetTitle?: ((task: string, title: string) => void) | undefined
   onSetStatus?: ((task: string, status: TaskStatus) => void) | undefined
+  onLaunchAgent?: ((task: string, agent: string, planning?: import('@/ipc/generated').PlanningPolicy) => Promise<void>) | undefined
   onSetAssignee?: ((task: string, agent: string | null) => void) | undefined
   onSetBody?: ((task: string, body: string) => void) | undefined
   /**
@@ -1492,6 +1494,9 @@ export function TaskDetail(props: TaskDetailProps) {
         {showsAssignee(spec, task.agent !== null) && (
           <FieldRow field="assignee" task={task} roles={roles} editing={editing} run={run} props={props} />
         )}
+        {task.change === null && props.onLaunchAgent !== undefined &&
+          !runs.some((candidate) => !['finished', 'cancelled', 'failed'].includes(candidate.phase)) &&
+          <TaskLaunch key={task.id} roles={roles} assigned={task.agent} onLaunch={(agent, planning) => props.onLaunchAgent!(task.id, agent, planning)} />}
         {task.change === null && <TaskDispatchInfo status={props.dispatchStatus} error={props.dispatchError}
           onOpenTask={onOpenTask} onOpenMilestone={props.onOpenMilestone} onOpenRun={onOpenRun}
           openable={runs.some((candidate) => candidate.run === props.dispatchStatus?.run && candidate.openable && candidate.phase !== 'queued')} />}

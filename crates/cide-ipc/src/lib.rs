@@ -1178,3 +1178,5 @@ pub use peer_chat::{
 
 pub mod decision;
 pub use decision::*;
+
+pub use agents::{PlanningPhase, PlanningPolicy};

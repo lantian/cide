@@ -128,6 +128,10 @@ fn merge(row: &mut SessionRecord, seen: SessionRecord) -> bool {
         if seen.kind.is_run() && !row.kind.is_run() {
             row.kind = seen.kind;
         }
+        row.planning_policy = seen.planning_policy.or(row.planning_policy);
+        if seen.planning_policy.is_some() {
+            row.planning_phase = seen.planning_phase;
+        }
         row.harness = seen.harness;
         if !seen.title.is_empty() {
             row.title = seen.title;
@@ -251,6 +255,8 @@ fn of_pane(
     };
     let branch = worktree_name(root, &cwd);
     Some(SessionRecord {
+        planning_policy: None,
+        planning_phase: None,
         id,
         known,
         kind,
@@ -562,6 +568,8 @@ mod tests {
 
     fn record(id: &str, kind: SessionKind) -> SessionRecord {
         SessionRecord {
+            planning_policy: None,
+            planning_phase: None,
             id: id.into(),
             known: true,
             kind,

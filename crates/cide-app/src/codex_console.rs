@@ -206,7 +206,11 @@ impl Console {
                     let Ok((mut client, _)) = tungstenite::client(request, stream) else {
                         return false;
                     };
-                    match read_policy(&mut client, &spec.cwd, planning.is_some()) {
+                    match read_policy(
+                        &mut client,
+                        &spec.cwd,
+                        planning.as_ref().is_some_and(|plan| plan.pending()),
+                    ) {
                         Ok(config) => {
                             if let Some((_, scratch)) = spec.env.iter().rev().find(|(name, _)| {
                                 name == cide_core::peer_chat::reviewer::SCRATCH_ENV

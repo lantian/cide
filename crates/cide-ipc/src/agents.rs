@@ -447,6 +447,10 @@ impl RunState {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AgentRun {
+    #[serde(default)]
+    pub planning_policy: PlanningPolicy,
+    #[serde(default)]
+    pub planning_phase: Option<PlanningPhase>,
     pub run: RunId,
     pub agent: AgentId,
     /// [`AgentDef::label`] **copied at dispatch, not looked up at render**.
@@ -908,11 +912,75 @@ pub struct OrchestrationPatch {
     pub comment_limit: Option<u32>,
 }
 
+/// Whether Cide requires a native plan before this assignment executes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PlanningPolicy {
+    Required,
+    #[default]
+    Skip,
+}
+
+impl PlanningPolicy {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Skip => "skip",
+        }
+    }
+
+    /// Omission creates direct work, but preserves an existing assignment on reuse.
+    pub fn resolve(requested: Option<Self>, retained: Option<Self>) -> Result<Self, String> {
+        match (requested, retained) {
+            (Some(requested), Some(retained)) if requested != retained => Err(format!(
+                "This assignment retains planning: {}. Requested planning: {} conflicts; stop/close the existing worker and start a fresh assignment (fresh: true for role dispatch).",
+                retained.wire(),
+                requested.wire()
+            )),
+            (_, Some(retained)) => Ok(retained),
+            (requested, None) => Ok(requested.unwrap_or_default()),
+        }
+    }
+
+    pub fn validate_execution(self, mode: Option<&str>) -> Result<(), String> {
+        if self == Self::Required && mode == Some("plan") {
+            Err("planning: required needs a permitted execution mode; this role is restricted by permission-mode: plan. Use skip to retain that restriction, or configure an execution mode.".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Present null is invalid; only a missing field denotes an omitted request.
+pub fn deserialize_planning<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PlanningPolicy>, D::Error> {
+    PlanningPolicy::deserialize(deserializer).map(Some)
+}
+
+/// Runtime progress is separate from the assignment's policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PlanningPhase {
+    Planning,
+    Approving,
+    Implementing,
+}
+
 /// Dispatch one run. Inbound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct DispatchRequest {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_planning",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub planning: Option<PlanningPolicy>,
     pub project: ProjectId,
     pub agent: AgentId,
     /// The task this run is for.
@@ -975,6 +1043,15 @@ pub struct DispatchRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub fresh: bool,
+}
+
+/// The accepted assignment and its retained effective planning choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DispatchResult {
+    pub run: RunId,
+    pub planning_policy: PlanningPolicy,
 }
 
 /// A piece of work that is not a task in this project's tracker. (M104)
@@ -2009,6 +2086,8 @@ mod tests {
     #[test]
     fn a_run_round_trips_under_its_wire_names() {
         let run = AgentRun {
+            planning_policy: crate::PlanningPolicy::Skip,
+            planning_phase: None,
             run: RunId::new(),
             agent: AgentId("developer".into()),
             agent_label: "Developer".into(),
@@ -2157,6 +2236,85 @@ mod tests {
                 enabled: Some(true),
                 ..Default::default()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod planning_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn planning_request_distinguishes_missing_and_explicit_and_rejects_malformed() {
+        let base = json!({"project": ProjectId::new(), "agent": "developer"});
+        let missing: DispatchRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(missing.planning, None);
+        assert!(
+            serde_json::to_value(&missing)
+                .unwrap()
+                .get("planning")
+                .is_none()
+        );
+        for (value, expected) in [
+            (json!("required"), PlanningPolicy::Required),
+            (json!("skip"), PlanningPolicy::Skip),
+        ] {
+            let mut request = base.clone();
+            request["planning"] = value;
+            assert_eq!(
+                serde_json::from_value::<DispatchRequest>(request)
+                    .unwrap()
+                    .planning,
+                Some(expected)
+            );
+        }
+        for value in [
+            json!(null),
+            json!(false),
+            json!(1),
+            json!([]),
+            json!({}),
+            json!("auto"),
+        ] {
+            let mut request = base.clone();
+            request["planning"] = value;
+            assert!(serde_json::from_value::<DispatchRequest>(request).is_err());
+        }
+    }
+
+    #[test]
+    fn assignment_resolution_and_permissions_are_independent() {
+        use PlanningPolicy::{Required, Skip};
+        for (request, retained, expected) in [
+            (None, None, Some(Skip)),
+            (Some(Skip), None, Some(Skip)),
+            (Some(Required), None, Some(Required)),
+            (None, Some(Required), Some(Required)),
+            (None, Some(Skip), Some(Skip)),
+            (Some(Required), Some(Required), Some(Required)),
+            (Some(Skip), Some(Skip), Some(Skip)),
+            (Some(Skip), Some(Required), None),
+            (Some(Required), Some(Skip), None),
+        ] {
+            assert_eq!(PlanningPolicy::resolve(request, retained).ok(), expected);
+        }
+        for mode in [
+            None,
+            Some("auto"),
+            Some("manual"),
+            Some("acceptEdits"),
+            Some("bypassPermissions"),
+        ] {
+            assert!(Required.validate_execution(mode).is_ok());
+            assert!(Skip.validate_execution(mode).is_ok());
+        }
+        assert!(Skip.validate_execution(Some("plan")).is_ok());
+        assert!(
+            Required
+                .validate_execution(Some("plan"))
+                .unwrap_err()
+                .contains("permitted execution")
         );
     }
 }

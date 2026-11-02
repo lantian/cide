@@ -82,6 +82,7 @@ fn a_real_turn_is_interrupted_by_esc_and_the_next_line_is_taken_up() {
 
     let agent = role();
     let plan = RunPlan {
+        planning_policy: cide_ipc::PlanningPolicy::Skip,
         images: Vec::new(),
         run: RunId::new(),
         session: SessionId::new(),

@@ -992,3 +992,55 @@ fn real_codex_native_delivery_preserves_drafts_and_restores_the_thread() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn planning_capability_preflight_is_needed_only_before_a_required_plan() {
+    for (planning, supported) in [(false, false), (true, false), (true, true)] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut socket);
+            assert_eq!(initialize["method"], "initialize");
+            assert_eq!(
+                initialize["params"]["capabilities"]["experimentalApi"]
+                    .as_bool()
+                    .unwrap_or(false),
+                planning
+            );
+            send_json(&mut socket, json!({"id":0,"result":{}}));
+            assert_eq!(read_json(&mut socket)["method"], "initialized");
+            assert_eq!(read_json(&mut socket)["method"], "config/read");
+            send_json(
+                &mut socket,
+                json!({"id":1,"result":{"config":{"model":"fixture-model"}}}),
+            );
+            if planning {
+                assert_eq!(read_json(&mut socket)["method"], "collaborationMode/list");
+                send_json(
+                    &mut socket,
+                    json!({"id":2,"result":{"data":if supported { json!([{"mode":"plan"}]) } else { json!([]) }}}),
+                );
+            }
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (mut client, _) = tungstenite::client(format!("ws://{address}"), stream).unwrap();
+        let result = read_policy(
+            &mut client,
+            std::path::Path::new("/tmp/disposable-worker"),
+            planning,
+        );
+        assert_eq!(result.is_ok(), !planning || supported);
+        if planning && !supported {
+            assert!(result.unwrap_err().contains("Native Plan mode unavailable"));
+        }
+        server.join().unwrap();
+    }
+}

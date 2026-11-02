@@ -1163,9 +1163,12 @@ The desktop event consumer is a stand-in; this audit does not exercise a live Ta
 
 ### Native planning for delegated workers
 
-Task assignment, role dispatch and worker sessions start in the harness's native Plan mode.
-Cide approves the completed native plan and resumes implementation automatically, without
-adding planning instructions to the role or task prompt. Ordinary consoles and reviewers
+New task assignments, role dispatch and worker sessions execute directly by default.
+The optional `planning` request accepts only `required` or `skip` (null is invalid).
+Use `required` for unresolved investigation or architecture; prepared implementation handoffs
+omit it or use `skip`. The manual task launch's “Plan before execution” choice resets after
+one launch. When required, Cide approves the completed native plan and resumes implementation
+automatically, without adding planning instructions to the role or task prompt. Ordinary consoles and reviewers
 keep their existing launch policy. Execution permissions, model and role instructions still
 come from the resolved launch configuration.
 
@@ -1176,14 +1179,30 @@ Claude/Qwen dialog choices and acknowledgements, slot retention during planning,
 phase compatibility. OpenCode's authenticated HTTP fixtures cover native agent selection,
 plan-exit question correlation, completed plans and unsupported installations.
 
-Check a real delegated run for each installed harness: native Plan must precede edits,
-one native plan approval must start implementation, and a planning hand-back must not
+Check both policies on isolated disposable work for each installed harness: default/skip
+must start in the resolved execution mode without a plan capability preflight. Required must
+enter native Plan before edits, one native plan approval must start implementation, and a planning hand-back must not
 release the worker's slot or open its reviewer. Stop or switch conversations at the approval
 boundary; stale callbacks must not approve another session's prompt. User questions and
 ordinary tool permissions remain separate. Restore an implementing run without planning
-again; snapshots from before this feature retain their old behavior.
+again. Omitted or matching policy on continuation preserves phase; a mismatch must refuse
+before delivering instructions or updating task turn bookkeeping. A fresh assignment defaults
+to skip. Legacy snapshots with planning state infer required and preserve their generation;
+those without state infer skip. Inconsistent policy/progress must report recovery guidance.
+Explicit role/override `permission-mode: plan` remains restricted under skip; required is
+incompatible with that restriction. OpenCode/MiMo currently have no mapping for a role's
+plan-only permission mode and refuse such a role rather than execute it unrestricted.
+Planning policy must never auto-accept ordinary permissions.
+Claude workers with Cide's own MCP bridge preapprove task discovery (`cide_task_get`,
+`cide_task_list`) and reporting (`cide_task_update`, `cide_task_comment`) under either
+policy, on fresh and resumed launches. Other task mutations, MCP tools and explicit
+deny rules keep their existing checks. Run the `cide-claude`
+`task_access` tests, Claude harness tests and session worker bridge tests; verify that
+disabled/missing bridges and ordinary consoles acquire no new grants.
+Inspect policy separately from phase, including required assignments already implementing and
+unnamed worker tabs after restoration. Do not restart the user's sessions for these checks.
 
-Claude requires Cide's native tool hooks, Qwen requires its interactive `/plan` command and
+For required planning, Claude requires Cide's native tool hooks, Qwen requires its interactive `/plan` command and
 JSON event tap, Codex requires app-server Plan collaboration support, and OpenCode/MiMo
 requires an exposed native `plan` agent. Missing native capabilities report a launch or
 approval failure; there is no prompt-based substitute. The unit/HTTP checks do not replace

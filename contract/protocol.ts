@@ -50,7 +50,7 @@ export type AgentId = string;
 /**
  * One dispatched execution, as the panel draws it.
  */
-export type AgentRun = { run: RunId, agent: AgentId, 
+export type AgentRun = { planningPolicy: PlanningPolicy, planningPhase: PlanningPhase | null, run: RunId, agent: AgentId, 
 /**
  * [`AgentDef::label`] **copied at dispatch, not looked up at render**.
  *
@@ -419,7 +419,7 @@ export type Cursor = { row: number, col: number, };
 /**
  * Dispatch one run. Inbound.
  */
-export type DispatchRequest = { project: ProjectId, agent: AgentId, 
+export type DispatchRequest = { planning?: PlanningPolicy, project: ProjectId, agent: AgentId, 
 /**
  * The task this run is for.
  *
@@ -796,6 +796,16 @@ selected?: number,
  * answer is refused when this has moved.
  */
 digest: string, };
+
+/**
+ * Runtime progress is separate from the assignment's policy.
+ */
+export type PlanningPhase = "planning" | "approving" | "implementing";
+
+/**
+ * Whether Cide requires a native plan before this assignment executes.
+ */
+export type PlanningPolicy = "required" | "skip";
 
 /**
  * One opened project (a header tab, or a window in `PerProject` mode).
@@ -1237,7 +1247,7 @@ export type SessionKind = "console" | "consoleSplit" | "tab" | "worker" | "plann
 /**
  * One conversation, as the journal remembers it. Durable, and outbound inside [`SessionRow`].
  */
-export type SessionRecord = { 
+export type SessionRecord = { planningPolicy: PlanningPolicy | null, planningPhase: PlanningPhase | null, 
 /**
  * The harness's conversation id, or cide's session handle standing in until the harness
  * names one — see [`Self::known`].

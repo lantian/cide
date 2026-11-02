@@ -2553,6 +2553,14 @@ fn child_with(
             harness: flavor.kind,
         });
     }
+    // This adapter has no read-only permission-mode mapping. Never turn a plan-only
+    // role into an execution role merely because Cide's planning stage was skipped.
+    if plan.agent.permission_mode.as_deref() == Some("plan") {
+        return Err(HarnessError::NoEquivalent {
+            harness: flavor.kind,
+            what: "permission-mode: plan (a read-only role needs a harness that enforces this restriction; choose Claude, Codex or Qwen)".into(),
+        });
+    }
     // Refused before anything is built. `run` with an empty message is a process that starts, has
     // nothing to do and holds a concurrency slot and a worktree while it works that out.
     if plan.prompt.trim().is_empty() {
@@ -3643,8 +3651,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn skipping_planning_never_executes_an_unsupported_plan_only_role() {
+        let mut agent = role();
+        agent.permission_mode = Some("plan".into());
+        for flavor in [&OPENCODE_CLI, &MIMO_CLI] {
+            let mut plan = plan_for(&agent);
+            plan.harness = flavor.kind;
+            assert!(matches!(
+                child_with(flavor, &plan, None, v1()),
+                Err(HarnessError::NoEquivalent { .. })
+            ));
+        }
+    }
+
     fn plan_for(agent: &LoadedAgent) -> RunPlan<'_> {
         RunPlan {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
             images: Vec::new(),
             run: RunId::new(),
             session: SessionId::new(),

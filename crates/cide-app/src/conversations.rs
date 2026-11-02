@@ -681,6 +681,7 @@ fn resume(
     }
     let registry = app.state::<SessionRegistry>();
     let request = crate::cmd::session::SpawnRequest {
+        planning: None,
         program: String::new(),
         harness,
         args: vec![],

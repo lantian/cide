@@ -15,7 +15,7 @@ const { createRoot } = await import('react-dom/client')
 let root
 try {
   execFileSync('node', ['node_modules/vite/bin/vite.js', 'build', '--ssr', 'src/sidebar/TasksPanel/dispatchSmoke.ts', '--outDir', out, '--logLevel', 'error'], { stdio: 'inherit' })
-  const { TaskDispatchInfo, TaskDetail, CARD_STORIES, dispatchNotice, useTasks } = await import(`file://${resolve(out, 'dispatchSmoke.js')}`)
+  const { TaskDispatchInfo, TaskDetail, TaskLaunch, useAgents, CARD_STORIES, dispatchNotice, useTasks } = await import(`file://${resolve(out, 'dispatchSmoke.js')}`)
   root = createRoot(document.querySelector('#root'))
   const calls = []
   const actions = { onOpenTask: (id) => calls.push(['task', id]), onOpenMilestone: (id) => calls.push(['milestone', id]), onOpenRun: (id) => calls.push(['run', id]) }
@@ -87,6 +87,36 @@ try {
   assert.ok(document.querySelector('[data-audit="taskDispatchInfo"]'), 'the real task card includes the explanation')
   const body = [...document.querySelectorAll('[data-field]')].find((el) => el.dataset.field === 'body')
   if (body) assert.ok(document.querySelector('[data-audit="taskDispatchInfo"]').compareDocumentPosition(body) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING)
+  const payloads = []
+  window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+    if (command === 'agents_dispatch') { payloads.push(args.request); return { run: 'run-planning', planningPolicy: args.request.planning ?? 'skip' } }
+    throw new Error(`Unexpected command: ${command}`)
+  } }
+  useAgents.setState({ project: 'project-a', refresh: async () => {} })
+  const launch = (agent, planning) => useAgents.getState().dispatch(agent, 't-1488', undefined, planning)
+  const launchProps = { roles: { developer: 'Developer' }, assigned: 'developer', onLaunch: launch }
+  const mountLaunch = async (extra = {}) => act(async () => root.render(React.createElement(TaskLaunch, { ...launchProps, ...extra })))
+  await mountLaunch()
+  await click('Start agent')
+  assert.equal(payloads.at(-1).agent, 'developer')
+  assert.equal(Object.hasOwn(payloads.at(-1), 'planning'), false, 'normal launch omits policy')
+  await click('Launch options')
+  assert.ok(document.body.textContent.includes('Plan before execution'))
+  await act(async () => document.querySelector('input[type="checkbox"]').click())
+  await click('Start agent')
+  assert.equal(payloads.at(-1).planning, 'required')
+  assert.equal(document.querySelector('input[type="checkbox"]'), null, 'options close after launch')
+  await click('Launch options')
+  assert.equal(document.querySelector('input[type="checkbox"]').checked, false, 'planning is not sticky')
+  await click('Start agent')
+  assert.equal(Object.hasOwn(payloads.at(-1), 'planning'), false)
+  await mountLaunch({ onLaunch: async () => { throw new Error('Launch refused') } })
+  await click('Launch options')
+  await act(async () => document.querySelector('input[type="checkbox"]').click())
+  await click('Start agent')
+  assert.ok(document.querySelector('[role="alert"]').textContent.includes('Launch refused'))
+  await click('Launch options')
+  assert.equal(document.querySelector('input[type="checkbox"]').checked, false, 'failure resets planning too')
   console.log('task-dispatch: PASS — multiple reasons, resolution, navigation, queues, notices, safe text and real card rendering')
 } finally {
   if (root) await act(async () => root.unmount())

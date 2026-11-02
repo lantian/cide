@@ -18997,6 +18997,122 @@ configuration and render checks, TypeScript, 17 focused agent tests and 14 app
 planning/session tests pass. Adapter socket tests required execution outside the
 sandbox. No paid model sessions or live desktop approval flows were exercised.
 
+## Explicit planning policy for delegated assignments
+
+New role dispatches and worker sessions execute directly by default. Their optional
+`planning` request accepts `required` or `skip`; null, unknown values and wrong types are
+refused. Required assignments retain automatic native-plan acceptance, concurrency ownership
+and implementation review boundaries. The manual task launch offers a non-sticky “Plan before
+execution” choice. Dispatch responses, run details and worker-session inspection show the
+retained policy separately from current progress.
+
+Continuation validates the held choice before instructions, follow-up queueing or turn
+bookkeeping. Omission and matching choices retain phase and generation; a conflicting choice
+names the assignment and the fresh-launch route. Saved records without a policy infer required
+from existing progress and skip from its absence. Inconsistent records report recovery guidance.
+Direct worker metadata persists by conversation identity without creating a planning controller.
+Restoration resolves execution permissions again, and Codex no longer requires a Plan preset
+after an assignment has entered implementation.
+
+Planning grants no tool or sandbox permissions. Explicit plan-only roles keep their restriction
+under skip and cannot request automatic plan-then-execute. Claude, Codex and Qwen retain their
+existing permission mappings. OpenCode/MiMo cannot map a role's plan-only permission mode and
+now refuse that configuration instead of silently executing it without the restriction.
+Ordinary consoles, automated planners/reviewers and standalone OpenSpec preferences retain
+their existing launch behavior.
+
+Validation: 518 cide-agents tests passed. The cide-app run passed 924 tests, including native
+Codex capability preflight, handoff/recovery and mismatch side-effect fixtures; its existing
+shutdown signal test failed in the full run and passed alone. Strict workspace Clippy passed.
+All 150 non-failing checks in the shared 152-check runner completed, including TypeScript,
+codegen/contracts, mounted task/agent UI, UI kit, theme/scale and the production UI build.
+The runner's initial Rust test/Clippy failures were followed by corrected Rust reruns; the
+workspace test rerun also exposed unchanged timeout and file-watcher failures in
+`a_check_past_its_limit_is_stopped_with_everything_it_started`,
+`the_probe_reads_rpc_results_and_bounds_failure_cleanup`, and
+`a_linked_worktree_commit_marks_the_change`. The watcher failure reproduced alone.
+The final workspace rerun finished with 4,852 passed, 5 failed and 106 ignored tests across
+101 test binaries/doc-test groups. Its additional LSP failure,
+`a_project_with_no_marker_does_not_start_a_server`, reports that rust-analyzer is not installed.
+All five failing tests are outside the planning-policy implementation. The full suite is not
+claimed green.
+
+Native transition evidence here uses protocol, authenticated HTTP and process fixtures, not
+live model/desktop acceptance. Installed CLIs were Claude Code 2.1.308, Codex 0.160.0 and
+OpenCode 1.18.29-crpt.45; Qwen and MiMo were absent. The installed-harness live matrix remains
+OpenSpec task 6.3. Existing working IDE sessions were not restarted.
+
+
+### Follow-up: Claude worker task discovery permissions
+
+A local desktop check exposed Claude asking permission for `mcp__cide__cide_task_get`
+in an execution-default worker. Previously only the native planning adapter preapproved
+task discovery. Fresh and resumed role workers and anonymous workers now receive the
+same two exact task-get/list grants when Cide attaches its own MCP bridge. The shared
+argv helper preserves existing grants, explicit denies, permission modes and other MCP
+servers. Ordinary consoles receive no extra grants; a disabled or missing bridge adds none.
+The planning rewrite preserves the launcher's grants instead of inventing them itself.
+Task writes and other tool permissions retain their existing behavior.
+
+Validation: 43 focused tests passed (one grant-merging test, 32 Claude harness tests,
+one anonymous-worker bridge test, four native-plan tests and five task-tool/session/RPC
+tests). RPC tests were rerun with local socket access after the sandbox refused binding.
+`check:claude-cli`, formatting, scoped diff whitespace checks and strict OpenSpec validation
+passed. The local cide-app/cide-hook binaries were rebuilt. Existing working sessions were
+not restarted; workers must be relaunched under the rebuilt app to receive the new argv.
+
+Rust was updated on this machine to Homebrew 1.99.1 during the local check, triggering a
+full dependency rebuild. The new strict Clippy run failed on existing `fetch_update`
+deprecations in cide-pty/cide-fs, `result_large_err` in cide-ide-mcp, and
+`unnecessary_sort_by` in cide-core scheme/sessions code. Those locations were not changed
+by this follow-up; strict Clippy is not claimed green on the updated toolchain. The live
+installed-harness matrix remains task 6.3.
+
+
+### Follow-up: task update and completion comment grants
+
+At the user's request, the trusted Claude worker bridge now also preapproves exactly
+`mcp__cide__cide_task_update` and `mcp__cide__cide_task_comment`, alongside get/list.
+The shared helper is named `allow_worker_task_tools` to reflect the reporting grants.
+Both fresh and resumed role and anonymous workers receive the same four grants under
+either planning policy. Explicit denies, bridge caller/task-scope enforcement, ordinary
+console grants and permissions for the other task tools remain unchanged.
+
+Validation: 38 focused tests passed (grant merging/idempotence, 32 Claude harness tests,
+one anonymous-worker bridge test and four native-plan tests). Formatting, strict OpenSpec
+validation and scoped diff whitespace checks passed. The local cide-app/cide-hook build
+completed; existing sessions were not restarted. The earlier Rust 1.99.1 strict Clippy
+limitations remain recorded above, and the live-harness matrix remains task 6.3.
+
+
+### Manual acceptance and review handoff
+
+After launching the rebuilt app in the isolated `planning-check` profile, the user
+confirmed the worker flow works on their project, including the four task-tool grants.
+This is local Claude acceptance evidence; it does not complete the installed-harness
+skip/required, cancellation and restoration matrix in task 6.3. The implementation and
+validation limits are included in the existing pull request's updated description.
+
+
+### CI follow-up: dispatch policy fixture without installed harness CLIs
+
+The PR's Linux and macOS jobs both failed only
+`cmd::agents::tests::assignment_planning_is_explicit_for_tracked_external_and_adhoc_work`:
+the fixture loaded real harness availability and unwrapped a refusal because Claude was
+not installed on the runners. Build, pinned-toolchain strict Clippy, contract/codegen and
+UI checks passed in CI run 41514308960.
+
+Dispatch planning now delegates from the normal project loader to the same planning code
+with a loaded project catalog. The policy fixture loads only its own role and supplies a
+deterministic availability probe, without changing PATH, global binary settings or the
+production availability checks. Both skip and required still reject an unavailable harness.
+
+Validation: all 23 cmd::agents tests passed. The exact regression also passed in a separate
+process with PATH limited to /usr/bin:/bin. Formatting, scoped diff whitespace checks and
+strict OpenSpec validation passed. The fix is submitted to the existing PR for a new CI run;
+the full installed-harness live matrix remains task 6.3.
+
+
 ## M194 — OpenSpec and tasks stop taking each other over
 
 Four fixes where a linked task replaced OpenSpec behaviour it should have left alone. Checks pass
@@ -19014,3 +19130,19 @@ was run on a display.**
 
 Not done: the card's "Make a proposal" still types into a console via `spec_propose_for_task`;
 a change living in a role's worktree is still read from the root only, so it reads as missing.
+
+
+### CI follow-up: synchronize the worker policy branch with master
+
+After the fixture fix was pushed, GitHub reported a merge conflict and did not start a
+new pull-request workflow. Merged master 2b6e8a5, retaining both the assignment planning
+policy and the upstream cide_session_open `worktree: false` option. The session response
+reports its planning policy and correctly describes root-directory sessions without a
+branch. Both sides' tests and journal records were preserved.
+
+Validation after the merge: 228 focused Rust tests passed (147 MCP tools, 23 dispatch,
+54 session and four native-plan tests). The policy test now covers required/skip combined
+with worktree=false. TypeScript plus task-dispatch, agents-render, task-navigation and
+OpenSpec-render UI checks passed. Formatting and scoped diff whitespace checks passed.
+The user's local tracker changes were left out of the merge commit. Full CI is rerun on
+the combined branch; the installed-harness live matrix remains task 6.3.

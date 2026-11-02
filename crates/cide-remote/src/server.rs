@@ -3359,6 +3359,8 @@ mod tests {
         // see. A control for a thing that cannot be shown is a guess with a button on it.
         let (h, first, second) = harness().await;
         h.host.runs.lock().push(cide_ipc::AgentRun {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
+            planning_phase: None,
             run: uuid::Uuid::new_v4().into(),
             agent: "reviewer".to_owned().into(),
             agent_label: "Reviewer".to_owned(),
@@ -5200,6 +5202,7 @@ mod tests {
             Some(1),
             ClientBody::Dispatch {
                 request: cide_ipc::DispatchRequest {
+                    planning: None,
                     project: first,
                     agent: cide_ipc::AgentId("reviewer".to_owned()),
                     task: Some(cide_ipc::TaskId("t-1".to_owned())),

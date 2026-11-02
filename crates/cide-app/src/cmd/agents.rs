@@ -811,11 +811,15 @@ pub async fn agents_dispatch(
     agents: State<'_, Arc<AgentRegistry>>,
     tasks: State<'_, Arc<TasksStores>>,
     request: DispatchRequest,
-) -> Result<RunId> {
+) -> Result<cide_ipc::agents::DispatchResult> {
+    let registry = Arc::clone(&agents);
     match dispatch_or_duplicate(app, state, agents, tasks, request).await? {
         DispatchOutcome::Started { run, .. }
         | DispatchOutcome::Continued { run, .. }
-        | DispatchOutcome::Told(run) => Ok(run),
+        | DispatchOutcome::Told(run) => Ok(cide_ipc::agents::DispatchResult {
+            run,
+            planning_policy: registry.planning_policy(run),
+        }),
         // Flattened to the sentence, because both callers of *this* function asked for the
         // dispatch out loud: the panel's button and `cide_agent_dispatch`. The one caller that
         // did not ask — auto-dispatch, where a repeated assignment is an ordinary gesture rather
@@ -975,9 +979,6 @@ pub(crate) async fn dispatch_or_duplicate(
     let root = project_root(&state, project)?;
     // New instructions for the pair: whatever it reports next is a new turn's report, not a
     // superseding of the last one. (M132)
-    if let Some(task) = request.task.as_ref() {
-        crate::agent_rpc::new_turn(project, &request.agent, task);
-    }
     // `ensure` rather than `get`, for `cmd::tasks::tracker`'s reason: the restore loop warms a
     // store per project but that list is capped, and a project past the cap would otherwise be
     // undispatchable with nothing anywhere saying why.
@@ -995,6 +996,10 @@ pub(crate) async fn dispatch_or_duplicate(
         .as_deref()
         .map(crate::agent_rpc::one_line)
         .filter(|line| !line.is_empty());
+    let turn = request
+        .task
+        .clone()
+        .map(|task| (request.agent.clone(), task));
     let notify = request.notify.clone();
 
     let planned = blocking(move || {
@@ -1014,6 +1019,7 @@ pub(crate) async fn dispatch_or_duplicate(
             .as_deref()
             .is_some_and(|line| !line.trim().is_empty());
         if let Some(run) = tell_route(held.as_ref(), reachable, request.fresh, has_instructions) {
+            lookup.retained_planning(run, request.planning)?;
             return Ok(Planned::Tell(run));
         }
         // This project's local redirections, read on the worker with the rest of the disk. The
@@ -1025,7 +1031,15 @@ pub(crate) async fn dispatch_or_duplicate(
         let overrides =
             cide_core::persist::load_agent_overrides(&cide_core::persist::agent_overrides_path())
                 .project(&root.to_string_lossy());
-        let spec = plan_dispatch(&root, &store, held.as_ref(), &overrides, &llm, &request)?;
+        let mut spec = plan_dispatch(
+            crate::agents::cide_hook_binary().as_deref(),
+            &root,
+            &store,
+            held.as_ref(),
+            &overrides,
+            &llm,
+            &request,
+        )?;
         // Free pair: the last ended run's conversation, if the harness can take it back. The
         // role id from the spec, which is the resolved one; external work has no pair.
         let previous = spec
@@ -1044,10 +1058,17 @@ pub(crate) async fn dispatch_or_duplicate(
             .and_then(|(_, _, thread)| cide_core::codex_cli::context_tokens(thread));
         let fresh_above = cide_agents::config::load(&root).agents.fresh_above;
         let route = continue_route(previous, spec.harness, request.fresh, context, fresh_above);
+        if let Ok((from, _)) = &route {
+            (spec.planning_policy, spec.planning) =
+                lookup.retained_planning(*from, request.planning)?;
+        }
         Ok(Planned::Spec(Box::new(spec), route))
     })
     .await?;
 
+    if let Some((agent, task)) = &turn {
+        crate::agent_rpc::new_turn(project, agent, task);
+    }
     let (mut spec, route) = match planned {
         Planned::Tell(run) => {
             // Re-pointed first, so the hand-back these instructions produce is announced to the
@@ -1672,6 +1693,7 @@ fn duplicate_refusal(agent: &AgentId, task: Option<&TaskId>, held: &HeldPair) ->
 /// `cide_agents::overrides`' standing arrangement, "the caller loads the overrides at the edge
 /// and hands them in". (M73)
 fn plan_dispatch(
+    hook_bin: Option<&Path>,
     root: &Path,
     store: &TaskStore,
     held: Option<&HeldPair>,
@@ -1680,6 +1702,21 @@ fn plan_dispatch(
     request: &DispatchRequest,
 ) -> Result<DispatchSpec> {
     let project = cide_agents::load_project(root);
+    plan_dispatch_loaded(hook_bin, &project, store, held, overrides, llm, request)
+}
+
+/// Plan from a loaded catalog so policy tests can supply harness availability without
+/// depending on the machine's PATH or changing process-wide binary settings.
+fn plan_dispatch_loaded(
+    hook_bin: Option<&Path>,
+    project: &ProjectAgents,
+    store: &TaskStore,
+    held: Option<&HeldPair>,
+    overrides: &cide_ipc::ProjectOverrides,
+    llm: &cide_ipc::LlmSettings,
+    request: &DispatchRequest,
+) -> Result<DispatchSpec> {
+    let root = store.root();
     let agent = project.get(&request.agent).ok_or_else(|| {
         CoreError::Io(format!(
             "this project defines no role named `{}`. Roles come from {}/agents/<name>.md.",
@@ -1722,11 +1759,7 @@ fn plan_dispatch(
     // See `cide_agents::dispatch_refusal`. This is the earliest of the three call sites and the
     // one that matters most for the bridge: refusing here is refusing before `worktree::ensure`,
     // so a run that could not have reported leaves no checkout behind either.
-    if let Some(why) = cide_agents::dispatch_refusal(
-        agent,
-        &project.config.agents,
-        crate::agents::cide_hook_binary().as_deref(),
-    ) {
+    if let Some(why) = cide_agents::dispatch_refusal(agent, &project.config.agents, hook_bin) {
         return Err(CoreError::Io(why));
     }
 
@@ -1807,8 +1840,18 @@ fn plan_dispatch(
         ));
     }
 
+    let planning_policy =
+        cide_ipc::PlanningPolicy::resolve(request.planning, None).map_err(CoreError::Io)?;
+    planning_policy
+        .validate_execution(
+            cide_agents::overrides::resolve(agent, overrides, llm)
+                .permission_mode
+                .as_deref(),
+        )
+        .map_err(CoreError::Io)?;
     Ok(DispatchSpec {
-        planning: Some(Default::default()),
+        planning_policy,
+        planning: (planning_policy == cide_ipc::PlanningPolicy::Required).then(Default::default),
         project: request.project,
         agent: agent.def.id.clone(),
         agent_label: agent.def.label.clone(),
@@ -2538,6 +2581,8 @@ mod tests {
         std::fs::create_dir_all(cide_git::worktree::path_of(&root, &name)).expect("worktree dir");
 
         let run = |task: Option<&str>| cide_ipc::AgentRun {
+            planning_policy: cide_ipc::PlanningPolicy::Skip,
+            planning_phase: None,
             run: cide_ipc::RunId::new(),
             agent: cide_ipc::AgentId("developer".into()),
             agent_label: "Developer".into(),
@@ -2604,6 +2649,7 @@ mod tests {
 
     fn request(project: ProjectId, task: &TaskId) -> DispatchRequest {
         DispatchRequest {
+            planning: None,
             project,
             agent: AgentId("game-designer".into()),
             task: Some(task.clone()),
@@ -2660,6 +2706,7 @@ mod tests {
         let live = held(RunState::Running);
 
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&live),
@@ -2694,6 +2741,7 @@ mod tests {
         // The project has never been enabled; `a_dispatch_into_a_disabled_project_…` below is
         // the same root state with nothing holding, and gets the switch's sentence.
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&held(RunState::Running)),
@@ -2709,6 +2757,7 @@ mod tests {
         let mut ghost = request(project, &task);
         ghost.agent = AgentId("nobody".into());
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&held(RunState::Running)),
@@ -2828,6 +2877,7 @@ mod tests {
     fn the_duplicate_refusal_tells_the_caller_what_to_do_instead() {
         let (root, store, project, task) = with_a_role("duplicate-advice");
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&held(RunState::Running)),
@@ -2864,6 +2914,7 @@ mod tests {
     fn an_idle_run_is_refused_with_the_word_the_run_list_uses_for_it() {
         let (root, store, project, task) = with_a_role("duplicate-idle");
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&held(RunState::Idle)),
@@ -2877,6 +2928,7 @@ mod tests {
         assert!(why.contains("its turn ended"), "{why}");
 
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&held(RunState::Paused { since_unix_ms: 1 })),
@@ -2891,6 +2943,7 @@ mod tests {
 
         // A state with no second clause says nothing extra rather than an empty dash.
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             Some(&held(RunState::Queued)),
@@ -2921,12 +2974,14 @@ mod tests {
         );
         let store = TaskStore::open(&root);
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             None,
             &no_overrides(),
             &cide_ipc::LlmSettings::default(),
             &DispatchRequest {
+                planning: None,
                 project: ProjectId::new(),
                 agent: AgentId("game-designer".into()),
                 task: None,
@@ -2963,12 +3018,14 @@ mod tests {
         let store = TaskStore::open(&root);
 
         let why = plan_dispatch(
+            bridge(),
             &root,
             &store,
             None,
             &no_overrides(),
             &cide_ipc::LlmSettings::default(),
             &DispatchRequest {
+                planning: None,
                 project: ProjectId::new(),
                 agent: cide_ipc::AgentId("developer".into()),
                 task: None,
@@ -3103,6 +3160,93 @@ mod tests {
             ),
             "run the tests and say what fails"
         );
+    }
+
+    #[test]
+    fn assignment_planning_is_explicit_for_tracked_external_and_adhoc_work() {
+        use cide_ipc::PlanningPolicy::{Required, Skip};
+        let (root, store, project, _) = with_a_role("planning-launch-matrix");
+        enable(&root);
+        // This tests dispatch policy, not whether Claude is installed on the runner.
+        // Load only the fixture role and inject availability without touching PATH,
+        // the user's global roles, or process-wide configured-binary settings.
+        let dispatch = |req: &DispatchRequest, available: bool| {
+            let config = config::load(&root);
+            let catalog = defs::load_from(
+                &[(AgentScope::Project, defs::project_dir(&root))],
+                config.agents.harness,
+                |_| (!available).then(|| "test harness unavailable".to_string()),
+            );
+            plan_dispatch_loaded(
+                bridge(),
+                &ProjectAgents { config, catalog },
+                &store,
+                None,
+                &no_overrides(),
+                &Default::default(),
+                req,
+            )
+        };
+        let task = store
+            .create(
+                &serde_json::from_value(
+                    serde_json::json!({ "project": project, "title": "Prepared implementation" }),
+                )
+                .unwrap(),
+                cide_ipc::TaskAuthor::User,
+            )
+            .unwrap();
+        for tracker in [true, false] {
+            write(
+                &config::config_path(&root),
+                &format!(r#"{{"version":1,"tracker":{tracker},"agents":{{"enabled":true}}}}"#),
+            );
+            for work in ["tracked", "external", "adhoc"] {
+                for requested in [None, Some(Skip), Some(Required)] {
+                    let mut req = request(project, &task.id);
+                    req.planning = requested;
+                    if work != "tracked" {
+                        req.task = None;
+                        req.prompt = Some("Implement the prepared patch".into());
+                    }
+                    if work == "external" {
+                        req.external = Some(cide_ipc::ExternalWork {
+                            title: "Prepared frontend".into(),
+                            brief: "Implement the agreed component".into(),
+                            reference: None,
+                        });
+                    }
+                    let plan = dispatch(&req, true).unwrap();
+                    assert_eq!(plan.planning_policy, requested.unwrap_or(Skip));
+                    assert_eq!(plan.planning.is_some(), requested == Some(Required));
+                }
+            }
+        }
+        role(
+            &root,
+            "game-designer",
+            "---\nname: game-designer\ndescription: Read only\npermission-mode: plan\n---\nInspect only.\n",
+        );
+        let mut req = request(project, &task.id);
+        req.planning = Some(Required);
+        assert!(
+            dispatch(&req, true)
+                .unwrap_err()
+                .to_string()
+                .contains("permitted execution")
+        );
+        req.planning = Some(Skip);
+        assert!(dispatch(&req, true).unwrap().planning.is_none());
+        for policy in [Skip, Required] {
+            req.planning = Some(policy);
+            assert!(
+                dispatch(&req, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("test harness unavailable")
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// External work (M104): the brief inline and flattened, the reference named as where to

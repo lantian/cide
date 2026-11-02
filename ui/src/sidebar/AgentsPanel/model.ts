@@ -530,6 +530,8 @@ export interface AgentDefView {
  * `RunState` flattened into [`RunView.phase`] plus the three payload fields.
  */
 export interface RunView {
+  planningPolicy?: 'required' | 'skip'
+  planningPhase?: 'planning' | 'approving' | 'implementing' | null
   run: string
   agent: string
   /**

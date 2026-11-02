@@ -197,7 +197,52 @@ pub fn observe_workspace(app: &AppHandle, ws: &Workspace) {
             .and_then(|r| r.get(session))
             .map(|pty| pty.spawn_cwd().to_path_buf())
     });
+    let sightings = sightings.into_iter().map(|(root, mut record)| {
+        if record.kind == cide_ipc::sessions::SessionKind::Worker
+            && record.known
+            && let Some(session) = record.session
+            && let Err(error) = crate::native_plan::bind_assignment(
+                app,
+                session,
+                cide_ipc::HarnessSession {
+                    harness: record.harness,
+                    id: record.id.clone(),
+                    cwd: record.cwd.clone(),
+                },
+            )
+        {
+            tracing::error!(%error, "could not save worker assignment");
+        }
+        enrich_worker(app, &mut record);
+        (root, record)
+    });
     sessions.upsert_all(sightings);
+}
+
+fn enrich_worker(app: &AppHandle, record: &mut SessionRecord) {
+    if record.kind != cide_ipc::sessions::SessionKind::Worker {
+        return;
+    }
+    let conversation = cide_ipc::HarnessSession {
+        harness: record.harness,
+        id: record.id.clone(),
+        cwd: record.cwd.clone(),
+    };
+    match crate::native_plan::restored_assignment(app, &conversation) {
+        Ok(Some((policy, state, _))) => {
+            record.planning_policy = Some(policy);
+            record.planning_phase = state.map(|s| s.phase);
+        }
+        Ok(None) => {
+            record.planning_policy = Some(
+                record
+                    .session
+                    .map(|s| crate::native_plan::assignment_policy(app, s))
+                    .unwrap_or_default(),
+            );
+        }
+        Err(error) => tracing::error!(%error, conversation=%record.id, "invalid worker metadata"),
+    }
 }
 
 /// Merge what the run registry holds for `project`. Called from `AgentRegistry::flush`.
@@ -273,6 +318,7 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
     let mut rows = Vec::with_capacity(records.len());
     let mut heads: Vec<(String, TranscriptHead)> = Vec::new();
     for mut record in records {
+        enrich_worker(app, &mut record);
         let is_live = record.session.is_some_and(|s| live.contains(&s));
         let pane = panes
             .get(&record.id)

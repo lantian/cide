@@ -482,6 +482,7 @@ fn dispatch(
             }
         }
         let request = DispatchRequest {
+            planning: None,
             project,
             agent: agent.clone(),
             task: Some(task.clone()),
