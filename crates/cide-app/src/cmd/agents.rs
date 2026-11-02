@@ -1702,6 +1702,21 @@ fn plan_dispatch(
     request: &DispatchRequest,
 ) -> Result<DispatchSpec> {
     let project = cide_agents::load_project(root);
+    plan_dispatch_loaded(hook_bin, &project, store, held, overrides, llm, request)
+}
+
+/// Plan from a loaded catalog so policy tests can supply harness availability without
+/// depending on the machine's PATH or changing process-wide binary settings.
+fn plan_dispatch_loaded(
+    hook_bin: Option<&Path>,
+    project: &ProjectAgents,
+    store: &TaskStore,
+    held: Option<&HeldPair>,
+    overrides: &cide_ipc::ProjectOverrides,
+    llm: &cide_ipc::LlmSettings,
+    request: &DispatchRequest,
+) -> Result<DispatchSpec> {
+    let root = store.root();
     let agent = project.get(&request.agent).ok_or_else(|| {
         CoreError::Io(format!(
             "this project defines no role named `{}`. Roles come from {}/agents/<name>.md.",
@@ -3152,6 +3167,26 @@ mod tests {
         use cide_ipc::PlanningPolicy::{Required, Skip};
         let (root, store, project, _) = with_a_role("planning-launch-matrix");
         enable(&root);
+        // This tests dispatch policy, not whether Claude is installed on the runner.
+        // Load only the fixture role and inject availability without touching PATH,
+        // the user's global roles, or process-wide configured-binary settings.
+        let dispatch = |req: &DispatchRequest, available: bool| {
+            let config = config::load(&root);
+            let catalog = defs::load_from(
+                &[(AgentScope::Project, defs::project_dir(&root))],
+                config.agents.harness,
+                |_| (!available).then(|| "test harness unavailable".to_string()),
+            );
+            plan_dispatch_loaded(
+                bridge(),
+                &ProjectAgents { config, catalog },
+                &store,
+                None,
+                &no_overrides(),
+                &Default::default(),
+                req,
+            )
+        };
         let task = store
             .create(
                 &serde_json::from_value(
@@ -3181,16 +3216,7 @@ mod tests {
                             reference: None,
                         });
                     }
-                    let plan = plan_dispatch(
-                        bridge(),
-                        &root,
-                        &store,
-                        None,
-                        &no_overrides(),
-                        &Default::default(),
-                        &req,
-                    )
-                    .unwrap();
+                    let plan = dispatch(&req, true).unwrap();
                     assert_eq!(plan.planning_policy, requested.unwrap_or(Skip));
                     assert_eq!(plan.planning.is_some(), requested == Some(Required));
                 }
@@ -3204,34 +3230,22 @@ mod tests {
         let mut req = request(project, &task.id);
         req.planning = Some(Required);
         assert!(
-            plan_dispatch(
-                bridge(),
-                &root,
-                &store,
-                None,
-                &no_overrides(),
-                &Default::default(),
-                &req
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("permitted execution")
+            dispatch(&req, true)
+                .unwrap_err()
+                .to_string()
+                .contains("permitted execution")
         );
         req.planning = Some(Skip);
-        assert!(
-            plan_dispatch(
-                bridge(),
-                &root,
-                &store,
-                None,
-                &no_overrides(),
-                &Default::default(),
-                &req
-            )
-            .unwrap()
-            .planning
-            .is_none()
-        );
+        assert!(dispatch(&req, true).unwrap().planning.is_none());
+        for policy in [Skip, Required] {
+            req.planning = Some(policy);
+            assert!(
+                dispatch(&req, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("test harness unavailable")
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

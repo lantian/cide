@@ -19092,3 +19092,22 @@ confirmed the worker flow works on their project, including the four task-tool g
 This is local Claude acceptance evidence; it does not complete the installed-harness
 skip/required, cancellation and restoration matrix in task 6.3. The implementation and
 validation limits are included in the existing pull request's updated description.
+
+
+### CI follow-up: dispatch policy fixture without installed harness CLIs
+
+The PR's Linux and macOS jobs both failed only
+`cmd::agents::tests::assignment_planning_is_explicit_for_tracked_external_and_adhoc_work`:
+the fixture loaded real harness availability and unwrapped a refusal because Claude was
+not installed on the runners. Build, pinned-toolchain strict Clippy, contract/codegen and
+UI checks passed in CI run 41514308960.
+
+Dispatch planning now delegates from the normal project loader to the same planning code
+with a loaded project catalog. The policy fixture loads only its own role and supplies a
+deterministic availability probe, without changing PATH, global binary settings or the
+production availability checks. Both skip and required still reject an unavailable harness.
+
+Validation: all 23 cmd::agents tests passed. The exact regression also passed in a separate
+process with PATH limited to /usr/bin:/bin. Formatting, scoped diff whitespace checks and
+strict OpenSpec validation passed. The fix is submitted to the existing PR for a new CI run;
+the full installed-harness live matrix remains task 6.3.
