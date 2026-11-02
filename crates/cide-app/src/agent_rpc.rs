@@ -1996,10 +1996,14 @@ impl AgentSink for RegistrySink {
                     return Ok(OpenedSession {
                         title: format!("{} · {}", task.id, one_line(&task.title)),
                         harness: chosen,
-                        cwd: cide_git::worktree::path_of(
-                            &root,
-                            &cide_agents::session_checkout(&id.0),
-                        ),
+                        cwd: if request.worktree {
+                            cide_git::worktree::path_of(
+                                &root,
+                                &cide_agents::session_checkout(&id.0),
+                            )
+                        } else {
+                            root.clone()
+                        },
                         branch: None,
                         reused: true,
                     });
@@ -2014,18 +2018,28 @@ impl AgentSink for RegistrySink {
             ),
         };
 
+        // `worktree: false` stands the session in the project root: no checkout, no branch, and
+        // nothing to carry an OpenSpec change into (it is already there).
         let name = cide_agents::session_checkout(&key);
-        let checkout = cide_git::worktree::ensure(&root, &name).map_err(|error| {
-            format!("could not make the worktree {name} for this session: {error}")
-        })?;
+        let checkout = if request.worktree {
+            let checkout = cide_git::worktree::ensure(&root, &name).map_err(|error| {
+                format!("could not make the worktree {name} for this session: {error}")
+            })?;
+            Some((checkout.path, checkout.branch))
+        } else {
+            None
+        };
 
         // The task's OpenSpec change, if it names one, travels into the checkout with the
         // session — the same copy a dispatched run gets at its fork, for the same reason: the
         // worktree is cut from `HEAD`, and the proposal is usually uncommitted there.
-        if let Some(change) = task.as_ref().and_then(|task| task.change.as_ref()) {
+        if let (Some((checkout_path, _)), Some(change)) = (
+            checkout.as_ref(),
+            task.as_ref().and_then(|task| task.change.as_ref()),
+        ) {
             crate::cmd::spec_sessions::carry_change(
                 &root,
-                &checkout.path,
+                checkout_path,
                 change.as_str(),
                 &crate::cmd::spec_sessions::carried_dir(&root, &name),
             )
@@ -2034,7 +2048,7 @@ impl AgentSink for RegistrySink {
 
         // Spelled the way the tab's own CLI presents cide's tools.
         let tools = cide_agents::harness::for_kind(chosen);
-        let prompt = match (&request.work, task.as_ref()) {
+        let mut prompt = match (&request.work, task.as_ref()) {
             (Work::External(work), _) => {
                 crate::cmd::agents::external_prompt(work, request.instructions.as_deref(), tools)
             }
@@ -2047,6 +2061,14 @@ impl AgentSink for RegistrySink {
                     .task_start_template(),
             ),
         };
+        if checkout.is_none() {
+            // The worker paragraph in the system prompt describes a worktree; say what is true.
+            prompt = format!(
+                "Note: this session runs in the project root itself, not in a worktree — there \
+                 is no branch of your own. Ignore the worktree/branch instructions above; do not \
+                 commit unless the person asks. {prompt}"
+            );
+        }
         let unattended = cide_agents::config::load(&root).agents.unattended();
 
         let (session, _tab) = crate::claude_tab::open(
@@ -2063,7 +2085,7 @@ impl AgentSink for RegistrySink {
                     // the user is reading — the console that is telling them what it did.
                     behind: true,
                 },
-                cwd: Some(checkout.path.clone()),
+                cwd: checkout.as_ref().map(|(path, _)| path.clone()),
                 harness: Some(tab_harness),
                 model: request.model.as_deref(),
                 voice: crate::cmd::session::Voice::Worker,
@@ -2098,8 +2120,11 @@ impl AgentSink for RegistrySink {
         Ok(OpenedSession {
             title,
             harness: chosen,
-            cwd: checkout.path,
-            branch: Some(checkout.branch),
+            cwd: checkout
+                .as_ref()
+                .map(|(path, _)| path.clone())
+                .unwrap_or_else(|| root.clone()),
+            branch: checkout.map(|(_, branch)| branch),
             reused: false,
         })
     }

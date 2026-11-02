@@ -579,6 +579,8 @@ pub struct SessionRequest {
     pub model: Option<String>,
     /// One extra line on top of the work, as `cide_agent_dispatch`'s.
     pub instructions: Option<String>,
+    /// `false` opens the tab in the project root: no worktree, no branch. Default `true`.
+    pub worktree: bool,
 }
 
 /// What `cide_session_open` did. (M104)
@@ -1794,7 +1796,8 @@ pub fn description(name: &str) -> &'static str {
         }
         tool::SESSION_OPEN => {
             "Open a new tab in cide running a coding agent on **one piece of work, in a git \
-             worktree of its own** \u{2014} the road for a project **with no subagent roles** (where \
+             worktree of its own** (or, with `worktree: false`, in the project root with no \
+             worktree or branch) \u{2014} the road for a project **with no subagent roles** (where \
              this project has roles, this is refused: use cide_agent_dispatch). To implement \
              several things in parallel, call it once per piece of work: each call makes its own \
              worktree (`.cide/worktrees/task-<key>`, branch `cide/task-<key>`) and its own tab, \
@@ -2769,6 +2772,14 @@ pub fn input_schema(name: &str) -> Value {
                 "instructions": {
                     "type": "string",
                     "description": "One extra sentence on top of the work. One line.",
+                },
+                "worktree": {
+                    "type": "boolean",
+                    "description":
+                        "Default true: the session gets a git worktree and branch of its own. \
+                         false: it runs in the project root itself, with no worktree and no \
+                         branch, sharing the working tree with the user and any other session \
+                         there — concurrent edits collide, so use it for one session at a time.",
                 },
             },
         }),
@@ -6490,11 +6501,16 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
     };
 
+    let worktree = match optional_bool(arguments, "worktree") {
+        Ok(value) => value.unwrap_or(true),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
+    };
     let request = SessionRequest {
         work,
         harness,
         model,
         instructions,
+        worktree,
     };
     match sink.open_session(&request) {
         Ok(opened) if opened.reused => ToolResult::text(format!(
@@ -6517,7 +6533,7 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
             };
             ToolResult::text(format!(
                 "Opened \"{}\" in a new tab, on {}, in {}{}. Nothing waits on it. {report} \
-                 When it is done, review the branch and merge it yourself.",
+                 {}",
                 opened.title,
                 harness_wire(opened.harness),
                 opened.cwd.display(),
@@ -6526,6 +6542,12 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
                     .as_deref()
                     .map(|b| format!(" (branch `{b}`)"))
                     .unwrap_or_default(),
+                if request.worktree {
+                    "When it is done, review the branch and merge it yourself."
+                } else {
+                    "It works in the project root, so its changes are in the working tree: there \
+                     is no branch to merge."
+                },
             ))
         }
         Err(why) => ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
@@ -11567,8 +11589,12 @@ mod tests {
             Ok(OpenedSession {
                 title,
                 harness: request.harness.unwrap_or(Harness::Claude),
-                cwd: PathBuf::from(format!("/p/.cide/worktrees/task-{key}")),
-                branch: Some(format!("cide/task-{key}")),
+                cwd: if request.worktree {
+                    PathBuf::from(format!("/p/.cide/worktrees/task-{key}"))
+                } else {
+                    PathBuf::from("/p")
+                },
+                branch: request.worktree.then(|| format!("cide/task-{key}")),
                 reused: false,
             })
         }
@@ -12207,8 +12233,34 @@ mod tests {
                 harness: Some(Harness::Opencode),
                 model: Some("anthropic/claude-sonnet-5".into()),
                 instructions: None,
+                worktree: true,
             }]
         );
+    }
+
+    /// `worktree: false` runs the session in the project root: no branch, and the reply says so.
+    #[test]
+    fn a_session_can_be_opened_without_a_worktree() {
+        let fake = FakeAgents {
+            defs: vec![def("qa", "QA", "Checks.", Some("no claude"))],
+            ..roster()
+        };
+        let answer = ask(
+            tool::SESSION_OPEN,
+            json!({ "task": "t-7", "worktree": false }),
+            &fake,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        let text = text_of(&answer);
+        assert!(!text.contains("branch `"), "{text}");
+        assert!(text.contains("project root"), "{text}");
+        assert!(!fake.sessions.lock()[0].worktree);
+        let bad = ask(
+            tool::SESSION_OPEN,
+            json!({ "task": "t-7", "worktree": "no" }),
+            &fake,
+        );
+        assert!(bad.is_error);
     }
 
     /// Work that is not on the board: `title` + `brief` (+ `ref`), and one or the other only.
