@@ -37,6 +37,8 @@ import {
   commandTitle,
   metaFigure,
   rowAction,
+  APPLY_LABEL,
+  APPLY_TITLE,
   readyActs,
   rowProgress,
   blocksApply,
@@ -569,22 +571,40 @@ function ChangeRow({ row, props }: { row: SpecRow & { kind: 'change' }; props: O
             {OPEN_SESSION_LABEL}
           </Button>
         )}
-        {(action.id === 'open' || (progress.stage !== 'ready' && progress.stage !== 'archived' && !blocksApply(session))) && (
+        {/*
+          * A linked task adds *Open task* to the row; it never takes the usual actions away.
+          * The row used to swap Apply for it, so a change whose task had gone stale (session
+          * closed, task parked in doing) could only be reached through the task card.
+          */}
+        {action.id === 'open' && (
           <Button
             size="sm"
-            variant={acts.length === 0 && action.id === 'start' ? 'secondary' : 'quiet'}
-            icon={action.id === 'start' ? 'play' : undefined}
+            variant="quiet"
             data-audit="openspecRowAction"
-            data-action={action.id}
+            data-action="open"
             data-change={row.id}
             data-write="true"
-            /* The reason *is* the tooltip when there is one, and the button goes inert with it. */
             title={action.disabledReason ?? action.title}
-            disabled={action.disabledReason !== undefined || progress.stage === 'archived'}
+            disabled={action.disabledReason !== undefined}
             data-disabled={action.disabledReason === undefined ? undefined : 'true'}
-            onClick={() => props.onRowAction(row.id, action.id)}
+            onClick={() => props.onRowAction(row.id, 'open')}
           >
             {action.label}
+          </Button>
+        )}
+        {progress.stage !== 'ready' && progress.stage !== 'archived' && !blocksApply(session) && (
+          <Button
+            size="sm"
+            variant={acts.length === 0 && action.id !== 'open' ? 'secondary' : 'quiet'}
+            icon="play"
+            data-audit="openspecRowAction"
+            data-action="start"
+            data-change={row.id}
+            data-write="true"
+            title={APPLY_TITLE}
+            onClick={() => props.onRowAction(row.id, 'start')}
+          >
+            {APPLY_LABEL}
           </Button>
         )}
       </div>

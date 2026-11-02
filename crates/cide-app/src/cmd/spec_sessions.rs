@@ -533,13 +533,14 @@ pub(super) fn plan_task_proposal(
     project: ProjectId,
     task: &cide_ipc::Task,
     harness: Harness,
+    plan_mode: Option<bool>,
 ) -> Result<DispatchSpec> {
     let mut spec = plan_session(
         root,
         project,
         SpecSessionStart {
             images: None,
-            plan_mode: None,
+            plan_mode,
             op: SpecOp::Propose,
             change: None,
             text: Some(format!("{} {}", task.title, task.body)),
@@ -1079,7 +1080,8 @@ mod tests {
         )
         .unwrap();
         for harness in [Harness::Claude, Harness::Codex] {
-            let planned = plan_task_proposal(&root, project, &task, harness).expect("proposal");
+            let planned =
+                plan_task_proposal(&root, project, &task, harness, None).expect("proposal");
             assert!(
                 planned.planning.is_none(),
                 "task proposal ignores tab preferences"

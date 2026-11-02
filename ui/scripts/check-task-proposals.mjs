@@ -65,6 +65,7 @@ try {
         if (id === '\0checks') return `
           export { useTasks } from ${JSON.stringify(join(ui, 'src/sidebar/tasksStore.ts'))};
           export { openTaskSpec, approveTaskSpec } from ${JSON.stringify(join(ui, 'src/sidebar/TasksPanel/openSpec.ts'))};
+          export { useApplyDialog } from ${JSON.stringify(join(ui, 'src/sidebar/OpenSpecPanel/applyStore.ts'))};
           export { TaskDetail } from ${JSON.stringify(join(ui, 'src/sidebar/TasksPanel/TaskDetail.tsx'))};
           export { CARD_STORIES } from ${JSON.stringify(join(ui, 'src/sidebar/TasksPanel/fixture.ts'))};
           export { taskSpecSessions, taskSpecStatuses, taskSpecPhase } from ${JSON.stringify(join(ui, 'src/sidebar/TasksPanel/specSessions.ts'))};
@@ -88,7 +89,7 @@ try {
     }],
     build: { ssr: 'virtual:task-proposals', outDir: out, rollupOptions: { output: { entryFileNames: 'checks.mjs' } } },
   })
-  const { useTasks, useWorkspace, EMPTY_DRAFT, followRunTab, followSpecRuns, useSpecRuns, openTaskSpec, approveTaskSpec, TaskDetail, CARD_STORIES, taskSpecSessions, taskSpecStatuses, taskSpecPhase, openSession } = await import(pathToFileURL(join(out, 'checks.mjs')).href)
+  const { useTasks, useWorkspace, EMPTY_DRAFT, followRunTab, followSpecRuns, useSpecRuns, openTaskSpec, approveTaskSpec, useApplyDialog, TaskDetail, CARD_STORIES, taskSpecSessions, taskSpecStatuses, taskSpecPhase, openSession } = await import(pathToFileURL(join(out, 'checks.mjs')).href)
   const workspace = (active = 'project-1', mode = 'background', harness = 'codex') => { globalThis.__taskProposalChecks.consoleHarness = harness; return useWorkspace.setState({
     boot: { role: { kind: 'shell', active }, workspace: { settings: { taskProposalRunMode: mode, consoleHarness: harness } } },
   }) }
@@ -277,38 +278,11 @@ try {
       await approval
       await flush()
     })
-    assert.deepEqual(calls.apply, [['project-1', { op: 'apply', change: 'add-dark-mode', launcher: { kind: 'harness', harness: 'codex' } }]], 'one click starts Apply using the configured default harness')
-    assert.equal(useTasks.getState().selected, null, 'successful approval closes the task modal')
+    assert.equal(calls.apply.length, 0, 'approval starts no run itself: the Apply dialog asks for plan mode and launcher first')
+    assert.equal(useApplyDialog.getState().change, 'add-dark-mode', 'approval opens the Apply dialog on the change')
+    assert.equal(useTasks.getState().selected, null, 'approval closes the task modal so the dialog is not under its scrim')
     assert.equal(document.querySelector('[data-audit="taskDispatchTargets"]'), null, 'approval draws no empty target row')
-    assert.equal(listeners.size, 1, 'a queued Apply is followed until admission')
-    emit([{ run: 'apply-42', state: { state: 'running' }, session: 'apply-session' }])
-    await flush()
-    assert.equal(calls.opened.length, 1, 'explicit approval opens a tab even with background proposals enabled')
-    assert.match(calls.opened[0][1], /Apply.*add-dark-mode.*codex/)
-    assert.equal(listeners.size, 0)
-
-    reset()
-    workspace('project-1', 'background', 'claude')
-    useTasks.setState({ selected: 't-42' })
-    let finishLaunch
-    applyResult = new Promise((resolve) => { finishLaunch = resolve })
-    const pending = approveTaskSpec('project-1', 't-42', 'add-dark-mode')
-    assert.equal(useTasks.getState().selected, 't-42', 'the modal remains while launch is pending')
-    assert.equal(calls.opened.length, 0, 'no tab is opened before the launcher accepts')
-    finishLaunch('apply-42')
-    await pending
-    await flush()
-    assert.equal(calls.apply[0][1].launcher.harness, 'claude', 'Claude also follows the default setting')
-    workspace('another-project')
-    await flush()
-
-    reset()
-    useTasks.setState({ selected: 't-42' })
-    applyResult = Promise.reject(new Error('Apply workflow missing'))
-    await assert.rejects(approveTaskSpec('project-1', 't-42', 'add-dark-mode'), /Apply workflow missing/)
-    assert.equal(useTasks.getState().selected, 't-42', 'a refused launch leaves the task card open')
     assert.equal(calls.opened.length, 0)
-    assert.equal(listeners.size, 0)
   } finally {
     await act(async () => root.unmount())
     dom.window.close()

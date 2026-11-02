@@ -18996,3 +18996,21 @@ save failures and stale saves. Apply passes 67 DOM assertions. OpenSpec model,
 configuration and render checks, TypeScript, 17 focused agent tests and 14 app
 planning/session tests pass. Adapter socket tests required execution outside the
 sandbox. No paid model sessions or live desktop approval flows were exercised.
+
+## M194 — OpenSpec and tasks stop taking each other over
+
+Four fixes where a linked task replaced OpenSpec behaviour it should have left alone. Checks pass
+(`check:openspec`, `check:openspec-render`, `check:agents-render`, `contract-check`); **none of it
+was run on a display.**
+
+- The panel row keeps *Apply…* beside a linked task; *Open task* is added next to it rather than
+  replacing it (`OpenSpecPanel.tsx` `ChangeRow`; `rowAction` is unchanged for the change page).
+- The task card's closed-conversation row no longer draws Resume / Reopen / Hand it elsewhere
+  (they stranded tasks); it offers *Apply…* (`onApplyChange`). Live and archived rows are as before.
+- A change page whose change cannot be read but has a linked task says so and offers *Propose*:
+  new `task_propose` command → `plan_task_proposal` (now takes `plan_mode`), opens a run tab.
+  `SpecTab` also stopped printing `[object Object]` (`errorText`).
+- Task-card *Approve* opens the Apply dialog (with the plan-mode switch) instead of launching.
+
+Not done: the card's "Make a proposal" still types into a console via `spec_propose_for_task`;
+a change living in a role's worktree is still read from the root only, so it reads as missing.

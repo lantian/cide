@@ -1986,22 +1986,15 @@ try {
       'a conversation whose pane is gone says so rather than reading as idle',
     )
     /*
-     * **A closed conversation keeps every control**, and that is the fix rather than an
-     * oversight. Open was withheld once the pane was gone, on the reasoning that a control
-     * opening onto nothing is what this card refuses — which left a closed conversation with no
-     * way to proceed except handing the work somewhere else, throwing away everything it had
-     * already worked out.
-     *
-     * The premise was wrong. A closed conversation is not nothing: its transcript is on disk
-     * under the id cide passed to `--session-id`, and `claude --resume <id>` brings all of it
-     * back under the same id — so the task's own record of where the work went keeps naming the
-     * right conversation.
+     * A closed conversation no longer draws Resume / Reopen / Hand it elsewhere. They stranded
+     * tasks: Resume split a pane into the console tab and the other two did nothing visible. The
+     * row offers *Apply…* instead (the OpenSpec panel's own action, with its plan-mode choice),
+     * wired by `onApplyChange`, which this story does not pass.
      */
     eq(
       t('card-spec-session-closed').specSessionControls,
-      ['specSessionResume', 'specSessionOpen', 'specSessionElsewhere'],
-      'a closed conversation can still be resumed and reopened — withholding those left the ' +
-        'only road forward as starting again somewhere else',
+      [],
+      'a closed conversation offers none of the old session controls',
     )
     eq(
       t('card-spec-session').specSessionControls,
@@ -2010,16 +2003,8 @@ try {
         'pointer when a pane is closed in another window',
     )
     ok(
-      (t('card-spec-session-closed').text ?? '').includes(
-        'Resume brings the whole transcript back and hands it this task again',
-      ),
-      'and the hint says Resume restores the transcript and hands the task back',
-    )
-    ok(
-      (t('card-spec-session-closed').text ?? '').includes(
-        'Reopen brings it back without asking it for anything',
-      ),
-      'and distinguishes Reopen, which restores the conversation without dispatching work',
+      !(t('card-spec-session-closed').text ?? '').includes('Resume brings'),
+      'and the hint no longer describes buttons that are not drawn',
     )
 
     /*

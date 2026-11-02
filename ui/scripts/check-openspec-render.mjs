@@ -207,8 +207,8 @@ try {
      */
     eq(
       board.rowActions,
-      ['rework-auth|start', 'add-dark-mode|open'],
-      'a change with a task opens it; unfinished work without a task offers Apply',
+      ['rework-auth|start', 'add-dark-mode|open', 'add-dark-mode|start'],
+      'a linked task adds Open task beside Apply rather than replacing it',
     )
     /*
      * And the same board with the **task** tracker unread. (OpenSpec sessions)

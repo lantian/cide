@@ -29,7 +29,7 @@ const stores = `import { create } from 'zustand';
   export const followMilestones = () => () => {};
   export const milestoneOfTask = () => globalThis.taskNavigationCheck.milestone;
   export const useSpecRuns = create(() => ({ project: 'p', runs: [] }));
-  export const followRunTab = () => {};
+  export const followRunTab = (...args) => globalThis.taskNavigationCheck.navigate('run-tab', ...args);
   export const openSession = (project, row) => globalThis.taskNavigationCheck.navigate('workflow', row.run);
   export const startSession = async (project, request, beforeOpen) => {
     await globalThis.taskNavigationCheck.launch(); beforeOpen?.();
@@ -38,7 +38,7 @@ const stores = `import { create } from 'zustand';
 const mocks = {
   stores,
   ipc: `const f = () => globalThis.taskNavigationCheck;
-    export const tasks = { get: async (_project, id) => f().read ? f().read(id) : f().board.tasks.find(task => task.id === id),
+    export const tasks = { propose: async () => 'run-1', get: async (_project, id) => f().read ? f().read(id) : f().board.tasks.find(task => task.id === id),
       edit: async (...args) => { f().edits.push(args); return f().board }, dispatchStatus: async () => null };
     export const claudeSend = { names: async () => ({}) };
     export const file = { open: (...args) => f().navigate('file', ...args) };
@@ -47,6 +47,7 @@ const mocks = {
     export const settings = { effective: async () => ({ consoleHarness: 'codex' }) };
     export const spec = { change: async () => f().change, openTab: (...args) => f().navigate('spec', ...args),
       dispatchToSession: async () => {}, proposeForTask: async () => 'conversation' };
+    export const specSessions = { settings: async () => ({ proposePlanMode: false }) };
     export const events = {};`,
   notices: `export const notify = () => {}; export const notifyFailure = error => globalThis.taskNavigationCheck.failures.push(String(error));`,
   adapt: `export const adaptDetail = x => x; export const adaptBoard = x => x;`,
@@ -62,6 +63,7 @@ const mocks = {
     export { useTasks } from '@/sidebar/tasksStore';
     export { leaveTaskDetails } from '@/sidebar/TasksPanel/taskNavigation';
     export { approveTaskSpec } from '@/sidebar/TasksPanel/openSpec';
+    export { useApplyDialog } from '@/sidebar/OpenSpecPanel/applyStore';
     export { useAgents, useWorkspace, useSpecRuns, useMilestones } from 'navigation-check:stores';`,
 }
 let root
@@ -87,7 +89,7 @@ try {
     }],
     build: { ssr: entry, outDir: out, emptyOutDir: false, rollupOptions: { output: { entryFileNames: 'check.mjs' } } },
   })
-  const { TaskDetailHost, CARD_STORIES, WaitingPanel, useTasks, useAgents, useWorkspace, useSpecRuns, useMilestones, leaveTaskDetails, approveTaskSpec } = await import(pathToFileURL(join(out, 'check.mjs')))
+  const { TaskDetailHost, CARD_STORIES, WaitingPanel, useTasks, useAgents, useWorkspace, useSpecRuns, useMilestones, leaveTaskDetails, approveTaskSpec, useApplyDialog } = await import(pathToFileURL(join(out, 'check.mjs')))
   const agent = document.getElementById('agent')
   const commit = (fn) => act(() => flushSync(fn))
   const click = async (selector) => {
@@ -181,8 +183,12 @@ try {
     }
   }
   await configure('card-spec-session', { closedSession: true })
-  assert.equal(document.querySelector('[data-audit="specSessionOpen"]').textContent.trim(), 'Reopen')
-  await opened('[data-audit="specSessionOpen"]', 'session')
+  // A closed conversation offers Apply…, not the Resume/Reopen/Hand-it-elsewhere trio that
+  // stranded tasks.
+  for (const gone of ['specSessionOpen', 'specSessionResume', 'specSessionElsewhere']) {
+    assert.equal(document.querySelector(`[data-audit="${gone}"]`), null, `${gone} is not drawn for a closed conversation`)
+  }
+  assert.ok(document.querySelector('[data-audit="specSessionApply"]'), 'a closed conversation offers Apply…')
   for (const audit of ['taskSpecHeaderLink', 'taskOpenSpec', 'specOpenFile']) {
     await configure('card-spec-session', { nested: true })
     await opened(`[data-audit="${audit}"]`, audit === 'specOpenFile' ? 'file' : 'spec')
@@ -200,7 +206,7 @@ try {
   await configure('card-with-live-run', { milestone: true, nested: true })
   await opened('[data-audit="taskMilestone"]', 'milestone')
   await configure('card-proposal-session', { nested: true })
-  await opened('[data-audit="specProposeForTask"]', 'session')
+  await opened('[data-audit="specProposeForTask"]', 'run-tab')
   await configure('card-spec-session')
   await click('[data-audit="specSessionElsewhere"]')
   await opened('[data-audit="taskDispatchTarget"][data-kind="session"]', 'session')
@@ -245,18 +251,13 @@ try {
   assert.ok(document.querySelector('[data-audit="taskCard"]'))
   await escape()
   assert.equal(visibleModals().length, 0)
-  // Approval waits for a successful launch, then exits the entire trail before opening.
+  // Approval leaves the whole trail and opens the Apply dialog, which asks for plan mode and the
+  // launcher; it no longer launches by itself.
   await configure('card-spec-ready', { waiting: true, nested: true })
-  let releaseLaunch
-  fixture.launch = () => new Promise((resolve) => { releaseLaunch = resolve })
-  let approving
-  await act(async () => { approving = approveTaskSpec('p', fixture.task.id, fixture.task.change) })
-  assert.ok(document.querySelector('[data-audit="taskCard"]'), 'pending approval keeps the card')
-  await act(async () => releaseLaunch())
-  assert.equal(fixture.navigations[0]?.[0], 'approve')
-  assert.equal(visibleModals().length, 0)
-  await settleDestination()
-  await approving
+  await act(async () => { await approveTaskSpec('p', fixture.task.id, fixture.task.change) })
+  assert.equal(visibleModals().length, 0, 'approval exits the task trail')
+  assert.equal(useApplyDialog.getState().change, fixture.task.change, 'approval opens Apply on the linked change')
+  assert.equal(fixture.navigations.length, 0, 'approval starts no run on its own')
   await configure('card-with-live-run', { nested: true })
   await click('[data-audit="tasksOpenRun"]')
   await settleDestination(true)

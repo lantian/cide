@@ -3542,6 +3542,9 @@ export const tasks = {
   /** Create a task, and with it `.cide/tasks.json` if the project has none. */
   create: (req: TaskNew) => invoke<TaskBoard>('task_new', { req }),
   createWithProposal: (req: TaskNew) => invoke<TaskProposalCreated>('task_new_with_proposal', { req }),
+  /** Propose a change for an existing task, in a run tab; the agent links it back. */
+  propose: (project: ProjectId, task: TaskId, planMode: boolean | null) =>
+    invoke<import('./generated').RunId>('task_propose', { project, task, planMode }),
 
   /** One mutation of one task. `TaskEdit` is an enum, not a patch — see its Rust doc. */
   edit: (project: ProjectId, task: TaskId, edit: TaskEdit) =>

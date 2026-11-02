@@ -143,20 +143,12 @@ try {
   await render(tab(true))
   const approve = () => document.querySelector('[data-audit="specTabApprove"]')
   assert.equal(approve().textContent, 'Approve')
+  // Approve hands off to the Apply dialog (plan-mode switch, launcher) rather than launching: it
+  // starts nothing itself, so a double click cannot start two runs and there is no pending state.
   await act(async () => { approve().click(); approve().click(); for (let i = 0; i < 8; i++) await flush() })
-  assert.equal(calls.filter((c) => c.command === 'spec_session_start').length, 1)
-  assert.equal(approve().disabled, true)
-  await act(async () => { launch.reject(new Error('Apply could not start')); await flush() })
-  assert.equal(approve().disabled, false, 'failed approval can be retried')
-  assert.ok(M.noticeSnapshot().some((notice) => notice.text.includes('Apply could not start')))
-  launch = deferred()
-  await act(async () => { approve().click(); for (let i = 0; i < 8; i++) await flush() })
-  assert.equal(calls.filter((c) => c.command === 'spec_session_start').length, 2)
-  assert.deepEqual(calls.filter((c) => c.command === 'spec_session_start').at(-1).args.request,
-    { op: 'apply', change: 'one', launcher: { kind: 'harness', harness: 'codex' } })
-  await act(async () => { launch.resolve('apply-1'); for (let i = 0; i < 8; i++) await flush() })
-  assert.equal(opened.length, 1, 'approval presents the Apply session')
-  assert.equal(approve(), null, 'a live Apply suppresses approval before the task status event arrives')
+  assert.equal(calls.filter((c) => c.command === 'spec_session_start').length, 0, 'approval starts no run on its own')
+  assert.equal(M.useApplyDialog.getState().change, 'one', 'approval opens the Apply dialog')
+  M.useApplyDialog.getState().close()
 
   // The application receives the creation invalidation, discovers the worktree, then follows
   // its checklist instead of the still-unticked root proposal, all without remounting the tab.

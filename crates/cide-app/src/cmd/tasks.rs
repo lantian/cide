@@ -229,17 +229,18 @@ pub async fn task_new_with_proposal(
     });
     let (board, task) = create_task(&app, &state, &stores, req).await?;
     let saved = task.clone();
-    let outcome =
-        blocking(move || super::spec_sessions::plan_task_proposal(&root, project, &saved, harness))
-            .await
-            .and_then(|mut spec| {
-                if let crate::agents::RunPurpose::Spec(purpose) = &mut spec.purpose {
-                    purpose.suppress_reveal = background;
-                }
-                agents.enqueue_unique(spec).map_err(|held| {
-                    CoreError::Io(format!("run {} already holds this proposal", held.run))
-                })
-            });
+    let outcome = blocking(move || {
+        super::spec_sessions::plan_task_proposal(&root, project, &saved, harness, None)
+    })
+    .await
+    .and_then(|mut spec| {
+        if let crate::agents::RunPurpose::Spec(purpose) = &mut spec.purpose {
+            purpose.suppress_reveal = background;
+        }
+        agents
+            .enqueue_unique(spec)
+            .map_err(|held| CoreError::Io(format!("run {} already holds this proposal", held.run)))
+    });
     let (proposal, proposal_error) = match outcome {
         Ok(run) => {
             agents.mark_changed(&app, project);
@@ -254,6 +255,45 @@ pub async fn task_new_with_proposal(
         proposal,
         proposal_error,
     })
+}
+
+/// Propose an OpenSpec change for a task that already exists — the *Propose* button on a task's
+/// link to a change that is not there (the agent named a change it never wrote, or it lives in
+/// a worktree nobody has integrated). Same run as [`task_new_with_proposal`] launches for a new
+/// task, so it opens in a tab of its own and carries the plan-mode choice; the agent links the
+/// change back to the task itself.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_propose(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    stores: State<'_, Arc<TasksStores>>,
+    agents: State<'_, Arc<crate::agents::AgentRegistry>>,
+    project: ProjectId,
+    task: TaskId,
+    plan_mode: Option<bool>,
+) -> Result<cide_ipc::RunId> {
+    let root = tasks_state::project_root(&state, project)?;
+    let harness = state.with(|ws| {
+        cide_core::harness_settings::effective(ws, Some(project))
+            .console_harness
+            .harness()
+    });
+    let store = Arc::clone(&stores);
+    let found = {
+        let root = root.clone();
+        blocking(move || Ok(tracker(&store, project, root).get(&task))).await?
+    };
+    let found = found.ok_or_else(|| CoreError::Io("That task no longer exists".into()))?;
+    let spec = blocking(move || {
+        super::spec_sessions::plan_task_proposal(&root, project, &found, harness, plan_mode)
+    })
+    .await?;
+    let run = agents
+        .enqueue_unique(spec)
+        .map_err(|held| CoreError::Io(format!("run {} already holds this proposal", held.run)))?;
+    agents.mark_changed(&app, project);
+    agents.pump(&app);
+    Ok(run)
 }
 
 async fn create_task(
