@@ -190,6 +190,31 @@ export function commitWalk(): void {
 }
 
 /**
+ * A click on a row of the popup: select that entry and commit as if Ctrl had been released on it.
+ *
+ * Goes through `commitWalk` so the MRU reorder and the reconcile-on-close are the keyboard's
+ * own, not a second path. The Ctrl keyup that follows finds `walk === null` and does nothing.
+ * No listener is added here: the module keeps exactly one `keyup` latch.
+ */
+export function pickWalk(id: string): void {
+  const walk = useSwitcher.getState().walk
+  if (walk === null) return
+  const index = walk.order.indexOf(id)
+  if (index < 0) return
+  useSwitcher.setState({ walk: { ...walk, index } })
+  commitWalk()
+}
+
+/** Pointer hover on a row moves the highlight only; nothing is activated until click/release. */
+export function hoverWalk(id: string): void {
+  const walk = useSwitcher.getState().walk
+  if (walk === null) return
+  const index = walk.order.indexOf(id)
+  if (index < 0 || index === walk.index) return
+  useSwitcher.setState({ walk: { ...walk, index } })
+}
+
+/**
  * Open a walk, or switch immediately when nothing is being held.
  *
  * The one entry point both switchers go through, and the private half of the pair of exported

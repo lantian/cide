@@ -1,8 +1,9 @@
 /**
  * The popup a held-modifier switcher puts up — for projects (Ctrl+`) and for tabs (Ctrl+Tab).
  *
- * **Presentation only.** It renders `useSwitcher`'s walk and nothing else: no keyboard
- * handling, no listeners, no focus. That is deliberate and it is the reason the gesture is
+ * **Presentation, plus a pointer pick.** It renders `useSwitcher`'s walk; the only input it
+ * takes is a mouse click/hover on a row, which calls `pickWalk`/`hoverWalk` in the store. No
+ * keyboard handling, no listeners, no focus. That is deliberate and it is the reason the gesture is
  * correct in a window where this never mounts — the walk, its capture on the walk key and on
  * Escape, and the release watcher all live in `keys/switcherStore.ts`, so the worst a missing
  * popup can do is switch invisibly. A component that owned the keyup would instead open a walk
@@ -32,7 +33,7 @@
  * Beside `<Failures />` in `App.tsx`, and for the same reason that one takes no props: it
  * reads its own store and renders `null` until there is something to show.
  */
-import { useSwitcher } from '@/keys/switcherStore'
+import { useSwitcher, pickWalk, hoverWalk } from '@/keys/switcherStore'
 import { useWorkspace } from '@/store/workspace'
 import { hintFor, selection } from '@/keys/switcher'
 import type { Project, Tab } from '@/ipc/client'
@@ -80,6 +81,11 @@ export function Switcher() {
               key={id}
               className={selected ? `${styles.row} ${styles.selected}` : styles.row}
               aria-current={selected ? 'true' : undefined}
+              // preventDefault on mousedown keeps focus where it is: a focus move fires the
+              // `blur` branch of `armRelease` and would cancel the walk before the click lands.
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => hoverWalk(id)}
+              onClick={() => pickWalk(id)}
             >
               {row.dot === null ? (
                 <span className={styles.mark} aria-hidden="true">

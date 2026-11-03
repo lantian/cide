@@ -24,7 +24,9 @@
   top: 50%;
   transform: translate(-50%, -50%);
   z-index: 70;
-  pointer-events: none;
+  /* Rows are clickable (hold Ctrl, click an entry). The box is not a full-screen scrim, so
+     nothing outside it loses hover or clicks. */
+  pointer-events: auto;
 
   min-width: calc(340px * var(--ui-scale));
   max-width: min(calc(520px * var(--ui-scale)), calc(100vw - 48px));
@@ -72,6 +74,7 @@
   font-size: var(--fs-ui-13);
   color: var(--text);
   white-space: nowrap;
+  cursor: pointer;
 }
 
 /*

@@ -616,6 +616,12 @@ try {
       'and removes exactly that one',
     )
 
+    // 1c. A click on a row commits through the same `commitWalk`, with no listener of its own.
+    ok(
+      /export function pickWalk[\s\S]*?commitWalk\(\)/.test(code),
+      'pickWalk selects the row and commits through commitWalk',
+    )
+
     // 2. The release is a latch, not a third way to resolve a chord. `keys/gate.ts` resolves
     //    on keydown at two entry points that `check-key-gate.mjs` proves agree; a keyup route
     //    into the keymap would be exactly the asymmetry that check exists to catch.
