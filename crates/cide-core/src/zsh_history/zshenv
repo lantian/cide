@@ -1,0 +1,10 @@
+# Cide's ZDOTDIR shim (see shell_history.rs). Forward to the user's real .zshenv with ZDOTDIR
+# restored so their config sees the value they set, then point zsh back at the shim so it
+# still reads our .zprofile and .zshrc. Runs for every zsh, interactive or not.
+_cide_real=${_CIDE_ZSH_ORIG_ZDOTDIR:-$HOME}
+if [[ -r $_cide_real/.zshenv ]]; then
+    ZDOTDIR=$_cide_real
+    source "$_cide_real/.zshenv"
+fi
+ZDOTDIR=$_CIDE_ZSH_SHIM
+unset _cide_real

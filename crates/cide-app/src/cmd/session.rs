@@ -2499,6 +2499,28 @@ pub(crate) async fn spawn_session(
                 spec = spec.env(key, value);
             }
         }
+        if local_login_shell
+            && let Some(pane) = pane
+            && cide_core::shell_history::is_zsh(&spec.program)
+        {
+            let files = cide_core::shell_history::prepare_zsh(pane).map_err(|error| {
+                SessionError::Pty(format!("cannot prepare this panel's zsh history: {error}"))
+            })?;
+            let original_zdotdir = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "ZDOTDIR")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("ZDOTDIR").ok());
+            spec.args = cide_core::shell_history::ZSH_ARGS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            for (key, value) in files.env(original_zdotdir.as_deref()) {
+                spec = spec.env(key, value);
+            }
+        }
         // Inside the blocking closure, not outside it: the first call reads `screens.json`
         // off disk, and every Tauri command that touches a filesystem in this app does it
         // here rather than on the webview's thread.

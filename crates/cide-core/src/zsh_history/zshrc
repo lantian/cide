@@ -1,0 +1,28 @@
+# Cide's ZDOTDIR shim: run the user's .zshrc (after /etc/zshrc, which on macOS picks the shared
+# ~/.zsh_history), then select this panel's private history. Running last means a HISTFILE or
+# SHARE_HISTORY in the user's rc cannot win.
+_cide_real=${_CIDE_ZSH_ORIG_ZDOTDIR:-$HOME}
+if [[ -r $_cide_real/.zshrc ]]; then
+    ZDOTDIR=$_cide_real
+    source "$_cide_real/.zshrc"
+fi
+
+HISTFILE=$_CIDE_ZSH_HISTORY_FILE
+# Discard anything already imported from a global file: shrinking the list to zero drops it.
+_cide_size=${HISTSIZE:-1000}
+HISTSIZE=0
+HISTSIZE=$_cide_size
+[[ -z $SAVEHIST || $SAVEHIST -eq 0 ]] && SAVEHIST=$_cide_size
+fc -R "$HISTFILE"
+setopt INC_APPEND_HISTORY
+unsetopt SHARE_HISTORY
+# Nested shells must not inherit this panel's file.
+typeset +x HISTFILE
+
+# Hand the real directory back: zsh reads .zlogin from ZDOTDIR next, which is now the user's.
+if [[ $_CIDE_ZSH_ZDOTDIR_WAS_SET == 1 ]]; then
+    ZDOTDIR=$_CIDE_ZSH_ORIG_ZDOTDIR
+else
+    unset ZDOTDIR
+fi
+unset _cide_real _cide_size _CIDE_ZSH_SHIM _CIDE_ZSH_ORIG_ZDOTDIR _CIDE_ZSH_ZDOTDIR_WAS_SET _CIDE_ZSH_HISTORY_FILE

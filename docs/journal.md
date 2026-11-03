@@ -19146,3 +19146,23 @@ with worktree=false. TypeScript plus task-dispatch, agents-render, task-navigati
 OpenSpec-render UI checks passed. Formatting and scoped diff whitespace checks passed.
 The user's local tracker changes were left out of the merge commit. Full CI is rerun on
 the combined branch; the installed-harness live matrix remains task 6.3.
+
+
+## M195 — Zsh panels retain their own command history
+
+M144 isolated panel history for Bash only, so on macOS, where the login shell is `/bin/zsh`,
+every panel still shared `~/.zsh_history` (Linux panels run Bash and were fine). Local zsh
+panels now start with `ZDOTDIR` pointing at a content-addressed shim directory under the
+profile's `shell-history/`; its `.zshenv`/`.zprofile`/`.zshrc` forward to the user's real files
+(with `ZDOTDIR` restored while they run). The shim `.zshrc` runs last, so a `HISTFILE` or
+`SHARE_HISTORY` from `/etc/zshrc` or the user's rc cannot win: it selects the pane's private
+file, drops any imported list, enables `INC_APPEND_HISTORY`, disables `SHARE_HISTORY`, and
+hands `ZDOTDIR` back so `.zlogin` and nested shells are unaffected. Fish and other shells are
+unchanged.
+
+**Verified:** a real-PTY regression (`tests/zsh_history.rs`) with a user rc that selects a
+shared file and `SHARE_HISTORY`: panels do not see each other's or the global commands, the
+global file is untouched, and history survives a forced kill. Bash history tests still pass.
+
+**Not confirmed on macOS or in a running GUI:** only Linux zsh 5.x was exercised. Existing
+panels keep the shared history they had; new per-panel files start empty.

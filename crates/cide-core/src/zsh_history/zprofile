@@ -1,0 +1,8 @@
+# Cide's ZDOTDIR shim: forward to the user's real .zprofile.
+_cide_real=${_CIDE_ZSH_ORIG_ZDOTDIR:-$HOME}
+if [[ -r $_cide_real/.zprofile ]]; then
+    ZDOTDIR=$_cide_real
+    source "$_cide_real/.zprofile"
+fi
+ZDOTDIR=$_CIDE_ZSH_SHIM
+unset _cide_real
