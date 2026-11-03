@@ -568,6 +568,9 @@ pub enum Work {
     Task(TaskId),
     /// Anything else: an issue in another system, or a sentence the user typed.
     External(cide_ipc::ExternalWork),
+    /// An existing OpenSpec change to apply. Opens an OpenSpec Apply session — a run, so it
+    /// shows on the change's card in the sidebar — rather than a bare worker tab.
+    Change(String),
 }
 
 /// `cide_session_open`'s arguments, validated. (M104)
@@ -2773,6 +2776,16 @@ pub fn input_schema(name: &str) -> Value {
                     "description":
                         "With `title`: where the work is written down, e.g. `PROJ-123` or a URL. \
                          Names the worktree.",
+                },
+                "openspec_change": {
+                    "type": "string",
+                    "description":
+                        "Instead of `task`/`title`: the name of an existing OpenSpec change in \
+                         `openspec/changes/` to implement. The session is then an OpenSpec Apply \
+                         session: it appears on that change's card in the OpenSpec sidebar with \
+                         its status and an Open session button. One session per change — asking \
+                         again returns the live one. Its worktree follows the project's OpenSpec \
+                         settings, so `worktree` is ignored.",
                 },
                 "harness": {
                     "type": "string",
@@ -6506,7 +6519,19 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Ok(external) => external,
         Err(result) => return result,
     };
+    let change = match optional_string(arguments, "openspec_change") {
+        Ok(change) => change.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+        Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
+    };
+    if change.is_some() && (task.is_some() || external.is_some()) {
+        return ToolResult::error(format!(
+            "{}: `openspec_change` names the work by itself — leave out `task` and `title`/`brief`. \
+             Put anything extra in `instructions`.",
+            tool::SESSION_OPEN
+        ));
+    }
     let work = match (task, external) {
+        (None, None) if change.is_some() => Work::Change(change.unwrap_or_default()),
         (Some(task), None) => Work::Task(TaskId(task)),
         (None, Some(external)) => Work::External(external),
         (Some(_), Some(_)) => {
@@ -6574,6 +6599,10 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
                 Work::External(_) => "There is no task on this board for it: it answers in its \
                      own tab, and reports to the source if it has a tool that reaches it."
                     .to_string(),
+                Work::Change(change) => format!(
+                    "It is applying OpenSpec change `{change}`, and shows on that change's card in \
+                     the OpenSpec sidebar."
+                ),
             };
             ToolResult::text(format!(
                 "Opened \"{}\" in a new tab, on {}, in {}{}. Nothing waits on it. {report} \
@@ -11648,6 +11677,7 @@ mod tests {
             let (title, key) = match &request.work {
                 Work::Task(task) => (format!("{task} · Fix it"), task.0.clone()),
                 Work::External(work) => (work.title.clone(), work.title.to_lowercase()),
+                Work::Change(change) => (format!("OpenSpec · {change}"), format!("spec-{change}")),
             };
             Ok(OpenedSession {
                 planning_policy: request.planning.unwrap_or_default(),
@@ -12373,6 +12403,30 @@ mod tests {
             &fake,
         );
         assert!(bad.is_error);
+    }
+
+    /// `openspec_change` names the work by itself and refuses to be mixed with a task.
+    #[test]
+    fn a_session_can_apply_an_openspec_change() {
+        let sink = FakeAgents::broken("subagents are off for this project");
+        let answer = ask(
+            tool::SESSION_OPEN,
+            json!({ "openspec_change": "add-notifications", "instructions": "go" }),
+            &sink,
+        );
+        assert!(!answer.is_error, "{}", text_of(&answer));
+        assert!(text_of(&answer).contains("add-notifications"));
+        assert_eq!(
+            sink.sessions.lock()[0].work,
+            Work::Change("add-notifications".into())
+        );
+        let mixed = ask(
+            tool::SESSION_OPEN,
+            json!({ "openspec_change": "add-notifications", "task": "t-7" }),
+            &sink,
+        );
+        assert!(mixed.is_error);
+        assert_eq!(sink.sessions.lock().len(), 1);
     }
 
     /// Work that is not on the board: `title` + `brief` (+ `ref`), and one or the other only.

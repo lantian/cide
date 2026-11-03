@@ -140,7 +140,7 @@ pub async fn spec_session_start(
 
 /// Both gestures enter here. Status synchronization writes straight to the store and broadcasts
 /// once, rather than passing through task_triggers and reflecting into a second Apply.
-fn start_session(
+pub(crate) fn start_session(
     app: &AppHandle,
     registry: &Arc<AgentRegistry>,
     root: &Path,

@@ -836,7 +836,9 @@ const SESSIONS_PARAGRAPH: &str = "This project in cide has no subagent roles to 
      find with `mcp__cide__cide_task_list`), or anything else, such as an issue you read from \
      another system through its own tools, as `title` + a one-line `brief` (+ `ref`). \
      `harness` picks the CLI for that tab (claude, codex or opencode) when the user asks for \
-     one. `worktree: false` runs it in the project root instead, with no branch of its own \
+     one. To implement an existing OpenSpec change, pass `openspec_change` (its name in \
+     `openspec/changes/`) instead: the session then shows on that change's card in the OpenSpec \
+     sidebar. `worktree: false` runs it in the project root instead, with no branch of its own \
      (use it for one session at a time). Each session commits on its own branch and, for a board task, sets it to review when \
      done; you review the branch and merge it with git.";
 
@@ -847,7 +849,9 @@ const SESSIONS_PARAGRAPH_NO_TRACKER: &str = "This project in cide has no subagen
      piece of work, in a git worktree and branch of its own, and returns at once. Call it once \
      per piece of work, as `title` + a one-line `brief` (+ `ref` when the work is written down \
      elsewhere, such as an issue you read through another system's tools). `harness` picks the \
-     CLI for that tab (claude, codex or opencode) when the user asks for one. Each session \
+     CLI for that tab (claude, codex or opencode) when the user asks for one. To implement an \
+     existing OpenSpec change, pass `openspec_change` (its name in `openspec/changes/`) instead: \
+     the session then shows on that change's card in the OpenSpec sidebar. Each session \
      commits on its own branch; you review the branch and merge it with git.";
 
 fn sessions_paragraph(tracker: bool, agent_sessions_enabled: bool) -> &'static str {

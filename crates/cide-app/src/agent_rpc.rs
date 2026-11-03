@@ -1976,6 +1976,53 @@ impl AgentSink for RegistrySink {
             }
         };
 
+        // An OpenSpec change is not a tab but a run — the sidebar card is built from registry
+        // runs (`spec_runs`), and a `claude_tab::open` tab is never one — so it goes through the
+        // same Apply path the panel's own button takes. The result is a mirror tab on that run,
+        // on the change's card, persisted with it.
+        if let Work::Change(change) = &request.work {
+            let reused = self
+                .app
+                .try_state::<Arc<AgentRegistry>>()
+                .and_then(|registry| registry.change_holding(self.project, change))
+                .is_some();
+            let registry = self
+                .app
+                .try_state::<Arc<AgentRegistry>>()
+                .map(|registry| Arc::clone(&registry))
+                .ok_or_else(|| gone().to_string())?;
+            crate::cmd::spec_sessions::start_session(
+                &self.app,
+                &registry,
+                &root,
+                self.project,
+                cide_ipc::SpecSessionStart {
+                    images: None,
+                    plan_mode: None,
+                    op: cide_ipc::SpecOp::Apply,
+                    change: Some(cide_ipc::ChangeName(change.clone())),
+                    text: request.instructions.clone(),
+                    launcher: cide_ipc::SpecLauncher::Harness { harness: chosen },
+                },
+                TaskAuthor::Orchestrator,
+            )
+            .map_err(|error| error.to_string())?;
+            let in_worktree = cide_agents::config::load_spec_settings(&root).apply_in_worktree;
+            let name = crate::cmd::spec_sessions::checkout_for(change);
+            return Ok(OpenedSession {
+                planning_policy: request.planning.unwrap_or_default(),
+                title: format!("OpenSpec · {change}"),
+                harness: chosen,
+                cwd: if in_worktree {
+                    cide_git::worktree::path_of(&root, &name)
+                } else {
+                    root.clone()
+                },
+                branch: in_worktree.then(|| format!("cide/{name}")),
+                reused,
+            });
+        }
+
         // The work: a task on the board, checked by the rules a dispatch applies, or something
         // from elsewhere. The key names the checkout, so asking twice lands in the same one.
         let store = self
@@ -2028,6 +2075,7 @@ impl AgentSink for RegistrySink {
                 cide_agents::external_key(work).to_string(),
                 one_line(&work.title),
             ),
+            Work::Change(_) => unreachable!("returned above"),
         };
 
         // `worktree: false` stands the session in the project root: no checkout, no branch, and
@@ -2064,6 +2112,7 @@ impl AgentSink for RegistrySink {
             (Work::External(work), _) => {
                 crate::cmd::agents::external_prompt(work, request.instructions.as_deref(), tools)
             }
+            (Work::Change(_), _) => unreachable!("returned above"),
             (Work::Task(_), task) => crate::cmd::agents::opening_prompt(
                 task,
                 request.instructions.as_deref(),
