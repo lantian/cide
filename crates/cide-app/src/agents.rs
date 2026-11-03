@@ -11335,6 +11335,19 @@ fn type_opening_line(
     type_line(app, session, pty, bytes, Some(Box::new(on_stuck)));
 }
 
+/// [`type_submitted_line`] for a tab cide opened with a prompt that a person may be watching:
+/// the same confirm-and-repeat-Enter as [`type_opening_line`], but giving up silently. The tab
+/// is the person's, so there is no run to fail; a prompt that never submits stays in the
+/// composer for them to send, which is the best that can be done after three more Enters.
+pub(crate) fn type_opening_line_soft(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &Arc<PtySession>,
+    bytes: Vec<u8>,
+) {
+    type_line(app, session, pty, bytes, Some(Box::new(|| {})));
+}
+
 /// How many times a run is put back on the queue for an opening that never took before it is
 /// failed instead. See [`AgentRegistry::abandon_unsubmitted`].
 const OPENING_REQUEUES: u8 = 2;
@@ -11497,7 +11510,11 @@ fn type_line(
             };
             let deadline = Instant::now() + ENTER_BOOT_DEADLINE;
             while Instant::now() < deadline {
-                if state_of() != Some(SessionState::Spawning) || booted() {
+                // No hook server to ask is not "up": only a reported state past `Spawning`
+                // releases the Enter, or an Enter would go out 250 ms after spawn.
+                if matches!(state_of(), Some(state) if state != SessionState::Spawning)
+                    || booted()
+                {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));

@@ -453,7 +453,7 @@ pub(crate) fn open_continuing(
         // Never a plain write: the TUI detects pastes *by length*, so a prompt this long arriving
         // with its `\r` in the same `read` lands in the composer unsubmitted. This writes the
         // text now and the Enter alone once the child has reported in.
-        crate::agents::type_submitted_line(app, session, &pty, bytes);
+        crate::agents::type_opening_line_soft(app, session, &pty, bytes);
     }
 
     Ok((session, tab))

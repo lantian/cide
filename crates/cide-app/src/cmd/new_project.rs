@@ -517,7 +517,7 @@ fn brief_live_console(
         return;
     };
     if let Some(bytes) = crate::agent_rpc::submit(&line) {
-        crate::agents::type_submitted_line(app, session, &pty, bytes);
+        crate::agents::type_opening_line_soft(app, session, &pty, bytes);
     }
 }
 
