@@ -272,9 +272,13 @@ export function ConfirmDestructive({ state, onCancel, onConfirm, busy = false, e
   // Cancel is the default unless the caller explicitly chooses confirm.
   const confirmDefault = state.defaultButton === 'confirm'
 
+  // `busy` is a dependency because a disabled button silently refuses focus: Archive opens in a
+  // `preparing` phase with the run button disabled, so a mount-only focus() was a no-op, focus
+  // stayed on the sidebar button that opened the dialog, and Enter never reached the dialog.
+  // Re-running when `busy` clears moves focus once the default button is actually enabled.
   useEffect(() => {
     ;(confirmDefault ? confirmBtn : cancel).current?.focus()
-  }, [confirmDefault])
+  }, [confirmDefault, busy])
 
   const onKeyDown = (ev: React.KeyboardEvent) => {
     if (ev.key === 'Escape') {
