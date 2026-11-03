@@ -2136,6 +2136,20 @@ pub(crate) async fn spawn_session(
                         == Some(Voice::Worker)
                 })
         });
+    // A tab cide opened for a planner or reviewer (`Voice::Acting`) is as unattended as a
+    // worker's: it is told to read its task, comment and move it, and every one of those was a
+    // permission prompt on each fresh tab — "don't ask again" is stored per working directory,
+    // so a new checkout never inherited it. The same four task tools are granted to it; the
+    // product owner's own console (`ProductOwner`) and a plain pane stay at the CLI's default.
+    let acting = voice == Some(Voice::Acting)
+        || project.is_some_and(|project| {
+            app.state::<crate::workspace_state::WorkspaceState>()
+                .with(|ws| {
+                    pane.and_then(|pane| restored_pane_voice(ws, project, pane))
+                        .or_else(|| resume.and_then(|session| restored_voice(ws, project, session)))
+                        == Some(Voice::Acting)
+                })
+        });
     if is_console && let Some(agents) = app.try_state::<crate::agent_rpc::AgentRpcServer>() {
         spec = spec.env(
             "CIDE_AGENT_SOCK",
@@ -2143,7 +2157,7 @@ pub(crate) async fn spawn_session(
         );
         // Codex's server is already in its argv, as `-c mcp_servers.cide.*` — `codex_console_argv`.
         if is_claude {
-            spec = with_task_tools(spec, &plan.inject, worker, agent_mcp_config);
+            spec = with_task_tools(spec, &plan.inject, worker || acting, agent_mcp_config);
         }
     }
 

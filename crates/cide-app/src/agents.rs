@@ -11512,8 +11512,7 @@ fn type_line(
             while Instant::now() < deadline {
                 // No hook server to ask is not "up": only a reported state past `Spawning`
                 // releases the Enter, or an Enter would go out 250 ms after spawn.
-                if matches!(state_of(), Some(state) if state != SessionState::Spawning)
-                    || booted()
+                if matches!(state_of(), Some(state) if state != SessionState::Spawning) || booted()
                 {
                     break;
                 }
