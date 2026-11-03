@@ -6520,7 +6520,9 @@ fn session_open(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
         Err(result) => return result,
     };
     let change = match optional_string(arguments, "openspec_change") {
-        Ok(change) => change.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+        Ok(change) => change
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty()),
         Err(why) => return ToolResult::error(format!("{}: {why}", tool::SESSION_OPEN)),
     };
     if change.is_some() && (task.is_some() || external.is_some()) {
