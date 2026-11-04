@@ -1304,6 +1304,9 @@ pub async fn spec_change_plan(
 ///
 /// Everything else is `spec_accept`'s: the plan is re-run rather than trusted from a preview,
 /// because a preview can be minutes old and an agent can tick a box inside them.
+// Eight: `retire` is the one the preview's consent adds, and a Tauri command takes its state as
+// separate parameters, so there is nothing to fold it into (`lsp.rs` allows the same).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(rename_all = "camelCase")]
 pub async fn spec_change_archive(
     app: AppHandle,
@@ -1313,8 +1316,12 @@ pub async fn spec_change_archive(
     project: ProjectId,
     change: ChangeName,
     expected_root: PathBuf,
+    // The person ticked "Retire capabilities". Only then is `retire_capabilities: true` written
+    // into the change; cide never declares it on its own (see `cide_spec::retire`).
+    retire: Option<bool>,
 ) -> Result<cide_ipc::SpecAccepted> {
     use cide_ipc::SpecAccepted;
+    let retire = retire.unwrap_or(false);
     let root = tasks_state::project_root(&state, project)?;
     let store = stores.ensure(project, &root);
     let reader = boards.project(project);
@@ -1328,6 +1335,17 @@ pub async fn spec_change_archive(
             let mut plan = plan_change(&dir, &change).map_err(|e| e.to_string())?;
             add_linked_refusals(&root, &store, &change, &mut plan);
             if !plan.refusals.is_empty() { return Ok(SpecAccepted::Refused { plan }); }
+            let retiring = plan.specs_touched.iter().any(|touch| touch.retires);
+            if retire && !retiring {
+                return Err("Nothing in this change retires a capability any more. Review a fresh preview.".into());
+            }
+            if retiring && !plan.retire_declared {
+                if !retire {
+                    return Err("This change removes every requirement of a capability, which retires it. Tick \"Retire capabilities\" in the preview to archive.".into());
+                }
+                cide_spec::retire::declare_retire(&dir.join("openspec/changes").join(change.as_str()))
+                    .map_err(|e| format!("could not write retire_capabilities to .openspec.yaml: {e}"))?;
+            }
             // Queueing and fresh validation can take seconds; recheck immediately before writing.
             let current = super::spec_sessions::archive_dir(&root, &change.0);
             if current.canonicalize().unwrap_or(current) != expected_root.canonicalize().unwrap_or_else(|_| expected_root.clone()) {
@@ -1440,6 +1458,7 @@ fn plan_detail(
             spec: delta.spec.clone(),
             operation: delta.operation,
             requirements: delta.requirements.len() as u32,
+            retires: retires_capability(root, &detail.deltas, delta),
         })
         .collect();
 
@@ -1471,6 +1490,8 @@ fn plan_detail(
         );
     }
 
+    let retire_declared =
+        cide_spec::retire::retire_declared(&root.join("openspec/changes").join(change.as_str()));
     SpecAcceptPlan {
         archive_root: root.to_path_buf(),
         change,
@@ -1480,7 +1501,37 @@ fn plan_detail(
         total_tasks: detail.progress.total,
         specs_touched,
         refusals,
+        retire_declared,
     }
+}
+
+/// Would this REMOVED delta take the capability's last requirement?
+///
+/// True when every requirement the spec has today is named by this delta and no other delta of
+/// the change adds, modifies or renames into the same spec. A capability with no spec file yet
+/// has nothing to retire. Names compare trimmed and exact, the archive's own matching.
+fn retires_capability(
+    root: &std::path::Path,
+    deltas: &[cide_ipc::SpecDelta],
+    delta: &cide_ipc::SpecDelta,
+) -> bool {
+    if delta.operation != cide_ipc::DeltaOperation::Removed {
+        return false;
+    }
+    let current = cide_spec::retire::spec_requirements(root, delta.spec.as_str());
+    if current.is_empty() {
+        return false;
+    }
+    let refills = deltas.iter().any(|other| {
+        other.spec == delta.spec && other.operation != cide_ipc::DeltaOperation::Removed
+    });
+    !refills
+        && current.iter().all(|name| {
+            delta
+                .requirements
+                .iter()
+                .any(|removed| removed.name.trim() == name.trim())
+        })
 }
 
 /* ==============================================================================================
@@ -1862,6 +1913,73 @@ fn respell(root: &std::path::Path, line: String, dollar: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn removed(spec: &str, names: &[&str]) -> cide_ipc::SpecDelta {
+        delta(spec, cide_ipc::DeltaOperation::Removed, names)
+    }
+    fn delta(
+        spec: &str,
+        operation: cide_ipc::DeltaOperation,
+        names: &[&str],
+    ) -> cide_ipc::SpecDelta {
+        cide_ipc::SpecDelta {
+            spec: cide_ipc::SpecId(spec.into()),
+            operation,
+            description: String::new(),
+            requirements: names
+                .iter()
+                .map(|name| cide_ipc::SpecRequirement {
+                    name: (*name).into(),
+                    text: String::new(),
+                    scenarios: Vec::new(),
+                    block: String::new(),
+                })
+                .collect(),
+            rename: None,
+        }
+    }
+
+    /// Removing every requirement a capability has retires it; removing some, or removing all
+    /// while the same change adds one back, does not. The CLI fails an emptied spec archive
+    /// without `retire_capabilities`, so a missed `true` here is the failure the preview exists
+    /// to prevent and a spurious one is a needless checkbox.
+    #[test]
+    fn removing_the_last_requirements_retires_the_capability() {
+        let root = std::env::temp_dir().join(format!("cide-retires-{}", std::process::id()));
+        let spec = root.join("openspec/specs/flows/spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &spec,
+            "# flows\n\n## Requirements\n\n### Requirement: One\nbody\n\n### Requirement: Two\nbody\n",
+        )
+        .expect("write");
+
+        let all = removed("flows", &["One", "Two"]);
+        assert!(super::retires_capability(
+            &root,
+            std::slice::from_ref(&all),
+            &all
+        ));
+        let some = removed("flows", &["One"]);
+        assert!(!super::retires_capability(
+            &root,
+            std::slice::from_ref(&some),
+            &some
+        ));
+        let refill = delta("flows", cide_ipc::DeltaOperation::Added, &["Three"]);
+        assert!(!super::retires_capability(
+            &root,
+            &[all.clone(), refill],
+            &all
+        ));
+        let unknown = removed("nothing-here", &["One"]);
+        assert!(!super::retires_capability(
+            &root,
+            std::slice::from_ref(&unknown),
+            &unknown
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// (M93) A codex console is told to follow the skill's file, with the command's input; a
     /// Claude console's line, and any line that is not a command, pass through untouched.
     #[test]

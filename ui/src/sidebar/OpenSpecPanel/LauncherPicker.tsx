@@ -17,7 +17,7 @@ import { Segmented } from '@/kit/components/Choice'
 import { settings, specSessions } from '@/ipc/client'
 import type { GitLabReviewHarness, Harness, SpecLauncher } from '@/ipc/generated'
 import { useAgents } from '../agentsStore'
-import { notifyFailure } from '@/chrome/notices'
+import { describe, notifyFailure } from '@/chrome/notices'
 import { HARNESS_NAME } from './model'
 
 export type LauncherMode = 'main' | 'role'
@@ -55,7 +55,7 @@ function useHarnesses(): { list: GitLabReviewHarness[] | null; error: string | n
     let alive = true
     specSessions.harnesses().then(
       (next) => alive && setList(next),
-      (e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)),
+      (e: unknown) => alive && setError(describe(e)),
     )
     return () => {
       alive = false

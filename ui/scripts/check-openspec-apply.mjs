@@ -38,7 +38,8 @@ const mocks = {
     window.applyCheck.launches.push({ project, request });
     return window.applyCheck.launch();
   }`,
-  notices: `export function notifyFailure(error) { window.applyCheck.failures.push(String(error)); }`,
+  notices: `export const describe = (error) => String(error);
+  export function notifyFailure(error) { window.applyCheck.failures.push(String(error)); }`,
 }
 
 let checks = 0

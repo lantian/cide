@@ -5,4 +5,10 @@ import type { SpecId } from "./SpecId";
 /**
  * One capability an archive would change.
  */
-export type SpecTouch = { spec: SpecId, operation: DeltaOperation, requirements: number, };
+export type SpecTouch = { spec: SpecId, operation: DeltaOperation, requirements: number, 
+/**
+ * This change's REMOVED requirements are all that is left of the capability, so archiving
+ * deletes `openspec/specs/<spec>/spec.md` ("retires" it). The CLI refuses that unless the
+ * change declares `retire_capabilities: true` — see `cide_spec::retire`.
+ */
+retires: boolean, };

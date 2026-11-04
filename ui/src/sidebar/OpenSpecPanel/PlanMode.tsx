@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { describe } from '@/chrome/notices'
 import { FormRow } from '@/kit/components/Field'
 import { Switch } from '@/kit/components/Choice'
 import { specSessions, type ProjectId } from '@/ipc/client'
@@ -29,7 +30,7 @@ export function usePlanMode(project: ProjectId | null, op: keyof typeof fields, 
       setLoaded(key)
       setReady(true)
     }, (e: unknown) => {
-      if (mine === generation.current) setError(String(e))
+      if (mine === generation.current) setError(describe(e))
     })
     return () => { generation.current++ }
   }, [project, op, open, key])
@@ -46,7 +47,7 @@ export function usePlanMode(project: ProjectId | null, op: keyof typeof fields, 
         setReady(true)
       }, (e: unknown) => {
         if (mine !== generation.current) return
-        setError(String(e))
+        setError(describe(e))
         setReady(true)
       })
     },

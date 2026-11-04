@@ -30,4 +30,9 @@ specsTouched: Array<SpecTouch>,
  * Empty means the gesture will go through. Non-empty is the list of sentences to draw
  * instead of the button, each naming what to do next.
  */
-refusals: Array<string>, archiveRoot: string, };
+refusals: Array<string>, 
+/**
+ * The change's `.openspec.yaml` already says `retire_capabilities: true`, so a retiring
+ * touch needs no further consent. Meaningful only when some touch `retires`.
+ */
+retireDeclared: boolean, archiveRoot: string, };

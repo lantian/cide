@@ -252,6 +252,12 @@ export interface ConfirmState {
 
 export interface ConfirmDestructiveProps {
   busy?: boolean
+  /**
+   * The run button is not available yet because the person has not answered something the dialog
+   * asks (Archive's *Retire capabilities* box). Not `busy`: nothing is running, and `aria-busy`
+   * would tell a screen reader otherwise.
+   */
+  confirmDisabled?: boolean
   error?: string | null
   virtualizeFiles?: boolean
   state: ConfirmState
@@ -260,7 +266,7 @@ export interface ConfirmDestructiveProps {
   onConfirm: () => void
 }
 
-export function ConfirmDestructive({ state, onCancel, onConfirm, busy = false, error, virtualizeFiles = false }: ConfirmDestructiveProps) {
+export function ConfirmDestructive({ state, onCancel, onConfirm, busy = false, confirmDisabled = false, error, virtualizeFiles = false }: ConfirmDestructiveProps) {
   const cancel = useRef<HTMLButtonElement>(null)
   const confirmBtn = useRef<HTMLButtonElement>(null)
   // Native `<input type="radio">`s group by `name`, and a fixed string would make two dialogs
@@ -278,7 +284,7 @@ export function ConfirmDestructive({ state, onCancel, onConfirm, busy = false, e
   // Re-running when `busy` clears moves focus once the default button is actually enabled.
   useEffect(() => {
     ;(confirmDefault ? confirmBtn : cancel).current?.focus()
-  }, [confirmDefault, busy])
+  }, [confirmDefault, busy, confirmDisabled])
 
   const onKeyDown = (ev: React.KeyboardEvent) => {
     if (ev.key === 'Escape') {
@@ -337,7 +343,7 @@ export function ConfirmDestructive({ state, onCancel, onConfirm, busy = false, e
       ref={confirmBtn}
       variant={danger ? 'danger' : confirmDefault ? 'primary' : 'secondary'}
       data-audit="confirmDestructiveRun"
-      disabled={busy}
+      disabled={busy || confirmDisabled}
       aria-busy={busy || undefined}
       onClick={onConfirm}
     >

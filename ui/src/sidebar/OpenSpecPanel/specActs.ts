@@ -17,7 +17,7 @@ import {
   specSessions,
   type ProjectId,
 } from '@/ipc/client'
-import { notify, notifyFailure, type NoticeAction } from '@/chrome/notices'
+import { describe, notify, notifyFailure, type NoticeAction } from '@/chrome/notices'
 import type { SpecAcceptPlan } from '@/ipc/generated'
 import type { ReadyAct } from './model'
 import { startSession, useSpecRuns } from './specRuns'
@@ -28,6 +28,8 @@ export interface ArchiveConfirmation {
   phase: 'preparing' | 'ready' | 'archiving' | 'failed'
   plan: SpecAcceptPlan | null
   error: string | null
+  /** The person ticked *Retire capabilities*; sent as consent to write `retire_capabilities`. */
+  retire: boolean
 }
 interface ConfirmStore {
   confirming: ArchiveConfirmation | null
@@ -42,7 +44,8 @@ export const useSpecConfirm = create<ConfirmStore>((set) => ({
 // Persists after dismissing the dialog, so another surface cannot submit the same operation.
 const archiving = new Map<string, ArchiveConfirmation>()
 const archiveKey = (project: ProjectId, change: string) => `${project}:${change}`
-const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error)
+// A rejected Rust command is `{kind, detail}`, not an `Error`; `String()` of it is `[object Object]`.
+const messageOf = describe
 
 export function runReadyAct(project: ProjectId, change: string, act: ReadyAct['id']): void {
   if (act === 'archive') archiveChange(project, change)
@@ -56,7 +59,7 @@ export function archiveChange(project: ProjectId, change: string, force = false)
   if (running) { useSpecConfirm.getState().set(running); return }
   const current = useSpecConfirm.getState().confirming
   if (current?.project === project && current.change === change && current.phase === 'preparing') return
-  const state: ArchiveConfirmation = { project, change, phase: 'preparing', plan: null, error: null }
+  const state: ArchiveConfirmation = { project, change, phase: 'preparing', plan: null, error: null, retire: false }
   useSpecConfirm.getState().set(state)
   void specApi.changePlan(project, change as never, force).then((plan) => {
     if (useSpecConfirm.getState().confirming !== state) return
@@ -67,12 +70,17 @@ export function archiveChange(project: ProjectId, change: string, force = false)
   })
 }
 
+/** Some capability would be deleted and the change has not declared it: ask first. */
+export const needsRetireConsent = (c: ArchiveConfirmation): boolean =>
+  c.plan !== null && !c.plan.retireDeclared && c.plan.specsTouched.some((touch) => touch.retires)
+
 /** A retry prepares a fresh preview; it never repeats a mutation automatically. */
 export async function confirmArchive(): Promise<void> {
   const current = useSpecConfirm.getState().confirming
   if (!current) return
   if (current.phase === 'failed') { archiveChange(current.project, current.change, true); return }
   if (current.phase !== 'ready' || !current.plan) return
+  if (needsRetireConsent(current) && !current.retire) return
   const { project, change, plan } = current
   const key = archiveKey(project, change)
   if (archiving.has(key)) return
@@ -80,7 +88,7 @@ export async function confirmArchive(): Promise<void> {
   archiving.set(key, running)
   useSpecConfirm.getState().set(running)
   try {
-    const outcome = await specApi.archiveChange(project, change as never, plan.archiveRoot)
+    const outcome = await specApi.archiveChange(project, change as never, plan.archiveRoot, current.retire)
     switch (outcome.kind) {
       case 'accepted':
         if (useSpecConfirm.getState().confirming === running) useSpecConfirm.getState().set(null)
@@ -191,7 +199,7 @@ export function integrateChange(project: ProjectId, change: string): void {
     .catch((error: unknown) => {
       notify(`${change} could not be integrated.`, {
         kind: 'error',
-        detail: error instanceof Error ? error.message : String(error),
+        detail: describe(error),
         actions: [resolveAction(project, change)],
       })
     })

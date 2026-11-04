@@ -229,6 +229,16 @@ pub fn names(text: &str, operation: &str) -> Vec<String> {
     found
 }
 
+/// Every requirement header in a file, whatever section it sits in, in document order.
+///
+/// For a *main* spec (`openspec/specs/<cap>/spec.md`), which has one `## Requirements` section
+/// and is asked "how many requirements does this capability still have?" — the number that
+/// decides whether a change's REMOVED deltas would empty it and so retire it. Fenced `###` lines
+/// are not counted, for [`fence_mask`]'s reason.
+pub fn all_names(text: &str) -> Vec<String> {
+    lines_of(text).iter().filter_map(requirement_name).collect()
+}
+
 /// Every block and its operation, located in one pass. Duplicate names remain present so
 /// callers can reject ambiguity instead of silently choosing one of the blocks.
 pub fn blocks(text: &str) -> Vec<(String, String, Block)> {

@@ -42,7 +42,7 @@ window.__TAURI_INTERNALS__ = {
 const board = { kind: 'ready', root: '/repo', changes: [], specs: [], commands: [] }
 const snapshot = { revision: 1, board }
 const change = (name = 'one') => ({ name, title: name, deltas: [], artifacts: [], progress: { completed: 1, total: 1, tasks: [] }, validation: { valid: true, issues: [] }, origin: { kind: 'active' } })
-const preview = { archiveRoot: '/repo', change: 'one', branch: null, refusals: [], specsTouched: [] }
+const preview = { archiveRoot: '/repo', change: 'one', branch: null, refusals: [], retireDeclared: false, specsTouched: [] }
 let root
 try {
   execFileSync('node', ['node_modules/vite/bin/vite.js', 'build', '--ssr', 'src/sidebar/OpenSpecPanel/PerformanceSmokeEntry.tsx', '--outDir', out, '--logLevel', 'error'], { cwd: UI, stdio: 'inherit' })
@@ -268,7 +268,7 @@ try {
   assert.equal(M.useSpecConfirm.getState().confirming.phase, 'failed')
 
   // Thousands of archive paths share the same measured-list bound.
-  M.useSpecConfirm.getState().set({ project: 'p', change: 'one', phase: 'ready', error: null, plan: { ...preview, specsTouched: Array.from({ length: 5000 }, (_, i) => ({ spec: `cap-${i}`, requirements: 2, operation: 'added' })) } })
+  M.useSpecConfirm.getState().set({ project: 'p', change: 'one', phase: 'ready', error: null, plan: { ...preview, specsTouched: Array.from({ length: 5000 }, (_, i) => ({ spec: `cap-${i}`, requirements: 2, operation: 'added', retires: false })) } })
   await render(React.createElement(M.SpecActsConfirm))
   assert.ok(document.querySelectorAll('[data-index]').length < 100)
   await render(null)

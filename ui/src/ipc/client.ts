@@ -4892,8 +4892,8 @@ export const spec = {
   changePlan: (project: ProjectId, change: ChangeName, force = false) =>
     invoke<SpecAcceptPlan>('spec_change_plan', { project, change, force }),
 
-  archiveChange: (project: ProjectId, change: ChangeName, expectedRoot: string) =>
-    invoke<SpecAccepted>('spec_change_archive', { project, change, expectedRoot }),
+  archiveChange: (project: ProjectId, change: ChangeName, expectedRoot: string, retire = false) =>
+    invoke<SpecAccepted>('spec_change_archive', { project, change, expectedRoot, retire }),
 
   /**
    * Open a change or a capability as a workspace tab, or activate the one it already has.

@@ -551,6 +551,9 @@ pub struct SpecAcceptPlan {
     /// Empty means the gesture will go through. Non-empty is the list of sentences to draw
     /// instead of the button, each naming what to do next.
     pub refusals: Vec<String>,
+    /// The change's `.openspec.yaml` already says `retire_capabilities: true`, so a retiring
+    /// touch needs no further consent. Meaningful only when some touch `retires`.
+    pub retire_declared: bool,
     // Checkout in which the archive will actually be written.
     #[ts(type = "string")]
     pub archive_root: PathBuf,
@@ -564,6 +567,10 @@ pub struct SpecTouch {
     pub spec: SpecId,
     pub operation: DeltaOperation,
     pub requirements: u32,
+    /// This change's REMOVED requirements are all that is left of the capability, so archiving
+    /// deletes `openspec/specs/<spec>/spec.md` ("retires" it). The CLI refuses that unless the
+    /// change declares `retire_capabilities: true` — see `cide_spec::retire`.
+    pub retires: bool,
 }
 
 /// What accepting actually did.
