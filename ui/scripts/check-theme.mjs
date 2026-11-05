@@ -855,6 +855,10 @@ try {
   const rowHeights = [
     ['src/sidebar/FileTree.tsx', /const ROW_HEIGHT = (\d+)/],
     ['src/sidebar/SearchPanel.tsx', /const ROW_HEIGHT = (\d+)/],
+    // What the git tree's virtualizer places rows by. Its `.row` is read below, and the two have
+    // to agree: the design number in CSS and this one drifting apart would space rows by one
+    // height and draw them at another.
+    ['src/sidebar/GitPanel/model.ts', /const ROW_HEIGHT = (\d+)/],
   ].map(([file, re]) => [file, Number(re.exec(readFileSync(file, 'utf8'))?.[1])])
   const gitRow = leafRules(readFileSync('src/sidebar/GitPanel/ChangesTree.module.css', 'utf8'))
     .find((r) => parts(r.selector).includes('.row'))

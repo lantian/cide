@@ -35,6 +35,7 @@ import { memo, useCallback } from 'react'
 import type { FileDiff, ProjectId, RepoId } from '@/ipc/client'
 import { useIconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 // The wording, not a fifth copy of it — see the note on the same import in `FileTree.tsx`.
 import { NO_HOST } from '@/chrome/menuModel'
 import { copyText } from '../copyText'
@@ -42,7 +43,7 @@ import { repoRoot } from './repoRoots'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
 import { useWorktrees, type Worktrees } from '@/chrome/useWorktrees'
-import { DEFAULT_CHANGELIST, changelistIdOf, groupOf, type Row } from './model'
+import { DEFAULT_CHANGELIST, ROW_HEIGHT, changelistIdOf, groupOf, type Row } from './model'
 import { grab, plural, trackMenuLabel } from './dragDrop'
 
 export interface GitPanelProps {
@@ -82,8 +83,8 @@ export interface GitPanelProps {
  * Memoised, like every sidebar panel host: the panel is a direct child of `App`, which
  * re-renders on every store notification it subscribes to, and everything this panel draws
  * arrives through its own store subscriptions or through props `App` pins with `useCallback`
- * for exactly this. Without the memo, every App render re-walked the panel's full
- * unvirtualized row list for events that had nothing to do with it.
+ * for exactly this. Without the memo, every App render re-walked the panel's hooks and rebuilt
+ * its visible rows for events that had nothing to do with it.
  */
 export const GitPanel = memo(GitPanelImpl)
 
@@ -117,6 +118,7 @@ function GitPanelScoped({
 }: GitPanelProps & { choice: Worktrees }) {
   const git = useGitPanel(project, { onOpenDiff, worktree: choice.worktree })
   const iconTheme = useIconTheme()
+  const rowHeight = scaledRow(ROW_HEIGHT, useUiScale())
 
   /** The `Row` a menu gesture landed on, or `null` for the empty space below the tree. */
   const rowAt = useCallback(
@@ -351,6 +353,7 @@ function GitPanelScoped({
       project={project}
       git={git}
       iconTheme={iconTheme}
+      rowHeight={rowHeight}
       treeMenu={{ onContextMenu, menu }}
       worktrees={choice.worktrees}
       worktree={choice.worktree}

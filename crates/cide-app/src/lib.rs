@@ -47,6 +47,7 @@ pub mod ext_state;
 mod image_snapshots;
 mod opencode_console;
 mod peer_chat;
+mod reaper;
 /// What is working in each project, for the header's project-tab badge — and the arithmetic
 /// [`spinner`] reads to decide a project has gone quiet. (M94)
 ///
@@ -1276,6 +1277,9 @@ pub fn run() {
             // `updater::start`. The windows also pull `update_status` on mount, so one whose
             // listener is not up yet when the event fires still hears about it.
             updater::start(app.handle());
+
+            // Sessions no pane has shown for a while. See `reaper` for what holds one.
+            reaper::start(app.handle().clone());
 
             // After the windows, because the dock menu is a *view* of the projects those
             // windows show and installing it first would put a menu on screen before there was

@@ -524,6 +524,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         each_project_keeps_claude_tab,
         reopen_last_project,
         keep_sessions_on_window_close,
+        reap_detached_after_minutes,
         confirm_close_with_live_session,
         editor,
         terminal,
@@ -587,6 +588,9 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     }
     if let Some(v) = keep_sessions_on_window_close {
         settings.keep_sessions_on_window_close = v;
+    }
+    if let Some(v) = reap_detached_after_minutes {
+        settings.reap_detached_after_minutes = v.min(Settings::MAX_REAP_MINUTES);
     }
     if let Some(v) = confirm_close_with_live_session {
         settings.confirm_close_with_live_session = v;
@@ -2726,6 +2730,32 @@ mod tests {
                 .task_proposal_run_mode,
             cide_ipc::TaskProposalRunMode::Tab
         );
+    }
+
+    #[test]
+    fn the_reaper_timeout_defaults_on_and_clamps_to_a_day() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.reap_detached_after_minutes, 30);
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                reap_detached_after_minutes: Some(u32::MAX),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(
+            settings.reap_detached_after_minutes,
+            Settings::MAX_REAP_MINUTES
+        );
+        // Zero is the off switch, not a value to clamp upwards.
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                reap_detached_after_minutes: Some(0),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(settings.reap_detached_after_minutes, 0);
     }
 
     #[test]

@@ -56,7 +56,9 @@ const MAX_CLOSED: usize = 16;
 ///   made when the strip was longer still lands somewhere sensible.
 /// * `tree` — the split shape, *with its original pane ids and session bindings*. That is what
 ///   makes a `ClaudeFull` tab come back attached to its own still-running conversation rather
-///   than to a fresh one; see `workspace::reinsert_tab` for why the ids are not reminted.
+///   than to a fresh one; see `workspace::reinsert_tab` for why the ids are not reminted. The
+///   child may have gone by the time this is reopened (`reaper`), which
+///   `claude_tab::resume_closed` answers.
 ///
 /// **Scroll position and caret are deliberately absent.** They are already remembered, by path,
 /// in `positions.json` — `panes/EditorPane.tsx` flushes the pending position on unmount and

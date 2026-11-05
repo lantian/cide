@@ -107,6 +107,11 @@ pub const SETTING_DOCS: &[SettingDoc] = &[
         "Keep sessions running when a project window is closed (they end when cide quits).",
     ),
     doc(
+        "reapDetachedAfterMinutes",
+        "number",
+        "Minutes a session may have no pane showing it before cide ends it (0 = never). Sessions mid-turn, holding a permission prompt or belonging to a run are never ended; reopening the tab resumes the conversation.",
+    ),
+    doc(
         "confirmCloseWithLiveSession",
         "bool",
         "Ask before quitting while a session is busy or waiting on a permission.",

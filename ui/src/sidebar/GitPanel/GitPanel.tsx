@@ -74,6 +74,8 @@ export interface GitPanelViewProps {
    * this module may not import. See the header.
    */
   iconTheme: IconTheme
+  /** The changes tree's row height in the chrome scale. A prop for `iconTheme`'s reason. */
+  rowHeight?: number | undefined
   /** Absent in a render with no window — the SSR check, and any fixture harness. */
   treeMenu?: TreeMenu | undefined
   /**
@@ -103,6 +105,7 @@ export function GitPanelView({
   project,
   git,
   iconTheme,
+  rowHeight,
   treeMenu,
   onUpdate,
   worktrees = [],
@@ -283,6 +286,7 @@ export function GitPanelView({
             onCollapseSelection={git.collapseSelection}
             diffOpen={diffOpen}
             iconTheme={iconTheme}
+            rowHeight={rowHeight}
             onToggleCheck={git.toggleCheck}
             onToggleCheckSelected={git.toggleCheckSelected}
             onToggleExpand={git.toggleExpand}

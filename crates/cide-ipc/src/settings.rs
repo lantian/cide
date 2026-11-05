@@ -78,6 +78,17 @@ pub struct Settings {
     /// relaunch via `claude --resume`. Promising background survival would be a lie.
     pub keep_sessions_on_window_close: bool,
 
+    /// Minutes a session may sit with **no pane showing it** before cide ends it. `0` turns the
+    /// reaper off. (M196)
+    ///
+    /// A closed tab keeps its child so Ctrl+Shift+T can re-adopt it; without this nothing ever
+    /// ends that child, and a day of opening and closing OpenSpec tabs left 54 `claude`
+    /// processes (~19 GB). The reaper never touches a session a pane references, a run names,
+    /// that is mid-turn or holding a permission prompt, or that a phone touched recently; and
+    /// Ctrl+Shift+T on a tab it ended resumes the conversation. A turn that has *finished* holds
+    /// nothing — see `cide_app::reaper`.
+    pub reap_detached_after_minutes: u32,
+
     /// "Confirm before closing a project with a live session." *Live* means a session is
     /// `Busy` or `AwaitingPermission` — not merely that a process exists, which would warn
     /// constantly.
@@ -163,6 +174,16 @@ pub enum SearchModalLayout {
     Stacked,
 }
 
+impl Settings {
+    /// [`Self::reap_detached_after_minutes`]'s default: long enough that closing a tab and
+    /// thinking better of it within a coffee break costs nothing, short enough that a day of
+    /// OpenSpec tabs does not pile up gigabytes.
+    pub const DEFAULT_REAP_MINUTES: u32 = 30;
+    /// One day. A larger figure is indistinguishable from off, and a clamp keeps `Duration`
+    /// arithmetic in the reaper from ever seeing `u32::MAX`.
+    pub const MAX_REAP_MINUTES: u32 = 1440;
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -175,6 +196,7 @@ impl Default for Settings {
             each_project_keeps_claude_tab: true,
             reopen_last_project: true,
             keep_sessions_on_window_close: true,
+            reap_detached_after_minutes: Settings::DEFAULT_REAP_MINUTES,
             confirm_close_with_live_session: false,
             editor: EditorSettings::default(),
             terminal: TerminalSettings::default(),

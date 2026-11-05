@@ -78,6 +78,8 @@ pub struct SettingsPatch {
     #[ts(optional)]
     pub keep_sessions_on_window_close: Option<bool>,
     #[ts(optional)]
+    pub reap_detached_after_minutes: Option<u32>,
+    #[ts(optional)]
     pub confirm_close_with_live_session: Option<bool>,
     #[ts(optional)]
     pub editor: Option<EditorSettings>,

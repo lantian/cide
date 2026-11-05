@@ -215,19 +215,26 @@ pub(crate) fn open_ide_file(
 /// been, which is `navHistory.ts`'s own stated rule. `openable`'s guards therefore still stand
 /// in front of every untrusted path; this command is reachable only from places one has already
 /// cleared.
+///
+/// # Why this is `async`
+///
+/// A File tab's record can hold a Claude split, whose child `reaper` may have ended, and resuming
+/// it forks a process, which must not happen on the GTK loop. `tab_reopen_closed` is `async` for
+/// the same reason. The `State` borrow of the stack is not held across that `.await`.
 #[tauri::command(rename_all = "camelCase")]
-pub fn tab_reopen_file(
+pub async fn tab_reopen_file(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     path: String,
 ) -> Result<ReopenedFile> {
     let path = PathBuf::from(path);
-    let stack = app.state::<crate::closed_tabs::ClosedTabs>();
 
     // Peeked, never popped, and *before* the plan — the plan needs the record to decide. The stat
     // is folded into `reopen_file_step` beside it so the whole decision is one call.
-    let record = stack.peek_file(project, &path);
+    let record = app
+        .state::<crate::closed_tabs::ClosedTabs>()
+        .peek_file(project, &path);
     let plan = record
         .as_ref()
         .map(|record| state.with(|ws| crate::cmd::project::reopen_plan(ws, record)));
@@ -241,14 +248,16 @@ pub fn tab_reopen_file(
             // here the workspace lock has been released, so `take_file` can find nothing if
             // another window reopened the same tab in the meantime — in which case this falls
             // back to an ordinary open rather than reinserting a record somebody else owns.
-            let Some(record) = stack.take_file(project, &path) else {
+            let taken = app
+                .state::<crate::closed_tabs::ClosedTabs>()
+                .take_file(project, &path);
+            let Some(mut record) = taken else {
                 return Ok(ReopenedFile::Opened {
                     tab: open_file_tab(&state, project, path)?,
                 });
             };
-            let tab = state.update(|ws| {
-                workspace::reinsert_tab(ws, project, record.index, record.kind, record.tree)
-            })?;
+            let resumed = crate::claude_tab::resume_closed(&app, &mut record).await;
+            let tab = crate::cmd::project::reinsert_record(&app, &state, record, resumed)?;
             Ok(ReopenedFile::Restored { tab })
         }
         // `open_file_tab` rather than a hand-rolled insert or a bare `activate_tab`, because it

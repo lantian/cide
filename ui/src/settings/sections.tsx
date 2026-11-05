@@ -497,6 +497,23 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
           checked={settings.keepSessionsOnWindowClose}
           onChange={(v) => patch({ keepSessionsOnWindowClose: v })}
         />
+        <Row
+          label="End sessions nobody is showing after"
+          hint="Minutes with no pane open on a session; 0 keeps them until cide quits."
+          info="A closed tab keeps its session running. Once the wait is up, this ends it — unless it is working, holding a permission prompt, or belongs to a run. Ctrl+Shift+T still brings the tab back and resumes the conversation."
+          {...resetTo(settings.reapDetachedAfterMinutes, def?.reapDetachedAfterMinutes, (v) =>
+            patch({ reapDetachedAfterMinutes: v }),
+          )}
+          control={
+            <NumberField
+              label="Minutes before ending an unshown session"
+              value={settings.reapDetachedAfterMinutes}
+              min={0}
+              max={1440}
+              onChange={(v) => patch({ reapDetachedAfterMinutes: v })}
+            />
+          }
+        />
         <ToggleRow
           // The info's second sentence is not decoration. This toggle governs *sessions* only:
           // unsaved editor buffers are confirmed whatever it says, because an interrupted turn

@@ -1108,6 +1108,36 @@ export function setHostBusy(paneId: string, busy: boolean): void {
 }
 
 /**
+ * Parked terminals whose child has gone, from `cide://panes-retired`. (M196)
+ *
+ * `sessions` is the reaper ending what no pane names: the hosts naming them go, which is what
+ * frees the terminal's memory and stops the ledger naming a corpse. Mounted hosts are spared and
+ * should not exist, because a pane on screen is in the tree and so was never reaped.
+ *
+ * `panes` is a reopen, delivered before the broadcast that mounts them. The old host goes in any
+ * case, since its sink is tied to the dead child and `ensureAttached` would call that attached.
+ * When Rust has already resumed the conversation, its id goes in the ledger: that is the state
+ * of an evicted host whose child is running, so `PaneBody` skips the Resume splash and
+ * `TerminalPane` attaches. Leaving it out would spawn a rival child, or a fresh conversation.
+ */
+export function retireHosts(
+  sessions: readonly string[],
+  panes: readonly { pane: string; session: string | null }[],
+): void {
+  const ended = new Set(sessions)
+  const names = (id: string | undefined) => id !== undefined && ended.has(id)
+  for (const paneId of [...hosts.keys(), ...ledger.keys()]) {
+    const host = hosts.get(paneId)
+    if (host?.mounted === true) continue
+    if (names(host?.sessionId) || names(ledger.get(paneId)?.sessionId)) destroyHost(paneId)
+  }
+  for (const { pane, session } of panes) {
+    destroyHost(pane)
+    if (session !== null) record(pane).sessionId = session
+  }
+}
+
+/**
  * Forget the session this pane was holding, and ready the host for the next one.
  *
  * For a restart and for the recovery path in `TerminalPane`: the child is gone (or is being

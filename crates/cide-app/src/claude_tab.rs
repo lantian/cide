@@ -462,6 +462,23 @@ pub(crate) fn open_continuing(
 /// The permission stance a tab cide opens is started under, as argv: one flag, spelled once.
 /// `Ask` passes nothing, which is the CLI's own default.
 ///
+/// What a resumed pane is launched with. Only a tab cide opened gets the stance: a user's tab
+/// resumes with what a restart gives it, and giving it the unattended stance instead would raise
+/// its permissions on reopen with nothing on screen to say so.
+fn resume_args(
+    by_cide: bool,
+    console: cide_ipc::ConsoleHarness,
+    codex: bool,
+    unattended: cide_agents::Unattended,
+    codex_policy: &cide_ipc::CodexCli,
+) -> Vec<String> {
+    if !by_cide || console == cide_ipc::ConsoleHarness::Opencode {
+        Vec::new()
+    } else {
+        stance_args(codex, unattended, codex_policy)
+    }
+}
+
 /// Shared by [`open`] and [`resume_closed`], because a reopened reviewer that came back asking
 /// for permission where the one the user closed did not would be the same tab behaving
 /// differently for no reason the user can see — and it is still unattended by construction.
@@ -562,6 +579,19 @@ pub(crate) fn bind_ide_pane(
 /// cide could continue — M104's stated gap). A spawn that fails is logged and left the same
 /// way: the tab still comes back, so the key never silently does nothing.
 ///
+/// # A tab the user opened (M196)
+///
+/// Comes through here too, now that `reaper` can end a closed tab's child. Three things differ
+/// from a tab cide opened, and the first is a safety property: it gets **no stance args**.
+/// [`stance_args`] is the unattended stance, and passing it to the user's own tab would resume
+/// it with permissions it never had. It gets what a restart gives it, which is the empty argv.
+/// Its voice comes from the pane's origin, as a restart's does. And where it cannot be resumed
+/// its dead entry is dropped, so a shell starts again and a Claude pane with no transcript starts
+/// fresh, rather than coming back as a corpse with a button on it.
+///
+/// A session any run names is left alone: its pane is a view, and it opens onto the retained
+/// entry.
+///
 /// Answers the sessions it started, which the caller kills if the reinsert then fails — a live
 /// `claude` with no pane is a leak and a billed process.
 pub(crate) async fn resume_closed(
@@ -595,19 +625,44 @@ pub(crate) async fn resume_closed(
     // under a running app.
     let unattended = cide_agents::config::load(&root).agents.unattended();
 
+    let by_cide = matches!(
+        record.kind,
+        TabKind::ClaudeFull {
+            ephemeral: true,
+            ..
+        }
+    );
+    let agents = app.try_state::<std::sync::Arc<crate::agents::AgentRegistry>>();
     let mut started = Vec::new();
+    let mut retired = Vec::new();
     let panes: Vec<Pane> = record.tree.panes.values().cloned().collect();
     for pane in &panes {
         let Some(session) = pane.session else {
             continue;
         };
+        if agents.as_ref().is_some_and(|a| a.names_session(session)) {
+            continue;
+        }
+        crate::reaper::wait_out(session).await;
         // Still running somewhere — nothing to resume, and spawning would be refused anyway.
         if registry.get(session).is_some_and(|pty| !pty.has_exited()) {
             continue;
         }
+        if !by_cide
+            && registry.remove(session).is_some()
+            && let Some(logs) = app.try_state::<std::sync::Arc<crate::logring::JsonLogRing>>()
+        {
+            logs.forget(session);
+        }
         let cide_ipc::SessionRestore::Resumable { session: resume } =
             state.with(|ws| crate::lifecycle::resumable_on_reopen(ws, pane, &root))
         else {
+            if !by_cide {
+                retired.push(crate::emit::RetiredPane {
+                    pane: pane.id,
+                    session: None,
+                });
+            }
             continue;
         };
         let codex = cide_core::workspace::pane_harness(pane) == cide_ipc::Harness::Codex;
@@ -623,11 +678,7 @@ pub(crate) async fn resume_closed(
             harness: Some(console),
             // A `continues` pane's argv is its harness's `continue_spec`, which replaces these;
             // for every other pane they are the stance the tab was opened under.
-            args: if console == cide_ipc::ConsoleHarness::Opencode {
-                Vec::new()
-            } else {
-                stance_args(codex, unattended, &codex_policy)
-            },
+            args: resume_args(by_cide, console, codex, unattended, &codex_policy),
             cwd: cwd.to_string_lossy().into_owned(),
             geometry: Geometry::default(),
             project: Some(project),
@@ -647,11 +698,13 @@ pub(crate) async fn resume_closed(
             pane: None,
             // Told explicitly: `spawn_session` infers a worker from the tree, and the tab is not
             // back in the tree yet — session first, tab second.
-            voice: Some(if pane.origin == Some(cide_ipc::PaneOrigin::Worker) {
-                crate::cmd::session::Voice::Worker
+            voice: if !by_cide {
+                crate::cmd::session::origin_voice(pane.origin)
+            } else if pane.origin == Some(cide_ipc::PaneOrigin::Worker) {
+                Some(crate::cmd::session::Voice::Worker)
             } else {
-                crate::cmd::session::Voice::Acting
-            }),
+                Some(crate::cmd::session::Voice::Acting)
+            },
             env: Vec::new(),
             // Nothing is typed: the conversation already holds its brief, and a reopened tab
             // waits for the user rather than starting another turn.
@@ -676,11 +729,24 @@ pub(crate) async fn resume_closed(
                     }
                 }
                 started.push(id);
+                retired.push(crate::emit::RetiredPane {
+                    pane: pane.id,
+                    session: Some(id),
+                });
             }
             Err(error) => {
-                tracing::warn!(%project, %session, %error, "could not resume a reopened tab; it comes back exited");
+                tracing::warn!(%project, %session, %error, "could not resume a reopened tab");
+                if !by_cide {
+                    retired.push(crate::emit::RetiredPane {
+                        pane: pane.id,
+                        session: None,
+                    });
+                }
             }
         }
+    }
+    if !retired.is_empty() {
+        crate::emit::panes_retired(app, Vec::new(), retired);
     }
     started
 }
@@ -688,6 +754,17 @@ pub(crate) async fn resume_closed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_users_tab_never_resumes_with_the_unattended_stance() {
+        use cide_agents::Unattended::Bypass;
+        use cide_ipc::ConsoleHarness::{Claude, Codex};
+        let policy = cide_ipc::CodexCli::default();
+        assert!(resume_args(false, Claude, false, Bypass, &policy).is_empty());
+        assert!(resume_args(false, Codex, true, Bypass, &policy).is_empty());
+        // The other half, so the two above cannot pass because the helper always answers empty.
+        assert!(!resume_args(true, Codex, true, Bypass, &policy).is_empty());
+    }
 
     #[test]
     fn codex_tabs_leave_saved_and_explicit_defaults_to_the_console_launcher() {

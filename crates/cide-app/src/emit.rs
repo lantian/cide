@@ -1062,6 +1062,37 @@ pub fn sessions_changed(app: &AppHandle, project: cide_ipc::ProjectId) {
     }
 }
 
+// --- retired panes (M196) ---------------------------------------------------------------
+
+/// Parked terminals whose child has gone. Every window has its own hosts, so this goes to all.
+///
+/// One event for the two moments that need it. `sessions` is the reaper: destroy whatever host
+/// names one. `panes` is a reopen: the pane is about to come back, so its old host goes and, when
+/// `session` is set, the ledger is told what it now holds, which is what makes `PaneBody` skip
+/// the splash and `TerminalPane` attach rather than spawn. A reopen emits this **before** the
+/// reinsert's `workspace-changed`, because the pane mounts on that.
+pub const PANES_RETIRED: &str = "cide://panes-retired";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetiredPane {
+    pub pane: cide_ipc::PaneId,
+    pub session: Option<cide_ipc::SessionId>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PanesRetired {
+    sessions: Vec<cide_ipc::SessionId>,
+    panes: Vec<RetiredPane>,
+}
+
+pub fn panes_retired(app: &AppHandle, sessions: Vec<cide_ipc::SessionId>, panes: Vec<RetiredPane>) {
+    if let Err(error) = app.emit(PANES_RETIRED, PanesRetired { sessions, panes }) {
+        tracing::debug!(%error, "panes-retired reached no window");
+    }
+}
+
 // --- pool notices (t-1090) ---------------------------------------------------------------
 
 /// A pool entry's configuration is wrong, and a run has just moved past it: which pool, which

@@ -4255,6 +4255,17 @@ impl AgentRegistry {
             .map(|run| run.harness)
     }
 
+    /// Whether any run names this session, finished ones included. [`Self::owns_session`] is the
+    /// question for a kill; this is the one for `reaper`, because a finished run's retained
+    /// entry is what its History row opens onto.
+    pub fn names_session(&self, session: SessionId) -> bool {
+        self.inner
+            .lock()
+            .runs
+            .values()
+            .any(|run| run.session == Some(session))
+    }
+
     pub fn owns_session(&self, session: SessionId) -> bool {
         self.inner.lock().runs.values().any(|run| {
             run.session == Some(session)

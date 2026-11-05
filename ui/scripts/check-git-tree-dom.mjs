@@ -20,6 +20,12 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
 HTMLElement.prototype.setPointerCapture = () => {}
 HTMLElement.prototype.hasPointerCapture = () => false
 HTMLElement.prototype.releasePointerCapture = () => {}
+// The tree is virtualized, and a scroller reporting no height is a list with no rows at all: the
+// library's range is null below 1px. 600px is 25 rows, and every fixture but the large one fits.
+Object.defineProperties(HTMLElement.prototype, {
+  offsetHeight: { get() { return this.dataset.audit === 'gitTree' ? 600 : 24 } },
+  offsetWidth: { get() { return 420 } },
+})
 
 let root
 try {
@@ -43,13 +49,13 @@ try {
     path, origPath: null, index: 'unmodified', worktree: 'modified', staged: false,
     binary: false, submodule: false, changelist,
   })
-  const viewFor = (emptyChanges = false) => normalizeStatus({ repos: [{
+  const viewFor = (emptyChanges = false, many = null) => normalizeStatus({ repos: [{
     repo: { id: 'repo', name: 'repo', root: '/test/repo', parent: null, isSubmodule: false },
     branch: { head: 'main', detached: false, upstream: null, ahead: 0, behind: 0,
       operation: null, unborn: false },
     changelists: [
       { id: 'default', name: 'Changes', active: true, comment: '',
-        changes: emptyChanges ? [] : [change('src/a.ts'), change('src/b.ts')] },
+        changes: many ?? (emptyChanges ? [] : [change('src/a.ts'), change('src/b.ts')]) },
       { id: 'fixes', name: 'fixes', active: false, comment: '',
         changes: [change('other.ts', 'fixes')] },
     ],
@@ -240,6 +246,60 @@ try {
     await mouse(arrow(group()), 'pointerdown', { pointerId: 2 })
   })
   assert.equal(expanded(directory()), 'true', 'another pointer cannot clear an active drag verdict')
+
+  /*
+   * A large tree, which is what the virtualization is for.
+   *
+   * Everything starts expanded and the panel remounts on every rail switch, so without it the whole
+   * list is built from nothing per click, however long it is. The keyboard half is the part that
+   * can quietly regress, because the row an arrow moves to may not exist yet and the
+   * row holding focus may have scrolled out of the window, and in both cases a failure is silent —
+   * focus lands on `<body>`, and every later key goes nowhere.
+   */
+  mountId++
+  view = viewFor(false, Array.from({ length: 2000 }, (_, i) => change(`pkg${i % 40}/src/f${i}.ts`)))
+  await render()
+  const allRows = buildRows(view, defaultExpanded(view))
+  const tree = () => document.querySelector('[data-audit="gitTree"]')
+  const rowAt = index => document.querySelector(`[data-audit="gitRow"][data-index="${index}"]`)
+  const mountedRows = () => document.querySelectorAll('[data-audit="gitRow"]').length
+  const active = () => document.activeElement?.dataset?.index
+  const scrollTo = async (top) => {
+    tree().scrollTop = top
+    await act(async () => tree().dispatchEvent(new window.Event('scroll')))
+  }
+  assert.ok(allRows.length > 2000, 'the fixture really is that many rows')
+  assert.ok(mountedRows() < 80, `only the window exists, but ${mountedRows()} rows are mounted`)
+  assert.equal(
+    tree().firstElementChild.style.height,
+    `${allRows.length * 24}px`,
+    'the spacer is the whole list long, or the scrollbar lies about it',
+  )
+
+  // A row far outside the window: it has to be mounted and focused by the same keystroke.
+  const last = String(allRows.length - 1)
+  assert.equal(rowAt(last), null, 'the last row does not exist before it is asked for')
+  await act(async () => rowAt(0).focus())
+  await key(rowAt(0), 'End')
+  assert.equal(active(), last, 'End lands focus on a row that was not mounted when it was pressed')
+  assert.equal(rowAt(last).getAttribute('tabindex'), '0', 'and the tab stop moved with it')
+  await key(rowAt(last), 'Home')
+  assert.equal(active(), '0', 'Home comes back the same way')
+
+  // The focused row survives being scrolled away from, and an arrow carries on from it.
+  await scrollTo(24 * 1000)
+  assert.ok(rowAt(1000), 'scrolling brings the rows at that offset into existence')
+  assert.equal(rowAt(1), null, 'and takes the ones it left out of existence')
+  assert.equal(active(), '0', 'but not the focused row, or focus falls to <body>')
+  assert.equal(rowAt(0).getAttribute('tabindex'), '0', 'which is also the tree\'s only tab stop')
+  assert.ok(mountedRows() < 80, 'and keeping it costs one row, not the rows between')
+  await key(rowAt(0), 'ArrowDown')
+  assert.equal(active(), '1', 'an arrow carries on from the cursor, wherever the scroll has got to')
+  assert.equal(
+    tree().querySelectorAll('[tabindex="0"]').length,
+    1,
+    'one tab stop, however far the cursor and the window have drifted apart',
+  )
 
   console.log('git tree interactions: ok')
 } finally {

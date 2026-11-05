@@ -19,11 +19,14 @@ import {
   useCallback,
   useEffect,
   useInsertionEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from 'react'
+import { timeRailSwitch } from '@/chrome/railTiming'
+import { noteExternalResize } from '@/layout/resizeGesture'
 import { AppHeader } from '@/chrome/AppHeader'
 import { ActivityRail } from '@/chrome/ActivityRail'
 import { PanelBoundary } from '@/chrome/PanelBoundary'
@@ -387,6 +390,33 @@ export function App() {
   const [sidebar, setSidebar] = useState<SidebarState>(
     tabWindow ? { view: null, last: SIDEBAR_INITIAL.last } : SIDEBAR_INITIAL,
   )
+  /*
+   * A sidebar switch is a resize gesture nobody is holding.
+   *
+   * The panels have different widths, so changing the view resizes `.content`, and `TabContent`
+   * lays every tab out at full size, so every terminal in every tab sees it at once. With no
+   * gesture open `whenResizeSettles` runs immediately: `FitAddon.fit()`, a reflow over up to 5000
+   * lines of scrollback and a synchronous `session_resize`, per terminal, all before the new panel
+   * has painted. That cost follows the number of terminals rather than what the panel draws, so
+   * it lands on any rail click that changes the width, however cheap the panel being opened is.
+   *
+   * Treated as what it is, it gets everything a splitter drag already has: the panel paints first,
+   * visible panes refit on a frame after it, background tabs refit one per task, and a few quick
+   * clicks are one refit rather than one each. The cost is the one drags already accept — a visible
+   * terminal holds its old grid for about 130 ms, clipped by its host's `overflow: hidden`.
+   *
+   * Keyed on the view rather than called from the rail's `onSelect`, because F4 and the `sidebar.*`
+   * commands reach `setSidebar` too and resize exactly the same boxes. A layout effect because it
+   * must beat the observers: this commit's size change is delivered to `ResizeObserver` later in
+   * the same frame, and a gesture opened after that would catch nothing. The ref is what spares
+   * the first mount, where nothing has changed size and StrictMode would run this twice.
+   */
+  const shownView = useRef(sidebar.view)
+  useLayoutEffect(() => {
+    if (shownView.current === sidebar.view) return
+    shownView.current = sidebar.view
+    noteExternalResize()
+  }, [sidebar.view])
   /*
    * This window's answer to "reveal a panel", for every caller that is not inside React.
    *
@@ -1841,6 +1871,13 @@ export function App() {
               // memory of which panel F4 restores. What is left here is the side effect only
               // this component can perform: Settings is a workspace *tab* rather than a
               // sidebar view, so choosing it also opens (or re-activates) the project's tab.
+              if (import.meta.env.DEV) {
+                // Only a click that really switches: ⚙ and the lit button's toggle-to-same are
+                // not what `[cide] rail` lines are for. `selectView` is pure, so asking twice is
+                // free. See `chrome/railTiming.ts`.
+                const after = selectView(sidebar, next)
+                if (after.view !== sidebar.view) timeRailSwitch(sidebar.view, after.view)
+              }
               setSidebar((s) => selectView(s, next))
               if (next === 'settings') {
                 if (activeProjectId) {

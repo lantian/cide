@@ -5805,3 +5805,15 @@ export const specImages = {
   release: (paths: readonly string[]) => invoke<void>('spec_images_release', { paths }),
   pick: () => invoke<string[]>('spec_images_pick'),
 }
+
+/* --------------------------------------------------------------------------------------
+ * Parked terminals whose child has gone. (M196) See `emit::panes_retired` for the two moments
+ * this fires, and `layout/paneHosts.ts`'s `retireHosts` for what a window does about it.
+ * ------------------------------------------------------------------------------------ */
+export const onPanesRetired = (
+  handler: (sessions: SessionId[], panes: { pane: PaneId; session: SessionId | null }[]) => void,
+) =>
+  listen<{ sessions: SessionId[]; panes: { pane: PaneId; session: SessionId | null }[] }>(
+    'cide://panes-retired',
+    (e) => handler(e.payload.sessions, e.payload.panes),
+  )

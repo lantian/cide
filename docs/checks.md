@@ -136,6 +136,22 @@ checks large-diff segmentation and coverage; `cargo test --locked -p cide-claude
 and `cargo test --locked -p cide-core cancellable_filter_reaps_a_running_child` check that
 cancellation stops active model processes.
 
+The changes tree is virtualized, and a failure there is silent: `check:git` mounts 2,000 changes
+and asserts the DOM stays bounded, that End and an arrow focus rows that were not mounted when
+pressed, and that the cursor's row survives being scrolled away from. Lose that last one and focus
+falls to `<body>` with no error, so no later key reaches the tree. A scroller reporting no height
+is a list with no rows, so any harness mounting this tree and reading its rows has to stub
+`offsetHeight`. `check:commit-message` pins `adopt`'s "nothing changed" shortcut: it must compare
+against the view last *adopted*, not last rendered, or the newest of two answers landing before a
+render is dropped. Its assertions need the panel's real project in the broadcast, which is why the
+row's appearance is asserted first; absence alone passed while nothing was being delivered.
+
+`check:commit-message` also mounts the rail's badge beside the panel and counts `git_status` calls.
+A panel on the project's own tree holds the count (`holdChangeCount`), so a burst costs one walk.
+Every exception exists because the badge would otherwise go stale with no error: a panel on an agent
+checkout or on another project holds nothing, releasing a hold asks for one walk, and `refresh` is
+never skipped.
+
 ### The diff surface
 
 **Touches:** the diff surface — `panes/GitDiffPane*`, `diffRows`, `diffSync`, `diffTokens`, `diffHighlight`, `diffConnector`, `changeNav`
@@ -466,6 +482,14 @@ behavior. The canvas still needs a browser check for real geometry, pointer offs
 **Touches:** a splitter's drag path, `layout/resizeGesture.ts`, or any `ResizeObserver`
 
 `check:resize` — a drag is smooth only because the expensive reactions to a size change (xterm's `fit()`, a `session_resize` that reflows the scrollback on the IPC thread, a minimap repaint) are deferred to the end of the gesture. Undo that and nothing throws, nothing changes on screen, and the app simply locks up while somebody drags a divider
+
+A sidebar switch is a resize gesture too. `App.tsx` calls `noteExternalResize()` in a layout effect
+keyed on `sidebar.view`, and `check:resize` pins it. A plain effect runs after `ResizeObserver` has
+delivered and catches nothing: every terminal then refits before the new panel paints, with no error
+anywhere. In a dev build each rail click logs `[cide] rail a→b: paint Nms, worst frame Nms`
+(`chrome/railTiming.ts`), which `./run.sh --inspect` carries into the Rust log. Read both figures,
+because the deferral moves work to after the paint, so `paint` alone cannot tell a fix from a stall
+that has only moved.
 
 ### `editor/`
 
@@ -1237,3 +1261,9 @@ uses the event tap and guarded Ink dialog navigation under the manual input lane
 changed, clipped, or unsupported dialog layouts retain the saved answer and direct the
 user to the original conversation. Protocol fixtures do not replace a live-model check
 of each installed harness and its terminal renderer.
+
+### What ends a session no pane names
+
+**Touches:** `cide_app::reaper`, anything that retains a registry entry on purpose, `SessionState`
+
+`cargo test -p cide-app --lib -- reaper claude_tab`, `check:attach`, plus `check:settings-copy`, `check:settings-agents`, and `cargo --locked xtask codegen --check` for the setting. **`AwaitingInput` must not hold a session**: it is what every `Stop` out of `Busy` becomes, so exempting it, or the `windows::awaiting` set the webview reports from it, leaves the reaper with nothing to end and fails no other test. A new reason to retain an exited entry has to be added to `Facts`, or the entry goes after a minute. **A reopened pane whose child has gone must go through `claude_tab::resume_closed` and `cide://panes-retired`**: skip the first and the pane silently starts a fresh conversation, skip the second and it attaches to a dead sink. A new route that reinserts a closed tab needs both, and a user's tab must never get `stance_args` (ADR 0016).

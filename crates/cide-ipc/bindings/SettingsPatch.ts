@@ -53,7 +53,7 @@ uiFontSize?: number, searchModalLayout?: SearchModalLayout,
  * computed where this lands, so no caller can store an illegible one. See
  * [`crate::settings::Accent`].
  */
-accent?: AccentPatch, awaitingHighlight?: AwaitingHighlight, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
+accent?: AccentPatch, awaitingHighlight?: AwaitingHighlight, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, reapDetachedAfterMinutes?: number, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
 /**
  * Which CLI a new console runs. (M93) See [`crate::settings::Settings::console_harness`].
  */

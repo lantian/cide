@@ -23,6 +23,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { events, git as gitApi, type ProjectId, type WorktreeInfo } from '@/ipc/client'
+import { shareEqual } from '@/store/shareEqual'
 
 /** Which surface is choosing. The choices are independent; see the header. */
 export type WorktreeSurface = 'panel' | 'log'
@@ -85,7 +86,9 @@ export function useWorktrees(surface: WorktreeSurface, project: ProjectId | null
             .then((info) => info.head)
             .catch(() => null)
     if (generation.current !== mine) return
-    setWorktrees(list ?? NONE)
+    // A fresh array off the wire every time, and this reloads on every watcher burst. Sharing it
+    // is what stops an unchanged list re-rendering the whole panel that holds this hook.
+    setWorktrees((prev) => shareEqual(prev, list ?? NONE))
     setProjectBranch(head)
     setLoaded(list !== null)
   }, [project])

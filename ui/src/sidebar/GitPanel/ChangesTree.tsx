@@ -12,6 +12,20 @@
  * One focusable thing per row: a nested `<input>` would make Tab walk two stops per file
  * and leave Space ambiguous between "tick this row" and "tick this box".
  *
+ * # Only the rows on screen exist
+ *
+ * Virtualized, like `FileTree.tsx` and `SearchPanel.tsx`, and unconditionally rather than above
+ * some row count, so the path every check exercises is the path a large repository takes. The
+ * panel unmounts on every rail switch and everything starts expanded, so this list is built from
+ * nothing each time the Git panel is opened and torn down each time it is left. A project with 772
+ * changed files in 259 directories made that the order of a thousand rows, each about six elements
+ * and an `<img>`.
+ *
+ * The one row kept mounted out of view is the cursor's — see `rangeExtractor` below, which is what
+ * the roving tabindex and the keyboard stand on. Nothing else here needed to change for it: every
+ * reader of these rows goes through the DOM only for what can be seen. The drag hit-tests under
+ * the pointer and listens on `window`, and the context menu reads back the row it was opened on.
+ *
  * # Three different things called selection
  *
  * `selected` in this file is the **tick** — the set of files a commit would take. The
@@ -52,9 +66,18 @@
  * refresh changes its rows would steal the caret out of the commit message box, and this
  * panel refreshes while the user types.
  */
-import { useCallback, useMemo, useRef, type KeyboardEvent, type ReactNode } from 'react'
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react'
+import { defaultRangeExtractor, useVirtualizer, type Range } from '@tanstack/react-virtual'
 import { blurLeftTheTree } from '@/sidebar/speedSearch'
 import {
+  ROW_HEIGHT,
   checkState,
   diffOpenMode,
   entryStatus,
@@ -124,6 +147,14 @@ export interface ChangesTreeProps {
   diffOpen: boolean
   /** Threaded from the panel, never subscribed to per row. Same argument as `FileTree`. */
   iconTheme: IconTheme
+  /**
+   * How tall a row is drawn, in whole pixels: [`ROW_HEIGHT`] in the chrome scale.
+   *
+   * A prop for the reason `iconTheme` is. `useUiScale` reads the workspace store, which touches
+   * `document` at import time, and `check-git-render.mjs` renders this tree under node, so the
+   * host reads it instead. Absent means the design height, which is what a fixture is drawn at.
+   */
+  rowHeight?: number | undefined
   onToggleCheck: (row: Row) => void
   /** Space over a multi-row selection: tick every selected row at once. */
   onToggleCheckSelected: () => void
@@ -174,6 +205,14 @@ export interface ChangesTreeProps {
  */
 const NO_KEY_MODS: SelectMods = { ctrl: false, shift: false }
 
+/**
+ * The box assumed until the scroller has been measured, which is all a server render ever has.
+ *
+ * `check-git-render.mjs` asserts on the rows of each story, so this has to admit a whole fixture;
+ * the first layout effect replaces it with the real box before anything paints.
+ */
+const INITIAL_RECT = { width: 420, height: 800 }
+
 const ARIA_CHECKED: Record<CheckState, 'true' | 'false' | 'mixed'> = {
   checked: 'true',
   partial: 'mixed',
@@ -196,6 +235,7 @@ export function ChangesTree({
   onCollapseSelection,
   diffOpen,
   iconTheme,
+  rowHeight = ROW_HEIGHT,
   onToggleCheck,
   onToggleCheckSelected,
   onToggleExpand,
@@ -248,6 +288,57 @@ export function ChangesTree({
   const found = current === null ? -1 : rows.findIndex((row) => row.id === current)
   const at = rows.length === 0 ? 0 : Math.max(0, Math.min(found, rows.length - 1))
 
+  /*
+   * The window of rows that exist, plus the cursor's wherever it has got to.
+   *
+   * Without that second half, wheel-scrolling away from the focused row would unmount it: focus
+   * falls to `<body>`, so the arrows stop reaching the tree at all, and Tab finds no stop because
+   * the only `tabIndex={0}` in the tree went with it. Kept mounted, it sits at its true offset,
+   * out of sight, and the next arrow carries on from there.
+   *
+   * `getItemKey` depends on `rowHeight` although it does not read it, and that is the point: the
+   * library recomputes row offsets when this function's identity moves and does not watch
+   * `estimateSize` at all, so a UI-scale change would otherwise keep every row at the old offset.
+   * This way it costs no extra render, where `virtualizer.measure()` in an effect would cost one.
+   */
+  const getItemKey = useCallback(
+    (index: number) => rows[index]?.id ?? index,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `rowHeight`: see above.
+    [rows, rowHeight],
+  )
+  const rangeExtractor = useCallback(
+    (range: Range) => {
+      const indexes = defaultRangeExtractor(range)
+      return indexes.includes(at) ? indexes : [...indexes, at].sort((a, b) => a - b)
+    },
+    [at],
+  )
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => container.current,
+    estimateSize: () => rowHeight,
+    getItemKey,
+    rangeExtractor,
+    overscan: 12,
+    initialRect: INITIAL_RECT,
+  })
+
+  /**
+   * A row a keystroke moved to before it existed, focused as soon as the commit has mounted it.
+   *
+   * It always mounts in that commit: `onKeyTo` makes it the cursor, and `rangeExtractor` above
+   * keeps the cursor's row mounted whatever the scroll position. Cleared whether or not it landed,
+   * because the rule at the top of this file is that only a key or a click moves focus. A
+   * leftover here would let some later background refresh steal the caret from the commit box.
+   */
+  const pendingFocus = useRef<number | null>(null)
+  useLayoutEffect(() => {
+    const next = pendingFocus.current
+    if (next === null) return
+    pendingFocus.current = null
+    container.current?.querySelector<HTMLElement>(`[data-index="${next}"]`)?.focus()
+  })
+
   /**
    * Move the cursor to a row index, taking the selection with it or not as the modifiers say.
    *
@@ -255,13 +346,21 @@ export function ChangesTree({
    * `rowSelection.ts::keySelect`'s decision, reached through the model so the pointer and the
    * keyboard cannot end up with two sets of rules. `mods` is threaded from the keystroke
    * rather than read off a ref, because shift+↓ and ↓ differ in nothing else.
+   *
+   * Scrolling is left to `focus()`, as it always has been here, and not `scrollToIndex`. That
+   * would be a second opinion about where the row belongs, and one that disagrees: it knows nothing
+   * of `.tree`'s padding, so it re-checks a frame later, finds focus's answer a few pixels off its
+   * own and scrolls back, leaving the row clipped. The scroll event `focus()` causes is also what
+   * brings the rows around the destination into existence, before that frame paints.
    */
   const move = useCallback(
     (next: number, mods: SelectMods) => {
       const row = rows[next]
       if (row === undefined) return
       onKeyTo(row.id, mods)
-      container.current?.querySelector<HTMLElement>(`[data-index="${next}"]`)?.focus()
+      const mounted = container.current?.querySelector<HTMLElement>(`[data-index="${next}"]`)
+      if (mounted) mounted.focus()
+      else pendingFocus.current = next
     },
     [rows, onKeyTo],
   )
@@ -459,7 +558,17 @@ export function ChangesTree({
       }}
       onContextMenu={onContextMenu}
     >
-      {rows.map((row, index) => {
+      {/* The spacer that gives the scrollbar the whole list's length. `role="none"` because the
+          `treeitem`s inside it have to read as children of the `role="tree"` above. */}
+      <div
+        className={styles.viewport}
+        role="none"
+        style={{ height: `${virtualizer.getTotalSize()}px` }}
+      >
+      {virtualizer.getVirtualItems().map((item) => {
+        const index = item.index
+        const row = rows[index]
+        if (row === undefined) return null
         const state = checkState(row, selected)
         const open = expanded.has(row.id)
         const isCurrent = index === found
@@ -508,7 +617,15 @@ export function ChangesTree({
             // `sidebar/FileTree.tsx`. One number across both trees because IDEA has one.
             // It makes the path compaction in `model.ts` matter more, not less: four levels
             // now cost 76px of a 420px panel instead of 56.
-            style={{ paddingLeft: `${8 + row.depth * 19}px` }}
+            //
+            // The height is the virtualizer's rather than left to `.row`'s `calc()`, which can
+            // land on a fraction: rows are placed on `scaledRow`'s whole-pixel grid, and a box of
+            // any other height would leave a seam between neighbours.
+            style={{
+              paddingLeft: `${8 + row.depth * 19}px`,
+              height: `${item.size}px`,
+              transform: `translateY(${item.start}px)`,
+            }}
             onFocus={() => onCurrent(row.id)}
             /* First, and deliberately separate from the click handling below: a press only
                becomes a drag after 4px of movement, so the click rules keep running exactly as
@@ -700,6 +817,7 @@ export function ChangesTree({
           </div>
         )
       })}
+      </div>
       {/* Portals out of this box; where it sits in the caller's tree does not move it. */}
       {menu}
       {drag.state !== null && <DragGhost state={drag.state} />}

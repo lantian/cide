@@ -213,6 +213,29 @@ try {
       'on the session (sessionSink.ts), not the mount, or a project switch loses output again',
   )
 
+  // A reopened pane whose child has gone. Each half fails silently: an unsubscribed window keeps
+  // the dead host and its pane adopts a corpse, and a retire that drops the ledger write makes the
+  // pane spawn a fresh conversation over one Rust has just resumed. (M196)
+  const code = (path) =>
+    src(path).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const retire = code('src/layout/paneHosts.ts')
+  const retireBody = retire.slice(
+    retire.indexOf('export function retireHosts('),
+    retire.indexOf('export function forgetSession('),
+  )
+  ok(
+    code('src/main.tsx').includes('onPanesRetired(retireHosts)'),
+    'every window subscribes to cide://panes-retired at module scope',
+  )
+  ok(
+    retireBody.includes('destroyHost(pane)') && retireBody.includes('record(pane).sessionId = session'),
+    'retireHosts destroys a reopened pane s old host and tells the ledger what it now holds',
+  )
+  ok(
+    retireBody.includes('host?.mounted === true'),
+    'retireHosts spares a mounted host: destroying one is the fault this module counts',
+  )
+
   // The three moments the sink really must go are all host-side. Each function's slice must
   // call the closure; a miss is a sink leaked for ever (teardown), a doubled view
   // (releaseHost) or a detach naming the wrong session (forgetSession).

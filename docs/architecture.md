@@ -69,7 +69,10 @@ serialised. Splitter drags write `gridTemplateColumns` directly and commit `pane
 once, on `pointerup`, because every mutation costs a round trip.
 
 **Sessions live outside the tree**, in a process-global registry keyed by `SessionId`. A pane
-holds an id and merely *attaches*; closing a pane, tab or window never touches the child.
+holds an id and merely *attaches*; moving a pane or closing a window or tab does not touch the
+child. What does end one: `closePane` (unless the pane only mirrors the session), closing a project,
+a restart, quitting, and `reaper` — which ends a session no pane names once its timeout passes and
+Ctrl+Shift+T can no longer bring it back (ADR 0016).
 `Session.sinks` is a list, not an `Option`, so a detach is gapless — the new window's sink is
 live before the old one drops. That one decision is what makes detach-into-a-window,
 survive-a-window-close, and the stacked-vs-per-project window setting the same mechanism.

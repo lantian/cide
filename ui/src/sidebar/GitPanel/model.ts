@@ -136,6 +136,13 @@ const SEP = '\u0000'
 export const IGNORED_GROUP = 'ignored'
 
 /**
+ * A row's design height, before the chrome scale: what the virtualizer in `ChangesTree.tsx` places
+ * rows by, once `GitPanelHost` has scaled it. The same number as `.row` in the module CSS and as
+ * the explorer's and the search panel's rows, which `check:theme` asserts.
+ */
+export const ROW_HEIGHT = 24
+
+/**
  * Which command a gesture that opens should route to.
  *
  * `gitTreeClick` returns `open` for two different reasons — a double-click, or a single click

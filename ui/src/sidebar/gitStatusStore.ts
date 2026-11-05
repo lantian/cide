@@ -29,6 +29,7 @@ import {
   type ProjectId,
   type TreeStatusMap,
 } from '@/ipc/client'
+import { shareEqual } from '@/store/shareEqual'
 import { NO_STATUS } from './treeStatus'
 
 /**
@@ -88,6 +89,11 @@ export const useGitStatus = create<GitStatusStore>((set, get) => ({
   degraded: false,
 
   async attach(project) {
+    // A remount over the SAME project is a rail switch away and back, not a different tree: what
+    // is held is the last true answer about these paths, so it stays up while the walk revalidates
+    // it. Clearing here dropped every tag and redrew every mounted row twice per return to Files.
+    // `treeStore.attach` makes the same call, and for the same reason.
+    if (project !== null && get().project === project) return get().refresh()
     generation += 1
     if (timer !== null) {
       clearTimeout(timer)
@@ -119,7 +125,8 @@ export const useGitStatus = create<GitStatusStore>((set, get) => ({
     // refresh was superseded (`generation` — by a project switch or by a later refresh), or
     // the store was pointed somewhere else entirely.
     if (generation !== mine || get().project !== project) return
-    set({ status, degraded: isDegraded('git_tree_status') })
+    // Shared, so a walk that found what the last one found leaves subscribers' selectors unmoved.
+    set({ status: shareEqual(get().status, status), degraded: isDegraded('git_tree_status') })
   },
 
   schedule() {

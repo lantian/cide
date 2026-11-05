@@ -689,7 +689,7 @@ fn restored_pane_voice(
     origin_voice(pane.origin)
 }
 
-fn origin_voice(origin: Option<cide_ipc::PaneOrigin>) -> Option<Voice> {
+pub(crate) fn origin_voice(origin: Option<cide_ipc::PaneOrigin>) -> Option<Voice> {
     match origin {
         Some(cide_ipc::PaneOrigin::Worker) => Some(Voice::Worker),
         Some(cide_ipc::PaneOrigin::Planner | cide_ipc::PaneOrigin::Reviewer) => Some(Voice::Acting),

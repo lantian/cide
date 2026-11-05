@@ -19166,3 +19166,109 @@ global file is untouched, and history survives a forced kill. Bash history tests
 
 **Not confirmed on macOS or in a running GUI:** only Linux zsh 5.x was exercised. Existing
 panels keep the shared history they had; new per-panel files start empty.
+
+## M196 — Sessions nobody is showing end on their own
+
+A closed tab keeps its child for Ctrl+Shift+T, and nothing ended it afterwards: a ten-hour instance
+held 54 `claude` processes at about 350 MB each. `cide_app::reaper` is a thread that polls every 30
+seconds and ends a session once no pane has named it for `reapDetachedAfterMinutes` (default 30,
+`0` for off, capped at a day), through the graceful ladder and then out of the registry so a later
+open resumes it. Exited entries get a minute. Held regardless: any session a pane or a run names,
+half of a two-agent chat, a phone's last five minutes, and anything `pane_is_busy` calls busy. ADR
+0016 has the reasoning, including why `AwaitingInput` must not hold a session.
+
+Reopening a tab whose child has gone now resumes it, from Ctrl+Shift+T and from Back into a File tab
+with a Claude split. `claude_tab::resume_closed` used to serve only tabs cide opened; a user's tab
+goes through it without the unattended stance, and `cide://panes-retired` destroys the stale parked
+terminal in every window so the pane attaches to the resumed child. Without those, the same pane
+would have silently started a fresh conversation.
+
+`docs/architecture.md` said closing a pane or tab never touches the child. Closing a pane does, and
+it now says so.
+
+The plan also called for a `reaped_at` field on the session journal. It was left out: a reaped
+conversation already lists in the Sessions tab, and the reap is logged at `info`.
+
+**Verified:** table tests over the decision and its clock, one of them pinning a finished turn
+against the real `next_state` and `pane_is_busy`; a test that a user's tab never gets the stance
+args; the settings clamp; source pins on the webview half in `check:attach`; the full `./test.sh`.
+
+**Not confirmed in a running GUI:** no child has actually been reaped on a display, and no tab has
+been reopened onto one. `tick` and `resume_closed` have no end-to-end test, because they need an
+`AppHandle`, and `retireHosts` is pinned only by source. Event order (retire before the mount) is
+reasoned from both being emitted in sequence, not observed.
+
+## M197 — A rail click stops paying for the whole project
+
+Switching rail items froze on `axarta-agent`: 772 changed files in 259 directories, five tabs holding
+seven terminals and three editors, 94 OpenSpec changes. A panel click itself is local React state and every Rust read on
+mount is `async`, so the stall had to be on the main thread, in what the click sets off. Reading the
+code gave two causes. Which one dominates is not known; see below.
+
+**Every terminal refitted inside the click's frame.** Panels differ in width, so a switch resizes
+`.content`, and all tabs stay laid out, so every `PaneSlot` observer fires. M102 taught a *settling
+gesture* to defer this and trickle off-screen panes, but a rail click opens no gesture, so
+`whenResizeSettles` ran `fit()`, a reflow and a synchronous `session_resize` for each terminal at
+once. `App.tsx` now calls `noteExternalResize()` in a layout effect on `sidebar.view`, which also
+covers F4 and the `sidebar.*` commands. A visible terminal holds its old grid for about 130 ms.
+
+**The Git panel built its whole list as DOM.** Everything starts expanded and the panel unmounts on
+every switch (keep-alive stays rejected), so about a thousand rows were built on the way in, several
+times, and torn down on the way out. `ChangesTree` is virtualized now, always rather than above a
+row count. The cursor's row stays mounted through `rangeExtractor`, or wheel-scrolling would drop
+focus to `<body>` and take the only tab stop with it. It deliberately does not use `scrollToIndex`,
+as the plan said it would: `focus()` already scrolls, as it always has here, and `scrollToIndex`
+re-checks a frame later without knowing about `.tree`'s padding. That is from reading the library;
+it was not observed on a display. Row height arrives as a prop, because `useUiScale` reaches the
+workspace store, which would break `check:render` at import.
+
+Redundant work per switch also went: `useRef(allGroups(initial))` rebuilt every group's directory
+tree on **every render**; the `loading` state had no reader and cost two renders per refresh;
+`adopt` returns early on an identical payload; merges and worktrees keep their identity; returning
+to Files no longer clears every git tag, which is what `treeStore.attach` already did.
+
+That early return introduced a bug while it was being written, and it is worth keeping. Compared
+against the rendered view, a newest answer equal to what is on screen reads as "no change" whenever
+an older answer is queued but not yet drawn, so the panel settles on the older tree with nothing due
+to correct it. It compares against a separate `adopted` ref. The first test for this passed with the
+bug present: the broadcast named the wrong project, and asserting a row *absent* cannot tell that
+from success. It now asserts the row appears first.
+
+OpenSpec was the first suspect and is not on this path. `openspec list` omits archived changes, so
+the panel draws 2 changes and 15 specs. The 156,346 ignored entries (133k in `target/debug`) are not
+either: `git_status` does not recurse into ignored directories, and asks for them only once the
+Ignored group is open.
+
+`chrome/railTiming.ts` logs `[cide] rail a→b: paint Nms, worst frame Nms` in dev builds, because M31,
+M38 and M102 all shipped freeze work nobody measured. `worst frame` is the one to trust: the
+deferral moves work to after the paint, and `paint` alone would call a moved stall a fix.
+
+**Left undone on purpose.** `flush` still refits all visible terminals in one frame, six of them on
+that project's main tab. A time budget there is the next step if `worst frame` stays above about
+100 ms, and was not added on a guess. `session_resize` stays synchronous, per M102.
+
+**The badge stopped walking behind an open panel.** `gitCountStore.ts` said no walk happened while
+the Git panel was open, but its `onFsChanged` and `onSessionTool` subscriptions scheduled one
+regardless, so an open panel walked twice per burst. Not on the rail-switch path and not a freeze
+(the walks are off the main thread), just waste. `useGitPanel` now takes `holdChangeCount` while it
+shows the project's own tree, and `schedule` skips while held; `refresh`, which *Refresh* calls by
+name, still walks. Releasing asks for one walk, because leaving the panel cancels its pending
+refresh, so a burst just before a rail click would otherwise have been answered by nobody.
+
+Removing the walk naively would have exposed an existing bug it was hiding. `absorb` passed every
+tree to `noteChangeCount`, so a panel on an agent checkout wrote that checkout's count over the
+project's, and the store's next walk put it back. It now notes only the project's own tree, and a
+panel on a checkout does not hold, so there the two walks are of two different trees and both stay.
+
+**Verified:** `./test.sh --only ui`, `tsc`. New guards in `check:git` (2,000 rows: bounded DOM, End
+and arrows reaching unmounted rows, the focused row surviving a scroll), `check:resize`, `check:theme`
+and `check:commit-message`, which now mounts the badge beside the panel and counts `git_status`
+calls. Sixteen deliberate breakages on a scratch copy, the complete `adopted` → `viewRef` regression
+among them; each now fails its check. JSDOM has no layout, so these prove the windowing logic, the
+focus rules and the walk counts, not how any of it looks or how fast it is.
+
+**Not confirmed on a display, including the fix itself.** No frame has been timed and nobody has
+watched a switch. There is no before-figure, and the ranking of the two causes is from reading code.
+Nothing here shows the freeze is gone until the `[cide] rail` lines say so. Unobserved in particular:
+absolute rows in WebKitGTK, native focus-scroll on a transformed row, the drag's edge-scroll over a
+windowed list, and the 130 ms a terminal spends on its old grid.

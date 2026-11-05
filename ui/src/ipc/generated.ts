@@ -11431,6 +11431,18 @@ reopenLastProject: boolean,
  */
 keepSessionsOnWindowClose: boolean, 
 /**
+ * Minutes a session may sit with **no pane showing it** before cide ends it. `0` turns the
+ * reaper off. (M196)
+ *
+ * A closed tab keeps its child so Ctrl+Shift+T can re-adopt it; without this nothing ever
+ * ends that child, and a day of opening and closing OpenSpec tabs left 54 `claude`
+ * processes (~19 GB). The reaper never touches a session a pane references, a run names,
+ * that is mid-turn or holding a permission prompt, or that a phone touched recently; and
+ * Ctrl+Shift+T on a tab it ended resumes the conversation. A turn that has *finished* holds
+ * nothing — see `cide_app::reaper`.
+ */
+reapDetachedAfterMinutes: number, 
+/**
  * "Confirm before closing a project with a live session." *Live* means a session is
  * `Busy` or `AwaitingPermission` — not merely that a process exists, which would warn
  * constantly.
@@ -11541,7 +11553,7 @@ uiFontSize?: number, searchModalLayout?: SearchModalLayout,
  * computed where this lands, so no caller can store an illegible one. See
  * [`crate::settings::Accent`].
  */
-accent?: AccentPatch, awaitingHighlight?: AwaitingHighlight, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
+accent?: AccentPatch, awaitingHighlight?: AwaitingHighlight, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, reapDetachedAfterMinutes?: number, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
 /**
  * Which CLI a new console runs. (M93) See [`crate::settings::Settings::console_harness`].
  */

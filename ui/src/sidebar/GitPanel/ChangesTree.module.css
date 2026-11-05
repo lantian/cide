@@ -35,14 +35,21 @@
   user-select: none;
 }
 
+/* The scroll spacer. Its height is the whole list's, written by the virtualizer. */
+.viewport {
+  position: relative;
+  width: 100%;
+}
+
 /* The gap is the space between twisty, box and name. */
 /*
  * 24px, matching the explorer's row rather than sitting 1px under it.
  *
- * This tree is not virtualized, so unlike `FileTree.tsx`/`SearchPanel.tsx` the height lives
- * in CSS — but it is the same number and the same decision, and the argument for departing
- * from the mock's 21 is in `sidebar/FileTree.tsx`. The two sibling trees disagreed (21 and
- * 23) where IDEA uses one height for both, which is a difference nobody chose.
+ * `ROW_HEIGHT` in `model.ts` is the same design number for the virtualizer, which writes the
+ * scaled result inline; `check:theme` keeps the two in step, and with the explorer and the search
+ * panel. The argument for departing from the mock's 21 is in `sidebar/FileTree.tsx`. The two
+ * sibling trees disagreed (21 and 23) where IDEA uses one height for both, which is a difference
+ * nobody chose.
  *
  * The parity is load-bearing, not incidental: every fixed-size box centred in this row —
  * the file icon, the twisty's triangle, the checkbox's margin box — is sized so that
@@ -50,6 +57,10 @@
  * height here silently un-does all three.
  */
 .row {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
   height: calc(24px * var(--ui-scale));
   display: flex;
   align-items: center;

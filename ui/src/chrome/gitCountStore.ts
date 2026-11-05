@@ -35,10 +35,12 @@
  *   * `cide://session-tool` — arrives ahead of the watcher when Claude edits, which is what
  *     keeps the badge inside the panel's own 200 ms acceptance window.
  *
- * And when the panel is open, no walk happens here at all: `useGitPanel.absorb` hands its tree
- * to {@link noteChangeCount} in passing, the same way it already hands roots to
- * `noteRepoRoots`. Two `git_status` walks of a large repository per keystroke-burst, to
- * produce one number that was already in the first one, is not a cost worth paying.
+ * And while the panel is open on the project's own tree, none of those triggers walks here:
+ * `useGitPanel` holds the count ({@link holdChangeCount}) and its `absorb` hands every tree to
+ * {@link noteChangeCount} in passing, the same way it already hands roots to `noteRepoRoots`. Two
+ * `git_status` walks of a large repository per keystroke-burst, to produce one number that was
+ * already in the first one, is not a cost worth paying. This paragraph said so for a long time
+ * before it was true: `noteChangeCount` was written, but nothing stopped the triggers below.
  */
 import { useEffect } from 'react'
 import { create } from 'zustand'
@@ -96,6 +98,8 @@ interface GitCountStore {
  */
 let generation = 0
 let timer: ReturnType<typeof setTimeout> | null = null
+/** The project a Git panel is feeding this count for. See {@link holdChangeCount}. */
+let panelProject: ProjectId | null = null
 
 export const useGitCount = create<GitCountStore>((set, get) => ({
   project: null,
@@ -131,7 +135,9 @@ export const useGitCount = create<GitCountStore>((set, get) => ({
   },
 
   schedule() {
-    if (timer !== null) return
+    // Here and not on `refresh`: *Refresh* in the palette calls that directly, and a user who asked
+    // for a fresh number gets a walk whatever else is open. Only the event-driven walks are spare.
+    if (timer !== null || panelProject === get().project) return
     timer = setTimeout(() => {
       timer = null
       void get().refresh()
@@ -158,6 +164,41 @@ export function noteChangeCount(project: ProjectId, tree: ChangesTree): void {
   if (useGitCount.getState().project !== project) return
   generation += 1
   useGitCount.setState({ count: countChangedFiles(normalizeStatus(tree)) })
+}
+
+/**
+ * Say that a Git panel will keep this project's count fresh from here on. Returns the release.
+ *
+ * The panel subscribes to every trigger this store does and answers each with a walk it hands to
+ * {@link noteChangeCount}, so while it is open a walk of ours could only produce a number that was
+ * already on its way. A hold, rather than the triggers asking whether the sidebar is on Git, because
+ * two things decide this and neither is the rail's to know:
+ *
+ *   * **Which tree the panel shows.** A panel on an agent checkout under `.cide/worktrees/` walks
+ *     that checkout, which says nothing about the project's own count. It must not hold, and the
+ *     badge keeps its own walks going, exactly as it does with the panel shut.
+ *   * **Which project.** A detached-pane window's panel and the shell can be looking at different
+ *     projects. The comparison in `schedule` is against the project this store is pointed at, so a
+ *     hold on any other project stops nothing.
+ *
+ * The release asks for one walk, and that is not tidiness. Leaving the panel cancels its pending
+ * refresh, so a trigger in the 120 ms before a rail click would otherwise have been answered by
+ * nobody: this store skipped it because the panel was open, and the panel unmounted before acting
+ * on it. The badge would then be wrong until the next edit, which may never come.
+ */
+export function holdChangeCount(project: ProjectId): () => void {
+  panelProject = project
+  const store = useGitCount.getState()
+  // A walk armed a moment before the panel opened would only repeat the panel's own first one.
+  if (timer !== null && store.project === project) {
+    clearTimeout(timer)
+    timer = null
+  }
+  return () => {
+    if (panelProject === project) panelProject = null
+    const after = useGitCount.getState()
+    if (after.project === project) after.schedule()
+  }
 }
 
 /**

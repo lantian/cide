@@ -62,12 +62,13 @@ import {
   type ProjectId,
   type RepoId,
 } from '@/ipc/client'
-import { noteChangeCount } from '@/chrome/gitCountStore'
+import { holdChangeCount, noteChangeCount } from '@/chrome/gitCountStore'
 import { explain } from '@/chrome/branchModel'
 import { notify } from '@/chrome/notices'
 import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { requestFocus } from '@/chrome/focusRequests'
+import { shareEqual } from '@/store/shareEqual'
 import {
   amendPending,
   amendPendingServer,
@@ -305,7 +306,6 @@ export interface GitPanelModel {
   expanded: ReadonlySet<string>
   /** The `ChangeEntry`s behind the ticks, in row order — what the footer counts. */
   picked: ChangeEntry[]
-  loading: boolean
   /** Set when a git call failed. One dim line, not a dialog. */
   unavailable: string | null
   /** A command is in flight; the commit buttons are disabled while it is. */
@@ -661,7 +661,6 @@ export function useGitPanel(
   const [selection, setSelection] = useState<RowSelection>(NO_ROWS)
   const [current, setCurrentRow] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => defaultExpanded(initial))
-  const [loading, setLoading] = useState(false)
   const [unavailable, setUnavailable] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   /**
@@ -699,8 +698,15 @@ export function useGitPanel(
   const [answered, setAnswered] = useState<ReadonlySet<RepoId>>(new Set())
   /** Repos where the answer was "overwrite": the next commit is sent with `force: true`. */
   const overwritten = useRef<Set<RepoId>>(new Set())
-  /** Which groups the previous payload contained, so genuinely new ones can be opened. */
-  const seenGroups = useRef<Set<string>>(allGroups(initial))
+  /**
+   * Which groups the previous payload contained, so genuinely new ones can be opened.
+   *
+   * A lazy `useState` holding a ref-shaped object, not `useRef(allGroups(initial))`. A `useRef`
+   * argument is evaluated on every render and thrown away after the first, and this one rebuilds
+   * the directory tree of every group in the view, the ignored group included — so every render
+   * of the panel paid for a walk whose answer nothing read.
+   */
+  const [seenGroups] = useState(() => ({ current: allGroups(initial) }))
 
   /*
    * The other half of `lastTicks`: hand the selection to the cache whenever it moves.
@@ -744,6 +750,16 @@ export function useGitPanel(
    */
   const viewRef = useRef(view)
   viewRef.current = view
+  /**
+   * The view `adopt` last installed, which is what its "nothing changed" test compares against.
+   *
+   * Not `viewRef`, which is the view last *rendered*. Two answers can land before React gets to
+   * render: with X on screen, a Y arrives and queues, then a newer X arrives. Compared against
+   * the rendered X that newest answer looks like no change and is dropped, Y wins, and the panel
+   * shows a tree the working copy has already left, with nothing due to correct it. Only `adopt`
+   * ever calls `setView`, so this cannot go stale behind its back.
+   */
+  const adopted = useRef(initial)
 
   /**
    * What is in the commit box, for the amend effect below.
@@ -859,11 +875,26 @@ export function useGitPanel(
    * evidence about anything — see the `pruneTo` call below, which is the one thing here that
    * destroys state the user cannot get back by waiting.
    */
-  const adopt = useCallback((next: StatusView, authoritative = true) => {
+  const adopt = useCallback((incoming: StatusView, authoritative = true) => {
+    // An unchanged subtree keeps its identity, so `rows` and everything keyed on `view` hold
+    // through a refresh that changed nothing. Not for a placeholder: `EMPTY` is not git's answer
+    // and has nothing to share with what is on screen.
+    const next = authoritative ? shareEqual(adopted.current, incoming) : incoming
     // Remembered for the next mount of this project's panel — see `lastStatus`. Real
     // answers only: adopting `EMPTY` on a failed status or a project switch is not
     // evidence about the repository.
     if (authoritative && scope !== null) lastStatus.set(scope, next)
+    /*
+     * The same answer as last time: nothing below can have anything to do.
+     *
+     * Every step from here on is a function of the payload — the prunes, `arrivals`, the
+     * divergence bookkeeping — and they already ran against this exact view, or against the cached
+     * one the panel mounted with, last time that was adopted. A remount paints from `lastStatus`
+     * and then revalidates, so this is what every rail switch back to an unchanged tree hits, and
+     * rendering for it was a full rebuild of the row list to arrive at the same rows.
+     */
+    if (authoritative && next === adopted.current) return
+    adopted.current = next
     const live = allFiles(next)
     // A partial selection outlives the panel that made it (it lives in a module store shared
     // with the diff pane), so the payload that says a file is gone is also the only signal
@@ -882,11 +913,12 @@ export function useGitPanel(
     }
     // What is genuinely new is decided *here*, before the two `seen` refs are replaced, and
     // never inside a state updater. React runs an updater eagerly only while the fiber has no
-    // other update pending, and `refresh` always leaves one (`setLoading(false)` runs one line
-    // earlier), so an updater that read `seenFiles.current` ran during the following render —
-    // after the assignments below — and found every id already seen. Nothing was ever ticked
-    // and no group was ever opened: the panel painted its rows and then sat there with every
-    // changelist shut and Commit disabled. See `model.ts::arrivals`.
+    // other update pending, and any update queued ahead of this one is enough to break that (the
+    // bug below came from a `setLoading(false)` one line earlier in `refresh`, since removed), so
+    // an updater that read `seenFiles.current` ran during the following render — after the
+    // assignments below — and found every id already seen. Nothing was ever ticked and no group
+    // was ever opened: the panel painted its rows and then sat there with every changelist shut
+    // and Commit disabled. See `model.ts::arrivals`.
     const fresh = arrivals(next, seenGroups.current)
     const groups = allGroups(next)
     seenGroups.current = groups
@@ -978,7 +1010,12 @@ export function useGitPanel(
    * `chrome/gitCountStore` is always live because the badge has to be right with the sidebar
    * on Files or shut — but while this panel *is* open, both would otherwise walk the work tree
    * on every burst, twice, to produce a number the first walk already contained. See
-   * `noteChangeCount`.
+   * `noteChangeCount` and `holdChangeCount`.
+   *
+   * Only for the project's own tree. An agent checkout's tree is a different number, and the
+   * badge counts the project: `useGitChangeCount` refuses a broadcast tagged with a worktree for
+   * this reason, and this call took one anyway, so a panel on a checkout wrote that checkout's
+   * count over the project's until the store's next walk put it back.
    *
    * Not folded into `viewOf`: `model.ts` is compiled on its own by `check-git-tree.mjs`, and a
    * side effect in a pure mapping is not the sort of thing that stays in one place.
@@ -986,11 +1023,21 @@ export function useGitPanel(
   const absorb = useCallback(
     (tree: ChangesTree): StatusView => {
       noteRepoRoots(tree)
-      if (project !== null) noteChangeCount(project, tree)
+      if (project !== null && worktree === null) noteChangeCount(project, tree)
       return viewOf(tree)
     },
-    [project],
+    [project, worktree],
   )
+
+  /*
+   * While this panel walks the project's own tree, the badge need not walk it as well. The other
+   * half of `absorb` above, and on exactly its condition: holding on a checkout would leave nobody
+   * feeding the project's count. A story has no walks to offer in the first place.
+   */
+  useEffect(() => {
+    if (story !== null || project === null || worktree !== null) return
+    return holdChangeCount(project)
+  }, [story, project, worktree])
 
   /*
    * Bumped on every `refresh`, and an answer tagged with an older one is dropped.
@@ -1020,14 +1067,12 @@ export function useGitPanel(
     // A coalesced background read can supersede a manual one. Its fresh answer still
     // completes the requested refresh, but it may acknowledge only the original note.
     if (manual) refreshAcknowledgement.current = noteRevision.current
-    setLoading(true)
     const raw = await guarded(
       'git status',
       () => gitApi.status(project, includeIgnoredRef.current, worktree),
       () => generation.current === mine,
     )
     if (generation.current !== mine) return
-    setLoading(false)
     // `undefined` is the guard's failure signal; `{ repos: [] }` is a legitimate answer.
     // Keeping the previous tree after a failure would show changes that may no longer
     // exist, so a failure empties the panel.
@@ -1067,7 +1112,10 @@ export function useGitPanel(
     if (generation.current !== mine) return
     // Remembered beside the tree it was probed with — see `lastMerges`.
     if (scope !== null) lastMerges.set(scope, found)
-    setMerges(found)
+    // `found` is a fresh object every time, and `{}` for almost every panel there is. Through
+    // `shareEqual` so that "still no merge" is React's identity bailout rather than one more
+    // render of the panel at the end of every refresh.
+    setMerges((prev) => shareEqual(prev, found))
   }, [project, worktree, scope, story, guarded, adopt, absorb, note])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
@@ -2498,7 +2546,6 @@ export function useGitPanel(
     current,
     expanded,
     picked,
-    loading,
     unavailable,
     busy: draft.generating ? 'Generating commit message…' : busy,
     diverged,

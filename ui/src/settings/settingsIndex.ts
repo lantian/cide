@@ -70,6 +70,7 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   { section: 'projectsAndWindows', label: 'Check for updates on start', keywords: 'update release github auto' },
   { section: 'projectsAndWindows', label: 'Skipping a version', keywords: 'skip update release offer again' },
   { section: 'projectsAndWindows', label: 'Keep sessions running when a project window is closed', keywords: 'background close window' },
+  { section: 'projectsAndWindows', label: 'End sessions nobody is showing after', keywords: 'reap idle detached timeout memory closed tab kill background' },
   { section: 'projectsAndWindows', label: 'Confirm before closing a project with a live session', keywords: 'close prompt warning dialog' },
   { section: 'projectsAndWindows', label: 'Open a run in', keywords: 'agent subagent run tab split view' },
   // Harness

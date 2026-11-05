@@ -422,6 +422,21 @@ try {
     )
   }
 
+  /*
+   * A rail switch resizes the same boxes a splitter does, and nobody is holding it.
+   *
+   * The panels have different widths, so without a gesture open every terminal in every tab refits
+   * at once, before the new panel has painted. Comments stripped first: the house style names the
+   * failure in prose, so the needle is in the comment above the call as well.
+   */
+  const app = read('src/App.tsx').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  ok(
+    /useLayoutEffect\(\(\) => \{[^}]*noteExternalResize\(\)[^}]*\}, \[sidebar\.view\]\)/.test(app),
+    '`App.tsx` opens a gesture when the sidebar view changes, in a LAYOUT effect keyed on the view. '
+      + 'A plain effect runs after `ResizeObserver` has delivered and catches nothing, and a call '
+      + 'in the rail\'s `onSelect` would miss F4 and the `sidebar.*` commands',
+  )
+
   const store = read('src/store/workspace.ts')
   ok(
     /setRatio: async \(project, tab, split, ratio\) => \{\n\s*await paneApi\.setRatio\([^)]*\)\n\s*\},/

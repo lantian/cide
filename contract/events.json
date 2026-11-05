@@ -20,6 +20,7 @@
   "cide://keymap-changed",
   "cide://milestones-changed",
   "cide://mouse-nav",
+  "cide://panes-retired",
   "cide://peer-chat-reviews",
   "cide://pool-notice",
   "cide://project-new-progress",

@@ -35,18 +35,46 @@ const repo = (id, staged = false) => ({
   useStagingArea: staged,
 })
 let status = { repos: [repo('repo-a')] }
+/** What a walk of an agent checkout answers. A different tree from the project's. */
+let checkoutStatus = null
 const statusReads = []
 const shelfReads = []
 const calls = []
 let generation = deferred()
 let commit = deferred()
+// Listeners by event id, so a test can deliver a broadcast the way Rust would. Unlisten is honoured:
+// a panel from an earlier mount must not answer one, because the real one no longer would.
+const callbacks = new Map()
+const listeners = new Map()
+let nextId = 1
+const broadcast = (event, payload) => {
+  for (const listener of listeners.values()) {
+    if (listener.event === event) listener.handler({ event, id: 0, payload })
+  }
+}
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} }
 window.__TAURI_INTERNALS__ = {
-  transformCallback: () => 1,
+  transformCallback: (callback) => {
+    const id = nextId++
+    callbacks.set(id, callback)
+    return id
+  },
   unregisterCallback: () => {},
   invoke: async (command, args) => {
     calls.push({ command, args })
-    if (command === 'git_status') return statusReads.shift()?.promise ?? structuredClone(status)
+    if (command === 'plugin:event|listen') {
+      const id = nextId++
+      listeners.set(id, { event: args.event, handler: callbacks.get(args.handler) })
+      return id
+    }
+    if (command === 'plugin:event|unlisten') {
+      listeners.delete(args.eventId)
+      return
+    }
+    if (command === 'git_status') {
+      return statusReads.shift()?.promise
+        ?? structuredClone(args.worktree ? checkoutStatus ?? status : status)
+    }
     if (command === 'git_conflicts') return null
     if (command === 'git_shelf_list') return shelfReads.shift()?.promise ?? []
     if (command === 'claude_commit_message') return generation.promise
@@ -63,7 +91,8 @@ try {
   execFileSync('node', ['node_modules/vite/bin/vite.js', 'build', '--ssr',
     'src/sidebar/GitPanel/commitSmoke.ts', '--outDir', out, '--logLevel', 'error'], { stdio: 'inherit' })
   const { CommitDraftStore, commitDrafts, commitDraftKey, useGitPanel, GitPanelView,
-    setPartial, clearAllPartials } = await import(`file://${resolve(out, 'commitSmoke.js')}`)
+    setPartial, clearAllPartials, useGitChangeCount, useGitCount,
+  } = await import(`file://${resolve(out, 'commitSmoke.js')}`)
 
   // Scope isolation, subscription cleanup, and edits that return to the same text.
   const drafts = new CommitDraftStore()
@@ -352,7 +381,6 @@ try {
   stale.repos[0].changelists[0].changes.push(change(taskPath))
   await act(async () => older.resolve(stale))
   assert.equal(current.rows.some((row) => row.entry?.path === taskPath), false)
-  assert.equal(current.loading, false)
 
   const olderFailure = deferred()
   const latest = deferred()
@@ -396,6 +424,43 @@ try {
   await click(refreshButton())
   assert.equal(current.unavailable, null)
 
+  /*
+   * An answer that changed nothing installs nothing, which is what every rail switch back to an
+   * unchanged tree relies on: the remount paints from the cache and this revalidation must not
+   * rebuild the same rows underneath it.
+   */
+  const rowsBefore = current.rows
+  await click(refreshButton())
+  assert.equal(current.rows, rowsBefore, 'an identical status keeps the rows, by identity')
+
+  /*
+   * And that shortcut must not compare against the wrong thing. Both broadcasts land in one `act`,
+   * so React renders nothing in between: the second is newest and equal to what is on screen, while
+   * the first is queued and not yet drawn. Measured against the *rendered* view the newest answer
+   * reads as no change and is dropped, the panel settles on the older tree, and if nothing else
+   * touches the working copy nothing ever corrects it.
+   */
+  const between = structuredClone(status)
+  between.repos[0].changelists[0].changes.push(change('landed-between.txt'))
+  const hasBetween = () => current.rows.some((row) => row.entry?.path === 'landed-between.txt')
+  // The control. The assertion below is about a row being absent, which would also hold if a
+  // broadcast never reached the panel at all.
+  await act(async () => broadcast('cide://git-status', { project: 'refresh-project', tree: between }))
+  assert.equal(hasBetween(), true, 'a broadcast reaches the panel and draws its row')
+  await act(async () => {
+    broadcast('cide://git-status', { project: 'refresh-project', tree: structuredClone(status) })
+  })
+  assert.equal(hasBetween(), false, 'and the next one takes it away again')
+  await act(async () => {
+    broadcast('cide://git-status', { project: 'refresh-project', tree: between })
+    broadcast('cide://git-status', { project: 'refresh-project', tree: structuredClone(status) })
+  })
+  assert.equal(
+    hasBetween(),
+    false,
+    'the newest of two answers wins, even when it equals what was on screen before either arrived',
+  )
+
   commit = deferred()
   await click(document.querySelector('[data-audit="gitCommit"]'))
   const refreshedCommit = calls.filter((call) => call.command === 'git_commit').at(-1)
@@ -405,7 +470,123 @@ try {
 
   assert.equal(commitDrafts.get(commitDraftKey('project-b', null)).message, 'project b draft')
   assert.equal(commitDrafts.get(commitDraftKey('project-a', '/test/worktree')).message, 'worktree draft')
-  console.log('Commit panel: scoped drafts, partial selections, generation, refresh recovery and commit clearing passed')
+
+  /*
+   * The rail's badge and an open panel do not both walk for one burst, and the badge is right
+   * either way.
+   *
+   * The second half is the one that matters: dropping a walk is only safe where something else is
+   * answering, and each case below is one where a simpler version of this leaves the badge showing
+   * a wrong number with nothing due to correct it. Real timers, because the 120 ms throttles are
+   * the thing under test, on both sides.
+   */
+  const badge = 'badge-project'
+  const treeOf = (files) => ({ repos: [{
+    ...repo('badge-repo'),
+    changelists: [{ id: 'default', name: 'Changes', active: true, comment: '',
+      changes: Array.from({ length: files }, (_, i) => change(`f${i}.txt`)) }],
+  }] })
+  function Badged({ worktree, panel, panelProject }) {
+    useGitChangeCount(badge)
+    return panel
+      ? React.createElement(Harness, {
+        key: `${panelProject}:${worktree}`, project: panelProject, worktree,
+      })
+      : null
+  }
+  const show = (panel, worktree = null, panelProject = badge) => act(async () => root.render(
+    React.createElement(Badged, { panel, worktree, panelProject }),
+  ))
+  const settle = () => act(async () => { await new Promise((done) => setTimeout(done, 200)) })
+  const burst = (event = 'cide://fs-changed') => act(async () => {
+    broadcast(event, event === 'cide://fs-changed'
+      ? { project: badge, change: {} }
+      : { session: 'some-session', paths: [] })
+  })
+  const walks = () => calls.filter(
+    (call) => call.command === 'git_status' && call.args.project === badge,
+  ).length
+  const badgeCount = () => useGitCount.getState().count
+  const walksFor = async (trigger) => {
+    const before = walks()
+    await trigger()
+    await settle()
+    return walks() - before
+  }
+
+  // Panel shut: the badge is on its own, so it walks.
+  await close()
+  status = treeOf(3)
+  await show(false)
+  await settle()
+  assert.equal(badgeCount(), 3, 'the badge counts the project with no panel open')
+  assert.equal(await walksFor(() => burst()), 1, 'and a burst is one walk, which is its own')
+
+  // Panel open on the project's tree: one walk per burst, whichever signal it arrives on.
+  await show(true)
+  await settle()
+  status = treeOf(5)
+  assert.equal(await walksFor(() => burst()), 1, 'a file burst costs one walk with the panel open')
+  assert.equal(badgeCount(), 5, 'and the badge moved anyway, off the walk the panel made')
+  status = treeOf(6)
+  assert.equal(
+    await walksFor(() => burst('cide://session-tool')),
+    1,
+    'a tool call costs one walk too: the badge subscribes to both signals, and so does the panel',
+  )
+  assert.equal(badgeCount(), 6)
+  // *Refresh* asks by name. A held count must not make that command quietly do nothing.
+  assert.equal(
+    await walksFor(async () => { await act(async () => useGitCount.getState().refresh()) }),
+    1,
+    'an explicit refresh still walks',
+  )
+
+  // A burst the panel never got to answer: its timer is cancelled by the unmount, and the store
+  // skipped the burst because the panel was open. Without a walk on release nobody answers it.
+  status = treeOf(7)
+  await burst()
+  await show(false)
+  await settle()
+  assert.equal(badgeCount(), 7, 'closing the panel catches the badge up on what it had skipped')
+  assert.equal(await walksFor(() => burst()), 1, 'and it is back to walking for itself')
+
+  // A panel on an agent checkout shows a different tree, and the badge counts the project.
+  status = treeOf(4)
+  checkoutStatus = treeOf(2)
+  await show(true, '/checkout')
+  await settle()
+  await act(async () => useGitCount.getState().refresh())
+  assert.equal(badgeCount(), 4, 'the project\'s count, not the two files of the checkout on screen')
+  assert.equal(current.rows.filter((row) => row.kind === 'file').length, 2, 'which is what it shows')
+  // Tagged with the checkout, so no walk of the badge's follows to paper over a wrong write.
+  await act(async () => {
+    broadcast('cide://git-status', { project: badge, tree: treeOf(9), worktree: '/checkout' })
+  })
+  assert.equal(current.rows.filter((row) => row.kind === 'file').length, 9, 'the panel took that')
+  assert.equal(badgeCount(), 4, 'and the badge did not')
+  status = treeOf(8)
+  assert.equal(
+    await walksFor(() => burst()),
+    2,
+    'nobody is feeding the project\'s count from a checkout, so here both walk: one tree each',
+  )
+  assert.equal(badgeCount(), 8, 'and the badge follows the project')
+  checkoutStatus = null
+
+  // A panel on some other project (a detached window's) feeds nothing here, so it holds nothing.
+  await show(true, null, 'other-project')
+  await settle()
+  status = treeOf(11)
+  assert.equal(
+    await walksFor(() => burst()),
+    1,
+    'a panel on another project does not stop this project\'s badge from walking',
+  )
+  assert.equal(badgeCount(), 11, 'and that walk is what keeps it right')
+  await close()
+
+  console.log('Commit panel: scoped drafts, partial selections, generation, refresh recovery, commit clearing and the badge\'s walks passed')
 } finally {
   if (root) await act(async () => root.unmount())
   dom.window.close()

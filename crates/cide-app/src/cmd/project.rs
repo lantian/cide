@@ -1546,9 +1546,10 @@ fn ephemeral_sessions(
 /// the stack is a `Mutex<Vec<_>>`, popping under one lock per iteration is simpler, and a record
 /// this call has decided against is one the *next* call must not see again.
 ///
-/// # A tab cide opened by itself comes back live
+/// # A tab whose child has gone comes back live
 ///
-/// Its children were ended at the close ([`ephemeral_sessions`]), so before it is reinserted
+/// A tab cide opened by itself had its children ended at the close ([`ephemeral_sessions`]), and
+/// `reaper` can have ended anyone else's since. So before it is reinserted
 /// `claude_tab::resume_closed` respawns `--resume` over each pane that can be resumed — session
 /// first, tab second, so the pane mounts onto a running child. That spawn is why this command is
 /// `async`: a synchronous command runs on the GTK loop, and forking a process there is the thing
@@ -1572,67 +1573,67 @@ pub async fn tab_reopen_closed(
                 return Ok(Some(id));
             }
             Reopen::Reinsert => {
-                let resumed = if record.peer_chat.is_none()
-                    && matches!(
-                        record.kind,
-                        TabKind::ClaudeFull {
-                            ephemeral: true,
-                            ..
-                        }
-                    ) {
+                let resumed = if record.peer_chat.is_none() {
                     crate::claude_tab::resume_closed(&app, &mut record).await
                 } else {
                     Vec::new()
                 };
-                let reinserted = state.update(|ws| {
-                    let tab = workspace::reinsert_tab(
-                        ws,
-                        project,
-                        record.index,
-                        record.kind,
-                        record.tree,
-                    )?;
-                    if let Some(mut chat) = record.peer_chat.clone() {
-                        chat.paused = true;
-                        chat.starting = false;
-                        workspace::tab_mut(ws, project, tab)?.peer_chat = Some(chat);
-                    }
-                    if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
-                        let bindings: Vec<_> = workspace::tab(ws, project, tab)?
-                            .tree
-                            .panes
-                            .values()
-                            .filter_map(|pane| {
-                                pane.session
-                                    .filter(|id| resumed.contains(id))
-                                    .map(|id| (pane.id, id))
-                            })
-                            .collect();
-                        // Startup hooks can arrive while the reopened tab is still outside the tree.
-                        for (pane, session) in bindings {
-                            crate::cmd::pane::bind_recorded_session(
-                                ws, &registry, project, tab, pane, session,
-                            )?;
-                        }
-                    }
-                    Ok(tab)
-                });
-                if reinserted.is_err()
-                    && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
-                {
-                    // The project closed between the spawn and the reinsert, or the mutation
-                    // failed its validator: a live `claude` with no pane is a leak and a billed
-                    // process, so it goes now — `claude_tab::open`'s rule on the same failure.
-                    for session in resumed {
-                        if let Some(pty) = registry.get(session) {
-                            pty.kill();
-                        }
-                    }
-                }
-                return reinserted.map(Some);
+                return reinsert_record(&app, &state, record, resumed).map(Some);
             }
         }
     }
+}
+
+/// Put a closed tab back, binding what [`crate::claude_tab::resume_closed`] started.
+///
+/// Shared with `cmd::file::tab_reopen_file`, whose record can hold a Claude split.
+pub(crate) fn reinsert_record(
+    app: &tauri::AppHandle,
+    state: &WorkspaceState,
+    record: crate::closed_tabs::ClosedTab,
+    resumed: Vec<SessionId>,
+) -> Result<TabId, CoreError> {
+    let project = record.project;
+    let reinserted = state.update(|ws| {
+        let tab = workspace::reinsert_tab(ws, project, record.index, record.kind, record.tree)?;
+        if let Some(mut chat) = record.peer_chat.clone() {
+            chat.paused = true;
+            chat.starting = false;
+            workspace::tab_mut(ws, project, tab)?.peer_chat = Some(chat);
+        }
+        if let Some(registry) = app.try_state::<crate::state::SessionRegistry>() {
+            let bindings: Vec<_> = workspace::tab(ws, project, tab)?
+                .tree
+                .panes
+                .values()
+                .filter_map(|pane| {
+                    pane.session
+                        .filter(|id| resumed.contains(id))
+                        .map(|id| (pane.id, id))
+                })
+                .collect();
+            // Startup hooks can arrive while the reopened tab is still outside the tree.
+            for (pane, session) in bindings {
+                crate::cmd::pane::bind_recorded_session(
+                    ws, &registry, project, tab, pane, session,
+                )?;
+            }
+        }
+        Ok(tab)
+    });
+    if reinserted.is_err()
+        && let Some(registry) = app.try_state::<crate::state::SessionRegistry>()
+    {
+        // The project closed between the spawn and the reinsert, or the mutation failed its
+        // validator: a live `claude` with no pane is a leak and a billed process, so it goes now —
+        // `claude_tab::open`'s rule on the same failure.
+        for session in resumed {
+            if let Some(pty) = registry.get(session) {
+                pty.kill();
+            }
+        }
+    }
+    reinserted
 }
 
 /// What [`tab_reopen_closed`] should do with one record. See that function for the reasoning.

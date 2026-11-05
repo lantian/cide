@@ -33,6 +33,8 @@ import './icons/icon.css'
  */
 import './editor/highlight.css'
 import { installConsoleBridge } from './ipc/consoleBridge'
+import { onPanesRetired } from './ipc/client'
+import { retireHosts } from './layout/paneHosts'
 import { installThemeSync } from './settings/useSettings'
 
 const root = document.getElementById('root')
@@ -60,6 +62,10 @@ installConsoleBridge()
 // the first render, because a `TerminalPane` mounted in that render builds an xterm that reads
 // the tokens at construction — an effect would hand it the wrong palette and then correct it.
 installThemeSync()
+
+// At module scope for the same window-lifetime reason, and because a reopen's event has to be
+// heard before the broadcast that mounts the pane it retires. Every window has its own hosts.
+void onPanesRetired(retireHosts)
 
 // StrictMode double-invokes effects in development, which is exactly the pressure a pane
 // host registry should be under: spawning a PTY twice per pane would be a real bug, and

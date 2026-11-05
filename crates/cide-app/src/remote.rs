@@ -442,6 +442,7 @@ impl RemoteHost for AppRemoteHost {
     }
 
     fn screen(&self, session: cide_ipc::SessionId) -> Option<ScreenCapture> {
+        crate::reaper::note_remote(session);
         // `None` for a session this process does not hold, which is an ordinary answer: a device
         // may be watching a pane that has since closed, and the server turns this into a sentence
         // rather than into silence.
@@ -459,6 +460,7 @@ impl RemoteHost for AppRemoteHost {
         from_top: u32,
         rows: u16,
     ) -> Option<ScrollbackCapture> {
+        crate::reaper::note_remote(session);
         Some(
             self.app
                 .try_state::<SessionRegistry>()?
@@ -468,6 +470,7 @@ impl RemoteHost for AppRemoteHost {
     }
 
     fn prompt(&self, session: cide_ipc::SessionId) -> Option<PermissionPrompt> {
+        crate::reaper::note_remote(session);
         // The state comes from the hook and the screen comes from the mirror, and both are read
         // here rather than passed in: `parse` refuses anything whose session is not awaiting
         // permission, and that gate is only worth having if the state it reads is the state now.
@@ -486,6 +489,7 @@ impl RemoteHost for AppRemoteHost {
         option: u8,
         expect_screen: &str,
     ) -> Result<(), String> {
+        crate::reaper::note_remote(session);
         // Re-read, re-parse, compare — in that order and at this moment. Over a network the
         // prompt a thumb was travelling towards can already have been replaced by the next one,
         // and without this a tap on "No, tell Claude what to do differently" lands as "1. Yes"
@@ -527,6 +531,7 @@ impl RemoteHost for AppRemoteHost {
         epoch: &str,
         seq: u64,
     ) -> Result<(), String> {
+        crate::reaper::note_remote(session);
         // A line submitted from the phone is the user at a keyboard as much as one typed at the
         // desk — see `agent_rpc::note_typed`. (M132)
         if bytes.contains(&b'\r') {
