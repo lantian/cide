@@ -25,6 +25,7 @@
   "cide://pool-notice",
   "cide://project-new-progress",
   "cide://project-running",
+  "cide://recent-project-requested",
   "cide://remote-changed",
   "cide://remote-scroll",
   "cide://schemes-changed",

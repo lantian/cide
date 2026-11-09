@@ -844,6 +844,21 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return void requestNewProject()
 
       /*
+       * Close the active project (M198) — the header tab's *Close project*, through the same
+       * store action, so the unsaved-file and live-session question is asked here too. Added
+       * for the macOS menu bar's File menu; the palette row and a bindable id come with it.
+       *
+       * Both halves of the clause re-checked, because a clause gates the palette and never the
+       * keys: a detached window shows one project but has no strip to close it from.
+       */
+      case 'project.close': {
+        if (boot()?.role.kind !== 'shell') return unmet(command, 'this window has no project strip')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        return void ws.closeProject(project.id)
+      }
+
+      /*
        * Ctrl+` — the held-modifier switcher over **projects**, in most-recently-used order.
        *
        * It was Ctrl+Tab until the tab switcher above took that chord; `cide_core::keymap` holds

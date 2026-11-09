@@ -19272,3 +19272,45 @@ watched a switch. There is no before-figure, and the ranking of the two causes i
 Nothing here shows the freeze is gone until the `[cide] rail` lines say so. Unobserved in particular:
 absolute rows in WebKitGTK, native focus-scroll on a transformed row, the drag's edge-scroll over a
 windowed list, and the 130 ms a terminal spends on its old grid.
+
+## M198 — The macOS File menu has something in it
+
+On a Mac the File menu held only *Close Window*, the default tauri installs: no project could be
+opened, created or reopened from the menu bar. `cide-app`'s `app_menu` now inserts into the
+default rather than replacing it (the Edit items and ⌘Q are why, unchanged since M127). File gets
+New Project…, New Scratch File…, Open Project…, *Open Recent ▸*, Save, Save All, Close Tab, Reopen
+Closed Tab, Close Project and Settings…, above *Close Window*. The app menu gets *Settings…* under
+*Check for Updates…*. Settings is in both places by request.
+
+Every row is a registry id. A click asks the focused shell window to dispatch it, through
+`cide://command-requested` with `project: null` ("whatever this window shows"), so a menu pick is
+a palette pick, refusals included. *Close Project* needed an id to name, so it became the
+command `project.close`, which runs the header's close with its unsaved/live-session question
+and is now in the palette too. *Close Tab* matters most: ⌘W is *Close Window* on a Mac, so
+`tab.close` had no working gesture in the menu bar.
+
+**No accelerators.** AppKit takes a menu item's key equivalent before the web view, so a shortcut
+on these rows would take the chord from the keymap rather than label it. `MACOS_MENU_CHORDS` is
+still the default's twelve.
+
+*Open Recent* lists 15 projects by display path, newest first. A missing folder is listed greyed,
+*More…* opens the project picker, and *Clear Menu* is the header's *Clear recent projects*. A
+row's click is `cide://recent-project-requested` to the window, which runs the header's own
+`projectMenu.reopen`, so a vanished folder becomes a `Failures` toast. muda has no menu-will-open
+hook, so the submenu is redrawn from the two places the recents file changes (an open, a
+forget/clear), off the main thread, under its own lock, reusing `project_recent`'s reader.
+
+**Verified:** `cargo test -p cide-app app_menu` (12 tests). They check that every row names a
+registry command, that ids round-trip including paths with `:` and spaces, and the recent rows'
+order, cap, greying, empty state and *Clear Menu* enablement. Also `cargo test -p cide-core
+commands keymap`, `check:commands`, `check:keys`, `check:switcher`, `check:unlisten`,
+`check:selectors`, `check:menu-model`, `tsc`, the contract and codegen checks, and clippy
+`-D warnings` on `cide-app`. All of the tauri glue except the one `install` call compiles on
+Linux, because it is plain `tauri::menu`, unlike M127's macOS-only module.
+
+**Never run on a Mac.** Unconfirmed: that the default's first submenu is the app menu with
+*About* at index 0, that a submenu titled `File` is found, that the rows draw above *Close
+Window*, that a click reaches the focused window, and that *Open Recent* fills shortly after
+launch. Rows are never greyed for a failed precondition, so Close Tab on the console or Save with
+no editor is a diagnostic-log refusal. Clicking while a detached window has focus runs the
+command in the first shell window.

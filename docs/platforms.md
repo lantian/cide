@@ -354,10 +354,24 @@ at before choosing:
   That is a design decision. Until it is made, the header draws its own buttons on the left and
   the OS resizes the edges.
 * **The menu bar.** cide calls no `.enable_macos_default_menu(false)`, and the menu it sets
-  (`cide-app`'s `app_menu`, since M127) is tauri's `Menu::default` with one item added —
-  *Check for Updates…* after *About*, no accelerator — so its accelerators are still the
-  default's, which AppKit resolves ahead of the web view. The item is type-checked for Darwin,
-  never run.
+  (`cide-app`'s `app_menu`) is tauri's `Menu::default` with items inserted, none replaced:
+  *Check for Updates…* after *About* (M127) and *Settings…* below it, and a File menu (M198) —
+  New Project…, New Scratch File…, Open Project…, *Open Recent ▸*, Save, Save All, Close Tab,
+  Reopen Closed Tab, Close Project, Settings… — above the default's *Close Window*. **None has
+  an accelerator**, so the menu's accelerators are still the default's, which AppKit resolves
+  ahead of the web view: an accelerator on a new item would take its chord from the keymap rather
+  than label it. A click runs the registry command in the focused shell window
+  (`cide://command-requested` with no project); an *Open Recent* row asks that window to run the
+  header's reopen, so a vanished folder is a toast rather than a log line. *Open Recent* is
+  redrawn when the recents file changes (an open, a forget, *Clear Menu*), because muda has no
+  menu-will-open hook — so a folder deleted since then draws enabled and fails on the click.
+  Rows are never greyed for a failed precondition (Close Tab on the console, Save with no
+  editor); that is the dispatcher's logged refusal, as from the palette. Everything but the one
+  `install` call compiles and is unit-tested on Linux — the glue is plain `tauri::menu` — and
+  **none of it has been run on a Mac**: what one has to confirm is that the default's first
+  submenu is the app menu with *About* first, that a submenu titled `File` is found, that the
+  rows draw above *Close Window*, that a click reaches the focused window, and that *Open
+  Recent* fills a moment after launch.
   `keymap::MACOS_MENU_CHORDS` lists all twelve and `macos_menu_conflicts()` computes which
   bindings they kill; a test pins the answer in both directions, so a new dead chord fails the
   build rather than shipping, and `./target/debug/cide-headless keymap` prints the list under

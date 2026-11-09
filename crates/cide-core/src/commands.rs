@@ -674,6 +674,18 @@ fn build() -> Vec<Command> {
             "openspec",
             "milestones",
         ]),
+        // (M198) Closing the active one — the header tab's *Close project*, with its unsaved-file
+        // and live-session question. It existed only as that right-click until the macOS menu
+        // bar's File menu needed a command to name, and a command is also what puts it in the
+        // palette and in reach of a binding.
+        //
+        // `shellWindow && projectOpen`: a project closes from the window whose strip holds it,
+        // and the handler re-checks both, since a clause gates the palette and never the keys.
+        // No `close` keyword: it is in the title already, and a tie on it falls to registry
+        // order, which keeps *Close tab* — far the commoner gesture — answering first.
+        Command::new("project.close", "Close project", PROJECT)
+            .when("shellWindow && projectOpen")
+            .keywords(&["remove", "folder", "workspace"]),
         //
         // The *switcher* is Ctrl+` — the key left of `1`, which is what a keyboard reports as
         // `Backquote` on every layout: hold the modifier, walk a popup in most-recently-used

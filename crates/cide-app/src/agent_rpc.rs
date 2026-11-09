@@ -1700,7 +1700,7 @@ impl AgentSink for RegistrySink {
             })
         });
         let window = window.ok_or_else(|| "no open window is showing this project".to_string())?;
-        crate::emit::command_requested(&self.app, &window, self.project, command, args);
+        crate::emit::command_requested(&self.app, &window, Some(self.project), command, args);
         Ok(())
     }
 

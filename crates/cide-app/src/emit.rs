@@ -1184,7 +1184,6 @@ struct UpdateCheckRequested<'a> {
     window: &'a str,
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn update_check_requested(app: &AppHandle, window: &cide_ipc::WindowLabel) {
     let payload = UpdateCheckRequested { window: &window.0 };
     if let Err(error) = app.emit_to(window.0.as_str(), UPDATE_CHECK_REQUESTED, payload) {
@@ -1192,21 +1191,24 @@ pub fn update_check_requested(app: &AppHandle, window: &cide_ipc::WindowLabel) {
     }
 }
 
-/// The console asked for a registry command to run, as the palette would run it (M134,
-/// `cide_command_run`).
+/// A registry command should run in one window, as the palette would run it: asked by the
+/// console (M134, `cide_command_run`) or by a macOS menu bar item (M198, `crate::app_menu`).
 ///
-/// Addressed to the one shell window that has the project in its strip, for
-/// [`UPDATE_CHECK_REQUESTED`]'s reason: every window runs its own dispatcher, and a command
-/// broadcast to all of them would open the palette in each. `project` rides along so a window
-/// whose active project is another can switch to the caller's first — a command acts on the
-/// active project, and the user typed the request into this one.
+/// Addressed to one shell window, for [`UPDATE_CHECK_REQUESTED`]'s reason: every window runs
+/// its own dispatcher, and a command broadcast to all of them would open the palette in each.
+///
+/// `project` is `Some` from the console, so a window whose active project is another can switch
+/// to the caller's first — a command acts on the active project, and the user typed the request
+/// into this one. It is `None` from the menu bar, which belongs to no project: the command runs
+/// on whatever the window is showing, which is what a palette pick in it would do — including
+/// nothing at all, in the empty shell, where New Project… and Open Project… are the point.
 pub const COMMAND_REQUESTED: &str = "cide://command-requested";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CommandRequested<'a> {
     window: &'a str,
-    project: cide_ipc::ProjectId,
+    project: Option<cide_ipc::ProjectId>,
     command: &'a str,
     args: Option<serde_json::Value>,
 }
@@ -1214,7 +1216,7 @@ struct CommandRequested<'a> {
 pub fn command_requested(
     app: &AppHandle,
     window: &cide_ipc::WindowLabel,
-    project: cide_ipc::ProjectId,
+    project: Option<cide_ipc::ProjectId>,
     command: &str,
     args: Option<serde_json::Value>,
 ) {
@@ -1226,6 +1228,37 @@ pub fn command_requested(
     };
     if let Err(error) = app.emit_to(window.0.as_str(), COMMAND_REQUESTED, payload) {
         tracing::debug!(%error, window = %window.0, "command-requested reached no window");
+    }
+}
+
+/// A row of the macOS menu bar's *Open Recent* was clicked (M198, `crate::app_menu`).
+///
+/// Only asks: the window runs the header menu's own `projectMenu.reopen(path)`, so a folder that
+/// has gone since the submenu was drawn is refused by `project_open_recent` and said by
+/// `Failures`, exactly as from the header. Opening it from Rust instead would have had nowhere to
+/// put that sentence. One shell window, by the payload's `window`, for
+/// [`UPDATE_CHECK_REQUESTED`]'s reason.
+pub const RECENT_PROJECT_REQUESTED: &str = "cide://recent-project-requested";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecentProjectRequested<'a> {
+    window: &'a str,
+    path: &'a str,
+}
+
+pub fn recent_project_requested(
+    app: &AppHandle,
+    window: &cide_ipc::WindowLabel,
+    path: &std::path::Path,
+) {
+    let path = path.to_string_lossy();
+    let payload = RecentProjectRequested {
+        window: &window.0,
+        path: &path,
+    };
+    if let Err(error) = app.emit_to(window.0.as_str(), RECENT_PROJECT_REQUESTED, payload) {
+        tracing::debug!(%error, window = %window.0, "recent-project-requested reached no window");
     }
 }
 

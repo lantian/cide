@@ -155,8 +155,14 @@ fn open_project_here(
         // as long as that takes, which is the one thing this list is not worth. It is
         // best-effort by design (see `remember`), so there is no answer to wait for and nothing
         // to report.
+        //
+        // The macOS menu bar's *Open Recent* is redrawn after the write, in the same closure:
+        // it reads the file `remember` just wrote, and it stats, so it belongs off this thread
+        // for the same reason. Free on every other host (`app_menu::refresh_recent`).
+        let handle = app.clone();
         drop(tauri::async_runtime::spawn_blocking(move || {
-            remember(&root, &name)
+            remember(&root, &name);
+            crate::app_menu::refresh_recent(&handle);
         }));
     }
 
@@ -286,16 +292,23 @@ fn with_existence(list: Vec<RecentProject>) -> Vec<RecentEntry> {
 /// NFS timeout on the IPC thread would freeze every window, not just the menu that asked.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn project_recent() -> Result<Vec<RecentEntry>, CoreError> {
-    tauri::async_runtime::spawn_blocking(|| {
-        // The lock covers the read and is dropped before the stats — see `with_existence`.
-        let list = {
-            let _guard = RECENT_LOCK.lock();
-            persist::load_recent(&persist::recent_path())
-        };
-        with_existence(list)
-    })
-    .await
-    .map_err(|e| CoreError::Io(format!("recent projects: {e}")))
+    tauri::async_runtime::spawn_blocking(load_recent_entries)
+        .await
+        .map_err(|e| CoreError::Io(format!("recent projects: {e}")))
+}
+
+/// The recents list, each entry marked with whether its directory is still there. **Blocking.**
+///
+/// What [`project_recent`] answers and what the macOS menu bar's *Open Recent* draws
+/// (`app_menu::refresh_recent`) — one reader, so the header's menu and the menu bar cannot
+/// disagree about the order or about which folders are gone. The lock covers the read and is
+/// dropped before the stats — see [`with_existence`].
+pub(crate) fn load_recent_entries() -> Vec<RecentEntry> {
+    let list = {
+        let _guard = RECENT_LOCK.lock();
+        persist::load_recent(&persist::recent_path())
+    };
+    with_existence(list)
 }
 
 /// Drop one entry, or every entry, and answer with what is left.
@@ -306,8 +319,14 @@ pub async fn project_recent() -> Result<Vec<RecentEntry>, CoreError> {
 ///
 /// Answers with the new list rather than a count, so the menu that asked can repaint from the
 /// truth instead of patching its own copy — the same argument the workspace mirror makes.
+///
+/// Also what the macOS menu bar's *Clear Menu* runs (`app_menu`), and the menu bar's *Open Recent*
+/// is redrawn after either: `app` is injected by tauri and is not part of the payload.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn project_forget_recent(path: Option<String>) -> Result<Vec<RecentEntry>, CoreError> {
+pub async fn project_forget_recent(
+    app: tauri::AppHandle,
+    path: Option<String>,
+) -> Result<Vec<RecentEntry>, CoreError> {
     tauri::async_runtime::spawn_blocking(move || {
         // Read-modify-write under the lock; the stats below it are not — see `with_existence`.
         let list = {
@@ -346,7 +365,11 @@ pub async fn project_forget_recent(path: Option<String>) -> Result<Vec<RecentEnt
             }
             list
         };
-        with_existence(list)
+        let left = with_existence(list);
+        // After the lock is released: the redraw takes its own and reads the file back, so it
+        // draws what was written rather than a copy of it. Free off macOS.
+        crate::app_menu::refresh_recent(&app);
+        left
     })
     .await
     .map_err(|e| CoreError::Io(format!("recent projects: {e}")))

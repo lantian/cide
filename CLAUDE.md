@@ -145,6 +145,7 @@ before you change it.
 | [`windows/`, detach and re-dock](docs/checks.md#windows-detach-and-re-dock) | `check:detached`, `check:window-controls` |
 | [Which projects or tabs a window draws](docs/checks.md#which-projects-or-tabs-a-window-draws) | `check:detached`, `check:commands`, `check:switcher`, `cargo test -p cide-core workspace`, `cargo test -p cide-app` |
 | [The macOS dock menu](docs/checks.md#the-macos-dock-menu) | `cargo test -p cide-app dock` |
+| [The macOS menu bar](docs/checks.md#the-macos-menu-bar) | `cargo test -p cide-app app_menu`, `cargo test -p cide-core commands`, `check:commands`, `check:keys`, `check:unlisten`, `cargo --locked xtask contract-check` |
 | [`cide-lang`, `cide-lsp`, symbol navigation, diagnostics](docs/checks.md#cide-lang-cide-lsp-symbol-navigation-diagnostics) | `check:outline`, `check:problems`, `check:commands`, `check:keys` |
 | [Code completion](docs/checks.md#code-completion) | `check:completion`, `check:editor`, `cargo test -p cide-lsp -- --ignored offers_an_import_edit` |
 | [The bundled servers](docs/checks.md#the-bundled-servers) | `cargo test -p cide-lsp`, `cargo test -p cide-core`, `cargo test -p xtask`, `cargo test -p cide-lsp -- --ignored a_broken_first_candidate`, `cargo test -p cide-lsp --test real_npm_server -- --ignored` |

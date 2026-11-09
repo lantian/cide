@@ -1455,11 +1455,15 @@ export const events = {
       'cide://editor-reveal',
       (e) => { if (e.payload.window === windowLabel()) handler(e.payload) },
     ),
-  /** Run one palette command in the project's shell window, filtered by its label. */
+  /**
+   * Run one palette command in this shell window, filtered by its label. `project` is the
+   * console's project (`cide_command_run`), or `null` from the macOS menu bar, which belongs to
+   * no project and means "whatever this window is showing".
+   */
   onCommandRequested: (
-    handler: (request: { project: string; command: string; args: unknown }) => void,
+    handler: (request: { project: string | null; command: string; args: unknown }) => void,
   ) =>
-    listen<{ window: string; project: string; command: string; args: unknown }>(
+    listen<{ window: string; project: string | null; command: string; args: unknown }>(
       'cide://command-requested',
       (e) => {
         if (e.payload.window === windowLabel()) handler(e.payload)
@@ -5817,3 +5821,19 @@ export const onPanesRetired = (
     'cide://panes-retired',
     (e) => handler(e.payload.sessions, e.payload.panes),
   )
+
+/* --------------------------------------------------------------------------------------
+ * The macOS menu bar's *Open Recent* (M198). See `cide-app`'s `app_menu` for why a click is
+ * routed through a window rather than opened in Rust: the reopen is `projectMenu.reopen`, so a
+ * folder gone since the submenu was drawn fails through `Failures`, as it does from the header.
+ * ------------------------------------------------------------------------------------ */
+export const menuBar = {
+  /**
+   * `cide://recent-project-requested`, addressed to one shell window. Filtered by label for
+   * `onCheckRequested`'s reason — `emit_to` reaches every webview, and each would reopen it.
+   */
+  onRecentProjectRequested: (handler: (path: string) => void) =>
+    listen<{ window: string; path: string }>('cide://recent-project-requested', (e) => {
+      if (e.payload.window === windowLabel()) handler(e.payload.path)
+    }),
+}

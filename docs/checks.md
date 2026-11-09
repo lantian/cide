@@ -693,6 +693,15 @@ This does not exercise the native Tauri webview. `audit:project-picker` also cov
 
 `cargo test -p cide-app dock` covers the model; the AppKit half cannot be built here at all. Check it by copying the `macos` module into a throwaway crate with the cide-side types stubbed and running `docs/platforms.md`'s Darwin recipe plus `cargo clippy --all-targets` — the recipe is in *Type-checking for macOS from Linux*, and it caught a hard error and two `-D warnings` clippy lints the first time
 
+### The macOS menu bar
+
+**Touches:** the macOS menu bar's File menu, *Open Recent* and *Settings…* — `cide-app`'s `app_menu`, `cmd::project`'s `load_recent_entries`/`project_forget_recent`, `cide://command-requested` (its `project: null`), `cide://recent-project-requested`, `project.close`
+
+`cargo test -p cide-app app_menu`, `cargo test -p cide-core commands`, `check:commands`, `check:keys`, `check:unlisten`, `cargo --locked xtask contract-check`. (M198) Three silent failures, and none of it has been run on a Mac.
+- **A row names a registry id, and a wrong one does nothing.** A click dispatches the id in the answering window; an id the registry lacks falls to the dispatcher's fallback and a diagnostic line. `every_file_menu_row_names_a_registry_command` is the guard — keep every row a `Row::Command` it can see.
+- **No accelerators.** AppKit resolves a menu key equivalent before WKWebView, so one here takes the chord from the keymap rather than labelling it, and adds to `keymap::MACOS_MENU_CHORDS` without the test that pins that list noticing. Keep `None::<&str>` on every item.
+- **`refresh_recent` is blocking and never on the main thread.** It stats every listed folder and holds its lock while tauri hops each submenu edit to the main thread and waits. Both call sites are `spawn_blocking` closures, and the redraw comes *after* `RECENT_LOCK` is released (it takes it again to read) — `parking_lot`'s mutex is not reentrant.
+
 ### `cide-lang`, `cide-lsp`, symbol navigation, diagnostics
 
 **Touches:** `cide-lang`, `cide-lsp`, symbol navigation, diagnostics

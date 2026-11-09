@@ -156,6 +156,8 @@ import {
   windows as windowApi,
   diag,
   events,
+  menuBar,
+  projectMenu,
   settings as settingsApi,
   agentEvents,
   taskEvents,
@@ -1392,17 +1394,32 @@ export function App() {
   }, [])
   useEffect(() => {
     const off = events.onCommandRequested((request) => {
-      if (request.project === activeProjectId) {
+      // `null` is the macOS menu bar (M198), which belongs to no project: run on whatever this
+      // window shows, as a palette pick in it would — the empty shell included.
+      if (request.project === null || request.project === activeProjectId) {
         runCommand(request.command, request.args ?? null)
         return
       }
-      pendingCommand.current = request
+      pendingCommand.current = { project: request.project, command: request.command, args: request.args }
       void activateProject(request.project as ProjectId)
     })
     return () => {
       void off.then((stop) => stop())
     }
   }, [activeProjectId, activateProject, runCommand])
+  /*
+   * The macOS menu bar's *Open Recent* (M198): the header menu's own reopen, so a folder gone
+   * since the submenu was drawn is refused in Rust and said by `Failures` — `void` for the reason
+   * `ProjectMenu` gives. The project arrives on the open's own broadcast.
+   */
+  useEffect(() => {
+    const off = menuBar.onRecentProjectRequested((path) => {
+      void projectMenu.reopen(path)
+    })
+    return () => {
+      void off.then((stop) => stop())
+    }
+  }, [])
   useEffect(() => {
     const pending = pendingCommand.current
     if (pending === null || pending.project !== activeProjectId) return
