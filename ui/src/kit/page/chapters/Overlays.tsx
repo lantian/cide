@@ -5,6 +5,7 @@ import { Field, TextInput } from '../../components/Field'
 import { Note } from '../../components/Feedback'
 import {
   Dialog,
+  DragGhost,
   Menu,
   Picker,
   PickerFoot,
@@ -42,6 +43,29 @@ export function Overlays(): ReactElement {
         </>
       }
     >
+      <Specimen
+        name="Drag ghost"
+        source="Overlay.tsx › DragGhost"
+        use="What is carried and the verdict, under the pointer during a tree drag — accent for a move, red with the reason for a refusal, plain over nothing or a no-op. Fixed to the viewport and never a pointer target; shown here inside a transformed box so it stays in its frame."
+      >
+        <div style={{ display: 'flex', gap: 'calc(24px * var(--ui-scale))', flexWrap: 'wrap' }}>
+          {(
+            [
+              ['move', 'Move to “Release 0.18”'],
+              ['refuse', '“Ideas” cannot go inside itself'],
+              ['noop', 'Already in “Menus”'],
+            ] as const
+          ).map(([outcome, hint]) => (
+            <div
+              key={outcome}
+              style={{ position: 'relative', transform: 'translateZ(0)', width: 'calc(240px * var(--ui-scale))', height: 'calc(56px * var(--ui-scale))' }}
+            >
+              <DragGhost x={-12} y={-14} load="Sessions panel mockup" hint={hint} outcome={outcome} />
+            </div>
+          ))}
+        </div>
+      </Specimen>
+
       <Specimen
         name="Dialog"
         source="Overlay.tsx › Dialog, Scrim"

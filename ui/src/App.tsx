@@ -103,9 +103,11 @@ import { followSpecRuns, useSpecRuns } from '@/sidebar/OpenSpecPanel/specRuns'
 import { invalidateSpecData, retainSpecProjects } from '@/sidebar/OpenSpecPanel/specData'
 import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
-import { openCount, waitingCount } from '@/sidebar/TasksPanel/model'
+import { openCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
 import { useUserRequests } from '@/sidebar/userRequestsStore'
+import { useSessions } from '@/sidebar/sessionsStore'
+import { useWaitingCounts } from '@/sidebar/sessionsWaiting'
 import { followRunTab } from '@/sidebar/OpenSpecPanel/specRuns'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { ProjectPicker } from '@/overlays/ProjectPicker'
@@ -988,16 +990,20 @@ export function App() {
   // component is the whole shell. The rail's badge is the only thing here that reads it.
   const openTasks = useTasks((s) => openCount(s.board))
   /*
-   * Tasks waiting for the user (M132) — accepted by eye and in review, or carrying an open
-   * question — for the rail's second mark on the Agents button, whose Waiting tab lists them.
-   * A number, not the lists, for `openTasks`' reason: the selector's answer is a primitive, so a
-   * board that changes nothing it counts re-renders nothing here. `null` for every board arm but
-   * `ready`, `openCount`'s rule — nobody looked is not "nothing waits".
+   * What waits for the user (M132, M199) — sessions stopped on them and the Waiting tab's tasks
+   * and requests, a session's question counted once — for the amber count on the Agents button.
+   * From `sessionsWaiting.ts`, which republishes only when a figure moves, for `openTasks`'
+   * reason: this component is the whole shell, and a board or a row list selected here would
+   * re-render it on every change to either.
    */
-  const waitingTasks = useTasks((s) =>
-    s.board.kind === 'ready' ? waitingCount(s.board.tasks) : null,
-  )
+  const waitingCounts = useWaitingCounts()
   const attachRequests = useUserRequests((s) => s.attach)
+  /*
+   * The session journal for the active project (M199). Attached here and not by the Sessions
+   * tab, because the rail's count reads it while the Agents panel is shut — `attachRequests`'
+   * reason, one line up.
+   */
+  const attachSessions = useSessions((s) => s.attach)
   const attachTasks = useTasks((s) => s.attach)
   const adoptTasks = useTasks((s) => s.adopt)
   /*
@@ -1013,7 +1019,8 @@ export function App() {
   useEffect(() => {
     void attachRequests(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
     void attachTasks(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
-  }, [attachTasks, attachRequests, activeProjectId, boot?.role.kind])
+    attachSessions(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
+  }, [attachTasks, attachRequests, attachSessions, activeProjectId, boot?.role.kind])
 
   useEffect(() => {
     /*
@@ -1138,9 +1145,6 @@ export function App() {
    * — its panel draws the off screen with the button that turns it on — but carries no count.
    */
   const tasksEnabled = useAgents((s) => s.config?.trackerEnabled)
-  const agentsAwaiting = useAgents(
-    (s) => s.roster.kind === 'ready' && s.roster.runs.some((run) => run.phase === 'awaitingPermission'),
-  )
   const attachAgents = useAgents((s) => s.attach)
   const adoptAgents = useAgents((s) => s.adopt)
 
@@ -1859,14 +1863,11 @@ export function App() {
                registry behind this slice a `ready` roster has no runs, so the honest badge is
                absent, which is exactly what `0` produces. */
             agents={liveAgents}
-            /* The one agent state that is a call to action, drawn in the error tone. It cannot
-               make a badge appear on its own — with `agents` `null` or `0` there is no pill to
-               recolour — which is why it is a separate flag rather than a fourth count. */
-            agentsAwaiting={agentsAwaiting}
-            /* What waits for the user on the board (M132), drawn as its own mark in the opposite
-               corner from the run pill — the two answer different questions and either can be
-               there without the other. Nothing with the tracker off, `tasks`' rule above. */
-            agentsWaiting={tasksEnabled === false ? null : waitingTasks}
+            /* What waits for the user (M132; a count since M199): its own amber mark in the
+               opposite corner from the run pill — the two answer different questions and either
+               can be there without the other. A permission prompt is counted here, which is why
+               the pill no longer turns red for one (`railMarks.ts`). */
+            agentsWaiting={waitingCounts}
             /*
              * The buttons extensions contribute, in registry order. (M22)
              *

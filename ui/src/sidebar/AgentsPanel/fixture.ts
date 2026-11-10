@@ -37,7 +37,7 @@ import type { ProjectId } from '@/ipc/client'
 import type { AgentsPanelViewProps } from './AgentsPanel'
 import type { AgentDefView, Roster, RunPhase, RunView } from './model'
 import type { TaskView } from '@/sidebar/TasksPanel/model'
-import type { SessionView } from './sessionsModel'
+import type { GroupView, SessionView } from './sessionsModel'
 
 /**
  * A fixed instant, so a digest of a story is the same on two runs.
@@ -837,8 +837,15 @@ export const WAITING_QUESTIONS: readonly TaskView[] = [
 ]
 
 /**
- * The Sessions tab (M134): a live console, an ended worker tab with a `/rename` name, a subagent on
- * a task, and an MR review — four kinds, so the filter row draws, and one of each liveness.
+ * The Sessions tab (M134, a tree since M199). Three groups — *Release* holding *Menus*, and a
+ * folded *Ideas* — and a session in every place a row can be:
+ *
+ * - loose and live: the console (a pane shows it, working) and a tab closed with its child kept
+ *   (background, waiting for input);
+ * - filed: an ended worker tab in *Release* (it stays), a background subagent run on a task in
+ *   *Menus*, and a working session folded away in *Ideas* (the roll-up);
+ * - closed: an MR review three days ago and a tab exactly a day ago — 24 hours, so its caption is
+ *   *Yesterday* in every time zone the render check might run in.
  */
 const SESSION_BASE = {
   name: null,
@@ -849,9 +856,21 @@ const SESSION_BASE = {
   branch: null,
   cwd: '/home/dev/proj',
   startedMs: NOW_MS - 3 * 3_600_000,
+  live: false,
+  liveSession: null,
+  run: null,
   pane: null,
   searchable: true,
+  activity: 'finished',
+  group: null,
+  label: null,
 } as const
+
+export const SESSION_GROUPS: readonly GroupView[] = [
+  { id: 'g-release', name: 'Release', parent: null, collapsed: false },
+  { id: 'g-menus', name: 'Menus', parent: 'g-release', collapsed: false },
+  { id: 'g-ideas', name: 'Ideas', parent: null, collapsed: true },
+]
 
 export const SESSIONS: readonly SessionView[] = [
   {
@@ -863,7 +882,50 @@ export const SESSIONS: readonly SessionView[] = [
     prompt: 'Add a Sessions tab to the Agents panel',
     lastSeenMs: NOW_MS - 30_000,
     live: true,
+    liveSession: '11111111-1111-4111-8111-111111111111',
     pane: 'pane-console',
+    activity: 'working',
+  },
+  {
+    ...SESSION_BASE,
+    id: '33333333-3333-4333-8333-333333333333',
+    kind: 'subagent',
+    harness: 'claude',
+    title: 'Coder',
+    agent: 'Coder',
+    task: 't-14',
+    taskTitle: 'Split the renderer',
+    branch: 'coder-t-14',
+    lastSeenMs: NOW_MS - 60_000,
+    live: true,
+    liveSession: '33333333-3333-4333-8333-333333333333',
+    run: 'run-14',
+    activity: 'working',
+    group: 'g-menus',
+  },
+  {
+    ...SESSION_BASE,
+    id: '55555555-5555-4555-8555-555555555555',
+    kind: 'tab',
+    harness: 'claude',
+    title: 'Docs pass',
+    lastSeenMs: NOW_MS - 4 * 60_000,
+    live: true,
+    liveSession: '55555555-5555-4555-8555-555555555555',
+    activity: 'awaitingInput',
+  },
+  {
+    ...SESSION_BASE,
+    id: '66666666-6666-4666-8666-666666666666',
+    kind: 'tab',
+    harness: 'claude',
+    title: 'Theme importer',
+    lastSeenMs: NOW_MS - 10 * 60_000,
+    live: true,
+    liveSession: '66666666-6666-4666-8666-666666666666',
+    pane: 'pane-theme',
+    activity: 'working',
+    group: 'g-ideas',
   },
   {
     ...SESSION_BASE,
@@ -876,20 +938,16 @@ export const SESSIONS: readonly SessionView[] = [
     branch: 'worker-t-9',
     cwd: '/home/dev/proj/.cide/worktrees/worker-t-9',
     lastSeenMs: NOW_MS - 2 * 3_600_000,
-    live: false,
+    group: 'g-release',
   },
   {
     ...SESSION_BASE,
-    id: '33333333-3333-4333-8333-333333333333',
-    kind: 'subagent',
-    harness: 'claude',
-    title: 'Coder',
-    agent: 'Coder',
-    task: 't-14',
-    taskTitle: 'Split the renderer',
-    branch: 'coder-t-14',
-    lastSeenMs: NOW_MS - 26 * 3_600_000,
-    live: false,
+    id: '77777777-7777-4777-8777-777777777777',
+    kind: 'tab',
+    harness: 'codex',
+    title: 'proj : codex',
+    prompt: 'Why does the dock menu list closed projects',
+    lastSeenMs: NOW_MS - 24 * 3_600_000,
   },
   {
     ...SESSION_BASE,
@@ -898,7 +956,6 @@ export const SESSIONS: readonly SessionView[] = [
     harness: 'opencode',
     title: 'Review !42',
     lastSeenMs: NOW_MS - 3 * 24 * 3_600_000,
-    live: false,
     searchable: false,
   },
 ]

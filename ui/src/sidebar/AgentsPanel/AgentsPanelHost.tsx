@@ -110,7 +110,13 @@
  * the one road with the refusals written down.
  */
 import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
-import { fsReveal, tasks as tasksApi, type ProjectId, type TaskResponse } from '@/ipc/client'
+import { fsReveal, session as sessionApi, tasks as tasksApi, type ProjectId, type TaskResponse } from '@/ipc/client'
+import type { SessionEdit } from '@/ipc/generated'
+import { useContextMenu, type MenuEntry } from '@/menus'
+import { copyText } from '@/sidebar/copyText'
+import { activeTabOf } from '@/keys/target'
+import { useWorkspace } from '@/store/workspace'
+import { useWaitingCounts } from '@/sidebar/sessionsWaiting'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { useAgents } from '@/sidebar/agentsStore'
 import { useTasks } from '@/sidebar/tasksStore'
@@ -129,9 +135,10 @@ import { sessionJournal } from '@/ipc/client'
 import { showOpenPlan } from './openRun'
 import { previewsSnapshot, subscribePreviews, requestPreview } from '@/sidebar/TasksPanel/attachmentPreviews'
 import { SessionsPanel } from './SessionsPanel'
-import { filterSessions, type SessionView } from './sessionsModel'
+import { displayName, type GroupView } from './sessionsModel'
+import { groupPath, isWithin } from './sessionsTree'
 import { useSessions } from '@/sidebar/sessionsStore'
-import type { GateView } from './model'
+import { isDonePhase, type GateView } from './model'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
 const TICK_MS = 1_000
@@ -400,75 +407,246 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     roster.kind === 'disabled' || roster.kind === 'empty' ? roster.configPath : null
 
   /*
-   * *Sessions* (M134): the journal of every agent conversation, from `sessionsStore`. Attached
-   * only while the tab shows — the listing stats a transcript per row, which is work for nobody
-   * while the user is on another tab — and re-attached on a project switch. The filter is memoised
-   * for `check:selectors`' rule: it builds an array.
+   * *Sessions* (M134, a tree since M199): the journal of every agent conversation, from
+   * `sessionsStore` — attached by `App` for the active project now, because the rail's waiting
+   * count reads it while this panel is shut. Every grouping gesture goes out through `organize`,
+   * which answers the new listing; a refusal (a group moved into itself by a second window a frame
+   * ago) is put on screen by `guarded`, never dropped.
    */
   const sessionRows = useSessions((s) => s.rows)
+  const sessionGroups = useSessions((s) => s.groups)
   const sessionsError = useSessions((s) => s.error)
   const sessionQuery = useSessions((s) => s.query)
-  const sessionKinds = useSessions((s) => s.kinds)
-  const sessionAgent = useSessions((s) => s.agent)
   const sessionTranscripts = useSessions((s) => s.transcripts)
   const sessionHits = useSessions((s) => s.hits)
   const sessionSearching = useSessions((s) => s.searching)
   const sessionCapped = useSessions((s) => s.capped)
-  useEffect(() => {
-    if (panelTab === 'sessions') useSessions.getState().attach(project)
-  }, [panelTab, project])
-  const shownSessions = useMemo(
-    () =>
-      sessionRows === null
-        ? NO_SESSIONS
-        : filterSessions(
-            sessionRows,
-            { query: sessionQuery, kinds: sessionKinds, agent: sessionAgent },
-            sessionHits,
-          ),
-    [sessionRows, sessionQuery, sessionKinds, sessionAgent, sessionHits],
+  const sessionSub = useSessions((s) => s.sub)
+  const sessionSelected = useSessions((s) => s.selected)
+  const sessionRenaming = useSessions((s) => s.renaming)
+  const waitingCounts = useWaitingCounts()
+  // The pane with focus, for the accent bar on the row it shows — a primitive, `check:selectors`.
+  const focusedPane = useWorkspace((s) => activeTabOf(s.boot)?.tree.focused ?? null)
+  const organize = useCallback(
+    (edit: SessionEdit) => guarded(useSessions.getState().organize(edit)),
+    [guarded],
   )
+  /*
+   * Conversations whose open is in flight. A row opens on one click, and resuming an ended one
+   * takes a round trip before its pane exists — a second click inside it would ask again and
+   * resume the conversation into a second pane. So a repeat waits for the first to answer.
+   */
+  const [opening] = useState(() => new Set<string>())
   const openSession = useCallback(
     (id: string) => {
       const view = sessionRows?.find((v) => v.id === id)
-      if (project === null || view === undefined) return
+      if (project === null || view === undefined || opening.has(id)) return
+      opening.add(id)
       // A dynamic import, `agentsStore.openPane`'s reason: the open path reaches the workspace
       // store and the pane hosts, which the render check of this panel must never load.
       guarded(
-        import('./openJournalSession').then(({ openJournalSession }) =>
-          openJournalSession(project, view),
-        ),
+        import('./openJournalSession')
+          .then(({ openJournalSession }) => openJournalSession(project, view))
+          .finally(() => opening.delete(id)),
       )
     },
-    [sessionRows, project, guarded],
+    [sessionRows, project, guarded, opening],
   )
+  const newGroup = useCallback(
+    (parent: string | null, then?: (id: string) => SessionEdit) => {
+      const id = crypto.randomUUID()
+      const store = useSessions.getState()
+      guarded(
+        store
+          .organize({ op: 'create', id, name: 'New group', parent })
+          .then(() => (then === undefined ? undefined : store.organize(then(id))))
+          .then(() => {
+            if (parent !== null) void store.organize({ op: 'collapse', id: parent, collapsed: false })
+            store.setSub('opened')
+            store.selectRow(id)
+            store.setRenaming(id)
+          }),
+      )
+    },
+    [guarded],
+  )
+  const renameRow = useCallback(
+    (id: string, text: string | null) => {
+      const store = useSessions.getState()
+      store.setRenaming(null)
+      if (text === null) return
+      const group = store.groups.find((g) => g.id === id)
+      if (group !== undefined) {
+        if (text.trim() !== '' && text.trim() !== group.name) organize({ op: 'rename', id, name: text })
+        return
+      }
+      const view = store.rows?.find((v) => v.id === id)
+      if (view === undefined || text.trim() === displayName(view)) return
+      // A blank name clears cide's label, and the row falls back to its /rename name or title.
+      organize({ op: 'label', conversation: id, label: text.trim() === '' ? null : text })
+    },
+    [organize],
+  )
+  const stopSession = useCallback(
+    (id: string) => {
+      const view = sessionRows?.find((v) => v.id === id)
+      if (view === undefined) return
+      // A run still going is stopped as the Subagents tab stops it. Anything else — and a run
+      // that is over but whose child a pane still shows, which `agents_stop` rightly leaves
+      // alone — has its child ended.
+      const run = roster.kind === 'ready' ? roster.runs.find((r) => r.run === view.run) : undefined
+      if (view.run !== null && run !== undefined && !isDonePhase(run.phase) && run.phase !== 'interrupted') {
+        guarded(stop(view.run))
+      } else if (view.liveSession !== null) {
+        guarded(sessionApi.kill(view.liveSession))
+      }
+    },
+    [sessionRows, roster, stop, guarded],
+  )
+  const { onContextMenu: onSessionsMenu, openAt: openSessionsMenuAt, menu: sessionsMenu } = useContextMenu({
+    label: 'Sessions',
+    items: ({ target }) => {
+      const el = target?.closest<HTMLElement>('[data-session-row]')
+      const id = el?.dataset['id']
+      const store = useSessions.getState()
+      // The empty space under the last row opens nothing rather than an empty box.
+      if (el === null || el === undefined || id === undefined) return []
+      store.selectRow(id)
+      const groups: readonly GroupView[] = store.groups
+      if (el.dataset['sessionRow'] === 'group') {
+        const g = groups.find((x) => x.id === id)
+        if (g === undefined) return []
+        const entries: MenuEntry[] = [
+          { id: 'fold', label: g.collapsed ? 'Expand' : 'Collapse', run: () => organize({ op: 'collapse', id, collapsed: !g.collapsed }) },
+          { id: 'newInside', label: 'New Group Inside', run: () => newGroup(id) },
+          { id: 'rename', label: 'Rename…', run: () => store.setRenaming(id) },
+          {
+            id: 'moveTo',
+            label: 'Move To',
+            submenu: () => [
+              {
+                id: 'top',
+                label: 'Top Level',
+                ...(g.parent === null
+                  ? { disabledReason: 'Already at the top level' }
+                  : { run: () => organize({ op: 'move', id, parent: null, before: null }) }),
+              },
+              { kind: 'separator' },
+              ...groups.map((h): MenuEntry => ({
+                id: `to:${h.id}`,
+                label: groupPath(groups, h.id),
+                ...(isWithin(groups, h.id, id)
+                  ? { disabledReason: 'A group cannot go inside itself' }
+                  : g.parent === h.id
+                    ? { disabledReason: 'Already here' }
+                    : { run: () => organize({ op: 'move', id, parent: h.id, before: null }) }),
+              })),
+            ],
+          },
+          { kind: 'separator' },
+          { id: 'delete', label: 'Delete Group', danger: true, run: () => organize({ op: 'delete', id }) },
+        ]
+        return entries
+      }
+      const view = store.rows?.find((v) => v.id === id)
+      if (view === undefined) return []
+      const verb = view.pane !== null ? 'Show' : view.live ? 'Watch' : 'Open'
+      const filed = view.group !== null && groups.some((g) => g.id === view.group)
+      const entries: MenuEntry[] = [
+        { id: 'open', label: verb, run: () => openSession(id) },
+        { id: 'rename', label: 'Rename…', run: () => store.setRenaming(id) },
+        { kind: 'separator' },
+        {
+          id: 'moveTo',
+          label: 'Move to Group',
+          submenu: () => [
+            ...groups.map((g): MenuEntry => ({
+              id: `to:${g.id}`,
+              label: groupPath(groups, g.id),
+              ...(view.group === g.id
+                ? { disabledReason: 'Already here' }
+                : { run: () => organize({ op: 'assign', conversation: id, group: g.id }) }),
+            })),
+            ...(groups.length > 0 ? [{ kind: 'separator' } as const] : []),
+            {
+              id: 'newGroup',
+              label: 'New Group…',
+              run: () => newGroup(null, (group) => ({ op: 'assign', conversation: id, group })),
+            },
+          ],
+        },
+        ...(filed
+          ? [{ id: 'unfile', label: 'Remove from Group', run: () => organize({ op: 'assign', conversation: id, group: null }) }]
+          : []),
+        { kind: 'separator' },
+        { id: 'copyId', label: 'Copy Session ID', run: () => void copyText(id) },
+        {
+          id: 'stop',
+          label: 'Stop Session',
+          danger: true,
+          ...(view.live ? { run: () => stopSession(id) } : { disabledReason: 'It is not running' }),
+        },
+      ]
+      return entries
+    },
+  })
 
   if (project !== null && panelTab === 'sessions') {
     const store = useSessions.getState()
     return (
-      <SessionsPanel
-        project={project}
-        title={<AgentsPanelTabs tab="sessions" onTab={setPanelTab} waiting={waitingTotal} />}
-        rows={sessionRows}
-        shown={shownSessions}
-        error={sessionsError}
-        query={sessionQuery}
-        kinds={sessionKinds}
-        agent={sessionAgent}
-        transcripts={sessionTranscripts}
-        hits={sessionHits}
-        searching={sessionSearching}
-        capped={sessionCapped}
-        nowMs={nowMs}
-        onQuery={store.setQuery}
-        onToggleKind={store.toggleKind}
-        onAllKinds={store.clearKinds}
-        onAgent={store.setAgent}
-        onTranscripts={store.setTranscripts}
-        onOpen={openSession}
-        // The run row's task link, exactly — `revealTask` owns the refusals.
-        onRevealTask={(task: string) => revealTask(task, project)}
-      />
+      <>
+        <SessionsPanel
+          project={project}
+          title={
+            <AgentsPanelTabs
+              tab="sessions"
+              onTab={setPanelTab}
+              waiting={waitingTotal}
+              sessions={waitingCounts.sessions}
+            />
+          }
+          rows={sessionRows}
+          groups={sessionGroups}
+          error={sessionsError}
+          query={sessionQuery}
+          transcripts={sessionTranscripts}
+          hits={sessionHits}
+          searching={sessionSearching}
+          capped={sessionCapped}
+          questioned={waitingCounts.questioned}
+          sub={sessionSub}
+          selected={sessionSelected}
+          renaming={sessionRenaming}
+          currentPane={focusedPane}
+          nowMs={nowMs}
+          onQuery={store.setQuery}
+          onTranscripts={store.setTranscripts}
+          onSub={store.setSub}
+          onSelect={store.selectRow}
+          onOpen={openSession}
+          onToggleGroup={(id, collapsed) => organize({ op: 'collapse', id, collapsed })}
+          onExpandAll={() => organize({ op: 'collapseAll', collapsed: false })}
+          onCollapseAll={() => organize({ op: 'collapseAll', collapsed: true })}
+          onNewGroup={() => newGroup(null)}
+          onStartRename={store.setRenaming}
+          onRename={renameRow}
+          onDeleteGroup={(id) => organize({ op: 'delete', id })}
+          onDrop={organize}
+          onSpring={(key) => {
+            if (key === 'tab') store.setSub('opened')
+            else if (key.startsWith('group:')) organize({ op: 'collapse', id: key.slice(6), collapsed: false })
+          }}
+          onContextMenu={onSessionsMenu}
+          onMenuButton={(button, row) => {
+            // Under the `⋯` button, its left edges aligned — the menu clamps itself to the window.
+            const at = button.getBoundingClientRect()
+            openSessionsMenuAt(at.left, at.bottom + 2, row)
+          }}
+          // The run row's task link, exactly — `revealTask` owns the refusals.
+          onRevealTask={(task: string) => revealTask(task, project)}
+        />
+        {sessionsMenu}
+      </>
     )
   }
 
@@ -482,7 +660,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
       <WaitingPanel
         key={`${project}:${decisionEpoch}`}
         project={project}
-        title={<AgentsPanelTabs tab="waiting" onTab={setPanelTab} waiting={waitingTotal} />}
+        title={<AgentsPanelTabs tab="waiting" onTab={setPanelTab} waiting={waitingTotal} sessions={waitingCounts.sessions} />}
         review={waiting.review}
         questions={waiting.questions}
         reports={reports}
@@ -621,6 +799,7 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
                Its presence is also what turns a run row's question line into a link. */
             onPanelTab: setPanelTab,
             waiting: waitingTotal,
+            sessionsWaiting: waitingCounts.sessions,
           })}
       /*
        * The agent→task link: selecting the task is the whole gesture now. `TaskDetailHost` is
@@ -651,5 +830,4 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
 }
 
 const NO_TASKS: readonly TaskView[] = []
-const NO_SESSIONS: readonly SessionView[] = []
 const NO_IDS: ReadonlySet<string> = new Set()

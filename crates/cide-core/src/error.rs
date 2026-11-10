@@ -113,6 +113,11 @@ pub enum CoreError {
     /// Settings shows under the picker, so the frontend has nothing to phrase.
     #[error("{0}")]
     AccentRefused(String),
+    /// A Sessions-tab group edit the journal would not take — an unknown group or conversation,
+    /// a blank name, a group moved into itself. The detail is the sentence the panel shows, so
+    /// the frontend has nothing to phrase. (M199)
+    #[error("{0}")]
+    SessionGroupRefused(String),
     #[error("{0}")]
     Io(String),
 

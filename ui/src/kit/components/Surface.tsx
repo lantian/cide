@@ -1,7 +1,7 @@
 /**
  * The kit's containers and rows. See `Surface.module.css` for the surface ladder and the radii.
  */
-import type { HTMLAttributes, KeyboardEvent, ReactElement, ReactNode } from 'react'
+import { useRef, type HTMLAttributes, type KeyboardEvent, type ReactElement, type ReactNode } from 'react'
 
 import { Icon, type IconName } from '@/icons/Icon'
 import { InfoTip } from './InfoTip'
@@ -435,4 +435,176 @@ export function PathRow({ name, where, mark, full, trailing, ...rest }: PathRowP
 /** A caption between two groups of a `PathList` — "Unsaved files", "Sessions mid-turn". */
 export function PathGroup({ children }: { children: ReactNode }): ReactElement {
   return <li className={styles.pathGroup}>{children}</li>
+}
+
+/** Where a carried row would land on a `TreeRow`: FileTree's four drop states. */
+export type TreeDrop = 'move' | 'noop' | 'refuse'
+
+export type TreeRowProps = Omit<HTMLAttributes<HTMLDivElement>, 'children' | 'role'> & {
+  /** Nesting depth: the twisty is indented 19px a level, the file tree's step. */
+  depth: number
+  /** Whether a folder is open; `undefined` for a leaf, whose twisty box stays (empty) so a
+   * leaf's icon lines up under its parent's label. */
+  expanded?: boolean | undefined
+  /** The twisty's click. A row click is the caller's; the twisty only folds. */
+  onToggle?: (() => void) | undefined
+  /** A `ReactNode`, not an icon name: a status glyph spins, a folder is drawn dim. */
+  icon?: ReactNode
+  label: ReactNode
+  /** Right after the label — a `Badge`. */
+  aside?: ReactNode
+  /** Right-aligned, mono and faint — a harness, a count. */
+  detail?: ReactNode
+  /** The far right — a time. Gives way to `actions` on hover and on the selected row. */
+  meta?: ReactNode
+  /** `IconButton`s shown on hover and on the selected row, in `meta`'s place. */
+  actions?: ReactNode
+  /** A second, dim line under the row — drawn whole, so it can wrap. It carries
+   * `data-tree-sub`, so a row click can tell a press on it from a press on the line itself. */
+  sub?: ReactNode
+  selected?: boolean | undefined
+  /** The row whose pane has focus: the file tree's accent bar. */
+  current?: boolean | undefined
+  /** Over — an ended session, a cut file. Drawn in `--dim`. */
+  dim?: boolean | undefined
+  /** This row is being carried. */
+  dragging?: boolean | undefined
+  /** This row is the drop target, and the verdict. */
+  drop?: TreeDrop | undefined
+  /** This row is inside the destination: a wash, not the target's ground. */
+  band?: boolean | undefined
+  /** A row dropped here would be placed before or after this one: an accent line. */
+  line?: 'before' | 'after' | undefined
+}
+
+/**
+ * The tree row: one 24px line in a `role="tree"` that is the single tab stop — the file tree's
+ * metrics and states, as a part. (M199)
+ *
+ * The file tree and the changes tree each draw their own row, and both predate the kit; this is
+ * what a third tree is built from instead of a third copy. The states are attributes, not
+ * classes, so a drag hook can paint them on the frame it decides and the CSS keeps one rule each.
+ */
+export function TreeRow({
+  depth,
+  expanded,
+  onToggle,
+  icon,
+  label,
+  aside,
+  detail,
+  meta,
+  actions,
+  sub,
+  selected = false,
+  current = false,
+  dim = false,
+  dragging = false,
+  drop,
+  band = false,
+  line,
+  className,
+  ...rest
+}: TreeRowProps): ReactElement {
+  return (
+    <div
+      {...rest}
+      role="treeitem"
+      aria-level={depth + 1}
+      aria-selected={selected}
+      aria-expanded={expanded}
+      className={className === undefined ? styles.treeRow : `${styles.treeRow} ${className}`}
+      data-selected={selected || undefined}
+      data-current={current || undefined}
+      data-dim={dim || undefined}
+      data-drag={dragging || undefined}
+      data-drop={drop}
+      data-band={band || undefined}
+      data-line={line}
+    >
+      <div className={styles.treeLine}>
+        <span
+          className={styles.treeTwisty}
+          style={{ marginLeft: `calc(${depth * 19}px * var(--ui-scale))` }}
+          onClick={
+            onToggle === undefined
+              ? undefined
+              : (e) => {
+                  e.stopPropagation()
+                  onToggle()
+                }
+          }
+        >
+          {expanded !== undefined && (
+            <Icon name={expanded ? 'chevron-down' : 'chevron-right'} size={1} />
+          )}
+        </span>
+        {icon !== undefined && <span className={styles.treeIcon}>{icon}</span>}
+        <span className={styles.treeLabel}>{label}</span>
+        {aside}
+        {detail !== undefined && <span className={styles.treeDetail}>{detail}</span>}
+        {meta !== undefined && <span className={styles.treeMeta}>{meta}</span>}
+        {actions !== undefined && <span className={styles.treeActions}>{actions}</span>}
+      </div>
+      {sub !== undefined && (
+        <div
+          className={styles.treeSub}
+          data-tree-sub=""
+          style={{ paddingLeft: `calc(${6 + depth * 19 + 11 + 5 + 14 + 5}px * var(--ui-scale))` }}
+        >
+          {sub}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Rename in place: the file tree's input, as a part. (M199)
+ *
+ * Enter or leaving the field commits; Escape cancels. `settled` is the guard the file tree's
+ * `RenameInput` learned it needed: Enter commits, the commit unmounts the input, and the unmount's
+ * blur would commit a second time. Keys and presses stop here, so the tree under it does not move
+ * its selection, start a drag, or open the row on the double-click that selects a word.
+ */
+export function InlineRename({
+  value,
+  label,
+  onDone,
+}: {
+  value: string
+  /** What is being renamed, for a screen reader: "Rename group". */
+  label: string
+  /** The new text, or `null` for cancelled. Called once. */
+  onDone: (text: string | null) => void
+}): ReactElement {
+  const settled = useRef(false)
+  const finish = (text: string | null) => {
+    if (settled.current) return
+    settled.current = true
+    onDone(text)
+  }
+  return (
+    <input
+      className={styles.treeRename}
+      aria-label={label}
+      defaultValue={value}
+      ref={(el) => {
+        if (el !== null && !settled.current && document.activeElement !== el) {
+          el.focus()
+          el.select()
+        }
+      }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onBlur={(e) => finish(e.currentTarget.value)}
+      onKeyDown={(e) => {
+        e.stopPropagation()
+        if (e.key === 'Enter') finish(e.currentTarget.value)
+        else if (e.key === 'Escape') finish(null)
+      }}
+    />
+  )
 }

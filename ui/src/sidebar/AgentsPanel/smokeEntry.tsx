@@ -36,12 +36,12 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { AgentsPanelView } from './AgentsPanel'
 import { AgentsPanelTabs } from './PanelTabs'
 import { WaitingPanel } from './WaitingPanel'
-import { SessionsPanel } from './SessionsPanel'
-import { filterSessions, type SessionKindName } from './sessionsModel'
+import { SessionsPanel, type SessionsPanelProps } from './SessionsPanel'
 import {
   AGENTS_STORIES,
   PROJECT,
   SESSIONS,
+  SESSION_GROUPS,
   NOW_MS as SESSIONS_NOW,
   WAITING_QUESTIONS,
   WAITING_REVIEW,
@@ -51,7 +51,14 @@ import {
 /** What the check script asserts on. Strings and counts, so a failure prints something legible. */
 export interface AgentsDigest {
   /** A fixture story, or `waiting-panel` — the Waiting tab's one render (M132). */
-  story: AgentsStoryName | 'waiting-panel' | 'sessions-panel' | 'sessions-filtered' | 'sessions-empty'
+  story:
+    | AgentsStoryName
+    | 'waiting-panel'
+    | 'sessions-panel'
+    | 'sessions-closed'
+    | 'sessions-filtered'
+    | 'sessions-nogroups'
+    | 'sessions-empty'
   /** The header's right-hand figure. Empty string when `metaFigure` withheld it. */
   meta: string
   /** The panel's one claim, when it makes one. */
@@ -92,15 +99,26 @@ export interface AgentsDigest {
   waitingOpens: number
   waitingAnswers: number
   waitingAccepts: number
-  /** The Sessions tab (M134): each row as `kind|live|title`, the kind chips as
-      `kind|pressed|text`, and how many transcript snippets are drawn. */
+  /** The Sessions tab (M134, a tree since M199): each row as `kind|live|title`, in drawing order,
+      and how many transcript snippets are drawn. */
   sessionRows: string[]
-  sessionKinds: string[]
   sessionHits: number
-  /** Open buttons, task links, and whether the role select is drawn. */
+  /** The tree in drawing order: `group|level|name|open|rollup`, `row|level|status|name|bg`,
+      `---` for the rule and `day|Caption` for Closed's captions. */
+  sessionTree: string[]
+  /** The sub-tabs as `tab|pressed|text`. */
+  sessionSubs: string[]
+  /** Each row's open button, by its verb (`Show`, `Watch`, `Open`); task links by their text. */
   sessionOpens: string[]
   sessionTasks: string[]
-  sessionRole: boolean
+  /** The strip's Sessions count, or `''` when none is drawn; and the first-group hint. */
+  sessionsCount: string
+  sessionHint: boolean
+  /** How many rows carry the `⋯` menu button. */
+  sessionMenus: number
+  /** The selected session's detail strip, as text, or `''`; and how many rows drew a second line. */
+  sessionDetail: string
+  sessionSubLines: number
   /** Whether the run figure / scope control sit inside the header (M134: not beside a strip). */
   metaInHeader: boolean
   scopeInHeader: boolean
@@ -234,47 +252,63 @@ digests.push(
   ),
 )
 /*
- * The Sessions tab (M134), as the host mounts it: under the same strip, Sessions on. Three
- * entries — everything, one kind picked with a transcript hit, and a project with no sessions.
+ * The Sessions tab (M134, a tree since M199), as the host mounts it: under the same strip,
+ * Sessions on. Five entries — the Opened tree with a row selected, Closed by day, a search with a
+ * transcript hit, a project with no groups yet, and a project with no sessions.
  */
-const sessionsProps = (kinds: ReadonlySet<SessionKindName>, hits: Record<string, string> | null) => ({
+const sessionsProps = (over: Partial<SessionsPanelProps> = {}): SessionsPanelProps => ({
   project: PROJECT,
-  title: <AgentsPanelTabs tab="sessions" onTab={() => {}} waiting={2} />,
+  title: <AgentsPanelTabs tab="sessions" onTab={() => {}} waiting={2} sessions={1} />,
   rows: SESSIONS,
-  shown: filterSessions(SESSIONS, { query: '', kinds, agent: null }, hits),
+  groups: SESSION_GROUPS,
   error: null,
   query: '',
-  kinds,
-  agent: null,
-  transcripts: hits !== null,
-  hits,
+  transcripts: false,
+  hits: null,
   searching: false,
   capped: false,
+  questioned: new Set<string>(),
+  sub: 'opened',
+  selected: null,
+  renaming: null,
+  currentPane: 'pane-console',
   nowMs: SESSIONS_NOW,
   onQuery: () => {},
-  onToggleKind: () => {},
-  onAllKinds: () => {},
-  onAgent: () => {},
   onTranscripts: () => {},
+  onSub: () => {},
+  onSelect: () => {},
   onOpen: () => {},
+  onToggleGroup: () => {},
+  onExpandAll: () => {},
+  onCollapseAll: () => {},
+  onNewGroup: () => {},
+  onStartRename: () => {},
+  onRename: () => {},
+  onDeleteGroup: () => {},
+  onMenuButton: () => {},
   onRevealTask: () => {},
+  ...over,
 })
 digests.push(
-  digest('sessions-panel', renderToStaticMarkup(<SessionsPanel {...sessionsProps(new Set(), null)} />)),
+  digest(
+    'sessions-panel',
+    renderToStaticMarkup(<SessionsPanel {...sessionsProps({ selected: '33333333-3333-4333-8333-333333333333' })} />),
+  ),
+  digest('sessions-closed', renderToStaticMarkup(<SessionsPanel {...sessionsProps({ sub: 'closed' })} />)),
   digest(
     'sessions-filtered',
     renderToStaticMarkup(
       <SessionsPanel
-        {...sessionsProps(new Set<SessionKindName>(['worker']), {
-          '22222222-2222-4222-8222-222222222222': 'the gate retried once and passed',
+        {...sessionsProps({
+          query: 'renderer',
+          transcripts: true,
+          hits: { '11111111-1111-4111-8111-111111111111': 'we split the renderer into two' },
         })}
       />,
     ),
   ),
-  digest(
-    'sessions-empty',
-    renderToStaticMarkup(<SessionsPanel {...sessionsProps(new Set(), null)} rows={[]} shown={[]} />),
-  ),
+  digest('sessions-nogroups', renderToStaticMarkup(<SessionsPanel {...sessionsProps({ groups: [] })} />)),
+  digest('sessions-empty', renderToStaticMarkup(<SessionsPanel {...sessionsProps({ rows: [] })} />)),
 )
 console.log(JSON.stringify(digests))
 
@@ -336,17 +370,32 @@ function digest(story: AgentsDigest['story'], html: string): AgentsDigest {
     waitingOpens: count(html, 'data-audit="waitingOpen"'),
     waitingAnswers: count(html, 'data-audit="waitingAnswer"'),
     waitingAccepts: count(html, 'data-audit="waitingAccept"'),
-    sessionRows: all(html, 'sessionRow').map((row, i) => {
-      const title = text(all(html, 'sessionTitle')[i] ?? '')
+    sessionRows: all(html, 'sessionRow').map((row) => {
+      const title = text(all(row, 'sessionTitle')[0] ?? '')
       return `${attr(row, 'data-kind')}|${attr(row, 'data-live')}|${title}`
     }),
-    sessionKinds: all(html, 'sessionsKind').map(
-      (chip) => `${attr(chip, 'data-kind')}|${attr(chip, 'aria-pressed')}|${text(chip)}`,
-    ),
     sessionHits: count(html, 'data-audit="sessionsHit"'),
-    sessionOpens: all(html, 'sessionsOpen').map((b) => text(b)),
+    sessionTree: [...html.matchAll(/data-audit="(sessionGroup|sessionRow|sessionsRule|sessionsDay)"/g)].map((m) => {
+      const el = outer(html, m.index)
+      if (m[1] === 'sessionsRule') return '---'
+      if (m[1] === 'sessionsDay') return `day|${text(el)}`
+      if (m[1] === 'sessionGroup') {
+        const rollup = all(el, 'sessionGroupRollup').length > 0 ? '|rollup' : ''
+        return `group|${attr(el, 'aria-level')}|${text(all(el, 'sessionGroupName')[0] ?? '')}|${attr(el, 'aria-expanded')}${rollup}`
+      }
+      const bg = all(el, 'sessionBackground').length > 0 ? '|bg' : ''
+      return `row|${attr(el, 'aria-level')}|${attr(el, 'data-status')}|${text(all(el, 'sessionTitle')[0] ?? '')}${bg}`
+    }),
+    sessionSubs: all(html, 'sessionsSub').map(
+      (tab) => `${attr(tab, 'data-sessions-tab')}|${attr(tab, 'aria-pressed')}|${text(tab)}`,
+    ),
+    sessionOpens: all(html, 'sessionsOpen').map((b) => attr(b, 'data-verb')),
     sessionTasks: all(html, 'sessionsTask').map((b) => text(b)),
-    sessionRole: count(html, 'data-audit="sessionsRole"') > 0,
+    sessionsCount: text(all(html, 'sessionsWaitingCount')[0] ?? ''),
+    sessionHint: count(html, 'data-audit="sessionsGroupHint"') > 0,
+    sessionMenus: count(html, 'data-audit="sessionsMenu"'),
+    sessionDetail: text(all(html, 'sessionsDetail')[0] ?? ''),
+    sessionSubLines: count(html, 'data-tree-sub'),
     metaInHeader: (all(html, 'agentsHeader')[0] ?? '').includes('data-audit="agentsMeta"'),
     scopeInHeader: /data-audit="agents(Resume|Pause)All"/.test(all(html, 'agentsHeader')[0] ?? ''),
     tabs: all(html, 'agentsTab').map(

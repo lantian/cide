@@ -240,6 +240,8 @@ export interface AgentsPanelViewProps {
   onPanelTab?: ((tab: AgentsPanelTab) => void) | undefined
   /** Tasks waiting for the user, for the Waiting tab's count. See [`AgentsPanelTabs`]. */
   waiting?: number | undefined
+  /** Sessions waiting for the user, for the Sessions tab's count (M199). */
+  sessionsWaiting?: number | undefined
   onOpen?: ((run: string) => void) | undefined
   onPause?: ((run: string) => void) | undefined
   onResume?: ((run: string) => void) | undefined
@@ -349,6 +351,7 @@ export function AgentsPanelView({
   tab = 'agents',
   onTab,
   onPanelTab,
+  sessionsWaiting,
   waiting = 0,
   onOpen,
   onPause,
@@ -403,7 +406,7 @@ export function AgentsPanelView({
           {onPanelTab === undefined ? (
             'Agents'
           ) : (
-            <AgentsPanelTabs tab="subagents" onTab={onPanelTab} waiting={waiting} />
+            <AgentsPanelTabs tab="subagents" onTab={onPanelTab} waiting={waiting} sessions={sessionsWaiting} />
           )}
         </span>
         {/*

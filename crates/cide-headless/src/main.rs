@@ -103,20 +103,45 @@ fn sessions(args: &[String]) {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     let rows = journal.list(&root);
+    // The Sessions tab's folders (M199): a session that left its folder is a membership that did
+    // not follow a re-key, and this is where that shows.
+    let organize = journal.organize(&root);
     let mut out = format!(
         "{} — {} session(s) in {}\n",
         root.display(),
         rows.len(),
         path.display()
     );
+    for group in &organize.groups {
+        out.push_str(&format!(
+            "  group {} “{}”{}{}\n",
+            group.id,
+            group.name,
+            group
+                .parent
+                .as_deref()
+                .map(|p| format!(" in {p}"))
+                .unwrap_or_default(),
+            if group.collapsed { " (folded)" } else { "" },
+        ));
+    }
     for row in rows {
         out.push_str(&format!(
-            "  {:<12} {:<8} {}{}  {}\n",
+            "  {:<12} {:<8} {}{}  {}{}\n",
             format!("{:?}", row.kind),
             format!("{:?}", row.harness).to_lowercase(),
             row.id,
             if row.known { "" } else { " (stand-in)" },
-            row.name.as_deref().unwrap_or(&row.title),
+            organize
+                .labels
+                .get(&row.id)
+                .or(row.name.as_ref())
+                .unwrap_or(&row.title),
+            organize
+                .members
+                .get(&row.id)
+                .map(|g| format!("  [in {g}]"))
+                .unwrap_or_default(),
         ));
         if let Some(prompt) = row.prompt.as_deref() {
             out.push_str(&format!("               “{prompt}”\n"));

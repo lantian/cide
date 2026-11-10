@@ -1,18 +1,46 @@
 /*
- * The Sessions tab (M134): only what the kit and the Tasks panel's frame do not already draw —
- * the gap between the controls, and the three text lines a row adds.
+ * The Sessions tab (M134, reworked M199). The rows are the kit's `TreeRow`, the search its
+ * `SearchField`, the sub-tabs the Tasks panel's filter segment; what is here is the layout around
+ * them and the few marks the kit has no part for.
+ *
+ * Unlike the Tasks panel's body, this one has **no side padding**: tree rows run edge to edge so
+ * a selected row's band and the drop washes span the panel, the way the file tree's do. The
+ * controls above carry the gutter themselves.
  */
-
-.controls {
+.body {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
-  margin-bottom: var(--sp-5);
+  overflow: hidden;
 }
 
-/* The Tasks panel's filter row sits under a heading there; here it follows the checkbox. */
-.kinds {
-  margin-top: 0;
+.controls {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-5) var(--sp-5) var(--sp-3);
+}
+
+.quiet {
+  padding: var(--sp-2) var(--sp-5);
+}
+
+.searchNote {
+  margin: 0;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.subbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.spacer {
+  flex: 1;
 }
 
 .count {
@@ -20,64 +48,181 @@
   font-variant-numeric: tabular-nums;
 }
 
-.top {
+/*
+ * The tree: the panel's single tab stop (`role="tree"`), scrolling, with the drag's cursor. The
+ * kit's `TreeRow` turns its own hover off under any `[data-dragging]` ancestor, as the file tree
+ * does — the target's verdict is the only thing that should light up under the pointer.
+ */
+.tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-bottom: var(--sp-6);
+  outline: none;
+}
+
+.tree:focus-visible {
+  box-shadow: var(--focus-inset);
+}
+
+.tree[data-dragging] {
+  cursor: grabbing;
+}
+
+/* The loose area as a drop target: the rows in it and the space below them. */
+.tree[data-drop-root='move'] .rootZone {
+  background: color-mix(in srgb, var(--sel) 40%, transparent);
+}
+
+.tree[data-drop-root='refuse'] .rootZone {
+  box-shadow: inset 0 0 0 1px var(--red);
+}
+
+.rootZone {
+  min-height: calc(36px * var(--ui-scale));
+}
+
+/* The line between the groups and the loose sessions — the file tree's `.rowSection` rule. */
+.rule {
+  position: relative;
+  height: calc(9px * var(--ui-scale));
+}
+
+.rule::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 6px;
+  right: 8px;
+  height: 1px;
+  background: var(--border-soft);
+}
+
+.caption {
+  composes: caption from '../../kit/components/Surface.module.css';
+  margin: 0;
+  padding: var(--sp-5) var(--sp-5) var(--sp-2);
+}
+
+.tree > div:first-child > .caption {
+  padding-top: var(--sp-1);
+}
+
+.hint {
+  margin: var(--sp-3) var(--sp-5) 0;
+  padding: var(--sp-4) var(--sp-5);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-2);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.inlineIcon {
+  display: inline-block;
+  vertical-align: -2px;
+}
+
+/* RunRow's glyph box is 12px wide for mono text; a session's glyph fills the tree's 14px slot. */
+.glyph {
+  width: auto;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.folder {
+  color: var(--dim);
+}
+
+.groupName {
+  font-weight: 500;
+}
+
+.rollup {
+  flex: none;
   display: inline-flex;
   align-items: center;
-  gap: var(--sp-3);
-  min-width: 0;
+  gap: var(--sp-2);
 }
 
-.onScreen {
-  color: var(--faint);
+/*
+ * The selected session's facts, under the tree. A strip of its own rather than a second line on
+ * the row: a row that grows when selected moved every row below it between the two clicks of a
+ * double-click (see `SessionsPanel.tsx`). Its height changes the tree's, never a row's place.
+ */
+.detail {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-4) var(--sp-5);
+  border-top: 1px solid var(--border-soft);
+  background: var(--panel);
   font-size: var(--fs-ui-11);
+  color: var(--dim);
+  -webkit-user-select: text;
+  user-select: text;
 }
 
-.title {
-  display: block;
+.detailName {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--fs-ui-13);
+  color: var(--text-hi);
 }
 
-/* What it was about: two lines at most — a first prompt can be a paragraph. */
-.about {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow: hidden;
+.detailLine {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px var(--sp-3);
 }
 
-/* A transcript search hit: the words around the match, as a quotation. */
-.snippet {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-  overflow: hidden;
-  margin-top: var(--sp-2);
+/* A row's name: one line in the tree row's label slot, ellipsised there. */
+.name {
+  min-width: 0;
+}
+
+/* The status in words, first on the second line. */
+.status {
+  font-weight: 500;
+}
+
+/* A name that is only "project : harness" — nothing better was known. */
+.generic {
   color: var(--dim);
+}
+
+.badge {
+  flex: none;
+  display: inline-flex;
+}
+
+.attention {
+  color: var(--yellow);
+}
+
+.error {
+  color: var(--red);
+}
+
+.note {
+  width: 100%;
+}
+
+.snippet {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-style: italic;
 }
 
-.facts {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  gap: var(--sp-3);
-  min-width: 0;
-  color: var(--faint);
-  font-size: var(--fs-ui-11);
-}
-
-/* Open sits at the right end of the facts line, apart from what it acts on. */
-.open {
-  margin-left: auto;
-  flex: none;
-}
-
-/* The role select takes the width of its label, not the panel's. */
-.role {
-  align-self: flex-start;
-  min-width: calc(160px * var(--ui-scale));
+.mark {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--yellow) 28%, transparent);
+  color: inherit;
 }

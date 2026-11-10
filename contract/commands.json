@@ -317,6 +317,7 @@
   "sessions_conversation_read",
   "sessions_list",
   "sessions_open",
+  "sessions_organize",
   "sessions_search",
   "sessions_user_inputs",
   "settings_defaults",

@@ -24,12 +24,18 @@ import {
   Toolbar,
   ToolbarSeparator,
   ToolbarSpacer,
+  TreeRow,
+  InlineRename,
 } from '../../components/Surface'
 import { Cell, Chapter, Frame, Line, Specimen, Stack } from '../Specimen'
 
 export function Structure(): ReactElement {
   const [tab, setTab] = useState<'overview' | 'changes' | 'pipelines'>('changes')
   const [sel, setSel] = useState('Button.tsx')
+  const [treeOpen, setTreeOpen] = useState(true)
+  const [treeSel, setTreeSel] = useState('mockup')
+  const [renaming, setRenaming] = useState(false)
+  const [groupName, setGroupName] = useState('Release 0.18')
   const [recapIndex, setRecapIndex] = useState(2)
   const [recapExpanded, setRecapExpanded] = useState(false)
   const recapConsole = useRef<HTMLDivElement>(null)
@@ -202,6 +208,72 @@ export function Structure(): ReactElement {
             }
           />
         </List>
+      </Specimen>
+
+      <Specimen
+        name="Tree row"
+        source="Surface.tsx › TreeRow, InlineRename"
+        use="The 24px tree line of a role=tree that is the single tab stop: the file tree's metrics (19px a level, an 11px twisty, 13px text) and its states — selected, the current row's accent bar, dim for something over, and the four drag states (carried, move, noop, refuse) plus a band and a before/after line. The time gives way to the row's buttons on hover and on the selected row. InlineRename is the file tree's rename field: Enter or leaving commits, Escape cancels."
+        ground="panel"
+      >
+        <Frame>
+          <div role="tree" aria-label="Sessions" tabIndex={0}>
+            <TreeRow
+              depth={0}
+              expanded={treeOpen}
+              onToggle={() => setTreeOpen(!treeOpen)}
+              icon={<Icon name="folder" size={1} />}
+              label={
+                renaming ? (
+                  <InlineRename
+                    value={groupName}
+                    label="Rename group"
+                    onDone={(text) => {
+                      setRenaming(false)
+                      if (text !== null && text.trim() !== '') setGroupName(text.trim())
+                    }}
+                  />
+                ) : (
+                  groupName
+                )
+              }
+              detail="3"
+              onDoubleClick={() => setRenaming(true)}
+            />
+            {treeOpen && (
+              <>
+                <TreeRow
+                  depth={1}
+                  icon={<Icon name="loader-circle" size={1} />}
+                  label="Sessions panel mockup"
+                  detail="claude"
+                  meta="now"
+                  current
+                  selected={treeSel === 'mockup'}
+                  onClick={() => setTreeSel('mockup')}
+                  actions={<IconButton icon="arrow-up-right" label="Show" />}
+                  sub={<>Working · Console · master</>}
+                />
+                <TreeRow
+                  depth={1}
+                  icon={<Icon name="circle-alert" size={1} />}
+                  label="Updater manifest self-test"
+                  aside={<Badge tone="purple" soft>Background</Badge>}
+                  detail="codex"
+                  meta="4m"
+                  selected={treeSel === 'updater'}
+                  onClick={() => setTreeSel('updater')}
+                  actions={<IconButton icon="eye" label="Watch" />}
+                  band
+                />
+                <TreeRow depth={1} icon={<Icon name="circle-check" size={1} />} label="Group storage spike" detail="codex" meta="3h" dim drop="move" />
+              </>
+            )}
+            <TreeRow depth={0} expanded={false} icon={<Icon name="folder" size={1} />} label="Ideas" detail="4" line="before" />
+            <TreeRow depth={0} icon={<Icon name="circle-dot" size={1} />} label="Carried away" detail="claude" meta="9m" dragging />
+            <TreeRow depth={0} icon={<Icon name="circle-x" size={1} />} label="Not here" detail="opencode" meta="2h" drop="refuse" />
+          </div>
+        </Frame>
       </Specimen>
 
       <Specimen

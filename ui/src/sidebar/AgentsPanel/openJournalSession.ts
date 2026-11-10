@@ -12,10 +12,10 @@
  */
 import { sessionJournal, type ProjectId } from '@/ipc/client'
 import { showOpenPlan } from './openRun'
-import { displayTitle, type SessionView } from './sessionsModel'
+import { displayName, type SessionView } from './sessionsModel'
 
 export async function openJournalSession(project: ProjectId, view: SessionView): Promise<void> {
   const plan = await sessionJournal.open(project, view.id)
   if (plan.kind === 'unavailable') throw new Error(plan.reason)
-  await showOpenPlan(plan, displayTitle(view), 'session')
+  await showOpenPlan(plan, displayName(view), 'session')
 }

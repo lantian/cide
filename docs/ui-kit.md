@@ -327,6 +327,16 @@ of keyboard focus and the floating controls' hover state.
   two lines, meta, a foot of signals). `current` draws the accent bar.
 - **`List`** + **`Row`**: the compact row, 26px, one line. Pass `depth` and `expanded` to make it
   a tree row, which indents 12px per level.
+- **`TreeRow`** (M199): the 24px line of a `role="tree"` that is the panel's single tab stop —
+  the file tree's metrics (19px a level, an 11px twisty with its own `onToggle`, 13px text) for a
+  tree that drags. `icon` is a node so a status glyph can spin; `meta` (a time) gives way to
+  `actions` on hover and on the selected row; `sub` is a second, dim line. Its states are `data-*`
+  attributes — `selected`, `current` (the accent bar), `dim`, and the file tree's drag states
+  `dragging`, `drop` (`move` / `noop` / `refuse`), `band` and `line` (`before` / `after`). Reach
+  for `Row` instead for a list or a tree nobody drags.
+- **`InlineRename`**: rename in place, the file tree's field. Enter or leaving the field commits,
+  Escape cancels, and it is called once. It stops keys and presses so the tree under it neither
+  moves its selection nor starts a drag.
 - **`Card`**: a box. A toned card is a state; a `draft` (dashed) card is proposed but not yet
   real.
 - **`Summary`**: key → value with zebra rows.
@@ -369,6 +379,10 @@ of keyboard focus and the floating controls' hover state.
     **`PickerFoot`** and **`PickerHint`** (`⏎ open`). `Picker` is them assembled for a short
     static list.
   - In the app, `overlays/ModalShell.tsx` builds every picker from these inside `Modal`.
+- **`DragGhost`** (M199): what a tree drag carries and the verdict, under the pointer — the file
+  tree's ghost. `outcome` colours it (accent for a move, red for a refusal, plain over nothing or a
+  no-op) and `hint` says why in words, so a refusal is never only a red border. Fixed to the
+  viewport and never a pointer target, so the hit test finds the row beneath it.
 - **`Menu`**: icons are optional but aligned, shortcuts sit on the right in mono, the destructive
   item comes last, bold, with the black danger fill under the pointer, and a group caption appears once there are more than seven items.
 - **`Tooltip`**: inverted, short, and with the shortcut if there is one. The app has none today

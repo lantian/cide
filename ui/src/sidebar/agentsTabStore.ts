@@ -1,5 +1,6 @@
 /**
- * Which top-level tab the Agents panel shows: *Subagents*, or *Waiting* for you. (M132)
+ * Which top-level tab the Agents panel shows: *Sessions*, *Subagents*, or *Waiting* for you.
+ * (M132; Sessions first and the default since M199)
  *
  * Here rather than in the panel, for `milestonesStore`'s `TasksTab` reason: something outside the
  * panel has to be able to ask for a tab. The run row's "Waiting for your answer: …" line is the
@@ -26,8 +27,8 @@ import { requestPanel } from '@/chrome/panelRequests'
 
 /**
  * The Agents panel's top-level tabs. Not `AgentsTab`, which is the inner Agents/History pair.
- * *Sessions* (M134) sits between the two: it is about the runs and consoles the first tab shows,
- * and *Waiting* stays last, where the eye finds its count.
+ * *Sessions* (M134) comes first since M199 — everything running, consoles and runs alike, so the
+ * panel opens on it — then *Subagents*, and *Waiting* stays last, where the eye finds its count.
  */
 export type AgentsPanelTab = 'subagents' | 'sessions' | 'waiting'
 
@@ -42,7 +43,7 @@ interface AgentsTabStore {
 }
 
 export const useAgentsTab = create<AgentsTabStore>((set) => ({
-  tab: 'subagents',
+  tab: 'sessions',
   setTab: (tab) => set({ tab }),
   showWaiting: () => {
     set({ tab: 'waiting' })

@@ -5738,6 +5738,13 @@ export const sessionJournal = {
     invoke<TranscriptSearch>('sessions_search', { project, query, token }),
   /** What Open means for one row: mirror a live child, continue an ended one, or why not. */
   open: (project: ProjectId, id: string) => invoke<RunOpen>('sessions_open', { project, id }),
+  /**
+   * Change the tab's grouping (M199) and get the listing it leaves — the reply redraws this
+   * window; the others hear `cide://sessions-changed`. Rejects with `sessionGroupRefused` and the
+   * sentence to show.
+   */
+  organize: (project: ProjectId, edit: import('./generated').SessionEdit) =>
+    invoke<SessionListing>('sessions_organize', { project, edit }),
   /** `cide://sessions-changed`: a project's journal moved; re-ask with `list`. */
   onChanged: (handler: (project: ProjectId) => void) =>
     listen<{ project: ProjectId }>('cide://sessions-changed', (e) => handler(e.payload.project)),

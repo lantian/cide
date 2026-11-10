@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cide_core::CoreError;
 use cide_ipc::conversations::{ConversationPage, ConversationRequest, ConversationResponse};
-use cide_ipc::sessions::{SessionListing, TranscriptHit, TranscriptSearch, UserInputPage};
+use cide_ipc::sessions::{
+    SessionEdit, SessionListing, TranscriptHit, TranscriptSearch, UserInputPage,
+};
 use cide_ipc::{HarnessSession, ProjectId, RunOpen};
 use tauri::{AppHandle, Manager, State};
 
@@ -37,6 +39,25 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn sessions_list(app: AppHandle, project: ProjectId) -> Result<SessionListing> {
     blocking(move || crate::sessions_state::list(&app, project)).await
+}
+
+/// Change the Sessions tab's grouping — a folder made, renamed, moved, folded or deleted, a
+/// session filed or unfiled, a label set — and answer the listing it leaves. (M199)
+///
+/// The answer is for the window that asked, so the tree redraws on the reply rather than on an
+/// event; every other window hears `cide://sessions-changed` (`sessions_state::organize`). A
+/// refusal is `CoreError::SessionGroupRefused` with the sentence to show.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sessions_organize(
+    app: AppHandle,
+    project: ProjectId,
+    edit: SessionEdit,
+) -> Result<SessionListing> {
+    blocking(move || {
+        crate::sessions_state::organize(&app, project, edit)?;
+        crate::sessions_state::list(&app, project)
+    })
+    .await
 }
 
 /// Page through a saved conversation without providing the desktop UI with Send or Resume.

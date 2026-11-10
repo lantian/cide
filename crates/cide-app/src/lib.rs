@@ -888,6 +888,7 @@ pub fn run() {
             cmd::sessions::sessions_user_inputs,
             cmd::sessions::sessions_search,
             cmd::sessions::sessions_open,
+            cmd::sessions::sessions_organize,
             cmd::agents::agents_integrate,
             cmd::agents::agents_plan_now,
             cmd::agents::milestones_get,

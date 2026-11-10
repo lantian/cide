@@ -120,27 +120,148 @@ pub struct SessionRecord {
 /// it; a whole brief is kilobytes the file does not need.
 pub const PROMPT_CLIP: usize = 300;
 
+/// What a conversation is doing, for the Sessions tab's status glyph and its waiting counts.
+/// Outbound. (M199)
+///
+/// **One table, decided in Rust**, by `cide_core::sessions::activity`, from a run's
+/// [`crate::agents::RunState`] when the conversation is a run's and from the hook-derived
+/// [`crate::SessionState`] otherwise. The Subagents tab's run rows draw the same run states with
+/// the same glyphs, so a run reads the same on both tabs.
+///
+/// *A question* is deliberately not a variant. Whether a conversation has asked the user
+/// something is a fact of the Waiting tab's requests and board questions, which the webview
+/// already holds and re-reads on its own events; folding it in here would make the listing stale
+/// the moment an answer was typed, until the next re-list. The panel lays it over this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SessionActivity {
+    /// A child is starting, or a run is queued or starting.
+    Starting,
+    /// A turn is in progress.
+    Working,
+    /// Alive, its turn over, nothing asked of the user.
+    Idle,
+    /// Its turn ended in a way that wants a reply.
+    AwaitingInput,
+    /// Stopped at a permission prompt.
+    Permission,
+    Paused,
+    /// A run that cannot go on without someone — a refused verify, a lost worktree.
+    Blocked,
+    /// A run that failed.
+    Failed,
+    /// The conversation ended normally.
+    Finished,
+    /// Stopped, cancelled, interrupted, or exited with a non-zero code.
+    Stopped,
+}
+
+/// A folder the user made in the Sessions tab's *Opened* tree. Durable (in the journal) and
+/// outbound. (M199)
+///
+/// A grouped conversation stays in its group after it ends — it never drops into *Closed* — and
+/// the journal never prunes it; see `cide_core::sessions::Organize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SessionGroup {
+    /// Chosen by the client that created it (a UUID), so the panel can start renaming the new
+    /// row without waiting for an answer to learn its id.
+    pub id: String,
+    pub name: String,
+    /// The group it is nested in; `None` at the top level.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Folded in the tree. Durable rather than webview state: a group the user folded is a
+    /// statement about the project that should survive a restart, the way a tree's expansion is.
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// One change to the Sessions tab's grouping. Inbound, to `sessions_organize`. (M199)
+///
+/// One command with an edit rather than a command per gesture: the seven share one lock, one
+/// validation and one "tell the other windows" step, and seven commands would be seven places
+/// for one of those to be forgotten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "op")]
+#[ts(export)]
+pub enum SessionEdit {
+    /// A new, empty group, last among its siblings.
+    Create {
+        id: String,
+        name: String,
+        parent: Option<String>,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    /// Remove a group. What it held — sessions and groups — moves up into its parent; at the top
+    /// level, sessions become loose again (and an ended one goes back to *Closed*).
+    Delete {
+        id: String,
+    },
+    /// Re-parent a group and place it before `before` (a sibling under the new parent), or last.
+    /// Refused into its own subtree.
+    Move {
+        id: String,
+        parent: Option<String>,
+        before: Option<String>,
+    },
+    Collapse {
+        id: String,
+        collapsed: bool,
+    },
+    /// Fold or unfold every group: the tree's *Expand all* and *Collapse all*.
+    CollapseAll {
+        collapsed: bool,
+    },
+    /// Put a conversation into a group, or take it out with `None`.
+    Assign {
+        conversation: String,
+        group: Option<String>,
+    },
+    /// cide's own name for a conversation, drawn before its `/rename` name; `None` (or blank)
+    /// clears it. It is not typed into the session: the harness never learns of it.
+    Label {
+        conversation: String,
+        label: Option<String>,
+    },
+}
+
 /// One row of the Sessions tab. Outbound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct SessionRow {
     pub record: SessionRecord,
-    /// A child is running for it right now.
+    /// A child is running for it right now — alive, not merely still registered.
     pub live: bool,
+    /// The handle of that child, which can differ from [`SessionRecord::session`] (a resumed
+    /// conversation gets a fresh one). The key the panel joins `cide://session-state` on.
+    pub live_session: Option<SessionId>,
     /// A pane of this project is showing it, so Open reveals rather than resumes.
     pub pane: Option<PaneId>,
     /// Whether its transcript can be searched: claude, qwen and codex keep one cide can read;
     /// opencode's is a database it does not.
     pub searchable: bool,
+    pub activity: SessionActivity,
+    /// The [`SessionGroup`] it is filed in.
+    pub group: Option<String>,
+    /// cide's own name for it — see [`SessionEdit::Label`].
+    pub label: Option<String>,
 }
 
-/// A project's sessions, newest first. Outbound.
+/// A project's sessions, newest first, and its groups in their order. Outbound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct SessionListing {
     pub rows: Vec<SessionRow>,
+    /// Every group, siblings in the user's order.
+    pub groups: Vec<SessionGroup>,
 }
 
 /// A submitted human prompt, not a terminal keystroke or a CLI's injected context.

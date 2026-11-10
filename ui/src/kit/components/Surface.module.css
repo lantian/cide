@@ -689,3 +689,196 @@
 .pathGroup:first-child {
   padding-top: var(--sp-2);
 }
+
+/* --- tree rows (M199) -------------------------------------------------------------------------- */
+
+/*
+ * `TreeRow`: the file tree's numbers (`FileTree.module.css`), as a part — 24px a line, the twisty
+ * an 11px box stepped 19px a level, 13px text, `--panel-2` hover, `--sel` selected, the accent
+ * bar for the row whose pane has focus. The state lives in `data-*` attributes so a drag hook
+ * paints a verdict without re-rendering every row.
+ */
+.treeRow {
+  position: relative;
+  cursor: default;
+}
+
+.treeLine {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 var(--sp-4) 0 var(--sp-3);
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+.treeRow:hover > .treeLine,
+.treeRow:hover > .treeSub {
+  background: var(--panel-2);
+}
+
+.treeRow[data-selected] > .treeLine,
+.treeRow[data-selected] > .treeSub {
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+/* While a drag is in flight (the tree sets `data-dragging`), hover lights nothing: the target's
+   verdict is the only thing under the pointer that should. */
+[data-dragging] .treeRow:hover:not([data-selected], [data-drop], [data-band]) > .treeLine,
+[data-dragging] .treeRow:hover:not([data-selected], [data-drop], [data-band]) > .treeSub {
+  background: transparent;
+}
+
+[data-dragging] .treeActions {
+  display: none !important;
+}
+
+[data-dragging] .treeMeta {
+  display: block !important;
+}
+
+.treeRow[data-current] > .treeLine,
+.treeRow[data-current] > .treeSub {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.treeRow[data-dim] .treeLabel {
+  color: var(--dim);
+}
+
+.treeTwisty {
+  width: 11px;
+  padding: 0;
+  flex: none;
+  align-self: stretch;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+}
+
+.treeIcon {
+  width: var(--icon-1);
+  padding: 0;
+  flex: none;
+  display: grid;
+  place-items: center;
+}
+
+.treeLabel {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.treeDetail {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.treeMeta {
+  flex: none;
+  min-width: calc(26px * var(--ui-scale));
+  text-align: right;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.treeActions {
+  display: none;
+  flex: none;
+  align-items: center;
+  margin-right: calc(var(--sp-2) * -1);
+}
+
+.treeRow:hover > .treeLine > .treeActions,
+.treeRow[data-selected] > .treeLine > .treeActions {
+  display: flex;
+}
+
+/* The time gives way to the buttons — only on a row that has buttons. */
+.treeRow:hover > .treeLine > .treeMeta:has(~ .treeActions),
+.treeRow[data-selected] > .treeLine > .treeMeta:has(~ .treeActions) {
+  display: none;
+}
+
+.treeSub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px var(--sp-3);
+  padding: 0 var(--sp-4) 5px;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+/* Rename in place: the file tree's `.rename`. */
+.treeRename {
+  flex: 1;
+  min-width: 0;
+  height: calc(18px * var(--ui-scale));
+  padding: 0 3px;
+  border: 1px solid var(--accent);
+  border-radius: var(--r-2);
+  background: var(--panel-2);
+  color: var(--text-hi);
+  font: inherit;
+  font-size: var(--fs-ui-13);
+  outline: none;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Drag: the file tree's four states. The carried row fades; the target carries the verdict. */
+.treeRow[data-drag] > .treeLine,
+.treeRow[data-drag] > .treeSub {
+  opacity: 0.45;
+}
+
+.treeRow[data-drop='move'] > .treeLine {
+  background: var(--sel);
+  box-shadow:
+    inset 0 0 0 1px var(--accent),
+    inset 2px 0 0 var(--accent);
+}
+
+.treeRow[data-drop='noop'] > .treeLine {
+  background: var(--sel);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.treeRow[data-drop='refuse'] > .treeLine {
+  box-shadow: inset 0 0 0 1px var(--red);
+  cursor: not-allowed;
+}
+
+.treeRow[data-band] > .treeLine,
+.treeRow[data-band] > .treeSub {
+  background: color-mix(in srgb, var(--sel) 40%, transparent);
+}
+
+.treeRow[data-line='before']::before,
+.treeRow[data-line='after']::after {
+  content: '';
+  position: absolute;
+  left: 6px;
+  right: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  z-index: 1;
+}
+
+.treeRow[data-line='before']::before {
+  top: -1px;
+}
+
+.treeRow[data-line='after']::after {
+  bottom: -1px;
+}

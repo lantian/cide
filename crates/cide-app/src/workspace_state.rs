@@ -50,6 +50,31 @@ fn projects_losing_session_views(
     projects.into_iter().collect()
 }
 
+/// Projects where the set of sessions a pane shows changed at all — a tab closed, a pane opened
+/// onto a running session, a session bound to a new pane. (M199)
+///
+/// The Sessions tab draws exactly that fact (a *Background* badge, Show against Watch), and no
+/// journal write announces it: the journal keys conversations, and a conversation losing its pane
+/// is not a new sighting. So this diff is the tab's only cue that a row moved.
+fn projects_changing_session_views(
+    before: &Workspace,
+    after: &Workspace,
+) -> Vec<cide_ipc::ProjectId> {
+    let shown = |ws: &Workspace| -> std::collections::HashSet<_> {
+        workspace::session_panes(ws, None)
+            .into_iter()
+            .map(|found| (found.project, found.session))
+            .collect()
+    };
+    let (was, now) = (shown(before), shown(after));
+    let projects: std::collections::BTreeSet<_> = was
+        .symmetric_difference(&now)
+        .map(|(project, _)| *project)
+        .filter(|project| after.projects.contains_key(project))
+        .collect();
+    projects.into_iter().collect()
+}
+
 pub struct WorkspaceState {
     inner: Mutex<Workspace>,
     path: PathBuf,
@@ -384,6 +409,10 @@ impl WorkspaceState {
             // are all ordinary mutations with no journal code near them. A walk of the panes
             // and one mutex; the write is the journal's own flusher's.
             crate::sessions_state::observe_workspace(app, &snapshot);
+            // After the sighting above is merged, so a re-list finds the new pane's row. (M199)
+            for project in projects_changing_session_views(&content_before, &snapshot) {
+                crate::emit::sessions_changed(app, project);
+            }
         }
         outcome
     }
@@ -491,6 +520,48 @@ mod tests {
         let before = ws.clone();
         workspace::close_project(&mut ws, project, true).unwrap();
         assert!(projects_losing_session_views(&before, &ws).is_empty());
+    }
+
+    #[test]
+    fn the_sessions_tab_hears_a_view_gained_or_lost_but_not_a_move() {
+        use cide_ipc::{Axis, PaneId, PaneRole, SessionId, Side};
+        let mut ws = state().with(Clone::clone);
+        let project = *ws.projects.keys().next().unwrap();
+        let tab = ws.projects[&project].active_tab;
+        let tree = &mut ws.projects.get_mut(&project).unwrap().tabs[0].tree;
+        let first = tree.focused;
+        let mut watch = tree.panes[&first].clone();
+        watch.id = PaneId::new();
+        watch.role = PaneRole::Auxiliary;
+        watch.session = Some(SessionId::new());
+        let before = ws.clone();
+        let tree = &mut ws.projects.get_mut(&project).unwrap().tabs[0].tree;
+        let watched = cide_core::layout::split(tree, first, Axis::Row, Side::After, watch).unwrap();
+        assert_eq!(
+            projects_changing_session_views(&before, &ws),
+            vec![project],
+            "a pane opened onto a running session — Watch"
+        );
+        let before = ws.clone();
+        let window = workspace::detach_pane(&mut ws, project, tab, watched).unwrap();
+        assert!(
+            projects_changing_session_views(&before, &ws).is_empty(),
+            "tearing a pane out still shows it"
+        );
+        let before = ws.clone();
+        workspace::redock_pane(&mut ws, &window).unwrap();
+        workspace::close_pane(&mut ws, project, tab, watched, false).unwrap();
+        assert_eq!(
+            projects_changing_session_views(&before, &ws),
+            vec![project],
+            "the session runs on with no pane — Background"
+        );
+        let before = ws.clone();
+        workspace::close_project(&mut ws, project, true).unwrap();
+        assert!(
+            projects_changing_session_views(&before, &ws).is_empty(),
+            "a closed project has no tab to tell"
+        );
     }
 
     /// A state with no `AppHandle` attached, so `update` skips the emit/retitle tail —

@@ -22,11 +22,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cide_ipc::agents::Harness;
-use cide_ipc::sessions::{PROMPT_CLIP, SessionKind, SessionRecord};
-use cide_ipc::{Pane, PaneOrigin, SessionId, Tab, TabKind, Workspace};
+use cide_ipc::agents::{Harness, RunState};
+use cide_ipc::sessions::{
+    PROMPT_CLIP, SessionActivity, SessionEdit, SessionGroup, SessionKind, SessionRecord,
+};
+use cide_ipc::{Pane, PaneOrigin, SessionId, SessionState, Tab, TabKind, Workspace};
 use cide_ipc::{PaneKind, PaneRole};
 use serde::{Deserialize, Serialize};
+
+use crate::error::CoreError;
 
 /// How many conversations the journal keeps per project. The oldest by `last_seen` go first.
 ///
@@ -49,6 +53,80 @@ pub struct Journal {
     pub sources: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub projects: BTreeMap<String, Vec<SessionRecord>>,
+    /// The user's groups and labels, per project root. (M199) See [`Organize`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub organize: BTreeMap<String, Organize>,
+}
+
+/// How the user arranged a project's sessions: folders in the *Opened* tree, which conversation
+/// sits in which, and the names cide gives conversations. (M199)
+///
+/// # A side table, not fields on `SessionRecord`
+///
+/// The record crosses the remote wire — `UserRequest.origin` carries one to a phone — and a
+/// grouping is the desktop panel's business; `sources` is beside the rows for the same reason.
+/// The price of a side table keyed by conversation id is that the keys must **follow a row that
+/// is re-keyed** (a codex stand-in learning its thread id), or the membership silently orphans
+/// and the session falls out of its group. `Journal::upsert` carries them.
+///
+/// # What membership promises
+///
+/// A grouped conversation stays in its group after it ends instead of dropping into *Closed*, so
+/// the journal must also **never prune it** at the cap, and the listing must **never hide it**
+/// for having no transcript — both of which it would do to an ordinary ended row. Those three are
+/// what "never goes to history" means below the panel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Organize {
+    /// Every group, siblings in the user's order (the order of this list).
+    #[serde(default)]
+    pub groups: Vec<SessionGroup>,
+    /// Conversation id → group id.
+    #[serde(default)]
+    pub members: BTreeMap<String, String>,
+    /// Conversation id → cide's name for it.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl Organize {
+    fn is_empty(&self) -> bool {
+        self.groups.is_empty() && self.members.is_empty() && self.labels.is_empty()
+    }
+
+    fn group(&self, id: &str) -> Option<&SessionGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// Whether `id` is `ancestor` or nested anywhere under it. Bounded by the group count, so a
+    /// cycle that somehow reached the file cannot hang the walk.
+    fn within(&self, id: &str, ancestor: &str) -> bool {
+        let mut at = Some(id.to_owned());
+        for _ in 0..=self.groups.len() {
+            let Some(here) = at else { return false };
+            if here == ancestor {
+                return true;
+            }
+            at = self.group(&here).and_then(|g| g.parent.clone());
+        }
+        false
+    }
+}
+
+/// How long a group's name may be. A name is one line in a 320px panel; a paste of a paragraph is
+/// a mistake, and clipping it here keeps the file from carrying it.
+const GROUP_NAME_MAX: usize = 120;
+
+fn refused(why: impl Into<String>) -> CoreError {
+    CoreError::SessionGroupRefused(why.into())
+}
+
+fn clean_name(name: &str) -> Result<String, CoreError> {
+    let flat = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return Err(refused("A group needs a name."));
+    }
+    Ok(flat.chars().take(GROUP_NAME_MAX).collect())
 }
 
 fn key(root: &Path) -> String {
@@ -68,8 +146,16 @@ impl Journal {
     }
 
     /// Merge one sighting. Answers whether anything worth writing changed.
+    ///
+    /// Two duties toward [`Organize`] ride along. A re-keyed row takes its group and label with
+    /// it. And a **new** conversation under a handle a grouped row already holds — the next
+    /// conversation in the same pane, which is what a `/clear` is — joins that group: the user
+    /// filed the pane's work, and a `/clear` that silently dropped it out of the folder would look
+    /// like the folder losing a session.
     pub fn upsert(&mut self, root: &Path, seen: SessionRecord) -> bool {
-        let rows = self.projects.entry(key(root)).or_default();
+        let root_key = key(root);
+        let rows = self.projects.entry(root_key.clone()).or_default();
+        let organize = self.organize.get_mut(&root_key);
         let found = rows
             .iter()
             .position(|r| r.id == seen.id)
@@ -85,11 +171,209 @@ impl Journal {
                 })
             });
         let Some(index) = found else {
+            let Some(organize) = organize else {
+                rows.push(seen);
+                prune(rows, |_| false);
+                return true;
+            };
+            if let Some(handle) = seen.session {
+                let previous = rows
+                    .iter()
+                    .filter(|r| r.session == Some(handle) && organize.members.contains_key(&r.id))
+                    .max_by_key(|r| r.last_seen_unix_ms)
+                    .and_then(|r| organize.members.get(&r.id).cloned());
+                if let Some(group) = previous {
+                    organize.members.insert(seen.id.clone(), group);
+                }
+            }
             rows.push(seen);
-            prune(rows);
+            // Every insert, not only one that inherited: a filed row is never what the cap drops.
+            prune(rows, |id| organize.members.contains_key(id));
             return true;
         };
-        merge(&mut rows[index], seen)
+        let was = rows[index].id.clone();
+        let changed = merge(&mut rows[index], seen);
+        let now = &rows[index].id;
+        if *now != was
+            && let Some(organize) = self.organize.get_mut(&root_key)
+        {
+            if let Some(group) = organize.members.remove(&was) {
+                organize.members.insert(now.clone(), group);
+            }
+            if let Some(label) = organize.labels.remove(&was) {
+                organize.labels.insert(now.clone(), label);
+            }
+        }
+        changed
+    }
+
+    /// A project's groups and labels, or nothing when it has none.
+    pub fn organize(&self, root: &Path) -> Organize {
+        self.organize.get(&key(root)).cloned().unwrap_or_default()
+    }
+
+    /// Apply one grouping edit. `Ok(false)` when it changed nothing (collapsing a folded group);
+    /// a refusal carries the sentence the panel shows.
+    pub fn edit(&mut self, root: &Path, edit: SessionEdit) -> Result<bool, CoreError> {
+        let root_key = key(root);
+        let known = |id: &str| {
+            self.projects
+                .get(&root_key)
+                .is_some_and(|rows| rows.iter().any(|r| r.id == id))
+        };
+        let row_known = match &edit {
+            SessionEdit::Assign { conversation, .. } | SessionEdit::Label { conversation, .. } => {
+                known(conversation)
+            }
+            _ => true,
+        };
+        if !row_known {
+            return Err(refused("That session is no longer in the journal."));
+        }
+        let organize = self.organize.entry(root_key.clone()).or_default();
+        let before = organize.clone();
+        let missing = || refused("That group no longer exists.");
+        match edit {
+            SessionEdit::Create { id, name, parent } => {
+                let id = id.trim().to_owned();
+                if id.is_empty() || id.len() > 64 || organize.group(&id).is_some() {
+                    return Err(refused("A group needs a new id."));
+                }
+                if let Some(parent) = &parent
+                    && organize.group(parent).is_none()
+                {
+                    return Err(missing());
+                }
+                organize.groups.push(SessionGroup {
+                    id,
+                    name: clean_name(&name)?,
+                    parent,
+                    collapsed: false,
+                });
+            }
+            SessionEdit::Rename { id, name } => {
+                let name = clean_name(&name)?;
+                let group = organize
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == id)
+                    .ok_or_else(missing)?;
+                group.name = name;
+            }
+            SessionEdit::Delete { id } => {
+                let parent = organize.group(&id).ok_or_else(missing)?.parent.clone();
+                for g in organize.groups.iter_mut() {
+                    if g.parent.as_deref() == Some(id.as_str()) {
+                        g.parent = parent.clone();
+                    }
+                }
+                organize.members.retain(|_, g| *g != id || parent.is_some());
+                if let Some(parent) = &parent {
+                    for g in organize.members.values_mut() {
+                        if *g == id {
+                            *g = parent.clone();
+                        }
+                    }
+                }
+                organize.groups.retain(|g| g.id != id);
+            }
+            SessionEdit::Move { id, parent, before } => {
+                if organize.group(&id).is_none() {
+                    return Err(missing());
+                }
+                if let Some(parent) = &parent {
+                    if organize.group(parent).is_none() {
+                        return Err(missing());
+                    }
+                    if organize.within(parent, &id) {
+                        return Err(refused("A group cannot go inside itself."));
+                    }
+                }
+                if let Some(before) = &before {
+                    let sibling = organize.group(before).ok_or_else(missing)?;
+                    if *before == id || sibling.parent != parent {
+                        return Err(refused("A group can only be placed beside its siblings."));
+                    }
+                }
+                let at = organize
+                    .groups
+                    .iter()
+                    .position(|g| g.id == id)
+                    .expect("found above");
+                let mut group = organize.groups.remove(at);
+                group.parent = parent;
+                let to = before
+                    .and_then(|b| organize.groups.iter().position(|g| g.id == b))
+                    .unwrap_or(organize.groups.len());
+                organize.groups.insert(to, group);
+            }
+            SessionEdit::Collapse { id, collapsed } => {
+                organize
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == id)
+                    .ok_or_else(missing)?
+                    .collapsed = collapsed;
+            }
+            SessionEdit::CollapseAll { collapsed } => {
+                for g in organize.groups.iter_mut() {
+                    g.collapsed = collapsed;
+                }
+            }
+            SessionEdit::Assign {
+                conversation,
+                group,
+            } => match group {
+                Some(group) => {
+                    if organize.group(&group).is_none() {
+                        return Err(missing());
+                    }
+                    organize.members.insert(conversation, group);
+                }
+                None => {
+                    organize.members.remove(&conversation);
+                }
+            },
+            SessionEdit::Label {
+                conversation,
+                label,
+            } => {
+                let flat = label
+                    .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|l| !l.is_empty());
+                match flat {
+                    Some(l) => {
+                        organize
+                            .labels
+                            .insert(conversation, l.chars().take(GROUP_NAME_MAX).collect());
+                    }
+                    None => {
+                        organize.labels.remove(&conversation);
+                    }
+                }
+            }
+        }
+        let changed = *organize != before;
+        if organize.is_empty() {
+            self.organize.remove(&root_key);
+        }
+        Ok(changed)
+    }
+
+    /// Drop memberships and labels whose conversation is no longer a row — a label on a row the
+    /// cap pruned. Grouped rows are never pruned, so this only ever tidies; it runs before a
+    /// write, the way the stale `sources` are dropped.
+    pub fn retain_organized(&mut self) {
+        let projects = &self.projects;
+        self.organize.retain(|root, organize| {
+            let ids: std::collections::BTreeSet<&str> = projects
+                .get(root)
+                .map(|rows| rows.iter().map(|r| r.id.as_str()).collect())
+                .unwrap_or_default();
+            organize.members.retain(|id, _| ids.contains(id.as_str()));
+            organize.labels.retain(|id, _| ids.contains(id.as_str()));
+            !organize.is_empty()
+        });
     }
 
     /// Fill in what a row's transcript says: its first prompt, when the row has none yet, and its
@@ -156,12 +440,103 @@ fn merge(row: &mut SessionRecord, seen: SessionRecord) -> bool {
     compare != before || stale
 }
 
-fn prune(rows: &mut Vec<SessionRecord>) {
+/// Past the cap, drop the oldest-seen rows — never one `keep` names (a grouped conversation; see
+/// [`Organize`]). If grouped rows alone exceed the cap the project keeps them all: the user chose
+/// each one, and a cap that evicted a filed session would be the journal un-filing it.
+fn prune(rows: &mut Vec<SessionRecord>, keep: impl Fn(&str) -> bool) {
     if rows.len() <= PER_PROJECT {
         return;
     }
     rows.sort_by(|a, b| b.last_seen_unix_ms.cmp(&a.last_seen_unix_ms));
-    rows.truncate(PER_PROJECT);
+    let mut excess = rows.len() - PER_PROJECT;
+    let mut at = rows.len();
+    while excess > 0 && at > 0 {
+        at -= 1;
+        if !keep(&rows[at].id) {
+            rows.remove(at);
+            excess -= 1;
+        }
+    }
+}
+
+/// Whether a run's state means the run is over: finished, cancelled, failed, or interrupted and
+/// waiting on Resume or Discard. (M199)
+pub fn run_is_over(state: &RunState) -> bool {
+    matches!(
+        state,
+        RunState::Interrupted
+            | RunState::Finished { .. }
+            | RunState::Cancelled { .. }
+            | RunState::Failed { .. }
+    )
+}
+
+/// The child the Sessions tab calls a conversation **live** in — `live`, the alive child that is
+/// still this conversation's (`conversations::live`) — or `None`. (M199)
+///
+/// One exception, and the bug it fixes: **a run that is over, with no pane showing it, is not
+/// live**, even though its child usually still is. A finished run keeps its child for a follow-up
+/// turn, and the reaper never ends a session a run names (ADR 0016), so by liveness alone every
+/// finished run sat in *Opened* as *Background · Idle* for as long as the registry held it — and
+/// Stop could not move it, because stopping a finished run is, rightly, nothing. A pane continuing
+/// or watching it makes it live again: someone is looking at it.
+pub fn shown_live(
+    live: Option<SessionId>,
+    run: Option<&RunState>,
+    on_screen: bool,
+) -> Option<SessionId> {
+    if run.is_some_and(run_is_over) && !on_screen {
+        return None;
+    }
+    live
+}
+
+/// What a conversation is doing — the one table behind the Sessions tab's glyphs and its waiting
+/// counts. (M199) See [`SessionActivity`] for why it lives here and why a question is not in it.
+///
+/// `run` is the run's state when the conversation is a run's and the registry still holds the run;
+/// `state` is the last hook-derived state of its live child; `live` is whether that child is alive.
+///
+/// A run's state wins — the Subagents tab draws it, and a run row must read the same on both tabs
+/// — **except** for an ended run whose conversation a pane has since continued: the run is
+/// finished, but the conversation is live and working again, and its glyph should say so.
+pub fn activity(
+    run: Option<&RunState>,
+    state: Option<SessionState>,
+    live: bool,
+) -> SessionActivity {
+    use SessionActivity as A;
+    if let Some(run) = run.filter(|r| !(live && run_is_over(r))) {
+        return match run {
+            RunState::Queued | RunState::Starting => A::Starting,
+            RunState::Running => A::Working,
+            RunState::Blocked { .. } => A::Blocked,
+            RunState::Idle => A::Idle,
+            RunState::AwaitingPermission => A::Permission,
+            RunState::Paused { .. } => A::Paused,
+            RunState::Interrupted | RunState::Cancelled { .. } => A::Stopped,
+            RunState::Finished { .. } => A::Finished,
+            RunState::Failed { .. } => A::Failed,
+        };
+    }
+    match (live, state) {
+        (_, Some(SessionState::Exited { code })) => {
+            if code == 0 {
+                A::Finished
+            } else {
+                A::Stopped
+            }
+        }
+        (false, _) => A::Finished,
+        (true, Some(SessionState::Spawning | SessionState::Splash)) => A::Starting,
+        (true, Some(SessionState::Busy)) => A::Working,
+        (true, Some(SessionState::AwaitingPermission)) => A::Permission,
+        (true, Some(SessionState::AwaitingInput)) => A::AwaitingInput,
+        (true, Some(SessionState::Paused)) => A::Paused,
+        // A live child the hooks have not described — opencode, a codex console between jobs —
+        // is alive and asking nothing, which is Idle. `Starting` would sit on it for its life.
+        (true, Some(SessionState::Idle) | None) => A::Idle,
+    }
 }
 
 /// One line of what was asked: whitespace collapsed, at most [`PROMPT_CLIP`] characters.
@@ -688,6 +1063,343 @@ mod tests {
         let rows = j.list(Path::new(ROOT));
         assert_eq!(rows.len(), PER_PROJECT);
         assert!(rows.iter().all(|r| r.id != "s0" && r.id != "s2"));
+    }
+
+    fn group_edit(j: &mut Journal, edit: SessionEdit) -> Result<bool, CoreError> {
+        j.edit(Path::new(ROOT), edit)
+    }
+
+    fn create(j: &mut Journal, id: &str, parent: Option<&str>) {
+        group_edit(
+            j,
+            SessionEdit::Create {
+                id: id.into(),
+                name: format!("  group\n{id} "),
+                parent: parent.map(Into::into),
+            },
+        )
+        .expect("created");
+    }
+
+    fn assign(j: &mut Journal, conversation: &str, group: Option<&str>) {
+        group_edit(
+            j,
+            SessionEdit::Assign {
+                conversation: conversation.into(),
+                group: group.map(Into::into),
+            },
+        )
+        .expect("assigned");
+    }
+
+    #[test]
+    fn an_old_journal_loads_with_no_groups_and_an_empty_organize_is_not_written() {
+        let old: Journal = serde_json::from_value(serde_json::json!({"projects": {}})).unwrap();
+        assert!(old.organize.is_empty());
+        let mut j = old;
+        j.upsert(Path::new(ROOT), record("a", SessionKind::Console));
+        create(&mut j, "g", None);
+        assert_eq!(j.organize(Path::new(ROOT)).groups[0].name, "group g");
+        group_edit(&mut j, SessionEdit::Delete { id: "g".into() }).unwrap();
+        assert!(
+            !serde_json::to_string(&j).unwrap().contains("organize"),
+            "a project with nothing arranged writes no entry"
+        );
+    }
+
+    #[test]
+    fn a_group_is_refused_a_blank_name_a_duplicate_id_and_an_unknown_parent() {
+        let mut j = Journal::default();
+        create(&mut j, "g", None);
+        let blank = SessionEdit::Create {
+            id: "h".into(),
+            name: " \n ".into(),
+            parent: None,
+        };
+        assert!(matches!(
+            group_edit(&mut j, blank),
+            Err(CoreError::SessionGroupRefused(_))
+        ));
+        let dup = SessionEdit::Create {
+            id: "g".into(),
+            name: "x".into(),
+            parent: None,
+        };
+        assert!(group_edit(&mut j, dup).is_err());
+        let orphan = SessionEdit::Create {
+            id: "h".into(),
+            name: "x".into(),
+            parent: Some("nope".into()),
+        };
+        assert!(group_edit(&mut j, orphan).is_err());
+        let ghost = SessionEdit::Assign {
+            conversation: "not-a-row".into(),
+            group: Some("g".into()),
+        };
+        assert!(
+            group_edit(&mut j, ghost).is_err(),
+            "an id the journal does not hold"
+        );
+    }
+
+    #[test]
+    fn a_group_cannot_move_into_itself_and_is_placed_before_a_sibling() {
+        let mut j = Journal::default();
+        create(&mut j, "a", None);
+        create(&mut j, "b", Some("a"));
+        create(&mut j, "c", None);
+        let into_child = SessionEdit::Move {
+            id: "a".into(),
+            parent: Some("b".into()),
+            before: None,
+        };
+        assert!(group_edit(&mut j, into_child).is_err());
+        let into_self = SessionEdit::Move {
+            id: "a".into(),
+            parent: Some("a".into()),
+            before: None,
+        };
+        assert!(group_edit(&mut j, into_self).is_err());
+        let before_a = SessionEdit::Move {
+            id: "c".into(),
+            parent: None,
+            before: Some("a".into()),
+        };
+        assert!(group_edit(&mut j, before_a).unwrap());
+        let order: Vec<_> = j
+            .organize(Path::new(ROOT))
+            .groups
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(order, ["c", "a", "b"]);
+        let beside_a_stranger = SessionEdit::Move {
+            id: "c".into(),
+            parent: None,
+            before: Some("b".into()),
+        };
+        assert!(
+            group_edit(&mut j, beside_a_stranger).is_err(),
+            "b is not a top-level sibling"
+        );
+    }
+
+    #[test]
+    fn deleting_a_group_moves_what_it_held_up_a_level() {
+        let mut j = Journal::default();
+        for id in ["x", "y", "z"] {
+            j.upsert(Path::new(ROOT), record(id, SessionKind::Tab));
+        }
+        create(&mut j, "top", None);
+        create(&mut j, "mid", Some("top"));
+        create(&mut j, "leaf", Some("mid"));
+        assign(&mut j, "x", Some("mid"));
+        assign(&mut j, "y", Some("top"));
+        group_edit(&mut j, SessionEdit::Delete { id: "mid".into() }).unwrap();
+        let o = j.organize(Path::new(ROOT));
+        assert_eq!(o.members.get("x").map(String::as_str), Some("top"));
+        assert_eq!(
+            o.group("leaf").and_then(|g| g.parent.as_deref()),
+            Some("top")
+        );
+        group_edit(&mut j, SessionEdit::Delete { id: "top".into() }).unwrap();
+        let o = j.organize(Path::new(ROOT));
+        assert!(
+            o.members.is_empty(),
+            "at the top level its sessions go loose"
+        );
+        assert_eq!(o.group("leaf").and_then(|g| g.parent.clone()), None);
+    }
+
+    #[test]
+    fn a_re_keyed_row_keeps_its_group_and_label() {
+        let mut j = Journal::default();
+        let handle = SessionId(uuid::Uuid::from_u128(11));
+        let mut stand_in = record(&handle.to_string(), SessionKind::Console);
+        stand_in.known = false;
+        stand_in.harness = Harness::Codex;
+        stand_in.session = Some(handle);
+        j.upsert(Path::new(ROOT), stand_in);
+        create(&mut j, "g", None);
+        assign(&mut j, &handle.to_string(), Some("g"));
+        group_edit(
+            &mut j,
+            SessionEdit::Label {
+                conversation: handle.to_string(),
+                label: Some("build fix".into()),
+            },
+        )
+        .unwrap();
+        let mut named = record("thread-1", SessionKind::Console);
+        named.harness = Harness::Codex;
+        named.session = Some(handle);
+        j.upsert(Path::new(ROOT), named);
+        let o = j.organize(Path::new(ROOT));
+        assert_eq!(o.members.get("thread-1").map(String::as_str), Some("g"));
+        assert_eq!(
+            o.labels.get("thread-1").map(String::as_str),
+            Some("build fix")
+        );
+        assert!(!o.members.contains_key(&handle.to_string()));
+    }
+
+    #[test]
+    fn a_clear_in_a_grouped_pane_stays_in_the_group() {
+        let mut j = Journal::default();
+        let handle = SessionId(uuid::Uuid::from_u128(12));
+        let mut first = record(&handle.to_string(), SessionKind::Tab);
+        first.session = Some(handle);
+        j.upsert(Path::new(ROOT), first);
+        create(&mut j, "g", None);
+        assign(&mut j, &handle.to_string(), Some("g"));
+        let mut after = record("after-clear", SessionKind::Tab);
+        after.session = Some(handle);
+        j.upsert(Path::new(ROOT), after);
+        let o = j.organize(Path::new(ROOT));
+        assert_eq!(o.members.get("after-clear").map(String::as_str), Some("g"));
+        let mut stranger = record("elsewhere", SessionKind::Tab);
+        stranger.session = Some(SessionId(uuid::Uuid::from_u128(13)));
+        j.upsert(Path::new(ROOT), stranger);
+        assert!(
+            !j.organize(Path::new(ROOT))
+                .members
+                .contains_key("elsewhere")
+        );
+    }
+
+    #[test]
+    fn a_grouped_row_survives_the_cap() {
+        let mut j = Journal::default();
+        j.upsert(Path::new(ROOT), record("filed", SessionKind::Tab));
+        create(&mut j, "g", None);
+        assign(&mut j, "filed", Some("g"));
+        for i in 0..(PER_PROJECT as u64 + 3) {
+            let mut r = record(&format!("s{i}"), SessionKind::Tab);
+            r.last_seen_unix_ms = 2_000 + i;
+            j.upsert(Path::new(ROOT), r);
+        }
+        let rows = j.list(Path::new(ROOT));
+        assert_eq!(rows.len(), PER_PROJECT);
+        assert!(
+            rows.iter().any(|r| r.id == "filed"),
+            "the oldest row, but filed"
+        );
+        assert!(rows.iter().all(|r| r.id != "s0" && r.id != "s3"));
+    }
+
+    #[test]
+    fn retaining_drops_labels_of_pruned_rows_only() {
+        let mut j = Journal::default();
+        j.upsert(Path::new(ROOT), record("kept", SessionKind::Tab));
+        group_edit(
+            &mut j,
+            SessionEdit::Label {
+                conversation: "kept".into(),
+                label: Some("mine".into()),
+            },
+        )
+        .unwrap();
+        j.organize
+            .get_mut(ROOT)
+            .unwrap()
+            .labels
+            .insert("gone".into(), "stale".into());
+        j.retain_organized();
+        let o = j.organize(Path::new(ROOT));
+        assert!(o.labels.contains_key("kept") && !o.labels.contains_key("gone"));
+    }
+
+    #[test]
+    fn collapsing_twice_is_no_change() {
+        let mut j = Journal::default();
+        create(&mut j, "g", None);
+        let fold = || SessionEdit::Collapse {
+            id: "g".into(),
+            collapsed: true,
+        };
+        assert!(group_edit(&mut j, fold()).unwrap());
+        assert!(!group_edit(&mut j, fold()).unwrap());
+        assert!(group_edit(&mut j, SessionEdit::CollapseAll { collapsed: false }).unwrap());
+    }
+
+    #[test]
+    fn a_finished_run_nobody_shows_is_not_live_though_its_child_is() {
+        let child = Some(SessionId(uuid::Uuid::from_u128(21)));
+        let finished = RunState::Finished { code: 0 };
+        assert_eq!(shown_live(child, Some(&finished), false), None);
+        assert_eq!(
+            shown_live(child, Some(&finished), true),
+            child,
+            "a pane watching or continuing it"
+        );
+        assert_eq!(
+            shown_live(child, Some(&RunState::Idle), false),
+            child,
+            "an idle run waits for more and is live"
+        );
+        assert_eq!(
+            shown_live(child, None, false),
+            child,
+            "not a run: liveness alone"
+        );
+        assert_eq!(shown_live(None, Some(&RunState::Running), true), None);
+        assert_eq!(
+            activity(Some(&finished), Some(SessionState::Idle), false),
+            SessionActivity::Finished,
+            "and it reads as finished, not idle"
+        );
+    }
+
+    #[test]
+    fn the_activity_table() {
+        use SessionActivity as A;
+        let exited = |code| Some(SessionState::Exited { code });
+        // A run's state wins…
+        assert_eq!(activity(Some(&RunState::Running), None, true), A::Working);
+        assert_eq!(activity(Some(&RunState::Queued), None, false), A::Starting);
+        assert_eq!(
+            activity(Some(&RunState::Blocked { reason: "x".into() }), None, true),
+            A::Blocked
+        );
+        assert_eq!(
+            activity(Some(&RunState::AwaitingPermission), None, true),
+            A::Permission
+        );
+        assert_eq!(
+            activity(Some(&RunState::Failed { reason: "x".into() }), None, false),
+            A::Failed
+        );
+        assert_eq!(
+            activity(Some(&RunState::Interrupted), None, false),
+            A::Stopped
+        );
+        // …except over a pane continuing an ended run.
+        assert_eq!(
+            activity(
+                Some(&RunState::Finished { code: 0 }),
+                Some(SessionState::Busy),
+                true
+            ),
+            A::Working
+        );
+        // A pane's session, from its hooks.
+        assert_eq!(
+            activity(None, Some(SessionState::AwaitingInput), true),
+            A::AwaitingInput
+        );
+        assert_eq!(
+            activity(None, Some(SessionState::Splash), true),
+            A::Starting
+        );
+        assert_eq!(activity(None, None, true), A::Idle, "undescribed but alive");
+        assert_eq!(activity(None, None, false), A::Finished);
+        assert_eq!(activity(None, exited(0), false), A::Finished);
+        assert_eq!(activity(None, exited(137), false), A::Stopped);
+        assert_eq!(
+            activity(None, Some(SessionState::Busy), false),
+            A::Finished,
+            "a stale Busy on a dead child is not work"
+        );
     }
 
     #[test]

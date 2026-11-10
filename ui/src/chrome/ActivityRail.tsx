@@ -17,7 +17,7 @@ import { groupDigits } from '@/overlays/format'
 import { Icon, type IconName, type IconSize } from '@/icons/Icon'
 import { useContextMenu } from '@/menus'
 import { railFit, railOverflowHint } from './railOverflow'
-import { agentsMarks } from './railMarks'
+import { agentsMarks, type AgentsWaiting } from './railMarks'
 import type { ActivityView } from './sidebarView'
 import styles from './ActivityRail.module.css'
 
@@ -223,41 +223,15 @@ export interface ActivityRailProps {
    */
   agents?: number | null | undefined
   /**
-   * Whether any of those runs is stopped at a permission prompt, which only changes the badge's
-   * **tone**, never whether it is drawn or what number it shows. (M18)
+   * What waits for the user, for the **amber count** on the hexagon (M132, a count since M199):
+   * live sessions stopped on them — the Sessions tab's pill — and the Waiting tab's tasks and
+   * requests, a session's question counted once. `railMarks.ts` says why it is its own mark and
+   * not the pill, and why the pill no longer turns red at a permission prompt.
    *
-   * A separate value rather than a second count because it answers a different question. The
-   * count is "how much is in flight", which the pill shows; this is "is any of it stuck on me",
-   * which is the one agent state that is a call to action rather than a status — the run has
-   * stopped, and it stays stopped until the user answers. So it draws the same red the Problems
-   * uses for errors. Folding it into the count instead would mean either drawing the wrong
-   * number or drawing two pills on one 42px button.
-   *
-   * It cannot make a badge appear on its own: with `agents` `null` or `0` there is no pill to
-   * tone, and a caller that says "one run is waiting" while saying "no runs are live" has
-   * contradicted itself — the rail believes the count, because that is the number on screen.
+   * `errors`' rule for the value: `null` is nobody looked, a zero total is looked and nothing
+   * waits, and neither draws anything.
    */
-  agentsAwaiting?: boolean | undefined
-  /**
-   * Tasks waiting for the user — accepted by eye and in review, or carrying an open question —
-   * for a **second mark** on the hexagon: the Agents panel's Waiting tab lists them. (M132)
-   *
-   * Its own mark and not the pill, because the two are independent facts and either can be true
-   * alone: a question can sit on the board after its run has finished (no live runs, no pill),
-   * and runs can work with nothing owed (pill, no mark). Folding it into the pill would mean
-   * choosing which number to draw; retoning the pill, as `agentsAwaiting` does, would say
-   * nothing when no run is live — which is exactly when a task waits longest unnoticed.
-   *
-   * So it sits in the corner the pill does not (bottom right, the pill is top right), as a dot
-   * without a number: the count is in the button's name and on the Waiting tab, and a second
-   * pill on a 32px button would be two numbers to tell apart at a glance. Amber (`--grad-yellow`),
-   * the kit's "waiting on someone" tone — not the pill's neutral, which reads as a quiet count,
-   * and not the red `agentsAwaiting` takes, which means a run is stopped at a prompt this second.
-   *
-   * `errors`' rule for the value: `null` is nobody looked (no tracker, board not read), `0` is
-   * looked and nothing waits, and neither draws anything.
-   */
-  agentsWaiting?: number | null | undefined
+  agentsWaiting?: AgentsWaiting | null | undefined
   /**
    * Open tasks in `.cide/tasks.json`, for the badge on the ticked box. (M18)
    *
@@ -314,7 +288,6 @@ export function ActivityRail({
   errors,
   busy,
   agents,
-  agentsAwaiting,
   agentsWaiting,
   tasks,
   onSelect,
@@ -443,7 +416,7 @@ export function ActivityRail({
   const count = changed ?? null
   /* The Agents button's two marks and its name, decided in `railMarks.ts` — see its header for
      why the run pill and the waiting mark are independent, and why the rule is not in here. */
-  const marks = agentsMarks(agents, agentsAwaiting, agentsWaiting, groupDigits)
+  const marks = agentsMarks(agents, agentsWaiting, groupDigits)
   const badges: Record<
     string,
     { pill: string; name: string; pillClass?: string | undefined } | undefined
@@ -479,7 +452,6 @@ export function ActivityRail({
       marks.runs !== null
         ? {
             pill: badgeText(marks.runs) ?? String(marks.runs),
-            pillClass: marks.blocked ? styles.badgeError : undefined,
             // `marks.name`, not a count of runs alone: it also names the waiting mark, which
             // is drawn with or without this pill (`railMarks.ts`).
             name: marks.name ?? '',
@@ -574,7 +546,9 @@ export function ActivityRail({
               {waitingHere && (
                 /* The waiting mark, bottom right — the corner the pill is not in. `aria-hidden`
                    for the pill's reason: the name above is the wording. */
-                <span className={styles.waitingMark} data-audit="railWaiting" aria-hidden="true" />
+                <span className={styles.waitingMark} data-audit="railWaiting" aria-hidden="true">
+                  {badgeText(marks.waiting)}
+                </span>
               )}
               {badge !== undefined && (
                 /*

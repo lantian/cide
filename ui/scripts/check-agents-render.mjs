@@ -2992,8 +2992,8 @@ try {
     const tabs = a('panel-tabs')
     eq(
       tabs.panelTabs,
-      ['subagents|true|Subagents', 'sessions|false|Sessions', 'waiting|false|Waiting 2'],
-      'the Agents panel header carries Subagents (on), Sessions and Waiting, with its count',
+      ['sessions|false|Sessions', 'subagents|true|Subagents', 'waiting|false|Waiting 2'],
+      'the Agents panel header carries Sessions (first, since M199), Subagents (on) and Waiting, with its count',
     )
     ok(
       (tabs.labels ?? []).includes('Waiting 2') || (tabs.buttons ?? []).includes('Waiting 2'),
@@ -3028,74 +3028,115 @@ try {
     }
 
     /*
-     * *Sessions* (M134): every agent conversation of the project, under the same strip. Four
-     * halves, each with its own quiet way to regress: every row is drawn with its kind and its
-     * liveness; the kind chips count only the kinds present and start on All; a picked kind and a
-     * transcript hit narrow the list and draw the snippet; and an empty journal says so rather
-     * than drawing a filter row with nothing to filter.
+     * *Sessions* (M134, a tree since M199): every agent conversation of the project, under the
+     * same strip, Sessions first. Each half has its own quiet way to regress: a session drawn in
+     * two places or in none; a group that forgets its nesting or its fold; a background session
+     * with no mark; a row whose click resumes a `claude`; a search that cannot see into a folded
+     * group; Closed losing its day captions.
      */
     const sessions = a('sessions-panel')
     eq(
       sessions.panelTabs,
-      ['subagents|false|Subagents', 'sessions|true|Sessions', 'waiting|false|Waiting 2'],
-      'the Sessions tab renders under the same strip, with Sessions on',
+      ['sessions|true|Sessions 1', 'subagents|false|Subagents', 'waiting|false|Waiting 2'],
+      'the Sessions tab renders under the same strip, first and on, with its own waiting count',
+    )
+    eq(sessions.sessionsCount, '1', 'the Sessions pill is the waiting-sessions count')
+    eq(
+      sessions.sessionSubs,
+      ['opened|true|Opened 5', 'closed|false|Closed 2'],
+      'two sub-tabs, Opened on, each counting its rows — a filed ended session counts as Opened',
     )
     eq(
-      sessions.sessionRows,
+      sessions.sessionTree,
       [
-        'console|true|proj : claude',
-        'worker|false|fix the flaky gate',
-        'subagent|false|Coder',
-        'mrReview|false|Review !42',
+        'group|1|Release|true',
+        'group|2|Menus|true',
+        'row|3|working|Coder|bg',
+        'row|2|finished|fix the flaky gate',
+        'group|1|Ideas|false|rollup',
+        '---',
+        'row|1|working|Add a Sessions tab to the Agents panel',
+        'row|1|awaitingInput|Docs pass|bg',
       ],
-      'every session is a row, newest first, named by its /rename name when it has one',
+      'groups first, nested, each with its subgroups then its sessions (an ended one stays); a folded group rolls up; ' +
+        'a rule; then the live loose sessions newest first, a generic title giving way to the first prompt, ' +
+        'background ones marked',
     )
-    eq(
-      sessions.sessionKinds,
-      ['|true|All', 'console|false|Console 1', 'worker|false|Worker tab 1', 'subagent|false|Subagent 1', 'mrReview|false|MR review 1'],
-      'the kind chips are All (on) and one per kind present, each with its count',
-    )
-    ok((sessions.text ?? '').includes('Add a Sessions tab to the Agents panel'), 'a console row says what it was first asked')
-    ok((sessions.text ?? '').includes('t-14 · Split the renderer'), 'a run row says which task it was on')
-    eq(sessions.sessionHits, 0, 'no snippet is drawn without a transcript search')
     eq(
       sessions.sessionOpens,
-      ['Show', 'Open', 'Open', 'Open'],
-      'every row has its own Open button — Show for the one a pane already holds',
+      ['Watch', 'Open', 'Show', 'Watch'],
+      'every drawn row has its own open button: Show for a pane’s, Watch for a background one, Open to resume',
     )
-    eq(sessions.sessionTasks, ['t-14 · Split the renderer'], 'a run’s task is a link to its card')
-    ok(sessions.sessionRole, 'the role filter is drawn when a subagent has run')
+    eq(sessions.sessionMenus, 4, '…and its ⋯ menu')
+    eq(sessions.sessionTasks, ['t-14 · Split the renderer'], 'the selected run’s second line links its task')
+    eq(sessions.sessionHits, 0, 'no snippet is drawn without a transcript search')
+    eq(sessions.sessionHint, false, 'no first-group hint once there are groups')
     {
-      // Comments out first: the file's header explains, in prose, the `onOpen` it no longer passes.
+      // Comments out first: the file's header explains, in prose, why a click does not open.
       const view = readFileSync(new URL('../src/sidebar/AgentsPanel/SessionsPanel.tsx', import.meta.url), 'utf8')
         .replace(/\/\*[\s\S]*?\*\//g, '')
         .replace(/\/\/[^\n]*/g, '')
-      ok(
-        !/<ListItem\b[^>]*\bonOpen=/.test(view),
-        'the row itself opens nothing: a missed task link must not resume a conversation',
-      )
+      const row = view.slice(view.indexOf('const sessionItem'), view.indexOf('const onKeyDown'))
+      // The row's own handler, a prop of its own line — not the open button's inline one above it.
+      const click = /\n {8}onClick=\{\(\) => \{([\s\S]*?)\n {8}\}\}/.exec(row)
+      ok(click !== null && /onSelect\(v\.id\)/.test(click[1]) && !/onOpen/.test(click[1]), 'a click on a row selects it and opens nothing — a stray click must not resume a conversation')
+      ok(/onDoubleClick=\{\(\) => onOpen\(v\.id\)\}/.test(row), '…a double-click opens it')
     }
+    eq(
+      sessions.sessionSubLines,
+      0,
+      'selecting a row grows no second line: a row that grew moved the rows under it between the two clicks of a double-click',
+    )
+    ok(
+      sessions.sessionDetail.startsWith('Coder Working · Subagent · Claude · coder-t-14') &&
+        sessions.sessionDetail.includes('t-14 · Split the renderer'),
+      'the selected session’s facts are in the strip under the tree — status in words, kind, harness, branch, task',
+    )
     eq(sessions.unclassed, 0, 'every hooked element on the Sessions tab has a class that exists')
 
-    const filtered = a('sessions-filtered')
-    eq(filtered.sessionRows, ['worker|false|fix the flaky gate'], 'a picked kind keeps only its rows')
+    const closed = a('sessions-closed')
     eq(
-      filtered.sessionKinds.slice(0, 3),
-      ['|false|All', 'console|false|Console 1', 'worker|true|Worker tab 1'],
-      '…and its chip reads pressed, All does not, and the counts stay the whole journal’s',
+      closed.sessionTree,
+      ['day|Yesterday', 'row|1|finished|Why does the dock menu list closed projects', 'day|Earlier', 'row|1|finished|Review !42'],
+      'Closed is the ended, unfiled rows under day captions — no groups, no rule',
     )
+    eq(closed.sessionOpens, ['Open', 'Open'], 'a closed row opens by resuming')
+    eq(closed.unclassed, 0, 'every hooked element on Closed has a class that exists')
+
+    const filtered = a('sessions-filtered')
+    eq(
+      filtered.sessionTree,
+      ['group|1|Release|true', 'group|2|Menus|true', 'row|3|working|Coder|bg', '---', 'row|1|working|Add a Sessions tab to the Agents panel'],
+      'a search keeps what it finds — by task title, or by transcript — and the groups on the way to it',
+    )
+    eq(filtered.sessionSubs, ['opened|true|Opened 2', 'closed|false|Closed 0'], '…and the sub-tabs count what it keeps')
     eq(filtered.sessionHits, 1, 'a transcript hit draws its snippet under the row')
-    ok((filtered.text ?? '').includes('the gate retried once and passed'), '…with the words around the match')
+    eq(filtered.sessionSubLines, 1, '…the one second line a row draws, and a click does not move it')
+    eq(filtered.sessionDetail, '', 'with nothing selected, no detail strip')
+    ok((filtered.text ?? '').includes('we split the renderer into two'), '…with the words around the match')
+
+    const noGroups = a('sessions-nogroups')
+    eq(
+      noGroups.sessionTree,
+      [
+        'row|1|working|Add a Sessions tab to the Agents panel',
+        'row|1|working|Coder|bg',
+        'row|1|awaitingInput|Docs pass|bg',
+        'row|1|working|Theme importer',
+      ],
+      'with no groups every live session is loose, and a membership naming a lost group reads as none',
+    )
+    eq(noGroups.sessionHint, true, '…and the tree says how to make the first group')
 
     const noSessions = a('sessions-empty')
     eq(noSessions.sessionRows, [], 'an empty journal draws no rows')
-    eq(noSessions.sessionKinds, [], '…and no filter row, which would filter nothing')
+    eq(noSessions.sessionSubs, [], '…and no sub-tabs, which would switch between two empty lists')
     ok((noSessions.text ?? '').includes('No agent session in this project yet'), '…and says why the list is empty')
 
     const waiting = a('waiting-panel')
     eq(
       waiting.panelTabs,
-      ['subagents|false|Subagents', 'sessions|false|Sessions', 'waiting|true|Waiting 2'],
+      ['sessions|false|Sessions', 'subagents|false|Subagents', 'waiting|true|Waiting 2'],
       'the Waiting tab renders under the same strip, with Waiting on',
     )
     eq(waiting.waitingOpens, 2, 'both waiting tasks are listed, each a link to its card')

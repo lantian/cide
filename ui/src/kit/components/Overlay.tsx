@@ -431,3 +431,39 @@ export function Tooltip({ text, shortcut }: { text: string; shortcut?: string | 
     </span>
   )
 }
+
+/**
+ * What is being carried, and the verdict, under the pointer: the file tree's drag ghost, as a
+ * part. (M199)
+ *
+ * `position: fixed` because the tree scrolls under it, and never a pointer target, so the hit
+ * test under the pointer finds the row and not the ghost. The hint is the sentence that says
+ * *why* — "cannot go inside itself" — so a refusal is not only a red border.
+ */
+export function DragGhost({
+  x,
+  y,
+  load,
+  hint,
+  outcome,
+}: {
+  /** Viewport coordinates of the pointer. */
+  x: number
+  y: number
+  load: ReactNode
+  hint: ReactNode
+  /** `none` while over nothing that takes a drop. */
+  outcome: 'move' | 'noop' | 'refuse' | 'none'
+}): ReactElement {
+  return (
+    <div
+      className={styles.ghost}
+      data-outcome={outcome}
+      aria-hidden="true"
+      style={{ left: `${x + 12}px`, top: `${y + 14}px` }}
+    >
+      <span className={styles.ghostLoad}>{load}</span>
+      <span className={styles.ghostHint}>{hint}</span>
+    </div>
+  )
+}

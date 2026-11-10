@@ -227,6 +227,11 @@ none of it does. Inspect a profile's with `CIDE_PROFILE=<name> ./target/debug/ci
 - `$XDG_STATE_HOME/cide/workspace.json` — the tree. Written atomically, 500 ms debounce; reads
   never fail, because a broken layout must not become a launch loop. Inspect without a GUI:
   `./target/debug/cide-headless tree`.
+- `$XDG_STATE_HOME/cide/sessions.json` — the session journal (M134): one row per agent
+  conversation per project root, at most 500 per root, plus (M199) the Sessions tab's
+  `organize` table — the user's groups, which conversation is filed where, and cide's own
+  names for conversations. A filed conversation is never pruned. Inspect without a GUI:
+  `./target/debug/cide-headless sessions <root>`.
 - `$XDG_CONFIG_HOME/cide/keymap.json` — user binding overrides only (diffs; defaults are
   compiled in).
 - `$XDG_CONFIG_HOME/cide/harness-settings.json` — local project defaults and CLI launch

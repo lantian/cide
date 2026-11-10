@@ -170,17 +170,37 @@
  * Static on purpose: the busy dot below pulses because it says "working", and this says
  * "yours to do" — it stays until the user does it, and a mark that throbs for hours is noise.
  */
+/*
+ * M199: a **count**, no longer a dot. It now sums what waits on the Sessions tab and the Waiting
+ * tab, and "something somewhere in this panel" stopped being enough to act on. So it is the run
+ * pill's box — 20×16, mono 11/600, one and two digits measuring the same — in this corner and
+ * this colour, with `--on-yellow` ink (the kit's amber fill's own). The run pill no longer turns
+ * red (`.badgeError` stays for the Problems badge), because a permission prompt is now counted
+ * here with everything else the user owes.
+ *
+ * The two pills meet at the button's middle at UI size 13 (16 + 16 = 32); each carries the
+ * `--chrome` ring, so where they touch a gap of the rail's own ground still parts them.
+ */
 .waitingMark {
   position: absolute;
-  right: 0;
+  right: -2px;
   bottom: 0;
-  width: 8px;
-  height: 8px;
+  min-width: 20px;
+  height: calc(16px * var(--ui-scale));
+  padding: 0 var(--sp-2);
+  box-sizing: border-box;
   border-radius: var(--r-full);
   background: var(--grad-yellow);
   box-shadow:
     var(--fill-sheen),
     0 0 0 2px var(--chrome);
+  color: var(--on-yellow);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: calc(16px * var(--ui-scale));
+  text-align: center;
+  letter-spacing: 0;
   pointer-events: none;
 }
 

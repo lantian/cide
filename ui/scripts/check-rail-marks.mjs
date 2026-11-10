@@ -78,44 +78,46 @@ try {
   // =====================================================================================
   // 1. The four states. Each one is a mark drawn or not, independently of the other.
 
+  const w = (total, sessions, decisions) => ({ total, sessions, decisions })
   eq(
-    agentsMarks(0, false, 0),
-    { runs: null, blocked: false, waiting: null, name: null },
-    'neither: no pill, no mark, and nothing added to the name',
+    agentsMarks(0, w(0, 0, 0)),
+    { runs: null, waiting: null, name: null },
+    'neither: no pill, no count, and nothing added to the name',
   )
   eq(
-    agentsMarks(2, false, 0),
-    { runs: 2, blocked: false, waiting: null, name: '2 runs' },
-    'runs only: the pill, and no waiting mark',
+    agentsMarks(2, w(0, 0, 0)),
+    { runs: 2, waiting: null, name: '2 runs' },
+    'runs only: the pill, and no waiting count',
   )
   eq(
-    agentsMarks(null, false, 1),
-    { runs: null, blocked: false, waiting: 1, name: '1 task waiting for you' },
-    'waiting only: the mark is drawn with no pill at all — a question outlives the run that asked it',
+    agentsMarks(null, w(1, 0, 1)),
+    { runs: null, waiting: 1, name: '1 waiting for you' },
+    'waiting only: the count is drawn with no pill at all — a question outlives the run that asked it',
   )
   eq(
-    agentsMarks(0, true, 2),
-    { runs: null, blocked: false, waiting: 2, name: '2 tasks waiting for you' },
-    '…and with a zero run count too, while `awaiting` still cannot conjure a pill',
+    agentsMarks(0, w(2, 2, 0)),
+    { runs: null, waiting: 2, name: '2 waiting for you' },
+    '…and with a zero run count too; one source needs no split',
   )
   eq(
-    agentsMarks(2, true, 3),
-    { runs: 2, blocked: true, waiting: 3, name: '2 runs, one blocked on a permission, 3 tasks waiting for you' },
-    'both: the pill (red, a run is at a prompt) and the mark, and the name says both',
+    agentsMarks(5, w(6, 4, 3)),
+    { runs: 5, waiting: 6, name: '5 runs, 6 waiting for you (4 sessions, 3 in Waiting; one is both, counted once)' },
+    'both: the pill and the count, and the name says which tab holds what and that a question is counted once',
   )
   eq(
-    agentsMarks(1, false, 1).name,
-    '1 run, 1 task waiting for you',
-    'the waiting count is named as tasks, so it cannot be read as a count of runs',
+    agentsMarks(1, w(3, 1, 2)).name,
+    '1 run, 3 waiting for you (1 session, 2 in Waiting)',
+    'the waiting count is named as waiting, so it cannot be read as a count of runs',
   )
+  ok(!('blocked' in agentsMarks(2, w(1, 1, 0))), 'no red pill any more: a permission prompt is one of the waiting sessions')
 
   // `null` (nobody looked) and `0` (looked, nothing) are different claims and draw alike: nothing.
-  eq(agentsMarks(1, false, null).waiting, null, 'an unread board draws no mark')
-  eq(agentsMarks(1, false, undefined).waiting, null, 'nor does a rail that was never told')
-  eq(agentsMarks(1, false, -1).waiting, null, 'nor a nonsense count')
+  eq(agentsMarks(1, null).waiting, null, 'an unread count draws no mark')
+  eq(agentsMarks(1, undefined).waiting, null, 'nor does a rail that was never told')
+  eq(agentsMarks(1, w(-1, 0, 0)).waiting, null, 'nor a nonsense count')
   eq(
-    agentsMarks(1_203, false, 1_500, commas).name,
-    '1,203 runs, 1,500 tasks waiting for you',
+    agentsMarks(1_203, w(1_500, 1_000, 500), commas).name,
+    '1,203 runs, 1,500 waiting for you (1,000 sessions, 500 in Waiting)',
     'the name groups digits with the rail`s own formatter',
   )
 
@@ -124,8 +126,8 @@ try {
 
   const rail = strip(readFileSync('src/chrome/ActivityRail.tsx', 'utf8'))
   ok(
-    /agentsMarks\(agents, agentsAwaiting, agentsWaiting, groupDigits\)/.test(rail),
-    'the rail asks `railMarks.ts` with all three facts',
+    /agentsMarks\(agents, agentsWaiting, groupDigits\)/.test(rail),
+    'the rail asks `railMarks.ts` with both facts',
   )
   ok(
     /const waitingHere = item\.id === 'agents' && marks\.waiting !== null\s/.test(rail),
@@ -140,10 +142,10 @@ try {
       'mean no mark — and the pill, later in the markup, paints over it where the two could meet',
   )
   ok(
-    /\{waitingHere && \(\s*<span className=\{styles\.waitingMark\} data-audit="railWaiting" aria-hidden="true" \/>/.test(
+    /\{waitingHere && \(\s*<span className=\{styles\.waitingMark\} data-audit="railWaiting" aria-hidden="true">\s*\{badgeText\(marks\.waiting\)/.test(
       rail,
     ),
-    'the mark is its own class and `aria-hidden`, like the pill: the name is the wording',
+    'the count is its own class and `aria-hidden`, like the pill (the name is the wording), and draws the number',
   )
   ok(
     /name = `\$\{item\.label\} — \$\{marks\.name\}`/.test(rail),
@@ -167,11 +169,12 @@ try {
   ok(!/animation/.test(mark), 'and it is static: it waits for the user, it is not "working"')
 
   // =====================================================================================
-  // 4. The shell passes it, from the board.
+  // 4. The shell passes it, from the sessions and the Waiting tab together.
 
   const app = strip(readFileSync('src/App.tsx', 'utf8'))
   ok(/agentsWaiting=\{/.test(app), 'the shell passes `agentsWaiting` — a prop nothing supplies draws nothing')
-  ok(/waitingCount\(s\.board\.tasks\)/.test(app), '…counted with the Waiting tab`s own `waitingCount`')
+  ok(/useWaitingCounts\(\)/.test(app), '…from `useWaitingCounts`, the one count the Sessions and Waiting tabs share')
+  ok(!/agentsAwaiting=/.test(app), '…and no red-pill flag: a permission prompt is counted as waiting')
 
   console.log(failed === 0 ? 'rail marks: ok' : `rail marks: ${failed} failure(s)`)
 } finally {

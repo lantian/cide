@@ -600,3 +600,49 @@
   font-family: var(--font-mono);
   opacity: 0.7;
 }
+
+/* --- the drag ghost (M199): the file tree's `.ghost` --------------------------------------- */
+
+.ghost {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--chrome);
+  box-shadow: var(--shadow-1);
+}
+
+.ghostLoad {
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ghostHint {
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+}
+
+.ghost[data-outcome='move'] {
+  border-color: var(--accent);
+}
+
+.ghost[data-outcome='move'] .ghostHint {
+  color: var(--accent);
+}
+
+.ghost[data-outcome='refuse'] {
+  border-color: var(--red);
+}
+
+.ghost[data-outcome='refuse'] .ghostHint {
+  color: var(--red);
+}

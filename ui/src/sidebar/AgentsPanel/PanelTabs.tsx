@@ -1,6 +1,10 @@
 /**
- * The Agents panel's top-level tabs, drawn where its header says *Agents*: **Subagents**,
- * **Sessions** (M134) and **Waiting**. (M132)
+ * The Agents panel's top-level tabs, drawn where its header says *Agents*: **Sessions** (M134),
+ * **Subagents** and **Waiting**. (M132)
+ *
+ * Sessions comes first since M199: it lists everything the user is running — consoles, tabs and
+ * runs — where Subagents is the runs alone, so it is the tab the panel opens on. Sessions and
+ * Waiting each carry a count of what waits for the user there; Subagents none.
  *
  * The Tasks panel's `TasksTabs` markup and classes, on purpose and not a lookalike: two sidebar
  * panels whose headers both carry tabs must read as one application, and a third tab look in the
@@ -35,15 +39,18 @@ export function AgentsPanelTabs({
   tab,
   onTab,
   waiting = 0,
+  sessions = 0,
 }: {
   tab: AgentsPanelTab
   onTab: (tab: AgentsPanelTab) => void
-  /** Tasks waiting for the user — `waitingCount` over the board — for the Waiting tab's count. */
+  /** What waits in *Waiting for you* — `waitingDecisionCount` — for the Waiting tab's count. */
   waiting?: number
+  /** Sessions stopped on the user — `waitingSummary`'s `sessions` — for the Sessions tab's (M199). */
+  sessions?: number | undefined
 }) {
   return (
     <span className={styles.tabs} role="tablist" aria-label="Agents panel" data-audit="agentsPanelTabs">
-      {(['subagents', 'sessions', 'waiting'] as const).map((t) => (
+      {(['sessions', 'subagents', 'waiting'] as const).map((t) => (
         <button
           key={t}
           type="button"
@@ -65,6 +72,15 @@ export function AgentsPanelTabs({
               title={`${waiting} task${waiting === 1 ? '' : 's'} waiting for you`}
             >
               {waiting}
+            </span>
+          )}
+          {t === 'sessions' && sessions > 0 && (
+            <span
+              className={styles.tabCount}
+              data-audit="sessionsWaitingCount"
+              title={`${sessions} session${sessions === 1 ? '' : 's'} waiting for you`}
+            >
+              {sessions}
             </span>
           )}
         </button>

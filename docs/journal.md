@@ -19314,3 +19314,88 @@ Window*, that a click reaches the focused window, and that *Open Recent* fills s
 launch. Rows are never greyed for a failed precondition, so Close Tab on the console or Save with
 no editor is a diagnostic-log refusal. Clicking while a detached window has focus runs the
 command in the first shell window.
+
+## M199 — The Sessions tab is a tree the user arranges
+
+The Sessions tab (M134) was a flat, newest-first list of tall cards under kind chips. With fifty
+conversations it could not be scanned: it did not separate what is open from what runs unseen
+from what is over, half its rows were titled `cide : claude`, it showed no activity beyond a green
+dot — which was wrong — and the user could not arrange anything. The design was agreed on an HTML
+mockup first (`tmp/index.html`, gitignored), then built from it.
+
+**What the user sees.**
+- The Agents panel's tabs are **Sessions · Subagents · Waiting**, and the panel opens on Sessions.
+  Sessions carries a count of sessions waiting on the user, beside Waiting's own.
+- Inside it, **Opened** and **Closed**. Opened is a tree: the user's **groups** (folders,
+  nestable, ordered by hand, folded state kept), a rule, then every live session in no group —
+  the ones a pane shows and the ones nothing shows, the latter badged *Background* (a run, a tab
+  closed with its child kept until the M196 reaper). A grouped session stays in its group after it
+  ends; it never drops to Closed. Closed is the ended, unfiled rest under Today / Yesterday /
+  Earlier.
+- One 24px row per session: status glyph (the Subagents tab's table), name, harness, time; on
+  hover the time gives way to Show / Watch / Open and `⋯`. The selected row grows a second line
+  (status in words, kind, branch, task link, id). A row is named by cide's label, the `/rename`
+  name, the title — or the first prompt when the title is only `project : harness`.
+- Pointer drag and drop with the file tree's mechanism and states: a session into a group or out
+  of one, a group into another or beside a sibling, refusals in words ("cannot go inside itself"),
+  folded groups and the *Opened* tab spring open after 600 ms. A context menu, F2 rename, arrows,
+  Enter, Delete for a group; Expand all, Collapse all, New group.
+- The search keeps only its box and a transcript toggle (the scroll icon). The kind chips and the
+  role select are gone; their words are in the haystack.
+- The Agents **rail button's** amber waiting mark is a count now — waiting sessions plus the
+  Waiting tab's items, a session's question counted once — and the run pill no longer turns red at
+  a permission prompt, because that prompt is in the amber count.
+
+**Underneath.**
+- `cide_core::sessions::Organize`, a side table on the journal per root (groups, conversation →
+  group, labels), so `SessionRecord` — which reaches a phone — did not move. Membership follows a
+  re-keyed stand-in, a `/clear` in a filed pane stays filed, the 500-row cap never prunes a filed
+  row, and the listing never hides one. `sessions_organize` takes one `SessionEdit` (seven ops,
+  `CoreError::SessionGroupRefused` with the sentence) and answers the new listing; other windows
+  hear `sessions-changed` at once.
+- `live` was registry membership, so every finished run and exited console read as running. It is
+  `conversations::live` now. Each row carries `activity`, from one Rust table
+  (`cide_core::sessions::activity`) over the run state and the last hook state, gathered once per
+  listing; the webview lays *Asked you a question* over it from the request store and the board.
+- Rows went stale on a tab closing (no journal write). `WorkspaceState::apply` now diffs the
+  pane-shown sessions and emits `sessions-changed`; the store also re-lists, throttled, on a
+  `session-state` change for one of its live rows. The store is attached by `App.tsx`, because the
+  rail's count reads it with the panel shut; `sessionsWaiting.ts` derives the three counts and
+  republishes only when one moves, so the shell does not re-render on every board change.
+- Kit first: `TreeRow`, `InlineRename` and `DragGhost`, with specimens and `docs/ui-kit.md`
+  entries. `sessionsTree.ts` holds every rule (placement, roll-up, drops, keys) import-free.
+
+**Verified:**
+- `cargo test -p cide-core sessions` (11 new: old journals load, refusals, cycle and sibling
+  placement, delete moves contents up, re-key keeps group and label, `/clear` inherits, filed rows
+  survive the cap, retention, the activity table) and a `workspace_state` test for the pane-set
+  diff; clippy `-D warnings`, fmt, `codegen --check`, `contract-check`.
+- `check:sessions` rewritten (kinds and activities pinned to Rust, each activity's glyph and tone
+  pinned to its run phase, placement, the tree, search opening folded groups, day captions by
+  calendar, the waiting dedupe, every drop rule, keys); `check:agents-render` with five Sessions
+  stories (tree, Closed, search hit, no groups, empty) and the reordered strip; `check:rail-marks`
+  for the count; `check:kit`.
+- The full `./test.sh`: 152 passed, 0 failed.
+
+**The first `./run.sh` showed a black window.** `sessionsStore.ts` declared a `const` below the
+`create()` call whose initializer reads it; zustand runs that initializer at module load, Vite's
+dev server serves modules unbundled, and the read threw before `App` could draw. Every check and
+the production build passed, because a bundle rewrites the `const` to a hoisted `var`. Fixed, and
+`check:sessions` now pins that every constant the store's initializer reads is declared above it.
+
+**From the first look on a display** (the user's): the `⋯` menu opened at the row's left edge,
+a panel's width from its button — it is placed at the button now; double-click did not open —
+selecting a row grew its second line and collapsed the previously selected one's, so the clicked
+row jumped under the pointer between the two clicks; the facts moved to a strip under the tree
+and rows never change height on selection (an open still answering also drops a repeat, so a
+closed session cannot be resumed twice); and a finished
+run could not be moved to *Closed* — its child lingers for a follow-up (the reaper keeps any
+session a run names), so it read as live, *Background · Idle*, and Stop does nothing to a finished
+run. `cide_core::sessions::shown_live` makes a run that is over and on no screen not live, and Stop
+ends the child directly when the run has nothing left to stop.
+
+**Not confirmed on a display.** Nothing else of this has been looked at in a running cide: the tree's
+look at the default 320px width, the drag (ghost, washes, edge scroll, both springs), rename in
+place, the context menu and its submenus, the rail's two pills meeting at the button's middle, and
+whether rows move between Opened and Closed promptly when a tab closes, a turn ends or the reaper
+ends a child. The live cues are reasoned from the events' emit sites, not observed.

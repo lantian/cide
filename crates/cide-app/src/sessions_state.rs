@@ -24,6 +24,20 @@
 //! harness (a codex console closed before its first turn) or with no transcript on disk (a
 //! claude console opened and closed without a word). "Every session that was doing something" is
 //! what the user asked for, and a conversation with no transcript did nothing.
+//!
+//! **Never a grouped row** (M199): the user filed it, and a filed session that vanished from its
+//! folder for want of a transcript would read as cide losing it. `cide_core::sessions::Organize`
+//! says what else membership promises.
+//!
+//! # Live, and what it is doing (M199)
+//!
+//! `live` is [`crate::conversations::live`]: a child that is **alive** and still this
+//! conversation's — not merely still in the registry, which until M199 it was, so an exited
+//! console, or any run's finished child (the reaper holds those), read as running. The row's
+//! `activity` is `cide_core::sessions::activity` over the run's state and the last hook state,
+//! gathered **once per listing**: `emit::last_session_states()` rebuilds a map under a lock and
+//! `AgentRegistry::runs_for` builds every run's wire form, and per row that was five hundred of
+//! each.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -34,7 +48,7 @@ use std::time::Duration;
 use cide_core::persist::{self, Debouncer};
 use cide_core::sessions::{Journal, TranscriptHead};
 use cide_ipc::agents::Harness;
-use cide_ipc::sessions::{SessionListing, SessionRecord, SessionRow, UserInputPage};
+use cide_ipc::sessions::{SessionEdit, SessionListing, SessionRecord, SessionRow, UserInputPage};
 use cide_ipc::{PaneId, ProjectId, SessionId, Workspace};
 use parking_lot::{Condvar, Mutex};
 use tauri::{AppHandle, Manager};
@@ -128,6 +142,7 @@ impl SessionsState {
                 .map(|r| source_key(&r.cwd, &r.id))
                 .collect();
             journal.sources.retain(|key, _| retained.contains(key));
+            journal.retain_organized();
             serde_json::to_vec_pretty(&*journal)
         };
         let bytes = match encoded {
@@ -291,7 +306,10 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
         .ok_or_else(|| cide_core::CoreError::Io("cide is shutting down".into()))?;
     let root = crate::tasks_state::project_root(&workspace, project)?;
     let Some(sessions) = state(app) else {
-        return Ok(SessionListing { rows: Vec::new() });
+        return Ok(SessionListing {
+            rows: Vec::new(),
+            groups: Vec::new(),
+        });
     };
     // Which pane shows which conversation, from every key a pane can be found by.
     let panes: HashMap<String, PaneId> = workspace.with(|ws| {
@@ -309,26 +327,56 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
         }
         panes
     });
-    let live: std::collections::HashSet<SessionId> = app
-        .try_state::<SessionRegistry>()
-        .map(|r| r.ids().into_iter().collect())
+    // Once per listing, not per row — see the module doc.
+    let states = crate::emit::last_session_states();
+    let runs: HashMap<cide_ipc::RunId, cide_ipc::RunState> = app
+        .try_state::<Arc<crate::agents::AgentRegistry>>()
+        .map(|agents| {
+            agents
+                .runs_for(project)
+                .into_iter()
+                .map(|r| (r.run, r.state))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let records = sessions.journal.lock().list(&root);
+    let (records, organize) = {
+        let journal = sessions.journal.lock();
+        (journal.list(&root), journal.organize(&root))
+    };
     let mut rows = Vec::with_capacity(records.len());
     let mut heads: Vec<(String, TranscriptHead)> = Vec::new();
     for mut record in records {
         enrich_worker(app, &mut record);
-        let is_live = record.session.is_some_and(|s| live.contains(&s));
         let pane = panes
             .get(&record.id)
             .or_else(|| record.session.and_then(|s| panes.get(&s.to_string())))
             .copied();
+        let run = record.run.and_then(|r| runs.get(&r));
+        // A run that is over and on no screen is closed, though its child lingers for a follow-up
+        // — `cide_core::sessions::shown_live`.
+        let live_session = cide_core::sessions::shown_live(
+            crate::conversations::live(app, &record),
+            run,
+            pane.is_some(),
+        );
+        let is_live = live_session.is_some();
+        let group = organize.members.get(&record.id).cloned();
         let transcript = sessions.input_path(&record);
         let pointless = !record.known || (keeps_transcript(record.harness) && transcript.is_none());
-        if !is_live && pane.is_none() && pointless {
+        if !is_live && pane.is_none() && group.is_none() && pointless {
             continue;
         }
+        // The live child's state; for an ended one, only an exit code the old handle left.
+        let state = live_session
+            .and_then(|s| states.get(&s).copied())
+            .or_else(|| {
+                record
+                    .session
+                    .and_then(|s| states.get(&s).copied())
+                    .filter(|s| matches!(s, cide_ipc::SessionState::Exited { .. }))
+            });
+        let activity = cide_core::sessions::activity(run, state, is_live);
         if let Some(path) = &transcript
             && let Some(head) = sessions.read_head(path, &record)
         {
@@ -342,9 +390,13 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
         }
         rows.push(SessionRow {
             searchable: transcript.is_some(),
+            label: organize.labels.get(&record.id).cloned(),
             record,
             live: is_live,
+            live_session,
             pane,
+            activity,
+            group,
         });
     }
     // Kept, so the next list does not read the transcript again; written on the debounce, and
@@ -361,7 +413,31 @@ pub fn list(app: &AppHandle, project: ProjectId) -> cide_core::Result<SessionLis
             sessions.debounce.note_change();
         }
     }
-    Ok(SessionListing { rows })
+    Ok(SessionListing {
+        rows,
+        groups: organize.groups,
+    })
+}
+
+/// Apply one of the Sessions tab's grouping edits to `root`'s journal. (M199)
+///
+/// Written on the debounce like every other change, but **announced at once** rather than after
+/// the write: `announce` waits for the flusher, and a second window still drawing a folder the
+/// user just renamed for half a second is the lag this exists to avoid. The caller re-lists for
+/// the window that asked.
+pub fn organize(app: &AppHandle, project: ProjectId, edit: SessionEdit) -> cide_core::Result<()> {
+    let workspace = app
+        .try_state::<WorkspaceState>()
+        .ok_or_else(|| cide_core::CoreError::Io("cide is shutting down".into()))?;
+    let root = crate::tasks_state::project_root(&workspace, project)?;
+    let sessions =
+        state(app).ok_or_else(|| cide_core::CoreError::Io("cide is shutting down".into()))?;
+    let changed = sessions.journal.lock().edit(&root, edit)?;
+    if changed {
+        sessions.debounce.note_change();
+        crate::emit::sessions_changed(app, project);
+    }
+    Ok(())
 }
 
 impl SessionsState {
