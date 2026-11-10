@@ -1,7 +1,7 @@
 {
   "name": "cide-ui",
   "private": true,
-  "version": "0.17.1-dev",
+  "version": "0.18.1-dev",
   "type": "module",
   "scripts": {
     "check:indexing-exclusions": "node scripts/check-indexing-exclusions.mjs",
