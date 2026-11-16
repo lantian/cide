@@ -336,6 +336,17 @@ impl Console {
             .flatten()
     }
 
+    /// Submit Cide's own notification through the visible conversation, leaving the
+    /// terminal composer (including an unfinished user prompt) entirely untouched.
+    /// The forwarder claims this receiver alongside native user requests, so a user
+    /// turn that wins the race defers the notification rather than merging the two.
+    pub(crate) fn background_prompt(&self, body: String, valid: Valid) -> Reply {
+        let Some(receiver) = self.receiver().map_err(|error| (false, error))? else {
+            return Ok(false);
+        };
+        self.peer_prompt(receiver, body, valid)
+    }
+
     pub fn peer_prompt(&self, receiver: Receiver, body: String, valid: Valid) -> Reply {
         let (reply, receive) = mpsc::channel();
         let expired = Arc::new(AtomicBool::new(false));
