@@ -685,7 +685,7 @@ impl GitLab {
                     .map(|r| r.id.clone())
                     .collect();
                 for id in &ids {
-                    self.workspaces.close(id)?;
+                    self.workspaces.close(id);
                     self.drafts.forget(id)?;
                     self.versions.lock().remove(id);
                 }
@@ -787,7 +787,7 @@ impl GitLab {
                 ))
             }
             Close { review } => {
-                self.workspaces.close(&review)?;
+                self.workspaces.close(&review);
                 self.drafts.forget(&review)?;
                 self.versions.lock().remove(&review);
                 let mut saved = self.saved.lock();

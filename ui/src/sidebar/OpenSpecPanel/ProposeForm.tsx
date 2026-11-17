@@ -87,7 +87,10 @@ export function ProposeFormView(props: ProposeFormProps) {
           }
         }}
         onPaste={(event) => {
-          if (!busy && props.onPasteImage && wantsImagePaste([...event.clipboardData.types, ...Array.from(event.clipboardData.items, item => item.type)])) {
+          // A paste with no text in it is handed to Rust to read as an image. Not a test for an
+          // `image/*` type: WebKit never lists one, which is why Ctrl+V here did nothing at all —
+          // `wantsImagePaste` has the whole story. Text still pastes into the box as text.
+          if (!busy && props.onPasteImage && wantsImagePaste(event.clipboardData)) {
             event.preventDefault()
             props.onPasteImage()
           }

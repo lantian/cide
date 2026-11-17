@@ -38,6 +38,7 @@ export function DraftReplies({
     last?.author.run === null &&
     agent !== undefined &&
     agent.state !== 'finished' &&
+    agent.state !== 'stopped' &&
     agent.state !== 'failed'
   return (
     <ol className={chrome.draftReplies} aria-label="Discussion about this draft">

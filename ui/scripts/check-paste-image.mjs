@@ -6,6 +6,8 @@
  *
  *   * `wantsImagePaste` too eager and a copied file path stops pasting as text — the buffer
  *     grows a screenshot instead, and the text the user copied is gone from the gesture.
+ *   * `wantsImagePaste` looking for an `image/*` type and no image paste ever fires: WebKit
+ *     never lists one. That shipped, in every image paste cide has, and was found on a display.
  *   * `relativeTo` off by one `../` and the markdown preview shows a broken-image glyph. No
  *     error, nothing logged, and the file really is on disk — so it reads as a preview bug.
  *   * `referenceFor` not wrapping a name with a space in it and CommonMark parses the
@@ -62,19 +64,44 @@ try {
 
   // ---- what counts as an image paste ------------------------------------------------------
 
-  eq(wantsImagePaste(['image/png']), true,
-    'a screenshot tool offers the image alone — Spectacle, Flameshot, GNOME Screenshot, ⌘⇧4')
-  eq(wantsImagePaste(['image/jpeg']), true,
-    'the prefix, not an exact type: cide writes a PNG out of the decoded bitmap either way')
-  eq(wantsImagePaste([]), false, 'an empty clipboard is not an image')
-  eq(wantsImagePaste(['text/plain']), false, 'and neither is text')
-  eq(wantsImagePaste(['image/png', 'text/plain']), false,
+  /*
+   * A paste event's `clipboardData`, as WebKit builds it: a type list and per-format data.
+   *
+   * The fixtures below are what WebKitGTK and WKWebView actually hand a page, not what a
+   * clipboard holds. WebKit filters `types` to `text/plain`, `text/html` and `text/uri-list`, plus
+   * `Files` for an in-memory image — so a screenshot is `[]` or `['Files']` and is never
+   * `['image/png']`. The rule this file used to pin (an `image/*` type and no text) was right in
+   * Chromium and never fired in cide: every image paste — buffer, task, OpenSpec composer — was a
+   * silent no-op until it was tried on a display.
+   */
+  const offer = (types, data = {}) => ({
+    types,
+    getData: (format) => data[format] ?? '',
+  })
+
+  eq(wantsImagePaste(offer([])), true,
+    'WebKitGTK lists nothing for an image-only clipboard, so no text at all is handed to Rust — '
+      + 'which also answers an empty clipboard, quietly')
+  eq(wantsImagePaste(offer(['Files'])), true,
+    'and `Files` alone is WebKit\'s in-memory image: a screenshot, not a copied file')
+  eq(wantsImagePaste(offer(['image/png'])), true,
+    'an engine that does name the image (Chromium, Firefox) is still claimed')
+  eq(wantsImagePaste(offer(['image/png', 'text/html'])), true,
+    'a browser\'s Copy Image offers HTML and no plain text — HTML is not what a textarea or a '
+      + 'buffer would have pasted')
+  eq(wantsImagePaste(offer(['text/plain'], { 'text/plain': 'src/main.rs' })), false,
+    'text is text')
+  eq(wantsImagePaste(offer(['image/png', 'text/plain'], { 'text/plain': 'shot.png' })), false,
     'a clipboard holding both is holding text — the same trade terminal/clipboard.ts makes, '
       + 'and it is what keeps a copied file path pasting as a path')
-  eq(wantsImagePaste(['text/uri-list', 'image/png']), false,
-    'a file copied in a file manager offers a uri-list and a thumbnail; the paste means the file')
-  eq(wantsImagePaste(['Files']), false,
-    'copying a .png file is the file tree\'s paste — copy the file, do not re-encode its pixels')
+  eq(wantsImagePaste(offer(['text/plain', 'image/png'])), true,
+    'the test reads the text, not the type list: a tool that offers an empty text target beside '
+      + 'its image is still an image')
+  eq(wantsImagePaste(offer(['Files', 'text/uri-list'], { 'text/uri-list': 'file:///a/b.png' })), false,
+    'a file copied in a file manager offers a uri-list; copying a .png file is the file tree\'s '
+      + 'paste — copy the file, do not re-encode its pixels')
+  eq(wantsImagePaste(null), false,
+    'a CodeMirror paste event with no DataTransfer at all claims nothing')
 
   // ---- where the file goes ----------------------------------------------------------------
 
@@ -140,9 +167,12 @@ try {
     return [h, calls]
   }
 
+  // What WebKit hands the editor for a Spectacle screenshot — see `offer` above.
+  const screenshot = offer(['Files'])
+
   {
     const [h, calls] = host()
-    eq(onImagePaste(h, ['image/png']), 'claimed', 'an image alone is this gesture')
+    eq(onImagePaste(h, screenshot), 'claimed', 'a screenshot is this gesture')
     await Promise.resolve()
     await Promise.resolve()
     eq(calls.dirs, ['/home/u/p/docs'], 'the file goes beside the document')
@@ -151,34 +181,41 @@ try {
   }
   {
     const [h, calls] = host()
-    eq(onImagePaste(h, ['text/plain']), 'no-image', 'text falls through to the webview')
+    eq(onImagePaste(h, offer(['text/plain'], { 'text/plain': 'hello' })), 'no-image',
+      'text falls through to the webview')
     eq(calls.dirs, [], 'and nothing is written')
+  }
+  {
+    const [h, calls] = host()
+    eq(onImagePaste(h, null), 'no-image', 'and so does an event with no DataTransfer')
+    eq(calls.dirs, [], 'without asking Rust')
   }
   {
     // A revision or a diff. It has a path, and pasting into it would put a file beside the
     // *working copy* on behalf of a buffer that cannot be edited.
     const [h, calls] = host({ readOnly: true })
-    eq(onImagePaste(h, ['image/png']), 'read-only', 'a read-only buffer refuses')
+    eq(onImagePaste(h, screenshot), 'read-only', 'a read-only buffer refuses')
     eq(calls.dirs, [], 'before writing anything')
   }
   {
     const [h, calls] = host({ docPath: null })
-    eq(onImagePaste(h, ['image/png']), 'no-path',
+    eq(onImagePaste(h, screenshot), 'no-path',
       'a buffer that is not a file on disk has nowhere to put it — never the process cwd')
     eq(calls.dirs, [], 'and nothing is written')
   }
   {
-    // The clipboard can change between the event and the write, so `write` is allowed to
-    // answer "there was no image after all" and the buffer must be left alone.
+    // An empty clipboard looks like a screenshot to the event under WebKit, and a clipboard can
+    // change between the event and the write, so `write` is allowed to answer "there was no
+    // image after all" and the buffer must be left alone.
     const [h, calls] = host({ write: async () => null })
-    eq(onImagePaste(h, ['image/png']), 'claimed', 'the event is still claimed synchronously')
+    eq(onImagePaste(h, offer([])), 'claimed', 'the event is still claimed synchronously')
     await Promise.resolve()
     await Promise.resolve()
     eq(calls.inserted, [], 'but nothing is typed when nothing was written')
   }
   {
     const [h, calls] = host({ languageId: 'rust', docPath: '/home/u/p/src/main.rs' })
-    eq(onImagePaste(h, ['image/png']), 'claimed', 'the gesture is not markdown-only')
+    eq(onImagePaste(h, screenshot), 'claimed', 'the gesture is not markdown-only')
     await Promise.resolve()
     await Promise.resolve()
     eq(calls.inserted, ['../docs/Pasted image 2026-08-31 at 22.41.07.png'],

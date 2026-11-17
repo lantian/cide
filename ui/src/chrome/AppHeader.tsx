@@ -11,7 +11,7 @@
  *
  * It is no longer store-*free*, and the note that used to claim so was wrong the moment the
  * context menu landed: `useContextMenu` subscribes to the workspace store for the live keymap
- * its shortcut chips come from. Two of this file's children — `ProjectMenu` and `RowControls`
+ * its shortcut chips come from. Two of this file's children — `ProjectMenu` and `SplitMenu`
  * — go further and drive the store directly, and each says at length why; neither is measured,
  * and neither replaces a prop a host was already passing.
  */
@@ -25,7 +25,7 @@ import { useRunningInProject, useRunsInProject, useWaitingTasksInProject } from 
 import { runningBadge, runningHint } from '@/panes/runningRule'
 import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
-import { RowControls } from './RowControls'
+import { SplitMenu } from './SplitMenu'
 import { currentUserAgent, windowControlLayout } from './windowControls'
 import { toggleMaximize } from './WindowFrame'
 import { Icon } from '@/icons/Icon'
@@ -74,33 +74,21 @@ export interface AppHeaderProps {
   onClose?: ((id: string) => void) | undefined
   onToggleTheme?: (() => void) | undefined
   /**
-   * Split the focused pane of the active tab.
-   *
-   * The header's ⊞ is the same gesture `TabStrip`'s already is, aimed at whatever pane has
-   * focus, so a host supplies the same call:
-   * `useWorkspace`'s `splitPane(project, tab.id, tab.tree.focused, 'row', 'after')`. The
-   * intent is left `null` on purpose — which pane kind a split produces is the domain's
-   * decision, not the header's.
-   *
-   * Omitted renders the button **disabled**, not inert. There is no project, or no host that
-   * can split, and a control that looks live and does nothing is indistinguishable from a
-   * broken app — which is the state this header shipped in.
-   */
-  onSplit?: (() => void) | undefined
-  /**
    * Detach the focused pane into its own window.
    *
    * A host supplies `useWorkspace`'s `detachPane(project, tab.id, tab.tree.focused)`, which
-   * measures the pane and forwards to `window_detach_pane`. Same disabled-when-absent
-   * contract as `onSplit`.
+   * measures the pane and forwards to `window_detach_pane`. Omitted renders the button
+   * **disabled**, not inert: a control that looks live and does nothing is indistinguishable
+   * from a broken app, which is the state this header once shipped in. (The split control has no
+   * such prop any more — `SplitMenu` wires itself and disables itself with a reason.)
    */
   onDetach?: (() => void) | undefined
   /**
    * Add a full-width row holding one pane, anchored under the focused one.
    *
-   * **Optional in the strong sense**: omitted, the controls still work — `RowControls` drives
+   * **Optional in the strong sense**: omitted, the controls still work — `SplitMenu` drives
    * `useWorkspace.addRow` itself. This exists so a fixture can intercept the gesture, and so a
-   * host that wants a different anchor can supply one. See `RowControls.tsx` for why the
+   * host that wants a different anchor can supply one. See `SplitMenu.tsx` for why the
    * fallback is there rather than a fifth prop nobody remembers to pass.
    */
   onAddRow?: ((intent: SplitIntent) => void) | undefined
@@ -114,7 +102,6 @@ export function AppHeader({
   onActivate,
   onClose,
   onToggleTheme,
-  onSplit,
   onDetach,
   onAddRow,
 }: AppHeaderProps) {
@@ -208,7 +195,7 @@ export function AppHeader({
        * open projects the only control that can open a ninth scrolled out of the window and
        * became unreachable. Outside, it is pinned: the strip shrinks and clips its own last tab
        * instead, which is the behaviour that stylesheet already documents for tabs and the same
-       * argument `RowControls` below makes for itself.
+       * argument `SplitMenu` below makes for itself.
        */}
       <ProjectMenu />
 
@@ -219,34 +206,21 @@ export function AppHeader({
           the window-frame agent binds double-click-to-maximize to. */}
       <div className={styles.filler} data-tauri-drag-region data-window-drag="true" />
 
-      {/* The two row gestures, moved up out of `SplitTree`'s bottom strip on request. Outside
-          `.tabs` so an overfull project strip clips its own last tab rather than pushing these
-          off the window edge — the same argument `TabStrip` makes about its own boxes. */}
-      <RowControls onAddRow={onAddRow} />
-
       <div className={styles.actions}>
         <button type="button" className={styles.action} title="Toggle theme" onClick={onToggleTheme}>
           <Icon name="sun-moon" size={1} />
         </button>
         {/*
-         * ⊞ and ⧉ are disabled when no host supplied a handler, rather than drawn live and
-         * doing nothing on click. Both spent a milestone in the latter state, which reads
-         * exactly like a broken app: there is no feedback to distinguish "this window cannot
-         * split right now" from "the split command crashed".
+         * The split menu (bash / harness × beside / below), which replaced the two labelled row
+         * buttons and the bare split icon. Inside `.actions`, so it is pinned at the right edge
+         * and an overfull project strip clips its own last tab rather than pushing it off.
          *
-         * `disabled` rather than hiding them: the mock states three actions in this corner,
-         * and a control that vanishes when unavailable teaches nothing about why. The title
-         * carries the reason, since the glyph cannot.
+         * ⧉ below is disabled when no host supplied a handler, rather than drawn live and doing
+         * nothing on click — that state reads exactly like a broken app. `disabled` rather than
+         * hiding it: a control that vanishes when unavailable teaches nothing about why, and the
+         * title carries the reason, since the glyph cannot.
          */}
-        <button
-          type="button"
-          className={`${styles.action} ${styles.actionSplit}`}
-          title={onSplit === undefined ? 'Split pane — unavailable in this window' : 'Split pane'}
-          disabled={onSplit === undefined}
-          onClick={onSplit}
-        >
-          <Icon name="columns-2" size={1} />
-        </button>
+        <SplitMenu onAddRow={onAddRow} />
         <button
           type="button"
           className={styles.action}

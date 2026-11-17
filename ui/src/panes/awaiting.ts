@@ -190,6 +190,20 @@ function applyState(session: string, phase: SessionPhase): void {
 }
 
 /**
+ * Everyone who wants to hear that the user touched a session's pane (M200: the Sessions tab,
+ * which reads a finished turn as seen once the user has acted in its pane). Told on *every*
+ * acknowledgement, including one this window's own track had nothing to clear for — the Sessions
+ * row's waiting comes from Rust's hook state, which this table may never have raised.
+ */
+const acknowledgers = new Set<(session: string) => void>()
+export function onAcknowledged(listener: (session: string) => void): () => void {
+  acknowledgers.add(listener)
+  return () => {
+    acknowledgers.delete(listener)
+  }
+}
+
+/**
  * Note that the user has dealt with this session.
  *
  * Called from a pointer-down on the pane frame and from a keystroke into the terminal —
@@ -199,6 +213,7 @@ function applyState(session: string, phase: SessionPhase): void {
  */
 export function acknowledge(session: string | null | undefined): void {
   if (!session) return
+  for (const listener of acknowledgers) listener(session)
   const before = trackOf(session)
   if (!before.awaiting) return
   const after = onAcknowledge(before)

@@ -135,7 +135,7 @@ const ICONS = [
   // A finished run's Integrate, in the Agents panel's History (M89).
   'git-merge',
   // Extension-contributed panel rows.
-  'file', 'folder', 'diamond',
+  'file', 'folder', 'folder-plus', 'diamond', 'zap',
   // Explorer header. `asterisk` is a footnote mark: the truncation notice is a footnote, not an
   // error, which is what its own comment insists on.
   'asterisk', 'crosshair',

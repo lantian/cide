@@ -109,7 +109,7 @@ before you change it.
 | [The commit actions](docs/checks.md#the-commit-actions) | `check:log-actions`, `cargo test -p cide-git --test commit_actions` |
 | [The file tree, fs ops](docs/checks.md#the-file-tree-fs-ops) | `check:tree-status`, `check:tree-flicker`, `check:fs-clipboard`, `check:new-entry`, `check:scratch`, `check:excalidraw` |
 | [The properties card](docs/checks.md#the-properties-card) | `check:properties`, `check:commands`, `check:menu-model`, `check:menus`, `check:theme`, `check:selectors`, `check:ui-scale`, `cargo test -p cide-core properties`, `./target/debug/cide-headless properties <path>` |
-| [Pasting an image](docs/checks.md#pasting-an-image) | `check:paste-image`, `check:fs-clipboard`, `check:editor`, `cargo test -p cide-core image`, `cargo test -p cide-fs` |
+| [Pasting an image](docs/checks.md#pasting-an-image) | `check:paste-image`, `check:fs-clipboard`, `check:editor`, `check:agents`, `check:agents-render`, `check:openspec-render`, `check:openspec-images`, `cargo test -p cide-core image`, `cargo test -p cide-fs` |
 | [The drawing pane](docs/checks.md#the-drawing-pane) | `check:excalidraw`, `check:commands`, `check:editor`, `check:image`, `cargo test -p cide-core document`, `cargo test -p cide-ipc frame`, `cargo test -p cide-app -- framed_write json_body truncated_frame` |
 | [Which shell a pane runs, or what `PATH` a child gets](docs/checks.md#which-shell-a-pane-runs-or-what-path-a-child-gets) | `cargo test -p cide-core` |
 | [The command line, or the one-instance guard](docs/checks.md#the-command-line-or-the-one-instance-guard) | `cargo test -p cide-app -- cli:: instance::` |

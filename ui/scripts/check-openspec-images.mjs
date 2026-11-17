@@ -11,12 +11,13 @@ const dom = new JSDOM('<div id="root"></div>', { url: 'https://cide.test' })
 for (const key of ['window', 'document', 'HTMLElement', 'Element', 'Node']) globalThis[key] = dom.window[key]
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
 const { createRoot } = await import('react-dom/client')
-let seq = 0, delayed, fail = false
-const released = [], errors = []
+let seq = 0, delayed, fail = false, empty = false
+const released = [], errors = [], notices = []
 window.imagesTest = {
-  stage: async () => { if (fail) throw Error('bad image'); if (delayed) await delayed; return [{ path: `/draft/${++seq}.png` }] },
+  stage: async () => { if (fail) throw Error('bad image'); if (delayed) await delayed; return empty ? [] : [{ path: `/draft/${++seq}.png` }] },
   release: async paths => released.push(...paths), pick: async () => [],
   error: e => errors.push(e),
+  notify: message => notices.push(message),
 }
 let root
 try {
@@ -26,7 +27,7 @@ try {
       resolveId(s) { if ((s === '@/ipc/client' || s === join(ui, 'src/ipc/client'))) return '\0ipc'; if ((s === '@/chrome/notices' || s === join(ui, 'src/chrome/notices'))) return '\0notices' },
       load(id) {
         if (id === '\0ipc') return 'export const specImages = window.imagesTest; export const image = {srcUrl: d => d.path};'
-        if (id === '\0notices') return 'export const notifyFailure = window.imagesTest.error;'
+        if (id === '\0notices') return 'export const notifyFailure = window.imagesTest.error; export const notify = window.imagesTest.notify;'
       },
     }],
     build: { ssr: join(ui, 'src/sidebar/OpenSpecPanel/useImages.ts'), outDir: out, rollupOptions: { output: { entryFileNames: 'images.mjs' } } },
@@ -62,7 +63,17 @@ try {
   await act(async () => current.pick())
   assert.equal(current.docs.length, 0, 'cancelled picker adds nothing')
   assert.equal(current.pending, false)
-  console.log('OpenSpec images: staging, removal, failures, cancellation and stale completions passed')
+  assert.deepEqual(notices, [], 'and says nothing — cancelling is not a failure')
+  // The composer claims any paste with no text in it (WebKit never names an image type), so an
+  // empty clipboard reaches Rust and comes back empty. That must be said: a Ctrl+V that did
+  // nothing at all is the bug this replaced.
+  empty = true
+  await act(async () => current.paste())
+  assert.equal(current.docs.length, 0, 'a paste with no image adds nothing')
+  assert.deepEqual(notices, ['The clipboard holds no image.'], 'and says why')
+  assert.equal(current.pending, false)
+  empty = false
+  console.log('OpenSpec images: staging, removal, failures, cancellation, empty pastes and stale completions passed')
 } finally {
   if (root) await act(async () => root.unmount())
   dom.window.close()

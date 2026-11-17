@@ -12,10 +12,14 @@
  * `ui/src/terminal/clipboard.ts` records at length why cide does not ask the clipboard whether
  * it holds an image: the plugin's `read_image` is a *decode*, not a probe — it materialises a
  * full RGBA bitmap and hands back a resource id. That argument is about asking a *question*.
- * Here the question is free: a `paste` event carries `clipboardData.types`, a list of strings
- * the browser has already assembled, and reading it costs nothing and decodes nothing. So the
- * DOM event is the detector, and `fs_paste_image` — which does decode, once, on a blocking
- * thread in Rust — is the reader. Nothing about the image is ever in JavaScript.
+ * Here the question is free: a `paste` event carries `clipboardData`, which the browser has
+ * already assembled, and reading its type list and its plain text costs nothing and decodes
+ * nothing. So the DOM event is the detector, and `fs_paste_image` — which does decode, once, on
+ * a blocking thread in Rust — is the reader. Nothing about the image is ever in JavaScript.
+ *
+ * What the event can tell is narrower than it looks, and [`wantsImagePaste`] says why: under
+ * WebKit the event never *names* an image, so the detector asks whether the paste is **text**,
+ * and everything that is not is handed to Rust to look at.
  *
  * # Import-free on purpose
  *
@@ -27,29 +31,63 @@
  */
 
 /**
+ * The half of a paste event's `DataTransfer` the detector reads.
+ *
+ * Structural rather than `DataTransfer` itself, so this module stays import-free and lib-free
+ * for `check:paste-image`, which hands it plain objects. A real `event.clipboardData` satisfies
+ * it as it stands.
+ */
+export interface ClipboardOffer {
+  readonly types: readonly string[]
+  getData(format: string): string
+}
+
+/**
  * Does this paste want an image file rather than text?
  *
- * Two conditions, and the second is the load-bearing one.
+ * **Yes when it carries no text and no file list**, and Rust decides whether there is an image.
  *
- * **There must be an image type.** `image/png` for every screenshot tool on every platform cide
- * targets; the prefix test rather than an exact match, because a clipboard can offer
- * `image/jpeg` or `image/tiff` and cide writes a PNG from the decoded bitmap either way.
+ * # Why this does not look for an image type
  *
- * **There must be no text.** A clipboard holding both is holding text as far as this is
- * concerned, and that is the same trade `terminal/clipboard.ts` makes for Ctrl+V in a Claude
- * pane, for the same reason: a file copied in a file manager offers `text/uri-list` *and*
- * `text/plain` *and* sometimes a thumbnail, and a person who copies a path and pastes it into a
- * buffer means the path. Screenshot tools (Spectacle, Flameshot, GNOME Screenshot, macOS
- * ⌘⇧4) offer the image alone, so the gesture this exists for is untouched.
+ * It used to: claim the paste when `types` held an `image/*` entry and no text. That rule is
+ * right in Chromium and Firefox and **never fires in either WebKit port**, which is what cide
+ * runs on (WebKitGTK on Linux, WKWebView on macOS). WebKit filters the DOM's type list to the
+ * types it calls safe for a page to read — `text/plain`, `text/html`, `text/uri-list` — and adds
+ * `Files` when the clipboard holds an in-memory image. So a Spectacle screenshot reaches
+ * JavaScript as `[]` or `["Files"]`, never as `["image/png"]`, and the old rule turned every image
+ * paste in cide into a silent no-op: the OpenSpec composer, the task composer, the task card, a
+ * task comment and an editor buffer all shared it, and none had been tried on a display. The
+ * composer had already grown a spread of `clipboardData.items` types to work around it, which
+ * WebKitGTK does not fill for an in-memory image either.
  *
- * `Files` is deliberately not treated as an image. Dragging or copying a `.png` *file* puts
- * `Files` in the list, and the right answer for that is the file tree's paste — copying the
- * file — not re-encoding its pixels into a new one under a new name.
+ * Naming an image being impossible, the question becomes *is this paste text?*, which WebKit
+ * does answer. A paste with no plain text in it inserts nothing into a textarea or a CodeMirror
+ * buffer anyway, so claiming it costs the user nothing — at worst one Rust read that finds no
+ * image, which every backend answers quietly (`FsError::NoClipboardImage`, a `null` attachment,
+ * an empty list).
+ *
+ * # Text wins, and a file list is a file
+ *
+ * **Plain text, if there is any, is what the paste means.** That is the same trade
+ * `terminal/clipboard.ts` makes for Ctrl+V in a Claude pane, for the same reason: a person who
+ * copies a path and pastes it into a buffer means the path. The test reads the *text*, not the
+ * type list, so an image tool that also offers an empty text target is still an image.
+ *
+ * **`text/uri-list` is a copied file**, and the right answer for that is the file tree's paste —
+ * copying the file — not re-encoding its pixels under a new name. A file manager offers it with
+ * plain text as well, so the first rule usually catches it; this one is for the manager that
+ * offers the list alone. It is what the old rule's `Files` exclusion was for, and it is checked by
+ * the list rather than by `Files` because `Files` is exactly what WebKit says for a screenshot.
+ *
+ * A browser's *Copy Image* offers `image/png` with `text/html` and no plain text, and is claimed:
+ * HTML is not what a textarea or a buffer would have pasted.
+ *
+ * `null` — CodeMirror's event can carry no `DataTransfer` — is not a claim.
  */
-export function wantsImagePaste(types: readonly string[]): boolean {
-  const hasImage = types.some((type) => type.startsWith('image/'))
-  const hasText = types.some((type) => type === 'text/plain' || type === 'text/uri-list')
-  return hasImage && !hasText
+export function wantsImagePaste(offer: ClipboardOffer | null): boolean {
+  if (offer === null) return false
+  if (offer.getData('text/plain') !== '') return false
+  return !offer.types.includes('text/uri-list')
 }
 
 /**
@@ -168,13 +206,15 @@ export function relativeTo(from: string, target: string): string {
  * `check:paste-image`; this is the ten impure lines that connect them.
  *
  * `write` is asynchronous and `paste` is not, so the choice to claim the event is made from
- * `clipboardData.types` alone — which is a list the browser has already assembled, costs
- * nothing to read and decodes nothing. That is the same shape, and the same constraint, as
- * `terminal/clipboard.ts`'s note about a synchronous key handler and an asynchronous clipboard.
+ * `clipboardData` alone — which the browser has already assembled, costs nothing to read and
+ * decodes nothing. That is the same shape, and the same constraint, as `terminal/clipboard.ts`'s
+ * note about a synchronous key handler and an asynchronous clipboard.
  *
- * `preventDefault` happens **only** when the answer is yes. Everything else — text, a file, an
- * empty clipboard, a read-only buffer, a buffer with no path — falls through to the webview's
- * own paste, unchanged.
+ * `preventDefault` happens **only** when the answer is yes. Everything else — text, a file, a
+ * read-only buffer, a buffer with no path — falls through to the webview's own paste, unchanged.
+ * An empty clipboard *is* claimed, because under WebKit it is indistinguishable from a
+ * screenshot (see [`wantsImagePaste`]); the write answers `null` and nothing is typed, which is
+ * what the webview's own paste would have done with it.
  */
 export interface ImagePasteHost {
   /** Where the document lives, or `null` when it is not a file on disk. */
@@ -185,8 +225,9 @@ export interface ImagePasteHost {
   readonly readOnly: boolean
   /**
    * Write the clipboard image into `dir` and answer where it landed, or `null` for *there was
-   * no image after all* — which the `types` list cannot rule out on its own, because a
-   * clipboard can change between the event and the write.
+   * no image after all* — the ordinary answer for an empty clipboard, which the event cannot
+   * tell from a screenshot, and also for a clipboard that changed between the event and the
+   * write.
    */
   readonly write: (dir: string) => Promise<string | null>
   /** Type `text` at the cursor. */
@@ -197,13 +238,13 @@ export interface ImagePasteHost {
 export type PasteVerdict = 'claimed' | 'no-image' | 'read-only' | 'no-path'
 
 /**
- * Decide what a `paste` carrying `types` should do in this host, and start it.
+ * Decide what a `paste` carrying `offer` should do in this host, and start it.
  *
  * Answers synchronously — the caller needs to know whether to `preventDefault` before the
  * write has begun — and the write runs on its own.
  */
-export function onImagePaste(host: ImagePasteHost, types: readonly string[]): PasteVerdict {
-  if (!wantsImagePaste(types)) return 'no-image'
+export function onImagePaste(host: ImagePasteHost, offer: ClipboardOffer | null): PasteVerdict {
+  if (!wantsImagePaste(offer)) return 'no-image'
   // Read-only is checked before the path, because a revision buffer has both a path and no
   // business growing a file beside the working copy.
   if (host.readOnly) return 'read-only'

@@ -82,17 +82,14 @@ import { ExtPanelHost } from '@/ext/ExtPanelHost'
 import type { PanelBinding } from '@/ipc/client'
 import { attachExtensions, useExtPanels } from '@/ext/extStore'
 import { attachEditorBridge, setBridgeProject } from '@/ext/editorBridge'
-import { ExtensionTab } from '@/ext/ExtensionTab'
 /* Straight from `model.ts` and not through the barrel, per that file's own rule: the
    barrel pulls in React and the DOM, and `model.ts` is import-free so `check:agents` can
    compile it standalone. `ProblemsPanel/model` is imported the same way two lines up. */
 import { liveCount } from '@/sidebar/AgentsPanel/model'
 import { useAgents } from '@/sidebar/agentsStore'
 import { TasksPanel, TaskDetailHost } from '@/sidebar/TasksPanel'
-import { DockerFilesPane } from '@/panes/DockerFilesPane'
 import { ConversationArchivePane } from '@/panes/ConversationArchivePane'
-import { DockerInspectPane } from '@/panes/DockerInspectPane'
-import { DocsPane } from '@/panes/DocsPane'
+import { PageTabBody, isPageOnly, isPageTab } from '@/panes/PageTabBody'
 import { useDocker } from '@/sidebar/dockerStore'
 import { OpenSpecPanel } from '@/sidebar/OpenSpecPanel'
 import { ProposeDialog, useProposeDialog } from '@/sidebar/OpenSpecPanel/ProposeDialog'
@@ -101,7 +98,6 @@ import { SpecActsConfirm } from '@/sidebar/OpenSpecPanel/SpecActsConfirm'
 import { useSpecConfirm } from '@/sidebar/OpenSpecPanel/specActs'
 import { followSpecRuns, useSpecRuns } from '@/sidebar/OpenSpecPanel/specRuns'
 import { invalidateSpecData, retainSpecProjects } from '@/sidebar/OpenSpecPanel/specData'
-import { SpecTab } from '@/sidebar/OpenSpecPanel/SpecTab'
 import { useSpec } from '@/sidebar/specStore'
 import { openCount } from '@/sidebar/TasksPanel/model'
 import { useTasks } from '@/sidebar/tasksStore'
@@ -147,7 +143,7 @@ import { changeNavPresent, subscribeChangeNav } from '@/panes/changeNav'
 import { focusPaneDom } from '@/panes/paneFocus'
 import { activateTabFocused } from '@/panes/activateTab'
 import { liveHosts } from '@/layout/paneHosts'
-import { SettingsTab, lastFrameSection } from '@/settings/SettingsTab'
+import { lastFrameSection } from '@/settings/SettingsTab'
 import { SettingsFrame } from '@/settings/SettingsFrame'
 import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
 import {
@@ -1810,8 +1806,6 @@ export function App() {
            */
           {...(activeProject && focused
             ? {
-                onSplit: () =>
-                  void splitPane(activeProject.id, focused.tab.id, focused.pane.id, 'row', 'after'),
                 /*
                  * The same rule the pane cluster's ⧉ follows (`clusterPlan`, applied in
                  * `TabPane`): a tab's only pane leaves as the whole *tab*. This used to call
@@ -2719,9 +2713,8 @@ const WorkspaceContent = memo(function WorkspaceContent({
                   // `activeTab` deliberately points at a tab the *shell* draws.
                   activeTab={tabRole !== null ? tabRole.tab : activeProject.activeTab}
                   renderTree={(tab, active) =>
-                    // A settings tab has a pane tree — every tab does, which is the invariant
-                    // that makes "promote pane to tab" one code path — but nothing to render
-                    // into it. The screen replaces the tree rather than living inside a pane.
+                    // Every tab has a pane tree — the invariant that makes "promote pane to tab"
+                    // one code path. A saved conversation is read-only, so it replaces its tree.
                     tab.kind.kind === 'conversation' ? (
                       <ConversationArchivePane
                         project={activeProject.id}
@@ -2729,60 +2722,15 @@ const WorkspaceContent = memo(function WorkspaceContent({
                         title={tab.kind.title}
                         active={active}
                       />
-                    ) : tab.kind.kind === 'settings' ? (
-                      <SettingsTab project={activeProject.id} section={tab.kind.section} />
-                    ) : tab.kind.kind === 'extension' ? (
+                    ) : isPageTab(tab.kind) && isPageOnly(tab.tree) ? (
                       /*
-                       * An extension's page, replacing the pane tree the way Settings does — and
-                       * for the same reason: it is a page *about* cide rather than a document in
-                       * the project, so there is nothing for a split to split.
+                       * A page tab (Settings, an extension, an OpenSpec change, docs, docker…)
+                       * draws its page straight into the tab while the page is its only pane:
+                       * no frame around a screen, and no remount for the common case. Once the
+                       * tab is split it falls through to `SplitTree`, and `PaneBody` draws the
+                       * page as the tree's editor-kind pane — see `panes/PageTabBody.tsx`.
                        */
-                      <ExtensionTab
-                        id={{ marketplace: tab.kind.marketplace, extension: tab.kind.extension }}
-                        name={tab.kind.name}
-                      />
-                    ) : tab.kind.kind === 'openSpec' ? (
-                      /*
-                       * A change or a capability, replacing the pane tree for the two reasons
-                       * above: it is a page about a *directory* rather than a document, and
-                       * there is nothing for a split to split. `TabKind::OpenSpec` argues why
-                       * opening `proposal.md` was not enough.
-                       */
-                      <SpecTab
-                        project={activeProject.id}
-                        /*
-                         * **Every tab is mounted**, hidden or not — `TabContent`'s own rule, and
-                         * hidden means `visibility: hidden` rather than unmounted. So a page that
-                         * bound a window-level key listener would bind one per open change and
-                         * they would all fire at once. `active` is what tells this one the chord
-                         * is meant for it.
-                         */
-                        active={active}
-                        {...(tab.kind.subject.kind === 'change'
-                          ? { change: tab.kind.subject.change }
-                          : { spec: tab.kind.subject.spec })}
-                      />
-                    ) : tab.kind.kind === 'docs' ? (
-                      /*
-                       * A symbol's documentation, replacing the pane tree for the reasons the
-                       * arms around it give: a page *about* something, nothing for a split to
-                       * split. The tab carries a subject; the pane asks for the page. (M60)
-                       */
-                      <DocsPane
-                        project={activeProject.id}
-                        subject={tab.kind.subject}
-                        title={tab.kind.title}
-                      />
-                    ) : tab.kind.kind === 'docker' ? (
-                      /*
-                       * A `docker inspect` document, replacing the pane tree for the two reasons
-                       * the OpenSpec and Extension arms above give: it is a page *about*
-                       * something rather than a document in the project, and there is nothing
-                       * for a split to split.
-                       */
-                      <DockerInspectPane target={tab.kind.target} title={tab.kind.title} />
-                    ) : tab.kind.kind === 'dockerFiles' ? (
-                      <DockerFilesPane container={tab.kind.container} name={tab.kind.name} />
+                      <PageTabBody project={activeProject.id} kind={tab.kind} active={active} />
                     ) : (
                     <SplitTree
                       tree={tab.tree}
@@ -2933,9 +2881,11 @@ const TabPane = memo(function TabPane({
       focused={tabFocused === pane.id}
       maximized={tabMaximized === pane.id}
       tabScoped={tabScoped}
-      // A file tab's pane gets no corner cluster: the header's split/detach and the tab
-      // strip's × cover it, and the cluster sat on the code being read.
-      bare={tabKind.kind === 'file' || tabKind.kind === 'clipboardDiff'}
+      // A file tab's *only* pane gets no corner cluster: the header's split menu and the tab
+      // strip's × cover it, and the cluster sat on the code being read. Once the tab is split
+      // that argument is gone — the new pane has no × of its own, so there was no way to close
+      // it — and every pane in it gets the cluster, whose close is pane-scoped (`clusterPlan`).
+      bare={(tabKind.kind === 'file' || tabKind.kind === 'clipboardDiff') && paneCount <= 1}
       onFocus={() => void focusPane(project, tab, pane.id)}
       // `row` is a tile beside this one, in this pane's own row — the axis
       // the command layer routes to `add_tile`. The row gesture is on the

@@ -72,10 +72,22 @@ pub async fn spec_images_stage(
                 }
             } else {
                 use tauri_plugin_clipboard_manager::ClipboardExt;
-                if let Ok(image) = handle.clipboard().read_image() {
-                    let bytes =
-                        cide_core::image::encode_png(image.rgba(), image.width(), image.height())?;
-                    saved.push(save(&bytes, "png", "drafts")?);
+                // No image is an empty answer, not an error: the composer claims any paste with
+                // no text in it (WebKit never names an image type — see `wantsImagePaste`), so an
+                // empty clipboard lands here and says so through the composer's notice. The
+                // reason is printed all the same, because "no image" and "the read failed" are
+                // one `Err` here, and the first time this path met a real display it failed
+                // without a word anywhere about which half had gone wrong.
+                match handle.clipboard().read_image() {
+                    Ok(image) => {
+                        let bytes = cide_core::image::encode_png(
+                            image.rgba(),
+                            image.width(),
+                            image.height(),
+                        )?;
+                        saved.push(save(&bytes, "png", "drafts")?);
+                    }
+                    Err(error) => eprintln!("[cide] OpenSpec paste: no clipboard image: {error}"),
                 }
             }
             Ok(())

@@ -28,8 +28,13 @@ export interface AgentReview {
    * reviewer does not exit after its summary. It used to fall through to `running`, so a review
    * that had long finished read "Reviewing…" with a Stop button; and it is the state in which a
    * draft's Discuss reaches the reviewer by typing rather than by reviving it.
+   *
+   * `stopped` is a run that ended without finishing its work: stopped by the user (the block's
+   * Stop, or closing the MR) or interrupted by cide quitting. Both also used to fall through to
+   * `running`, so a stopped review read "Reviewing…" with a spinner for as long as the panel
+   * was open.
    */
-  state: 'queued' | 'running' | 'idle' | 'waiting' | 'finished' | 'failed'
+  state: 'queued' | 'running' | 'idle' | 'waiting' | 'finished' | 'stopped' | 'failed'
   detail: string
   tabOpened: boolean
 }
@@ -126,42 +131,74 @@ async function follow(review: string, entry: AgentReview) {
       return
     }
     if (row) {
+      // Exhaustive, with a `never` default: this was an if-chain whose `else` called every
+      // state it did not name "Reviewing…", and `cancelled` — what Stop and closing the MR
+      // both leave — was one of them. A new `RunState` variant is a type error here instead.
       const state = row.state
-      if (state.state === 'failed') {
-        update(entry, { state: 'failed', detail: state.reason })
-        return
-      }
-      if (state.state === 'finished') {
-        if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
-        update(entry, {
-          state: 'finished',
-          detail:
-            state.code === 0
-              ? 'Finished. Its findings are in Drafts.'
-              : `Ended with exit ${state.code}.`,
-        })
-        return
-      }
-      if (state.state === 'queued') {
-        update(entry, {
-          state: 'queued',
-          detail: row.note ?? 'Waiting for a run slot…',
-        })
-      } else if (state.state === 'idle') {
-        // Keep following: a Discuss message starts another turn in this same run.
-        update(entry, {
-          state: 'idle',
-          detail: 'Done. Its findings are in Drafts; Discuss a draft to ask about it.',
-        })
-      } else if (state.state === 'awaitingPermission') {
-        update(entry, {
-          state: 'waiting',
-          detail: 'Waiting for a permission answer in its tab.',
-        })
-        if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
-      } else {
-        update(entry, { state: 'running', detail: 'Reviewing…' })
-        if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
+      switch (state.state) {
+        case 'failed':
+          update(entry, { state: 'failed', detail: state.reason })
+          return
+        case 'finished':
+          if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
+          update(entry, {
+            state: 'finished',
+            detail:
+              state.code === 0
+                ? 'Finished. Its findings are in Drafts.'
+                : `Ended with exit ${state.code}.`,
+          })
+          return
+        case 'cancelled':
+          update(entry, {
+            state: 'stopped',
+            detail: `Stopped (${state.reason}). Drafts it wrote are kept.`,
+          })
+          return
+        case 'interrupted':
+          update(entry, {
+            state: 'stopped',
+            detail: 'Interrupted when cide quit. Drafts it wrote are kept.',
+          })
+          return
+        case 'queued':
+          update(entry, {
+            state: 'queued',
+            detail: row.note ?? 'Waiting for a run slot…',
+          })
+          break
+        case 'idle':
+          // Keep following: a Discuss message starts another turn in this same run.
+          update(entry, {
+            state: 'idle',
+            detail: 'Done. Its findings are in Drafts; Discuss a draft to ask about it.',
+          })
+          break
+        case 'awaitingPermission':
+          update(entry, {
+            state: 'waiting',
+            detail: 'Waiting for a permission answer in its tab.',
+          })
+          if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
+          break
+        case 'blocked':
+          // The turn failed but the child is alive: its tab is where it can be recovered.
+          update(entry, { state: 'waiting', detail: state.reason })
+          break
+        case 'paused':
+          update(entry, { state: 'waiting', detail: 'Paused.' })
+          break
+        case 'starting':
+          update(entry, { state: 'running', detail: 'Starting…' })
+          break
+        case 'running':
+          update(entry, { state: 'running', detail: 'Reviewing…' })
+          if (!entry.tabOpened) await openTab(review, entry).catch(() => false)
+          break
+        default: {
+          const unhandled: never = state
+          void unhandled
+        }
       }
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_MS))

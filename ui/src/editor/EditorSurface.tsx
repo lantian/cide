@@ -1128,11 +1128,13 @@ export function EditorSurface({
        * `pasteImage.ts`, which is import-free and driven by `check:paste-image`; what is here
        * is the wiring, and it is deliberately three decisions long.
        *
-       * **The event decides, and Rust reads.** `clipboardData.types` is a list the browser has
+       * **The event decides, and Rust reads.** `clipboardData` is something the browser has
        * already assembled — free to read, decodes nothing — so this handler can answer
        * synchronously, which it must: `preventDefault` cannot be deferred, and reading a
        * clipboard cannot be done without awaiting. `ui/src/terminal/clipboard.ts` reached the
        * same constraint from the other side and its note is worth reading before changing this.
+       * What the event decides is *not text*, never *is an image*: WebKit never lists `image/*`
+       * in `types` — `wantsImagePaste` has the whole story.
        *
        * **Nothing about the image is ever in JavaScript.** `fs_paste_image` reads, encodes and
        * writes in one blocking Rust call and answers a path, which is
@@ -1140,9 +1142,8 @@ export function EditorSurface({
        * direction that had never needed it.
        *
        * **Text still pastes as text.** A clipboard holding both an image and text is text here,
-       * so a copied path, a copied file and an ordinary Ctrl+V are all untouched — only a
-       * clipboard holding an image *alone* is claimed, which is what every screenshot tool
-       * produces and nothing else does.
+       * so a copied path, a copied file and an ordinary Ctrl+V are all untouched — only a paste
+       * with no text in it is claimed, which is what every screenshot tool produces.
        *
        * `project` may be undefined for a surface with no project (a standalone buffer in a
        * fixture); there is no command to call then, so the paste falls through.
@@ -1150,7 +1151,6 @@ export function EditorSurface({
       EditorView.domEventHandlers({
         paste(event, view) {
           if (project === undefined) return false
-          const types = event.clipboardData === null ? [] : [...event.clipboardData.types]
           const verdict = onImagePaste(
             {
               docPath: path,
@@ -1158,10 +1158,11 @@ export function EditorSurface({
               readOnly,
               write: (dir) =>
                 fsClipboard.pasteImage(project, dir).catch((error: unknown) => {
-                  // "No image after all" is the ordinary answer — the `types` list said there
-                  // was one, and a clipboard can change between the event and this call — so it
-                  // is silent. Everything else is a real failure the user has to see: a full
-                  // disk, or a directory deleted since the buffer was opened.
+                  // "No image after all" is the ordinary answer — an empty clipboard looks like
+                  // a screenshot to the event under WebKit, and a clipboard can change between
+                  // the event and this call — so it is silent. Everything else is a real failure
+                  // the user has to see: a full disk, or a directory deleted since the buffer
+                  // was opened.
                   if (!isNoClipboardImage(error)) notifyFailure(error)
                   return null
                 }),
@@ -1175,7 +1176,7 @@ export function EditorSurface({
                 )
               },
             },
-            types,
+            event.clipboardData,
           )
           if (verdict !== 'claimed') return false
           event.preventDefault()

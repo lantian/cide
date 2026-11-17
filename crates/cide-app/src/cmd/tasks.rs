@@ -791,8 +791,17 @@ pub async fn task_attach(
 /// whenever the card has focus, and an ordinary paste of text must cost the user nothing to see.
 fn clipboard_png(app: &tauri::AppHandle) -> Result<Option<(String, Vec<u8>)>> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
-    let Ok(image) = app.clipboard().read_image() else {
-        return Ok(None);
+    // Printed before it becomes `None`: the frontend claims any paste with no text in it (WebKit
+    // never names an image type — see `wantsImagePaste`), so an empty clipboard and a read that
+    // failed both arrive as this one `Err`, and the notice the user sees cannot tell them apart.
+    // `fs_paste_image` does not print, because the file tree's Ctrl+V reaches it on every
+    // ordinary text paste; this is reached only by a paste somebody meant as an image.
+    let image = match app.clipboard().read_image() {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("[cide] task paste: no clipboard image: {error}");
+            return Ok(None);
+        }
     };
     let bytes = cide_core::image::encode_png(image.rgba(), image.width(), image.height())?;
     Ok(Some((cide_core::image::pasted_image_name_now(), bytes)))

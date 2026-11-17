@@ -253,15 +253,45 @@ try {
     'App.tsx passes `onAddTile` — without it the per-pane control renders nowhere',
   )
 
+  // A file tab's corner cluster is withheld only while the tab is ONE pane. Once it is split the
+  // new pane has no × of its own — `bare` per tab hid the close control on every pane in it.
+  const appCode = app.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  ok(
+    /bare=\{\([^)]*'file'[^)]*\)\s*&&\s*paneCount\s*<=\s*1\}/.test(appCode),
+    'a file tab’s pane is `bare` only while the tab holds one pane, so a split pane can be closed',
+  )
+  // A page tab (Settings, docs, …) is drawn by `PageTabBody` both directly and as a grid pane,
+  // so a split there is visible instead of landing in a tree nothing renders.
+  const paneBody = readFileSync('src/panes/PaneBody.tsx', 'utf8')
+  ok(
+    /<PageTabBody\b/.test(appCode) && /<PageTabBody\b/.test(paneBody),
+    'a page tab draws its page in `renderTree` while whole and in `PaneBody` once split',
+  )
+
   // The add-ROW gesture moved into the header, because two sets of buttons for one gesture is
   // what the user reported. So the assertion moves with it rather than being deleted: the
-  // header must MOUNT `RowControls`, and `App.tsx` must NOT re-supply `onAddRow` to the pane
-  // tree, or both sets come back — which is exactly the regression this pair now pins.
+  // header must MOUNT `SplitMenu` (one icon whose menu holds the bash/harness pane and row
+  // gestures; the two labelled buttons are gone), and `App.tsx` must NOT re-supply `onAddRow`
+  // to the pane tree, or both sets come back — which is exactly the regression this pair pins.
   //
-  // `RowControls` drives the workspace store itself when no handler is passed, so mounting it
+  // `SplitMenu` drives the workspace store itself when no handler is passed, so mounting it
   // is the whole of the wiring; there is no prop to check on the other side.
   const header = readFileSync('src/chrome/AppHeader.tsx', 'utf8')
-  ok(/<RowControls\b/.test(header), 'the header mounts `RowControls`')
+  ok(/<SplitMenu\b/.test(header), 'the header mounts `SplitMenu`')
+  ok(!/<RowControls\b/.test(header), 'and no longer draws the two labelled row buttons')
+  const splitMenu = readFileSync('src/chrome/SplitMenu.tsx', 'utf8')
+  // Comments stripped first: this file's prose names every one of these ids.
+  const splitMenuCode = splitMenu.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  for (const command of ['terminal.splitRight', 'terminal.addRow', 'claude.split.right', 'claude.addRow']) {
+    ok(
+      splitMenuCode.includes(`'${command}'`),
+      `the split menu offers ${command}, so its chip is the live binding for that gesture`,
+    )
+  }
+  ok(
+    /tooltip:/.test(splitMenuCode) && /command:/.test(splitMenuCode),
+    'every split-menu row carries a tooltip and a command chip',
+  )
   // Scoped to the `<SplitTree>` element, not to the whole file. It used to grep all of
   // App.tsx, and that was too broad the moment the pane's title bar was deleted: the floating
   // controls' context menu takes an `onAddRow` of its own, on `<PaneFrame>`, which is a menu
@@ -324,13 +354,13 @@ try {
   //
   // "'Add a pane to this row' - should have a dropdown to select - claude or bash". The two
   // kinds live in exactly one place so the header and the pane bar cannot drift, which is
-  // already how `SplitTree`'s wording drifted from `RowControls`'.
-  const rowControls = readFileSync('src/chrome/RowControls.tsx', 'utf8')
+  // already how `SplitTree`'s wording drifted from the header's.
+  const rowControls = splitMenu
   ok(
     /export const PANE_KINDS\b/.test(rowControls)
       && /kind: 'shell'/.test(rowControls)
       && /kind: 'newClaude'/.test(rowControls),
-    '`RowControls` exports the one `PANE_KINDS` table, holding both intents',
+    '`SplitMenu` exports the one `PANE_KINDS` table, holding both intents',
   )
   const titleBar = readFileSync('src/layout/PaneTitleBar.tsx', 'utf8')
   ok(

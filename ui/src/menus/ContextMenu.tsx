@@ -588,7 +588,7 @@ export function ContextMenu({
                 data-item={entry.id}
                 data-enabled={entry.enabled ? 'true' : 'false'}
                 data-submenu={entry.submenu === null ? undefined : 'true'}
-                title={entry.reason ?? undefined}
+                title={entry.reason ?? entry.tooltip ?? undefined}
                 onMouseDown={(ev) => {
                   if (search !== undefined) ev.preventDefault()
                 }}
@@ -690,7 +690,7 @@ export function ContextMenu({
                 aria-disabled={entry.enabled ? undefined : true}
                 data-item={entry.id}
                 data-enabled={entry.enabled ? 'true' : 'false'}
-                title={entry.reason ?? undefined}
+                title={entry.reason ?? entry.tooltip ?? undefined}
                 onClick={() => runSub(index)}
                 onPointerEnter={() => entry.enabled && setSubActive(index)}
               >

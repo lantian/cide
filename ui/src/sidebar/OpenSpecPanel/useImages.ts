@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { image, specImages } from '@/ipc/client'
 import type { ImageDoc } from '@/ipc/generated'
-import { notifyFailure } from '@/chrome/notices'
+import { notify, notifyFailure } from '@/chrome/notices'
 
 export function useImages(key: string) {
   const [docs, setDocs] = useState<(ImageDoc & { name: string; order: number })[]>([])
@@ -29,6 +29,11 @@ export function useImages(key: string) {
       if (mine !== generation.current || sources?.length === 0) return
       const next = (await specImages.stage(sources)).map((doc, i) => ({ ...doc, order, name: sources?.[i]?.split(/[\\/]/).pop() ?? 'Pasted image.png' }))
       if (mine !== generation.current) { release(next); return }
+      // A paste the composer claimed and Rust found no image in. Said aloud, as the task
+      // composer says it: the claim is "no text", not "an image" (WebKit never names one — see
+      // `wantsImagePaste`), so an empty clipboard lands here, and so does a clipboard read that
+      // failed. Silence here is the bug this replaced: Ctrl+V that did nothing at all.
+      if (!pick && paths === undefined && next.length === 0) notify('The clipboard holds no image.', { kind: 'warn' })
       owned.current = [...owned.current, ...next].sort((a, b) => a.order - b.order)
       setDocs(owned.current)
     } catch (error) { if (mine === generation.current) notifyFailure(error) }

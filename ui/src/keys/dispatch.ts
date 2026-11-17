@@ -539,7 +539,7 @@ export function __clearParkedTag(): void {
  * two are different gestures in the rows model and the titles in `cide_core::commands` name
  * which is which — "Split pane right (adds a tile)" against "Split pane down (adds a row)".
  * `App.tsx`'s old fallback ran both through `pane_split`, so *Split pane down* subdivided the
- * current row instead; the title is the specification here, and `chrome/RowControls.tsx`'s
+ * current row instead; the title is the specification here, and `chrome/SplitMenu.tsx`'s
  * `+` button already makes the same call this does.
  */
 function split(target: { project: ProjectId; tab: TabId; pane: PaneId }, axis: Axis, intent: SplitIntent | null): void {

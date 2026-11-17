@@ -95,8 +95,25 @@ export function reviewProject(id: string, sha: string): string {
   const s = id.slice(0, 16) + sha.slice(0, 16)
   return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`
 }
-export function message(error: unknown) {
-  return error instanceof Error ? error.message : String(error)
+/**
+ * The sentence for a failure anywhere in the MR panel — `errorText`'s rule
+ * (`ui/src/ipc/errorText.ts`, which says why at length), restated rather than imported because
+ * `check:gitlab` compiles this file standalone and a cross-directory import breaks that compile.
+ *
+ * It was `String(error)` for anything not an `Error`, and the panel's own requests reject with a
+ * plain string, so it looked right — until a call reached a `CoreError`-returning command
+ * (`agents_run_open` behind the review block's **Show**): a tagged `{ kind, detail }` object,
+ * printed as `[object Object]` above the very block it was about.
+ */
+export function message(error: unknown): string {
+  if (typeof error === 'string') return error
+  if (error instanceof Error) return error.message
+  if (error !== null && typeof error === 'object') {
+    const tagged = error as { kind?: unknown; detail?: unknown }
+    if (typeof tagged.detail === 'string' && tagged.detail.length > 0) return tagged.detail
+    if (typeof tagged.kind === 'string' && tagged.kind.length > 0) return tagged.kind
+  }
+  return String(error)
 }
 
 /** GitLab's approvals endpoint can omit `approved`; approvals_left is authoritative. */
