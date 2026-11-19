@@ -618,7 +618,10 @@ fn orchestrator_paragraph(
     // that starts before cide knows what to tell it.
     // A worker is told what it is and nothing about orchestration (M104): see `Voice::Worker`.
     if voice.unwrap_or(inferred) == Voice::Worker {
-        return Some(worker_paragraph());
+        let config = cide_agents::config::load(&root);
+        return Some(worker_paragraph(Some(
+            config.agents.worker_session_instructions_template(),
+        )));
     }
     let agents = cide_agents::load_project(&root);
     let tracker = cide_agents::config::load_tracker(&root);
@@ -707,7 +710,7 @@ fn project_paragraph(
     agent_sessions_enabled: bool,
 ) -> String {
     if voice == Voice::Worker {
-        return worker_paragraph();
+        return worker_paragraph(None);
     }
     let roster = roles
         .map(|roles| roster_paragraph(roles, voice, limits, tracker))
@@ -790,17 +793,10 @@ pub(crate) enum Voice {
     Worker,
 }
 
-/// The worker's paragraph. (M104) A constant because nothing about the project changes it: the
-/// work itself arrives as the opening line, and the tracker is read with the tools.
-const WORKER_PARAGRAPH: &str = "cide opened this session to implement one piece of work, which \
-     your first message states, in a git worktree of its own: the directory you are in, on its \
-     own branch. Work only there, and commit your work on that branch as you go — the person or \
-     session that opened you reviews the branch and merges it, so an uncommitted change is a \
-     change nobody sees. You are the worker, not the product owner: you cannot dispatch or open \
-     other sessions, and you do not merge. When the work is on this project's board, the \
-     `mcp__cide__cide_task_*` tools read and write it — leave one short report on the task when \
-     you are done (no progress comments), and set it to `review`. Anything you notice that is not your \
-     work goes on the board as a new task with `inbox: true` rather than into this branch.";
+/// Shipped worker-tab default, exposed beside role and opening prompts in Settings.
+/// The work itself arrives in the opening line. Project overrides are read at spawn
+/// (including restore), without changing the worker's actual tool scope.
+const WORKER_PARAGRAPH: &str = cide_agents::config::DEFAULT_WORKER_SESSION_INSTRUCTIONS;
 
 const REQUEST_PARAGRAPH: &str = "When you need the user, call `mcp__cide__cide_user_request`; \
      it waits for the answer in this conversation by default. Set wait=false only for \
@@ -818,8 +814,11 @@ fn request_paragraph(tracker: bool) -> String {
     }
 }
 
-fn worker_paragraph() -> String {
-    format!("{WORKER_PARAGRAPH} {REQUEST_PARAGRAPH}")
+fn worker_paragraph(instructions: Option<&str>) -> String {
+    let instructions = instructions
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(WORKER_PARAGRAPH);
+    format!("{instructions} {REQUEST_PARAGRAPH}")
 }
 
 /// The sentence a console gets when the project has **nobody to dispatch to**. (M104)
@@ -839,8 +838,9 @@ const SESSIONS_PARAGRAPH: &str = "This project in cide has no subagent roles to 
      one. To implement an existing OpenSpec change, pass `openspec_change` (its name in \
      `openspec/changes/`) instead: the session then shows on that change's card in the OpenSpec \
      sidebar. `worktree: false` runs it in the project root instead, with no branch of its own \
-     (use it for one session at a time). Each session commits on its own branch and, for a board task, sets it to review when \
-     done; you review the branch and merge it with git.";
+     (use it for one session at a time). Each session follows the requested scope and build/commit ownership; planning alone \
+     requires no edits, builds or commits. For a board task, it sets the task to review when \
+     done; committed implementation changes can then be merged with git.";
 
 /// [`SESSIONS_PARAGRAPH`] for a project whose tracker is off: the same road without the board.
 const SESSIONS_PARAGRAPH_NO_TRACKER: &str = "This project in cide has no subagent roles to hand \
@@ -852,7 +852,8 @@ const SESSIONS_PARAGRAPH_NO_TRACKER: &str = "This project in cide has no subagen
      CLI for that tab (claude, codex or opencode) when the user asks for one. To implement an \
      existing OpenSpec change, pass `openspec_change` (its name in `openspec/changes/`) instead: \
      the session then shows on that change's card in the OpenSpec sidebar. Each session \
-     commits on its own branch; you review the branch and merge it with git.";
+     follows the requested scope and build/commit ownership; planning alone requires no edits, \
+     builds or commits. Review and merge committed implementation changes with git.";
 
 fn sessions_paragraph(tracker: bool, agent_sessions_enabled: bool) -> &'static str {
     // No announcement that the capability is disabled: that would advertise it just as
@@ -3405,6 +3406,24 @@ mod tests {
             max_concurrent: 1,
             worktree: true,
         }
+    }
+
+    #[test]
+    fn worker_session_instructions_are_replaceable_without_adding_orchestration_tools() {
+        let default = worker_paragraph(None);
+        assert!(default.contains(
+            "Planning, analysis or consultation alone requires no file edits, builds or commits"
+        ));
+        assert!(!default.contains("commit your work on that branch as you go"));
+        let custom = worker_paragraph(Some("Only return the plan. Main session owns commits."));
+        assert!(custom.starts_with("Only return the plan. Main session owns commits."));
+        assert!(!custom.contains(WORKER_PARAGRAPH));
+        assert!(
+            custom.contains("cide_user_request_result"),
+            "runtime question guidance stays attached"
+        );
+        assert!(!custom.contains("cide_agent_dispatch"));
+        assert_eq!(worker_paragraph(Some(" \n")), default);
     }
 
     #[test]

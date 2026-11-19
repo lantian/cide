@@ -1822,7 +1822,12 @@ fn plan_dispatch_loaded(
     let kind = cide_agents::overrides::effective_harness(agent, overrides);
     let harness = cide_agents::harness::for_kind(kind);
     let prompt = match request.external.as_ref() {
-        Some(work) => external_prompt(work, request.prompt.as_deref(), harness),
+        Some(work) => external_prompt(
+            work,
+            request.prompt.as_deref(),
+            harness,
+            project.config.agents.external_work_instructions_template(),
+        ),
         None => opening_prompt(
             task.as_ref(),
             request.prompt.as_deref(),
@@ -1939,6 +1944,7 @@ pub(crate) fn external_prompt(
     work: &cide_ipc::ExternalWork,
     extra: Option<&str>,
     tools: Option<&dyn Harness>,
+    instructions: &str,
 ) -> String {
     let reference = work
         .reference
@@ -1962,11 +1968,12 @@ pub(crate) fn external_prompt(
         None => "This is not a task on this project's cide board, so do not look for it there."
             .to_string(),
     });
-    parts.push(
-        "Commit each coherent step as you go — your branch is the record that survives if this \
-         session dies. When the work is complete, stop and summarise what you did and where."
-            .to_string(),
-    );
+    let instructions = if instructions.trim().is_empty() {
+        cide_agents::config::DEFAULT_EXTERNAL_WORK_INSTRUCTIONS
+    } else {
+        instructions
+    };
+    parts.push(one_line(instructions));
     // Anything the work turns up that is not the work still goes on the board — to the inbox.
     if let Some(harness) = tools {
         parts.push(format!(
@@ -2027,11 +2034,8 @@ pub(crate) fn opening_prompt(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = task {
-        // The middle sentence is P4's checkpoint discipline (the preamble carries the durable
-        // copy; this is the copy that lands while the run is deciding what to do first):
-        // per-step commits are what a death cannot erase. It asked for a plan comment too until
-        // M132, which runs took as licence to narrate — `TRACKER_PREAMBLE`'s header has the
-        // numbers.
+        // The project owns its opening workflow. Delegation does not authorize implementation
+        // or checkpoints by itself: the default follows task scope and build/commit ownership.
         // The closing clause is the done-workflow convention's opening half; the durable mirror
         // rides every run's system prompt in `cide_agents::harness::TRACKER_PREAMBLE`, and the
         // orchestrator's side of the loop is taught in `roster_paragraph`.
@@ -2065,8 +2069,7 @@ pub(crate) fn opening_prompt(
             // the wrong place to encode a claim about a fact it cannot see, and because the id
             // and title still let the run say what it was asked to do.
             None => format!(
-                "Work on task {} ({}). Commit each coherent step as you go — your branch is the \
-                 record that survives if this run dies.",
+                "Work on task {} ({}). Follow its requested scope and build/commit ownership.",
                 task.id,
                 one_line(&task.title)
             ),
@@ -2079,9 +2082,9 @@ pub(crate) fn opening_prompt(
         // while the run is deciding what to do first.
         if let Some(change) = task.change.as_ref() {
             parts.push(format!(
-                "This task implements the OpenSpec change {} — its proposal, design and task \
-                 checklist are in openspec/changes/{}/, and working that checklist in order is \
-                 the work.",
+                "This task concerns the OpenSpec change {} — its proposal, design and task \
+                 checklist are in openspec/changes/{}/. Follow the task's requested scope; \
+                 implement the checklist only when implementation is requested.",
                 one_line(change.as_str()),
                 one_line(change.as_str())
             ));
@@ -3105,6 +3108,10 @@ mod tests {
             prompt_with_change.contains("openspec/changes/add-dark mode/"),
             "name the change's directory: {prompt_with_change}"
         );
+        assert!(
+            prompt_with_change
+                .contains("implement the checklist only when implementation is requested")
+        );
         assert!(prompt.contains("t-14"), "name the task: {prompt}");
         assert!(
             prompt.contains("cide_task_get"),
@@ -3116,17 +3123,16 @@ mod tests {
             prompt.contains("status to review with mcp__cide__cide_task_update"),
             "say how to hand the work back: {prompt}"
         );
-        // P4's checkpoint discipline: the per-step commits that survive a mid-turn death.
-        // `TRACKER_PREAMBLE` carries the durable copy; this is the one that lands before the
-        // run's first decision. The plan comment it asked for until M132 is now refused in
-        // words: runs took it as licence to narrate (the preamble's header has the numbers).
+        // Return the requested result once, without narrating work in tracker comments.
         assert!(
-            prompt.contains("do not comment while you work"),
+            prompt.contains("Do not comment while you work"),
             "no progress comments: {prompt}"
         );
         assert!(
-            prompt.contains("commit each coherent step"),
-            "ask for the checkpoint commits: {prompt}"
+            prompt.contains(
+                "Planning, analysis or consultation alone requires no file edits, builds or commits"
+            ),
+            "a task is not implicit implementation or permission to commit: {prompt}"
         );
         assert!(prompt.contains("mind the tabs"), "{prompt}");
 
@@ -3250,15 +3256,20 @@ mod tests {
     }
 
     /// External work (M104): the brief inline and flattened, the reference named as where to
-    /// report, and the commit discipline a worktree run needs — never the ad-hoc "do not commit".
+    /// report, with project-configured workflow rather than mandatory implementation/commits.
     #[test]
-    fn external_work_is_stated_inline_and_committed_on_its_branch() {
+    fn external_work_is_stated_inline_and_respects_its_requested_scope() {
         let work = cide_ipc::ExternalWork {
             reference: Some("PROJ-12".into()),
             title: "Add --version".into(),
             brief: "print the crate version\nand exit 0".into(),
         };
-        let prompt = external_prompt(&work, Some("keep it small"), claude());
+        let prompt = external_prompt(
+            &work,
+            Some("keep it small"),
+            claude(),
+            cide_agents::config::DEFAULT_EXTERNAL_WORK_INSTRUCTIONS,
+        );
         eprintln!("{prompt}");
         assert!(!prompt.contains('\n'), "{prompt}");
         assert!(
@@ -3267,15 +3278,42 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("reaches PROJ-12"), "{prompt}");
-        assert!(prompt.contains("Commit each coherent step"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "Planning, analysis or consultation alone requires no file edits, builds or commits"
+            ),
+            "{prompt}"
+        );
         assert!(prompt.contains("mcp__cide__cide_task_create"), "{prompt}");
         assert!(prompt.ends_with("keep it small"), "{prompt}");
+
+        let custom = external_prompt(
+            &work,
+            None,
+            claude(),
+            "Only plan.\n Main session builds and commits. {literal}",
+        );
+        assert!(custom.contains("Only plan. Main session builds and commits. {literal}"));
+        assert!(
+            !custom.contains("Planning, analysis or consultation"),
+            "custom instructions replace the shipped policy"
+        );
+        assert!(!custom.contains('\n'));
+        assert!(
+            external_prompt(&work, None, None, " \n")
+                .contains("Planning, analysis or consultation")
+        );
 
         let bare = cide_ipc::ExternalWork {
             reference: None,
             ..work
         };
-        let prompt = external_prompt(&bare, None, None);
+        let prompt = external_prompt(
+            &bare,
+            None,
+            None,
+            cide_agents::config::DEFAULT_EXTERNAL_WORK_INSTRUCTIONS,
+        );
         assert!(!prompt.contains("reaches"), "{prompt}");
         assert!(!prompt.contains("cide_task_create"), "{prompt}");
     }
@@ -3331,7 +3369,7 @@ mod tests {
         for prompt in [&by_claude, &by_opencode] {
             assert!(prompt.contains("t-9"), "{prompt}");
             assert!(prompt.contains("wire the thing"), "{prompt}");
-            assert!(prompt.contains("do not comment while you work"), "{prompt}");
+            assert!(prompt.contains("Do not comment while you work"), "{prompt}");
             assert!(!prompt.contains('\n'), "one line, always: {prompt}");
         }
     }
@@ -3355,13 +3393,15 @@ mod tests {
 
         assert!(!prompt.contains("cide_task_"), "{prompt}");
         assert!(!prompt.contains("mcp__"), "{prompt}");
-        // What survives: which task, what it is called, the instruction, and the commit rule —
-        // the one piece of the discipline that needs no tracker.
+        // What survives: task identity, requested scope, ownership and added instructions.
         assert!(prompt.contains("t-9"), "{prompt}");
         assert!(prompt.contains("wire the thing"), "{prompt}");
         assert!(prompt.contains("and hurry"), "{prompt}");
-        // Capital, because with no tracker sentence in front of it this one opens the line.
-        assert!(prompt.contains("Commit each coherent step"), "{prompt}");
+        // Scope and ownership require no tracker tool.
+        assert!(
+            prompt.contains("Follow its requested scope and build/commit ownership"),
+            "{prompt}"
+        );
         assert!(!prompt.contains('\n'), "{prompt}");
     }
 
@@ -3389,7 +3429,7 @@ mod tests {
             assert!(prompt.contains("openspec/changes/add-prompt-settings/"));
             assert!(prompt.ends_with("Keep this small."));
             assert!(!prompt.contains('\n'));
-            assert!(!prompt.contains("do not comment while you work"));
+            assert!(!prompt.contains("Do not comment while you work"));
         }
         assert_eq!(
             opening_prompt(Some(&plain_task()), None, claude(), " \n"),

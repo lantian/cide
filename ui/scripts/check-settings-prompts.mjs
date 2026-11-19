@@ -31,6 +31,8 @@ try {
   const defaults = {
     taskStartPrompt: 'Work on task {task_id}: {task_title}. Read it with {cide_task_get}.',
     workerInstructions: 'Default tracker rules.\n\nUse {cide_task_comment}.',
+    externalWorkInstructions: 'Follow the requested external scope.',
+    workerSessionInstructions: 'Return the requested worker result.',
   }
   let stored = { ...defaults }
   let nextSave = 'success'
@@ -44,6 +46,8 @@ try {
       ...stored,
       taskStartPrompt: patch.taskStartPrompt.trim().replace(/\s+/g, ' ') || defaults.taskStartPrompt,
       workerInstructions: patch.workerInstructions.trim() || defaults.workerInstructions,
+      externalWorkInstructions: patch.externalWorkInstructions.trim().replace(/\s+/g, ' ') || defaults.externalWorkInstructions,
+      workerSessionInstructions: patch.workerSessionInstructions.trim() || defaults.workerSessionInstructions,
     }
     return { ...stored }
   }
@@ -88,6 +92,8 @@ try {
 
   await edit(0, 'Implement {task_id}\ncarefully')
   await edit(1, 'Custom rules.\n\nReport once.')
+  await edit(2, 'Plan only.\nMain session commits.')
+  await edit(3, 'Only analyse.\n\nDo not edit files.')
   assert.equal(calls.length, 0, 'typing and blur do not save')
   assert.equal(button('Save prompts').disabled, false)
   await leave()
@@ -105,8 +111,12 @@ try {
   assert.deepEqual(calls.at(-1), {
     taskStartPrompt: 'Implement {task_id}\ncarefully',
     workerInstructions: 'Custom rules.\n\nReport once.',
-  }, 'both prompts save in one patch')
+    externalWorkInstructions: 'Plan only.\nMain session commits.',
+    workerSessionInstructions: 'Only analyse.\n\nDo not edit files.',
+  }, 'all prompts save in one patch')
   assert.equal(fields()[0].value, 'Implement {task_id} carefully', 'show backend normalization after save')
+  assert.equal(fields()[2].value, 'Plan only. Main session commits.', 'external instructions normalize safely')
+  assert.equal(fields()[3].value, 'Only analyse.\n\nDo not edit files.', 'session instructions retain paragraphs')
   assert.equal(button('Save prompts').disabled, true)
   assert.equal(document.querySelector('[role="status"][data-tone="warn"]'), null)
   await leave()
@@ -119,7 +129,7 @@ try {
   assert.equal(fields()[0].value, 'Changed on disk', 'failed reset keeps saved content')
   nextSave = 'success'
   await click('Reset to defaults')
-  assert.deepEqual(calls.at(-1), { taskStartPrompt: '', workerInstructions: '' })
+  assert.deepEqual(calls.at(-1), { taskStartPrompt: '', workerInstructions: '', externalWorkInstructions: '', workerSessionInstructions: '' })
   assert.deepEqual(fields().map((field) => field.value), Object.values(defaults), 'reset displays returned defaults')
 
   await edit(0, 'An older draft')
@@ -149,7 +159,7 @@ try {
     compilerOptions: { module: ts.ModuleKind.ESNext },
   }).outputText
   const { searchSettings } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
-  for (const query of ['task prompt', 'dispatch template', 'plan template', 'worker instructions']) {
+  for (const query of ['task prompt', 'dispatch template', 'plan template', 'worker instructions', 'external work', 'worker session', 'commit ownership']) {
     assert.ok(searchSettings(query).some((hit) => hit.section === 'agents' && hit.tab === 'prompts'), query)
   }
   console.log('settings prompts: visible defaults, explicit save/reset, drafts, failures, late replies and search passed')

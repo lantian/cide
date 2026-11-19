@@ -36,7 +36,7 @@ reviewPrompt?: string,
 /**
  * Empty resets to the current shipped default. These prompts are edited in Settings.
  */
-taskStartPrompt?: string, workerInstructions?: string, 
+taskStartPrompt?: string, workerInstructions?: string, externalWorkInstructions?: string, workerSessionInstructions?: string, 
 /**
  * `agents.isolateEnv`, whole: the list replaces the file's, and an empty one turns
  * isolation off. `AgentsConfig::apply` drops a name `cide_core::isolated_env::check_var`

@@ -19516,3 +19516,40 @@ reproduce the EACCES.
 it was inferred from the brief, the sandbox and the error rather than read off the reporter's
 machine. `find ~/.cache/cide/gitlab-reviews -type d ! -perm -u+w` there would settle it. The panel's
 new states were type-checked and not watched.
+
+## M204 — Delegated work follows its requested scope
+
+A planning-only worker could report a workflow conflict because cide's task opener and
+tracker preamble demanded checkpoint commits even when the task reserved builds and
+commits for the main session. External-work dispatch and worker tabs separately forced
+implementation and commits. Shipped defaults now follow the requested scope and ownership:
+planning, analysis and consultation alone require no edits, builds or commits. Workers
+report uncommitted implementation changes to the session responsible for committing them.
+OpenSpec context follows the same scope rule rather than turning a linked planning task
+into permission to implement its checklist. Explicit native planning policy is unchanged.
+
+The four affected workflow defaults live in `crates/cide-agents/prompts/`. Settings →
+Agents → Prompts retains task-start and tracker editors and adds external-work and
+worker-session editors. Overrides are per project, use explicit Save/Reset, and apply to
+future launches (including worker-tab restores). Existing custom prompts are preserved;
+Reset adopts the new defaults. Reset removes all four keys so later shipped defaults remain
+live. Role prompts, runtime question guidance and tool scopes retain their own mechanisms.
+
+Verification: 371 focused configuration/harness/tool tests and 140 app dispatch/session/RPC
+tests passed. The mounted settings editor check covers all four fields, save/reset,
+normalization, draft isolation, errors and late replies. TypeScript, production UI build,
+codegen/contract checks, settings copy/agents, UI kit/scale/motion/theme, casing, demo and
+task-dispatch checks and strict `cide-agents` Clippy passed. Strict app Clippy reports 12 errors in code unchanged from
+the base `3988c9e` (sorting, unit-error results, a large error variant and a collapsible
+match); those files were left intact. No installed-model run or desktop visual audit was
+performed.
+
+Before publication, the full shared `./test.sh` run on macOS completed with 149 passed
+checks and three failed groups: `rust/test`, `rust/clippy`, and
+`ui/check:openspec-performance`. The Rust failures were the process-thaw test, the
+check-timeout test, the Codex configuration-probe test and LSP discovery without an
+installed `rust-analyzer`; the first three passed when repeated individually. Workspace
+Clippy stopped at `xtask/src/package.rs`'s `needless_match` on Rust 1.99.1. The OpenSpec
+check also failed separately at `approval opens the Apply dialog`. Those test surfaces and
+the linted file are unchanged from the base. Full workspace build, codegen and UI build
+passed. Complete logs are under `target/ci-checks/run-aNJpJNRc/` in the publishing checkout.

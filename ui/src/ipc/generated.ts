@@ -7543,6 +7543,14 @@ taskStartPrompt: string,
  */
 workerInstructions: string, 
 /**
+ * Effective opening workflow for work dispatched without a cide task.
+ */
+externalWorkInstructions: string, 
+/**
+ * Effective system brief for ad-hoc worker tabs.
+ */
+workerSessionInstructions: string, 
+/**
  * `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
  * Empty when the project isolates nothing, which is the default. (M92)
  */
@@ -7635,7 +7643,7 @@ reviewPrompt?: string,
 /**
  * Empty resets to the current shipped default. These prompts are edited in Settings.
  */
-taskStartPrompt?: string, workerInstructions?: string, 
+taskStartPrompt?: string, workerInstructions?: string, externalWorkInstructions?: string, workerSessionInstructions?: string, 
 /**
  * `agents.isolateEnv`, whole: the list replaces the file's, and an empty one turns
  * isolation off. `AgentsConfig::apply` drops a name `cide_core::isolated_env::check_var`

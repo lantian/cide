@@ -854,15 +854,20 @@ rotation, and Android Back, from both question options and task attachments.
 
 ### Task dispatch prompts
 
-**Touches:** Settings → Agents → Prompts, `AgentsConfig::{task_start_template,worker_instructions_template}`,
-the shared task opening builder and each harness's tracker preamble.
+**Touches:** Settings → Agents → Prompts, `AgentsConfig::{task_start_template,worker_instructions_template,external_work_instructions_template,worker_session_instructions_template}`,
+`crates/cide-agents/prompts/`, the task/external opening builders, worker-tab system briefs,
+and each harness's tracker and OpenSpec preambles.
 
 Run `check:settings-prompts`, `check:settings-agents`, `check:settings-copy`, TypeScript and
 the UI build; Rust config, harness and dispatch tests; codegen/contract checks and Clippy.
 The mounted editor check covers explicit save/reset, retained drafts, write failures,
 double submission and late replies after a section switch. Rust regressions cover
 single-pass interpolation, harness-specific tool names, preserved OpenSpec/extra context,
-project isolation and reset removing the override keys. Cide's custom tracker rules replace
+project isolation and reset removing all four override keys. Defaults must keep planning-only
+requests free of implementation/build/commit requirements and honor main-session ownership;
+test this in the actual composed harness prompts, task/external openings and worker-tab brief.
+External work overrides are plain text normalized to one terminal line; worker-session
+overrides retain paragraphs and the runtime question guidance. Cide's custom tracker rules replace
 the built-in paragraph without replacing the role prompt or bypassing tool-availability gates.
 
 ### The inbox, milestones and their gates
