@@ -31,6 +31,31 @@ pub fn submitted_body_matches(observed: &str, expected: &str) -> bool {
         || crate::peer_composer::matches_tail(&observed, &expected, 64.min(expected.len()))
 }
 
+/// Automatic terminal notifications must never accept a suffix match: a user's
+/// draft before the notification would otherwise be silently submitted with it.
+pub fn background_body_matches(observed: &str, expected: &str) -> bool {
+    let observed = observed
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::peer_composer::matches_body(&observed, &expected)
+}
+
+/// Idle describes the model, not the input box. A person can be editing a draft
+/// while it is idle; unknown layouts and native permission menus fail closed.
+pub fn background_ready(
+    harness: cide_ipc::Harness,
+    capture: &cide_ipc::screen::ScreenCapture,
+    state: cide_ipc::SessionState,
+) -> bool {
+    matches!(
+        state,
+        cide_ipc::SessionState::Idle | cide_ipc::SessionState::AwaitingInput
+    ) && composer(harness, capture).is_some_and(|body| body.trim().is_empty())
+}
+
 /// Native exporters are read-only helpers, but their output and lifetime still need bounds.
 pub fn run_export(
     mut command: std::process::Command,
@@ -1256,6 +1281,28 @@ mod tests {
     }
 
     #[test]
+    fn background_notification_never_submits_a_draft_prefix() {
+        let notification = "A subagent turn just ended. Check cide_agent_runs.";
+        assert!(background_body_matches(notification, notification));
+        assert!(background_body_matches(
+            "A subagent turn just ended.\n Check cide_agent_runs.",
+            notification
+        ));
+        assert!(background_body_matches(
+            "A subagent turn just ended. Check cide_agent_\nruns.",
+            notification
+        ));
+        assert!(!background_body_matches(
+            &format!("unfinished user prompt {notification}"),
+            notification
+        ));
+        assert!(!background_body_matches(
+            "Check cide_agent_runs.",
+            notification
+        ));
+    }
+
+    #[test]
     fn qwen_composer_reads_only_the_input_and_preserves_desktop_drafts() {
         use cide_ipc::screen::*;
         let screen = |body: &str, row| ScreenCapture {
@@ -1283,6 +1330,49 @@ mod tests {
                 })
                 .collect(),
         };
+        use cide_ipc::{Harness, SessionState};
+        let empty = screen(
+            " ────────────────────\n >   Type your message or @path/to/file\n ────────────────────",
+            1,
+        );
+        for state in [SessionState::Idle, SessionState::AwaitingInput] {
+            assert!(background_ready(Harness::Qwen, &empty, state));
+            for (harness, input) in [
+                (
+                    Harness::Qwen,
+                    " ────────────────────\n > unfinished prompt\n ────────────────────",
+                ),
+                (
+                    Harness::Claude,
+                    "────────────────────\n❯ unfinished prompt\n────────────────────",
+                ),
+                (
+                    Harness::Codex,
+                    "history\n› unfinished prompt\n\n  ? for shortcuts",
+                ),
+                (Harness::Claude, "Approve this tool?\n❯ 1. Yes\n  2. No"),
+            ] {
+                let capture = screen(input, 1);
+                if input.contains("unfinished prompt") {
+                    assert!(
+                        composer(harness, &capture)
+                            .is_some_and(|body| body.contains("unfinished prompt"))
+                    );
+                }
+                assert!(
+                    !background_ready(harness, &capture, state),
+                    "{harness:?}: {input}"
+                );
+            }
+        }
+        for state in [
+            SessionState::Busy,
+            SessionState::Spawning,
+            SessionState::AwaitingPermission,
+            SessionState::Paused,
+        ] {
+            assert!(!background_ready(Harness::Qwen, &empty, state));
+        }
         assert_eq!(composer(cide_ipc::Harness::Qwen, &screen(" ────────────────────\n >   Type your message or @path/to/file\n ────────────────────", 1)).as_deref(), Some(""));
         assert_eq!(
             composer(

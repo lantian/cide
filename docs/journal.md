@@ -19400,6 +19400,46 @@ place, the context menu and its submenus, the rail's two pills meeting at the bu
 whether rows move between Opened and Closed promptly when a tab closes, a turn ends or the reaper
 ends a child. The live cues are reasoned from the events' emit sites, not observed.
 
+## M200 — Subagent notifications leave the user's draft alone
+
+The completion nudge used to append text to the orchestrator's PTY and send a delayed Enter.
+`Idle | AwaitingInput` only describes the agent's turn: a person can already be composing the
+next prompt. The notification therefore submitted that unfinished prompt together with its own
+instructions. The same path was used to notify an existing reviewer.
+
+Both now use `peer_chat::submit_background`. Codex uses the visible conversation's native
+connection and claims an independent turn alongside native user requests. Its bridge is enabled
+for projects with completion nudges even when pairing and Decision are off; native lifecycle
+events are authoritative for those consoles. OpenCode uses its existing conversation API.
+Neither route touches the terminal composer. A terminal-only or older CLI waits for a recognized
+empty composer under the local/phone input gate, verifies the entire notification before Enter,
+and holds drafts and menus for the next ready edge. Manual typing also re-arms held notifications,
+so clearing a draft does not require another model turn. An uncertain submission is surfaced
+without an automatic retry.
+
+**Verified:** `cargo test --locked -p cide-core --lib conversations` (15 passed), the three
+quota-free `real_codex_native` audits against the installed Codex and a local fake provider, and
+`check:peer-chat`, `check:awaiting`, `check:agents`, `check:claude-cli`. The new installed-CLI
+regression starts with a draft, delivers a completion notification, continues typing while the
+notification is running, checks that the model has received none of the draft, and checks that
+only a later user Enter submits the complete draft. Existing native resume, stale receiver and
+conversation-lock audits also pass.
+
+**Shared suite:** the complete `./test.sh` finished with 149 passed and 3 failed groups.
+Rust and UI builds, typecheck, contract, codegen and fork pins passed. `rust/test` failed in
+`a_shutdown_thaws_before_it_signals` and
+`a_check_past_its_limit_is_stopped_with_everything_it_started` during the parallel run (both pass
+in a separate serial repeat), plus `a_project_with_no_marker_does_not_start_a_server` because
+`rust-analyzer` is absent (also fails separately). `rust/clippy` rejects the unchanged
+`xtask/src/package.rs:2970` match as `needless_match` on Rust 1.99.1.
+`check:openspec-performance` fails its unchanged "approval opens the Apply dialog" assertion,
+also in a separate repeat. These failures are outside the changed notification paths. The
+conversation tests were repeated successfully after adding exact visual-wrap matching.
+
+**Not verified in a running Cide window.** The native proof drives the real CLI and inspects its
+terminal capture and fake-provider requests. The terminal-only fallback's draft/menu and exact
+content refusals are covered by domain tests, not a real Claude/OpenCode UI audit.
+
 ## M201 — Ctrl+V attaches a screenshot, everywhere cide said it would
 
 > *"CTRL+v doesn't work, it doesn't paste the image"* — in *Propose an OpenSpec change*, whose

@@ -2430,8 +2430,18 @@ pub(crate) async fn spawn_session(
         None
     };
 
+    // Subagent completion must use native turns even with Decision and pairing off:
+    // typing a notification plus Enter into the TUI also submits the user's draft.
+    let nudge_native = is_codex
+        && project
+            .and_then(|project| {
+                app.try_state::<crate::workspace_state::WorkspaceState>()
+                    .and_then(|ws| crate::tasks_state::project_root(&ws, project).ok())
+            })
+            .is_some_and(|root| cide_agents::config::load(&root).agents.nudge_orchestrator);
     let codex = if is_codex
-        && (native_planning.is_some()
+        && (nudge_native
+            || native_planning.is_some()
             || pair.is_some()
             || crate::decision::configured(&app, project))
     {
@@ -2462,6 +2472,16 @@ pub(crate) async fn spawn_session(
     } else {
         None
     };
+
+    if codex.is_some() {
+        // Native lifecycle is authoritative for these consoles, including ordinary
+        // orchestrators with pairing/Decision off. Do not let terminal scraping
+        // or invocation-local hooks race the independent notification turn.
+        if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
+            hooks.codex_native(id, console.as_ref().and_then(|console| console.thread));
+        }
+        spec.output_observer = None;
+    }
 
     let qwen_events = if is_qwen {
         Some(
