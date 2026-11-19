@@ -382,10 +382,22 @@ script pattern. Once all three are in place, **remove global host locks**, such 
 ## Reports and cost
 
 A run reports **once per turn**. Its preamble tells it not to comment a plan, progress, logs or
-measurements while it works; it commits each coherent step instead, because the branch's commits
-are the record if the run dies. When it stops it leaves **one** report of about ten lines: the
+measurements while it works. The default follows the requested scope and build/commit ownership:
+planning, analysis or consultation alone does not require file edits, builds or commits. If the
+main session owns builds or commits, the worker leaves those to it and reports uncommitted work;
+this is not a workflow conflict. Integration still takes committed branch changes. When a run
+stops it leaves **one** report of about ten lines: the
 result, what changed (paths), how it verified (the command and pass or fail, no pasted output),
 what is left, and anything noticed.
+
+**Settings → Agents → Prompts** exposes four project-level workflow texts: **Task-start
+template**, **Cide worker instructions** (appended to role prompts), **External work
+instructions** (a title and brief without a cide task), and **Worker-session instructions**
+(the system brief of worker tabs). Save applies to future dispatches and worker launches;
+existing sessions keep their current instructions. Worker-tab restoration reads the current
+setting. Empty text or **Reset to defaults** removes the override from `.cide/config.json`.
+Existing custom overrides are preserved, including any old commit rules: edit them or reset
+to adopt the new defaults. Role-authored instructions retain their separate Roles editor.
 
 - A second comment from the same run in the same turn marks its earlier one **superseded**. The
   log stays append-only: nothing is rewritten, the card collapses superseded comments, and an

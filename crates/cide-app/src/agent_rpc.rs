@@ -2109,9 +2109,14 @@ impl AgentSink for RegistrySink {
         // Spelled the way the tab's own CLI presents cide's tools.
         let tools = cide_agents::harness::for_kind(chosen);
         let mut prompt = match (&request.work, task.as_ref()) {
-            (Work::External(work), _) => {
-                crate::cmd::agents::external_prompt(work, request.instructions.as_deref(), tools)
-            }
+            (Work::External(work), _) => crate::cmd::agents::external_prompt(
+                work,
+                request.instructions.as_deref(),
+                tools,
+                cide_agents::config::load(&root)
+                    .agents
+                    .external_work_instructions_template(),
+            ),
             (Work::Change(_), _) => unreachable!("returned above"),
             (Work::Task(_), task) => crate::cmd::agents::opening_prompt(
                 task,

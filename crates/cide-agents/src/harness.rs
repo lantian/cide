@@ -152,7 +152,9 @@ pub const SERVER: &str = "cide";
 /// comments against 1.3 MB of game code, most of it progress notes, pasted test output and
 /// measurements that nobody read and every later `cide_task_get` re-sent. Liveness is the
 /// registry's job (the run row, its state), and the durable record a death cannot erase is the
-/// branch's commits — P4's checkpoint discipline survives as "commit each step". The report is
+/// branch's commits when implementation and worker-owned commits are authorized. P4's old
+/// unconditional checkpoint sentence caused planning tasks to demand commits; the shipped
+/// workflow now follows the task's scope and commit ownership instead. The report is
 /// one comment with a fixed shape and a length cap (`agents.commentLimit`, enforced by the tool),
 /// and a second comment in the same turn supersedes the first. The done-workflow half stays:
 /// finish → review + comment, and `done` belongs to whoever reviews — or to the user, for a task
@@ -164,21 +166,7 @@ pub const SERVER: &str = "cide";
 /// `question` asking whether it might edit it, and the task sat waiting for the user. The field
 /// exists for the scheduler (`cide_app::agents`' path gate), and a run widening its own claim
 /// is exactly what the gate wants to hear about — so it is told to do that and go on.
-pub const TRACKER_PREAMBLE: &str = "Tasks live in .cide/tasks.json; cide is its only writer, so \
-     direct edits are refused. Read with {cide_task_get} and {cide_task_list}; update fields \
-     with {cide_task_update}, comment with {cide_task_comment}, assign with {cide_task_assign}, \
-     create with {cide_task_create}. Comments report back: do not post plans, progress, logs or \
-     measurements while working. Commit coherent steps; integration takes branch commits. The \
-     task body may skip optional commands such as builds. If it forbids commits, report the \
-     conflict before editing. When done, blocked or out of time, leave one short comment (at \
-     most ten lines): result, changed paths, verification command and result, remaining work, \
-     and findings. A later comment supersedes it. Ask with {cide_user_request}; it waits by \
-     default. Use wait=false only for independent work. Reconnect with \
-     {cide_user_request_result}; timeout or cancellation is not approval. Propose inbox moves \
-     with kind=moveTasks. For visual approval set status to review; never ask both. Done is the \
-     reviewer’s or user’s call. Touches schedules parallel work, not permission: add needed \
-     paths with {cide_task_update}. Something wrong that is not this task: do not fix it here; \
-     create an inbox task with {cide_task_create} or name it in your report.";
+pub const TRACKER_PREAMBLE: &str = include_str!("../prompts/worker-instructions.txt");
 
 /// Every tracker tool cide's prose is allowed to name.
 ///
@@ -281,10 +269,10 @@ pub fn fill_tools(text: &str, harness: &dyn Harness) -> String {
 /// The template holds `{CHANGE}`, `{OPENSPEC}` and one tracker tool placeholder;
 /// [`spec_preamble`] fills all three.
 pub const SPEC_PREAMBLE: &str = concat!(
-    "This task implements the OpenSpec change {CHANGE}, whose proposal, design, task checklist and delta specs are in openspec/changes/{CHANGE}/. ",
+    "This task concerns the OpenSpec change {CHANGE}, whose proposal, design, task checklist and delta specs are in openspec/changes/{CHANGE}/. Follow the task's requested scope. ",
     "Before your first edit, run `{OPENSPEC} instructions apply --change {CHANGE} --json` from the repository root: it answers with that change's context files, its schema's own apply instruction, and the checklist as data — that list is the work, in that order, and it outranks any summary of it including this one. ",
-    "Tick each box off in its file as you finish that step, and commit as you go, so the checklist always says how far you got. ",
-    "If implementing shows you that the proposal, the design or a delta spec was wrong, correct that file in the same commit — a spec that no longer describes the code is worse than no spec. ",
+    "Follow the task's requested scope and build/commit ownership. A planning-only task returns its plan without implementing this checklist. For authorized implementation, tick each completed box in its file; the session responsible for commits commits the changes. ",
+    "If authorized implementation shows that the proposal, design or a delta spec was wrong, correct that file alongside the code. ",
     "When every box is ticked, set the task's status to review with {cide_task_update} and comment what you did. ",
     "Never run `{OPENSPEC} archive`: archiving merges the deltas into openspec/specs/, and that is the reviewer's call once your branch has been integrated.",
 );
@@ -301,7 +289,7 @@ pub const SPEC_PREAMBLE: &str = concat!(
 ///
 /// `{APPLY}` is the resolved line, never a name — see [`RunPlan::spec_apply`].
 const SPEC_APPLY_CLAUSE: &str = concat!(
-    " This project installs OpenSpec's own apply workflow as {APPLY}: run it and follow what it says, ",
+    " If implementation is requested, this project installs OpenSpec's own apply workflow as {APPLY}: run it and follow what it says, ",
     "in preference to the paragraph above, which is cide's summary of the same thing.",
 );
 
@@ -384,9 +372,9 @@ pub fn spec_session_brief(
         SpecOp::Apply => {
             let change = change.unwrap_or("the change named in your first message");
             let place = if in_worktree {
-                "You are in a git worktree of your own, on its own branch: commit each coherent \
-                 step as you finish it — the user publishes or integrates this branch when the \
-                 change is done, and an uncommitted edit is one they do not see."
+                "You are in a git worktree of your own, on its own branch. Follow the user's \
+                 build/commit ownership; report uncommitted changes to the session that owns \
+                 committing and integration."
             } else {
                 "You are in the project's own checked-out tree, which the user works in too: do \
                  not commit, stage, stash, checkout or reset unless they ask — leave your edits in \
@@ -414,9 +402,9 @@ pub fn spec_session_brief(
 ///
 /// # It exists to countermand one sentence of the paragraph above it
 ///
-/// `TRACKER_PREAMBLE` tells every run to comment its plan on the task, to *commit each coherent
-/// step of the work*, and to set the task to review — three instructions about a task the run
-/// does not have, and one of them dangerous: a task-less run stands in the **project root**
+/// `TRACKER_PREAMBLE` historically asked every run to comment a plan and commit each step.
+/// Today's default follows task scope, but a project can replace it with its own workflow.
+/// An ad-hoc run still needs the explicit shared-tree restriction: it stands in the **project root**
 /// (`crate::run_checkout`'s rule), which is the tree the user is working in, and a run that
 /// committed "each coherent step" there would be committing onto the user's branch beside their
 /// own uncommitted changes. So this says, in the same durable position, what such a run may not
@@ -431,7 +419,7 @@ pub fn spec_session_brief(
 /// old by the time the work is done; the commit rule this overrides rides the system prompt, so
 /// the override has to sit where the rule does. It names no tool, so it needs no namespacing test
 /// — `the_adhoc_preamble_stays_within_its_budget_and_names_no_tool` pins that as well as the size.
-pub const ADHOC_PREAMBLE: &str = "This run was dispatched with no task on the board. Do only what the opening instruction asks. The directory you started in is the project's own checked-out tree, which the user is working in too — not a worktree of your own — so the paragraph above about committing each step does not apply here: do not commit, stage, stash, checkout, reset or otherwise move HEAD or the index unless the instruction explicitly asks for a commit, and leave your edits in the working tree for the user to read. Do not open a task or comment on one for this work. Whoever dispatched you reads the tree and your pane, so finish by saying plainly what you did or found.";
+pub const ADHOC_PREAMBLE: &str = "This run was dispatched with no task on the board. Do only what the opening instruction asks. The directory you started in is the project's own checked-out tree, which the user is working in too — not a worktree of your own — do not commit, stage, stash, checkout, reset or otherwise move HEAD or the index unless the instruction explicitly asks for a commit, and leave your edits in the working tree for the user to read. Do not open a task or comment on one for this work. Whoever dispatched you reads the tree and your pane, so finish by saying plainly what you did or found.";
 
 /// Everything one implementation of a CLI has to answer.
 ///
@@ -2017,6 +2005,35 @@ mod tests {
             told_by_codex.contains("mcp__cide__cide_task_get"),
             "{told_by_codex}"
         );
+    }
+
+    #[test]
+    fn default_worker_workflow_respects_planning_and_commit_ownership_on_every_harness() {
+        let (claude, opencode, codex) = told_by_all(Some(&TaskId("t-plan".into())), None);
+        for text in [claude, opencode, codex] {
+            assert!(text.contains("Planning, analysis or consultation alone requires no file edits, builds or commits"), "{text}");
+            assert!(text.contains("this is not a workflow conflict"), "{text}");
+            assert!(!text.contains("commit each coherent step"), "{text}");
+            assert!(!text.contains("If it forbids commits"), "{text}");
+        }
+        let spec = spec_preamble(
+            "plan-first",
+            None,
+            Some("/openspec-apply-change"),
+            &ClaudeHarness,
+        );
+        assert!(spec.contains("planning-only task returns its plan without implementing"));
+        assert!(spec.contains("If implementation is requested"));
+        assert!(!spec.contains("commit as you go"));
+        let apply = spec_session_brief(
+            cide_ipc::SpecOp::Apply,
+            Some("plan-first"),
+            None,
+            None,
+            true,
+        );
+        assert!(apply.contains("build/commit ownership"));
+        assert!(!apply.contains("commit each coherent step"));
     }
 
     #[test]

@@ -144,6 +144,8 @@ export const SETTINGS_INDEX: readonly SettingsHit[] = [
   // --- Agents ---
   { section: 'agents', tab: 'prompts', label: 'Task-start template', keywords: 'task prompt dispatch template plan first message startup' },
   { section: 'agents', tab: 'prompts', label: 'Cide worker instructions', keywords: 'worker instructions prompt tracker rules system progress comments' },
+  { section: 'agents', tab: 'prompts', label: 'External work instructions', keywords: 'external task brief prompt plan build commit ownership scope' },
+  { section: 'agents', tab: 'prompts', label: 'Worker-session instructions', keywords: 'worker session tab prompt plan build commit ownership scope' },
   // Agents — This project
   { section: 'agents', tab: 'project', label: 'Task tracker & milestones', keywords: 'board tasks milestones openspec config.json tracker' },
   { section: 'agents', tab: 'project', label: 'Allow agents to open harness tabs', keywords: 'session ad hoc new tab harness parallel agentSessions config.json' },

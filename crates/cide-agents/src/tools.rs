@@ -5182,9 +5182,14 @@ fn render_definition(draft: &AgentDraft) -> String {
 
 /// Patch `.cide/config.json`'s two settable keys. (M71)
 fn agents_config(arguments: &Value, sink: &dyn AgentSink) -> ToolResult {
-    if ["taskStartPrompt", "workerInstructions"]
-        .iter()
-        .any(|key| arguments.get(*key).is_some())
+    if [
+        "taskStartPrompt",
+        "workerInstructions",
+        "externalWorkInstructions",
+        "workerSessionInstructions",
+    ]
+    .iter()
+    .any(|key| arguments.get(*key).is_some())
     {
         return ToolResult::error(
             "Dispatch prompts are edited in Settings → Agents → Prompts. Nothing was written.",
@@ -9057,7 +9062,12 @@ mod tests {
     #[test]
     fn dispatch_prompt_edits_are_ui_only_and_cannot_partially_patch_the_config() {
         let sink = roster();
-        for field in ["taskStartPrompt", "workerInstructions"] {
+        for field in [
+            "taskStartPrompt",
+            "workerInstructions",
+            "externalWorkInstructions",
+            "workerSessionInstructions",
+        ] {
             let mut arguments = json!({ "maxConcurrent": 9 });
             arguments[field] = json!("New workflow");
             let answer = ask(tool::AGENTS_CONFIG, arguments, &sink);
