@@ -349,14 +349,16 @@ pub fn fill_prompt(template: &str, values: &[(&str, &str)]) -> String {
 }
 
 /// The task's opening message. Kept here so Settings and every dispatch path use one default.
-pub const DEFAULT_TASK_START_PROMPT: &str = "Work on task {task_id} ({task_title}). Read it with \
-    {cide_task_get}, and record what you do with the {cide_task_*} tools rather than by editing \
-    the tracker file; commit each coherent step as you go — your branch is the record that \
-    survives if this run dies and is what integration merges. Follow the task body for optional \
-    commands such as builds; if it forbids commits, report the workflow conflict before editing. \
-    do not comment while you work. When the work is complete, \
-    set the task's status to review with {cide_task_update} and leave one short comment saying \
-    what you did and where.";
+pub const DEFAULT_TASK_START_PROMPT: &str = include_str!("../prompts/task-start.txt");
+
+/// Work without a cide task still needs an editable scope/hand-back policy. Its title,
+/// brief and reference are runtime facts added separately, never interpreted as templates.
+pub const DEFAULT_EXTERNAL_WORK_INSTRUCTIONS: &str =
+    include_str!("../prompts/external-work-instructions.txt");
+
+/// The system brief of an ad-hoc worker tab, independent of role tracker rules.
+pub const DEFAULT_WORKER_SESSION_INSTRUCTIONS: &str =
+    include_str!("../prompts/worker-session-instructions.txt");
 
 /// What [`AgentsConfig::permission_mode`] may say. Checked in order by nothing; listed for the
 /// sentence a bad value produces.
@@ -629,6 +631,12 @@ pub struct AgentsConfig {
     /// Replaces cide's tracker instructions, independently of the role's own system prompt.
     #[serde(skip_serializing_if = "is_default_worker_instructions")]
     pub worker_instructions: String,
+    /// Opening workflow for a dispatch with title/brief instead of a cide task.
+    #[serde(skip_serializing_if = "is_default_external_work_instructions")]
+    pub external_work_instructions: String,
+    /// System brief for worker tabs opened with cide_session_open.
+    #[serde(skip_serializing_if = "is_default_worker_session_instructions")]
+    pub worker_session_instructions: String,
     /// Which of `cide_core::isolated_env::VARS` (`XDG_DATA_HOME`, `XDG_CACHE_HOME`,
     /// `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `TMPDIR`) every worktree gets its own copy of, for
     /// its run and for the verify of its branch alike.
@@ -755,6 +763,12 @@ fn is_default_task_start_prompt(prompt: &String) -> bool {
 fn is_default_worker_instructions(prompt: &String) -> bool {
     prompt.trim().is_empty() || prompt == crate::harness::TRACKER_PREAMBLE
 }
+fn is_default_external_work_instructions(prompt: &String) -> bool {
+    prompt.trim().is_empty() || prompt == DEFAULT_EXTERNAL_WORK_INSTRUCTIONS
+}
+fn is_default_worker_session_instructions(prompt: &String) -> bool {
+    prompt.trim().is_empty() || prompt == DEFAULT_WORKER_SESSION_INSTRUCTIONS
+}
 fn is_default_batch_review_prompt(prompt: &String) -> bool {
     prompt.trim().is_empty() || prompt == DEFAULT_BATCH_REVIEW_PROMPT
 }
@@ -843,6 +857,8 @@ impl Default for AgentsConfig {
             review_prompt: DEFAULT_REVIEW_PROMPT.to_string(),
             task_start_prompt: String::new(),
             worker_instructions: String::new(),
+            external_work_instructions: String::new(),
+            worker_session_instructions: String::new(),
             isolate_env: Vec::new(),
             isolate_env_share: Vec::new(),
             verify_exclusive: false,
@@ -866,6 +882,25 @@ impl AgentsConfig {
             DEFAULT_TASK_START_PROMPT
         } else {
             &self.task_start_prompt
+        }
+    }
+
+    /// An empty project override follows the shipped external-work workflow.
+    #[must_use]
+    pub fn external_work_instructions_template(&self) -> &str {
+        if self.external_work_instructions.trim().is_empty() {
+            DEFAULT_EXTERNAL_WORK_INSTRUCTIONS
+        } else {
+            &self.external_work_instructions
+        }
+    }
+
+    #[must_use]
+    pub fn worker_session_instructions_template(&self) -> &str {
+        if self.worker_session_instructions.trim().is_empty() {
+            DEFAULT_WORKER_SESSION_INSTRUCTIONS
+        } else {
+            &self.worker_session_instructions
         }
     }
 
@@ -992,6 +1027,8 @@ impl AgentsConfig {
             review_prompt: self.review_prompt.clone(),
             task_start_prompt: self.task_start_template().to_string(),
             worker_instructions: self.worker_instructions_template().to_string(),
+            external_work_instructions: self.external_work_instructions_template().to_string(),
+            worker_session_instructions: self.worker_session_instructions_template().to_string(),
             isolate_env: self.isolate_env.clone(),
             isolate_env_share: self.isolate_env_share.clone(),
             verify_exclusive: self.verify_exclusive,
@@ -1063,6 +1100,14 @@ impl AgentsConfig {
         }
         if let Some(prompt) = patch.task_start_prompt {
             self.task_start_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        if let Some(prompt) = patch.external_work_instructions {
+            // This is part of the opening line, so the terminal must see one Enter only.
+            self.external_work_instructions =
+                prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        if let Some(prompt) = patch.worker_session_instructions {
+            self.worker_session_instructions = prompt.trim().to_string();
         }
         if let Some(prompt) = patch.worker_instructions {
             // System instructions are not typed into the terminal; their paragraphs can stay.
@@ -1469,6 +1514,8 @@ const CLEARED_WHEN_EMPTY: &[&str] = &[
     "reviewPrompt",
     "taskStartPrompt",
     "workerInstructions",
+    "externalWorkInstructions",
+    "workerSessionInstructions",
     "batchReviewPrompt",
 ];
 
@@ -1586,18 +1633,48 @@ mod tests {
         let defaults = wire_for(&root);
         assert_eq!(defaults.task_start_prompt, DEFAULT_TASK_START_PROMPT);
         assert_eq!(
+            defaults.external_work_instructions,
+            DEFAULT_EXTERNAL_WORK_INSTRUCTIONS
+        );
+        assert_eq!(
+            defaults.worker_session_instructions,
+            DEFAULT_WORKER_SESSION_INSTRUCTIONS
+        );
+        assert_eq!(
             defaults.worker_instructions,
             crate::harness::TRACKER_PREAMBLE
         );
 
         let mut config = load(&root);
         config.agents.apply(OrchestrationPatch {
+            external_work_instructions: Some(
+                "Plan only.\n  Leave commits to the main session.".into(),
+            ),
+            worker_session_instructions: Some(
+                "  Return the analysis.\n\nDo not edit files.  ".into(),
+            ),
             task_start_prompt: Some("Implement {task_id}\n  called {task_title}".into()),
             worker_instructions: Some("  Custom rules.\n\nUse {cide_task_comment}.  ".into()),
             ..Default::default()
         });
         write(&root, &config).unwrap();
         let saved = wire_for(&root);
+        assert_eq!(
+            saved.external_work_instructions,
+            "Plan only. Leave commits to the main session."
+        );
+        assert_eq!(
+            saved.worker_session_instructions,
+            "Return the analysis.\n\nDo not edit files."
+        );
+        assert_eq!(
+            wire_for(&other).external_work_instructions,
+            DEFAULT_EXTERNAL_WORK_INSTRUCTIONS
+        );
+        assert_eq!(
+            wire_for(&other).worker_session_instructions,
+            DEFAULT_WORKER_SESSION_INSTRUCTIONS
+        );
         assert_eq!(
             saved.task_start_prompt,
             "Implement {task_id} called {task_title}"
@@ -1616,14 +1693,21 @@ mod tests {
         );
         assert!(!saved.enabled, "saving prompts does not enable agents");
 
-        for (task, worker) in [
-            (" \n", "\t"),
-            (DEFAULT_TASK_START_PROMPT, crate::harness::TRACKER_PREAMBLE),
+        for (task, worker, external, session) in [
+            (" \n", "\t", " \n", "\t"),
+            (
+                DEFAULT_TASK_START_PROMPT,
+                crate::harness::TRACKER_PREAMBLE,
+                DEFAULT_EXTERNAL_WORK_INSTRUCTIONS,
+                DEFAULT_WORKER_SESSION_INSTRUCTIONS,
+            ),
         ] {
             let mut config = load(&root);
             config.agents.apply(OrchestrationPatch {
                 task_start_prompt: Some(task.into()),
                 worker_instructions: Some(worker.into()),
+                external_work_instructions: Some(external.into()),
+                worker_session_instructions: Some(session.into()),
                 ..Default::default()
             });
             write(&root, &config).unwrap();
@@ -1631,6 +1715,16 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(config_path(&root)).unwrap()).unwrap();
             assert!(doc["agents"].get("taskStartPrompt").is_none());
             assert!(doc["agents"].get("workerInstructions").is_none());
+            assert!(doc["agents"].get("externalWorkInstructions").is_none());
+            assert!(doc["agents"].get("workerSessionInstructions").is_none());
+            assert_eq!(
+                wire_for(&root).external_work_instructions,
+                defaults.external_work_instructions
+            );
+            assert_eq!(
+                wire_for(&root).worker_session_instructions,
+                defaults.worker_session_instructions
+            );
             assert_eq!(doc["agents"]["futureAgentKey"], 17);
             assert_eq!(doc["futureKey"], "keep");
             assert_eq!(
@@ -2334,6 +2428,8 @@ mod tests {
             review_prompt: "review {task_id}".into(),
             task_start_prompt: String::new(),
             worker_instructions: String::new(),
+            external_work_instructions: String::new(),
+            worker_session_instructions: String::new(),
             isolate_env: vec!["XDG_DATA_HOME".into()],
             isolate_env_share: vec!["gh".into()],
             verify_exclusive: true,

@@ -75,6 +75,17 @@ pub(crate) fn submit_mobile(
         }
     }
     let _release = Release(&lane);
+    submit_terminal(app, session, pty, harness, text, false)
+}
+
+fn submit_terminal(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &PtySession,
+    harness: cide_ipc::Harness,
+    text: &str,
+    exact: bool,
+) -> Result<(), String> {
     let capture = pty.capture_screen();
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if text.contains('\n') && !capture.info.bracketed_paste {
@@ -96,9 +107,13 @@ pub(crate) fn submit_mobile(
         ) {
             return Err("Submission is uncertain because the session changed state. Check Terminal before resending.".into());
         }
-        if cide_core::conversations::composer(harness, &pty.capture_screen())
-            .is_some_and(|body| cide_core::conversations::submitted_body_matches(&body, &text))
-        {
+        if cide_core::conversations::composer(harness, &pty.capture_screen()).is_some_and(|body| {
+            if exact {
+                cide_core::conversations::background_body_matches(&body, &text)
+            } else {
+                cide_core::conversations::submitted_body_matches(&body, &text)
+            }
+        }) {
             break;
         }
         if Instant::now() >= deadline {
@@ -111,6 +126,75 @@ pub(crate) fn submit_mobile(
     }
     pty.write(vec![b'\r']);
     Ok(())
+}
+
+/// Deliver an automatic notification without submitting a person's draft. `false`
+/// means nothing was sent and the caller may hold it for the next ready edge. An
+/// error after submission is uncertain and must never be retried automatically.
+pub(crate) fn submit_background(
+    app: &AppHandle,
+    session: SessionId,
+    pty: &PtySession,
+    line: String,
+) -> Result<bool, (bool, String)> {
+    let runtime = app.state::<Runtime>();
+    if let Some(console) = runtime.codex_console(session) {
+        let pinned = app.clone();
+        return console.background_prompt(
+            line,
+            Box::new(move || {
+                let sessions = pinned.state::<SessionRegistry>();
+                if sessions.get(session).is_some_and(|pty| !pty.has_exited()) {
+                    Ok(())
+                } else {
+                    Err("The notification's session closed".into())
+                }
+            }),
+        );
+    }
+    let opencode = runtime.worker_console(session).or_else(|| {
+        crate::sessions_state::handle(app)?
+            .conversations
+            .consoles
+            .get(&session)
+            .map(|console| console.clone())
+    });
+    if let Some(console) = opencode {
+        if !console.peer_ready().map_err(|error| (false, error))? {
+            return Ok(false);
+        }
+        return console
+            .peer_prompt(&line)
+            .map(|()| true)
+            .map_err(|error| (true, error));
+    }
+    // Older CLIs and terminal-only harnesses have no out-of-band channel. Claim
+    // the same lane as local/phone typing, then inspect the live composer while
+    // holding it. Idle alone says nothing about an unfinished user prompt. Never
+    // clear, stash, append to or press Enter on that prompt on the user's behalf.
+    native_input(app, session, || {
+        let Some(harness) = app.state::<SessionRegistry>().harness_of(session) else {
+            return Ok(Ok(false));
+        };
+        let state = app
+            .try_state::<crate::hooks::HookServer>()
+            .map(|hooks| hooks.state(session))
+            .unwrap_or(cide_ipc::SessionState::Spawning);
+        let recent_input = runtime
+            .lane(session)
+            .lock()
+            .last_manual_write
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(250));
+        if recent_input
+            || !cide_core::conversations::background_ready(harness, &pty.capture_screen(), state)
+        {
+            return Ok(Ok(false));
+        }
+        Ok(submit_terminal(app, session, pty, harness, &line, true)
+            .map(|()| true)
+            .map_err(|error| (true, error)))
+    })
+    .map_err(|error| (false, error))?
 }
 
 #[derive(Default)]
@@ -130,6 +214,7 @@ struct Lane {
     queue: VecDeque<Message>,
     running: bool,
     writing: bool,
+    last_manual_write: Option<Instant>,
     generation: u64,
 }
 struct Message {
@@ -259,14 +344,21 @@ impl Runtime {
         data: Vec<u8>,
     ) -> Result<(), String> {
         let lane = self.lane(session);
-        let guard = lane.lock();
+        let mut guard = lane.lock();
         if guard.writing {
             return Err("A message is being delivered; input is briefly suspended. Please type again when delivery finishes.".into());
         }
         if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
             hooks.note_codex_input(session, &data, pty);
         }
+        guard.last_manual_write = Some(Instant::now());
         pty.write(data);
+        drop(guard);
+        // Clearing a held draft need not start a model turn, so it owes its own
+        // re-arm. The coalescer waits out the typing burst before checking again.
+        if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
+            crate::agent_rpc::note_session_ready(app, hooks.state(session));
+        }
         Ok(())
     }
 }

@@ -750,6 +750,10 @@ pub struct OrchestrationConfig {
     pub task_start_prompt: String,
     /// Effective cide tracker instructions; separate from a role's own system prompt.
     pub worker_instructions: String,
+    /// Effective opening workflow for work dispatched without a cide task.
+    pub external_work_instructions: String,
+    /// Effective system brief for ad-hoc worker tabs.
+    pub worker_session_instructions: String,
     /// `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
     /// Empty when the project isolates nothing, which is the default. (M92)
     pub isolate_env: Vec<String>,
@@ -813,6 +817,8 @@ impl Default for OrchestrationConfig {
             review_prompt: String::new(),
             task_start_prompt: String::new(),
             worker_instructions: String::new(),
+            external_work_instructions: String::new(),
+            worker_session_instructions: String::new(),
             isolate_env: Vec::new(),
             isolate_env_share: Vec::new(),
             verify_exclusive: false,
@@ -870,6 +876,10 @@ pub struct OrchestrationPatch {
     pub task_start_prompt: Option<String>,
     #[ts(optional)]
     pub worker_instructions: Option<String>,
+    #[ts(optional)]
+    pub external_work_instructions: Option<String>,
+    #[ts(optional)]
+    pub worker_session_instructions: Option<String>,
     /// `agents.isolateEnv`, whole: the list replaces the file's, and an empty one turns
     /// isolation off. `AgentsConfig::apply` drops a name `cide_core::isolated_env::check_var`
     /// refuses; the `cide_agents_config` tool refuses it first, with the sentence. (M92)

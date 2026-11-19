@@ -95,6 +95,14 @@ taskStartPrompt: string,
  */
 workerInstructions: string, 
 /**
+ * Effective opening workflow for work dispatched without a cide task.
+ */
+externalWorkInstructions: string, 
+/**
+ * Effective system brief for ad-hoc worker tabs.
+ */
+workerSessionInstructions: string, 
+/**
  * `agents.isolateEnv`: which per-user directories each worktree gets its own copy of.
  * Empty when the project isolates nothing, which is the default. (M92)
  */

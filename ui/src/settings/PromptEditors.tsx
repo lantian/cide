@@ -8,7 +8,7 @@ import { InfoPara } from '@/kit/components/InfoTip'
 import { Group } from './controls'
 import styles from './PromptEditors.module.css'
 
-type Prompts = Pick<OrchestrationConfig, 'taskStartPrompt' | 'workerInstructions'>
+type Prompts = Pick<OrchestrationConfig, 'taskStartPrompt' | 'workerInstructions' | 'externalWorkInstructions' | 'workerSessionInstructions'>
 type Draft = Partial<Prompts>
 
 // Switching Settings sections unmounts the form. Keep only unsaved writing, per project,
@@ -31,8 +31,11 @@ export function PromptEditors({
   const [error, setError] = useState<string | null>(null)
   const taskStartPrompt = draft.taskStartPrompt ?? config.taskStartPrompt
   const workerInstructions = draft.workerInstructions ?? config.workerInstructions
+  const externalWorkInstructions = draft.externalWorkInstructions ?? config.externalWorkInstructions
+  const workerSessionInstructions = draft.workerSessionInstructions ?? config.workerSessionInstructions
   const dirty =
-    taskStartPrompt !== config.taskStartPrompt || workerInstructions !== config.workerInstructions
+    taskStartPrompt !== config.taskStartPrompt || workerInstructions !== config.workerInstructions ||
+    externalWorkInstructions !== config.externalWorkInstructions || workerSessionInstructions !== config.workerSessionInstructions
 
   function edit(field: keyof Prompts, text: string) {
     const next = { ...draft, [field]: text }
@@ -52,8 +55,8 @@ export function PromptEditors({
     try {
       await save(
         reset
-          ? { taskStartPrompt: '', workerInstructions: '' }
-          : { taskStartPrompt, workerInstructions },
+          ? { taskStartPrompt: '', workerInstructions: '', externalWorkInstructions: '', workerSessionInstructions: '' }
+          : { taskStartPrompt, workerInstructions, externalWorkInstructions, workerSessionInstructions },
       )
       // An older save can finish after a section switch and a new edit. It must not erase
       // that newer cached draft, even though the component making this call has unmounted.
@@ -75,7 +78,7 @@ export function PromptEditors({
       </InfoPara>
       <InfoPara>
         The task-start template supports <code>{'{task_id}'}</code> and{' '}
-        <code>{'{task_title}'}</code>. Both editors support these tool placeholders, filled
+        <code>{'{task_title}'}</code>. Task-start and Cide worker instructions support these tool placeholders, filled
         with the names used by the chosen harness:{' '}
         {['cide_task_get', 'cide_task_list', 'cide_task_update', 'cide_task_comment',
           'cide_task_assign', 'cide_task_create', 'cide_task_*', 'cide_user_request',
@@ -87,7 +90,10 @@ export function PromptEditors({
       </InfoPara>
       <InfoPara>
         Cide worker instructions replace the tracker rules appended to a role’s prompt.
-        Worker tabs keep their own system instructions. Empty text uses cide’s default.
+        Worker-session instructions control the system brief of worker tabs. External work
+        instructions follow the title and brief for work outside the cide board. These two
+        fields are plain text. Defaults follow the requested scope and build/commit ownership;
+        planning alone does not request edits, builds or commits. Empty text uses cide’s default.
         Unsaved edits survive Settings tab switches until this window closes.
       </InfoPara>
     </>}>
@@ -115,6 +121,32 @@ export function PromptEditors({
               spellCheck={false}
               disabled={busy}
               onChange={(event) => edit('workerInstructions', event.target.value)}
+            />}
+          </Field>
+        </div>
+        <div data-setting="External work instructions">
+          <Field label="External work instructions" hint="Workflow for a title and brief outside the board. Line breaks become spaces.">
+            {({ id, describedBy }) => <Textarea
+              id={id}
+              aria-describedby={describedBy}
+              value={externalWorkInstructions}
+              rows={8}
+              spellCheck={false}
+              disabled={busy}
+              onChange={(event) => edit('externalWorkInstructions', event.target.value)}
+            />}
+          </Field>
+        </div>
+        <div data-setting="Worker-session instructions">
+          <Field label="Worker-session instructions" hint="System brief for new or restored worker tabs opened by an orchestrator.">
+            {({ id, describedBy }) => <Textarea
+              id={id}
+              aria-describedby={describedBy}
+              value={workerSessionInstructions}
+              rows={10}
+              spellCheck={false}
+              disabled={busy}
+              onChange={(event) => edit('workerSessionInstructions', event.target.value)}
             />}
           </Field>
         </div>
