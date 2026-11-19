@@ -58,7 +58,7 @@
 import { useMemo, useRef, type ReactNode } from 'react'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import { useWindowChrome } from '@/chrome/WindowFrame'
-import { PANE_KINDS } from '@/chrome/RowControls'
+import { PANE_KINDS } from '@/chrome/SplitMenu'
 import {
   windows as windowApi,
   windowLabel,
@@ -102,7 +102,7 @@ function inDetachedPaneWindow(): boolean {
  *
  * `pane_split` is addressed by project **and** tab **and** pane, and the frame is handed only
  * the last of the three — so the two other thirds are looked up rather than threaded down. A
- * walk of the snapshot rather than a prop for the same reason `RowControls` re-reads
+ * walk of the snapshot rather than a prop for the same reason `SplitMenu` re-reads
  * `rowTarget` at click time instead of taking one: the alternative is two more props on this
  * component and at both call sites in `App.tsx` and `DetachedPaneWindow.tsx`, which is the
  * exact arrangement this file's own header blames for three controls being wired to nothing.
@@ -197,7 +197,9 @@ export interface PaneFrameProps {
    */
   onMove?: ((outcome: MoveOutcome) => void) | undefined
   /**
-   * Draw no pane controls in the corner — a **file** tab's pane.
+   * Draw no pane controls in the corner — a **file** tab's *only* pane. `App.tsx` stops passing
+   * it once the tab is split: the new pane has no × of its own, and a tab with two panes needs
+   * the pane-scoped close on both.
    *
    * Asked for by name: on an open file the cluster only repeated the header's split and detach
    * and the tab strip's ×, and it floated over the top line of the code the user was reading.
@@ -381,7 +383,7 @@ export function PaneFrame({
    * `⊞` used to add whichever pane the domain felt like.
    *
    * The report: "'Add a pane to this row' — should have a dropdown to select — claude or bash".
-   * The header already asks that question with two labelled buttons (`chrome/RowControls.tsx`),
+   * The header already asks that question with split menu (`chrome/SplitMenu.tsx`),
    * and the two kinds below come from that file so the two surfaces cannot drift.
    *
    * **A menu under one button, not two buttons**, and that is the whole of the interaction

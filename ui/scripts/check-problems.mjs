@@ -537,8 +537,8 @@ try {
 
   const header = read('src/chrome/AppHeader.tsx')
   ok(
-    header.includes('disabled={onSplit === undefined}'),
-    'the header’s ⊞ is disabled when no host can split, rather than enabled and inert',
+    read('src/chrome/SplitMenu.tsx').includes('disabled={reason !== null && !onAddRow}'),
+    'the header’s split icon is disabled when nothing can split, rather than enabled and inert',
   )
   ok(
     header.includes('disabled={onDetach === undefined}'),

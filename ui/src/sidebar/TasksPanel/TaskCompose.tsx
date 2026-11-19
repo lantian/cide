@@ -518,7 +518,7 @@ export function TaskCompose({
                 // A screenshot pasted into the body is staged for the create — there is no task
                 // to attach it to yet — and shown as a chip below. (M39)
                 if (onStageClipboard === undefined) return
-                if (!wantsImagePaste([...event.clipboardData.types])) return
+                if (!wantsImagePaste(event.clipboardData)) return
                 event.preventDefault()
                 void onStageClipboard().then((staged) => {
                   if (staged !== null) {

@@ -30,7 +30,6 @@ export const ICON_PATHS = {
   'bold': 'M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8',
   'book-open-text': 'M12 5v16M16 13h2M16 9h2M20.001 19A2 2 0 0022 17V5a2 2 0 00-1.999-2L16 3.002A5 5 0 0012 5a5 5 0 00-4-2H4a2 2 0 00-2 2v12a2 2 0 001.999 2H8a5 5 0 014 2 5 5 0 014-2zM6 13h2M6 9h2',
   'case-sensitive': 'M2 16l4.039-9.69a.5.5 0 0 1 .923 0L11 16M22 9v7M3.304 13h6.392M15 12.5a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0 -7 0Z',  // from path + circle
-  'zap': 'm13 2-10 12h8l-1 8 11-12h-8V2Z',
   'check': 'M20 6 9 17l-5-5',
   'chevron-down': 'M6 9l6 6 6-6',
   'chevron-first': 'M17 18l-6-6 6-6M7 6v12',
@@ -62,6 +61,7 @@ export const ICON_PATHS = {
   'file-diff': 'M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2zM9 10h6M12 13V7M9 17h6',
   'file-text': 'M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2zM14 2v5a1 1 0 0 0 1 1h5M10 9H8M16 13H8M16 17H8',
   'folder': 'M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z',
+  'folder-plus': 'M12 10v6M9 13h6M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z',
   'git-branch': 'M15 6a9 9 0 0 0-9 9V3M15 6a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM3 18a3 3 0 1 0 6 0a3 3 0 1 0 -6 0Z',  // from path + circle
   'git-commit-horizontal': 'M9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM3 12L9 12M15 12L21 12',  // from circle + line
   'git-merge': 'M15 18a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM3 6a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM6 21V9a9 9 0 0 0 9 9',  // from circle + path
@@ -107,6 +107,7 @@ export const ICON_PATHS = {
   'undo-2': 'M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11',
   'whole-word': 'M4 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM10 9v6M14 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0ZM14 7v8M22 17v1c0 .5-.5 1-1 1H3c-.5 0-1-.5-1-1v-1',  // from circle + path
   'x': 'M18 6 6 18M6 6l12 12',
+  'zap': 'M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z',
 } as const
 
 /** Every name `<Icon>` will draw. A literal union, so a typo is a compile error. */

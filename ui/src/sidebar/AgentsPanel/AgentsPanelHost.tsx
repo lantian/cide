@@ -109,7 +109,7 @@
  * Waiting row is the run row's own gesture, `revealTask`, so the card opens over this panel by
  * the one road with the refusals written down.
  */
-import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { fsReveal, session as sessionApi, tasks as tasksApi, type ProjectId, type TaskResponse } from '@/ipc/client'
 import type { SessionEdit } from '@/ipc/generated'
 import { useContextMenu, type MenuEntry } from '@/menus'
@@ -135,9 +135,12 @@ import { sessionJournal } from '@/ipc/client'
 import { showOpenPlan } from './openRun'
 import { previewsSnapshot, subscribePreviews, requestPreview } from '@/sidebar/TasksPanel/attachmentPreviews'
 import { SessionsPanel } from './SessionsPanel'
-import { displayName, type GroupView } from './sessionsModel'
+import { displayName, type GroupView, type SessionView } from './sessionsModel'
 import { groupPath, isWithin } from './sessionsTree'
 import { useSessions } from '@/sidebar/sessionsStore'
+import { ConfirmDestructive, type ConfirmState } from '@/chrome/ConfirmDestructive'
+import { onAcknowledged } from '@/panes/awaiting'
+import { idleLive } from './sessionsSeen'
 import { isDonePhase, type GateView } from './model'
 
 /** How often elapsed times are recomputed. See the header for why it is not 30 s. */
@@ -442,6 +445,8 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
       const view = sessionRows?.find((v) => v.id === id)
       if (project === null || view === undefined || opening.has(id)) return
       opening.add(id)
+      // Opening it is looking at it: a finished turn stops reading as "waiting" (M200).
+      useSessions.getState().markSeen(id)
       // A dynamic import, `agentsStore.openPane`'s reason: the open path reaches the workspace
       // store and the pane hosts, which the render check of this panel must never load.
       guarded(
@@ -452,6 +457,101 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     },
     [sessionRows, project, guarded, opening],
   )
+  /*
+   * The focused pane's row (M200): when focus moves onto a pane that one session row shows, that
+   * row is selected, the Opened list is brought up, and the row is scrolled into view — so the
+   * list answers "which one am I in". Also counts as having looked at it (`markSeen`).
+   *
+   * Keyed on the **pane**, never on the rows: the rows re-list on every turn, and re-selecting on
+   * each would both yank the list while the user scrolls it and mark a turn that *just* ended in
+   * the pane they are staring at as already read — it would never be notified. A search in
+   * progress or a rename in flight keeps the selection where the user put it.
+   */
+  const [reveal, setReveal] = useState<{ id: string; seq: number } | null>(null)
+  const revealed = useRef<string | null>(null)
+  useEffect(() => {
+    if (focusedPane === revealed.current) return
+    const row = focusedPane === null ? undefined : sessionRows?.find((v) => v.pane === focusedPane)
+    if (focusedPane !== null && sessionRows === null) return // not listed yet — try again on the answer
+    revealed.current = focusedPane
+    if (row === undefined) return
+    const store = useSessions.getState()
+    store.markSeen(row.id)
+    if (store.query !== '' || store.renaming !== null) return
+    if (row.live) store.setSub('opened')
+    store.selectRow(row.id)
+    // A folded group hides its members; open the ancestors so the row exists to scroll to.
+    const byId = new Map(sessionGroups.map((g) => [g.id, g]))
+    let at = row.group
+    for (let i = 0; i <= sessionGroups.length && at !== null; i += 1) {
+      const g = byId.get(at)
+      if (g === undefined) break
+      if (g.collapsed) void store.organize({ op: 'collapse', id: g.id, collapsed: false }).catch(() => {})
+      at = g.parent
+    }
+    setReveal((r) => ({ id: row.id, seq: (r?.seq ?? 0) + 1 }))
+  }, [focusedPane, sessionRows, sessionGroups])
+  // A click or a keystroke in a pane is the stricter "I looked" — also for the pane that already
+  // had focus, which the effect above deliberately ignores.
+  useEffect(
+    () =>
+      onAcknowledged((handle) => {
+        const store = useSessions.getState()
+        const row = store.rows?.find((v) => v.liveSession === handle)
+        if (row !== undefined) store.markSeen(row.id)
+      }),
+    [],
+  )
+  /** A new tab in the default harness. */
+  const newSession = useCallback(() => {
+    if (project === null) return
+    guarded(useWorkspace.getState().newClaudeTab(project).then(() => undefined))
+  }, [project, guarded])
+  /** The idle sweep's confirmation, or `null`. */
+  const [sweep, setSweep] = useState<ConfirmState | null>(null)
+  const idle = useMemo(
+    () => idleLive(sessionRows ?? [], waitingCounts.questioned),
+    [sessionRows, waitingCounts.questioned],
+  )
+  const sweepIdle = useCallback(
+    async (project: ProjectId, targets: readonly SessionView[]): Promise<void> => {
+      const ws = useWorkspace.getState()
+        let kept = 0
+        for (const v of targets) {
+          try {
+            if (v.pane !== null) {
+              const tabs = ws.boot?.workspace.projects[project]?.tabs ?? []
+              const tab = tabs.find((t) => v.pane! in t.tree.panes)
+              if (tab !== undefined) {
+                if (Object.keys(tab.tree.panes).length <= 1) await ws.closeTab(project, tab.id, true)
+                else await ws.closePane(project, tab.id, v.pane, true)
+              }
+            }
+            // `closePane` ends the child it owns; a tab close deliberately leaves it (undo), and a
+            // background session has no pane at all — so end it here, ignoring "already gone".
+            if (v.liveSession !== null) await sessionApi.kill(v.liveSession).catch(() => undefined)
+          } catch {
+            kept += 1 // the pinned console cannot be closed; it stays, and is counted below
+          }
+        }
+        if (kept > 0) notify(`${kept} idle session${kept === 1 ? ' was' : 's were'} kept: its pane cannot be closed.`, { kind: 'warn' })
+    },
+    [],
+  )
+  const askCloseIdle = useCallback(() => {
+    if (project === null || idle.length === 0) return
+    const targets = idle
+    setSweep({
+      title: `Close ${targets.length} idle session${targets.length === 1 ? '' : 's'}?`,
+      body:
+        'These sessions are alive but finished their turn and ask nothing. Their tabs are closed and the harness processes ended; ' +
+        'they move to Closed and can be resumed from there.',
+      files: targets.map(displayName),
+      split: false,
+      confirmLabel: `Close ${targets.length}`,
+      run: () => guarded(sweepIdle(project, targets)),
+    })
+  }, [project, idle, guarded, sweepIdle])
   const newGroup = useCallback(
     (parent: string | null, then?: (id: string) => SessionEdit) => {
       const id = crypto.randomUUID()
@@ -618,6 +718,10 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
           selected={sessionSelected}
           renaming={sessionRenaming}
           currentPane={focusedPane}
+          reveal={reveal}
+          idleCount={idle.length}
+          onNewSession={newSession}
+          onCloseIdle={askCloseIdle}
           nowMs={nowMs}
           onQuery={store.setQuery}
           onTranscripts={store.setTranscripts}
@@ -646,6 +750,17 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
           onRevealTask={(task: string) => revealTask(task, project)}
         />
         {sessionsMenu}
+        {sweep !== null && (
+          <ConfirmDestructive
+            state={sweep}
+            onCancel={() => setSweep(null)}
+            onConfirm={() => {
+              const run = sweep.run
+              setSweep(null)
+              run()
+            }}
+          />
+        )}
       </>
     )
   }

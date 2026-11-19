@@ -334,7 +334,7 @@ export function ReviewPanel({
                 tone={
                   agent.state === 'failed'
                     ? 'bad'
-                    : agent.state === 'waiting'
+                    : agent.state === 'waiting' || agent.state === 'stopped'
                       ? 'warn'
                       : agent.state === 'idle' || agent.state === 'finished'
                         ? 'ok'
@@ -343,7 +343,9 @@ export function ReviewPanel({
                 title={`${HARNESS_LABEL[agent.harness]} review`}
                 actions={
                   <>
-                    {(agent.state === 'idle' || agent.state === 'finished') && (
+                    {(agent.state === 'idle' ||
+                      agent.state === 'finished' ||
+                      agent.state === 'stopped') && (
                       <Button
                         size="sm"
                         icon="pencil"
@@ -363,7 +365,9 @@ export function ReviewPanel({
                         Show
                       </Button>
                     )}
-                    {agent.state !== 'finished' && agent.state !== 'failed' && (
+                    {agent.state !== 'finished' &&
+                      agent.state !== 'stopped' &&
+                      agent.state !== 'failed' && (
                       <Button
                         size="sm"
                         variant="quiet"

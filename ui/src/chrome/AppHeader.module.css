@@ -437,9 +437,8 @@
  * someone had knocked out of alignment. There was no rule between them, no outline around them,
  * and their hover highlights were two different shapes butted together.
  *
- * So the grouping is drawn rather than implied: a bordered 22px pill, the height of `.rowButton`
- * and `.action` so the header's three control clusters share one silhouette, with a hairline
- * between the halves. The alternative that lost was folding the recents list into a long-press
+ * So the grouping is drawn rather than implied: a bordered 22px pill, the height of `.action`
+ * so the header's control clusters share one silhouette, with a hairline between the halves. The alternative that lost was folding the recents list into a long-press
  * or a right-click on `+` and deleting the caret — that removes the crowding by removing the
  * affordance, and the request was for something visible that says a list exists.
  */
@@ -510,54 +509,6 @@
 .recent[aria-expanded='true'] {
   background: var(--panel-2);
   color: var(--text-hi);
-}
-
-/*
- * `⊞ bash row` / `⊞ claude row`.
- *
- * `flex: none` and `white-space: nowrap`: these are the controls that were moved here to be
- * findable, and a header that squeezes them to `⊞ b…` at 900px wide would undo the move. The
- * project strip beside them shrinks instead — it already clips by design.
- */
-.rows {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-  flex: none;
-  padding: 0 var(--sp-2);
-}
-
-.rowButton {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  height: calc(22px * var(--ui-scale));
-  padding: 0 var(--sp-4);
-  border-radius: var(--r-2);
-  background: transparent;
-  border: 0;
-  color: var(--dim);
-  font-family: inherit;
-  font-size: var(--fs-ui-11);
-  white-space: nowrap;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
-}
-
-.rowButton:hover:not(:disabled) {
-  background: var(--panel-2);
-  color: var(--text);
-}
-
-/* Same treatment, and the same argument, as `.action:disabled` below: --faint rather than an
-   opacity, because opacity fades the glyph against the two themes' chrome by different
-   amounts. The tooltip carries the reason, which is why this is a state and not a hide. */
-.rowButton:disabled {
-  color: var(--faint);
-  cursor: default;
 }
 
 /*

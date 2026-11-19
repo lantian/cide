@@ -1179,9 +1179,12 @@ export function TaskDetail(props: TaskDetailProps) {
          * comment is staged with the comment; everything else — the body at rest, the body
          * editor, a comment's editor — is the task's. `wantsImagePaste` is the editor's own
          * detector: a copied file path carries text as well and must go on pasting as text.
+         * It claims any paste with no text in it, because WebKit never lists an `image/*` type
+         * to look for — so an empty clipboard reaches the attach too, and is answered with the
+         * host's "holds no image" notice rather than with nothing.
          */
         if (onAttachClipboard === undefined) return
-        if (!wantsImagePaste([...event.clipboardData.types])) return
+        if (!wantsImagePaste(event.clipboardData)) return
         event.preventDefault()
         onAttachClipboard(task.id, { kind: 'task' })
       }}
@@ -2392,7 +2395,7 @@ export function TaskDetail(props: TaskDetailProps) {
                 // attached to the task at once: it belongs to the report being written. Claimed
                 // here and stopped, so the card's own paste handler does not also take it.
                 if (onStageClipboard === undefined || onComposerStaged === undefined) return
-                if (!wantsImagePaste([...event.clipboardData.types])) return
+                if (!wantsImagePaste(event.clipboardData)) return
                 event.preventDefault()
                 event.stopPropagation()
                 void onStageClipboard().then((staged) => {

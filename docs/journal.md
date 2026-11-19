@@ -19439,3 +19439,120 @@ conversation tests were repeated successfully after adding exact visual-wrap mat
 **Not verified in a running Cide window.** The native proof drives the real CLI and inspects its
 terminal capture and fake-provider requests. The terminal-only fallback's draft/menu and exact
 content refusals are covered by domain tests, not a real Claude/OpenCode UI audit.
+
+## M201 — Ctrl+V attaches a screenshot, everywhere cide said it would
+
+> *"CTRL+v doesn't work, it doesn't paste the image"* — in *Propose an OpenSpec change*, whose
+> hint line reads *Paste with Ctrl+V or drop images here*.
+
+It did nothing at all: no chip, no notice, no error. The composer was not alone. Every image
+paste cide has — a buffer (M35), the task composer, the task card and a task comment (M39), the
+OpenSpec composer — asked one question, `editor/pasteImage.ts`'s `wantsImagePaste`: *does the
+paste event's `clipboardData.types` hold an `image/*` entry and no text?* That is the right
+question in Chromium and Firefox, and **WebKit never answers yes to it**. Both ports cide runs on
+filter the DOM's type list to the types they call safe for a page — `text/plain`, `text/html`,
+`text/uri-list` — and add `Files` for an in-memory image. A Spectacle screenshot reaches JavaScript
+as `[]` or `["Files"]`, and the old rule excluded `Files` on purpose (a copied `.png` *file*), so
+nothing was ever claimed and the webview's own paste inserted nothing into a textarea. M35's entry
+had already said neither paste had been tried on a display; the OpenSpec composer had even grown
+a spread of `clipboardData.items` types around the problem, which WebKitGTK does not fill either.
+
+The detector now asks the question WebKit can answer: **is this paste text?** A paste with no
+plain text and no `text/uri-list` is handed to Rust, which reads the clipboard as before and is
+still the only thing that ever sees pixels. Claiming such a paste costs nothing — it would have
+inserted nothing — and every backend already answers *no image* without an error. Text still
+wins, so a copied path pastes as a path; a file list is still a file, which is what the `Files`
+exclusion was for, now tested by the list because `Files` is what WebKit says for a screenshot.
+`wantsImagePaste` takes the `DataTransfer` (structurally, so the module stays import-free) and
+reads the *text*, not the type list, so a tool offering an empty text target beside its image is
+still an image. `check:paste-image` pins WebKit's shapes rather than Chromium's.
+
+Two consequences are deliberate. An **empty clipboard** is now claimed too, because the event
+cannot tell it from a screenshot; the buffer types nothing, the task surfaces say *The clipboard
+holds no image.* as they already did, and the OpenSpec composer — which used to say nothing when
+the read found nothing — now says the same. And the **clipboard read's error is printed**
+(`[cide] … no clipboard image: …` on stderr) in the OpenSpec and task paths, because *no image* and
+*the read failed* are one `Err` from the plugin, and this bug was invisible partly because nothing
+said which half had failed. `fs_paste_image` does not print: the file tree's Ctrl+V reaches it on
+every ordinary text paste.
+
+**Not confirmed on a display.** The WebKit type lists above come from reading WebKit's source,
+not from a paste watched in a running cide; the fix is built so that it does not depend on which of
+`[]` and `["Files"]` WebKitGTK 2.52 actually hands over. That arboard's Wayland data-control read
+returns a Spectacle screenshot on KWin is likewise unobserved — if a paste still shows *holds no
+image* with a screenshot on the clipboard, the stderr line names the reason. Nothing on macOS was
+tried.
+
+## M202 — The Sessions tab: new session, follows focus, reads what you have read, sweeps idle
+
+Four requests on the M199 tab, all webview-side — no Rust, no new command, no contract drift.
+
+- **New session.** A `+` in the tab's sub-bar calls `useWorkspace.newClaudeTab(project)`, a closable
+  tab with one `claude` pane and `harness_choice: None`, so `session_spawn` resolves the harness the
+  way any fresh pane does (`harness_settings::effective`, cmd/session.rs ~1543). Default harness
+  only, by decision: a per-pick menu was offered and declined.
+- **The list follows focus.** When the focused pane changes to one a row shows, the host selects that
+  row, switches to Opened, opens folded ancestors and scrolls it into view (`reveal` request with a
+  `seq`, `scrollIntoView({block:'nearest'})`). It is keyed on the **pane**, not the rows — re-listing
+  on every turn would otherwise yank the list under a scroll — and leaves the selection alone while
+  a search or a rename is in progress.
+- **"Waiting for your input" is a notification that ends when read.** Rust's `awaitingInput` lasts
+  from the `Stop` hook to the next `Busy`; nothing the user did reached it, so a finished agent
+  stayed amber, in the pill and on the rail, after the user had read its closing note.
+  `sessionsSeen.ts` (import-free) lays one fact over the rows as `sessionsStore` adopts them: a
+  *seen* `awaitingInput` row reads `idle`. Marked by opening a row, by focus moving onto its pane
+  (`markSeen`), and by a click or keystroke in its pane (`awaiting.ts::onAcknowledged`, new). Never
+  for `permission` or a question — those are real debts — and the mark is dropped the moment raw
+  activity is anything else, so the next turn re-raises waiting rather than being born read. Looser
+  than `awaiting.ts`'s pane highlight on purpose (that one still refuses "the tab is shown").
+- **Close idle sessions.** A trash button in the sub-bar (Opened) counts `idleLive` — live, idle after
+  seen, no open question, not a run, **not the pinned console** — and confirms through
+  `ConfirmDestructive` listing every session by name. Each: close its tab (one-pane tab) or pane,
+  then `sessionApi.kill`, because a tab close deliberately leaves the child running. The rows move to
+  Closed and stay resumable.
+
+`check:sessions` pins the seen mapping, the pruning, the waiting counts and the sweep's selection.
+
+**Not confirmed on a display.** None of the four was watched in a running cide. In particular the
+scroll-into-view on a focus change, the order of closeTab → kill for a sweep of many tabs, and that
+the new-session tab lands focused with the default harness were reasoned from the store code only.
+
+## M203 — A GitLab review that would not close
+
+Reported on macOS: closing some MR reviews failed with `Review workspace: Permission denied (os
+error 13)` while others closed fine. The same review's agent block stayed blue on "Reviewing…" long
+after the reviewer had finished, and **Show** answered `[object Object]`. That was three defects.
+
+- **The checkout held a tree nobody could delete.** The reviewer brief allows builds and tests that
+  do not write outside the checkout, and a codex reviewer's sandbox can write nowhere else. On a Go
+  MR the agent therefore points `GOMODCACHE`/`GOPATH` inside the checkout, and Go makes its module
+  cache read-only: 0555 directories, 0444 files. That is why only some MRs failed: the ones whose
+  reviewer had built. `Workspaces::close`, the startup sweep and `shutdown` all used a bare
+  `remove_dir_all`, so the leftover also outlived every restart. `workspaces::remove_tree` now
+  restores `u+rwx` on directories (before listing each one, since a 0000 directory cannot be read)
+  and retries. It never follows a symlink, because the checkout is MR content.
+- **Cleanup held Close hostage.** `close` returned the first deletion error and `Close` propagated
+  it before forgetting the review. By then the review's runs had been stopped and its tabs closed.
+  `close` is now infallible: the entry goes either way, and a directory it still cannot delete stays
+  under the owner-locked parent, where `shutdown` and the next sweep retry it.
+- **A stopped reviewer read as running.** `agentReview.ts`'s `follow` was an if-chain whose `else`
+  treated every state it did not name as "Reviewing…". Stop and Close both leave `cancelled`, so a
+  stopped review spun for as long as the panel was open. It is now an exhaustive `switch` with a
+  `never` default. `cancelled` and `interrupted` become a new `stopped` state (warn tone, no
+  spinner, no Stop, Show and Open drafts kept), and `blocked`/`paused` become `waiting`.
+  `DraftDiscussion` no longer counts a stopped reviewer as owing an answer.
+- **`[object Object]`.** The MR panel's `message()` was `String(e)`. That is fine for its own
+  string rejections and wrong for a tagged `CoreError` from `agents_run_open`. It now restates
+  `errorText`'s rule. It is restated rather than imported because `check:gitlab` compiles
+  `model.ts` standalone.
+
+Tests: `a_read_only_tree_in_a_checkout_does_not_stop_its_review_closing` (a Go-cache-shaped tree,
+plus a symlink to a read-only directory outside, which must come out untouched and still 0555). The
+cleanup test now plants the same tree for the startup sweep and `shutdown`. `check:gitlab` asserts
+`message` on tagged objects. With the chmod pass disabled, both Rust tests fail, so the fixture does
+reproduce the EACCES.
+
+**Not confirmed on macOS or on a display.** The Go-module-cache explanation fits every symptom, but
+it was inferred from the brief, the sandbox and the error rather than read off the reporter's
+machine. `find ~/.cache/cide/gitlab-reviews -type d ! -perm -u+w` there would settle it. The panel's
+new states were type-checked and not watched.

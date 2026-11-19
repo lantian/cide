@@ -42,6 +42,7 @@ import {
 } from '@/ipc/client'
 import type { SessionEdit } from '@/ipc/generated'
 import { errorText } from '@/ipc/errorText'
+import { applySeen, canMarkSeen } from '@/sidebar/AgentsPanel/sessionsSeen'
 import type {
   GroupView,
   SessionActivityName,
@@ -102,6 +103,12 @@ interface SessionsStore {
   selected: string | null
   /** The row being renamed in place, or `null`. */
   renaming: string | null
+  /**
+   * The user has looked at this conversation's finished turn: read it as idle instead of
+   * "Waiting for your input" (`sessionsSeen.ts`). A no-op for anything that is not waiting on
+   * nothing but being read.
+   */
+  markSeen: (id: string) => void
   /** Follow `project`: reset for a new one, and re-ask either way. */
   attach: (project: ProjectId | null) => void
   refresh: () => void
@@ -128,6 +135,9 @@ let searchTimer: ReturnType<typeof setTimeout> | undefined
  * renders nothing. It shipped that way once in M199.
  */
 const NO_GROUPS: readonly GroupView[] = []
+/** The rows as Rust answered, before "seen" is laid over them (`sessionsSeen.ts`). */
+let rawRows: SessionView[] = []
+let seenIds: ReadonlySet<string> = new Set()
 
 export const useSessions = create<SessionsStore>((set, get) => {
   /** Start (or restart) the debounced transcript search for the current query. */
@@ -163,9 +173,11 @@ export const useSessions = create<SessionsStore>((set, get) => {
   const adopt = (project: ProjectId, listing: SessionListing) => {
     // A late answer for a project the store has since left is dropped.
     if (get().project !== project) return
-    const rows = listing.rows.map(adaptSession)
-    remember(rows)
-    set({ rows, groups: listing.groups, error: null })
+    rawRows = listing.rows.map(adaptSession)
+    const shown = applySeen(rawRows, seenIds)
+    seenIds = shown.seen
+    remember(shown.rows)
+    set({ rows: shown.rows, groups: listing.groups, error: null })
   }
 
   return {
@@ -185,6 +197,8 @@ export const useSessions = create<SessionsStore>((set, get) => {
       follow()
       if (project !== get().project) {
         // Another project's search hits, selection and rename name its conversations, not these.
+        rawRows = []
+        seenIds = new Set()
         set({
           project,
           rows: null,
@@ -220,6 +234,14 @@ export const useSessions = create<SessionsStore>((set, get) => {
     },
     setSub: (sub) => set({ sub, renaming: null }),
     selectRow: (id) => set({ selected: id }),
+    markSeen: (id) => {
+      if (!canMarkSeen(rawRows, id)) return
+      const next = new Set(seenIds)
+      next.add(id)
+      const shown = applySeen(rawRows, next)
+      seenIds = shown.seen
+      set({ rows: shown.rows })
+    },
     setRenaming: (id) => set({ renaming: id }),
     organize: (edit) => {
       const project = get().project

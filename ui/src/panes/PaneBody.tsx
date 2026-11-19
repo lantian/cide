@@ -22,6 +22,7 @@ import { useState, type ReactNode } from 'react'
 import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
 import { ClipboardDiffPane } from './ClipboardDiffPane'
+import { PageTabBody, isPageTab } from './PageTabBody'
 import { ImagePane } from './ImagePane'
 import { imageKindFor } from './imageKinds'
 import { ExcalidrawHost } from './ExcalidrawHost'
@@ -240,6 +241,13 @@ export function PaneBody({
   const pairTab = useWorkspace((s) => s.boot?.workspace.projects[project ?? '']?.tabs.find((t) => t.peerChat !== undefined && pane.id in t.tree.panes))
   const clipboardTab = useWorkspace(s => s.boot?.workspace.projects[project ?? '']?.tabs.find(t =>
     t.kind.kind === 'clipboardDiff' && pane.id in t.tree.panes))
+  // The page tab this pane belongs to, if it is one (Settings, OpenSpec, docs, docker…). Another
+  // hook, so it sits with the other selectors above every early return. The tab object is the
+  // snapshot's own (structurally shared), so this is `Object.is`-stable until the tab changes.
+  const pageTab = useWorkspace((s) => {
+    const tab = s.boot?.workspace.projects[project ?? '']?.tabs.find((t) => pane.id in t.tree.panes)
+    return tab && isPageTab(tab.kind) ? tab : undefined
+  })
   if (pairTab) return <PeerChatPane tab={pairTab} pane={pane} cwd={cwd} project={project} primarySession={primarySession} restore={restore} roots={roots} onOpenPath={onOpenPath} onRevealPath={onRevealPath} onSessionBound={onSessionBound} onScreen={onScreen} />
 
   // A file is a document too: no session, no spawn, nothing to resume. (M9)
@@ -258,6 +266,13 @@ export function PaneBody({
     return <ClipboardDiffPane snapshotId={clipboardTab.kind.snapshotId}
       path={clipboardTab.kind.path} tab={clipboardTab.id} project={project}
       pane={pane.id} root={cwd} onScreen={onScreen} onShowHistory={onShowHistory} />
+  }
+
+  // A page tab that has been split: the page is the tree's editor-kind pane, and the splits are
+  // Claude/shell panes that fall through to the terminal below. Keyed on the PANE kind for the
+  // same reason the File tab's editor is — see `PageTabBody.tsx`.
+  if (pageTab && project !== undefined && pane.kind === 'editor') {
+    return <PageTabBody project={project} kind={pageTab.kind} active={onScreen ?? true} />
   }
 
   if (editor && pane.kind === 'editor') {

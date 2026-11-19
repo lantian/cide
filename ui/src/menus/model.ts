@@ -53,6 +53,13 @@ export interface MenuItem {
   readonly command?: string | undefined
   /** Present ⇒ the item is disabled, and this is the sentence shown in place of the hint. */
   readonly disabledReason?: string | undefined
+  /**
+   * What the row does, in a sentence, shown as the native tooltip while it is enabled.
+   *
+   * A disabled row's tooltip is its [`disabledReason`] — the reason wins, because "why can't I"
+   * is the question a greyed row asks and the explanation of what it would have done is not.
+   */
+  readonly tooltip?: string | undefined
   /** Destructive. Painted in `--red`; changes nothing about behaviour. */
   readonly danger?: boolean | undefined
   /** Set (either way) ⇒ the item is a toggle and gets a check gutter. */
@@ -108,6 +115,8 @@ export interface ResolvedItem {
   readonly enabled: boolean
   /** `null` iff enabled. */
   readonly reason: string | null
+  /** The caller's [`MenuItem::tooltip`], shown only while the row is enabled. */
+  readonly tooltip?: string
   /** The keychip, e.g. `⌘S` — or `null` when the command is unbound or unnamed. */
   readonly hint: string | null
   readonly danger: boolean
@@ -194,6 +203,7 @@ export function resolveMenu(
       label: entry.label,
       enabled,
       reason,
+      ...(entry.tooltip !== undefined ? { tooltip: entry.tooltip } : {}),
       // Disabled items get no chip: the slot is showing the reason instead, and a shortcut
       // beside a line that refuses to run reads as a promise the menu will not keep.
       hint: enabled && entry.command !== undefined && chipFor ? chipFor(entry.command) : null,

@@ -37,7 +37,7 @@
  * draws and a click does not move. The host also drops an open asked for a conversation whose last
  * open has not answered, so a quick third click cannot resume it into a second pane.
  */
-import { useMemo, useRef, type MouseEvent, type ReactElement, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, type MouseEvent, type ReactElement, type ReactNode } from 'react'
 
 import { Button, IconButton } from '@/kit/components/Button'
 import { SearchField } from '@/kit/components/Field'
@@ -92,6 +92,17 @@ export interface SessionsPanelProps {
   /** The pane that has focus, so the row it shows gets the accent bar. */
   currentPane?: string | null | undefined
   nowMs: number
+  /**
+   * A row to bring into view, set when the focused pane's session changes (M200). A request, not
+   * state: `seq` makes the same id twice in a row scroll twice.
+   */
+  reveal?: { id: string; seq: number } | null | undefined
+  /** How many live sessions the "Close idle sessions" sweep would end. */
+  idleCount?: number | undefined
+  /** Start a new tab in the project's default harness. Absent, no button. */
+  onNewSession?: (() => void) | undefined
+  /** Ask to end every idle session — the host confirms. Absent, no button. */
+  onCloseIdle?: (() => void) | undefined
   onQuery: (query: string) => void
   onTranscripts: (on: boolean) => void
   onSub: (sub: 'opened' | 'closed') => void
@@ -247,7 +258,7 @@ function SelectedDetail(props: SessionsPanelProps & { rows: readonly SessionView
 
 /** The Opened / Closed segment, with Expand all, Collapse all and New group on Opened. */
 function SubBar(props: SessionsPanelProps & { rows: readonly SessionView[] }): ReactElement {
-  const { rows, groups, query, hits, sub, onSub, onExpandAll, onCollapseAll, onNewGroup } = props
+  const { rows, groups, query, hits, sub, onSub, onExpandAll, onCollapseAll, onNewGroup, onNewSession, onCloseIdle, idleCount } = props
   const counts = tabCounts(rows, groups, (v) => keeps(v, query, hits))
   const tab = (which: 'opened' | 'closed', label: string, n: number) => (
     <button
@@ -266,6 +277,34 @@ function SubBar(props: SessionsPanelProps & { rows: readonly SessionView[] }): R
       {tab('opened', 'Opened', counts.opened)}
       {tab('closed', 'Closed', counts.closed)}
       <span className={styles.spacer} />
+      {onNewSession !== undefined && (
+        <IconButton
+          icon="plus"
+          size="sm"
+          label="New session — a new tab in the default harness"
+          data-audit="sessionsNew"
+          onClick={onNewSession}
+        />
+      )}
+      {sub === 'opened' && onNewGroup !== undefined && (
+        // Beside *New session*: the two things you add. A folder, not the square-plus this used
+        // to be — that read as the same button as the `+` next to it (M202).
+        <IconButton icon="folder-plus" size="sm" label="New group" data-audit="sessionsNewGroup" onClick={onNewGroup} />
+      )}
+      {sub === 'opened' && onCloseIdle !== undefined && (
+        <IconButton
+          icon="trash-2"
+          size="sm"
+          label={
+            (idleCount ?? 0) === 0
+              ? 'Close idle sessions — none are idle'
+              : `Close ${idleCount} idle session${idleCount === 1 ? '' : 's'}`
+          }
+          disabled={(idleCount ?? 0) === 0}
+          data-audit="sessionsCloseIdle"
+          onClick={onCloseIdle}
+        />
+      )}
       {sub === 'opened' && (
         <>
           {onExpandAll !== undefined && (
@@ -273,9 +312,6 @@ function SubBar(props: SessionsPanelProps & { rows: readonly SessionView[] }): R
           )}
           {onCollapseAll !== undefined && (
             <IconButton icon="chevrons-down-up" size="sm" label="Collapse all groups" disabled={groups.length === 0} data-audit="sessionsCollapseAll" onClick={onCollapseAll} />
-          )}
-          {onNewGroup !== undefined && (
-            <IconButton icon="square-plus" size="sm" label="New group" data-audit="sessionsNewGroup" onClick={onNewGroup} />
           )}
         </>
       )}
@@ -311,6 +347,21 @@ function SessionsTree(
         : [],
     [sub, rows, groups, query, hits, minute],
   )
+  /*
+   * Bring a requested row into view (M200 — the focused harness tab's row). `nearest`, so a row
+   * already on screen does not move; rows are a fixed 24px, so scrolling never shifts the one the
+   * user is pointing at. Keyed on `seq`, not the id: focusing the same tab again must scroll again
+   * after the user has scrolled away.
+   */
+  const revealId = props.reveal?.id
+  const revealSeq = props.reveal?.seq
+  useEffect(() => {
+    if (revealId === undefined) return
+    const row = [...(box.current?.querySelectorAll<HTMLElement>('[data-session-row]') ?? [])].find(
+      (el) => el.dataset['id'] === revealId,
+    )
+    row?.scrollIntoView({ block: 'nearest' })
+  }, [revealId, revealSeq, sub, opened, closed])
   const order: string[] = sub === 'opened' ? opened.filter((i) => i.type !== 'rule').map((i) => i.id) : closed.flatMap((b) => b.views.map((v) => v.id))
 
   const drag = useSessionsDrag({
@@ -536,7 +587,7 @@ function SessionsTree(
           )}
           {groups.length === 0 && words.length === 0 && props.onNewGroup !== undefined && (
             <p className={styles.hint} data-audit="sessionsGroupHint">
-              Make a group with <Icon name="square-plus" size={0} className={styles.inlineIcon} /> and drag sessions into it. A grouped
+              Make a group with <Icon name="folder-plus" size={0} className={styles.inlineIcon} /> and drag sessions into it. A grouped
               session stays in its group after it ends — it never moves to Closed.
             </p>
           )}

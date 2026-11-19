@@ -36,7 +36,19 @@ try {
     approvalStatus,
     repositoryOfMr,
     defaultReviewPrompt,
+    message,
   } = await import(join(out, 'model.js'))
+  {
+    // A `CoreError` rejection is a tagged object. `String()` of it was `[object Object]`, shown
+    // above the review block when **Show** failed; `errorText`'s rule, restated in `message`.
+    assert.equal(message({ kind: 'io', detail: 'no such run in this project: r1' }), 'no such run in this project: r1')
+    assert.equal(message({ kind: 'lastTab' }), 'lastTab')
+    assert.equal(message({ kind: 'io', detail: '' }), 'io')
+    assert.equal(message('GitLab refused the token'), 'GitLab refused the token')
+    assert.equal(message(new Error('Review closed')), 'Review closed')
+    assert.notEqual(message({}), '')
+    assert.equal(message(null), 'null')
+  }
   {
     const url = 'https://git.example/Group/Sub/Repo/-/merge_requests/7'
     assert.deepEqual(repositoryOfMr(url), {

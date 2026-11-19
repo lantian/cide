@@ -67,6 +67,7 @@ try {
       'node_modules/typescript/bin/tsc',
       'src/sidebar/AgentsPanel/sessionsModel.ts',
       'src/sidebar/AgentsPanel/sessionsTree.ts',
+      'src/sidebar/AgentsPanel/sessionsSeen.ts',
       'src/sidebar/AgentsPanel/model.ts',
       '--rootDir', 'src',
       '--outDir', out,
@@ -82,6 +83,7 @@ try {
   const dir = join(out, 'sidebar', 'AgentsPanel')
   const m = await import(`file://${join(dir, 'sessionsModel.js')}`)
   const t = await import(`file://${join(dir, 'sessionsTree.js')}`)
+  const seenMod = await import(`file://${join(dir, 'sessionsSeen.js')}`)
   const runModel = await import(`file://${join(dir, 'model.js')}`)
 
   // --- the vocabularies, against Rust ---------------------------------------------------------
@@ -297,6 +299,29 @@ try {
   )
   eq(t.stepSelection(['a', 'b'], null, 'ArrowDown'), 'a', 'from no selection Down takes the first')
   eq(t.stepSelection(['a', 'b'], 'c', 'ArrowUp'), 'b', 'a selection that left the list starts from the end')
+
+  // --- seen: a finished turn that the user has looked at stops waiting (M200) ----------------------
+  {
+    const row = (id, activity, extra = {}) => ({ id, live: true, activity, kind: 'tab', run: null, liveSession: `s-${id}`, ...extra })
+    const raw = [row('a', 'awaitingInput'), row('b', 'permission'), row('c', 'awaitingInput'), row('d', 'working')]
+    const shown = seenMod.applySeen(raw, new Set(['a', 'b', 'd', 'gone']))
+    eq(shown.rows.map((r) => r.activity), ['idle', 'permission', 'awaitingInput', 'working'], 'only a seen awaitingInput reads idle; permission is a real debt')
+    eq([...shown.seen].sort(), ['a'], 'a mark whose row is no longer awaiting input (or is gone) is dropped')
+    eq(raw[0].activity, 'awaitingInput', 'the raw rows are not mutated')
+    const same = new Set(['a'])
+    ok(seenMod.applySeen(raw, same).seen === same, 'nothing pruned keeps the same set')
+    ok(seenMod.canMarkSeen(raw, 'a') && !seenMod.canMarkSeen(raw, 'b') && !seenMod.canMarkSeen(raw, 'd'), 'only a waiting-for-input row can be marked seen')
+    ok(!seenMod.canMarkSeen([row('x', 'awaitingInput', { live: false })], 'x'), 'an ended row cannot')
+    // waiting counts: a seen turn drops out of both the pill and the rail
+    const views = shown.rows.map((r) => ({ ...r, task: null }))
+    eq(m.waitingSummary(views, new Set(), 0), { sessions: 2, total: 2 }, 'seen finished turn no longer counts as waiting (b permission, c unseen remain)')
+    // the idle sweep
+    const sweepRows = [
+      row('i1', 'idle'), row('i2', 'idle', { run: 'r1' }), row('i3', 'idle', { kind: 'console' }),
+      row('i4', 'idle', { liveSession: null }), row('i5', 'idle', { live: false }), row('i6', 'idle'), row('w', 'working'),
+    ]
+    eq(seenMod.idleLive(sweepRows, new Set(['i6'])).map((r) => r.id), ['i1'], 'sweep: live idle sessions only — not runs, the console, background-less, ended, questioned or working')
+  }
 
   // --- when --------------------------------------------------------------------------------------
   const noon = Date.UTC(2026, 8, 30, 12)
