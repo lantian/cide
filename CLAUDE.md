@@ -50,7 +50,7 @@ Run the full shared CI suite before pushing code changes:
 ```sh
 ./test.sh                    # every CI check for this host, reporting all failures
 ./test.sh --list             # command inventory without running checks
-./test.sh --only rust        # quick iteration; other groups: ui, no-tauri, shell, fork-pins, macos
+./test.sh --only rust        # quick iteration (= rust-lint + rust-test); other groups: ui, no-tauri, shell, fork-pins, macos
 ```
 
 CI invokes this same runner. It keeps full logs in `target/ci-checks/`, enumerates UI checks,
@@ -65,7 +65,8 @@ remaining failures before pushing. A Linux run does not validate macOS-specific 
 - **The frontend has no test runner**: `ui/scripts/check-*.mjs` are the suite. Adding a
   `check:foo` script to `ui/package.json` is enough for CI. **A check that greps source must strip
   comments first** — house-style comments name the failure, so the needle is in the prose.
-  Keep modules a check compiles standalone import-free.
+  Keep modules a check compiles standalone import-free. `./test.sh` runs the checks in
+  parallel, so one that asserts on its own timing goes in `test.sh`'s `ui_serial_checks`.
 - The audits (`./run.sh --audit-chrome|--audit-panes|--audit-windows`) need a display and are not
   in CI; they are the only check for pane-host and chrome regressions.
 

@@ -26,6 +26,12 @@ with open(os.environ['CIDE_RUNNER_CALLS'], 'a') as out:
 if call in json.loads(os.environ.get('CIDE_RUNNER_FAILURES', '[]')):
     print('fixture command failed:', ' '.join(call), file=sys.stderr)
     sys.exit(23)
+if call in json.loads(os.environ.get('CIDE_RUNNER_KILLS', '[]')):
+    # Kill the shell that launched this command, as an OOM kill or a stray signal would:
+    # the runner never learns an exit code for it.
+    import signal
+    os.kill(os.getppid(), signal.SIGKILL)
+    sys.exit(1)
 if tool == 'node':
     scripts = json.loads(Path('ui/package.json').read_text())['scripts']
     print('\n'.join(s for s in scripts if s.startswith('check:')))
@@ -72,14 +78,19 @@ class RunnerChecks(unittest.TestCase):
             mock.write_text(f"#!{sys.executable}\n" + MOCK)
             mock.chmod(0o755)
 
-    def run_checks(self, *args, failures=()):
+    def run_checks(self, *args, failures=(), kills=(), jobs=None, serial=None):
         env = dict(os.environ)
         env.update(
             PATH=str(self.bin) + os.pathsep + env["PATH"],
             CIDE_RUNNER_CALLS=str(self.calls_file),
             CIDE_RUNNER_FAILURES=json.dumps(failures),
+            CIDE_RUNNER_KILLS=json.dumps(kills),
             GITHUB_ACTIONS="false",
         )
+        if jobs is not None:
+            env["CIDE_CHECK_JOBS"] = str(jobs)
+        if serial is not None:
+            env["CIDE_SERIAL_CHECKS"] = serial
         result = subprocess.run(
             ["bash", str(self.root / "test.sh"), *args],
             cwd=self.temp.name, env=env, text=True, capture_output=True, timeout=30,
@@ -138,6 +149,67 @@ class RunnerChecks(unittest.TestCase):
         result, calls = self.run_checks("--only", "fork-pins", failures=[remote])
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(calls), 3)
+
+    def results(self):
+        runs = sorted((self.root / "target" / "ci-checks").glob("run-*"))
+        self.assertEqual(len(runs), 1)
+        return [line.split("\t") for line in (runs[0] / "results.tsv").read_text().splitlines()]
+
+    def test_parallel_ui_checks_report_in_order_with_real_exit_codes(self):
+        # The check:* scripts run concurrently; each must still be reported once, numbered and
+        # ordered as package.json lists them, with its own exit code.
+        failing = ["pnpm", "--dir", "ui", "run", "check:added-later"]
+        result, _ = self.run_checks("--only", "ui", failures=[failing], jobs=2)
+        self.assertEqual(result.returncode, 1)
+        rows = self.results()
+        self.assertEqual([r[0] for r in rows], [
+            "ui/install", "ui/typecheck", "ui/check:first", "ui/check:added-later", "ui/build",
+        ])
+        self.assertEqual([r[1] for r in rows], ["0", "0", "0", "23", "0"])
+        self.assertEqual([Path(r[2]).name for r in rows],
+                         ["001.log", "002.log", "003.log", "004.log", "005.log"])
+        self.assertIn("ui/check:added-later (exit 23)", result.stderr)
+        self.assertIn("1 failed", result.stdout)
+
+    def test_a_serial_ui_check_keeps_its_place_in_the_report(self):
+        # check:first is made serial, so it runs after check:added-later — and must still be
+        # numbered and reported before it.
+        result, calls = self.run_checks("--only", "ui", jobs=2, serial="check:first")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = [c for c in calls if c[:4] == ["pnpm", "--dir", "ui", "run"]]
+        self.assertEqual([c[4] for c in runs], ["check:added-later", "check:first"])
+        rows = self.results()
+        self.assertEqual([r[0] for r in rows][2:4], ["ui/check:first", "ui/check:added-later"])
+        self.assertEqual([Path(r[2]).name for r in rows][2:4], ["003.log", "004.log"])
+
+    def test_a_ui_check_that_never_reports_is_a_failure_not_a_gap(self):
+        # Killing the first check's shell stops xargs launching the second as well. Neither
+        # may vanish from the summary or be counted as a pass.
+        killed = ["pnpm", "--dir", "ui", "run", "check:first"]
+        result, _ = self.run_checks("--only", "ui", kills=[killed], jobs=1)
+        self.assertEqual(result.returncode, 1)
+        rows = {r[0]: r for r in self.results()}
+        self.assertEqual(rows["ui/check:first"][1], "125")
+        self.assertEqual(rows["ui/check:added-later"][1], "125")
+        self.assertIn("did not finish", Path(rows["ui/check:first"][2]).read_text())
+        self.assertIn("2 failed", result.stdout)
+
+    def test_the_two_rust_jobs_add_up_to_the_rust_group(self):
+        # CI runs rust-lint and rust-test as separate jobs. A step in neither would be a check
+        # CI silently stopped running while every job stayed green; a step in both is a job
+        # paying for the other's work.
+        def cargo_calls(group):
+            self.calls_file.unlink(missing_ok=True)
+            result, calls = self.run_checks("--only", group)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return [tuple(call) for call in calls if call[0] == "cargo"]
+
+        whole = cargo_calls("rust")
+        lint = cargo_calls("rust-lint")
+        tests = cargo_calls("rust-test")
+        self.assertFalse(set(lint) & set(tests))
+        self.assertEqual(sorted(lint + tests), sorted(whole))
+        self.assertEqual(tests, [("cargo", "test", "--locked", "--workspace", "--no-fail-fast")])
 
     def test_invalid_group_never_starts_a_check(self):
         result, calls = self.run_checks("--only", "typo")

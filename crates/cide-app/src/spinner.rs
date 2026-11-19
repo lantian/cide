@@ -897,6 +897,23 @@ fn mark_busy(project: ProjectId, now: Instant) {
 mod tests {
     use super::*;
 
+    /// `SINCE` is one process-wide map, and `a_closed_project_forgets_how_long_it_was_quiet`
+    /// clears all of it (`forget_all_but(&[])`), not just its own project — that is the
+    /// behaviour under test. A clear landing between another test's `mark_busy` and its
+    /// `dwell` erased a ten-minute quiet and failed
+    /// `a_milestone_answer_releases_the_latch_and_preserves_the_planning_delta` at random
+    /// (`assertion failed: should_spin(&quiet, &config)`, seen 2026-11-19 in a full
+    /// `cargo test --workspace`; it passed every time alone). The clearing test takes this for
+    /// writing, every test that reads back a dwell it wrote takes it for reading, so those still
+    /// run in parallel with each other. A new test that calls `dwell` twice belongs here too.
+    static DWELL: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn dwell_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+        DWELL
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A project that satisfies every condition. Each test below breaks exactly one.
     fn ready() -> Quiet {
         Quiet {
@@ -919,6 +936,7 @@ mod tests {
 
     #[test]
     fn a_milestone_answer_releases_the_latch_and_preserves_the_planning_delta() {
+        let _dwell = dwell_shared();
         let project = ProjectId::new();
         let goal = cide_ipc::TaskId::from("t-1110".to_owned());
         let plan: cide_ipc::MilestonePlan = serde_json::from_value(serde_json::json!({
@@ -1027,6 +1045,7 @@ mod tests {
 
     #[test]
     fn an_unprompted_codex_console_allows_the_full_quiet_dwell() {
+        let _dwell = dwell_shared();
         let config = AgentsConfig {
             auto_spin_after_secs: 300,
             ..asking()
@@ -1353,6 +1372,9 @@ mod tests {
     /// inheriting an hour of "quiet" during which cide was not watching.
     #[test]
     fn a_closed_project_forgets_how_long_it_was_quiet() {
+        let _dwell = DWELL
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let project = ProjectId::new();
         let start = Instant::now();
 
@@ -1375,6 +1397,7 @@ mod tests {
     /// project quiet are only observable from the moment cide is watching.
     #[test]
     fn the_dwell_starts_when_the_quiet_is_first_seen() {
+        let _dwell = dwell_shared();
         let project = ProjectId::new();
         let start = Instant::now();
 

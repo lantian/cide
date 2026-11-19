@@ -25,7 +25,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A second push to a branch makes the first run's answer worthless, and the rust job is
+# A second push to a branch makes the first run's answer worthless, and the rust jobs are
 # minutes long. The trunk is exempt: its runs are the record of what shipped.
 #
 # `master`, not `main` — this repository's trunk is master (release.yml cuts
@@ -42,6 +42,23 @@ env:
   CARGO_TERM_COLOR: always
   # A backtrace turns "assertion failed" into a location. Free on a green run.
   RUST_BACKTRACE: 1
+  # A cheaper build profile for every cargo step in CI, set here rather than in Cargo.toml so
+  # neither `./run.sh` nor a local `./test.sh` changes. `[profile.dev]` is opt-level 1 with
+  # full debuginfo (and every dependency at opt-level 2) because the dev build is the IDE
+  # people actually use; tests need none of it. Measured on this workspace (2026-11-19, every
+  # workspace crate rebuilt — which is what each CI run does, since rust-cache keeps only
+  # dependencies): opt-level 0 for the workspace cut its summed per-crate compile time from
+  # 761 s to 276 s, and line-tables-only debuginfo to 229 s. The suite pinned to 4 cores (the
+  # runner's size) ran in 61 s instead of 57 s — four seconds of test time for minutes of
+  # compile. `[profile.dev.package."*"]` still wins for dependencies, so they stay at
+  # opt-level 2: libgit2 and the tree-sitter grammars run inside the tests too. Backtraces
+  # keep file and line under line-tables-only; only a debugger's variables are lost.
+  #
+  # Both variables also enter rust-cache's key (it hashes every `CARGO*` variable), so
+  # changing either starts a fresh cache rather than restoring artifacts this profile can't
+  # use. The jobs that run no cargo build ignore them.
+  CARGO_PROFILE_DEV_OPT_LEVEL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # ---------------------------------------------------------------------------------
@@ -111,51 +128,62 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------------
-  # Rust: build, test, lint, format, and the two xtask gates.
+  # Rust, as two jobs that run side by side: lint (fmt, contract, check, clippy, codegen) and
+  # test. They were one job of six sequential steps until 2026-11-19; nothing in one uses the
+  # other's artifacts — `check` and `clippy` emit metadata, `cargo test` builds code, and
+  # `codegen --check` builds cide-ipc's tests under its own `-p` feature set — so running them
+  # one after the other only added their times together. `./test.sh --only rust` still runs
+  # both, which is what a local run should do; check-test-runner.py pins that the two groups
+  # add up to it, so a step dropped from both cannot pass as a green split.
   # ---------------------------------------------------------------------------------
-  rust:
-    name: rust
+  rust-lint:
+    name: rust-lint
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
-      # cide-app links the system webview. Tauri 2 is on the libsoup-3 stack, so this is
-      # webkit2gtk **4.1**, not 4.0 — 4.0 is the libsoup-2 build and links a second,
-      # incompatible copy of the same libraries.
-      #
-      # libwebkit2gtk-4.1-dev pulls gtk+-3.0, libsoup-3.0 and javascriptcoregtk-4.1 in
-      # transitively; they are named anyway so that a runner image dropping one fails here
-      # with the package name rather than three thousand lines later inside a build script
-      # that could not find a .pc file.
-      #
-      # Deliberately absent: patchelf, librsvg2-dev and the rest of the AppImage/deb
-      # bundling chain. Nothing in this workflow runs `tauri build` or `cargo xtask
-      # package`; adding them would slow every run for a capability no job uses.
-      - name: Install system dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            pkg-config
+      - uses: ./.github/actions/linux-deps
 
+      # Its own cache entry: check/clippy metadata and a test build cannot share target/
+      # contents, and one key for both would have each job evict the other's.
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: rust
+          cache-key: rust-lint
 
-      # The same commands as a local full run, including --no-fail-fast so a failed test
-      # binary does not conceal the failures in other packages. Ignored tests stay ignored.
-      - name: Run shared rust checks
-        run: ./test.sh --only rust
+      - name: Run shared rust lint checks
+        run: ./test.sh --only rust-lint
 
       - name: Upload check logs
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: ci-rust
+          name: ci-rust-lint
+          path: target/ci-checks/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rust-test:
+    name: rust-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/linux-deps
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-test
+
+      # --no-fail-fast so a failed test binary does not conceal the failures in other
+      # packages. Ignored tests stay ignored.
+      - name: Run shared rust tests
+        run: ./test.sh --only rust-test
+
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-rust-test
           path: target/ci-checks/
           if-no-files-found: ignore
           retention-days: 7
@@ -248,6 +276,11 @@ jobs:
     name: macos (advisory)
     runs-on: macos-15
     continue-on-error: true
+    # Pushes to master only, since 2026-11-19: on every PR push it took 31–39 min — longer
+    # than any other job — for an answer nobody waited on, because it is advisory. A
+    # `workflow_dispatch` run skips it too; to get it on demand for a branch, widen this to
+    # `github.event_name != 'pull_request'`.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v5
 
@@ -255,8 +288,8 @@ jobs:
         with:
           cache-key: macos
 
-      # Native macOS formatting, build, all tests and clippy. The platform-independent
-      # contract and codegen gates are covered by the rust job.
+      # Native macOS formatting, check, all tests and clippy. The platform-independent
+      # contract and codegen gates are covered by the rust-lint job.
       - name: Run shared macos checks
         run: ./test.sh --only macos
 

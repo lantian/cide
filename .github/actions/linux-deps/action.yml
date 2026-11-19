@@ -1,0 +1,64 @@
+name: Install the Linux build dependencies
+description: >
+  The WebKitGTK/GTK development packages cide-app links against, with the downloaded .debs
+  cached. A composite action because both Rust jobs compile cide-app — `cargo check` and
+  `clippy` run the same pkg-config build scripts a build does — and two copies of a package
+  list drift apart one package at a time.
+
+runs:
+  using: composite
+  steps:
+    # cide-app links the system webview. Tauri 2 is on the libsoup-3 stack, so this is
+    # webkit2gtk **4.1**, not 4.0 — 4.0 is the libsoup-2 build and links a second,
+    # incompatible copy of the same libraries.
+    #
+    # libwebkit2gtk-4.1-dev pulls gtk+-3.0, libsoup-3.0 and javascriptcoregtk-4.1 in
+    # transitively; they are named anyway so that a runner image dropping one fails here
+    # with the package name rather than three thousand lines later inside a build script
+    # that could not find a .pc file.
+    #
+    # Deliberately absent: patchelf, librsvg2-dev and the rest of the AppImage/deb
+    # bundling chain. Nothing in this workflow runs `tauri build` or `cargo xtask
+    # package`; adding them would slow every run for a capability no job uses.
+    #
+    # The downloaded .debs are cached. The step was the slowest and least predictable in the
+    # job: the same 67.5 MB took 5 min, 20 min and 28 min in three runs on 2026-11-19
+    # (39–223 kB/s from the runner's mirror) — longer than the whole Rust build. Only the
+    # download is skipped: `apt-get update` still runs and apt still resolves and installs
+    # through dpkg, so a newer package version is fetched as usual and nothing is unpacked
+    # behind dpkg's back. The key rolls weekly so security updates get re-cached instead of
+    # being downloaded on every run for ever after; a new week restores last week's set.
+    # Both Rust jobs share the key; whichever finishes second gets a "cache already exists"
+    # warning on save, which is the cache working, not failing.
+    - name: Week for the apt cache key
+      id: apt-week
+      shell: bash
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore downloaded system packages
+      uses: actions/cache@v4
+      with:
+        path: ~/apt-archives
+        key: apt-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-webkit41-${{ steps.apt-week.outputs.week }}
+        restore-keys: apt-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-webkit41-
+
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        archives="$HOME/apt-archives"
+        mkdir -p "$archives/partial"
+        sudo apt-get update
+        # Dir::Cache::Archives points apt at the restored directory; Keep-Downloaded-Packages
+        # stops it deleting the .debs after installing them, which is what the cache saves.
+        sudo apt-get install -y --no-install-recommends \
+          -o Dir::Cache::Archives="$archives" \
+          -o APT::Keep-Downloaded-Packages=true \
+          libwebkit2gtk-4.1-dev \
+          libgtk-3-dev \
+          libsoup-3.0-dev \
+          libjavascriptcoregtk-4.1-dev \
+          pkg-config
+        # apt ran as root; actions/cache saves as the runner user.
+        sudo chown -R "$(id -u):$(id -g)" "$archives"
+        rm -rf "$archives/partial" "$archives/lock"

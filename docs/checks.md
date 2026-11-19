@@ -12,12 +12,12 @@ Everything CI runs, in CI's order:
 ```sh
 cargo fmt --all --check
 cargo --locked xtask contract-check
-cargo build --locked --workspace
-cargo test --locked --workspace
+cargo check --locked --workspace        # not build: see the comment in test.sh's rust_checks
+cargo test --locked --workspace --no-fail-fast
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo --locked xtask codegen --check
 pnpm --dir ui exec tsc --noEmit
-pnpm --dir ui run check:<name>          # every check:* script in ui/package.json
+pnpm --dir ui run check:<name>          # every check:* script in ui/package.json, in parallel
 pnpm --dir ui build
 ```
 
@@ -37,7 +37,16 @@ pnpm --dir ui build
   sitting on `height: 100%` and on `spawnPlans.ts`. Adding a `check:foo` script to
   `ui/package.json` is enough — CI enumerates them rather than listing them. Several modules
   are import-free *so that* their check can compile them standalone; keep them that way.
-- **Linux is the only platform cide has ever run on.** `docs/platforms.md` is the record: what a `cfg` arm does on macOS instead, which guarantees have no equivalent there (`PR_SET_PDEATHSIG` above all), and what still needs a Mac. The `macos` CI job is advisory until it has passed once.
+- **`./test.sh` runs the `check:*` scripts in parallel** (`CIDE_CHECK_JOBS`, default every
+  core) and reports them in order afterwards; that took the UI suite from 180 s to 50 s here.
+  So a check must not share a fixed output path with another one, and **a check that asserts on
+  its own wall-clock time belongs in `ui_serial_checks` in `test.sh`**, which runs alone after
+  the rest: `check:markdown`'s linear-time assertion failed on its first parallel run, because
+  contention skews the two timings it compares by different amounts.
+- **CI builds with `CARGO_PROFILE_DEV_OPT_LEVEL=0` and `CARGO_PROFILE_DEV_DEBUG=line-tables-only`**
+  (`.github/workflows/ci.yml` has the measurements). A test that only passes optimised is a
+  test with a timing assumption; locally the dev profile is unchanged.
+- **Linux is the only platform cide has ever run on.** `docs/platforms.md` is the record: what a `cfg` arm does on macOS instead, which guarantees have no equivalent there (`PR_SET_PDEATHSIG` above all), and what still needs a Mac. The `macos` CI job is advisory until it has passed once, and runs only on pushes to master.
 - **The macOS arms type-check from here for nine of the twelve crates, and it is worth doing before touching a `cfg`-gated one.** `docs/platforms.md`'s *Type-checking for macOS from Linux* has the command; it uses `scripts/darwin-cc.sh` and `DOCS_RS=1`. **`cide-app`, `cide-git` and `xtask` are excluded** — `git2` is `vendored-openssl`, so they build OpenSSL for Darwin and that needs a real cross toolchain. So it covers `cide-core`'s `child_env` arms and every other domain crate, and it does *not* cover the crate that links tauri: the two errors a Mac reported in M16 were both in `cide-app` and this would have caught neither. It proves nothing about linking or runtime, and it is not a substitute for the `macos` CI job.
 
 ## By surface

@@ -170,16 +170,18 @@ Run the full CI suite before pushing:
 ```sh
 ./test.sh                    # all CI checks for this host
 ./test.sh --list             # print the commands without running them
-./test.sh --only rust        # one CI job; also ui, no-tauri, shell, fork-pins, macos
+./test.sh --only rust        # rust-lint + rust-test (two CI jobs); also ui, no-tauri, shell, fork-pins, macos
 ```
 
 CI calls the same script, so its command list cannot drift from the local one. A full run
-includes shell portability, the Tauri dependency boundary, Rust formatting/build/tests/clippy,
+includes shell portability, the Tauri dependency boundary, Rust formatting/check/tests/clippy,
 contract and generated bindings, frozen UI dependency installation, TypeScript, every
 `check:*` script, the UI build, and remote fork-pin checks. It continues after independent
 failures and summarizes them all, with complete output and `results.tsv` under
 `target/ci-checks/run-*/`. Rust tests use `--no-fail-fast`, so one failed test binary does not
-hide the rest of the workspace. CI uploads these logs as job artifacts.
+hide the rest of the workspace. The UI `check:*` scripts run in parallel — `CIDE_CHECK_JOBS=N`
+sets how many at once — and are reported in order when they finish. CI uploads these logs as
+job artifacts.
 
 This runs the native host's tests. Run it on macOS to exercise macOS's system Bash, Git,
 filesystem and target-specific Rust code; a green Linux run cannot establish that those pass.
@@ -265,4 +267,4 @@ edit by hand, for a minor bump between releases.
 **Linux is the only platform cide has ever run on.** [`docs/platforms.md`](docs/platforms.md) is
 the record: what a `cfg` arm does on macOS instead, which guarantees have no equivalent there
 (`PR_SET_PDEATHSIG` above all), and what still needs a Mac. The `macos` CI job is advisory until
-it has passed once. Windows is not a target.
+it has passed once, and runs only on pushes to master — a PR does not get it. Windows is not a target.
