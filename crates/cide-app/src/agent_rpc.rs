@@ -4277,31 +4277,23 @@ fn hand_back_to_run_with_view(
 /// A subagent's turn ended — handed back, finished, or failed. Tell the pane the run's
 /// [`RunNotify`] names, once per burst — or nobody, for a run dispatched `notify: none`.
 ///
-/// # Why this is a PTY write at all
+/// # Delivery must not submit a person's draft
 ///
-/// A run reports back only through `.cide/tasks.json`, and nothing reads that file on the
-/// orchestrator's behalf. **There is no out-of-band channel into a running `claude`** — no socket,
-/// no signal, nothing that hands a live session a message which is not a keystroke — so the only
-/// way to tell the project's primary session that there is something new to read is to write into
-/// its PTY, exactly as a dispatch writes a run's opening prompt into its child's. That is the
-/// third reason the interactive-PTY decision earned its place, and it is also why
-/// `AgentsConfig::nudge_orchestrator` exists: this types into somebody's own conversation.
+/// Codex and OpenCode receive an independent native turn in the visible conversation.
+/// The user's terminal composer is left untouched, including while a notification is
+/// processed. Terminal-only harnesses have no separate live input channel: they wait
+/// for a recognized empty composer, claim the manual-input lane, and verify the whole
+/// notification before sending Enter. Idle alone never proves the composer is empty.
 ///
-/// # Four rules, each a bug if dropped
+/// Notifications still obey four rules:
 ///
-/// 1. **Only when the orchestrator is `Idle | AwaitingInput`** ([`may_be_typed_into`]). Bytes
-///    written into a session mid-turn land in whatever it is composing.
-/// 2. **One line, terminated with `\r`** ([`submit`]). A PTY write is keystrokes, so an embedded
-///    newline is another Enter — finding 8, and the rule every prompt path in this codebase
-///    inherits. The bytes are then *delivered* as text-then-lone-Enter through
-///    `crate::agents::type_submitted_line`, never one chunk: the TUI's paste detection eats a
-///    trailing CR off a long chunk, and the nudge sat unsubmitted in the composer until that
-///    was measured — see the helper's header.
-/// 3. **Coalesced** ([`NudgeCoalescer`]), or six agents finishing together type six prompts and
-///    are answered six times.
-/// 4. **The setting is read from disk at the moment of the nudge** ([`deliver_nudge`]), never
-///    cached: `.cide/config.json` is committed, and a `git checkout` can switch it off under a
-///    running app.
+/// 1. **Only when the orchestrator is `Idle | AwaitingInput`** ([`may_be_typed_into`]).
+///    A native receiver claim rechecks readiness against concurrent user turns.
+/// 2. **One line** ([`nudge_line`]). Terminal fallback verifies exact content and sends
+///    a separate Enter; it never appends to or clears a user draft.
+/// 3. **Coalesced** ([`NudgeCoalescer`]), or six agents finishing together start six turns.
+/// 4. **The setting is read from disk at delivery** ([`deliver_nudge`]), so a checkout
+///    can switch it off under a running app.
 ///
 /// Called from two producers and nowhere else: `crate::agents::AgentRegistry::set_state`, on
 /// the `Running | AwaitingPermission → Idle` edge and on an app-carrying transition into
@@ -4646,7 +4638,7 @@ fn flush_nudges(app: &AppHandle) {
     }
 }
 
-/// Read the setting, find the pane the route names, check it is not mid-turn, and type the line.
+/// Read the setting, resolve the live pane, and deliver an independent notification.
 ///
 /// Every step can decline, and each declines by doing nothing: this runs on a background thread
 /// with no user in front of it, and there is no screen on which "the nudge could not be sent"
@@ -4795,23 +4787,7 @@ fn deliver_nudge(app: &AppHandle, project: ProjectId, route: &NudgeRoute, turns:
         return;
     }
 
-    let title = title_of(app, project, &turns);
-    let Some(bytes) = submit(&nudge_line(&turns, title.as_deref())) else {
-        return;
-    };
-
-    let Some(pty) = app
-        .try_state::<SessionRegistry>()
-        .and_then(|sessions| sessions.get(session))
-    else {
-        return;
-    };
-    tracing::info!(%project, turns = turns.len(), "nudging the product owner");
-    // The text now, the Enter alone after a beat — never one chunk. The TUI's paste detection
-    // is length-triggered, and a line this long written whole lands in the composer with its
-    // CR eaten: the measured shape was two nudges stacked in the product owner's input box,
-    // submitted by nobody. `type_submitted_line`'s header carries the measurements.
-    crate::agents::type_submitted_line(app, session, &pty, bytes);
+    deliver_notification(app, project, session, turns);
 }
 
 /// Tell the review tab that already owns this task, instead of opening a second one. (M79)
@@ -4836,18 +4812,41 @@ fn note_to_reviewer(app: &AppHandle, project: ProjectId, session: SessionId, tur
         NUDGES.hold(turns);
         return;
     }
+    deliver_notification(app, project, session, turns);
+}
+
+/// Both existing conversations use the same protected delivery route. Native
+/// transports leave a draft untouched; terminal-only delivery waits for an empty
+/// composer under the manual-input gate. A bare automatic Enter is never safe.
+fn deliver_notification(app: &AppHandle, project: ProjectId, session: SessionId, turns: Vec<Turn>) {
     let title = title_of(app, project, &turns);
-    let Some(bytes) = submit(&nudge_line(&turns, title.as_deref())) else {
-        return;
-    };
     let Some(pty) = app
         .try_state::<SessionRegistry>()
         .and_then(|sessions| sessions.get(session))
     else {
         return;
     };
-    tracing::info!(%project, %session, turns = turns.len(), "telling the task's open reviewer");
-    crate::agents::type_submitted_line(app, session, &pty, bytes);
+    match crate::peer_chat::submit_background(
+        app,
+        session,
+        &pty,
+        nudge_line(&turns, title.as_deref()),
+    ) {
+        Ok(true) => {
+            tracing::info!(%project, %session, turns = turns.len(), "notified the orchestrator")
+        }
+        Ok(false) | Err((false, _)) => NUDGES.hold(turns),
+        Err((true, error)) => {
+            tracing::warn!(%project, %session, %error, "notification delivery uncertain; not resending");
+            crate::emit::pool_notice(
+                app,
+                project,
+                format!(
+                    "Subagent notification delivery was not confirmed. Check its conversation and cide_agent_runs: {error}"
+                ),
+            );
+        }
+    }
 }
 
 /// The worktree the run being reviewed stood in, if it had one. (M79)
@@ -7987,9 +7986,10 @@ mod tests {
     /// makes about why a prompt is submitted this way and why it may not contain another one.
     ///
     /// What a shell's `read` **cannot** see is a raw-mode TUI's paste detection — claude 2.1.245
-    /// eats the trailing CR off exactly these bytes when they arrive as one chunk, which is why
-    /// delivery goes through `crate::agents::type_submitted_line` and this test stays a test of
-    /// the byte shape, not of the delivery.
+    /// eats the trailing CR off these bytes when they arrive as one chunk. Production
+    /// terminal delivery separates the paste and Enter and verifies the composer first;
+    /// the native draft/Enter regression lives in `codex_console_tests`. This shell
+    /// test stays a test of the byte shape, not of the interactive delivery.
     #[test]
     fn the_nudge_reaches_a_real_child_as_one_submitted_line() {
         let bytes = submit(&nudge_line(

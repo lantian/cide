@@ -594,6 +594,8 @@ impl Provider {
                                         content.iter().any(|part| {
                                             part["text"].as_str().is_some_and(|text| {
                                                 text.starts_with("Chat from Peer")
+                                                    || text
+                                                        .starts_with("A subagent turn just ended:")
                                             })
                                         })
                                     })
@@ -841,6 +843,56 @@ fn real_codex_native_lock_conflict_reports_failure_and_recovers_after_owner_exit
         resumed.console.receiver().is_ok_and(|r| r.is_some())
     });
     assert_eq!(resumed.console.receiver().unwrap().unwrap().thread, thread);
+}
+
+#[test]
+#[ignore = "installed Codex, local fake provider and isolated state only; no model quota"]
+fn real_codex_native_subagent_notification_leaves_draft_until_enter() {
+    let dir = Temp::new();
+    let provider = Provider::new();
+    let native = Native::start(&dir, &provider, None);
+    native.wait("notification receiver", || {
+        native.console.receiver().is_ok_and(|r| r.is_some())
+    });
+    let draft = "USER_PROMPT_ONLY_AFTER_ENTER";
+    native.tui.write(draft.as_bytes().to_vec());
+    native.wait("unfinished user prompt", || native.screen().contains(draft));
+    let notification = "A subagent turn just ended: developer handed its turn back, dispatched with no task. Check mcp__cide__cide_agent_runs.";
+    provider.hold.store(true, Ordering::SeqCst);
+    assert_eq!(
+        native
+            .console
+            .background_prompt(notification.into(), Box::new(|| Ok(()))),
+        Ok(true)
+    );
+    native.wait("notification reaches provider", || {
+        provider.requests.lock().len() == 1
+    });
+    native.tui.write(b"_STILL_TYPING".to_vec());
+    let continued = format!("{draft}_STILL_TYPING");
+    native.wait("continued typing during notification", || {
+        native.screen().contains(&continued)
+    });
+    let request = provider.requests.lock()[0].clone();
+    assert!(request.to_string().contains(notification));
+    assert!(
+        !request.to_string().contains(draft),
+        "an automatic notification leaked the user's draft"
+    );
+    assert_eq!(provider.requests.lock().len(), 1);
+    provider.hold.store(false, Ordering::SeqCst);
+    native.wait("notification processed", || {
+        native.console.receiver().is_ok_and(|r| r.is_some())
+    });
+    native.wait("draft preserved", || {
+        cide_pty::codex_clear::composer(&native.tui.capture_screen())
+            .is_some_and(|text| text.contains(&continued))
+    });
+    native.tui.write(b"\r".to_vec());
+    native.wait("explicit user Enter", || {
+        provider.requests.lock().len() == 2
+    });
+    assert!(provider.requests.lock()[1].to_string().contains(&continued));
 }
 
 #[test]
