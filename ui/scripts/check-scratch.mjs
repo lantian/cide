@@ -253,7 +253,9 @@ try {
     '`ipc/client.ts` has the only seam to `fs_writable_roots`',
   )
   ok(
-    /fsApi\.writableRoots\(project\)/.test(store),
+    // `, worktree` since M207: the Explorer can show an agent checkout, whose writable root is the
+    // checkout itself — still Rust's answer, asked the same way.
+    /fsApi\.writableRoots\(project(?:, worktree)?\)/.test(store),
     '`treeStore.attach` asks for it — the drawer is a blake3 under $XDG_STATE_HOME and cannot ' +
       'be derived in the webview',
   )

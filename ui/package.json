@@ -150,6 +150,7 @@
     "check:ui-icons": "node scripts/check-ui-icons.mjs",
     "check:ui-scale": "node scripts/check-ui-scale.mjs",
     "check:unlisten": "node scripts/check-unlisten.mjs",
+    "check:worktree-scope": "node scripts/check-worktree-scope.mjs",
     "check:window-controls": "node scripts/check-window-controls.mjs",
     "dev": "vite",
     "preview": "vite preview",

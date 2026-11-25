@@ -19593,3 +19593,210 @@ Clippy stopped at `xtask/src/package.rs`'s `needless_match` on Rust 1.99.1. The 
 check also failed separately at `approval opens the Apply dialog`. Those test surfaces and
 the linted file are unchanged from the base. Full workspace build, codegen and UI build
 passed. Complete logs are under `target/ci-checks/run-aNJpJNRc/` in the publishing checkout.
+
+## M205 — A finished turn that stayed "waiting" after it was read
+
+Reported: a Sessions row sometimes kept *Waiting for your input* after its turn ended. Opening
+the session cleared the pane's finished marker but not the row (or the Sessions pill, or the
+rail's amber number). Webview only: no Rust, no command, no contract change.
+
+M202's "seen" was a second copy of the answer `panes/awaiting.ts` already keeps. That table is
+what the pane highlight, the tab badge, the header and the OS title read. It hears every
+`session-state` transition at once and clears on a click or keystroke in the pane. The seen set
+could drop or miss a mark the table had, in three ways:
+
+- **The acknowledgement listener was in the panel.** `onAcknowledged` was subscribed by
+  `AgentsPanelHost`, which is unmounted whenever another sidebar panel shows. `App.tsx` keeps the
+  rows attached for the rail anyway (M199). A click into a finished pane with the Files panel
+  showing cleared its marker and reached no listener for the row.
+- **A race.** The row learns `awaitingInput` only after the 200 ms throttle and a
+  `sessions_list` on the blocking pool. A click in that gap found the row still `working`, so
+  `canMarkSeen` refused it. The listing then raised the row, and nothing marked it again.
+- **A project switch reset the set.** `attach` cleared `seenIds`, so coming back raised every turn
+  already read.
+
+The fix makes the table one of the inputs. `sessionsSeen.applySeen` takes `settled`
+(`awaiting.ts::isSettled`: the table holds the child and says it is not waiting), and a raw
+`awaitingInput` row reads `idle` when it is seen *or* settled. A child the table has never heard
+of is not settled. `permission` and questions are still never downgraded. `sessionsStore`'s
+`follow` subscribes to the table (`subscribeAwaiting`, re-laying the overlay without a re-list,
+published only when a drawn activity moves) and takes over the `onAcknowledged` listener from
+the panel. That listener is still needed, because `acknowledge` returns early for a session the
+table never raised. Seen marks are kept per project. A listing answer overtaken by a newer one
+is now dropped: two `sessions_list` calls run side by side, and the older one could land last
+and set a row back to a state its session had left. One consequence, intended: peer-chat
+reviewer sessions, which the table already holds down because they wait on their writer, now
+read *Idle* on the Sessions tab too.
+
+The hook log ruled out the other suspect. Recent `Stop → AwaitingInput` transitions on the live
+instance hold steady until the next prompt or `SessionStart`, so Rust's state was not
+flickering. The mark was being lost in the webview.
+
+`check:sessions` pins the overlay (settled reads idle, a settled permission stays, settled
+neither adds to nor prunes the set, no live child is never settled), that `follow` holds both
+subscriptions, that no seen set is reset on `attach`, and that `AgentsPanelHost` has no
+listener of its own. `./test.sh --only ui`: 141 passed. `check:keys` failed on
+`ctrl+shift+h → claude.newTab`, from another session's uncommitted keymap change in the shared
+tree, which this change does not touch.
+
+**Not confirmed on a display.** To try with `./run.sh`:
+1. Finish a turn with the Files panel showing, click into the pane, then open Agents → Sessions.
+   The row should read Idle.
+2. Click into a pane the instant its turn ends. The row should never come up waiting.
+3. Open a finished row, switch projects and back. It should still read Idle.
+4. A turn that ends in the focused pane should still raise waiting until you click or type, and a
+   permission prompt should still read *Wants a permission* after a click.
+
+## M206 — A new harness tab on Ctrl+Shift+H, and dropdowns that open under their button
+
+Asked for as *"Need a hotkey and in menu … to open a tab of default harness (empty)"*, against a
+screenshot of the header's split menu, with *"btw need to correct it opening, right now it
+slightly left"*.
+
+**The tab.** `claude.newTab`, *New Harness tab*, bound to **Ctrl+Shift+H** (`shellWindow`) and
+offered as a third row in the split menu's Harness group, *harness new tab*, with the chip read
+from the keymap like its neighbours. Nothing new underneath: it is the store's `newClaudeTab`,
+the Sessions tab's `+`, which calls `tab_new_claude`. That builds a pane with no harness of its
+own, and `ConsoleSpawn::decide` gives a fresh spawn with no explicit choice Settings → Harness, so
+the tab opens empty in whatever the default harness is and the command names no CLI. The clause
+is `shellWindow && projectOpen`, `tab.console`'s: it splits nothing, so it needs no pane, but a
+detached window has no strip to add a tab to. The menu row is refused only for "no project"; a
+maximized pane is a reason to refuse a split, not a tab.
+
+The chord was chosen with the user. Ctrl+H was the first idea and loses twice: ^H is the
+backspace byte, and the key gate is a window capture listener, so every bash and Claude pane would
+lose backward-delete-char; and on macOS the blanket rewrite would land it on ⌘H, *Hide*. Ctrl+T
+(git pull) and Ctrl+Shift+T (reopen closed tab, which stays) were taken. Ctrl+Shift+H costs
+nothing in any layer: nothing bound it, xterm encodes no byte for Ctrl+Shift+letter, CodeMirror
+binds `Mod-Shift-` only for l/u/z, and ⇧⌘H is not in `MACOS_MENU_CHORDS`.
+
+**The placement.** Measured off the user's screenshot rather than guessed: the menu's border
+ended at x=224 and the split button spanned x=226–249, so the menu stopped where the button
+*starts*. `openFor` reduced the button to its bottom-left point and handed that to `placeMenu`,
+which near the right edge flips through its anchor (`x - width`): right for a pointer, one
+button-width off for anything with a width. `openFor` now keeps the element's rect and the box
+is placed by a new `placeDropdown` (`menus/model.ts`): under the element with left edges aligned,
+the **right** edges aligned when there is no room to the right, and **above** the element rather
+than over it when there is no room below. A right-click still uses `placeMenu`. Every `openFor`
+caller moves with it — the tab strip's `▾`, the project caret, the pane `⊞`, the rail's overflow,
+Shift+F10 — and for any of them with room below and to the right nothing changes.
+
+`check:menus` pins the new placement, including the reported case: a 180px box off a button at
+380–404 lands at 224, and `placeMenu` from the same button's corner at 200. `check:rows` requires
+the split menu to offer `claude.newTab`; `check:keys`' fixture carries the binding, with `KeyH` in
+its sweep. The `check:keys` failure M205 records was this change caught half-applied in the shared
+tree (the default landed before its fixture and dispatch case); it passes now. `cargo test -p
+cide-core -- commands keymap` (125 passed), `check:keys`, `check:commands`, `check:switcher`,
+`check:keymap`, `check:menus`, `check:menu-model`, `check:rows`, `check:problems` and `tsc`
+passed, and so did `./test.sh --only ui`: 142 passed, 0 failed, the production build included.
+
+**Not confirmed on a display.** To try with `./run.sh`:
+1. Open the header's split icon. The menu's right edge should be flush with the button's.
+2. Click *harness new tab*: a new tab with an empty session, focused, in the Settings → Harness
+   default. Try it with codex or opencode selected too.
+3. Press Ctrl+Shift+H in a bash pane, a Claude pane and an editor: a new tab each time, and no
+   stray character typed into the terminal.
+4. Ctrl+Shift+T still reopens the tab just closed.
+5. The palette lists *New Harness tab* with ⌃⇧H.
+6. The tab strip's `▾` and the project caret should also sit under their buttons.
+
+## M207 — Pick an agent worktree in the Explorer; one choice for the tree, the Git panel and the Log
+
+The user asked to select a worktree in the main Explorer panel. Two choices were settled with them
+first. The picker **switches the whole tree** to the checkout; the cheaper alternative, a
+"Worktrees" group next to *Scratches*, was declined. And the choice is **shared**: the Git panel's
+selector moves with it, and so does the bottom Log's *Current branch*. The Log still has no picker
+of its own; the worktree milestone's "Ninth" call stands.
+
+**Rust — `crate::worktree_fs`.**
+- `WorktreeFs` is a second, lighter index per checkout: `Index`, `Filter` and `Watcher`. It has
+  no picker matcher, no symbols and no groups, and it does not notify LSP or `dotcide`.
+- It is held by the project's `ProjectFs`, at most two, most recently used first, so it never
+  outlives the project. `fs_close`, or a settings re-walk that replaces the entry, drops it.
+- It is built on the first tree call that names it (`view()`, which walks synchronously on the
+  blocking pool). The path is validated by `cide_git::worktree::resolve`; anything else is
+  `OutsideProject`.
+- **The exclusions are compiled again against the checkout.** The project's compiled policy makes
+  the checkout an excluded folder of the project root, and the walk returns an empty tree.
+- Its budget is `Budget::sibling` of the project's: the same global pool, its own per-project
+  allowance.
+
+**Rust — commands and events.**
+- Thirteen tree commands take an optional `worktree`.
+- The mutating file ops keep their signatures. They also fold into any open view
+  (`ProjectFs::fold_views`), so *New File…* in a checkout shows its row before the command returns.
+- `writable_paths` includes the open views' roots, so a symlinked project root is not refused.
+- `git_tree_status` takes `worktree` through `scoped`.
+- `cide://fs-changed` and `cide://fs-status` gain a `worktree` tag, set only by a view's watcher
+  (`FsEvents::view_status` / `view_changed`, defaulted to nothing for the test doubles).
+- No command or event was added: `contract-check` reports 422 and 48, in sync.
+
+**UI.**
+- `chrome/useWorktrees.ts` is now a zustand store: one choice and **one list** per project, per
+  window, with a refcounted listener. The list is shared too. With one per consumer, a Log that
+  loaded before a new checkout existed judged the user's fresh pick stale and dropped it for
+  everyone.
+- `chrome/worktreeScope.ts` holds the rules, pure and import-free: `adoptsBurst`, `projectHears`,
+  `checkoutHears`, `keptChoice`, `worktreeLogScope` and `logScopeChain`.
+- The Explorer draws the selector on a kit `toolbar` strip under its header, and only when the
+  project has checkouts. The header was already full at 252px.
+- The tree and its tags attach to `(project, worktree)`. Every listener adopts only its own tree's
+  bursts.
+- An untagged `fs-status` while a checkout is shown refreshes too: a project re-walk drops the
+  views, and the next call rebuilds this one.
+- `IndexWarning` is shown for the project's index only, because its actions act on that index.
+- `treeStore` and `gitStatusStore` carry `worktree`. Every `fsApi` call is scoped, and every guard
+  after a round trip is `inScope`.
+- The branch readout ignores tagged bursts. The Git panel, the Log and the rail's change badge
+  hear untagged bursts, because the project's watcher sees the shared refs move, plus their own
+  checkout's, the only watcher that sees its `HEAD` and `index`.
+- **The rail's change badge follows the choice.** The user's first try reported it still showing
+  the master checkout's 20 after the tree moved to an agent checkout: `gitCountStore` had been
+  written to count the project whatever the panel showed. It now carries `worktree`: `App.tsx`
+  passes `useWorktrees(project).worktree`, which also keeps the stale-choice fallback live with
+  the sidebar shut. The walk is `git_status(…, worktree)`. `noteChangeCount` and
+  `holdChangeCount` name the tree, so a panel feeds and holds the badge only for the tree they
+  both show. The parameter defaults to the project, so `check-commit-message`'s mounted badge is
+  unchanged.
+- The Log's chain is `logScopeChain(one, pinned, worktree, merged)`. A filter outranks the checkout
+  and does not clear it. The branch box reads *Current branch in <dir>*.
+- ⌖ reveals in the tree on screen only. A project file while a checkout is shown gets the existing
+  "not in the tree" notice rather than moving all three surfaces back.
+
+**Checks.**
+- New `check:worktree-scope`, 91 assertions: the rules, plus source pins that every listener filters
+  by tag, every tree call carries the scope, and every Rust tree command takes it.
+- `check:log` is re-pinned to the new chain.
+- `check:scratch`'s `writableRoots` regex accepts the scope argument.
+- `check:git` pins `BranchSelector`'s literal `if (!change.git) return`, so the tag check is a line
+  of its own.
+- Five tests in `worktree_fs::tests`:
+  - a checkout is its own tree and its root is never excluded;
+  - anything but a cide checkout is refused;
+  - a create or rename folds into the view;
+  - the cap of two, and rebuilding after eviction;
+  - a removed checkout is forgotten, and closing the project cancels its views.
+
+**What was run.**
+- `cargo test -p cide-app --lib -- worktree_fs cmd::fs cmd::git files::`: 50 passed, 2 ignored.
+- `cargo test -p cide-fs`, `cargo test -p cide-git worktree`: all passed.
+- `cargo clippy -p cide-app -p cide-fs --all-targets -D warnings` and `cargo fmt --check`: clean.
+- `contract-check` and `codegen --check`: in sync.
+- `./test.sh --only ui`: all checks pass after the two pin fixes above.
+
+**Not done or not confirmed.**
+- The plan's Rust test for `git_tree_status` with a worktree was not written: the command needs a
+  managed `WorkspaceState`. It goes through the same `scoped` that `git_status` already uses, and is
+  covered only by that.
+- Ctrl+P, Search and *Show History* stay project-scoped. History on a checkout file is unverified.
+- The choice is per window: a detached window chooses on its own.
+- **Not confirmed on a display.** To try with `./run.sh`:
+  1. In a project, `git worktree add .cide/worktrees/try -b cide/try`, or dispatch a role.
+  2. A strip with the selector appears under the Explorer's header. Pick `cide/try`. The tree,
+     count and tags become the checkout's; the Git panel shows the same choice; the Log's branch
+     box reads *Current branch in try* and walks `cide/try`.
+  3. Edit a checkout file from a shell. Its row gains **M**, and the Git panel lists it, with no ↻.
+  4. *New File…* inside the checkout's tree: the row appears and is selected at once.
+  5. Pick the project row. All three surfaces return to the project.
+  6. `./run.sh --audit-panes` for the strip's layout.
+

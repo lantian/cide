@@ -911,6 +911,23 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (on === null) return unmet(command, 'no focused pane')
         return void ws.addRow(on.project, on.tab, on.pane, 'after', { kind: 'newClaude' })
 
+      /*
+       * Ctrl+Shift+H — a new tab with one empty session in it, and the header split menu's
+       * *harness new tab* row. `tab.console`'s two re-checks, for its reason: the tab lands in
+       * this window's strip and a detached window has none, and a `Command::when` gates the
+       * palette and never the keyboard. Which CLI runs is Rust's — `tab_new_claude` leaves the
+       * pane's harness unset and a fresh spawn takes Settings → Harness — so nothing here names
+       * one. `newClaudeTab` focuses the new pane itself.
+       */
+      case 'claude.newTab': {
+        if (boot()?.role.kind !== 'shell') return unmet(command, 'this window has no tab strip')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        return void ws
+          .newClaudeTab(project.id)
+          .catch((error: unknown) => notifyFailure(error, { project: project.id }))
+      }
+
       case 'claude.fork':
         // Branches the focused conversation: shared history to this point, then divergent.
         if (on === null) return unmet(command, 'no focused pane')

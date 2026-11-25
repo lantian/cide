@@ -145,6 +145,7 @@ import { copyText } from '@/sidebar/copyText'
 import { shareEqual } from '@/store/shareEqual'
 import { useWorkspace } from '@/store/workspace'
 import { useWorktrees } from '@/chrome/useWorktrees'
+import { checkoutHears, logScopeChain, worktreeLogScope } from '@/chrome/worktreeScope'
 import {
   applyLocalText,
   comparePair,
@@ -658,8 +659,9 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
     return { kind: 'merged', repos: ids }
   }, [repoKey])
   /*
-   * The agent checkouts under `.cide/worktrees/`, for the branch box to **mark** — not to choose
-   * which checkout the log reads. There was a worktree picker in the filter bar, and the user's
+   * The agent checkouts under `.cide/worktrees/`, for the branch box to **mark**, and — since
+   * M207 — the checkout the Explorer and the Git panel are pointed at, which this tab follows.
+   * There was a worktree picker in the filter bar, and the user's
    * call was that it is redundant: a linked worktree shares the project's object database and
    * refs, so filtering the log to `cide/<role>-<task>` already shows that checkout's history. The
    * branch box now draws which of its branches are checked out in a worktree, and where.
@@ -667,12 +669,33 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
    * The Log tab only: a History tab is one file in one repository already.
    */
   const logTab = repo === null && path === null
-  const checkouts = useWorktrees('log', logTab ? project : null)
+  const checkouts = useWorktrees(logTab ? project : null)
   const logWorktrees = useMemo(
     () => (logTab ? checkouts.worktrees : undefined),
     [logTab, checkouts.worktrees],
   )
-  const scope = oneScope ?? pinnedScope ?? mergedScope
+  /*
+   * The shared checkout choice, as a scope. (M207)
+   *
+   * Not a picker of the Log's own — the user's "Ninth" call stands, and the branch box already
+   * shows any branch's history. What the user asked for is the other direction: pointing the
+   * Explorer (or the Git panel) at an agent's checkout should move the Log too, so *Current
+   * branch* is the checkout's `HEAD`. `git_log`'s `One` scope resolves a checkout's id through
+   * `cide_git::worktree::find`, which is the fallback that existed for the old picker.
+   *
+   * Below a filter's scope in the chain and above the merged one: a *View commits* or a folder
+   * history narrows the walk without clearing the choice — it is shared, and a filter typed here
+   * must not move the Explorer.
+   */
+  const worktreeScope = useMemo<LogScope | null>(
+    () => worktreeLogScope(logTab, checkouts.current),
+    [logTab, checkouts.current],
+  )
+  const scope = logScopeChain(oneScope, pinnedScope, worktreeScope, mergedScope)
+  // The checkout whose own watcher this tab also hears, and whose name the branch box shows —
+  // only while the checkout is what the walk is actually scoped to.
+  const scopedCheckout = worktreeScope !== null && scope === worktreeScope ? checkouts.current : null
+  const scopedCheckoutRoot = scopedCheckout?.repo.root ?? null
 
   // --- the debounce -------------------------------------------------------------------------
   //
@@ -934,8 +957,11 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
    * `git add` — or a `git status` in a loop — must not restart a frontier walk.
    */
   useEffect(() => {
-    const stop = events.onFsChanged((changed: ProjectId, change) => {
+    const stop = events.onFsChanged((changed: ProjectId, change, tag) => {
       if (changed !== project) return
+      // The project's watcher always (refs are shared); a checkout view's only for the checkout
+      // this tab walks, whose `HEAD` only that watcher sees.
+      if (!checkoutHears(scopedCheckoutRoot, tag)) return
       if (!gitRefsMoved(change)) return
       if (gitTick.current !== null) return
       gitTick.current = setTimeout(() => {
@@ -954,7 +980,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         gitTick.current = null
       }
     }
-  }, [project])
+  }, [project, scopedCheckoutRoot])
 
   /**
    * The loaded page's oids, newest first — what decides which of two selected commits is older.
@@ -2132,6 +2158,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         onRefresh={() => setRefreshes((n) => n + 1)}
         onFindCommit={onFindCommit}
         worktrees={logWorktrees}
+        checkout={scopedCheckout?.repo.name ?? null}
         /*
          * One pane, two answers, decided in one place.
          *

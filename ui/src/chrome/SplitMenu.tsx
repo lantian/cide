@@ -9,14 +9,17 @@
  * a different gesture (a tile of the domain's *default* kind) from the labelled pair beside it.
  * The request was to hide them under the icon. The icon now opens a menu, in two groups by what
  * the new pane runs (bash, harness), each offering both shapes: a **pane beside** the focused one
- * (a tile in its row) and a full-width **row below** it.
+ * (a tile in its row) and a full-width **row below** it. The harness group has a third row, a
+ * **new tab** holding one empty session in the default harness (`claude.newTab`, Ctrl+Shift+H) —
+ * asked for "in menu" beside the hotkey, and this is the menu that already answers "where do I
+ * get another harness". A shell has no tab of its own to offer, so the bash group stays at two.
  *
  * # Hotkeys come from the keymap, not from here
  *
  * Every item names its command, and `resolveMenu` fills the chip from the same resolved keymap
  * the key gate dispatches from, so a rebound key shows up here with no edit to this file. The
- * four commands are the *kind-specific* ones (`terminal.splitRight`, `claude.split.right`, …),
- * because the generic `pane.split.right` splits with the domain's default and a chip for it on a
+ * pane and row commands are the *kind-specific* ones (`terminal.splitRight`,
+ * `claude.split.right`, …), because the generic `pane.split.right` splits with the domain's default and a chip for it on a
  * "bash" line would promise that keystroke makes a shell. (`PaneTitleBar`'s own `⊞` menu leaves
  * `command` off for exactly that reason; here the commands are the per-kind ones, so the chip is
  * true.) A chip is cosmetic: clicking runs the gesture directly through the store.
@@ -39,7 +42,7 @@ import { useCallback, useRef } from 'react'
 import type { SplitIntent } from '@/ipc/generated'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import { useWorkspace } from '@/store/workspace'
-import { rowGate, rowTarget } from './menuModel'
+import { NO_PROJECT_REASON, rowGate, rowTarget } from './menuModel'
 import { Icon } from '@/icons/Icon'
 
 import styles from './AppHeader.module.css'
@@ -53,7 +56,9 @@ import styles from './AppHeader.module.css'
  * "bash pane" without this file knowing which surface is asking; `what` is the object of a
  * tooltip's sentence, so both surfaces describe the same intent in the same words.
  *
- * `beside` / `row` are the command ids whose chip each shape shows.
+ * `beside` / `row` are the command ids whose chip each shape shows. `tab`, when present, is the
+ * command for a whole new tab of that kind — the harness only; the pane title bar's `⊞` adds to
+ * a row and has no use for it, so it reads none of this field.
  */
 export const PANE_KINDS: ReadonlyArray<{
   id: 'bash' | 'claude'
@@ -62,6 +67,7 @@ export const PANE_KINDS: ReadonlyArray<{
   intent: SplitIntent
   beside: string
   row: string
+  tab?: string
 }> = [
   {
     id: 'bash',
@@ -78,6 +84,7 @@ export const PANE_KINDS: ReadonlyArray<{
     intent: { kind: 'newClaude' },
     beside: 'claude.split.right',
     row: 'claude.addRow',
+    tab: 'claude.newTab',
   },
 ]
 
@@ -116,13 +123,23 @@ export function SplitMenu({ onAddRow }: SplitMenuProps) {
     [onAddRow],
   )
 
+  // A tab, not a split: it needs a project and nothing else — a maximized pane is no reason
+  // to refuse one, so this reads `rowTarget` for the project rather than `rowGate`. The tab
+  // opens empty in the default harness; `tab_new_claude` leaves the CLI to Settings → Harness.
+  const newTab = useCallback(() => {
+    const target = rowTarget(useWorkspace.getState().boot)
+    if (target === null) return
+    void useWorkspace.getState().newClaudeTab(target.project)
+  }, [])
+
   const { openFor, isOpen, menu } = useContextMenu({
     label: 'Split pane',
     items: (): MenuEntry[] => {
       // Read when the menu opens, not when the header last painted — see `useContextMenu`.
       const why = onAddRow ? null : rowGate(useWorkspace.getState().boot)
+      const noProject = rowTarget(useWorkspace.getState().boot) === null ? NO_PROJECT_REASON : null
       const out: MenuEntry[] = []
-      PANE_KINDS.forEach(({ id, word, what, intent, beside: besideCommand, row: rowCommand }, i) => {
+      PANE_KINDS.forEach(({ id, word, what, intent, beside: besideCommand, row: rowCommand, tab: tabCommand }, i) => {
         if (i > 0) out.push({ kind: 'separator' })
         // A heading row (`information`) is how this menu draws a group: it is not focusable and
         // keyboard navigation skips it, which a disabled item would not.
@@ -143,6 +160,16 @@ export function SplitMenu({ onAddRow }: SplitMenuProps) {
           disabledReason: why ?? undefined,
           run: () => row(intent),
         })
+        if (tabCommand !== undefined) {
+          out.push({
+            id: `${id}-tab`,
+            label: `${word} new tab`,
+            command: tabCommand,
+            tooltip: `Open a new tab holding ${what}, in the default harness`,
+            disabledReason: noProject ?? undefined,
+            run: newTab,
+          })
+        }
       })
       return out
     },
@@ -157,7 +184,7 @@ export function SplitMenu({ onAddRow }: SplitMenuProps) {
         type="button"
         className={`${styles.action} ${styles.actionSplit}`}
         data-audit="headerSplit"
-        title={reason ?? 'Split — add a bash or harness pane or row'}
+        title={reason ?? 'Split — add a bash or harness pane or row, or a harness tab'}
         aria-label="Split pane"
         aria-haspopup="menu"
         aria-expanded={isOpen}

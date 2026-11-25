@@ -419,6 +419,31 @@ cases create state files as well as their project fixtures.
 
 `check:tree-status`, `check:tree-flicker`, `check:fs-clipboard`, `check:new-entry`, plus `check:scratch` and `check:excalidraw` for the context menu's **New ▸** submenu — whose rows are `SCRATCH_TYPES`, the *New scratch file…* picker's list, so an extension's languages appear there and a literal array would be the second copy that silently stops growing. Picking one **seeds** the name box with `.rs` and puts the caret in front of it, and three things about that are silent: `checkName` takes the seed as a fourth argument so Enter on a bare `.rs` refuses down the same road as Enter on an empty box (in the pure module, because `check:new-entry` can drive it and a branch in a `useCallback` could only be grepped for) — `draftSeed` must therefore be in `commitDraft`'s dep array, and there is no `exhaustive-deps` lint here to say so; "untouched" is measured against the seed, or the box greets *New ▸ Rust* with the dot-file note; and `setSelectionRange(0, 0)` is what stops `parser` typed into `.rs` spelling `.rsparser`, which is a legal filename nothing refuses
 
+### The Explorer's worktree view
+
+Run `check:worktree-scope`, `check:log`, `check:scratch`, `check:tree-status`,
+`check:tree-flicker`, `check:new-entry`, `check:render` and
+`cargo test --locked -p cide-app --lib worktree_fs` (M207). The Explorer can show an agent
+checkout under `.cide/worktrees/` from an index of its own (`crate::worktree_fs`). One choice,
+`chrome/useWorktrees.ts`, drives the Explorer, the Git panel and the Log's *Current branch*.
+
+What breaks silently:
+- **The exclusions must be compiled against the checkout.** The project's compiled policy makes the
+  checkout an excluded folder of the project root, and the walk returns an empty tree with no error.
+- **Every tree call carries the scope.** A `treeStore` call that forgets `worktree` answers rows from
+  the project's index into a tree drawing the checkout. Every guard after a round trip must be
+  `inScope` (project *and* checkout), not `get().project !== project`.
+- **Every `fs-changed` / `fs-status` listener decides what a `worktree` tag means to it.**
+  - Project mirrors (the change count, the branch readout, the checkout list) ignore tagged
+    bursts.
+  - A file tree adopts only its own tree's.
+  - The Git panel and the Log hear untagged bursts plus their own checkout's.
+  - Path-keyed listeners (blame, the change column, terminal links) need no change.
+- **The checkout list is shared, not per consumer.** A consumer with an older list would drop the
+  user's fresh choice for every surface.
+- **A view never outlives its `ProjectFs`.** A settings re-walk drops the views. The Explorer
+  re-asks on the untagged `fs-status`, and `view()` rebuilds on that first call.
+
 ### The properties card
 
 **Touches:** the properties card — `cide_ipc::properties`, `cide_core::properties`, `cide_git::properties`, `cmd::file::file_properties{,_dir}`, `cmd::git::file_properties_git`, `chrome/FileProperties*`, `filePropertiesModel.ts`
@@ -1067,12 +1092,12 @@ The MR diff folds unchanged stretches at any size (`presentSegments`' `foldAlway
 
 ### The session journal and the Sessions tab
 
-**Touches:** `cide_ipc::sessions`, `cide_core::sessions` (with its `Organize` groups and `activity` table, M199), `cide-app`'s `sessions_state` and `cmd::sessions` (`sessions_organize`), the `observe_workspace` call and `projects_changing_session_views` in `WorkspaceState::apply`, `AgentRegistry::journal_sightings` and the `observe_runs` call in its `flush`, `cide://sessions-changed`, `ui/src/sidebar/{sessionsStore,sessionsWaiting}.ts`, `AgentsPanel/{SessionsPanel,sessionsModel,sessionsTree,sessionsSeen,useSessionsDrag,openJournalSession}.ts(x)`, `chrome/railMarks.ts`, the kit's `TreeRow`, `InlineRename` and `DragGhost`, `openRun.ts::showOpenPlan`
+**Touches:** `cide_ipc::sessions`, `cide_core::sessions` (with its `Organize` groups and `activity` table, M199), `cide-app`'s `sessions_state` and `cmd::sessions` (`sessions_organize`), the `observe_workspace` call and `projects_changing_session_views` in `WorkspaceState::apply`, `AgentRegistry::journal_sightings` and the `observe_runs` call in its `flush`, `cide://sessions-changed`, `ui/src/sidebar/{sessionsStore,sessionsWaiting}.ts`, `panes/awaiting.ts`'s `subscribeAwaiting`/`isSettled` (M205), `AgentsPanel/{SessionsPanel,sessionsModel,sessionsTree,sessionsSeen,useSessionsDrag,openJournalSession}.ts(x)`, `chrome/railMarks.ts`, the kit's `TreeRow`, `InlineRename` and `DragGhost`, `openRun.ts::showOpenPlan`
 
-`cargo test -p cide-core sessions`, `cargo test -p cide-app -- agents workspace_state lifecycle`, `check:sessions`, `check:agents-render`, `check:rail-marks`, `check:kit`, `check:selectors`, `check:task-links`, `cargo --locked xtask codegen --check`, `cargo --locked xtask contract-check`, `./target/debug/cide-headless sessions <root>`. (M134, M199, M202) Nine silent failures.
+`cargo test -p cide-core sessions`, `cargo test -p cide-app -- agents workspace_state lifecycle`, `check:sessions`, `check:agents-render`, `check:rail-marks`, `check:kit`, `check:selectors`, `check:task-links`, `cargo --locked xtask codegen --check`, `cargo --locked xtask contract-check`, `./target/debug/cide-headless sessions <root>`. (M134, M199, M202, M205) Nine silent failures.
 - **The journal is keyed by conversation, not by pane or run.** Keyed any other way, a run's mirror tab and a resumed console each become a second row for one conversation. `Journal::upsert` merges by id, then by run, then by a stand-in's handle. A pane sighting never demotes a run's kind and never blanks what the run knew. `/clear` is deliberately a second row.
 - **`last_seen` alone is not news.** The tree mutates on every focus click, and `observe_workspace` runs on every accepted mutation. A merge that answered "changed" for a newer `last_seen` would write `sessions.json` on every click. It counts only after `SEEN_GRANULARITY_MS`.
-- **"Waiting" is Rust's, "seen" is the webview's.** `awaitingInput` lasts until the next `Busy`; `sessionsSeen.applySeen` reads a seen one as `idle` as the store adopts rows, so every reader agrees. Only `awaitingInput` is downgraded (never `permission` or a question), a mark is dropped as soon as the raw activity moves, and the focus effect is keyed on the pane, never the rows — keyed on rows it would mark a turn that just ended in the pane you are staring at as already read. The idle sweep (`idleLive`) must never include the pinned console or a run. (M202)
+- **"Waiting" is Rust's, "seen" is the webview's, and the pane marker's answer is one of them.** `awaitingInput` lasts until the next `Busy`; `sessionsSeen.applySeen` reads a seen one as `idle` as the store adopts rows, so every reader agrees. Only `awaitingInput` is downgraded (never `permission` or a question), a mark is dropped as soon as the raw activity moves, and the focus effect is keyed on the pane, never the rows — keyed on rows it would mark a turn that just ended in the pane you are staring at as already read. The idle sweep (`idleLive`) must never include the pinned console or a run. (M202) A row whose live child `awaiting.ts`'s table says is no longer waiting (`isSettled`) also reads `idle`. Before M205 the seen set was a second copy of that answer, and the row stayed *waiting* over a pane whose marker a click had already cleared. Three things caused it: the acknowledgement listener lived in `AgentsPanelHost`, which is unmounted whenever another sidebar panel shows; a click in the gap before the row's `awaitingInput` arrived (200 ms plus one listing) was refused as "still working"; and every project switch reset the seen set. So both subscriptions live in `sessionsStore`'s `follow`, seen marks are kept per project, and a listing answer overtaken by a newer one is dropped (two `sessions_list` calls run side by side on the blocking pool). `check:sessions` pins the overlay and that the wiring is the store's, not the panel's. (M205)
 - **The listing hides rows that did nothing.** A row is dropped when it is not live, not on screen, and either was never named by its harness or has no transcript on disk. A transcript-path bug therefore empties the tab with no error. `cide-headless sessions <root>` prints the unfiltered file, which is how to tell a hidden row from a missing one.
 - **Reading a transcript is read-only and bounded, and every failure means "nothing".** `transcript_head` reads 1 MiB at most. `transcript_find` tests the raw line before parsing, which is sound only for needles JSON does not escape. Bookkeeping keys (`type`, `uuid`, `cwd`, …) are not searched, or a search for `user` would match every transcript. Open never spawns from the domain: `sessions_open` only answers, and `showOpenPlan` builds the pane, for `openRun.ts`'s ownership reason.
 - **A group's membership is keyed by conversation id and must follow a re-key.** `Organize` is a side table beside the rows (so `SessionRecord`, which reaches a phone through `UserRequest.origin`, does not move), and a codex stand-in learning its thread id changes the key. `Journal::upsert` carries the member and the label with it; without that the session silently leaves its folder. `a_re_keyed_row_keeps_its_group_and_label` is the pin; `cide-headless sessions <root>` prints each row's `[in group]`.

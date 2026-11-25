@@ -31,6 +31,7 @@ import {
   isEmptyMenu,
   resolveMenu,
   type MenuEntry,
+  type Rect,
   type ResolvedEntry,
 } from './model'
 import { buildKeymap, type Keymap } from '@/keys/keymap'
@@ -131,6 +132,13 @@ function useWindowKeymap(): Keymap {
 interface OpenMenu {
   readonly entries: readonly ResolvedEntry[]
   readonly at: { x: number; y: number }
+  /**
+   * The element the menu was opened *from*, when it was (`openFor`), and `undefined` for a
+   * pointer. Kept whole because the box is placed against it — `placeDropdown` aligns to its
+   * right edge near the window's — and `at`, its bottom-left corner, has lost the width that
+   * needs. See `placeDropdown` for the one-button-width miss this is the fix for.
+   */
+  readonly anchor: Rect | undefined
   readonly invocation: MenuInvocation
 }
 
@@ -200,8 +208,8 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
     }
   }, [])
 
-  const openAt = useCallback(
-    (x: number, y: number, target?: HTMLElement | null) => {
+  const show = useCallback(
+    (x: number, y: number, target: HTMLElement | null | undefined, anchor: Rect | undefined) => {
       const invocation = { target: target ?? null, x, y }
       const entries = resolveMenu(items(invocation, ''), { chipFor })
       // An empty box at the pointer is worse than no menu: it says the surface is broken
@@ -211,17 +219,30 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
       returnTo.current =
         document.activeElement instanceof HTMLElement ? document.activeElement : null
       setQuery('')
-      setOpen({ entries, at: { x, y }, invocation })
+      setOpen({ entries, at: { x, y }, anchor, invocation })
     },
     [items, chipFor],
   )
 
+  const openAt = useCallback(
+    (x: number, y: number, target?: HTMLElement | null) => show(x, y, target, undefined),
+    [show],
+  )
+
   const openFor = useCallback(
     (target: HTMLElement) => {
-      const point = anchorToRect(target.getBoundingClientRect())
-      openAt(point.x, point.y, target)
+      const rect = target.getBoundingClientRect()
+      const point = anchorToRect(rect)
+      // Copied out of the `DOMRect` rather than stored as one: state should be a plain value,
+      // and these four numbers are all `placeDropdown` reads.
+      show(point.x, point.y, target, {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+      })
     },
-    [openAt],
+    [show],
   )
 
   const onContextMenu = useCallback(
@@ -270,6 +291,7 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
           entries={entries}
           search={search === undefined ? undefined : { ...search, value: query, onChange: setQuery }}
           at={open.at}
+          anchor={open.anchor}
           onClose={close}
           // Handed down because a submenu's rows do not exist yet: they are built when the
           // submenu is hovered, so `ContextMenu` resolves those itself and would otherwise

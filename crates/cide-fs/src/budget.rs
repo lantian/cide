@@ -61,6 +61,17 @@ impl Budget {
         Self::new(SharedBudget::new(2048 * MIB), 512 * MIB)
     }
 
+    /// A new generation's budget under the same global pool and per-project limit.
+    ///
+    /// For an index that belongs to a project without being its main one — the Explorer's view
+    /// of an agent checkout. Charged against the pool every project shares, so the total the
+    /// user configured still bounds everything; given its own per-project allowance rather than a
+    /// slice of this one's, because a checkout is a second copy of the same tree and halving the
+    /// project's limit would refuse the project walk the moment a checkout was looked at.
+    pub fn sibling(&self) -> Arc<Self> {
+        Self::new(Arc::clone(&self.shared), self.limit)
+    }
+
     pub fn used(&self) -> u64 {
         self.used.load(Ordering::Acquire)
     }

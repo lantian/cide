@@ -90,7 +90,9 @@ export const GitPanel = memo(GitPanelImpl)
 
 /*
  * Which working tree the panel shows — the project's, or an agent checkout under
- * `.cide/worktrees/` — chosen in the header, and the model keyed by it.
+ * `.cide/worktrees/` — chosen in the header, and the model keyed by it. The choice is the one
+ * the Explorer's selector and the Log's *Current branch* share (M207; `chrome/useWorktrees.ts`),
+ * so picking a checkout in the file tree re-points this panel as well.
  *
  * Keyed, i.e. a remount per choice, rather than handing the worktree to one long-lived model:
  * the model's state is a composed commit — ticks, expansion, the merge bar, the guard bar's
@@ -99,7 +101,7 @@ export const GitPanel = memo(GitPanelImpl)
  * paints the last-known tree and ticks of that checkout at once.
  */
 function GitPanelImpl(props: GitPanelProps) {
-  const choice = useWorktrees('panel', props.project)
+  const choice = useWorktrees(props.project)
   return (
     <GitPanelScoped
       key={`${props.project ?? ''}\u0000${choice.worktree ?? ''}`}

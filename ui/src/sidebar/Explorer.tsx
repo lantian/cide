@@ -16,6 +16,9 @@ import { useGitStatus } from './gitStatusStore'
 import { groupDigits } from '@/overlays/format'
 import { events, fs, type FsStatus, type ProjectId } from '@/ipc/client'
 import { Icon } from '@/icons/Icon'
+import { useWorktrees } from '@/chrome/useWorktrees'
+import { WorktreeSelect } from '@/chrome/WorktreeSelect'
+import { adoptsBurst } from '@/chrome/worktreeScope'
 
 import { IndexWarning } from './IndexWarning'
 import styles from './FileTree.module.css'
@@ -112,19 +115,32 @@ function ExplorerImpl({
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
 
+  /*
+   * Which tree this panel shows: the project's, or one agent checkout under `.cide/worktrees/`.
+   * (M207)
+   *
+   * The **shared** choice — the Git panel's selector and the Log's *Current branch* read the
+   * same one (`chrome/useWorktrees.ts` says why it is one rather than three). Every effect
+   * below is keyed on the pair, so a pick re-attaches the rows and the tags to the checkout's
+   * own index in Rust (`crate::worktree_fs`), and every event handler adopts only the bursts
+   * tagged with the tree on screen (`adoptsBurst`).
+   */
+  const choice = useWorktrees(project)
+  const worktree = choice.worktree
+
   const [status, setStatus] = useState<FsStatus | null>(null)
   useEffect(() => {
     setStatus(null)
     if (project === null) return
     let cancelled = false
-    void fs.status(project).then((next) => {
+    void fs.status(project, worktree).then((next) => {
       if (!cancelled) setStatus((old) => old && old.generation > next.generation ? old : next)
     }).catch(() => { /* A newly opened project may not yet have an index. */ })
     return () => { cancelled = true }
-  }, [project])
+  }, [project, worktree])
   useEffect(() => {
-    void useFileTree.getState().attach(project)
-  }, [project])
+    void useFileTree.getState().attach(project, worktree)
+  }, [project, worktree])
 
   /*
    * The status map is attached separately from the rows and never awaited alongside them.
@@ -133,8 +149,8 @@ function ExplorerImpl({
    * untagged tree that gains tags — never an empty pane.
    */
   useEffect(() => {
-    void useGitStatus.getState().attach(project)
-  }, [project])
+    void useGitStatus.getState().attach(project, worktree)
+  }, [project, worktree])
 
   useEffect(() => {
     if (project === null) return
@@ -161,10 +177,11 @@ function ExplorerImpl({
      * burst that moved nothing with no state write at all.
      */
     void events
-      .onFsChanged((changed) => {
-        // Only this project's events. A second project's watcher firing must not disturb the
-        // tree the user is looking at.
-        if (changed !== project) return
+      .onFsChanged((changed, _change, tag) => {
+        // Only this project's events, and only the tree on screen's: a second project's
+        // watcher, or the project's own while a checkout is shown (and the reverse), must not
+        // disturb the tree the user is looking at.
+        if (changed !== project || !adoptsBurst(worktree, tag)) return
         void useFileTree.getState().refresh()
       })
       .then((fn) => {
@@ -175,7 +192,7 @@ function ExplorerImpl({
       cancelled = true
       unlisten?.()
     }
-  }, [project])
+  }, [project, worktree])
 
   /*
    * The walk finishing is news, and nothing else carries it.
@@ -200,10 +217,21 @@ function ExplorerImpl({
     let cancelled = false
     let unlisten: (() => void) | null = null
     void events
-      .onFsStatus((changed, next) => {
+      .onFsStatus((changed, next, tag) => {
         if (changed !== project || cancelled) return
-        setStatus((old) => old && old.generation > next.generation ? old : next)
-        void useFileTree.getState().refresh()
+        if (adoptsBurst(worktree, tag)) {
+          setStatus((old) => old && old.generation > next.generation ? old : next)
+          void useFileTree.getState().refresh()
+          return
+        }
+        /*
+         * The project's own status while a checkout is shown: not this tree's numbers, but
+         * still news. A settings change re-walks the project, and the re-walk builds a new
+         * entry in Rust that holds none of the old one's checkout views — so the checkout's
+         * tree is gone until something asks for it. `refresh` asks, and `worktree_fs::view`
+         * rebuilds it on that first call.
+         */
+        if (worktree !== null && tag === null) void useFileTree.getState().refresh()
       })
       .then((fn) => {
         if (cancelled) fn()
@@ -213,7 +241,7 @@ function ExplorerImpl({
       cancelled = true
       unlisten?.()
     }
-  }, [project])
+  }, [project, worktree])
 
   /*
    * Keeping the tags true as things change, without polling.
@@ -242,8 +270,10 @@ function ExplorerImpl({
         else unlisten.push(fn)
       })
     }
-    const refresh = (changed: ProjectId) => {
-      if (changed === project) useGitStatus.getState().schedule()
+    // Both events carry the tree they are about as their third argument: the checkout a view's
+    // watcher or a Git-panel commit was in, or `null` for the project.
+    const refresh = (changed: ProjectId, _what: unknown, tag: string | null) => {
+      if (changed === project && adoptsBurst(worktree, tag)) useGitStatus.getState().schedule()
     }
     subscribe(events.onFsChanged(refresh))
     subscribe(events.onGitStatus(refresh))
@@ -251,7 +281,7 @@ function ExplorerImpl({
       cancelled = true
       for (const fn of unlisten) fn()
     }
-  }, [project])
+  }, [project, worktree])
 
   return (
     <div className={styles.panel} data-audit="sidebarFiles">
@@ -335,7 +365,34 @@ function ExplorerImpl({
           </button>
         )}
       </div>
-      {project && status && <IndexWarning key={project} project={project} status={status} />}
+      {/*
+        * The worktree selector, on a strip of its own under the header rather than in it. The
+        * header already carries the title, the count and three actions in 252px; a dropdown
+        * naming `cide/frontend-developer-t-123` beside them would truncate to nothing. Drawn
+        * only when the project has checkouts — the Git panel's rule — so a project with none
+        * keeps the panel exactly as it was. The trigger names the branch shown, with a folder
+        * icon for a checkout and a branch icon for the project's own tree: the cue that the rows
+        * below are not the project's.
+        */}
+      {choice.worktrees.length > 0 && (
+        <div className={styles.worktreeBar} data-audit="explorerWorktreeBar">
+          <WorktreeSelect
+            audit="explorerWorktree"
+            worktrees={choice.worktrees}
+            value={worktree}
+            projectBranch={choice.projectBranch}
+            onChange={choice.choose}
+          />
+        </div>
+      )}
+      {/*
+        * The project's index warnings only. Its actions (restart the walk, the diagnostics
+        * dialog) act on the project's index, and offering them over a checkout's tree would
+        * restart a walk the user is not looking at.
+        */}
+      {project && status && worktree === null && (
+        <IndexWarning key={project} project={project} status={status} />
+      )}
       <FileTree
         project={project}
         onOpen={onOpenFile}

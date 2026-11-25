@@ -23,6 +23,20 @@
  * user has focused or opened the pane they have, and the pane's own highlight is the stricter
  * signal and is untouched.
  *
+ * # The pane's answer counts too (M205)
+ *
+ * Looser, never *stricter*: a row whose pane marker the user has already cleared must not go on
+ * saying "Waiting for your input". Until M205 it could, because the seen set was this module's
+ * own second copy of "has the user dealt with it" — the exact shape `awaitingRule.ts` is arranged
+ * against, flags on several surfaces that half-clear. Three roads led to it: the acknowledgement
+ * listener lived in the Agents panel, so a click into a pane while another sidebar panel showed
+ * reached nobody; a click in the 200 ms and one listing between the `Stop` and the row's
+ * `awaitingInput` found the row still `working` and marked nothing; and a project switch dropped
+ * every mark. So `applySeen` also asks `settled` — `awaiting.ts::isSettled`, the very table the
+ * pane highlight, the tab badge and the OS title read — and a row whose live child that table says
+ * is no longer waiting reads `idle` whatever the seen set holds. The table hears the transition
+ * before the row does, so the order the two arrive in no longer matters.
+ *
  * **Import-free**, like the rest of the tab's pure core: `check-sessions.mjs` compiles it alone.
  */
 
@@ -31,20 +45,32 @@ export interface SeenRow {
   id: string
   live: boolean
   activity: string
+  /** The live child's handle — the key `settled` is asked by. */
+  liveSession: string | null
 }
 
+/** Whether the pane-level table holds this child and says it is not waiting (`awaiting.ts::isSettled`). */
+export type Settled = (handle: string) => boolean
+
+/** For a caller with no pane table: nothing is settled. */
+export const NOTHING_SETTLED: Settled = () => false
+
 /**
- * `rows` with the seen `awaitingInput` ones read as `idle`, and the seen set pruned of every id
- * whose raw activity is no longer `awaitingInput` (or that left the list). The set is returned
- * as-is when nothing was pruned, so a store can compare it by identity.
+ * `rows` with the seen `awaitingInput` ones read as `idle` — seen here, or settled in the pane
+ * table (see the header) — and the seen set pruned of every id whose raw activity is no longer
+ * `awaitingInput` (or that left the list). `settled` neither adds to the set nor keeps a mark in
+ * it: the table raises the next turn's end by itself. The set is returned as-is when nothing was
+ * pruned, so a store can compare it by identity.
  */
 export function applySeen<T extends SeenRow>(
   raw: readonly T[],
   seen: ReadonlySet<string>,
+  settled: Settled = NOTHING_SETTLED,
 ): { rows: T[]; seen: ReadonlySet<string> } {
   let kept: Set<string> | null = null
   const rows = raw.map((r) => {
-    if (r.activity !== 'awaitingInput' || !seen.has(r.id)) return r
+    if (r.activity !== 'awaitingInput') return r
+    if (!seen.has(r.id) && !(r.liveSession !== null && settled(r.liveSession))) return r
     return { ...r, activity: 'idle' }
   })
   const waiting = new Set(raw.filter((r) => r.activity === 'awaitingInput').map((r) => r.id))

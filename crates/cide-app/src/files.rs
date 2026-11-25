@@ -68,6 +68,25 @@ pub trait FsEvents: Send + Sync + 'static {
     fn files_changed(&self, project: ProjectId, paths: &[PathBuf]) {
         let _ = (project, paths);
     }
+
+    /// The Explorer's view of an agent checkout re-walked, or its watcher's state moved. (M207)
+    ///
+    /// Separate from [`Self::status`] rather than a `worktree` argument on it, so that no
+    /// listener of the project's index can mistake a checkout's numbers for the project's: the
+    /// webview hears the same `cide://fs-status` event, **tagged** with the checkout, and the
+    /// header's counts, the index warning and every project-scoped store ignore a tagged one.
+    /// Defaulted to nothing for [`Self::files_changed`]'s reason.
+    fn view_status(&self, project: ProjectId, worktree: &std::path::Path, status: &FsStatus) {
+        let _ = (project, worktree, status);
+    }
+
+    /// Files changed inside a checkout the Explorer is showing. Tagged like [`Self::view_status`],
+    /// and deliberately *not* routed through [`Self::files_changed`]: the language servers were
+    /// started for the project's roots, and `dotcide` classifies against the project root, so a
+    /// checkout's own `.cide/` would be noise to both.
+    fn view_changed(&self, project: ProjectId, worktree: &std::path::Path, change: &FsChange) {
+        let _ = (project, worktree, change);
+    }
 }
 
 impl FsEvents for AppHandle {
@@ -96,6 +115,14 @@ impl FsEvents for AppHandle {
         // tracker, the agent roster), and an agent's Write or a `git pull` moves it with no
         // Tauri command involved. See `dotcide`'s header for the routes and the worktrees trap.
         crate::dotcide::files_changed(self, project, paths);
+    }
+
+    fn view_status(&self, project: ProjectId, worktree: &std::path::Path, status: &FsStatus) {
+        crate::emit::fs_status_in(self, project, Some(worktree), status);
+    }
+
+    fn view_changed(&self, project: ProjectId, worktree: &std::path::Path, change: &FsChange) {
+        crate::emit::fs_changed_in(self, project, Some(worktree), change);
     }
 }
 
@@ -492,7 +519,7 @@ impl Indexing {
 /// no repository to discover at this moment and no event that could tell us one appeared —
 /// `.git` is pruned by the walk and refused by the filter. Re-indexing the project is the
 /// recovery, and it is the same recovery as for any other change to the root set.
-fn git_watch_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn git_watch_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     // `discover` already deduplicates by canonical work tree, so two roots inside one
     // repository yield one entry — but a superproject and its submodules yield several, and a
@@ -620,6 +647,13 @@ pub struct ProjectFs {
     libraries_walked: AtomicBool,
     /// How many packages the walk covered, for the empty-answer sentence.
     library_packages: AtomicU32,
+
+    // --- M207: the Explorer's view of an agent checkout ----------------------------------
+    //
+    // Held here, by the project, so that a view can never outlive the project it is a view of:
+    // dropping this entry — `fs_close`, or a settings change that re-walks — drops every view and
+    // stops its watcher. See `crate::worktree_fs`.
+    views: crate::worktree_fs::Views,
 }
 
 impl ProjectFs {
@@ -681,6 +715,7 @@ impl ProjectFs {
             libraries_indexing: AtomicBool::new(false),
             libraries_walked: AtomicBool::new(false),
             library_packages: AtomicU32::new(0),
+            views: crate::worktree_fs::Views::default(),
         }
     }
 
@@ -689,6 +724,49 @@ impl ProjectFs {
         // No registry shard is held while the watcher joins its thread.
         let watcher = self.watcher.lock().take();
         drop(watcher);
+        self.views.cancel_all();
+    }
+
+    // --- M207: the Explorer's view of an agent checkout ------------------------------------
+
+    /// The view of `path`, if this project holds one, moved to the front of the cap's order.
+    pub(crate) fn touch_view(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<Arc<crate::worktree_fs::WorktreeFs>> {
+        self.views.touch(path)
+    }
+
+    /// Hold the view for `root`, building it with `make` when there is none. See `Views::adopt`.
+    pub(crate) fn adopt_view(
+        &self,
+        root: PathBuf,
+        make: impl FnOnce() -> Result<crate::worktree_fs::WorktreeFs, cide_fs::FsError>,
+    ) -> Result<(Arc<crate::worktree_fs::WorktreeFs>, bool), cide_fs::FsError> {
+        self.views.adopt(root, make)
+    }
+
+    pub(crate) fn forget_view(&self, root: &std::path::Path) {
+        self.views.forget(root);
+    }
+
+    /// Every checkout view this project holds.
+    pub fn views(&self) -> Vec<Arc<crate::worktree_fs::WorktreeFs>> {
+        self.views.all()
+    }
+
+    /// Fold a change cide made itself into whichever checkout views hold its paths.
+    ///
+    /// Called beside every fold into the project's own index (`create_entry`, `rename_entry`,
+    /// `delete_entries`, `paste_into`), so a *New File…* in a checkout's tree shows its row the
+    /// moment the command returns — the promise `fs_create_in` makes for the project's tree —
+    /// rather than after the checkout watcher's debounce. The project fold is left alone: a path
+    /// under `.cide/worktrees/` is an excluded browse node there, and `apply` already knows what
+    /// to do with one.
+    pub fn fold_views(&self, change: &FsChange) {
+        for view in self.views.all() {
+            view.fold(change);
+        }
     }
 
     fn publish_status(&self) {
@@ -1190,6 +1268,17 @@ impl ProjectFs {
     pub fn writable_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.root_paths();
         paths.extend(self.groups.writable_dirs());
+        // The checkouts the Explorer is showing. Usually redundant — a checkout sits under a root
+        // — but a project opened through a symlink has roots spelled one way and checkouts spelled
+        // canonically, and without this every rename in a checkout's tree would be "outside this
+        // project". Only views that exist: a checkout nobody is looking at is reached through the
+        // root like any other folder.
+        paths.extend(
+            self.views
+                .all()
+                .iter()
+                .map(|view| view.root().to_path_buf()),
+        );
         paths
     }
 

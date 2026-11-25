@@ -68,6 +68,7 @@ import { notify } from '@/chrome/notices'
 import { openPushDialog } from '@/chrome/pushRun'
 import { showConflicts } from '@/chrome/conflictsStore'
 import { requestFocus } from '@/chrome/focusRequests'
+import { checkoutHears } from '@/chrome/worktreeScope'
 import { shareEqual } from '@/store/shareEqual'
 import {
   amendPending,
@@ -1012,10 +1013,11 @@ export function useGitPanel(
    * on every burst, twice, to produce a number the first walk already contained. See
    * `noteChangeCount` and `holdChangeCount`.
    *
-   * Only for the project's own tree. An agent checkout's tree is a different number, and the
-   * badge counts the project: `useGitChangeCount` refuses a broadcast tagged with a worktree for
-   * this reason, and this call took one anyway, so a panel on a checkout wrote that checkout's
-   * count over the project's until the store's next walk put it back.
+   * Tagged with the tree it is (M207). The badge counts the shared checkout choice, which is the
+   * tree this panel shows, so a checkout's tree is adopted for a checkout's badge; the store drops
+   * a tree of any other scope. Before M207 the badge counted the project whatever the panel
+   * showed, and this call had to skip checkouts — a panel on one wrote that checkout's count over
+   * the project's until the store's next walk put it back.
    *
    * Not folded into `viewOf`: `model.ts` is compiled on its own by `check-git-tree.mjs`, and a
    * side effect in a pure mapping is not the sort of thing that stays in one place.
@@ -1023,20 +1025,20 @@ export function useGitPanel(
   const absorb = useCallback(
     (tree: ChangesTree): StatusView => {
       noteRepoRoots(tree)
-      if (project !== null && worktree === null) noteChangeCount(project, tree)
+      if (project !== null) noteChangeCount(project, tree, worktree)
       return viewOf(tree)
     },
     [project, worktree],
   )
 
   /*
-   * While this panel walks the project's own tree, the badge need not walk it as well. The other
-   * half of `absorb` above, and on exactly its condition: holding on a checkout would leave nobody
-   * feeding the project's count. A story has no walks to offer in the first place.
+   * While this panel walks a tree, the badge need not walk the same tree as well. The other half
+   * of `absorb` above: the hold names the tree, so it stops only the badge's walks of this one.
+   * A story has no walks to offer in the first place.
    */
   useEffect(() => {
-    if (story !== null || project === null || worktree !== null) return
-    return holdChangeCount(project)
+    if (story !== null || project === null) return
+    return holdChangeCount(project, worktree)
   }, [story, project, worktree])
 
   /*
@@ -1215,8 +1217,12 @@ export function useGitPanel(
      * answer is one coalesced `git status`, which is the call that actually knows.
      */
     track(
-      events.onFsChanged((forProject) => {
-        if (project !== null && forProject === project) schedule()
+      events.onFsChanged((forProject, _change, tag) => {
+        // `checkoutHears`: the project's own watcher always (it sees the shared refs move), and
+        // the Explorer's view of this panel's checkout when one is open (M207) — the only watcher
+        // that sees a plain edit or a `git add` inside the checkout. A project panel ignores a
+        // checkout's bursts; nothing in them changes the project's status.
+        if (project !== null && forProject === project && checkoutHears(worktree, tag)) schedule()
       }),
       'fs',
     )

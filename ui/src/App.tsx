@@ -53,6 +53,7 @@ import { WindowFrame } from '@/chrome/WindowFrame'
 import { auditMode, formatAuditReport, runLayoutAudit } from '@/chrome/layoutAudit'
 import { AUDIT_ACTIVE_TAB, AUDIT_GIT_CHANGES, AUDIT_TABS } from '@/chrome/auditFixture'
 import { useGitChangeCount } from '@/chrome/gitCountStore'
+import { useWorktrees } from '@/chrome/useWorktrees'
 import { auditPanesMode, formatPaneAudit, runPaneAudit } from '@/layout/paneAudit'
 import { createAppPaneDriver } from '@/layout/appPaneDriver'
 import { auditWindowsMode, formatWindowAudit, runWindowAudit } from '@/layout/windowAudit'
@@ -886,9 +887,15 @@ export function App() {
    * than skipping the call, because the rule React enforces is that the hook order never
    * changes — not that hooks are only called when they are useful.
    */
-  const gitChanged = useGitChangeCount(
-    boot?.role.kind === 'detachedPane' ? null : activeProjectId,
-  )
+  const badgeProject = boot?.role.kind === 'detachedPane' ? null : activeProjectId
+  /*
+   * The badge counts the tree the shared worktree choice shows (M207): the Explorer, the Git
+   * panel and the Log are pointed at one agent checkout or at the project together, and a badge
+   * still counting the project beside a panel on a checkout reads as two answers to one question.
+   * Holding the list here also keeps the stale-choice fallback live while the sidebar is shut.
+   */
+  const badgeCheckout = useWorktrees(badgeProject).worktree
+  const gitChanged = useGitChangeCount(badgeProject, badgeCheckout)
 
   /*
    * Every path the file tree can hang a row from, for the status bar's clickable path trail.

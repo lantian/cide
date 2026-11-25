@@ -1272,13 +1272,23 @@ try {
         + 'on a keystroke the debounce is holding back',
     )
     ok(
-      /oneScope \?\? pinnedScope \?\? mergedScope/.test(tab),
-      '…behind the History tab’s own repository, which no filter changes — and no worktree scope: '
-        + 'a worktree’s branch is chosen in the branch box, which already shows its history',
+      /logScopeChain\(oneScope, pinnedScope, worktreeScope, mergedScope\)/.test(tab),
+      '…behind the History tab’s own repository, which no filter changes; the shared checkout '
+        + 'choice (M207) sits below a filter’s scope and above the merged one, so the Explorer '
+        + 'pointing at an agent’s checkout moves *Current branch* to its HEAD',
     )
     ok(
-      /useWorktrees\('log', logTab \? project : null\)/.test(tab),
-      'the worktree list is the Log tab’s alone: a History tab is one file in one repository',
+      /worktreeLogScope\(logTab, checkouts\.current\)/.test(tab),
+      'the checkout scope is the Log tab’s alone: a History tab is one file in one repository',
+    )
+    ok(
+      /useWorktrees\(logTab \? project : null\)/.test(tab),
+      'the worktree list and the shared choice are read for the Log tab only — no per-surface key '
+        + 'any more: the Explorer, the Git panel and the Log share one choice',
+    )
+    ok(
+      /checkout=\{scopedCheckout\?\.repo\.name \?\? null\}/.test(tab),
+      'and the branch box is told which checkout it walks, so *Current branch* names it',
     )
     const dispatch = stripComments(readFileSync(join(UI, 'src', 'keys', 'dispatch.ts'), 'utf8'))
     const app = stripComments(readFileSync(join(UI, 'src', 'App.tsx'), 'utf8'))

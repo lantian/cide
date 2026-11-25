@@ -93,6 +93,7 @@ pub mod proposals;
 pub mod remote;
 pub mod scratches;
 pub mod sessions_state;
+pub mod worktree_fs;
 // Comment stripping for this crate's structural source assertions. Test-only: a source
 // assertion is a gate, not a product feature, and shipping the stripper in the binary would
 // invite it to be used for something.

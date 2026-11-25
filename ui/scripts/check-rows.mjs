@@ -282,7 +282,7 @@ try {
   const splitMenu = readFileSync('src/chrome/SplitMenu.tsx', 'utf8')
   // Comments stripped first: this file's prose names every one of these ids.
   const splitMenuCode = splitMenu.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-  for (const command of ['terminal.splitRight', 'terminal.addRow', 'claude.split.right', 'claude.addRow']) {
+  for (const command of ['terminal.splitRight', 'terminal.addRow', 'claude.split.right', 'claude.addRow', 'claude.newTab']) {
     ok(
       splitMenuCode.includes(`'${command}'`),
       `the split menu offers ${command}, so its chip is the live binding for that gesture`,

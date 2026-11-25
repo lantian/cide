@@ -603,17 +603,26 @@ export const fs = {
   /** Drop the index and stop watching. Call on project close. */
   close: (projectId: ProjectId) => invoke<boolean>('fs_close', { project: projectId }),
 
-  status: (projectId: ProjectId) => invoke<FsStatus>('fs_status', { project: projectId }),
+  /**
+   * `worktree` scopes this — and every tree call below that takes one — to an agent checkout
+   * under `.cide/worktrees/`, as `git.worktrees` reported it in `repo.root`: the Explorer's
+   * selector (M207). `null` is the project's own tree, which is every caller that predates it.
+   * Rust refuses a path that is not one of this project's checkouts.
+   */
+  status: (projectId: ProjectId, worktree: string | null = null) =>
+    invoke<FsStatus>('fs_status', { project: projectId, worktree }),
   indexDiagnostics: (projectId: ProjectId) => invoke<FsIndexDiagnostics>('fs_index_diagnostics', { project: projectId }),
-  browsePage: (project: ProjectId, path: string, direction: number) => invoke<number>('fs_browse_page', { project, path, direction }),
+  browsePage: (project: ProjectId, path: string, direction: number, worktree: string | null = null) =>
+    invoke<number>('fs_browse_page', { project, path, direction, worktree }),
   restartIndex: (projectId: ProjectId, generation: number) => invoke<FsStatus>('fs_restart_index', { project: projectId, generation }),
 
   /** Total visible rows — the virtual scroller's range. */
-  treeCount: (projectId: ProjectId) => invoke<number>('fs_tree_count', { project: projectId }),
+  treeCount: (projectId: ProjectId, worktree: string | null = null) =>
+    invoke<number>('fs_tree_count', { project: projectId, worktree }),
 
   /** The rows in `[offset, offset + len)`. Clamped in Rust; past the end is `[]`, not an error. */
-  treeRows: (projectId: ProjectId, offset: number, len: number) =>
-    invoke<TreeRow[]>('fs_tree_rows', { project: projectId, offset, len }),
+  treeRows: (projectId: ProjectId, offset: number, len: number, worktree: string | null = null) =>
+    invoke<TreeRow[]>('fs_tree_rows', { project: projectId, offset, len, worktree }),
 
   /**
    * Which visible rows a speed-search query matches, and where in each row's name.
@@ -626,23 +635,23 @@ export const fs = {
    * The frame echoes the query and carries the row count it was computed against; see
    * `sidebar/useSpeedSearch.ts` for what is done with both.
    */
-  treeMatch: (projectId: ProjectId, query: string) =>
-    invoke<TreeMatches>('fs_tree_match', { project: projectId, query }),
+  treeMatch: (projectId: ProjectId, query: string, worktree: string | null = null) =>
+    invoke<TreeMatches>('fs_tree_match', { project: projectId, query, worktree }),
 
   /** Returns the new row count, so the scroller can resize without a second call. */
-  expand: (projectId: ProjectId, path: string) =>
-    invoke<number>('fs_expand', { project: projectId, path }),
+  expand: (projectId: ProjectId, path: string, worktree: string | null = null) =>
+    invoke<number>('fs_expand', { project: projectId, path, worktree }),
 
-  collapse: (projectId: ProjectId, path: string) =>
-    invoke<number>('fs_collapse', { project: projectId, path }),
+  collapse: (projectId: ProjectId, path: string, worktree: string | null = null) =>
+    invoke<number>('fs_collapse', { project: projectId, path, worktree }),
 
   /** *Expand all*: every walked directory the watcher would watch, so never `target/`. (M96) */
-  expandAll: (projectId: ProjectId) =>
-    invoke<number>('fs_expand_all', { project: projectId }),
+  expandAll: (projectId: ProjectId, worktree: string | null = null) =>
+    invoke<number>('fs_expand_all', { project: projectId, worktree }),
 
   /** *Collapse all*: every directory and group, the roots excepted. (M96) */
-  collapseAll: (projectId: ProjectId) =>
-    invoke<number>('fs_collapse_all', { project: projectId }),
+  collapseAll: (projectId: ProjectId, worktree: string | null = null) =>
+    invoke<number>('fs_collapse_all', { project: projectId, worktree }),
 
   /**
    * Re-scan everything under one folder against the disk. The tree's *Refresh* menu item,
@@ -650,8 +659,8 @@ export const fs = {
    * directory is never watched, so external churn under `target/` is invisible until
    * somebody asks. Returns the new row count, on `expand`'s argument.
    */
-  refresh: (projectId: ProjectId, path: string) =>
-    invoke<number>('fs_refresh', { project: projectId, path }),
+  refresh: (projectId: ProjectId, path: string, worktree: string | null = null) =>
+    invoke<number>('fs_refresh', { project: projectId, path, worktree }),
 
   /**
    * Expand everything above a path and return the row it now sits on.
@@ -659,8 +668,8 @@ export const fs = {
    * `null` when the path has no row — gitignored, or deleted. Scroll to the number; show
    * nothing on `null` rather than guessing a position.
    */
-  reveal: (projectId: ProjectId, path: string) =>
-    invoke<number | null>('fs_reveal', { project: projectId, path }),
+  reveal: (projectId: ProjectId, path: string, worktree: string | null = null) =>
+    invoke<number | null>('fs_reveal', { project: projectId, path, worktree }),
 
   /**
    * What the index holds at each path: `'file'`, `'dir'`, or `null` for nothing.
@@ -752,8 +761,8 @@ export const fs = {
    * blake3 of a canonicalised root under `$XDG_STATE_HOME` — a fact only Rust can compute, and
    * the same list `cide_fs::ops::check_within` is given.
    */
-  writableRoots: (projectId: ProjectId) =>
-    invoke<string[]>('fs_writable_roots', { project: projectId }),
+  writableRoots: (projectId: ProjectId, worktree: string | null = null) =>
+    invoke<string[]>('fs_writable_roots', { project: projectId, worktree }),
 
   /**
    * Every path the file tree can hang a row from: the project's roots **plus** each synthetic
@@ -773,8 +782,8 @@ export const fs = {
    * group answers with the roots alone and the library crumbs light up on the `cide://fs-status`
    * the resolver emits.
    */
-  revealRoots: (projectId: ProjectId) =>
-    invoke<string[]>('fs_reveal_roots', { project: projectId }),
+  revealRoots: (projectId: ProjectId, worktree: string | null = null) =>
+    invoke<string[]>('fs_reveal_roots', { project: projectId, worktree }),
 
   /**
    * The same speed-search rule over a list the caller supplies — the git panel's changes tree.
@@ -1625,10 +1634,15 @@ export const events = {
    * A whole `cargo build` is one of these. `truncated` means the burst was larger than the
    * watcher holds, so the paths are a prefix and anything you care about should be re-read.
    * `git` means `HEAD`, the index or a ref moved — the branch readout and the git panel.
+   *
+   * `worktree` is the agent checkout whose watcher saw the burst — the Explorer is showing it
+   * (M207) — or `null` for the project's own index. A listener that mirrors the *project* (its
+   * tree, branch or change count) skips a tagged burst; a path-keyed one (blame, the change
+   * column, terminal links) wants a checkout file's edits like any other file's.
    */
-  onFsChanged: (handler: (project: ProjectId, change: FsChange) => void) =>
-    listen<{ project: ProjectId; change: FsChange }>('cide://fs-changed', (e) =>
-      handler(e.payload.project, e.payload.change),
+  onFsChanged: (handler: (project: ProjectId, change: FsChange, worktree: string | null) => void) =>
+    listen<{ project: ProjectId; change: FsChange; worktree?: string | null }>('cide://fs-changed', (e) =>
+      handler(e.payload.project, e.payload.change, e.payload.worktree ?? null),
     ),
 
   /**
@@ -1636,10 +1650,12 @@ export const events = {
    *
    * `watch.backend === 'polling'` is the degraded mode: `watch.reason` is a sentence written
    * for a banner, and it names the sysctl that fixes it.
+   *
+   * `worktree` as on `onFsChanged`: a checkout view's walk or watcher, not the project's.
    */
-  onFsStatus: (handler: (project: ProjectId, status: FsStatus) => void) =>
-    listen<{ project: ProjectId; status: FsStatus }>('cide://fs-status', (e) =>
-      handler(e.payload.project, e.payload.status),
+  onFsStatus: (handler: (project: ProjectId, status: FsStatus, worktree: string | null) => void) =>
+    listen<{ project: ProjectId; status: FsStatus; worktree?: string | null }>('cide://fs-status', (e) =>
+      handler(e.payload.project, e.payload.status, e.payload.worktree ?? null),
     ),
 
   /**
@@ -1728,8 +1744,8 @@ export const git = {
    * Every project it is asked about is answered: a root with no repository above it simply
    * has an empty map.
    */
-  treeStatus: (project: ProjectId) =>
-    invoke<TreeStatusMap>('git_tree_status', { project }),
+  treeStatus: (project: ProjectId, worktree: string | null = null) =>
+    invoke<TreeStatusMap>('git_tree_status', { project, worktree }),
 
   /**
    * Which repositories the project actually contains, roots before their submodules.

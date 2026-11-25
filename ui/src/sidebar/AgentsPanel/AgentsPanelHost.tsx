@@ -139,7 +139,6 @@ import { displayName, type GroupView, type SessionView } from './sessionsModel'
 import { groupPath, isWithin } from './sessionsTree'
 import { useSessions } from '@/sidebar/sessionsStore'
 import { ConfirmDestructive, type ConfirmState } from '@/chrome/ConfirmDestructive'
-import { onAcknowledged } from '@/panes/awaiting'
 import { idleLive } from './sessionsSeen'
 import { isDonePhase, type GateView } from './model'
 
@@ -491,17 +490,11 @@ function AgentsPanelImpl({ project }: AgentsPanelProps) {
     }
     setReveal((r) => ({ id: row.id, seq: (r?.seq ?? 0) + 1 }))
   }, [focusedPane, sessionRows, sessionGroups])
-  // A click or a keystroke in a pane is the stricter "I looked" — also for the pane that already
-  // had focus, which the effect above deliberately ignores.
-  useEffect(
-    () =>
-      onAcknowledged((handle) => {
-        const store = useSessions.getState()
-        const row = store.rows?.find((v) => v.liveSession === handle)
-        if (row !== undefined) store.markSeen(row.id)
-      }),
-    [],
-  )
+  // A click or a keystroke in a pane — the stricter "I looked", also for the pane that already had
+  // focus, which the effect above deliberately ignores — is `sessionsStore`'s to hear, not this
+  // panel's (M205): this host is unmounted whenever another sidebar panel shows, and a listener
+  // here missed every acknowledgement made meanwhile, leaving the row and the rail's count waiting
+  // over a pane whose own marker the click had cleared.
   /** A new tab in the default harness. */
   const newSession = useCallback(() => {
     if (project === null) return

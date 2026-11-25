@@ -48,6 +48,24 @@ pub(crate) fn project_fs(
     registry.get(project).ok_or(FsError::NoIndex)
 }
 
+/// The checkout view a tree command is scoped to, or `None` for the project's own tree. (M207)
+///
+/// Every tree command takes an optional `worktree` — the agent checkout the Explorer is showing,
+/// as `git_worktrees` reported it in `repo.root` — and answers from that checkout's own index
+/// instead of the project's. Absent, which is every caller that predates the Explorer's selector,
+/// nothing changes. The first call naming a checkout walks it (see `crate::worktree_fs::view`),
+/// which is why this runs inside the blocking half of each handler and never before it.
+fn scoped_view(
+    fs: &Arc<crate::files::ProjectFs>,
+    events: &Arc<dyn FsEvents>,
+    project: ProjectId,
+    worktree: Option<&std::path::Path>,
+) -> Result<Option<Arc<crate::worktree_fs::WorktreeFs>>, FsError> {
+    worktree
+        .map(|path| crate::worktree_fs::view(fs, events, project, path))
+        .transpose()
+}
+
 /// Run a handler's blocking half on the blocking pool.
 ///
 /// The join can only fail if the job panicked or the runtime is shutting down. Reported as
@@ -278,10 +296,20 @@ pub(crate) async fn close_project(
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_status(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<FsStatus, FsError> {
-    status_of(&registry, project).await
+    let Some(worktree) = worktree else {
+        return status_of(&registry, project).await;
+    };
+    let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
+    blocking("fs_status", move || {
+        crate::worktree_fs::view(&fs, &events, project, &worktree).map(|view| view.status())
+    })
+    .await?
 }
 
 /// [`fs_status`] without Tauri's argument extraction. See the module note.
@@ -400,14 +428,18 @@ pub async fn fs_tree_count(
     app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
     let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_tree_count", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            return Ok(view.count() as u32);
+        }
         prepare(&fs, Some((&events, project)));
-        tree_count(&fs) as u32
+        Ok(tree_count(&fs) as u32)
     })
-    .await
+    .await?
 }
 
 /// The rows in `[offset, offset + len)`.
@@ -418,25 +450,32 @@ pub async fn fs_tree_count(
 /// out-of-range request to `[]` rather than erroring, so the arithmetic never has to.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_tree_rows(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     offset: u32,
     len: u32,
+    worktree: Option<PathBuf>,
 ) -> Result<Vec<TreeRow>, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     let len = (len as usize).min(MAX_ROWS);
     blocking("fs_tree_rows", move || {
+        // A checkout has no groups, so there is no seam to compose across.
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            return Ok(view.rows(offset as usize, len));
+        }
         prepare(&fs, None);
         let walked = fs.with_index(|index| index.count());
-        compose(
+        Ok(compose(
             walked,
             offset as usize,
             len,
             |offset, len| fs.with_index(|index| index.rows(offset, len)),
             |offset, len| fs.groups().rows(offset, len),
-        )
+        ))
     })
-    .await
+    .await?
 }
 
 /// The most matches one speed-search keystroke will return.
@@ -491,21 +530,37 @@ fn compose_matches(
 /// admitting it.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_tree_match(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     query: String,
+    worktree: Option<PathBuf>,
 ) -> Result<cide_ipc::TreeMatches, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_tree_match", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            let count = view.count() as u32;
+            let (matches, truncated) = match cide_fs::speed::Needle::new(&query) {
+                Some(needle) => view.with_index(|index| index.match_rows(&needle, MAX_MATCHES)),
+                None => (Vec::new(), false),
+            };
+            return Ok(cide_ipc::TreeMatches {
+                query,
+                count,
+                matches,
+                truncated,
+            });
+        }
         prepare(&fs, None);
         let count = tree_count(&fs) as u32;
         let Some(needle) = cide_fs::speed::Needle::new(&query) else {
-            return cide_ipc::TreeMatches {
+            return Ok(cide_ipc::TreeMatches {
                 query,
                 count,
                 matches: Vec::new(),
                 truncated: false,
-            };
+            });
         };
         let walked = fs.with_index(|index| index.count());
         let (matches, truncated) = compose_matches(
@@ -514,14 +569,14 @@ pub async fn fs_tree_match(
             |limit| fs.with_index(|index| index.match_rows(&needle, limit)),
             |limit| fs.groups().match_rows(&needle, limit),
         );
-        cide_ipc::TreeMatches {
+        Ok(cide_ipc::TreeMatches {
             query,
             count,
             matches,
             truncated,
-        }
+        })
     })
-    .await
+    .await?
 }
 
 /// The same rule over a list the caller supplies — the git panel's changes tree.
@@ -581,10 +636,16 @@ pub async fn fs_expand(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
     let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_expand", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            view.with_index_mut(|index| index.expand(&path))
+                .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?;
+            return Ok(view.count() as u32);
+        }
         prepare(&fs, Some((&events, project)));
         if fs.with_index_mut(|index| index.expand(&path)).is_some() {
             return Ok(tree_count(&fs) as u32);
@@ -604,12 +665,20 @@ pub async fn fs_expand(
 /// Collapse a directory, or a synthetic group. Returns the new row count.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_collapse(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_collapse", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            view.with_index_mut(|index| index.collapse(&path))
+                .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?;
+            return Ok(view.count() as u32);
+        }
         prepare(&fs, None);
         if fs.with_index_mut(|index| index.collapse(&path)).is_some() {
             return Ok(tree_count(&fs) as u32);
@@ -624,13 +693,21 @@ pub async fn fs_collapse(
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_browse_page(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
     direction: i8,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_browse_page", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            view.with_index_mut(|index| index.browse_page(&path, direction))
+                .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?;
+            return Ok(view.count() as u32);
+        }
         fs.with_index_mut(|index| index.browse_page(&path, direction))
             .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?;
         Ok(tree_count(&fs) as u32)
@@ -646,11 +723,21 @@ pub async fn fs_browse_page(
 /// side effect for one click. [`cide_fs::Index::set_all_expanded`] explains both.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_expand_all(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_expand_all", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            let filter = view.filter();
+            view.with_index_mut(|index| {
+                index.set_all_expanded(true, |p| filter.watchable(p, true))
+            });
+            return Ok(view.count() as u32);
+        }
         prepare(&fs, None);
         let filter = fs.filter();
         fs.with_index_mut(|index| index.set_all_expanded(true, |p| filter.watchable(p, true)));
@@ -663,11 +750,18 @@ pub async fn fs_expand_all(
 /// Returns the new row count. (M96)
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_collapse_all(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_collapse_all", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            view.with_index_mut(|index| index.set_all_expanded(false, |_| true));
+            return Ok(view.count() as u32);
+        }
         prepare(&fs, None);
         fs.with_index_mut(|index| index.set_all_expanded(false, |_| true));
         fs.groups().collapse_all();
@@ -696,8 +790,30 @@ pub async fn fs_refresh(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
+    worktree: Option<PathBuf>,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    if let Some(worktree) = worktree {
+        // A checkout's *Refresh*: the same re-scan, against the checkout's index, refused outside
+        // the checkout. Its retry-on-exhaustion is the next `fs_tree_count` after the view is
+        // evicted, so the project's restart path below is not repeated here.
+        let events: Arc<dyn FsEvents> = Arc::new(app);
+        return blocking("fs_refresh", move || {
+            let view = crate::worktree_fs::view(&fs, &events, project, &worktree)?;
+            ops::check_within(&[view.root().to_path_buf()], &path)?;
+            let filter = view.filter();
+            let _ = view.with_index_mut(|index| index.refresh_subtree(&path, &filter));
+            events.view_status(project, view.root(), &view.status());
+            let change = cide_ipc::FsChange {
+                paths: vec![path],
+                truncated: false,
+                git: false,
+            };
+            events.view_changed(project, view.root(), &change);
+            Ok(view.count() as u32)
+        })
+        .await?;
+    }
     // An explicit root refresh retries an incomplete generation, reclaiming its stale
     // arena/matcher capacity. Exhaustion itself never schedules a retry loop.
     if fs.budget.reason().is_some() && fs.root_paths().contains(&path) {
@@ -770,12 +886,26 @@ pub async fn fs_refresh(
 /// is why the retry is gated on the library predicate rather than run unconditionally.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_reveal(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
+    worktree: Option<PathBuf>,
 ) -> Result<Option<u32>, FsError> {
     let fs = project_fs(&registry, project)?;
-    blocking("fs_reveal", move || reveal_path(&fs, &path)).await
+    let events: Arc<dyn FsEvents> = Arc::new(app);
+    blocking("fs_reveal", move || {
+        // Within the checkout only. A project file revealed while the tree shows a checkout is
+        // "not in this tree" — switching the tree back would also move the Git panel and the Log,
+        // which share the choice, and a reveal is not the gesture that should do that.
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            return Ok(view
+                .with_index_mut(|index| index.reveal(&path))
+                .map(|row| row as u32));
+        }
+        Ok(reveal_path(&fs, &path))
+    })
+    .await?
 }
 
 /// [`fs_reveal`]'s body, over values.
@@ -1162,6 +1292,7 @@ fn show_now(fs: &crate::files::ProjectFs, created: PathBuf) -> PathBuf {
             item.path.to_string_lossy().into_owned(),
         ));
     }
+    fs.fold_views(&change);
     created
 }
 
@@ -1351,11 +1482,17 @@ pub async fn fs_notes_ensure(
 /// [`crate::files::ProjectFs::writable_paths`] for what that would break.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_writable_roots(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_writable_roots", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            return Ok(vec![view.root().to_path_buf()]);
+        }
         // Through `prepare`, because the drawer is only known once the groups have been shown
         // and this is routinely the *first* thing a freshly attached tree asks for. Without it
         // the answer would be the roots alone until some later read, and every scratch row
@@ -1363,9 +1500,9 @@ pub async fn fs_writable_roots(
         if fs.groups().needs_prepare() {
             fs.groups().prepare(&fs.root_paths());
         }
-        fs.writable_paths()
+        Ok(fs.writable_paths())
     })
-    .await
+    .await?
 }
 
 /// Every path the file tree can hang a row from: the project's roots, plus each group's
@@ -1391,11 +1528,17 @@ pub async fn fs_writable_roots(
 /// when a group resolves, not on every watcher burst.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_reveal_roots(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_reveal_roots", move || {
+        if let Some(view) = scoped_view(&fs, &events, project, worktree.as_deref())? {
+            return Ok(vec![view.root().to_path_buf()]);
+        }
         // Through `prepare` for the reason `fs_writable_roots` is: a freshly attached tree asks
         // this before anything has shown the groups, and without it the answer would be the roots
         // alone for that window — every crumb of a library path inert until something else
@@ -1403,9 +1546,9 @@ pub async fn fs_reveal_roots(
         if fs.groups().needs_prepare() {
             fs.groups().prepare(&fs.root_paths());
         }
-        fs.reveal_paths()
+        Ok(fs.reveal_paths())
     })
-    .await
+    .await?
 }
 
 /// Rename a file or folder, and take everything that pointed at it along. (M25)
@@ -1516,6 +1659,7 @@ pub(crate) fn rename_entry(
             item.path.to_string_lossy().into_owned(),
         ));
     }
+    fs.fold_views(&change);
     Ok(relist_if_scratch(
         fs,
         &[from.to_path_buf(), to.to_path_buf()],
@@ -1609,6 +1753,7 @@ pub(crate) fn delete_entries(
         git: false,
     };
     let _ = fs.with_index_mut(|index| index.apply(&change, &filter));
+    fs.fold_views(&change);
     // After the moves, not before: a delete that failed part way through has still removed the
     // rows it managed, and re-listing here is what stops the group showing files that are
     // already in the trash.
@@ -2031,6 +2176,7 @@ pub(crate) fn paste_with_source_roots(
         };
         let filter = source.filter();
         source.with_index_mut(|index| index.apply(&left, &filter));
+        source.fold_views(&left);
         let _ = relist_if_scratch(source, &left.paths);
     }
 
@@ -2055,6 +2201,7 @@ pub(crate) fn paste_with_source_roots(
             item.path.to_string_lossy().into_owned(),
         ));
     }
+    fs.fold_views(&change);
     // The fold above cannot reach the drawer, so anything that landed there — or left it —
     // needs the other mechanism. `change.paths` is sources *and* destinations, which is
     // exactly the set that matters for a cut out of the drawer as well as a paste into it.

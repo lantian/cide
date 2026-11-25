@@ -393,8 +393,73 @@ export function placeSubmenu(
 }
 
 /**
- * A keyboard-invoked menu (Shift+F10, the Menu key) has no pointer to sit at, so it hangs off
- * the element instead — bottom-left corner, the convention every desktop menu follows.
+ * Where a menu opened *from an element* goes — a header button's dropdown, a `▾` caret, a
+ * keyboard-invoked menu (Shift+F10) hanging off the focused element: under it, lined up with
+ * one of its edges.
+ *
+ * # Why this is not `placeMenu` from the element's corner
+ *
+ * It was. `openFor` reduced the element to its bottom-left point and handed that to
+ * `placeMenu`, and `placeMenu` flips a box **through** its anchor, which is right for a
+ * pointer and wrong for anything with a width: near the window's right edge the box's right
+ * edge landed on the button's *left* edge, so the menu hung one button-width to the left of
+ * the control that opened it. Reported against the header's split icon as "it opens slightly
+ * left", and measured off the user's screenshot rather than guessed: the menu's border ended at
+ * x=224, the button began at x=226 and ended at x=249. Every `openFor` caller sat on the same
+ * sum — the tab strip's `▾`, the project caret, the pane `⊞` — the split icon was simply the
+ * one far enough right to show it.
+ *
+ * So the flip goes round the element, as `placeSubmenu`'s goes round its row, but on the
+ * other axis pair: a dropdown opens **below**, left edges aligned; with no room to the right it
+ * keeps hanging below and aligns the two **right** edges (`anchor.right - width`) instead; with
+ * no room below it opens **above** the element (`anchor.top - height`) rather than through its
+ * bottom edge, which would lay the box over the button the user just pressed.
+ *
+ * The rest is `placeMenu`'s rules, for its reasons: flip only when the other side is strictly
+ * roomier, clamp afterwards for a window that can hold neither, budget a downward box from where
+ * it *landed*, and a flipped one by the room above the element.
+ */
+export function placeDropdown(
+  anchor: Rect,
+  size: Size,
+  viewport: Size,
+  margin: number = MENU_MARGIN,
+): Placement {
+  const spaceRight = viewport.width - margin - anchor.left
+  const spaceLeft = anchor.right - margin
+  const flippedX = size.width > spaceRight && spaceLeft > spaceRight
+  const x = clamp(
+    flippedX ? anchor.right - size.width : anchor.left,
+    margin,
+    viewport.width - margin - size.width,
+  )
+
+  const spaceBelow = viewport.height - margin - anchor.bottom
+  const spaceAbove = anchor.top - margin
+  const flippedY = size.height > spaceBelow && spaceAbove > spaceBelow
+  const y = clamp(
+    flippedY ? anchor.top - size.height : anchor.bottom,
+    margin,
+    viewport.height - margin - size.height,
+  )
+
+  const maxHeight = Math.max(
+    0,
+    flippedY
+      ? Math.min(spaceAbove, viewport.height - margin * 2)
+      : viewport.height - margin - y,
+  )
+
+  return { x, y, flippedX, flippedY, maxHeight }
+}
+
+/**
+ * The point an element-anchored menu reports as its invocation — the element's bottom-left
+ * corner, which is what `items()` is told for a menu with no pointer to sit at (Shift+F10, the
+ * Menu key, a header button).
+ *
+ * It is **not** where the box goes any more: `openFor` keeps the whole rect and the box is
+ * placed by `placeDropdown`, because a point has thrown away the width the placement needs.
  */
 export function anchorToRect(rect: {
   readonly left: number

@@ -328,6 +328,14 @@ pub const FS_STATUS: &str = "cide://fs-status";
 struct FsChanged {
     project: cide_ipc::ProjectId,
     change: cide_ipc::FsChange,
+    /// The agent checkout whose watcher saw this, or `None` for the project's own index. (M207)
+    ///
+    /// The Explorer can show a checkout under `.cide/worktrees/` (`crate::worktree_fs`), and
+    /// that view's watcher reports on the same event — path-keyed listeners (blame, the change
+    /// column, terminal links) want a checkout file's edits exactly as they want a project
+    /// file's. Every listener that mirrors the *project* — its tree, its branch, its change count
+    /// — skips a tagged burst. The precedent is `GitStatus::worktree` below.
+    worktree: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Serialize)]
@@ -335,12 +343,26 @@ struct FsChanged {
 struct FsStatusChanged {
     project: cide_ipc::ProjectId,
     status: cide_ipc::FsStatus,
+    /// As [`FsChanged::worktree`]: `Some` when this is a checkout view's status, not the
+    /// project's — a walk finishing over a checkout must not repaint the project's counts.
+    worktree: Option<std::path::PathBuf>,
 }
 
 pub fn fs_changed(app: &AppHandle, project: cide_ipc::ProjectId, change: &cide_ipc::FsChange) {
+    fs_changed_in(app, project, None, change);
+}
+
+/// [`fs_changed`] for a burst seen by a checkout view's watcher, tagged with the checkout.
+pub fn fs_changed_in(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    worktree: Option<&std::path::Path>,
+    change: &cide_ipc::FsChange,
+) {
     let payload = FsChanged {
         project,
         change: change.clone(),
+        worktree: worktree.map(std::path::Path::to_path_buf),
     };
     if let Err(error) = app.emit(FS_CHANGED, payload) {
         tracing::debug!(%error, "fs-changed reached no window");
@@ -348,9 +370,20 @@ pub fn fs_changed(app: &AppHandle, project: cide_ipc::ProjectId, change: &cide_i
 }
 
 pub fn fs_status(app: &AppHandle, project: cide_ipc::ProjectId, status: &cide_ipc::FsStatus) {
+    fs_status_in(app, project, None, status);
+}
+
+/// [`fs_status`] for a checkout view, tagged with the checkout.
+pub fn fs_status_in(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    worktree: Option<&std::path::Path>,
+    status: &cide_ipc::FsStatus,
+) {
     let payload = FsStatusChanged {
         project,
         status: status.clone(),
+        worktree: worktree.map(std::path::Path::to_path_buf),
     };
     if let Err(error) = app.emit(FS_STATUS, payload) {
         tracing::debug!(%error, "fs-status reached no window");

@@ -193,6 +193,13 @@ export interface LogViewProps {
    * `check:log-render` and the list is read over IPC by `LogTab`.
    */
   worktrees?: readonly WorktreeInfo[] | undefined
+  /**
+   * The agent checkout the walk is scoped to — its directory name — when the Log follows the
+   * Explorer's and the Git panel's shared choice (M207), or `null`. Named in the branch box, so
+   * *Current branch* reads *Current branch in dev-42* and the user can see why the history moved
+   * without having touched the Log at all.
+   */
+  checkout?: string | null | undefined
 }
 
 export function LogView({
@@ -218,6 +225,7 @@ export function LogView({
   rowMenu,
   split,
   worktrees,
+  checkout = null,
 }: LogViewProps) {
   const filtered = isFiltered(filter)
   const strip = repoStripOn(repos)
@@ -226,7 +234,11 @@ export function LogView({
   // noise. `repoChipFor` is `null` for a repository the list has not caught up with, and the
   // label then says nothing rather than a uuid.
   const scopeName =
-    strip && filter.repo !== null ? (repoChipFor(repos, filter.repo)?.name ?? null) : null
+    filter.repo !== null
+      ? strip
+        ? (repoChipFor(repos, filter.repo)?.name ?? null)
+        : null
+      : checkout
   const refNote = missingRefNote(page, filter)
   const note = revealNote(reveal)
 

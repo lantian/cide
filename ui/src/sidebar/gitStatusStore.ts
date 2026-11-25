@@ -51,13 +51,18 @@ const COALESCE_MS = 120
 
 interface GitStatusStore {
   project: ProjectId | null
+  /**
+   * The agent checkout whose tags these are, or `null` for the project's. Follows the tree it
+   * tags (`treeStore.worktree`): the Explorer attaches both with the same pair. (M207)
+   */
+  worktree: string | null
   /** Absolute path → status, plus the truncation flag. Never null; see `NO_STATUS`. */
   status: TreeStatusMap
   /** True once `git_tree_status` has failed, i.e. it is not registered in this build. */
   degraded: boolean
 
-  /** Point the store at a project, or at nothing. Clears the map first. */
-  attach: (project: ProjectId | null) => Promise<void>
+  /** Point the store at a project (and optionally one of its checkouts), or at nothing. */
+  attach: (project: ProjectId | null, worktree?: string | null) => Promise<void>
   /** Re-read the map now. */
   refresh: () => Promise<void>
   /** Re-read the map at most once per `COALESCE_MS`, on a trigger. */
@@ -85,15 +90,18 @@ let timer: ReturnType<typeof setTimeout> | null = null
 
 export const useGitStatus = create<GitStatusStore>((set, get) => ({
   project: null,
+  worktree: null,
   status: NO_STATUS,
   degraded: false,
 
-  async attach(project) {
+  async attach(project, worktree = null) {
     // A remount over the SAME project is a rail switch away and back, not a different tree: what
     // is held is the last true answer about these paths, so it stays up while the walk revalidates
     // it. Clearing here dropped every tag and redrew every mounted row twice per return to Files.
     // `treeStore.attach` makes the same call, and for the same reason.
-    if (project !== null && get().project === project) return get().refresh()
+    if (project !== null && get().project === project && get().worktree === worktree) {
+      return get().refresh()
+    }
     generation += 1
     if (timer !== null) {
       clearTimeout(timer)
@@ -101,13 +109,13 @@ export const useGitStatus = create<GitStatusStore>((set, get) => ({
     }
     // Cleared rather than left in place while the new map is fetched: the old project's tags
     // over the new project's rows is a wrong answer, and no tags is a true one.
-    set({ project, status: NO_STATUS })
+    set({ project, worktree, status: NO_STATUS })
     if (project === null) return
     await get().refresh()
   },
 
   async refresh() {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return
     // Claimed *before* the call, so a refresh started after this one supersedes it: whichever
     // walk was issued last is the only one whose answer may be installed, however the two
@@ -118,13 +126,13 @@ export const useGitStatus = create<GitStatusStore>((set, get) => ({
 
     const status = await pendingCommand(
       'git_tree_status',
-      () => gitApi.treeStatus(project),
+      () => gitApi.treeStatus(project, worktree),
       NO_STATUS,
     )
     // Two guards, because two different things can have happened while the walk ran: this
     // refresh was superseded (`generation` — by a project switch or by a later refresh), or
     // the store was pointed somewhere else entirely.
-    if (generation !== mine || get().project !== project) return
+    if (generation !== mine || get().project !== project || get().worktree !== worktree) return
     // Shared, so a walk that found what the last one found leaves subscribers' selectors unmoved.
     set({ status: shareEqual(get().status, status), degraded: isDegraded('git_tree_status') })
   },

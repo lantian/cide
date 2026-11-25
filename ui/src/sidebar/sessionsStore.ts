@@ -29,6 +29,21 @@
  * search that fires carries a token one higher than the last, and Rust stops reading for any
  * older token and answers `cancelled` — which is dropped here, as is any answer for a query or a
  * project the store has since left.
+ *
+ * # "Seen" is wired here, not in the panel (M205)
+ *
+ * A finished turn the user has dealt with reads `idle` (`sessionsSeen.ts`), and both roads to
+ * that are subscribed in `follow`, from the app's first `attach`: the pane table's changes
+ * (`awaiting.ts::subscribeAwaiting`, re-laid over the rows without a re-list) and a click or a
+ * keystroke in a pane (`onAcknowledged`). Until M205 the second lived in `AgentsPanelHost`,
+ * which is unmounted whenever another sidebar panel shows — while `App.tsx` keeps these rows
+ * attached precisely so the rail can count them with the panel shut. A click into a finished
+ * pane then cleared its marker and left its row, and the rail's number, saying *waiting*.
+ *
+ * The seen marks are kept per project, so switching to another project and back no longer raises
+ * every turn the user had already read; and a listing answer that a newer one has overtaken is
+ * dropped — two `sessions_list` calls run side by side on Rust's blocking pool, and the slower,
+ * older one used to land last and set a row back to a state its session had left.
  */
 import { create } from 'zustand'
 
@@ -43,6 +58,7 @@ import {
 import type { SessionEdit } from '@/ipc/generated'
 import { errorText } from '@/ipc/errorText'
 import { applySeen, canMarkSeen } from '@/sidebar/AgentsPanel/sessionsSeen'
+import { isSettled, onAcknowledged, subscribeAwaiting } from '@/panes/awaiting'
 import type {
   GroupView,
   SessionActivityName,
@@ -137,7 +153,31 @@ let searchTimer: ReturnType<typeof setTimeout> | undefined
 const NO_GROUPS: readonly GroupView[] = []
 /** The rows as Rust answered, before "seen" is laid over them (`sessionsSeen.ts`). */
 let rawRows: SessionView[] = []
-let seenIds: ReadonlySet<string> = new Set()
+/**
+ * Each project's seen marks (M205). Kept across `attach` — one set reset on every project switch
+ * re-raised every finished turn the user had read — and each pruned only against its own
+ * project's listing, which is the one list its ids can be in.
+ */
+const seenByProject = new Map<ProjectId, ReadonlySet<string>>()
+const NO_SEEN: ReadonlySet<string> = new Set()
+/** Listing order (M205): each ask takes the next number, and an answer older than one adopted is dropped. */
+let listAsked = 0
+let listAdopted = 0
+
+/**
+ * The rows to draw for `project`: the raw rows with seen, and settled in the pane table, laid
+ * over them. Stores the pruned set as a side effect, so a mark whose turn has moved on is gone
+ * before the next turn can end.
+ */
+function overlay(project: ProjectId): SessionView[] {
+  const before = seenByProject.get(project) ?? NO_SEEN
+  const shown = applySeen(rawRows, before, isSettled)
+  if (shown.seen !== before) {
+    if (shown.seen.size === 0) seenByProject.delete(project)
+    else seenByProject.set(project, shown.seen)
+  }
+  return shown.rows
+}
 
 export const useSessions = create<SessionsStore>((set, get) => {
   /** Start (or restart) the debounced transcript search for the current query. */
@@ -170,14 +210,14 @@ export const useSessions = create<SessionsStore>((set, get) => {
     }, 300)
   }
 
-  const adopt = (project: ProjectId, listing: SessionListing) => {
-    // A late answer for a project the store has since left is dropped.
-    if (get().project !== project) return
+  const adopt = (project: ProjectId, listing: SessionListing, asked: number) => {
+    // A late answer for a project the store has since left is dropped — and so is one a newer
+    // listing has already overtaken (see the header).
+    if (get().project !== project || asked < listAdopted) return
+    listAdopted = asked
     rawRows = listing.rows.map(adaptSession)
-    const shown = applySeen(rawRows, seenIds)
-    seenIds = shown.seen
-    remember(shown.rows)
-    set({ rows: shown.rows, groups: listing.groups, error: null })
+    remember(rawRows)
+    set({ rows: overlay(project), groups: listing.groups, error: null })
   }
 
   return {
@@ -197,8 +237,8 @@ export const useSessions = create<SessionsStore>((set, get) => {
       follow()
       if (project !== get().project) {
         // Another project's search hits, selection and rename name its conversations, not these.
+        // Its seen marks stay in `seenByProject`, for when the user comes back (M205).
         rawRows = []
-        seenIds = new Set()
         set({
           project,
           rows: null,
@@ -217,9 +257,11 @@ export const useSessions = create<SessionsStore>((set, get) => {
     refresh: () => {
       const project = get().project
       if (project === null) return
+      listAsked += 1
+      const asked = listAsked
       void sessionJournal
         .list(project)
-        .then((listing) => adopt(project, listing))
+        .then((listing) => adopt(project, listing, asked))
         .catch((e: unknown) => {
           if (get().project === project) set({ error: errorText(e) })
         })
@@ -235,18 +277,26 @@ export const useSessions = create<SessionsStore>((set, get) => {
     setSub: (sub) => set({ sub, renaming: null }),
     selectRow: (id) => set({ selected: id }),
     markSeen: (id) => {
-      if (!canMarkSeen(rawRows, id)) return
-      const next = new Set(seenIds)
+      const project = get().project
+      if (project === null || !canMarkSeen(rawRows, id)) return
+      // Already marked: nothing to draw. `acknowledge` runs on every keystroke into a terminal,
+      // and typing the next prompt into a finished pane would otherwise publish fresh rows per key.
+      if (seenByProject.get(project)?.has(id) === true) return
+      const next = new Set(seenByProject.get(project) ?? NO_SEEN)
       next.add(id)
-      const shown = applySeen(rawRows, next)
-      seenIds = shown.seen
-      set({ rows: shown.rows })
+      seenByProject.set(project, next)
+      set({ rows: overlay(project) })
     },
     setRenaming: (id) => set({ renaming: id }),
     organize: (edit) => {
       const project = get().project
       if (project === null) return Promise.resolve()
-      return sessionJournal.organize(project, edit).then((listing) => adopt(project, listing))
+      listAsked += 1
+      const asked = listAsked
+      // An answer overtaken by a newer listing is dropped like any other; the edit is still on
+      // screen, because `sessions_organize` announces `sessions-changed` to every window,
+      // this one included, and that re-list is newer still.
+      return sessionJournal.organize(project, edit).then((listing) => adopt(project, listing, asked))
     },
   }
 })
@@ -279,6 +329,19 @@ function refreshSoon(): void {
   }, 200)
 }
 
+/**
+ * Re-lay the overlay after the pane table moved, without a re-list (M205). Published only when a
+ * row's drawn activity actually changed: the table notifies on every transition of every session
+ * in the app, and a fresh `rows` array re-renders the panel and recounts the rail.
+ */
+function reshow(): void {
+  const { project, rows } = useSessions.getState()
+  if (project === null || rows === null) return
+  const next = overlay(project)
+  if (next.length === rows.length && next.every((r, i) => r.id === rows[i]?.id && r.activity === rows[i]?.activity)) return
+  useSessions.setState({ rows: next })
+}
+
 let wired = false
 /**
  * Subscribe once, from the first `attach`: a store that subscribed at import time would do so in
@@ -287,6 +350,16 @@ let wired = false
 function follow(): void {
   if (wired) return
   wired = true
+  // "Seen" (M205, the header): the pane table's answer, and a click or keystroke in a pane —
+  // both here, app-wide, never in the panel. The listener marks every row the child is live in;
+  // `markSeen` refuses any that is not waiting on nothing but being read. It is still needed
+  // beside the table: `acknowledge` returns early for a session the table never raised, and
+  // the row's waiting is Rust's hook state, which the table may not have heard.
+  subscribeAwaiting(reshow)
+  onAcknowledged((handle) => {
+    const store = useSessions.getState()
+    for (const r of rawRows) if (r.liveSession === handle) store.markSeen(r.id)
+  })
   void sessionJournal.onChanged((project) => {
     if (project === useSessions.getState().project) refreshSoon()
   })

@@ -47,11 +47,13 @@ import styles from './ContextMenu.module.css'
 import {
   activeItem,
   moveFocus,
+  placeDropdown,
   placeMenu,
   placeSubmenu,
   resolveMenu,
   type MenuEntry,
   type Placement,
+  type Rect,
   type ResolvedEntry,
 } from './model'
 
@@ -61,6 +63,13 @@ export interface ContextMenuProps {
   entries: readonly ResolvedEntry[]
   /** Window coordinates of the pointer, or of the anchor for a keyboard invocation. */
   at: { x: number; y: number }
+  /**
+   * The element the menu hangs off, when it was opened from one (`useContextMenu.openFor`).
+   * Present, the box is placed by `placeDropdown` against the element's edges; absent — a
+   * pointer — by `placeMenu` at `at`. A point cannot stand in for an element: it has no width,
+   * and near the right edge that put a header dropdown one button-width left of its button.
+   */
+  anchor?: Rect | undefined
   onClose: () => void
   search?: {
     label: string
@@ -116,6 +125,7 @@ export function ContextMenu({
   label,
   entries,
   at,
+  anchor,
   onClose,
   chipFor,
   search,
@@ -161,14 +171,12 @@ export function ContextMenu({
     const el = box.current
     if (el === null) return
     const rect = el.getBoundingClientRect()
+    const size = { width: rect.width, height: rect.height }
+    const viewport = { width: window.innerWidth, height: window.innerHeight }
     setPlacement(
-      placeMenu(
-        at,
-        { width: rect.width, height: rect.height },
-        { width: window.innerWidth, height: window.innerHeight },
-      ),
+      anchor !== undefined ? placeDropdown(anchor, size, viewport) : placeMenu(at, size, viewport),
     )
-  }, [at, entries])
+  }, [at, anchor, entries])
 
   /*
    * The same, for the submenu, against its parent *row* rather than the pointer.

@@ -36,6 +36,7 @@ export {
   isEmptyMenu,
   isInertMenu,
   moveFocus,
+  placeDropdown,
   placeMenu,
   placeSubmenu,
   resolveMenu,

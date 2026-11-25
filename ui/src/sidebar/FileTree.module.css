@@ -92,6 +92,28 @@
 }
 
 /*
+ * The worktree selector's strip under the header (M207): the kit's `toolbar`, so it reads as
+ * the same surface every other panel's tool row is drawn on. The selector stretches to the
+ * strip — a checkout's branch is `cide/<role>-<task>` and every character of the 252px is
+ * wanted for it.
+ */
+.worktreeBar {
+  composes: toolbar from '../kit/components/Surface.module.css';
+  flex: none;
+}
+
+.worktreeBar > span {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.worktreeBar > span > * {
+  flex: 1;
+  min-width: 0;
+}
+
+/*
  * Disabled is an ordinary state here, not a failure: it is what "no file tab is open" looks
  * like, which is true every time the Claude console is the active tab. So it dims and stops
  * responding rather than disappearing — a control that renders nothing does not read as "not

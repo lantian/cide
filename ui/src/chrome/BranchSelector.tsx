@@ -90,6 +90,7 @@ import {
 import { showConflicts } from './conflictsStore'
 import { divergenceOf, strategyAsk } from './pullStrategyModel'
 import { requestPullStrategy } from './pullStrategyStore'
+import { projectHears } from './worktreeScope'
 import { Icon } from '@/icons/Icon'
 
 import styles from './BranchSelector.module.css'
@@ -278,8 +279,11 @@ function useBranchData(): { project: ProjectId | null; lists: BranchList[]; load
    * have changed.
    */
   useEffect(() => {
-    const stop = events.onFsChanged((changed: ProjectId, change) => {
+    const stop = events.onFsChanged((changed: ProjectId, change, tag) => {
+      // The project's branches. A checkout view's watcher (M207) also sees the common refs, so a
+      // tagged burst repeats one the project's watcher has already reported.
       if (!change.git) return
+      if (!projectHears(tag)) return
       if (changed === useBranches.getState().project) void useBranches.getState().load(changed)
     })
     return () => void stop.then((off: () => void) => off())
@@ -385,8 +389,8 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
     let pending: number | null = null
     let gone = false
     let unlisten: (() => void) | null = null
-    const stop = events.onFsChanged((changed, change) => {
-      if (change.git || changed !== project || pending !== null) return
+    const stop = events.onFsChanged((changed, change, tag) => {
+      if (change.git || changed !== project || pending !== null || !projectHears(tag)) return
       pending = window.setTimeout(() => {
         pending = null
         void useBranches.getState().load(project)

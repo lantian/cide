@@ -617,9 +617,13 @@ pub async fn git_blame_parent(
 pub async fn git_tree_status(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
+    worktree: Option<PathBuf>,
 ) -> Result<TreeStatusMap> {
     let roots = roots(&state, project)?;
-    blocking(move || Ok(tree_status::tree_status(&roots))).await
+    // The file tree's tags for whichever tree it shows: the project's, or the agent checkout the
+    // Explorer's selector chose (M207). `scoped` is the gate `git_status` already goes through,
+    // so a path that is not one of this project's checkouts is refused rather than walked.
+    blocking(move || Ok(tree_status::tree_status(&scoped(roots, worktree)?))).await
 }
 
 #[tauri::command(rename_all = "camelCase")]

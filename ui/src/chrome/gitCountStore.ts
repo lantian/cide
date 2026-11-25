@@ -53,6 +53,7 @@ import {
   type ProjectId,
 } from '@/ipc/client'
 import { countChangedFiles, normalizeStatus } from '@/sidebar/GitPanel/model'
+import { checkoutHears } from './worktreeScope'
 
 /**
  * How long a burst of triggers is held before one walk runs.
@@ -70,6 +71,17 @@ const EMPTY: ChangesTree = { repos: [] }
 interface GitCountStore {
   project: ProjectId | null
   /**
+   * The agent checkout whose changes the badge counts, or `null` for the project's own tree.
+   * (M207)
+   *
+   * The shared choice the Explorer, the Git panel and the Log follow (`chrome/useWorktrees.ts`).
+   * Until the user reported it this badge counted the project whatever the panel showed, so
+   * switching the tree to a checkout left a number about the master checkout beside a panel
+   * listing the agent's: two figures for "what is uncommitted here", one of them about a tree
+   * nobody was looking at.
+   */
+  worktree: string | null
+  /**
    * Changed files across every repository, or `null` for "not walked yet".
    *
    * `null` is not `0` and the difference is the whole point: `0` says the tree is clean, and
@@ -80,8 +92,8 @@ interface GitCountStore {
   /** True once `git_status` has failed, i.e. it is not registered in this build. */
   degraded: boolean
 
-  /** Point the store at a project, or at nothing. */
-  attach: (project: ProjectId | null) => Promise<void>
+  /** Point the store at a project (and optionally one of its checkouts), or at nothing. */
+  attach: (project: ProjectId | null, worktree?: string | null) => Promise<void>
   /** Re-read the count now. */
   refresh: () => Promise<void>
   /** Re-read at most once per `COALESCE_MS`, on a trigger. */
@@ -98,16 +110,20 @@ interface GitCountStore {
  */
 let generation = 0
 let timer: ReturnType<typeof setTimeout> | null = null
-/** The project a Git panel is feeding this count for. See {@link holdChangeCount}. */
-let panelProject: ProjectId | null = null
+/** The tree a Git panel is feeding this count for. See {@link holdChangeCount}. */
+let panelScope: { project: ProjectId; worktree: string | null } | null = null
+
+const holds = (project: ProjectId | null, worktree: string | null) =>
+  panelScope !== null && panelScope.project === project && panelScope.worktree === worktree
 
 export const useGitCount = create<GitCountStore>((set, get) => ({
   project: null,
+  worktree: null,
   count: null,
   degraded: false,
 
-  async attach(project) {
-    if (project === get().project) return
+  async attach(project, worktree = null) {
+    if (project === get().project && worktree === get().worktree) return
     generation += 1
     if (timer !== null) {
       clearTimeout(timer)
@@ -115,13 +131,13 @@ export const useGitCount = create<GitCountStore>((set, get) => ({
     }
     // Back to `null`, not to `0`. The previous project's number over the new project's badge
     // is a wrong answer; "not known yet" is a true one, and it draws nothing either way.
-    set({ project, count: null })
+    set({ project, worktree, count: null })
     if (project === null) return
     await get().refresh()
   },
 
   async refresh() {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return
     generation += 1
     const mine = generation
@@ -129,15 +145,19 @@ export const useGitCount = create<GitCountStore>((set, get) => ({
     // `includeIgnored: false`, always. The count excludes ignored files by rule
     // (`model.counts`), so asking for them would be paying for the expensive half of a status
     // walk — every path under a big `target/` — to throw the answer away.
-    const tree = await pendingCommand('git_status', () => gitApi.status(project, false), EMPTY)
-    if (generation !== mine || get().project !== project) return
+    const tree = await pendingCommand(
+      'git_status',
+      () => gitApi.status(project, false, worktree),
+      EMPTY,
+    )
+    if (generation !== mine || get().project !== project || get().worktree !== worktree) return
     set({ count: countChangedFiles(normalizeStatus(tree)), degraded: isDegraded('git_status') })
   },
 
   schedule() {
     // Here and not on `refresh`: *Refresh* in the palette calls that directly, and a user who asked
     // for a fresh number gets a walk whatever else is open. Only the event-driven walks are spare.
-    if (timer !== null || panelProject === get().project) return
+    if (timer !== null || holds(get().project, get().worktree)) return
     timer = setTimeout(() => {
       timer = null
       void get().refresh()
@@ -158,10 +178,17 @@ export const useGitCount = create<GitCountStore>((set, get) => ({
  * cannot land afterwards and overwrite a fresher number with an older one.
  *
  * A tree for a project this store is not pointed at is dropped rather than adopted: a
- * detached-pane window's panel and the shell can be looking at different projects.
+ * detached-pane window's panel and the shell can be looking at different projects. So is a tree
+ * of another *checkout* than the one the badge counts — `worktree` is the tree's, `null` for the
+ * project's own.
  */
-export function noteChangeCount(project: ProjectId, tree: ChangesTree): void {
-  if (useGitCount.getState().project !== project) return
+export function noteChangeCount(
+  project: ProjectId,
+  tree: ChangesTree,
+  worktree: string | null = null,
+): void {
+  const store = useGitCount.getState()
+  if (store.project !== project || store.worktree !== worktree) return
   generation += 1
   useGitCount.setState({ count: countChangedFiles(normalizeStatus(tree)) })
 }
@@ -175,8 +202,8 @@ export function noteChangeCount(project: ProjectId, tree: ChangesTree): void {
  * two things decide this and neither is the rail's to know:
  *
  *   * **Which tree the panel shows.** A panel on an agent checkout under `.cide/worktrees/` walks
- *     that checkout, which says nothing about the project's own count. It must not hold, and the
- *     badge keeps its own walks going, exactly as it does with the panel shut.
+ *     that checkout. Since M207 the badge counts the same checkout (the choice is shared), so the
+ *     hold names the tree as well as the project and stops only the walks of that tree.
  *   * **Which project.** A detached-pane window's panel and the shell can be looking at different
  *     projects. The comparison in `schedule` is against the project this store is pointed at, so a
  *     hold on any other project stops nothing.
@@ -186,18 +213,19 @@ export function noteChangeCount(project: ProjectId, tree: ChangesTree): void {
  * nobody: this store skipped it because the panel was open, and the panel unmounted before acting
  * on it. The badge would then be wrong until the next edit, which may never come.
  */
-export function holdChangeCount(project: ProjectId): () => void {
-  panelProject = project
+export function holdChangeCount(project: ProjectId, worktree: string | null = null): () => void {
+  const scope = { project, worktree }
+  panelScope = scope
   const store = useGitCount.getState()
   // A walk armed a moment before the panel opened would only repeat the panel's own first one.
-  if (timer !== null && store.project === project) {
+  if (timer !== null && store.project === project && store.worktree === worktree) {
     clearTimeout(timer)
     timer = null
   }
   return () => {
-    if (panelProject === project) panelProject = null
+    if (panelScope === scope) panelScope = null
     const after = useGitCount.getState()
-    if (after.project === project) after.schedule()
+    if (after.project === project && after.worktree === worktree) after.schedule()
   }
 }
 
@@ -215,23 +243,29 @@ export function holdChangeCount(project: ProjectId): () => void {
  * before the rail is rendered and has nothing to draw a badge on, so walking its repositories
  * would be work for nobody. Passing `null` rather than skipping the call keeps the hook order
  * unconditional, which is the rule React actually enforces.
+ *
+ * `worktree` is the shared checkout choice (M207), passed in by `App.tsx` rather than read here
+ * so this hook stays mountable against a mocked IPC with no worktree list behind it
+ * (`check-commit-message.mjs` does exactly that). `null` counts the project's own tree.
  */
-export function useGitChangeCount(project: ProjectId | null): number | null {
+export function useGitChangeCount(
+  project: ProjectId | null,
+  worktree: string | null = null,
+): number | null {
   const count = useGitCount((s) => s.count)
 
   useEffect(() => {
-    void useGitCount.getState().attach(project)
-  }, [project])
+    void useGitCount.getState().attach(project, worktree)
+  }, [project, worktree])
 
   useEffect(() => {
     if (project === null) return
     // Carries the whole recomputed tree, so this costs no round trip at all.
-    // A tree tagged with a worktree is one agent checkout's, broadcast because the Git panel was
-    // looking at it when it committed — not the project's count, so it must not replace it.
-    const stop = events.onGitStatus((changed: ProjectId, tree: ChangesTree, worktree) => {
-      if (worktree === null && changed === useGitCount.getState().project) {
-        noteChangeCount(changed, tree)
-      }
+    // Tagged with the checkout it describes (`null` for the project's own): adopted only when that
+    // is the tree the badge counts, so a commit in another checkout cannot repaint it.
+    const stop = events.onGitStatus((changed: ProjectId, tree: ChangesTree, tag) => {
+      const store = useGitCount.getState()
+      if (changed === store.project && tag === store.worktree) noteChangeCount(changed, tree, tag)
     })
     return () => void stop.then((off: () => void) => off())
   }, [project])
@@ -240,8 +274,13 @@ export function useGitChangeCount(project: ProjectId | null): number | null {
     if (project === null) return
     // The watcher's view. This is the only signal for a `git add` or a `git commit` run in a
     // bash pane, and for a plain edit — neither of which broadcasts `cide://git-status`.
-    const stop = events.onFsChanged((changed: ProjectId) => {
-      if (changed === useGitCount.getState().project) useGitCount.getState().schedule()
+    const stop = events.onFsChanged((changed: ProjectId, _change, tag) => {
+      // `checkoutHears` (M207): the project's watcher always — it sees the shared refs move — and
+      // a checkout view's watcher only for the checkout being counted, the one watcher that sees
+      // a plain edit or a `git add` inside it.
+      const store = useGitCount.getState()
+      if (!checkoutHears(store.worktree, tag)) return
+      if (changed === store.project) store.schedule()
     })
     return () => void stop.then((off: () => void) => off())
   }, [project])

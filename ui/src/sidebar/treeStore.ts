@@ -112,6 +112,16 @@ export interface TreePress {
 
 interface FileTreeStore {
   project: ProjectId | null
+  /**
+   * The agent checkout under `.cide/worktrees/` this tree shows instead of the project's roots,
+   * or `null` for the project's own tree. (M207)
+   *
+   * Part of the store's identity exactly as `project` is: `attach` resets on a change of either,
+   * every `fsApi` call is scoped by it, and every guard after a round trip asks `inScope` —
+   * both — because a reply for the project's tree landing after the user picked a checkout (or
+   * the reverse) would number rows from a tree that is no longer on screen.
+   */
+  worktree: string | null
   /** Total rows in the flattened tree. The virtualizer's `count`. */
   count: number
   /** Resident rows, keyed by chunk index. */
@@ -242,7 +252,7 @@ interface FileTreeStore {
   } | null
 
   /** Point the tree at a project, or at nothing. Reads the row count. */
-  attach: (project: ProjectId | null) => Promise<void>
+  attach: (project: ProjectId | null, worktree?: string | null) => Promise<void>
   /**
    * Ask for whatever chunks cover `[from, to)`, and record that range as the visible one.
    * Cheap and idempotent; call from an effect on every render.
@@ -517,15 +527,26 @@ function sameRows(a: readonly TreeRow[] | undefined, b: readonly TreeRow[]): boo
   })
 }
 
+/** Whether the store still shows the tree a round trip was issued for: same project, same checkout. */
+function inScope(s: FileTreeStore, project: ProjectId, worktree: string | null): boolean {
+  return s.project === project && s.worktree === worktree
+}
+
 /** One chunk's rows, or `[]` for a chunk that is entirely past the end. */
-function readChunk(project: ProjectId, chunk: number, total: number): Promise<TreeRow[]> {
+function readChunk(
+  project: ProjectId,
+  worktree: string | null,
+  chunk: number,
+  total: number,
+): Promise<TreeRow[]> {
   const { offset, len } = chunkRequest(chunk, total)
   if (len <= 0) return Promise.resolve([])
-  return tree('fs_tree_rows', () => fsApi.treeRows(project, offset, len), [] as TreeRow[])
+  return tree('fs_tree_rows', () => fsApi.treeRows(project, offset, len, worktree), [] as TreeRow[])
 }
 
 export const useFileTree = create<FileTreeStore>((set, get) => ({
   project: null,
+  worktree: null,
   count: 0,
   chunks: new Map(),
   degraded: false,
@@ -537,7 +558,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   selection: NO_PATHS,
   draft: null,
 
-  async attach(project) {
+  async attach(project, worktree = null) {
     // A remount over the SAME project — the rail toggling Files shut and back open, or a
     // panel switch away and back — must not blank a tree the user was just looking at:
     // the reset below zeroes the count, so the virtualizer draws nothing until three
@@ -547,7 +568,11 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // for a genuinely different project — and a caller that someday reuses a project id
     // across a roots change must add an explicit reset flag here; today no such caller
     // exists (`Explorer`'s effect keys on the id).
-    if (project !== null && get().project === project) return get().refresh()
+    // The checkout is part of "the same tree": picking one in the Explorer's selector is a
+    // different tree, and gets the full reset below exactly as another project does.
+    if (project !== null && get().project === project && get().worktree === worktree) {
+      return get().refresh()
+    }
     resetCache()
     // The selection goes with the project. A path from the old one names nothing in the new
     // tree, and keeping it would leave a highlight the user cannot see and the arrows
@@ -558,6 +583,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // project the user is no longer looking at.
     set({
       project,
+      worktree,
       count: 0,
       chunks: new Map(),
       revealTo: null,
@@ -575,7 +601,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     if (project === null) return
 
     const mine = generation
-    const count = await tree('fs_tree_count', () => fsApi.treeCount(project), 0)
+    const count = await tree('fs_tree_count', () => fsApi.treeCount(project, worktree), 0)
     if (generation !== mine) return
     set({ count, degraded: isDegraded('fs_tree_count') })
 
@@ -588,8 +614,8 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
      * `fs_writable_roots` keeps a working file tree and merely refuses to rename a scratch —
      * which it also has no way to create.
      */
-    const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project), [])
-    if (generation !== mine || get().project !== project) return
+    const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project, worktree), [])
+    if (generation !== mine || !inScope(get(), project, worktree)) return
     set({ writable })
 
     /*
@@ -602,13 +628,13 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
      * `fs_reveal_roots` never resolves *External Libraries*, so on a cold project this answers
      * with the roots alone. That is why `refresh` asks again; see the self-heal there.
      */
-    const revealable = await tree('fs_reveal_roots', () => fsApi.revealRoots(project), [])
-    if (generation !== mine || get().project !== project) return
+    const revealable = await tree('fs_reveal_roots', () => fsApi.revealRoots(project, worktree), [])
+    if (generation !== mine || !inScope(get(), project, worktree)) return
     set({ revealable })
   },
 
   ensure(from, to) {
-    const { project, count, chunks } = get()
+    const { project, worktree, count, chunks } = get()
     if (project === null || count === 0) return
 
     const wanted = chunksFor(Math.max(0, from), Math.min(to, count), CHUNK_ROWS)
@@ -626,7 +652,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       // replaces them only if they actually moved.
       if (chunks.has(chunk) && !stale.has(chunk)) continue
       inFlight.add(chunk)
-      void loadChunk(project, chunk, new Set(wanted), set, get)
+      void loadChunk(project, worktree, chunk, new Set(wanted), set, get)
     }
   },
 
@@ -697,23 +723,23 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async browsePage(row, direction) {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return
-    const count = await tree('fs_browse_page', () => fsApi.browsePage(project, row.path, direction), get().count)
-    if (get().project !== project) return
+    const count = await tree('fs_browse_page', () => fsApi.browsePage(project, row.path, direction, worktree), get().count)
+    if (!inScope(get(), project, worktree)) return
     resetCache()
     set({ count, chunks: new Map(), degraded: isDegraded('fs_browse_page') })
   },
 
   async toggle(row) {
-    const { project } = get()
+    const { project, worktree } = get()
     // `rowVerbs`, not `kind === 'dir'`: a group header folds too, and a note must not. This is
     // one of the six sites that used to ask about `'dir'` and meant six different things.
     if (project === null || !rowVerbs(row.kind, true).expandable) return
 
     const call = row.expanded
-      ? () => fsApi.collapse(project, row.path)
-      : () => fsApi.expand(project, row.path)
+      ? () => fsApi.collapse(project, row.path, worktree)
+      : () => fsApi.expand(project, row.path, worktree)
     const name = row.expanded ? 'fs_collapse' : 'fs_expand'
 
     // The toggled row's flat index, read from the resident cache *before* the round trip:
@@ -728,6 +754,9 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // between them, and the virtualizer would briefly size itself to a count that never
     // matched the rows.
     const count = await tree(name, call, get().count)
+    // Another tree since the click — a project switch, or the Explorer's selector moved to or
+    // from a checkout — and this count sizes a tree it was not computed for.
+    if (!inScope(get(), project, worktree)) return
     // The toggled row's own chunk is dropped with everything after it — its `expanded` flag
     // changed, so its rows genuinely differ.
     const keepBelow = at === null ? 0 : chunkOf(at)
@@ -737,33 +766,33 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async setAllExpanded(expanded) {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return
     const name = expanded ? 'fs_expand_all' : 'fs_collapse_all'
     const count = await tree(
       name,
-      () => (expanded ? fsApi.expandAll(project) : fsApi.collapseAll(project)),
+      () => (expanded ? fsApi.expandAll(project, worktree) : fsApi.collapseAll(project, worktree)),
       get().count,
     )
     // `refreshDir`'s guard: a project swapped out under the round trip must not be sized by
     // this one's count.
-    if (get().project !== project) return
+    if (!inScope(get(), project, worktree)) return
     resetCache()
     set({ count, chunks: new Map(), degraded: isDegraded(name) })
   },
 
   async refreshDir(path) {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return
     // `toggle`'s cache discipline, for `toggle`'s reason: a refresh re-flattens everything
     // under the folder and moves nothing above it, so the chunks strictly above the fold
     // keep their rows on screen for the length of the round trip. The folder's own chunk is
     // dropped with everything after it — its children share it.
     const at = get().indexOf(path)
-    const count = await tree('fs_refresh', () => fsApi.refresh(project, path), get().count)
+    const count = await tree('fs_refresh', () => fsApi.refresh(project, path, worktree), get().count)
     // The project can be swapped out from under the round trip — `reveal` carries the same
     // guard — and writing this count into the next project's tree would size it wrongly.
-    if (get().project !== project) return
+    if (!inScope(get(), project, worktree)) return
     const keepBelow = at === null ? 0 : chunkOf(at)
     retainCacheBelow(keepBelow)
     const kept = new Map([...get().chunks].filter(([index]) => index < keepBelow))
@@ -771,23 +800,23 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async reveal(path) {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return false
 
     // `fs_reveal` answers `null` for a path outside the index — a gitignored file, a stale
     // picker row, a file deleted between the pick and the reveal, or a tab holding a file the
     // project does not contain at all. Treated as "nothing to scroll to" rather than coerced to
     // a row number, and *reported*: the caller is the one that knows whether silence is honest.
-    const index = await tree('fs_reveal', () => fsApi.reveal(project, path), null)
+    const index = await tree('fs_reveal', () => fsApi.reveal(project, path, worktree), null)
     // The project can be swapped out from under a reveal — `attach` is what a project switch
     // runs — and writing this count and this index into the new project's tree would scroll it
     // to a row belonging to the old one.
-    if (index === null || index < 0 || get().project !== project) return false
+    if (index === null || index < 0 || !inScope(get(), project, worktree)) return false
 
     // Revealing expands ancestors, so the flattening moved; everything cached is stale.
     resetCache()
     const mine = generation
-    const count = await tree('fs_tree_count', () => fsApi.treeCount(project), get().count)
+    const count = await tree('fs_tree_count', () => fsApi.treeCount(project, worktree), get().count)
     // The same guard `attach` and `refresh` carry, for the same reason: an expand or a watcher
     // refresh that landed while this count was in flight has already re-flattened the tree, so
     // both the count and the row index below describe a shape that is gone.
@@ -813,7 +842,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async revealGroup(id) {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return false
     const path = groupPath(id)
 
@@ -824,14 +853,14 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // `fs_reveal` answers `null` when this project has no such group, which is every project
     // with no Cargo or Go manifest under a root. That is the honest "nothing to show" and the
     // caller says so.
-    const at = await tree('fs_reveal', () => fsApi.reveal(project, path), null)
-    if (at === null || at < 0 || get().project !== project) return false
+    const at = await tree('fs_reveal', () => fsApi.reveal(project, path, worktree), null)
+    if (at === null || at < 0 || !inScope(get(), project, worktree)) return false
 
     // The expand is what starts the resolution, and its answer is the new count — the group is
     // about to grow a `Resolving…` row, so the scroller has to be sized for it before the
     // virtualizer is told where to scroll.
-    const count = await tree('fs_expand', () => fsApi.expand(project, path), get().count)
-    if (get().project !== project) return false
+    const count = await tree('fs_expand', () => fsApi.expand(project, path, worktree), get().count)
+    if (!inScope(get(), project, worktree)) return false
 
     resetCache()
     set({
@@ -850,7 +879,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async refresh() {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return
 
     // The generation still moves — a `fs_tree_rows` issued before the burst describes the
@@ -861,8 +890,8 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     const mine = generation
     inFlight = new Set()
 
-    const count = await tree('fs_tree_count', () => fsApi.treeCount(project), get().count)
-    if (generation !== mine || get().project !== project) return
+    const count = await tree('fs_tree_count', () => fsApi.treeCount(project, worktree), get().count)
+    if (generation !== mine || !inScope(get(), project, worktree)) return
 
     /*
      * Self-heal the writable set, and *only* when it is empty.
@@ -875,8 +904,8 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
      * shape this whole milestone is about. The guard keeps the ordinary burst at zero calls.
      */
     if (get().writable.length === 0) {
-      const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project), [])
-      if (generation !== mine || get().project !== project) return
+      const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project, worktree), [])
+      if (generation !== mine || !inScope(get(), project, worktree)) return
       if (writable.length > 0) set({ writable })
     }
 
@@ -926,14 +955,14 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
      * inventing one for a one-frame staleness is the more expensive mistake.
      */
     if (count !== get().count || get().revealable.length === 0) {
-      const revealable = await tree('fs_reveal_roots', () => fsApi.revealRoots(project), [])
-      if (generation !== mine || get().project !== project) return
+      const revealable = await tree('fs_reveal_roots', () => fsApi.revealRoots(project, worktree), [])
+      if (generation !== mine || !inScope(get(), project, worktree)) return
       if (revealable.length > 0 && !sameList(get().revealable, revealable)) set({ revealable })
     }
 
     const wanted = [...visible].filter((chunk) => chunk * CHUNK_ROWS < count)
-    const fetched = await Promise.all(wanted.map((chunk) => readChunk(project, chunk, count)))
-    if (generation !== mine || get().project !== project) return
+    const fetched = await Promise.all(wanted.map((chunk) => readChunk(project, worktree, chunk, count)))
+    if (generation !== mine || !inScope(get(), project, worktree)) return
 
     const before = get()
     const fresh = new Map<number, TreeRow[]>()
@@ -966,41 +995,41 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async beginDraft(parent, directory, atTop) {
-    const { project } = get()
+    const { project, worktree } = get()
     if (project === null) return false
 
     if (atTop) {
       // The hidden root of a single-root project. There is no row to anchor under, so the
       // draft is row 0 and the whole tree shifts down by one. Depth 0 for the same reason:
       // the top-level rows of a single-root project are the root's children at depth 0.
-      const siblings = await readSiblings(project, 0, -1)
-      if (get().project !== project) return false
+      const siblings = await readSiblings(project, worktree, 0, -1)
+      if (!inScope(get(), project, worktree)) return false
       set({ draft: { parent, directory, index: 0, depth: 0, siblings }, revealTo: 0 })
       return true
     }
 
     const mine = generation
-    const at = await tree('fs_reveal', () => fsApi.reveal(project, parent), null)
-    if (generation !== mine || get().project !== project) return false
+    const at = await tree('fs_reveal', () => fsApi.reveal(project, parent, worktree), null)
+    if (generation !== mine || !inScope(get(), project, worktree)) return false
     // The parent has no row: gitignored, or deleted between the right-click and now. Rust
     // would refuse the create anyway; declining to open a box that cannot lead anywhere is
     // the earlier and quieter version of the same answer, and the caller reports it.
     if (at === null || at < 0) return false
 
-    const count = await tree('fs_expand', () => fsApi.expand(project, parent), get().count)
-    if (generation !== mine || get().project !== project) return false
+    const count = await tree('fs_expand', () => fsApi.expand(project, parent, worktree), get().count)
+    if (generation !== mine || !inScope(get(), project, worktree)) return false
 
     // Expanding re-flattened everything below the parent, so every cached chunk past it is
     // wrong. The two reads below therefore go through `fsApi` rather than the cache.
     resetCache()
     const parentRow = await tree(
       'fs_tree_rows',
-      () => fsApi.treeRows(project, at, 1),
+      () => fsApi.treeRows(project, at, 1, worktree),
       [] as TreeRow[],
     )
     const depth = parentRow[0]?.depth ?? 0
-    const siblings = await readSiblings(project, at + 1, depth)
-    if (get().project !== project) return false
+    const siblings = await readSiblings(project, worktree, at + 1, depth)
+    if (!inScope(get(), project, worktree)) return false
 
     set({
       count,
@@ -1032,10 +1061,10 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   async selectCreated(created) {
-    const project = get().project
+    const { project, worktree } = get()
     if (project === null) return null
     await get().refresh()
-    if (get().project !== project) return null
+    if (!inScope(get(), project, worktree)) return null
 
     // `indexOf` searches the *resident* chunks, so a miss means one of two very different
     // things: the file genuinely has no row, or the cache does not currently hold the chunk
@@ -1050,8 +1079,8 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // message actually wants to make. One extra round trip, on the miss path only.
     const cached = get().indexOf(created)
     const at =
-      cached ?? (await tree('fs_reveal', () => fsApi.reveal(project, created), null))
-    if (at === null || at < 0 || get().project !== project) {
+      cached ?? (await tree('fs_reveal', () => fsApi.reveal(project, created, worktree), null))
+    if (at === null || at < 0 || !inScope(get(), project, worktree)) {
       // Created, but no row — the project's ignore rules hide it. `.gitignore`d dot-files are
       // the ordinary case. Reported rather than papered over: a selection pointing at a path
       // with no row is a highlight nobody can see.
@@ -1182,17 +1211,17 @@ async function fetchBand(
   hi: number,
   get: () => FileTreeStore,
 ): Promise<string[] | null> {
-  const project = get().project
+  const { project, worktree } = get()
   if (project === null) return null
   const mine = generation
   const rows = await tree(
     'fs_tree_rows',
-    () => fsApi.treeRows(project, lo, hi - lo + 1),
+    () => fsApi.treeRows(project, lo, hi - lo + 1, worktree),
     [] as TreeRow[],
   )
   // The same guard every other read in this file carries: an expand, a collapse or a watcher
   // burst that landed while this was in flight has renumbered the rows these paths came from.
-  if (generation !== mine || get().project !== project) return null
+  if (generation !== mine || !inScope(get(), project, worktree)) return null
   // Deliberately whatever came back rather than the length that was asked for. A tree that
   // shrank under the request answers short, and selecting the rows that do exist is a better
   // answer than refusing the gesture.
@@ -1228,10 +1257,15 @@ const SIBLING_SCAN = 512
  * *not* deeper than the parent, which is the parent's next sibling — everything between is
  * its subtree, and only the shallowest level of that subtree is a sibling of the new entry.
  */
-async function readSiblings(project: ProjectId, from: number, depth: number): Promise<string[]> {
+async function readSiblings(
+  project: ProjectId,
+  worktree: string | null,
+  from: number,
+  depth: number,
+): Promise<string[]> {
   const rows = await tree(
     'fs_tree_rows',
-    () => fsApi.treeRows(project, from, SIBLING_SCAN),
+    () => fsApi.treeRows(project, from, SIBLING_SCAN, worktree),
     [] as TreeRow[],
   )
   const names: string[] = []
@@ -1245,6 +1279,7 @@ async function readSiblings(project: ProjectId, from: number, depth: number): Pr
 /** Fetch one chunk and merge it in, evicting whatever the cap no longer allows. */
 async function loadChunk(
   project: ProjectId,
+  worktree: string | null,
   chunk: number,
   visible: ReadonlySet<number>,
   set: (partial: Partial<FileTreeStore>) => void,
@@ -1258,13 +1293,13 @@ async function loadChunk(
     inFlight.delete(chunk)
     return
   }
-  const rows = await readChunk(project, chunk, get().count)
+  const rows = await readChunk(project, worktree, chunk, get().count)
 
   inFlight.delete(chunk)
   // The tree was re-flattened while this was in flight. These rows describe a shape that no
   // longer exists; writing them would show files at the wrong indentation under the wrong
   // parent, which looks like corruption rather than staleness.
-  if (generation !== mine || get().project !== project) return
+  if (generation !== mine || !inScope(get(), project, worktree)) return
   stale.delete(chunk)
 
   // A revalidation that found nothing. Returning before the `set` is the whole point: the

@@ -235,6 +235,11 @@ try {
     { key: 'ctrl+shift+tab', command: 'tab.switcher.prev', when: 'shellWindow' },
     { key: 'ctrl+`', command: 'project.switcher.next', when: 'shellWindow' },
     { key: 'ctrl+1', command: 'tab.console', when: 'shellWindow' },
+    // A new harness tab, `shellWindow`-scoped like the four above and for the same reason (a
+    // detached window has no strip to add it to). `KeyH` is in the sweep corpus, so this also
+    // holds both entry points to swallowing ⌃⇧H identically — and to leaving plain ⌃H, the ^H
+    // backspace byte a terminal must get, alone.
+    { key: 'ctrl+shift+h', command: 'claude.newTab', when: 'shellWindow' },
     // M14. F4 toggles the left panel. xterm *encodes* F4 as `ESC O S`, so this is the one
     // binding in the table whose whole cost is measured by the sweep below: both entry points
     // must swallow it in a shell window and pass it through in a detached one, or `mc` and

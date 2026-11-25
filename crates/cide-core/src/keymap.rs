@@ -793,6 +793,32 @@ pub fn defaults() -> Vec<Binding> {
              */
             ("ctrl+1", "tab.console", "shellWindow"),
             /*
+             * Ctrl+Shift+H — a new tab holding an empty session in the default harness, asked
+             * for as "a hotkey … to open a tab of default harness (empty)". H for Harness.
+             *
+             * `shellWindow` for `ctrl+tab`'s reason above: the tab lands in the shell window's
+             * strip, and a detached window has none, so the chord is not merely inert there — it
+             * is not taken from it at all.
+             *
+             * What it costs, checked in every layer rather than assumed:
+             *
+             * * **In this table**: nothing bound `ctrl+shift+h`. `ctrl+alt+shift+h` is
+             *   `pane.move.left` and is a different chord — the two normalise apart.
+             * * **In a terminal**: nothing. xterm encodes a control byte only for
+             *   `ctrl && !shift && !alt && !meta`, the fact that leaves ⌃⇧C inert, so no pty
+             *   loses a byte.
+             * * **In CodeMirror**: the installed keymaps bind `Mod-Shift-` only for `l`, `u`
+             *   and `z` (`ctrl+shift+e`'s note above).
+             * * **On macOS**: the blanket rewrite makes ⇧⌘H, which `MACOS_MENU_CHORDS` does not
+             *   list — ⌘H (Hide) and ⌥⌘H (Hide Others) are the menu's, Shift is not.
+             *
+             * **Not Ctrl+H**, which was the first ask and loses on both counts: ^H *is* the
+             * backspace byte, so the capture listener would take backward-delete-char from every
+             * shell and Claude pane in every window (and the left move from vim/tmux navigator
+             * setups), and on macOS it would rewrite onto ⌘H and never run at all.
+             */
+            ("ctrl+shift+h", "claude.newTab", "shellWindow"),
+            /*
              * F4 — hide the left panel, or bring back the last one that was open.
              *
              * Free in every layer: `ctrl+f12` above is the only other f-key in this table,
@@ -2088,6 +2114,7 @@ mod tests {
             "tab.switcher.next",
             "tab.switcher.prev",
             "tab.console",
+            "claude.newTab",
             "sidebar.toggle",
             "navigate.usages",
         ] {

@@ -289,6 +289,18 @@ try {
       if (declared === -1) continue
       ok(declared < createAt, `sessionsStore: \`${name}\` is declared above \`create\` — read at module load, below it is a ReferenceError`)
     }
+
+    // M205: "seen" is wired by the store, which App attaches for the rail, never by the panel,
+    // which is unmounted whenever another sidebar panel shows — a click into a finished pane then
+    // reached nobody, and the row stayed waiting over a pane whose marker the click had cleared.
+    const followAt = store.indexOf('function follow(')
+    const followBody = store.slice(followAt, store.indexOf('\n}', followAt))
+    ok(followAt > 0 && /\bonAcknowledged\(/.test(followBody), 'sessionsStore: follow() hears acknowledgements')
+    ok(/\bsubscribeAwaiting\(/.test(followBody), 'sessionsStore: follow() re-lays the overlay when the pane table moves')
+    ok(/applySeen\([^)]*\bisSettled\b/.test(store), 'sessionsStore: the overlay asks the pane table (isSettled)')
+    ok(!/\bseenIds\s*=\s*new Set/.test(store), 'sessionsStore: no seen set reset on attach')
+    const host = stripComments(readFileSync(resolve(UI, 'src/sidebar/AgentsPanel/AgentsPanelHost.tsx'), 'utf8'))
+    ok(!/\bonAcknowledged\b/.test(host), 'AgentsPanelHost: no acknowledgement listener of its own')
   }
 
   // --- the keyboard ------------------------------------------------------------------------------
@@ -312,6 +324,15 @@ try {
     ok(seenMod.applySeen(raw, same).seen === same, 'nothing pruned keeps the same set')
     ok(seenMod.canMarkSeen(raw, 'a') && !seenMod.canMarkSeen(raw, 'b') && !seenMod.canMarkSeen(raw, 'd'), 'only a waiting-for-input row can be marked seen')
     ok(!seenMod.canMarkSeen([row('x', 'awaitingInput', { live: false })], 'x'), 'an ended row cannot')
+    // M205: the pane table's answer counts too — a row whose pane marker is down reads idle.
+    const settled = (h) => h === 's-c' || h === 's-b'
+    const table = seenMod.applySeen(raw, new Set(), settled)
+    eq(table.rows.map((r) => r.activity), ['awaitingInput', 'permission', 'idle', 'working'], 'a settled child’s awaitingInput reads idle; a settled permission stays a debt; an unsettled one still waits')
+    eq([...table.seen], [], 'settled adds nothing to the seen set')
+    const kept = new Set(['a'])
+    ok(seenMod.applySeen(raw, kept, settled).seen === kept, 'settled prunes nothing either')
+    eq(seenMod.applySeen([row('n', 'awaitingInput', { liveSession: null })], new Set(), () => true).rows[0].activity, 'awaitingInput', 'a row with no live child is never settled')
+    eq(seenMod.applySeen(raw, new Set()).rows.map((r) => r.activity), raw.map((r) => r.activity), 'with no table, nothing is settled')
     // waiting counts: a seen turn drops out of both the pill and the rail
     const views = shown.rows.map((r) => ({ ...r, task: null }))
     eq(m.waitingSummary(views, new Set(), 0), { sessions: 2, total: 2 }, 'seen finished turn no longer counts as waiting (b permission, c unseen remain)')

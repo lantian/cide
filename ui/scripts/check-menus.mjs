@@ -65,6 +65,7 @@ try {
     isEmptyMenu,
     isInertMenu,
     moveFocus,
+    placeDropdown,
     placeMenu,
     placeSubmenu,
     resolveMenu,
@@ -430,6 +431,52 @@ try {
     'a keyboard-invoked menu hangs off the element’s bottom-left, having no pointer to sit at',
   )
 
+  // --- and a dropdown, which hangs off an element rather than a point ---------------------
+  //
+  // Every `openFor` menu: a header button's, a `▾` caret's, Shift+F10's. It used to be
+  // `placeMenu` from the element's bottom-left corner, which flips *through* that corner — so
+  // near the right edge the box's right edge landed on the button's LEFT edge, one button-width
+  // off. Reported against the split icon as "it opens slightly left"; on the user's screenshot
+  // the menu ended at x=224 and the button began at x=226.
+
+  const roomy = placeDropdown({ left: 100, right: 124, top: 20, bottom: 44 }, box, win)
+  eq(
+    [roomy.x, roomy.y, roomy.flippedX, roomy.flippedY, roomy.maxHeight],
+    [100, 44, false, false, 248],
+    'with room below and to the right it hangs under the element, left edges aligned, and '
+      + 'budgets from there to the bottom margin: 300 - 8 - 44',
+  )
+  const button = { left: 380, right: 404, top: 4, bottom: 28 }
+  const edge = placeDropdown(button, box, win)
+  eq(
+    [edge.x, edge.y, edge.flippedX, edge.flippedY],
+    [224, 28, true, false],
+    'near the right edge it stays under the button and aligns the two RIGHT edges — 404 - 180 '
+      + '— so the box ends where the button does',
+  )
+  eq(
+    placeMenu(anchorToRect(button), box, win).x,
+    200,
+    'which is not what the point placement gives: from the corner, 380 - 180 = 200, the box '
+      + 'ending at the button’s left edge — the reported miss, kept here as the reason the two '
+      + 'functions differ',
+  )
+  const below = placeDropdown({ left: 100, right: 124, top: 250, bottom: 274 }, box, win)
+  eq(
+    [below.y, below.flippedY, below.maxHeight],
+    [130, true, 242],
+    'with 18px below and 242 above it opens ABOVE the element — 250 - 120, its bottom edge on '
+      + 'the element’s top — rather than through the bottom edge, which would cover the control '
+      + 'that opened it; and scrolls inside the room above, not the room below',
+  )
+  const tooWide = placeDropdown({ left: 100, right: 124, top: 20, bottom: 44 }, { width: 900, height: 120 }, win)
+  eq(
+    [tooWide.x, tooWide.flippedX],
+    [8, false],
+    'and a box wider than the window pins to the left margin — the readable end, as '
+      + '`placeMenu` and `placeSubmenu` both choose',
+  )
+
   // --- and a submenu, which hangs off a row rather than a point ---------------------------
   //
   // The distinction is the whole reason this is not `placeMenu` with a cleverer anchor: a
@@ -776,7 +823,7 @@ try {
   // worth: they prove the imports and the tokens are there, not that a pixel moved.
 
   const component = readFileSync('src/menus/ContextMenu.tsx', 'utf8')
-  for (const fn of ['placeMenu', 'placeSubmenu', 'moveFocus', 'activeItem']) {
+  for (const fn of ['placeMenu', 'placeSubmenu', 'placeDropdown', 'moveFocus', 'activeItem']) {
     ok(
       new RegExp(`\\b${fn}\\(`).test(component),
       `ContextMenu.tsx calls \`${fn}\` — a box that placed itself would pass everything above `

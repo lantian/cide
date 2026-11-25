@@ -755,6 +755,25 @@ fn build() -> Vec<Command> {
         Command::new("claude.addRow", "Add row: new Harness session", HARNESS)
             .when("paneFocused")
             .keywords(&["panel", "full-width"]),
+        /*
+         * A new tab holding one empty session in the default harness — the header split menu's
+         * *harness new tab* row and the Sessions panel's `+`, as a command. Asked for as "a
+         * hotkey and in menu … to open a tab of default harness (empty)".
+         *
+         * `shellWindow && projectOpen`, not `paneFocused` like the three spawn rows above: it
+         * splits nothing, so it needs no pane, but it adds a tab to a strip and the strip lives in
+         * the shell window — `tab.console`'s clause, for `tab.console`'s reason. The handler
+         * re-checks both, because a clause gates the palette and never the keyboard.
+         *
+         * Which CLI it runs is not decided here or in the handler: `tab_new_claude` builds a pane
+         * with no harness of its own, and `ConsoleSpawn::decide` gives a fresh spawn with no
+         * explicit choice Settings → Harness. No `split` keyword —
+         * `searching_for_split_puts_split_pane_right_first` pins that list exactly, and a tab is
+         * not a split.
+         */
+        Command::new("claude.newTab", "New Harness tab", HARNESS)
+            .when("shellWindow && projectOpen")
+            .keywords(&["tab", "empty", "fresh", "session", "conversation"]),
         Command::new("claude.fork", "Fork session into new pane", HARNESS)
             .when("claudePaneFocused"),
         Command::new("claude.mirror", "Mirror session into new pane", HARNESS)
@@ -2041,6 +2060,9 @@ mod tests {
                 // Each creates the session it splits to, so it needs a pane to split and not
                 // a conversation to act on — the same clause `terminal.splitBelow` carries.
                 "claude.split.newSession" | "claude.split.right" | "claude.addRow" => "paneFocused",
+                // Creates a whole tab, so it needs the shell window's strip and a project to
+                // put it in — no pane at all, let alone a conversation.
+                "claude.newTab" => "shellWindow && projectOpen",
                 _ => "claudePaneFocused",
             };
             assert_eq!(command.when.as_deref(), Some(expected), "{}", command.id);

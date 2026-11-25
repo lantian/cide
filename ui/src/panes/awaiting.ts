@@ -280,6 +280,31 @@ function subscribe(notify: () => void): () => void {
 }
 
 /**
+ * Hear every change to the table, outside React (M205: the Sessions tab's store, which lays this
+ * table's answer over Rust's `awaitingInput` — `sessionsSeen.ts`). Installs the table like any
+ * reader does, so the Sessions rows do not depend on a pane title bar having rendered first.
+ */
+export function subscribeAwaiting(notify: () => void): () => void {
+  return subscribe(notify)
+}
+
+/**
+ * Whether this window's table holds `session` and says it is **not** waiting: the user has
+ * clicked into or typed at its pane since its turn ended, another window did and Rust's broadcast
+ * said so, or role policy (`publish`) says it waits on its writer rather than on anybody.
+ *
+ * A session the table has never heard of is not settled. Absent means "no news" here exactly as
+ * in `awaitingAmong`, and the Sessions row reads Rust's answer for it rather than guessing.
+ *
+ * The reviewer case is deliberate, not a side effect: a peer reviewer that went `awaitingInput`
+ * is not waiting on the user, and a Sessions row counting it into the rail's amber number while
+ * its pane shows no marker is the disagreement M205 removes.
+ */
+export function isSettled(session: string): boolean {
+  return tracks.get(session)?.awaiting === false
+}
+
+/**
  * Subscribe a component to one session's answer.
  *
  * Takes the session rather than the pane so a mirrored pane — two panes, one child — lights
